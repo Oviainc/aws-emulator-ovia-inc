@@ -8,10 +8,10 @@
 //!
 //! 1. creating a data source persists it under its GraphQL API and answers the stored
 //!    record — its ARN named under the API's own path, its `type`, its per-type
-//!    configuration and its `metricsConfig` as the request set them, and a
-//!    `description` only where the request carried a non-empty one (an empty
-//!    description describes nothing, so the member is reported absent, exactly as
-//!    for a request that omitted it) — and `GetDataSource` answers the same body.
+//!    configuration, its `serviceRoleArn` and its `metricsConfig` as the request set
+//!    them, and a `description` only where the request carried a non-empty one (an
+//!    empty description describes nothing, so the member is reported absent, exactly
+//!    as for a request that omitted it) — and `GetDataSource` answers the same body.
 //!    Asserted over a table holding every `DataSourceType` the model declares, with
 //!    the description and `metricsConfig` states rotating across it;
 //! 2. a data source of a type that is set up through a configuration member is
@@ -26,6 +26,9 @@
 //! 5. an `apiId` that cannot name an API is a 400 `BadRequestException`, one that
 //!    names no API this account holds a 404 `NotFoundException`, and a name the API
 //!    does not hold a 404.
+//!
+//! The service-role requirement each row satisfies is asserted on its own, over the
+//! same value set, in `data_source_service_role.rs`.
 //!
 //! Every assertion goes through the router the production emulator mounts, so these
 //! exercise routing, restJson1 (de)serialization, the handlers and the shared engine
@@ -42,6 +45,12 @@ use super::graphql_api_lifecycle::{create_api as create_graphql_api, router, REG
 
 /// The account id every emulated ARN carries.
 const ACCOUNT: &str = "000000000000";
+
+/// The service role a row carries when its type needs one: AppSync "assumes this role
+/// when accessing the data source", so a data source of a type it can only reach that
+/// way cannot be created without one (see `data_source_service_role.rs`, which
+/// asserts that rule over the whole value set).
+const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/service-role/appsync-datasource";
 
 /// One answer from the emulator: the parts a client branches on.
 #[derive(Debug, Clone)]
@@ -206,6 +215,10 @@ struct Row {
     config: Option<(&'static str, Value)>,
     description: Option<&'static str>,
     metrics_config: Option<&'static str>,
+    /// The `serviceRoleArn` the row sends, which is `Some` exactly for a type AppSync
+    /// must assume a role to reach — the service's own predicate decides, so this
+    /// table cannot disagree with the handler about which types need one.
+    service_role: Option<&'static str>,
 }
 
 /// The round-trip table: every `DataSourceType`, with the `description` and
@@ -221,6 +234,10 @@ fn rows() -> Vec<Row> {
             config,
             description: DESCRIPTIONS[index % DESCRIPTIONS.len()],
             metrics_config: METRICS_CONFIGS[index % METRICS_CONFIGS.len()],
+            // None of these rows authorizes its HTTP endpoint with IAM, so the
+            // requirement is the type's alone.
+            service_role: state::data_source_needs_service_role(data_source_type, false)
+                .then_some(ROLE_ARN),
         })
         .collect()
 }
@@ -234,6 +251,9 @@ fn request_body(row: &Row) -> Value {
     }
     if let Some(metrics_config) = row.metrics_config {
         object.insert("metricsConfig".to_string(), json!(metrics_config));
+    }
+    if let Some(service_role) = row.service_role {
+        object.insert("serviceRoleArn".to_string(), json!(service_role));
     }
     if let Some((member, value)) = row.config.clone() {
         object.insert(member.to_string(), value);
@@ -267,6 +287,19 @@ fn assert_projects(row: &Row, api_id: &str, data_source: &Value, source: &str) {
         "case {row:?} ({source}): expected dataSourceArn {expected_arn}, got {:?}",
         data_source["dataSourceArn"]
     );
+    match row.service_role {
+        Some(service_role) => assert_eq!(
+            data_source["serviceRoleArn"],
+            json!(service_role),
+            "case {row:?} ({source}): expected serviceRoleArn {service_role}, got {:?}",
+            data_source["serviceRoleArn"]
+        ),
+        None => assert!(
+            data_source["serviceRoleArn"].is_null(),
+            "case {row:?} ({source}): expected no serviceRoleArn, got {:?}",
+            data_source["serviceRoleArn"]
+        ),
+    }
     // A description is reported only where the request carried a non-empty one: an
     // empty description describes nothing, so it is reported absent just like an
     // omitted one.
@@ -442,6 +475,7 @@ async fn a_name_the_api_already_holds_is_refused_and_the_stored_one_is_untouched
             config: None,
             description: Some("the second create"),
             metrics_config: None,
+            service_role: None,
             ..row.clone()
         };
         let answer = create_data_source(&router, &api_id, &clash).await;

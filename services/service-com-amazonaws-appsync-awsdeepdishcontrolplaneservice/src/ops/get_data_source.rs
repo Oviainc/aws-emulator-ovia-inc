@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDataSource
+//! Implemented: reports one stored `DataSource` of an API from [`crate::state`]. This
+//! is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -171,7 +173,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // A data source is addressed by name within its API, so a name the API does
-        // not hold names no resource — including one held by a DIFFERENT API.
+        // not hold names no resource — including one held by a DIFFERENT API, and one
+        // whose create was refused.
         let Some(record) = api.data_sources.get(&input.name) else {
             return Err(GetDataSourceErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::data_source_not_found_message(&input.name)),

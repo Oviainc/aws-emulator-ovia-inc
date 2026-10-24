@@ -106,6 +106,8 @@ mod describe_vpcs;
 // `DescribeDhcpOptions` reports for it.
 #[path = "all/dhcp_options.rs"]
 mod dhcp_options;
+#[path = "all/dhcp_options_association.rs"]
+mod dhcp_options_association;
 #[path = "all/dry_run_and_unknown_ids.rs"]
 mod dry_run_and_unknown_ids;
 // The account-level EBS encryption-by-default setting and the CreateVolume default it

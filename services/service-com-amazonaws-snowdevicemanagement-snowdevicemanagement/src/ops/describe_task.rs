@@ -164,13 +164,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
-        // The account-level device gate, consulted BEFORE the id is resolved.
-        if !store.has_activated_device(&region) {
-            return Err(DescribeTaskErrorModeled::AccessDeniedException(
-                crate::state::no_devices_in_region(),
-            )
-            .into());
-        }
         store.settle(now);
 
         let Some(task) = store.task_in(&region, &input.task_id) else {

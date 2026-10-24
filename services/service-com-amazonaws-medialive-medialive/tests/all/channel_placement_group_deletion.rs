@@ -17,9 +17,10 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::channel_lifecycle::wait_for_the_clock;
 use crate::channel_placement_groups::{
-    create_channel, create_cluster, create_group, created, describe_group, described, group_uri,
-    id_of, without_state,
+    create_channel, create_cluster, create_group, create_nodes, created, describe_group, described,
+    group_uri, id_of, without_state, NodesSent,
 };
+use crate::node_lifecycle::node_uri;
 use crate::wire::{call, error_code, error_message, medialive};
 
 /// `DeleteChannelPlacementGroup` is bound to the group instance
@@ -64,30 +65,43 @@ async fn delete_channel(router: &MultiServiceRouter, case: &str, id: &str) {
 /// shape="ChannelPlacementGroupState")`).
 #[tokio::test]
 async fn an_accepted_delete_moves_the_group_through_deleting_to_deleted() {
-    // (case, which cluster, create request)
-    let rows: [(&str, usize, Value); 5] = [
-        ("nothing at all", 0, json!({})),
-        ("name only", 0, json!({ "name": "studio-a" })),
+    // (case, which cluster, create request besides `Nodes`, how `Nodes` is sent)
+    let rows: [(&str, usize, Value, NodesSent); 5] = [
+        ("nothing at all", 0, json!({}), NodesSent::Absent),
+        (
+            "name only",
+            0,
+            json!({ "name": "studio-a" }),
+            NodesSent::Absent,
+        ),
         (
             "name and one node",
             0,
-            json!({ "name": "studio-b", "nodes": ["node-7"] }),
+            json!({ "name": "studio-b" }),
+            NodesSent::Named(1),
         ),
-        ("node only, second cluster", 1, json!({ "nodes": ["n1"] })),
+        ("node only, second cluster", 1, json!({}), NodesSent::Named(1)),
         (
             "tags too, second cluster",
             1,
             json!({ "name": "tagged", "tags": { "team": "news" } }),
+            NodesSent::Absent,
         ),
     ];
 
-    for (case, which, request) in rows {
+    for (case, which, request, sent) in rows {
         let router = medialive();
         let clusters = [
             create_cluster(&router, case, "primary").await,
             create_cluster(&router, case, "secondary").await,
         ];
         let cluster = clusters[which].clone();
+        let mut request = request;
+        // A node a row names is one its own cluster really has: `Nodes` is a
+        // reference to a node of the group's cluster.
+        if let NodesSent::Named(count) = sent {
+            request["nodes"] = json!(create_nodes(&router, case, &cluster, count).await);
+        }
         let group = created(&router, case, &cluster, request).await;
         let id = id_of(&group);
 
@@ -167,11 +181,12 @@ async fn a_repeated_delete_is_accepted_without_restarting_the_clock() {
     for (case, waits, expected) in rows {
         let router = medialive();
         let cluster = create_cluster(&router, case, "primary").await;
+        let node = create_nodes(&router, case, &cluster, 1).await.remove(0);
         let group = created(
             &router,
             case,
             &cluster,
-            json!({ "name": "studio-a", "nodes": ["node-7"] }),
+            json!({ "name": "studio-a", "nodes": [node] }),
         )
         .await;
         let id = id_of(&group);
@@ -386,18 +401,7 @@ async fn a_deleted_group_holds_neither_its_name_nor_its_node() {
 
         // A node of the same cluster, created through `CreateNode`, so the
         // association the group reports is with a node the store really minted.
-        let (status, node) = call(
-            &router,
-            "POST",
-            &format!("/prod/clusters/{cluster}/nodes"),
-            Some(json!({ "name": "node-a", "requestId": "node-token" })),
-        )
-        .await;
-        assert_eq!(
-            status, 201,
-            "case {case:?}: CreateNode: expected 201, got {status}: {node}"
-        );
-        let node_id = node["id"].as_str().unwrap_or_default().to_string();
+        let node_id = create_nodes(&router, case, &cluster, 1).await.remove(0);
 
         let group = created(
             &router,
@@ -409,13 +413,7 @@ async fn a_deleted_group_holds_neither_its_name_nor_its_node() {
         let id = id_of(&group);
 
         // While the group is live the node reports the association.
-        let (status, before) = call(
-            &router,
-            "GET",
-            &format!("/prod/clusters/{cluster}/nodes/{node_id}"),
-            None,
-        )
-        .await;
+        let (status, before) = call(&router, "GET", &node_uri(&cluster, &node_id), None).await;
         assert_eq!(
             status, 200,
             "case {case:?}: DescribeNode: expected 200, got {status}: {before}"
@@ -433,13 +431,7 @@ async fn a_deleted_group_holds_neither_its_name_nor_its_node() {
         }
 
         // The node associates the group no longer.
-        let (status, after) = call(
-            &router,
-            "GET",
-            &format!("/prod/clusters/{cluster}/nodes/{node_id}"),
-            None,
-        )
-        .await;
+        let (status, after) = call(&router, "GET", &node_uri(&cluster, &node_id), None).await;
         assert_eq!(
             status, 200,
             "case {case:?}: DescribeNode: expected 200, got {status}: {after}"

@@ -1739,6 +1739,56 @@ pub fn coip_pool_id_reads_as_one(id: &str) -> bool {
     coip_pool_id_suffix(id).is_some()
 }
 
+// ---------------------------------------------------------------------------
+// DHCP option sets
+// ---------------------------------------------------------------------------
+//
+// One section for what the DHCP options surface needs beside the store itself
+// ([`ComAmazonawsEc2Amazonec2State::dhcp_options`] and
+// [`ComAmazonawsEc2Amazonec2State::holds_dhcp_options`]), so every operation of that
+// surface reads its id form and the word `default` from one place.
+
+/// The id prefix a DHCP options set is minted with (`dopt-…`), which is also the prefix of
+/// the `Vpc$DhcpOptionsId` every VPC reports
+/// ([`ComAmazonawsEc2Amazonec2State::default_dhcp_options_id`]).
+pub const DHCP_OPTIONS_ID_PREFIX: &str = "dopt";
+
+/// The word a request uses in place of a DHCP options set id to associate NO DHCP options
+/// with a VPC: "The ID of the DHCP options set, or `default` to associate no DHCP options
+/// with the VPC" (`AssociateDhcpOptionsRequest$DhcpOptionsId`). It is not an id, so it is
+/// neither looked up nor refused as malformed.
+pub const DHCP_OPTIONS_DEFAULT: &str = "default";
+
+/// EC2's error code for a request that named something that is not a DHCP options set id
+/// at all, so there is nothing to look up — answered BEFORE the id is resolved, the same
+/// ordering [`require_well_formed_id`] keeps for every other resource of this module.
+pub const INVALID_DHCP_OPTIONS_ID_MALFORMED: &str = "InvalidDhcpOptionsId.Malformed";
+
+/// Whether `id` is a well-formed DHCP options set id.
+///
+/// [`DHCP_OPTIONS_ID_PREFIX`] followed by 8 or 17 lowercase hexadecimal digits — the short
+/// and the long EC2 resource id forms, as [`prefixed_id_is_well_formed`] reads them.
+/// `DhcpOptionsId` and `DefaultingDhcpOptionsId` are bare strings in the model
+/// (`smithy_query(query="shape",shape="DefaultingDhcpOptionsId")`), so this is what
+/// separates "not a dhcp-options id at all" from "no such options set", and what bounds the
+/// bytes of an id a VPC can be made to carry.
+pub fn dhcp_options_id_is_well_formed(id: &str) -> bool {
+    prefixed_id_is_well_formed(DHCP_OPTIONS_ID_PREFIX, id)
+}
+
+/// Refuse a request that named something that is not a DHCP options set id at all: HTTP
+/// 400 `InvalidDhcpOptionsId.Malformed`, which EC2 answers BEFORE it resolves the id, so a
+/// caller can tell "not a dhcp-options id" from "no such options set".
+pub fn invalid_dhcp_options_id_malformed<E>(
+    dhcp_options_id: &str,
+) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_DHCP_OPTIONS_ID_MALFORMED,
+        400,
+        format!("The dhcp-options ID '{dhcp_options_id}' is malformed"),
+    )
+}
+
 /// The name of the default security group every VPC comes with: "the default security
 /// group is named `default`" (Amazon VPC User Guide, "Default security groups for your
 /// VPCs"). It is also the one group name a caller may name a group by.
@@ -2723,6 +2773,21 @@ impl ComAmazonawsEc2Amazonec2State {
         self.subnets.len() < MAX_SUBNETS
     }
 
+    /// Whether this account holds the DHCP option set `dhcp_options_id` names.
+    ///
+    /// A set exists while [`Self::dhcp_options`] holds a record for it, which is the ONE
+    /// store of option sets this service has: a Region's default set is minted into it by
+    /// [`Self::default_dhcp_options_id`], and a caller-created one joins it when
+    /// `CreateDhcpOptions` lands, so every operation that has to resolve an id — an
+    /// association, a describe, a delete — asks the same question in the same place.
+    /// Whether a VPC happens to be associated with the set is beside the point: an
+    /// association moves without the set ceasing to exist.
+    ///
+    /// A READ: an id this store does not hold is not given a set here.
+    pub fn holds_dhcp_options(&self, dhcp_options_id: &str) -> bool {
+        self.dhcp_options.contains_key(dhcp_options_id)
+    }
+
     /// Whether `region`'s default DHCP option set can be answered: either the store already
     /// holds it, or another set fits inside the store's ceiling
     /// ([`MAX_DHCP_OPTION_SETS`]).
@@ -2777,7 +2842,7 @@ impl ComAmazonawsEc2Amazonec2State {
         if let Some(dhcp_options_id) = self.default_dhcp_options_ids.get(region) {
             return dhcp_options_id.clone();
         }
-        let dhcp_options_id = self.next_id("dopt");
+        let dhcp_options_id = self.next_id(DHCP_OPTIONS_ID_PREFIX);
         let configuration = |key: &str, value: String| DhcpConfiguration {
             key: Some(key.to_string()),
             values: Some(vec![AttributeValue { value: Some(value) }]),
@@ -13782,6 +13847,9 @@ impl ComAmazonawsEc2Amazonec2State {
         // later must start from the creation defaults, never from what a
         // `ModifyVpcAttribute` left behind for a VPC that no longer exists.
         self.vpc_attributes.remove(vpc_id);
+        // The Region's DHCP option set does NOT go with the VPC: one set is shared by every
+        // VPC of the Region and outlives all of them, as it does on AWS, so a delete leaves
+        // [`Self::dhcp_options`] alone.
         self.release_stored_bytes(vpc_payload_bytes(&vpc));
         let groups: Vec<String> = self
             .security_groups

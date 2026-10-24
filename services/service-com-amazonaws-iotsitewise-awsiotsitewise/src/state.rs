@@ -23,7 +23,10 @@
 //! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::dataset_export_jobs`], keyed by
 //! the workspace and the minted job id, each record carrying the request that
 //! started it and the instant it started, from which a read DERIVES how far the
-//! job has got. The service's own settings live here too:
+//! job has got. An execution of an action lives in
+//! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::executions`], keyed by its own
+//! id, which is what `ListExecutions` summarises for the target resource a
+//! request names. The service's own settings live here too:
 //! the logging options, one entry per scope a call named
 //! ([`ComAmazonawsIotsitewiseAwsiotsitewiseState::logging_options`]), and the
 //! account's default encryption configuration
@@ -45,12 +48,13 @@ use crate::ops::types::{
     AssetModelProperty, AssetModelPropertyDefinition, AssetModelStatus, AssetProperty,
     AssetPropertyValue, AssetStatus, AssetSummary, ComputeNode, ComputeNodeExecutionDetails,
     ComputeNodeExecutionStatus, ConfigurationStatus, DatasetConfig, DatasetSource, DatasetStatus,
-    ExecutionEnvironmentVariables, ExportErrorReportLocation, ExpressionVariable,
-    GatewayCapabilitySummary, GatewayPlatform, ImageLocation, LoggingOptions, Mount,
-    MountOverrides, PipelineExecutionStatus, PortalStatus, PortalTypeEntry, ProcessingInput,
-    PropertyType, ResourceStatus, TaskConfiguration, TimeInNanos, TrimSettings, Variant,
-    WorkspaceEncryptionConfiguration, WorkspaceEncryptionConfigurationInfo, WorkspaceStatus,
-    ENCRYPTION_TYPE_VALUES, VIDEO_DATA_TYPE_VALUES,
+    ExecutionEnvironmentVariables, ExecutionStatus, ExecutionSummary, ExportErrorReportLocation,
+    ExpressionVariable, GatewayCapabilitySummary, GatewayPlatform, ImageLocation, LoggingOptions,
+    Mount, MountOverrides, PipelineExecutionStatus, PortalStatus, PortalTypeEntry, ProcessingInput,
+    PropertyType, ResolveTo, ResourceStatus, TargetResource, TaskConfiguration, TimeInNanos,
+    TrimSettings, Variant, WorkspaceEncryptionConfiguration,
+    WorkspaceEncryptionConfigurationInfo, WorkspaceStatus, ENCRYPTION_TYPE_VALUES,
+    VIDEO_DATA_TYPE_VALUES,
 };
 
 /// The `iotsitewise` ARN service namespace, as `OPERATIONS.md` reports it.
@@ -1882,6 +1886,122 @@ pub fn task_arn(region: &str, workspace_name: &str, task_name: &str) -> String {
     )
 }
 
+/// The `TargetResourceType` value that addresses an asset. Source:
+/// `smithy_query(query="shape", shape="TargetResourceType")` — ASSET |
+/// COMPUTATION_MODEL.
+pub const TARGET_RESOURCE_TYPE_ASSET: &str = "ASSET";
+
+/// The `TargetResourceType` value that addresses a computation model. See
+/// [`TARGET_RESOURCE_TYPE_ASSET`] for the source of the pair.
+pub const TARGET_RESOURCE_TYPE_COMPUTATION_MODEL: &str = "COMPUTATION_MODEL";
+
+/// The `ExecutionState` an execution reports while the action it runs is still in
+/// flight.
+///
+/// Source: `smithy_query(query="shape", shape="ExecutionState")` — RUNNING |
+/// COMPLETED | FAILED, of which this is the only non-terminal value.
+pub const EXECUTION_STATE_RUNNING: &str = "RUNNING";
+
+/// The `ExecutionState` of an execution whose action finished successfully. See
+/// [`EXECUTION_STATE_RUNNING`] for the source of the set.
+pub const EXECUTION_STATE_COMPLETED: &str = "COMPLETED";
+
+/// The `ExecutionState` of an execution whose action finished unsuccessfully. See
+/// [`EXECUTION_STATE_RUNNING`] for the source of the set.
+pub const EXECUTION_STATE_FAILED: &str = "FAILED";
+
+/// One execution of an action on a target resource: what `ListExecutions`
+/// summarises, keyed by its own `executionId` in
+/// [`ComAmazonawsIotsitewiseAwsiotsitewiseState::executions`].
+///
+/// An execution runs for a span rather than finishing inside the call that starts
+/// it, so the record keeps the instant its run is owed to end
+/// ([`Self::settles_at`]) and the terminal state it settles into
+/// ([`Self::outcome`]) instead of a state field a read would have to move:
+/// [`Self::state`] reports [`EXECUTION_STATE_RUNNING`] until that instant falls
+/// due and the outcome from then on, so a listing never has to write to report
+/// what the clock already made true.
+#[derive(Debug, Clone)]
+pub struct ExecutionRecord {
+    /// The id this execution is addressed by.
+    pub execution_id: String,
+    /// The `actionType` of the action definition this execution runs, which is
+    /// also what the listing's `actionType` filter matches on.
+    pub action_type: Option<String>,
+    /// The resource the action was taken on: an asset or a computation model.
+    pub target_resource: TargetResource,
+    /// The version of the target resource the action ran against.
+    pub target_resource_version: String,
+    /// The detailed resource this execution resolves to, which only an execution
+    /// whose target resolves through a data binding carries.
+    pub resolve_to: Option<ResolveTo>,
+    /// When the execution started.
+    pub execution_start_time: SystemTime,
+    /// The instant this execution's run is owed to end — when it stops reporting
+    /// [`EXECUTION_STATE_RUNNING`] and reports [`Self::outcome`] instead.
+    pub settles_at: SystemTime,
+    /// The terminal `ExecutionState` this execution settles into:
+    /// [`EXECUTION_STATE_COMPLETED`] or [`EXECUTION_STATE_FAILED`].
+    pub outcome: String,
+    /// The execution entity version associated with the summary.
+    pub execution_entity_version: Option<String>,
+}
+
+impl ExecutionRecord {
+    /// The `ExecutionState` this execution reports at `now`: still running until
+    /// [`Self::settles_at`] falls due, its outcome from then on.
+    pub fn state(&self, now: SystemTime) -> &str {
+        if now < self.settles_at {
+            EXECUTION_STATE_RUNNING
+        } else {
+            &self.outcome
+        }
+    }
+
+    /// When the execution ended, which is reported only once it has: "The time
+    /// the process ended" is absent for one still running.
+    pub fn execution_end_time(&self, now: SystemTime) -> Option<SystemTime> {
+        (now >= self.settles_at).then_some(self.settles_at)
+    }
+
+    /// `true` when `resource_type` and `resource_id` address THIS execution's
+    /// target resource — the pairing `ListExecutions` scopes its listing by.
+    pub fn targets(&self, resource_type: &str, resource_id: &str) -> bool {
+        let addressed = match resource_type {
+            TARGET_RESOURCE_TYPE_ASSET => self.target_resource.asset_id.as_deref(),
+            // No computation model is stored while `CreateComputationModel` is a
+            // scaffold stub, so `ListExecutions` refuses a listing scoped to one
+            // before it reaches this arm; the arm is what makes an execution of a
+            // computation model addressable once that writer exists.
+            TARGET_RESOURCE_TYPE_COMPUTATION_MODEL => {
+                self.target_resource.computation_model_id.as_deref()
+            }
+            _ => None,
+        };
+        addressed == Some(resource_id)
+    }
+
+    /// This execution as the summary a listing reports for it, at `now`.
+    ///
+    /// Derived here rather than in the handler so every view of one stored
+    /// execution reports the same state, end time and versions.
+    pub fn summary(&self, now: SystemTime) -> ExecutionSummary {
+        ExecutionSummary {
+            execution_id: self.execution_id.clone(),
+            action_type: self.action_type.clone(),
+            target_resource: self.target_resource.clone(),
+            target_resource_version: self.target_resource_version.clone(),
+            resolve_to: self.resolve_to.clone(),
+            execution_start_time: to_date_time(self.execution_start_time),
+            execution_end_time: self.execution_end_time(now).map(to_date_time),
+            execution_status: ExecutionStatus {
+                state: self.state(now).to_string(),
+            },
+            execution_entity_version: self.execution_entity_version.clone(),
+        }
+    }
+}
+
 /// The `kmsKeyArn` a workspace reports for the `kmsKeyId` it was given.
 ///
 /// `kmsKeyId` "Accepts a key ID, key ARN, or key alias" while the read form
@@ -2358,6 +2478,9 @@ pub struct ComAmazonawsIotsitewiseAwsiotsitewiseState {
     pub logging_options: HashMap<String, LoggingOptionsRecord>,
     /// Datasets by `datasetId`.
     pub datasets: HashMap<String, DatasetRecord>,
+    /// Executions of actions by `executionId`, which `ListExecutions`
+    /// summarises for the target resource a request names.
+    pub executions: HashMap<String, ExecutionRecord>,
     /// The account's default encryption configuration, as the last
     /// `PutDefaultEncryptionConfiguration` left it. `None` is an account nothing
     /// has configured, which reports [`ENCRYPTION_TYPE_SITEWISE_DEFAULT`] without storing
@@ -3451,6 +3574,9 @@ pub const RESOURCE_TIME_SERIES: &str = "Time Series";
 
 /// The resource kind those errors name for an IoT SiteWise Monitor portal.
 pub const RESOURCE_PORTAL: &str = "Portal";
+
+/// The resource kind those errors name for a computation model.
+pub const RESOURCE_COMPUTATION_MODEL: &str = "Computation Model";
 
 /// The message a not-found refusal carries: the resource kind, then the
 /// identifier the REQUEST supplied, echoed exactly as sent — whatever form that

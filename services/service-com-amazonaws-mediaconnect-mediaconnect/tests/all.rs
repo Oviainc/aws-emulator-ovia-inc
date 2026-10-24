@@ -63,6 +63,8 @@ mod ops_name_bindings;
 mod remove_flow_media_stream;
 #[path = "all/remove_flow_output.rs"]
 mod remove_flow_output;
+#[path = "all/remove_flow_vpc_interface.rs"]
+mod remove_flow_vpc_interface;
 #[path = "all/reservation_description.rs"]
 mod reservation_description;
 #[path = "all/reservation_listing.rs"]

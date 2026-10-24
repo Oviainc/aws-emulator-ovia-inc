@@ -1,26 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The account-level device gate, and the front-door refusal of a `CreateTask` that
-//! names no target, end to end over HTTP.
+//! The front-door refusal of a `CreateTask` that names no target device, and what
+//! `ListTasks` reports, end to end over HTTP.
 //!
-//! The rule under test: in a Region where this account has activated Snow Device
-//! Management on no Snow Family device, EVERY operation the model declares
-//! `AccessDeniedException` on is refused with that error (HTTP 403, a message naming
-//! device/Region availability) BEFORE the request's ids are resolved — so a gated
-//! caller never learns whether a device or a task exists — and the refusal is a
-//! precondition, so repeated and concurrent calls answer it identically. A Region that
-//! HAS an activated device answers the same calls from state: the per-resource
-//! `ResourceNotFoundException` for an id it does not hold, the resource for one it
-//! does.
+//! The rules under test. (1) A `CreateTask` that names NO target — no `targets`
+//! member at all, or an empty list — has no device for the call to be authorized
+//! against, so the front door denies it (`UnauthorizedException` / "Unauthorized")
+//! before any constraint check; a list that is too LONG is a request-shape problem
+//! and keeps `ValidationException`. (2) `ListTasks` is a projection of the tasks
+//! created in the signed Region: every one of them once, filtered by `TaskState`
+//! when the request names one, paged at `maxResults`, and nothing from any other
+//! Region.
 //!
-//! Rows differ along what the rule generalises over: the operation, the Region, the id
-//! form, the repeat, and — for the `targets` refusal — the size of the list.
+//! An account that manages no device in the signed Region is not refused for that —
+//! what every operation answers such a caller is pinned in
+//! `empty_inventory_refusals.rs`.
+//!
+//! Rows differ along what the rules generalise over: the size of the `targets` list
+//! (absent, empty, both modelled bounds, past the maximum), the command and target
+//! count of each created task, the `TaskState` filter, the page size, and the
+//! Region.
 //!
 //! Nothing here asserts a value the emulator invented: the device inventory is put in
 //! state through the one activation seam (the API models no device-creation operation),
 //! and every answer is read back over the wire.
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -33,10 +37,10 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The Region this suite activates devices in.
 const ACTIVE_REGION: &str = "ap-southeast-2";
 
-/// Regions this account has activated no device in. Three of them, so the gate is
-/// shown to be a property of the Region the request is signed for rather than of one
-/// particular Region name.
-const GATED_REGIONS: &[&str] = &["us-east-1", "eu-west-1", "us-west-2"];
+/// Other Regions of the same account, which hold no device and no task of their
+/// own. Three of them, so a listing is shown to be a property of the Region the
+/// request is signed for rather than of one particular Region name.
+const OTHER_REGIONS: &[&str] = &["us-east-1", "eu-west-1", "us-west-2"];
 
 /// `TaskState`'s values, from
 /// `smithy_query(query="shape",shape="TaskState")` — the filter `ListTasks` admits.
@@ -72,8 +76,8 @@ impl Answer {
 }
 
 /// One emulator, with Snow Device Management activated on `count` devices in
-/// `region` — `count = 0` is an account that has ordered nothing, which is the gated
-/// state. Answers the router and the ids of the devices it activated.
+/// `region` — `count = 0` is an account that has ordered nothing. Answers the router
+/// and the ids of the devices it activated.
 fn emulator_with(region: &str, count: u64) -> (MultiServiceRouter, Vec<String>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let activated = service_state(&*engine)
@@ -127,320 +131,6 @@ async fn call(
         })
     };
     Answer { status, body }
-}
-
-/// One request per gated operation, shaped so that nothing but the gate can refuse it
-/// first: every id is well formed and every body satisfies the model's constraints.
-///
-/// The set is the implemented operations the model declares `AccessDeniedException`
-/// on (`smithy_query(query="digest")`): ListDevices, ListTasks, DescribeDevice,
-/// DescribeTask, DescribeExecution, DescribeDeviceEc2Instances, CreateTask,
-/// CancelTask and ListExecutions, plus the three list operations carrying a
-/// `nextToken` this service never issued. ListDeviceResources answers the gate too
-/// (it is still scaffolded past it), and the tag operations do not declare the
-/// error at all.
-fn gated_requests(device_id: &str, task_id: &str) -> Vec<(String, &'static str, String, Option<Value>)> {
-    vec![
-        (
-            "ListDevices".to_string(),
-            "GET",
-            "/managed-devices".to_string(),
-            None,
-        ),
-        (
-            "ListDevices?maxResults=1".to_string(),
-            "GET",
-            "/managed-devices?maxResults=1".to_string(),
-            None,
-        ),
-        ("ListTasks".to_string(), "GET", "/tasks".to_string(), None),
-        (
-            "ListTasks?state=IN_PROGRESS".to_string(),
-            "GET",
-            "/tasks?state=IN_PROGRESS".to_string(),
-            None,
-        ),
-        (
-            "DescribeDevice".to_string(),
-            "POST",
-            format!("/managed-device/{device_id}/describe"),
-            None,
-        ),
-        (
-            "DescribeTask".to_string(),
-            "POST",
-            format!("/task/{task_id}"),
-            None,
-        ),
-        (
-            "CreateTask".to_string(),
-            "POST",
-            "/task".to_string(),
-            Some(json!({ "targets": [device_id], "command": { "unlock": {} } })),
-        ),
-        (
-            "CancelTask".to_string(),
-            "POST",
-            format!("/task/{task_id}/cancel"),
-            None,
-        ),
-        (
-            "ListExecutions".to_string(),
-            "GET",
-            format!("/executions?taskId={task_id}"),
-            None,
-        ),
-        // A `nextToken` this service never issued is request-carried state like an
-        // id, so the gate answers it too rather than judging the token.
-        (
-            "ListDevices?nextToken=<unissued>".to_string(),
-            "GET",
-            "/managed-devices?nextToken=zz".to_string(),
-            None,
-        ),
-        (
-            "ListTasks?nextToken=<unissued>".to_string(),
-            "GET",
-            "/tasks?nextToken=zz".to_string(),
-            None,
-        ),
-        (
-            "ListExecutions?nextToken=<unissued>".to_string(),
-            "GET",
-            format!("/executions?taskId={task_id}&nextToken=zz"),
-            None,
-        ),
-        (
-            "DescribeExecution".to_string(),
-            "POST",
-            format!("/task/{task_id}/execution/{device_id}"),
-            None,
-        ),
-        (
-            "ListDeviceResources".to_string(),
-            "GET",
-            format!("/managed-device/{device_id}/resources"),
-            None,
-        ),
-        (
-            "DescribeDeviceEc2Instances".to_string(),
-            "POST",
-            format!("/managed-device/{device_id}/resources/ec2/describe"),
-            Some(json!({ "instanceIds": ["i-0123456789abcdef0"] })),
-        ),
-    ]
-}
-
-/// Assert `answer` is the account-level device gate: HTTP 403 `AccessDeniedException`
-/// whose message states the precondition (devices in this Region) rather than an
-/// identity's permissions.
-fn assert_gated(answer: &Answer, case: &str) {
-    assert_eq!(
-        answer.status, 403,
-        "case {case:?}: expected the account-level device gate to answer HTTP 403, got {} with {}",
-        answer.status, answer.body
-    );
-    assert_eq!(
-        answer.error_code(),
-        "AccessDeniedException",
-        "case {case:?}: expected AccessDeniedException, got {}",
-        answer.body
-    );
-    let message = answer.message().to_lowercase();
-    assert!(
-        message.contains("device") && message.contains("region"),
-        "case {case:?}: the gate's message must name device/Region availability, not an \
-         identity's permissions, got {:?}",
-        answer.message()
-    );
-}
-
-#[tokio::test]
-async fn every_gated_operation_is_refused_in_a_region_with_no_activated_device() {
-    // Rows: one per gated operation, in each of several Regions this account has
-    // activated no device in.
-    for region in GATED_REGIONS {
-        let (router, activated) = emulator_with(region, 0);
-        assert!(
-            activated.is_empty(),
-            "case {region:?}: this emulator must start with no activated device"
-        );
-        for (operation, method, uri, body) in gated_requests("smd-0000000000000000", "st-0000000000000001")
-        {
-            let case = format!("{operation} in {region}");
-            let answer = call(&router, region, method, &uri, body).await;
-            assert_gated(&answer, &case);
-        }
-    }
-}
-
-#[tokio::test]
-async fn the_gate_is_regional_and_lifts_only_where_a_device_is_activated() {
-    let (router, activated) = emulator_with(ACTIVE_REGION, 2);
-    let device = activated
-        .first()
-        .expect("two devices were activated")
-        .clone();
-
-    // The Region the devices were activated in answers from state.
-    let body = call(&router, ACTIVE_REGION, "GET", "/managed-devices", None).await;
-    assert_eq!(
-        body.status, 200,
-        "case \"active region\": a Region with activated devices must answer ListDevices, got {}",
-        body.body
-    );
-    let listed: BTreeSet<String> = body.body["devices"]
-        .as_array()
-        .unwrap_or_else(|| panic!("case \"active region\": expected devices, got {}", body.body))
-        .iter()
-        .map(|device| {
-            device["managedDeviceId"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string()
-        })
-        .collect();
-    assert_eq!(
-        listed,
-        activated.iter().cloned().collect::<BTreeSet<String>>(),
-        "case \"active region\": ListDevices must report exactly the activated inventory"
-    );
-
-    // Every other Region of the same account is still gated — including for the very
-    // device ids that exist in the active one.
-    for region in GATED_REGIONS {
-        let case = format!("DescribeDevice {device} in {region}");
-        let answer = call(
-            &router,
-            region,
-            "POST",
-            &format!("/managed-device/{device}/describe"),
-            None,
-        )
-        .await;
-        assert_gated(&answer, &case);
-
-        let case = format!("ListDevices in {region}");
-        assert_gated(
-            &call(&router, region, "GET", "/managed-devices", None).await,
-            &case,
-        );
-    }
-}
-
-#[tokio::test]
-async fn the_gate_precedes_the_per_resource_lookup() {
-    // The same ids, asked of a gated account and of an activated one: the gated
-    // account answers 403 for all of them (it discloses nothing about the id), the
-    // activated one resolves the id and answers the modelled 404.
-    let rows: &[(&str, &str)] = &[
-        // (operation, uri) — every id here is well formed and names nothing.
-        ("DescribeDevice", "/managed-device/smd-ffffffffffffffff/describe"),
-        ("DescribeDevice", "/managed-device/does-not-exist/describe"),
-        ("DescribeTask", "/task/st-ffffffffffffffff"),
-        ("CancelTask", "/task/st-ffffffffffffffff/cancel"),
-        ("ListExecutions", "/executions?taskId=st-ffffffffffffffff"),
-    ];
-
-    let (gated, _) = emulator_with(ACTIVE_REGION, 0);
-    let (activated, _) = emulator_with(ACTIVE_REGION, 1);
-    for (operation, uri) in rows {
-        let method = if uri.starts_with("/executions") {
-            "GET"
-        } else {
-            "POST"
-        };
-        let case = format!("{operation} {uri} on a gated account");
-        assert_gated(&call(&gated, ACTIVE_REGION, method, uri, None).await, &case);
-
-        let case = format!("{operation} {uri} on an activated account");
-        let answer = call(&activated, ACTIVE_REGION, method, uri, None).await;
-        assert_eq!(
-            answer.status, 404,
-            "case {case:?}: past the gate an unknown id is the modelled \
-             ResourceNotFoundException, got {} with {}",
-            answer.status, answer.body
-        );
-        assert_eq!(
-            answer.error_code(),
-            "ResourceNotFoundException",
-            "case {case:?}: expected ResourceNotFoundException, got {}",
-            answer.body
-        );
-    }
-
-    // CreateTask the same way: the gate precedes resolving its targets.
-    let create = json!({ "targets": ["smd-ffffffffffffffff"], "command": { "unlock": {} } });
-    assert_gated(
-        &call(
-            &gated,
-            ACTIVE_REGION,
-            "POST",
-            "/task",
-            Some(create.clone()),
-        )
-        .await,
-        "CreateTask on a gated account",
-    );
-    let answer = call(&activated, ACTIVE_REGION, "POST", "/task", Some(create)).await;
-    assert_eq!(
-        answer.error_code(),
-        "ResourceNotFoundException",
-        "case \"CreateTask on an activated account\": past the gate an unknown target is \
-         the modelled ResourceNotFoundException, got {}",
-        answer.body
-    );
-}
-
-#[tokio::test]
-async fn the_gate_is_a_precondition_so_repeated_and_concurrent_calls_answer_it_identically() {
-    let (router, _) = emulator_with(ACTIVE_REGION, 0);
-
-    // Repeated over time: a precondition does not come and go.
-    let mut samples: BTreeSet<(u16, String, String)> = BTreeSet::new();
-    for sample in 0..4 {
-        let case = format!("sample {sample}");
-        let answer = call(&router, ACTIVE_REGION, "GET", "/managed-devices", None).await;
-        assert_gated(&answer, &case);
-        samples.insert((
-            answer.status,
-            answer.error_code().to_string(),
-            answer.message().to_string(),
-        ));
-        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
-    }
-    assert_eq!(
-        samples.len(),
-        1,
-        "case \"repeat\": the gate must answer every sample identically, got {samples:?}"
-    );
-
-    // And concurrently: eight CreateTask calls against the same target.
-    let body = json!({ "targets": ["smd-0000000000000000"], "command": { "reboot": {} } });
-    let one = || call(&router, ACTIVE_REGION, "POST", "/task", Some(body.clone()));
-    let answers = tokio::join!(one(), one(), one(), one(), one(), one(), one(), one());
-    let concurrent = [
-        answers.0, answers.1, answers.2, answers.3, answers.4, answers.5, answers.6, answers.7,
-    ];
-    let mut codes: BTreeSet<(u16, String, String)> = BTreeSet::new();
-    for (index, answer) in concurrent.iter().enumerate() {
-        assert_gated(answer, &format!("concurrent CreateTask {index}"));
-        codes.insert((
-            answer.status,
-            answer.error_code().to_string(),
-            answer.message().to_string(),
-        ));
-    }
-    assert_eq!(
-        codes.len(),
-        1,
-        "case \"concurrent\": every concurrent call must answer the same gate, got {codes:?}"
-    );
-    assert_eq!(
-        codes, samples,
-        "case \"concurrent vs repeat\": the gate is one answer, not two, got {codes:?} and \
-         {samples:?}"
-    );
 }
 
 #[tokio::test]
@@ -544,11 +234,12 @@ async fn create_task_that_names_no_target_is_denied_at_the_front_door() {
         }
     }
 
-    // The denial precedes the account-level gate too: an account with no activated
-    // device still answers it for a CreateTask that names no target.
-    let (gated, _) = emulator_with(ACTIVE_REGION, 0);
+    // The denial is the front door's, ahead of anything this service's handler does:
+    // an account that manages no device at all still answers it for a `CreateTask`
+    // that names no target.
+    let (bare, _) = emulator_with(ACTIVE_REGION, 0);
     let answer = call(
-        &gated,
+        &bare,
         ACTIVE_REGION,
         "POST",
         "/task",
@@ -558,8 +249,8 @@ async fn create_task_that_names_no_target_is_denied_at_the_front_door() {
     assert_eq!(
         answer.error_code(),
         "UnauthorizedException",
-        "case \"no targets on a gated account\": the front door denies the call before the \
-         service's own gate, got {}",
+        "case \"no targets without an inventory\": the front door denies the call before \
+         the handler runs, got {}",
         answer.body
     );
 }
@@ -568,8 +259,7 @@ async fn create_task_that_names_no_target_is_denied_at_the_front_door() {
 async fn list_tasks_reports_the_tasks_created_in_the_region_and_filters_them_by_state() {
     let (router, activated) = emulator_with(ACTIVE_REGION, 3);
 
-    // Nothing has been created yet, so the list is empty — the Region has a device, so
-    // the gate does not fire.
+    // Nothing has been created yet, so the list is empty.
     let empty = call(&router, ACTIVE_REGION, "GET", "/tasks", None).await;
     assert_eq!(
         empty.status, 200,
@@ -772,9 +462,20 @@ async fn list_tasks_reports_the_tasks_created_in_the_region_and_filters_them_by_
     }
 
     // The tasks belong to the Region they were created in: another Region of the same
-    // account is gated, and one with its own device does not see them.
-    for region in GATED_REGIONS {
+    // account reports none of them, and reports that as an empty list.
+    for region in OTHER_REGIONS {
         let case = format!("ListTasks in {region}");
-        assert_gated(&call(&router, region, "GET", "/tasks", None).await, &case);
+        let answer = call(&router, region, "GET", "/tasks", None).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: expected HTTP 200, got {} with {}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            answer.body["tasks"],
+            json!([]),
+            "case {case:?}: a Region no task was created in reports none, got {}",
+            answer.body
+        );
     }
 }

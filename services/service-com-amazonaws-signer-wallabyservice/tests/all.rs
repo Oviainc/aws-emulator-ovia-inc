@@ -14,6 +14,9 @@
 #[path = "all/error_responses.rs"]
 mod error_responses;
 
+#[path = "all/profile_listing_pagination.rs"]
+mod profile_listing_pagination;
+
 #[path = "all/profile_permissions.rs"]
 mod profile_permissions;
 

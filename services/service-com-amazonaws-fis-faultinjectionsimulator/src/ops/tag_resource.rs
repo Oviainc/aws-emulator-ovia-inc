@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -56,6 +47,23 @@
 //! * `resourceArn` (ResourceArn, len 20..2048, pattern ^[\S]+$) **required** — The Amazon
 //!   Resource Name (ARN) of the resource.
 //! * `tags` (TagMap, len 0..50) **required** — The tags for the resource.
+//!
+//! ## Output
+//!
+//! The response carries no members: the applied tags are read back through the resource's
+//! own reader (`GetExperimentTemplate`, `GetExperiment`), which reports the tag map this
+//! call left on the record.
+//!
+//! ## Errors
+//!
+//! The operation shape lists none, so both refusals below are shapes this SERVICE models,
+//! widened in through `extra_errors`:
+//!
+//! * `ValidationException` (HTTP 400) — the `resourceArn` is not a well-formed ARN of this
+//!   service naming a resource that carries tags, a tag key is outside `TagKey`'s modelled
+//!   bounds, or the request would leave the resource with more tags than a `TagMap` holds.
+//! * `ResourceNotFoundException` (HTTP 404) — the ARN names a resource of this service
+//!   that the store holds no record of.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -68,12 +76,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-fis-faultinjectionsimul
 
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `TagResourceError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.fis#TagResource")]
+// here — hence the `TagResourceError` alias below. This operation shape lists NO errors,
+// so the two this service models for every operation that resolves and validates caller
+// input are widened in through `extra_errors`: `ValidationException` for a `resourceArn`
+// or a tag this service cannot accept, and `ResourceNotFoundException` for an ARN naming a
+// resource the store does not hold.
+#[smithy_macros::operation_error(
+    "com.amazonaws.fis#TagResource",
+    extra_errors = ["ValidationException", "ResourceNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum TagResourceErrorModeled {
+    ValidationException(ValidationException),
+    ResourceNotFoundException(ResourceNotFoundException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -127,18 +142,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // Nothing here depends on request metadata: the resource is named by the ARN the
+        // request carries, not by the region it was signed for.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::internal_failure(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // WHICH resource the ARN names is a property of the request, so it is read before
+        // the store is reached: an ARN that addresses nothing in this service's namespace
+        // is a bad request rather than a missing resource.
+        let resource = crate::state::tagged_resource(&input.resource_arn)
+            .map_err(TagResourceErrorModeled::ValidationException)?;
+
+        // A map's KEY target is not reached by the boundary validator (its VALUE target
+        // is), so `TagKey`'s modelled bounds are enforced here.
+        if let Some(refusal) =
+            crate::state::tag_keys_refusal("tags", input.tags.keys().map(String::as_str))
+        {
+            return Err(TagResourceErrorModeled::ValidationException(refusal).into());
+        }
+
+        let mut store = state.lock();
+        let Some(tags) = store.tags_mut(resource) else {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                crate::state::tagged_resource_not_found(resource),
+            )
+            .into());
+        };
+
+        // Judged against what the resource would carry AFTERWARDS, before anything is
+        // written, so a refused request leaves the stored tags exactly as they were.
+        if let Some(refusal) = crate::state::tag_count_refusal("tags", tags, &input.tags) {
+            return Err(TagResourceErrorModeled::ValidationException(refusal).into());
+        }
+
+        // Merge, never replace: this call "applies the specified tags to the specified
+        // resource", so a key the request does not name keeps the value it had and a key
+        // it does name takes the value it carries.
+        for (key, value) in input.tags {
+            tags.insert(key, value);
+        }
+        Ok(TagResourceOutput {})
     }
 }

@@ -228,8 +228,8 @@ pub(crate) use alarm_template_groups::alarm_template_group_output;
 pub mod channel_placement_groups;
 
 pub use channel_placement_groups::{
-    channel_placement_group_state, too_many_nodes_message, ChannelPlacementGroupChanges,
-    ChannelPlacementGroupDescription, ChannelPlacementGroupRecord,
+    channel_placement_group_state, too_many_nodes_message, unassociable_node_message,
+    ChannelPlacementGroupChanges, ChannelPlacementGroupDescription, ChannelPlacementGroupRecord,
     ChannelPlacementGroupRefusal, ChannelPlacementGroupUpdateRefusal,
     MAX_CHANNEL_PLACEMENT_GROUPS, MAX_CHANNEL_PLACEMENT_GROUP_NODES,
     MAX_CHANNEL_PLACEMENT_GROUP_TOKENS,

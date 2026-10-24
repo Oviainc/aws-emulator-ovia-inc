@@ -207,10 +207,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // Everything the request supplied is stored verbatim by the slice, which
-        // owns the documented node bound, the in-cluster name uniqueness and the
-        // store's ceiling; the response is then read back out of the stored
-        // record, never from `input`.
+        // Everything the request supplied goes to the slice, which owns the
+        // documented node bound, the resolution of every node id against the
+        // cluster's own nodes, the in-cluster name uniqueness and the store's
+        // ceiling; the response is then read back out of the stored record,
+        // never from `input`.
         let id = state
             .insert_channel_placement_group(
                 &region,
@@ -220,7 +221,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.tags.unwrap_or_default(),
                 now,
             )
-            .map_err(refused)?;
+            .map_err(|refusal| refused(refusal, &input.cluster_id))?;
 
         if let Some(token) = input.request_id {
             // Bounded, evicting write: a caller-chosen token can neither
@@ -247,51 +248,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// service already reports a semantically invalid request
 /// (`BatchUpdateSchedule`). A store that has reached this emulator's ceiling is
 /// `TooManyRequestsException` (429), as it is for every other create here.
-fn refused(refusal: crate::state::ChannelPlacementGroupRefusal) -> CreateChannelPlacementGroupError {
+///
+/// `cluster_id` is the cluster the request was addressed to, so a refusal about
+/// a node reference that did not resolve can name what it was resolved against.
+fn refused(
+    refusal: crate::state::ChannelPlacementGroupRefusal,
+    cluster_id: &str,
+) -> CreateChannelPlacementGroupError {
     match refusal {
         crate::state::ChannelPlacementGroupRefusal::NoSuchCluster => {
             // A group lives inside one Cluster, and this operation models no
             // `NotFoundException` to answer a path that names none with, so the
             // request is the thing that cannot be processed: 422, naming the
             // member the problem was found at.
-            let message = "No cluster with that ClusterId".to_string();
-            CreateChannelPlacementGroupErrorModeled::UnprocessableEntityException(
-                UnprocessableEntityException {
-                    message: Some(message.clone()),
-                    validation_errors: Some(vec![ValidationError {
-                        element_path: Some("clusterId".to_string()),
-                        error_message: Some(message),
-                    }]),
-                },
-            )
+            unprocessable("clusterId", "No cluster with that ClusterId".to_string())
         }
         crate::state::ChannelPlacementGroupRefusal::TooManyNodes { count } => {
             // The one wording for this refusal lives in the slice, so the
             // update cannot word the same documented bound differently.
-            let message = crate::state::too_many_nodes_message(count);
-            CreateChannelPlacementGroupErrorModeled::UnprocessableEntityException(
-                UnprocessableEntityException {
-                    message: Some(message.clone()),
-                    validation_errors: Some(vec![ValidationError {
-                        element_path: Some("nodes".to_string()),
-                        error_message: Some(message),
-                    }]),
-                },
+            unprocessable("nodes", crate::state::too_many_nodes_message(count))
+        }
+        crate::state::ChannelPlacementGroupRefusal::UnassociableNode { node_id } => {
+            // `Nodes` names the Node to associate the group with, and the two
+            // must be in the same Cluster, so an id that names no node of this
+            // cluster leaves nothing to associate: the request cannot be
+            // processed, naming the member it was found at.
+            unprocessable(
+                "nodes",
+                crate::state::unassociable_node_message(cluster_id, &node_id),
             )
         }
-        crate::state::ChannelPlacementGroupRefusal::NameTaken => {
-            CreateChannelPlacementGroupErrorModeled::UnprocessableEntityException(
-                UnprocessableEntityException {
-                    message: Some(crate::state::NAME_ALREADY_IN_USE_MESSAGE.to_string()),
-                    validation_errors: Some(vec![ValidationError {
-                        element_path: Some("name".to_string()),
-                        error_message: Some(
-                            crate::state::NAME_ALREADY_IN_USE_MESSAGE.to_string(),
-                        ),
-                    }]),
-                },
-            )
-        }
+        crate::state::ChannelPlacementGroupRefusal::NameTaken => unprocessable(
+            "name",
+            crate::state::NAME_ALREADY_IN_USE_MESSAGE.to_string(),
+        ),
         crate::state::ChannelPlacementGroupRefusal::StoreFull => {
             CreateChannelPlacementGroupErrorModeled::TooManyRequestsException(
                 TooManyRequestsException {
@@ -305,6 +295,23 @@ fn refused(refusal: crate::state::ChannelPlacementGroupRefusal) -> CreateChannel
         }
     }
     .into()
+}
+
+/// One `UnprocessableEntityException` (422) carrying `message` and the single
+/// `ValidationErrors` entry that names the member the problem was found at.
+///
+/// The 422-and-element-path shape is stated ONCE for this operation, so two
+/// refusals of the same class cannot report it differently.
+fn unprocessable(element_path: &str, message: String) -> CreateChannelPlacementGroupErrorModeled {
+    CreateChannelPlacementGroupErrorModeled::UnprocessableEntityException(
+        UnprocessableEntityException {
+            message: Some(message.clone()),
+            validation_errors: Some(vec![ValidationError {
+                element_path: Some(element_path.to_string()),
+                error_message: Some(message),
+            }]),
+        },
+    )
 }
 
 /// The engine this operation was built from is not the shared in-memory engine,

@@ -4,13 +4,10 @@
 //! Reports the cloud-side cache of the Amazon EC2 instances running on the managed
 //! device `managedDeviceId` names: one `InstanceSummary` for each requested
 //! `instanceIds` entry the cache holds, in the cache's own order, so neither the
-//! order nor the repetition of the requested ids changes the answer. A request to a
-//! Region this account has activated no device in at all is refused by the
-//! account-level device gate with the modelled `AccessDeniedException`, which
-//! discloses nothing about the id; past that gate a `managedDeviceId` that names no
-//! device of this account in the signed Region is the modelled
-//! `ResourceNotFoundException`, the same as every other id-addressed operation of
-//! this service answers.
+//! order nor the repetition of the requested ids changes the answer. A
+//! `managedDeviceId` that names no device of this account in the signed Region is
+//! the modelled `ResourceNotFoundException`, the same as every other id-addressed
+//! operation of this service answers.
 //!
 //! ## Shape of an operation
 //!
@@ -165,24 +162,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
-        // The account-level device gate comes FIRST — before the clock-owed
-        // settlement and before the addressed id is resolved: a Region this
-        // account has activated no device in is refused without this call
-        // touching the store at all, exactly as the other gated operations are.
-        if !store.has_activated_device(&region) {
-            return Err(DescribeDeviceEc2InstancesErrorModeled::AccessDeniedException(
-                crate::state::no_devices_in_region(),
-            )
-            .into());
-        }
         store.settle(now);
 
-        // Past the account-level gate the addressed id is RESOLVED, and an id that
-        // names no device of this account in the signed Region is the modelled
-        // `ResourceNotFoundException` — "the request references a resource that
-        // doesn't exist" — not a permission refusal. The id is resolved before the
-        // instance ids are looked at, so the answer never depends on what was
-        // requested of a device that does not exist.
+        // The addressed id is RESOLVED, and an id that names no device of this
+        // account in the signed Region is the modelled `ResourceNotFoundException`
+        // — "the request references a resource that doesn't exist" — not a
+        // permission refusal. The id is resolved before the instance ids are
+        // looked at, so the answer never depends on what was requested of a device
+        // that does not exist.
         let Some(device) = store.device_in(&region, &input.managed_device_id) else {
             return Err(DescribeDeviceEc2InstancesErrorModeled::ResourceNotFoundException(
                 crate::state::not_found(

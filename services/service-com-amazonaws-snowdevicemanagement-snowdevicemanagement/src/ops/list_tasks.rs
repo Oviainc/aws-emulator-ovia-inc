@@ -4,9 +4,8 @@
 //! Enumerates the tasks created in the signed Region as `TaskSummary`, in `taskId`
 //! order, narrowed to one `TaskState` when the request names one:
 //! `@paginated(items: tasks)`, so a page is cut at `maxResults` and `nextToken`
-//! carries the task id the next page resumes at. A Region this account has
-//! activated no device in is refused by the account-level device gate
-//! (`AccessDeniedException`) instead.
+//! carries the task id the next page resumes at. A Region no task was created in
+//! answers an empty page.
 //!
 //! ## Shape of an operation
 //!
@@ -159,17 +158,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
-        // The account-level device gate comes FIRST: a Region this account has
-        // activated no Snow device in has no device to have run a task, and the
-        // service refuses the call rather than answering an empty list — or than
-        // judging the request's `nextToken`, which is request-carried state like
-        // any id.
-        if !store.has_activated_device(&region) {
-            return Err(ListTasksErrorModeled::AccessDeniedException(
-                crate::state::no_devices_in_region(),
-            )
-            .into());
-        }
         store.settle(now);
 
         // The token carries the task id the next page resumes at; a value this

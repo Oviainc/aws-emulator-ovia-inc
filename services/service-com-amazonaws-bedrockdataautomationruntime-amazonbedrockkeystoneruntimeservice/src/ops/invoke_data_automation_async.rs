@@ -188,6 +188,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A submission may delimit the part of the asset to process
+        // (`inputConfiguration.assetProcessingConfiguration`). The model bounds the two
+        // timestamps of such a segment only one at a time, so the interval's own
+        // consistency — its end lies after its start — is checked here with the
+        // operation's own modelled `ValidationException` (HTTP 400), before anything is
+        // minted. See `crate::state::timestamp_segment_refusal`.
+        if let Some(message) = crate::state::timestamp_segment_refusal(
+            input
+                .input_configuration
+                .asset_processing_configuration
+                .as_ref(),
+        ) {
+            return Err(InvokeDataAutomationAsyncErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message.to_string()),
+                },
+            )
+            .into());
+        }
+
         // Every tag key must satisfy the modelled `TagKey` pattern, which the boundary
         // walk cannot enforce (see `crate::state::tag_key_is_well_formed`). Checked
         // before anything is minted, so a refused submission leaves no record.
@@ -248,6 +268,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.data_automation_profile_arn.clone(),
             now,
         );
+        // The whole submitted input configuration is retained, not just its `s3Uri`: the
+        // accepted job's processing scope is the scope the submission asked for.
+        invocation.asset_processing_configuration =
+            input.input_configuration.asset_processing_configuration;
         if let Some(configuration) = input.data_automation_configuration {
             invocation.data_automation_project_arn =
                 Some(configuration.data_automation_project_arn);

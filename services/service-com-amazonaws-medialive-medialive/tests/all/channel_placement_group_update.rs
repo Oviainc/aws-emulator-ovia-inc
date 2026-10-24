@@ -24,15 +24,17 @@
 //! 3. A request the service cannot apply is refused with the modelled error for
 //!    its class and NOTHING is written: a pair naming no group of that cluster is
 //!    404 `NotFoundException`, a `Name` another group of the same cluster holds
-//!    is 409 `ConflictException`, and more nodes than the one `Nodes` documents
-//!    is 422 `UnprocessableEntityException` naming the member.
+//!    is 409 `ConflictException`, and more nodes than the one `Nodes` documents —
+//!    or a node id that is not a node of the group's own cluster — is 422
+//!    `UnprocessableEntityException` naming the member.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::channel_lifecycle::wait_for_the_clock;
 use crate::channel_placement_groups::{
-    create_cluster, created, described, group_uri, id_of, without_state,
+    create_channel, create_cluster, create_nodes, created, described, deregister_node, group_uri,
+    id_of, without_state,
 };
 use crate::wire::{call, error_code, medialive};
 
@@ -65,18 +67,22 @@ async fn updated(
     group
 }
 
-/// One row of the update table: the case, the nodes the group is created with,
-/// the update's request body, the `name` and `nodes` expected afterwards, the
-/// state the update itself reports and the state the clock settles it into.
-type UpdateRow = (
-    &'static str,
-    Value,
-    Value,
-    Value,
-    Value,
-    &'static str,
-    &'static str,
-);
+/// One row of the update table: the case, the nodes the group is created with
+/// and the ones the update asks for — both as indices into the nodes the row's
+/// cluster really has, since `Nodes` names a node of the group's own cluster —
+/// the update's `Name` when it carries one, the `name` and node indices expected
+/// afterwards, the state the update itself reports and the state the clock
+/// settles it into. `nodes: None` is an update that omits the member.
+struct UpdateRow {
+    case: &'static str,
+    start: &'static [usize],
+    name: Option<&'static str>,
+    nodes: Option<&'static [usize]>,
+    expected_name: &'static str,
+    expected_nodes: &'static [usize],
+    state: &'static str,
+    settled_state: &'static str,
+}
 
 /// Rule: an update changes exactly the members the request carries, leaves the
 /// ones it omits, and a node set that really changed starts the association the
@@ -93,85 +99,122 @@ type UpdateRow = (
 #[tokio::test]
 async fn an_update_changes_the_members_it_carries() {
     let rows: [UpdateRow; 7] = [
-        (
-            "a rename, nodes omitted",
-            json!(["node-a"]),
-            json!({ "name": "renamed" }),
-            json!("renamed"),
-            json!(["node-a"]),
-            "ASSIGNED",
-            "ASSIGNED",
-        ),
-        (
-            "a node where there was none",
-            json!([]),
-            json!({ "nodes": ["node-b"] }),
-            json!("created"),
-            json!(["node-b"]),
-            "ASSIGNING",
-            "ASSIGNED",
-        ),
-        (
-            "another node",
-            json!(["node-a"]),
-            json!({ "nodes": ["node-c"] }),
-            json!("created"),
-            json!(["node-c"]),
-            "ASSIGNING",
-            "ASSIGNED",
-        ),
-        (
-            "the last node taken away",
-            json!(["node-a"]),
-            json!({ "nodes": [] }),
-            json!("created"),
-            json!([]),
-            "UNASSIGNING",
-            "UNASSIGNED",
-        ),
-        (
-            "the node it already has, resent",
-            json!(["node-a"]),
-            json!({ "nodes": ["node-a"] }),
-            json!("created"),
-            json!(["node-a"]),
-            "ASSIGNED",
-            "ASSIGNED",
-        ),
-        (
-            "a name and a node at once",
-            json!([]),
-            json!({ "name": "renamed-and-assigned", "nodes": ["node-d"] }),
-            json!("renamed-and-assigned"),
-            json!(["node-d"]),
-            "ASSIGNING",
-            "ASSIGNED",
-        ),
-        (
-            "neither member",
-            json!(["node-a"]),
-            json!({}),
-            json!("created"),
-            json!(["node-a"]),
-            "ASSIGNED",
-            "ASSIGNED",
-        ),
+        UpdateRow {
+            case: "a rename, nodes omitted",
+            start: &[0],
+            name: Some("renamed"),
+            nodes: None,
+            expected_name: "renamed",
+            expected_nodes: &[0],
+            state: "ASSIGNED",
+            settled_state: "ASSIGNED",
+        },
+        UpdateRow {
+            case: "a node where there was none",
+            start: &[],
+            name: None,
+            nodes: Some(&[1]),
+            expected_name: "created",
+            expected_nodes: &[1],
+            state: "ASSIGNING",
+            settled_state: "ASSIGNED",
+        },
+        UpdateRow {
+            case: "another node",
+            start: &[0],
+            name: None,
+            nodes: Some(&[1]),
+            expected_name: "created",
+            expected_nodes: &[1],
+            state: "ASSIGNING",
+            settled_state: "ASSIGNED",
+        },
+        UpdateRow {
+            case: "the last node taken away",
+            start: &[0],
+            name: None,
+            nodes: Some(&[]),
+            expected_name: "created",
+            expected_nodes: &[],
+            state: "UNASSIGNING",
+            settled_state: "UNASSIGNED",
+        },
+        UpdateRow {
+            case: "the node it already has, resent",
+            start: &[0],
+            name: None,
+            nodes: Some(&[0]),
+            expected_name: "created",
+            expected_nodes: &[0],
+            state: "ASSIGNED",
+            settled_state: "ASSIGNED",
+        },
+        UpdateRow {
+            case: "a name and a node at once",
+            start: &[],
+            name: Some("renamed-and-assigned"),
+            nodes: Some(&[1]),
+            expected_name: "renamed-and-assigned",
+            expected_nodes: &[1],
+            state: "ASSIGNING",
+            settled_state: "ASSIGNED",
+        },
+        UpdateRow {
+            case: "neither member",
+            start: &[0],
+            name: None,
+            nodes: None,
+            expected_name: "created",
+            expected_nodes: &[0],
+            state: "ASSIGNED",
+            settled_state: "ASSIGNED",
+        },
     ];
 
-    for (case, start_nodes, request, name, nodes, state, settled_state) in rows {
+    for row in rows {
+        let UpdateRow {
+            case,
+            start,
+            name: new_name,
+            nodes: new_nodes,
+            expected_name,
+            expected_nodes,
+            state,
+            settled_state,
+        } = row;
         let router = medialive();
         let cluster = create_cluster(&router, case, "primary").await;
+        // The nodes this row's group may be associated with: a group's `Nodes`
+        // names a node of its own cluster, so every id below is one this
+        // cluster really has.
+        let minted = create_nodes(&router, case, &cluster, 2).await;
+        let ids = |indices: &[usize]| -> Value {
+            json!(indices
+                .iter()
+                .map(|index| minted[*index].clone())
+                .collect::<Vec<_>>())
+        };
         let group = created(
             &router,
             case,
             &cluster,
-            json!({ "name": "created", "nodes": start_nodes }),
+            json!({ "name": "created", "nodes": ids(start) }),
         )
         .await;
         let id = id_of(&group);
         // Start from a settled group, so the state the update reports is the one
         // the update put it in rather than one left over from the create.
         wait_for_the_clock();
+
+        let mut request = json!({});
+        if let Some(name) = new_name {
+            request["name"] = json!(name);
+        }
+        if let Some(nodes) = new_nodes {
+            request["nodes"] = ids(nodes);
+        }
+        let name = json!(expected_name);
+        let nodes = ids(expected_nodes);
 
         let after = updated(&router, case, &cluster, &id, request).await;
 
@@ -249,11 +292,15 @@ async fn an_update_only_reaches_a_group_of_the_cluster_the_path_names() {
     let router = medialive();
     let cluster_one = create_cluster(&router, "scoping", "primary").await;
     let cluster_two = create_cluster(&router, "scoping", "secondary").await;
+    // The node the first group is associated with: a node of its own cluster.
+    let node = create_nodes(&router, "scoping", &cluster_one, 1)
+        .await
+        .remove(0);
     let one = created(
         &router,
         "scoping",
         &cluster_one,
-        json!({ "name": "in-cluster-one", "nodes": ["node-a"] }),
+        json!({ "name": "in-cluster-one", "nodes": [node] }),
     )
     .await;
     let two = created(
@@ -323,22 +370,27 @@ async fn an_update_only_reaches_a_group_of_the_cluster_the_path_names() {
 /// what the rule generalises over.
 #[tokio::test]
 async fn an_update_is_held_to_the_documented_bounds() {
-    // (case, nodes the update asks for, accepted)
-    let node_rows: [(&str, Value, bool); 4] = [
-        ("no node", json!([]), true),
-        ("one node", json!(["node-x"]), true),
-        ("two nodes", json!(["node-x", "node-y"]), false),
-        ("three nodes", json!(["node-x", "node-y", "node-z"]), false),
+    // (case, how many of the cluster's nodes the update asks for, accepted)
+    let node_rows: [(&str, usize, bool); 4] = [
+        ("no node", 0, true),
+        ("one node", 1, true),
+        ("two nodes", 2, false),
+        ("three nodes", 3, false),
     ];
 
-    for (case, nodes, accepted) in node_rows {
+    for (case, count, accepted) in node_rows {
         let router = medialive();
         let cluster = create_cluster(&router, case, "primary").await;
+        // Four nodes of this cluster: the one the group starts with and the
+        // three a row may ask for, so the COUNT is the only thing each row
+        // varies.
+        let minted = create_nodes(&router, case, &cluster, 4).await;
+        let nodes = json!(minted[1..1 + count]);
         let group = created(
             &router,
             case,
             &cluster,
-            json!({ "name": "under-test", "nodes": ["node-a"] }),
+            json!({ "name": "under-test", "nodes": [minted[0].clone()] }),
         )
         .await;
         let id = id_of(&group);
@@ -474,6 +526,117 @@ async fn an_update_is_held_to_the_documented_bounds() {
     }
 }
 
+/// Rule: `Nodes` is a REFERENCE — the Node it names and the
+/// ChannelPlacementGroup "must be in the same Cluster" — so an update naming an
+/// id that is not a node of the group's cluster the account can still associate
+/// is refused with `UnprocessableEntityException` (HTTP 422) naming the member,
+/// and the stored group keeps the nodes it had.
+///
+/// The rows differ along the shape of the id that does not resolve (an id no
+/// node has, a node of another cluster, ids from two other resource id spaces, a
+/// non-numeric id, and a node whose deregistration has been accepted), because
+/// that is what the rule generalises over; the accepted control at the end is a
+/// node of the group's own cluster.
+#[tokio::test]
+async fn an_update_only_assigns_a_node_of_the_groups_own_cluster() {
+    let router = medialive();
+    let setup = "node resolution";
+    let cluster = create_cluster(&router, setup, "primary").await;
+    let elsewhere = create_cluster(&router, setup, "secondary").await;
+    // Three nodes of the group's own cluster — the one it starts with, the one
+    // the accepted control moves it to and the one deregistered below — and one
+    // node of another cluster.
+    let minted = create_nodes(&router, setup, &cluster, 3).await;
+    let far = create_nodes(&router, setup, &elsewhere, 1).await.remove(0);
+    // A resource of another type, to show that an id of another of this
+    // service's id spaces resolves no better than one nothing holds.
+    let channel = create_channel(&router, setup, "unplaced", None).await;
+    let group = created(
+        &router,
+        setup,
+        &cluster,
+        json!({ "name": "under-test", "nodes": [minted[0].clone()] }),
+    )
+    .await;
+    let id = id_of(&group);
+    deregister_node(&router, setup, &cluster, &minted[2]).await;
+    wait_for_the_clock();
+    let before = described(&router, setup, &cluster, &id).await;
+
+    let rows: [(&str, String); 6] = [
+        ("a numeric id no node has", "9999999".to_string()),
+        ("a node of another cluster", far.clone()),
+        ("the cluster's own id", cluster.clone()),
+        ("a channel's id", channel.clone()),
+        ("a non-numeric id", "not-a-node".to_string()),
+        (
+            "a node whose deregistration was accepted",
+            minted[2].clone(),
+        ),
+    ];
+
+    for (case, unresolvable) in rows {
+        let (status, body) = update_group(
+            &router,
+            &cluster,
+            &id,
+            json!({ "nodes": [unresolvable.clone()] }),
+        )
+        .await;
+        assert_eq!(
+            status, 422,
+            "case {case:?}: expected 422 for node {unresolvable:?}, got {status}: {body}"
+        );
+        assert_eq!(
+            error_code(status, &body),
+            "UnprocessableEntityException",
+            "case {case:?}: expected UnprocessableEntityException, got {body}"
+        );
+        assert_eq!(
+            body["validationErrors"][0]["elementPath"],
+            json!("nodes"),
+            "case {case:?}: expected the validation error to name the member, got {body}"
+        );
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(&unresolvable),
+            "case {case:?}: expected the refusal to name the id it could not resolve, got {body}"
+        );
+        let after = described(&router, case, &cluster, &id).await;
+        assert_eq!(
+            after, before,
+            "case {case:?}: expected the refused update to change nothing, got {after}"
+        );
+    }
+
+    // The same update naming a node the cluster really has is accepted, so the
+    // refusals were about the reference rather than about the update itself.
+    let case = "a node of this cluster";
+    let after = updated(
+        &router,
+        case,
+        &cluster,
+        &id,
+        json!({ "nodes": [minted[1].clone()] }),
+    )
+    .await;
+    assert_eq!(
+        after["nodes"],
+        json!([minted[1].clone()]),
+        "case {case:?}: expected the node the update named, got {:?}",
+        after["nodes"]
+    );
+    let read = described(&router, case, &cluster, &id).await;
+    assert_eq!(
+        read["nodes"],
+        json!([minted[1].clone()]),
+        "case {case:?}: expected the accepted node to be stored, got {:?}",
+        read["nodes"]
+    );
+}
+
 /// Rule: an update is a WRITE to the group it names and to nothing else — a
 /// sibling group of the same cluster, a group of another cluster, and the
 /// channels placed in the group are all left exactly as they were, and the
@@ -484,12 +647,15 @@ async fn an_update_touches_only_the_group_it_names() {
     let case = "one group at a time";
     let cluster = create_cluster(&router, case, "primary").await;
     let elsewhere = create_cluster(&router, case, "secondary").await;
+    // Two nodes of the target's own cluster: the one it starts with and the one
+    // the update moves it to.
+    let minted = create_nodes(&router, case, &cluster, 2).await;
 
     let target = created(
         &router,
         case,
         &cluster,
-        json!({ "name": "target", "nodes": ["node-a"] }),
+        json!({ "name": "target", "nodes": [minted[0].clone()] }),
     )
     .await;
     let sibling = created(&router, case, &cluster, json!({ "name": "sibling" })).await;
@@ -523,7 +689,7 @@ async fn an_update_touches_only_the_group_it_names() {
         case,
         &cluster,
         &id,
-        json!({ "name": "target-renamed", "nodes": ["node-b"] }),
+        json!({ "name": "target-renamed", "nodes": [minted[1].clone()] }),
     )
     .await;
     assert_eq!(

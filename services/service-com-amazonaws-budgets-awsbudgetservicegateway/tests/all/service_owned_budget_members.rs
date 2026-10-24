@@ -4,6 +4,10 @@
 //! auto-adjust figures it derives from the cost it tracks (never taken from a request),
 //! and the `BudgetLimit` a utilization or coverage budget defaults to.
 //!
+//! A derived member a request carried is discarded, and what a read reports for it is
+//! whatever the service itself has: nothing for the auto-adjust figures, and for
+//! `CalculatedSpend` the spend it computes for the budget (see [`computed_spend`]).
+//!
 //! Both write paths are covered: `CreateBudget`, an `UpdateBudget` that resends the
 //! budget unchanged, and an `UpdateBudget` that REWRITES the budget's caller-owned parts
 //! while supplying the service-owned ones — "you can change every part of a budget except
@@ -21,7 +25,8 @@ use service_com_amazonaws_budgets_awsbudgetservicegateway::ops::types::{
     BUDGET_TYPE_VALUES, TIME_UNIT_VALUES,
 };
 use service_com_amazonaws_budgets_awsbudgetservicegateway::state::{
-    PERCENTAGE_LIMIT_AMOUNT, PERCENTAGE_LIMIT_BUDGET_TYPES, PERCENTAGE_LIMIT_UNIT,
+    ATTRIBUTED_SPEND_AMOUNT, PERCENTAGE_LIMIT_AMOUNT, PERCENTAGE_LIMIT_BUDGET_TYPES,
+    PERCENTAGE_LIMIT_UNIT,
 };
 
 use super::budget_lifecycle::{account, call, carries, is_error, router, same};
@@ -89,7 +94,34 @@ async fn write_and_read(
         "case {case:?}: the two read paths must report the same budget after {operation}, \
          got {read} from DescribeBudget and {listed} from DescribeBudgets"
     );
+    // Every row of this suite is also a row of the spend rule: the budget reads back with
+    // the spend the SERVICE computes for it, whether or not the request carried one.
+    assert_computed_spend(case, &read);
     read
+}
+
+/// The `CalculatedSpend` the service computes for the budget a read reported: the spend
+/// attributed to that budget (nothing spends in this emulator, so
+/// `ATTRIBUTED_SPEND_AMOUNT`) measured in the unit of the limit the read carries, and no
+/// forecast — there is no usage history to predict one from. `Value::Null` for a budget
+/// that reports no limit at all, whose record names no unit of measurement.
+fn computed_spend(read: &Value) -> Value {
+    match read["BudgetLimit"]["Unit"].as_str() {
+        Some(unit) => json!({"ActualSpend": {"Amount": ATTRIBUTED_SPEND_AMOUNT, "Unit": unit}}),
+        None => Value::Null,
+    }
+}
+
+/// Assert the budget a read reported carries exactly the service-computed
+/// `CalculatedSpend` ([`computed_spend`]) — never a figure a request supplied.
+fn assert_computed_spend(case: &str, read: &Value) {
+    let expected = computed_spend(read);
+    let actual = member(read, &["CalculatedSpend"]);
+    assert_eq!(
+        actual, &expected,
+        "case {case:?}: expected the service-computed CalculatedSpend {expected}, got \
+         {actual} in {read}"
+    );
 }
 
 /// The value at `path` (a trail of member names) in `budget`, or `Value::Null`.
@@ -115,7 +147,8 @@ fn assert_absent(case: &str, budget: &Value, path: &[&str]) {
 }
 
 /// One row of the service-derived table: the case, the `Budget` to write, and the member
-/// paths whose caller-sent values the write must discard.
+/// paths the read must report NOTHING for, because the service has no value of its own
+/// for them (the spend it computes is checked for every row by [`assert_computed_spend`]).
 struct Derived {
     case: &'static str,
     budget: Value,
@@ -140,7 +173,7 @@ fn derived_rows() -> Vec<Derived> {
                 "BudgetLimit": {"Amount": "100", "Unit": "USD"},
                 "CalculatedSpend": {"ActualSpend": {"Amount": "777", "Unit": "USD"}}
             }),
-            dropped: vec![vec!["CalculatedSpend"]],
+            dropped: vec![],
             kept: json!({"BudgetLimit": {"Amount": "100", "Unit": "USD"}}),
         },
         Derived {
@@ -155,7 +188,7 @@ fn derived_rows() -> Vec<Derived> {
                     "ForecastedSpend": {"Amount": "12.25", "Unit": "GB"}
                 }
             }),
-            dropped: vec![vec!["CalculatedSpend"]],
+            dropped: vec![],
             kept: json!({"BudgetLimit": {"Amount": "3.5", "Unit": "GB"}}),
         },
         Derived {
@@ -167,7 +200,7 @@ fn derived_rows() -> Vec<Derived> {
                 "PlannedBudgetLimits": {"1704067200": {"Amount": "10", "Unit": "USD"}},
                 "CalculatedSpend": {"ActualSpend": {"Amount": "9999999", "Unit": "USD"}}
             }),
-            dropped: vec![vec!["CalculatedSpend"]],
+            dropped: vec![],
             kept: json!({"PlannedBudgetLimits": {"1704067200": {"Amount": "10", "Unit": "USD"}}}),
         },
         Derived {
@@ -178,7 +211,7 @@ fn derived_rows() -> Vec<Derived> {
                 "BudgetType": "RI_COVERAGE",
                 "CalculatedSpend": {"ActualSpend": {"Amount": "42", "Unit": "PERCENTAGE"}}
             }),
-            dropped: vec![vec!["CalculatedSpend"]],
+            dropped: vec![],
             kept: json!({"BudgetType": "RI_COVERAGE"}),
         },
         Derived {
@@ -249,19 +282,18 @@ fn derived_rows() -> Vec<Derived> {
                     "ForecastedSpend": {"Amount": "2", "Unit": "PERCENTAGE"}
                 }
             }),
-            dropped: vec![
-                vec!["CalculatedSpend"],
-                vec!["AutoAdjustData", "LastAutoAdjustTime"],
-            ],
+            dropped: vec![vec!["AutoAdjustData", "LastAutoAdjustTime"]],
             kept: json!({"AutoAdjustData": {"AutoAdjustType": "FORECAST"}}),
         },
     ]
 }
 
 /// RULE: a member whose value the service derives from the cost and usage it tracks is
-/// not caller-settable — the write path discards whatever the request carried for it and
-/// a read reports only what the service itself derived, which for this emulator (it
-/// tracks no spend) is nothing. The caller-owned members of the same shapes survive.
+/// not caller-settable — the write path discards whatever the request carried for it and a
+/// read reports only what the service itself derived: the spend it computes for the budget
+/// ([`computed_spend`]), and nothing for the auto-adjust figures, which this emulator
+/// (holding no cost history to average) never produces. The caller-owned members of the
+/// same shapes survive.
 #[tokio::test]
 async fn a_write_discards_the_members_the_service_derives_from_tracked_cost() {
     let router = router();
@@ -284,8 +316,8 @@ async fn a_write_discards_the_members_the_service_derives_from_tracked_cost() {
 
 /// RULE: the same holds on the UPDATE write path — `UpdateBudget` documents that "you can
 /// change every part of a budget except for the `budgetName` and the `calculatedSpend`",
-/// so a budget that reads back without the derived members keeps reading back without
-/// them however many times a caller resends them.
+/// so a budget reads back with the same service-owned members however many times a caller
+/// resends values for them.
 #[tokio::test]
 async fn an_update_discards_them_too() {
     let router = router();
@@ -325,7 +357,7 @@ struct Modified {
     /// The caller-owned members the update must land, none of which the created budget
     /// already carried.
     changed: Value,
-    /// The member paths whose caller-sent values the update must discard.
+    /// The member paths the read must report nothing for, whatever the request carried.
     dropped: Vec<Vec<&'static str>>,
     /// Caller-owned member paths the update's `NewBudget` omits, which must therefore be
     /// gone from the read: dropping the service-derived members does not turn the update
@@ -357,7 +389,7 @@ fn modified_rows() -> Vec<Modified> {
                 "CalculatedSpend": {"ActualSpend": {"Amount": "999999", "Unit": "USD"}}
             }),
             changed: json!({"BudgetLimit": {"Amount": "250", "Unit": "USD"}}),
-            dropped: vec![vec!["CalculatedSpend"]],
+            dropped: vec![],
             absent_after: vec![],
         },
         Modified {
@@ -382,7 +414,7 @@ fn modified_rows() -> Vec<Modified> {
                 "TimeUnit": "MONTHLY",
                 "BudgetLimit": {"Amount": "7", "Unit": "GB"}
             }),
-            dropped: vec![vec!["CalculatedSpend"]],
+            dropped: vec![],
             absent_after: vec![],
         },
         Modified {
@@ -407,7 +439,7 @@ fn modified_rows() -> Vec<Modified> {
                 "PlannedBudgetLimits": {"1704067200": {"Amount": "10", "Unit": "USD"}},
                 "BudgetLimit": {"Amount": "10", "Unit": "USD"}
             }),
-            dropped: vec![vec!["CalculatedSpend"]],
+            dropped: vec![],
             absent_after: vec![],
         },
         Modified {
@@ -439,7 +471,6 @@ fn modified_rows() -> Vec<Modified> {
                 }
             }),
             dropped: vec![
-                vec!["CalculatedSpend"],
                 vec!["AutoAdjustData", "LastAutoAdjustTime"],
                 vec!["AutoAdjustData", "HistoricalOptions", "LookBackAvailablePeriods"],
             ],
@@ -493,7 +524,7 @@ fn modified_rows() -> Vec<Modified> {
                 "TimeUnit": "MONTHLY",
                 "BudgetType": "SAVINGS_PLANS_COVERAGE"
             }),
-            dropped: vec![vec!["CalculatedSpend"]],
+            dropped: vec![],
             absent_after: vec![],
         },
         Modified {
@@ -513,7 +544,7 @@ fn modified_rows() -> Vec<Modified> {
                 "CalculatedSpend": {"ActualSpend": {"Amount": "0", "Unit": "USD"}}
             }),
             changed: json!({"BudgetLimit": {"Amount": "500", "Unit": "USD"}}),
-            dropped: vec![vec!["CalculatedSpend"]],
+            dropped: vec![],
             absent_after: vec![vec!["CostFilters"]],
         },
     ]
@@ -594,6 +625,9 @@ async fn a_modifying_update_applies_the_change_and_still_discards_the_derived_me
         for path in &row.dropped {
             clean = without(&clean, path);
         }
+        // `CalculatedSpend` is discarded on the write path like the rest of them — the
+        // read reports the service-computed spend either way — so the resend drops it too.
+        clean = without(&clean, &["CalculatedSpend"]);
         let resent = write_and_read(&router, row.case, "UpdateBudget", &account_id, &clean).await;
         let (expected, actual) = (
             without_write_instant(&updated),

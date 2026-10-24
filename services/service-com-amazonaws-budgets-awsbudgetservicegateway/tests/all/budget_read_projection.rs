@@ -96,7 +96,10 @@ fn month_start(secs: i64) -> i64 {
 /// containing now. Walked one month at a time off the month grid — stepping 31 days on
 /// from the first of a month always lands in the next month, never past it — so no
 /// month is skipped whatever its length.
-fn month_start_offset(months: i32) -> i64 {
+///
+/// `pub(crate)` so the sibling suites in this test target build planned-limit keys off
+/// the one helper rather than copying the calendar walk.
+pub(crate) fn month_start_offset(months: i32) -> i64 {
     let mut start = month_start(now_secs());
     for _ in 0..months.abs() {
         start = if months < 0 {

@@ -112,6 +112,20 @@ pub fn too_many_nodes_message(count: usize) -> String {
     format!("Nodes accepts at most {MAX_CHANNEL_PLACEMENT_GROUP_NODES} node id, but {count} were supplied")
 }
 
+/// The message a request that named a node this cluster has nothing to associate
+/// carries: the member, the id the request supplied and the cluster it was
+/// resolved against, all built from the request itself so the caller can fix it
+/// from that text alone.
+///
+/// One helper, so the create and the update cannot word the one refusal two
+/// ways.
+pub fn unassociable_node_message(cluster_id: &str, node_id: &str) -> String {
+    format!(
+        "Nodes names {node_id}, which is not a Node of Cluster {cluster_id} that a \
+         ChannelPlacementGroup can be associated with"
+    )
+}
+
 /// Why [`ComAmazonawsMedialiveMedialiveState::insert_channel_placement_group`]
 /// stored nothing. Each variant is one refusal, and each leaves the store
 /// exactly as it was.
@@ -123,6 +137,9 @@ pub enum ChannelPlacementGroupRefusal {
     /// The request named more node ids than
     /// [`MAX_CHANNEL_PLACEMENT_GROUP_NODES`]. Carries how many it named.
     TooManyNodes { count: usize },
+    /// A node id the request named is not a node of this cluster that a group
+    /// can be associated with. Carries that id, so the refusal can name it.
+    UnassociableNode { node_id: String },
     /// A group in the same cluster already carries that name, which `Name` is
     /// documented to make unique there ("Specify a name that is unique in the
     /// Cluster").
@@ -175,6 +192,9 @@ pub enum ChannelPlacementGroupUpdateRefusal {
     /// The request named more node ids than
     /// [`MAX_CHANNEL_PLACEMENT_GROUP_NODES`]. Carries how many it named.
     TooManyNodes { count: usize },
+    /// A node id the request named is not a node of this cluster that a group
+    /// can be associated with. Carries that id, so the refusal can name it.
+    UnassociableNode { node_id: String },
     /// Another group of the same cluster already carries the new `Name`.
     NameTaken,
 }
@@ -390,6 +410,14 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// recorded, which is what keeps every stored group reachable through a real
     /// cluster.
     ///
+    /// Each node id the request carries is RESOLVED against that cluster's nodes
+    /// ([`ComAmazonawsMedialiveMedialiveState::first_unassociable_node`]) rather than
+    /// recorded verbatim: `Nodes` names "the Node that you want to associate
+    /// with the ChannelPlacementGroup", so an id that names none is a request
+    /// there is nothing to carry out for. Refusing it is what keeps a group's
+    /// `Nodes` and a node's own `ChannelPlacementGroups` two views of ONE
+    /// association rather than two lists that can disagree.
+    ///
     /// A group created with a node starts in the transient `ASSIGNING` state and
     /// the clock owes it `ASSIGNED`; a group created with no node is
     /// `UNASSIGNED`, which is what it is — there is no association in flight, so
@@ -416,6 +444,12 @@ impl ComAmazonawsMedialiveMedialiveState {
             return Err(ChannelPlacementGroupRefusal::TooManyNodes {
                 count: nodes.len(),
             });
+        }
+        // A node id is a REFERENCE to a node of this cluster, so it is resolved
+        // before anything is written: a group that named a node the cluster does
+        // not have would claim an association with nothing.
+        if let Some(node_id) = self.first_unassociable_node(cluster_id, &nodes) {
+            return Err(ChannelPlacementGroupRefusal::UnassociableNode { node_id });
         }
         if let Some(name) = name.as_deref() {
             if self
@@ -465,6 +499,30 @@ impl ComAmazonawsMedialiveMedialiveState {
             },
         );
         Ok(id)
+    }
+
+    /// The first id in `nodes` that names no node of `cluster_id` a channel
+    /// placement group can be associated with, or `None` when every id resolves.
+    ///
+    /// `Nodes` names the Node a group is associated with, and "The Node and the
+    /// ChannelPlacementGroup must be in the same Cluster", so an id is resolved
+    /// against THIS cluster's nodes — a node of another cluster resolves no
+    /// better than one the account never created. A node whose deregistration
+    /// has been accepted is on its way out of the account, so it is nothing a
+    /// new association can be made with either: it is the same notion of "a node
+    /// a write may still name" the tag writers resolve
+    /// ([`super::NodeRecord::is_delete_accepted`]).
+    ///
+    /// The ONE resolver, so the create and the update cannot disagree about
+    /// which node ids may reach a stored group.
+    fn first_unassociable_node(&self, cluster_id: &str, nodes: &[String]) -> Option<String> {
+        nodes
+            .iter()
+            .find(|node_id| {
+                self.node(cluster_id, node_id)
+                    .is_none_or(|node| node.is_delete_accepted())
+            })
+            .cloned()
     }
 
     /// The group `id` names in `cluster_id`, or `None` when that cluster holds
@@ -551,11 +609,17 @@ impl ComAmazonawsMedialiveMedialiveState {
             }
             Some(_) => {}
         }
-        if let Some(nodes) = changes.nodes.as_ref() {
+        if let Some(nodes) = changes.nodes.as_deref() {
             if nodes.len() > MAX_CHANNEL_PLACEMENT_GROUP_NODES {
                 return Err(ChannelPlacementGroupUpdateRefusal::TooManyNodes {
                     count: nodes.len(),
                 });
+            }
+            // The same resolution the create performs, for the same reason: the
+            // two operations write the same member of the same record, so a node
+            // id reaches it only if it names a node of this cluster.
+            if let Some(node_id) = self.first_unassociable_node(cluster_id, nodes) {
+                return Err(ChannelPlacementGroupUpdateRefusal::UnassociableNode { node_id });
             }
         }
         // A name another group of this cluster holds is refused, while

@@ -261,6 +261,33 @@ pub const MAX_TARGET_RESOURCE_ARNS: usize = 5;
 /// emulator serves.
 pub const MAX_RESOLVED_TARGETS: usize = 1_000;
 
+/// The most tags ONE resource of this service carries.
+///
+/// `TagMap` is modelled `@length(min: 0, max: 50)`
+/// (`smithy_query(query="shape", shape="TagMap", model_path="services/service-com-amazonaws-fis-faultinjectionsimulator/smithy-model/com-amazonaws-fis-faultinjectionsimulator.json")`),
+/// so a resource carrying more tags than that could not be reported in a `TagMap` at all.
+/// The boundary validator applies that bound to ONE request's map; this is what a resource
+/// accumulates over MANY calls, and tags are the one part of a record a caller can keep
+/// growing after the resource exists.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// `TagKey`'s modelled minimum length: it is `@length(min: 0, max: 128)` with
+/// `pattern ^[\s\S]+$`, and that pattern needs at least one character, so the shortest
+/// admissible key is one character long
+/// (`smithy_query(query="shape", shape="TagKey", model_path="services/service-com-amazonaws-fis-faultinjectionsimulator/smithy-model/com-amazonaws-fis-faultinjectionsimulator.json")`).
+pub const TAG_KEY_MIN_LENGTH: usize = 1;
+
+/// `TagKey`'s modelled maximum length, from the same shape.
+pub const TAG_KEY_MAX_LENGTH: usize = 128;
+
+/// `TagValue`'s modelled maximum length (`@length(min: 0, max: 256)`), from
+/// `smithy_query(query="shape", shape="TagValue", model_path="services/service-com-amazonaws-fis-faultinjectionsimulator/smithy-model/com-amazonaws-fis-faultinjectionsimulator.json")`.
+///
+/// Nothing here enforces it: the boundary validator reaches a map's VALUE target, so a
+/// longer tag value is refused before any handler runs. It is named for the tests that
+/// pin that bound.
+pub const TAG_VALUE_MAX_LENGTH: usize = 256;
+
 /// `TargetAccountId`'s modelled bounds (`@length(min: 12, max: 48)`) — the floor.
 ///
 /// The boundary validator applies them to a modelled `accountId` member; they are named
@@ -1614,6 +1641,26 @@ impl ComAmazonawsFisFaultinjectionsimulatorState {
         format_id(EXPERIMENT_ID_PREFIX, self.experiment_seq)
     }
 
+    /// The tag map of the resource `resource` names, for a call that CHANGES it
+    /// (`TagResource`), or `None` when this store holds no such record.
+    ///
+    /// The one copy: it hands back the map held ON the record, so a tag written here is
+    /// the tag `GetExperimentTemplate` and `GetExperiment` report for that resource.
+    pub fn tags_mut(
+        &mut self,
+        resource: TaggedResource<'_>,
+    ) -> Option<&mut HashMap<String, String>> {
+        match resource {
+            TaggedResource::ExperimentTemplate(id) => self
+                .experiment_templates
+                .get_mut(id)
+                .map(|record| &mut record.tags),
+            TaggedResource::Experiment(id) => {
+                self.experiments.get_mut(id).map(|record| &mut record.tags)
+            }
+        }
+    }
+
     /// What `token` says about a request whose canonical rendering is `request`.
     ///
     /// A token whose resource has since left the store is [`TokenReplay::Fresh`]: there
@@ -1936,6 +1983,119 @@ pub fn experiment_arn(region: &str, id: &str) -> String {
 /// through the helper — [`template_arn`] and [`experiment_arn`].
 pub fn action_arn(region: &str, id: &str) -> String {
     format!("arn:aws:{ARN_SERVICE}:{region}::{ACTION_RESOURCE}/{id}")
+}
+
+/// A resource of this service that CARRIES tags, and the id the ARN names it by.
+///
+/// The two caller-owned records are the two that hold a tag map: an experiment template
+/// ([`ExperimentTemplateRecord::tags`]) and an experiment ([`ExperimentRecord::tags`]).
+/// The service's own catalogued records carry none a caller could change — an action is
+/// service-owned and reports an empty map, and no API creates one — so an ARN naming one
+/// of those is not a resource this service tags.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TaggedResource<'a> {
+    ExperimentTemplate(&'a str),
+    Experiment(&'a str),
+}
+
+/// Which taggable resource the caller-supplied ARN `resource_arn` names, or the
+/// `ValidationException` that refuses the value.
+///
+/// A `resourceArn` is modelled only as a string within `@length(20..2048)`,
+/// `pattern ^[\S]+$`, so WHICH resources this service can address by ARN is a server-side
+/// rule. A value that is not a well-formed ARN, one whose vendor field is another
+/// service's namespace, and one naming a resource type this service holds no tags for all
+/// name nothing in this namespace, which is a bad REQUEST rather than a resource that
+/// happens to be missing.
+///
+/// The ARN's `region` and `account` segments are NOT a second key: the id is what names a
+/// record here, exactly as `GetExperimentTemplate` and `GetExperiment` resolve one, and
+/// this store holds the account's records rather than a set of them per Region.
+pub fn tagged_resource(resource_arn: &str) -> Result<TaggedResource<'_>, ValidationException> {
+    let Some(arn) = ::service_common::arn::parse(resource_arn) else {
+        return Err(invalid_input(
+            "Value for resourceArn is not a valid ARN.".to_string(),
+        ));
+    };
+    let id = |resource_type: &str| {
+        ::service_common::arn::resource_id_of_type(resource_arn, resource_type)
+            .filter(|id| !id.is_empty())
+    };
+    if arn.vendor == ARN_SERVICE {
+        if let Some(id) = id(TEMPLATE_RESOURCE) {
+            return Ok(TaggedResource::ExperimentTemplate(id));
+        }
+        if let Some(id) = id(EXPERIMENT_RESOURCE) {
+            return Ok(TaggedResource::Experiment(id));
+        }
+    }
+    Err(invalid_input(format!(
+        "Value for resourceArn does not name a taggable {ARN_SERVICE} resource: \
+         a tag belongs to an {EXPERIMENT_RESOURCE} or an {TEMPLATE_RESOURCE}."
+    )))
+}
+
+/// The `ResourceNotFoundException` for a `resourceArn` this store holds no record for.
+///
+/// Each kind answers through the resolver its OWN operations use, so a tag call and a read
+/// of the same resource cannot disagree about a miss.
+pub fn tagged_resource_not_found(resource: TaggedResource<'_>) -> ResourceNotFoundException {
+    match resource {
+        TaggedResource::ExperimentTemplate(_) => template_not_found(),
+        TaggedResource::Experiment(id) => experiment_not_found(id),
+    }
+}
+
+/// Why `key` is not an acceptable tag key — naming the member and the constraint it breaks
+/// — or `None` when it is acceptable.
+///
+/// The boundary validator captures a map's KEY without checking it (its VALUE target IS
+/// checked), so a request carrying a tag key outside `TagKey`'s modelled bounds reaches
+/// the handler. This is where those bounds are enforced, for every operation of this
+/// service that takes tag keys.
+pub fn tag_key_refusal(member: &str, key: &str) -> Option<ValidationException> {
+    let length = key.chars().count();
+    (!(TAG_KEY_MIN_LENGTH..=TAG_KEY_MAX_LENGTH).contains(&length)).then(|| {
+        invalid_input(format!(
+            "{member}: a tag key is {TAG_KEY_MIN_LENGTH} to {TAG_KEY_MAX_LENGTH} \
+             characters long; this request carries one of {length}."
+        ))
+    })
+}
+
+/// Why this set of tag keys is not acceptable, or `None` when every one of them is.
+///
+/// Taken over the keys in sorted order, so one request always earns the same refusal
+/// however the map happened to be iterated.
+pub fn tag_keys_refusal<'a>(
+    member: &str,
+    keys: impl IntoIterator<Item = &'a str>,
+) -> Option<ValidationException> {
+    let mut keys: Vec<&str> = keys.into_iter().collect();
+    keys.sort_unstable();
+    keys.into_iter()
+        .find_map(|key| tag_key_refusal(member, key))
+}
+
+/// `None` when applying `tags` to a resource that already carries `current` leaves it
+/// within [`MAX_TAGS_PER_RESOURCE`]; otherwise the `ValidationException` that refuses the
+/// request before anything is written.
+///
+/// A key the resource ALREADY carries takes the new value rather than adding to the count,
+/// so only the keys it does not carry grow it.
+pub fn tag_count_refusal(
+    member: &str,
+    current: &HashMap<String, String>,
+    tags: &HashMap<String, String>,
+) -> Option<ValidationException> {
+    let added = tags.keys().filter(|key| !current.contains_key(*key)).count();
+    let total = current.len() + added;
+    (total > MAX_TAGS_PER_RESOURCE).then(|| {
+        invalid_input(format!(
+            "{member}: a {ARN_SERVICE} resource carries a maximum of \
+             {MAX_TAGS_PER_RESOURCE} tags; this request would leave it with {total}."
+        ))
+    })
 }
 
 /// The region this request was signed for — what a minted ARN names.

@@ -80,8 +80,7 @@ const ACTIVATED_DEVICES: u64 = 3;
 /// The API models NO device-creation operation — a device becomes manageable by being
 /// ORDERED, which is another service's API — so the activation goes through the one
 /// state seam that puts a device in the inventory. Without it this account's inventory
-/// is empty and every gated operation answers the account-level device gate, which is
-/// what `account_device_gate.rs` pins.
+/// is empty, which is what `empty_inventory_refusals.rs` pins.
 pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     service_state(&*engine)

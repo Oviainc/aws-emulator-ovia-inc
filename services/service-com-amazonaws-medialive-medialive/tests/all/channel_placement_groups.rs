@@ -10,7 +10,9 @@
 //! every `ClusterId` in this suite is an id the store really minted.
 //!
 //! The suites are tables: one cluster, one name and one node id is ONE row of
-//! each.
+//! each. Every node id a row names is one `CreateNode` really minted in the
+//! row's own cluster, because that is the only kind of id a group's `Nodes` may
+//! carry.
 //!
 //! The group helpers here are `pub(crate)` because the UPDATE suite
 //! ([`crate::channel_placement_group_update`]) drives the same resource through
@@ -22,6 +24,7 @@ use service_com_amazonaws_medialive_medialive::state::MAX_CHANNEL_PLACEMENT_GROU
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::channel_lifecycle::wait_for_the_clock;
+use crate::node_lifecycle::node_uri;
 use crate::support::percent_encoded;
 use crate::wire::{call, error_code, medialive, ACCOUNT};
 
@@ -166,6 +169,60 @@ pub(crate) async fn create_channel(
         .to_string()
 }
 
+/// `count` nodes created in `cluster` through `CreateNode`, answering the ids
+/// the store minted, in the order they were created.
+///
+/// A group's `Nodes` is a REFERENCE to a node of the group's own cluster, so
+/// every row that associates a group with a node names an id the store really
+/// minted rather than a literal. The CreateNode call itself is the NODE suite's
+/// ([`crate::node_lifecycle::created`]), so the node collection and the status
+/// it answers are spelled once in this harness. `pub(crate)` for the same
+/// reason as the group helpers above: the UPDATE, LISTING and DELETION suites
+/// associate the same kind of node with the same kind of group.
+pub(crate) async fn create_nodes(
+    router: &MultiServiceRouter,
+    case: &str,
+    cluster: &str,
+    count: usize,
+) -> Vec<String> {
+    let mut ids = Vec::with_capacity(count);
+    for index in 0..count {
+        let node = crate::node_lifecycle::created(
+            router,
+            case,
+            cluster,
+            json!({ "name": format!("node-{index}") }),
+        )
+        .await;
+        ids.push(node["id"].as_str().unwrap_or_default().to_string());
+    }
+    ids
+}
+
+/// One node of one cluster, deleted through the NODE suite's `DeleteNode` call;
+/// the delete is asserted to have been accepted (`202`, the status the model
+/// declares for it).
+pub(crate) async fn deregister_node(
+    router: &MultiServiceRouter,
+    case: &str,
+    cluster: &str,
+    node: &str,
+) {
+    let (status, body) = crate::node_lifecycle::delete_node(router, cluster, node).await;
+    assert_eq!(
+        status, 202,
+        "case {case:?}: DeleteNode: expected 202, got {status}: {body}"
+    );
+}
+
+/// How a row sends the `Nodes` member: not at all, or naming `n` nodes the
+/// row's own cluster really has (`Named(0)` is the empty list).
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum NodesSent {
+    Absent,
+    Named(usize),
+}
+
 /// Rule: a created channel placement group is stored under a minted `Id` whose
 /// `Arn` is built from the signed region and that id, carries the `ClusterId`
 /// the request's path named and the `Name` and `Nodes` the request supplied, is
@@ -176,18 +233,20 @@ pub(crate) async fn create_channel(
 /// The rows differ along which members the create supplies (name, nodes, tags,
 /// none at all) and along which of the account's clusters the group belongs to,
 /// because that is what the rule generalises over; the states are the model's
-/// own (`smithy_query(query="shape", shape="ChannelPlacementGroupState")`).
+/// own (`smithy_query(query="shape", shape="ChannelPlacementGroupState")`). The
+/// node ids the rows name are minted by `CreateNode` in the row's own cluster,
+/// since that is the only kind of id a group may be associated with.
 #[tokio::test]
 async fn a_created_group_is_read_back_by_describe() {
-    // (case, which cluster, request, expected name, expected nodes, state now,
-    //  state after the clock)
-    let rows: [(&str, usize, Value, Value, Value, &str, &str); 6] = [
+    // (case, which cluster, request besides `Nodes`, how `Nodes` is sent,
+    //  expected name, state now, state after the clock)
+    let rows: [(&str, usize, Value, NodesSent, Value, &str, &str); 6] = [
         (
             "nothing at all",
             0,
             json!({}),
+            NodesSent::Absent,
             Value::Null,
-            json!([]),
             "UNASSIGNED",
             "UNASSIGNED",
         ),
@@ -195,26 +254,26 @@ async fn a_created_group_is_read_back_by_describe() {
             "name only",
             0,
             json!({ "name": "studio-a" }),
+            NodesSent::Absent,
             json!("studio-a"),
-            json!([]),
             "UNASSIGNED",
             "UNASSIGNED",
         ),
         (
             "name and one node",
             0,
-            json!({ "name": "studio-b", "nodes": ["node-7"] }),
+            json!({ "name": "studio-b" }),
+            NodesSent::Named(1),
             json!("studio-b"),
-            json!(["node-7"]),
             "ASSIGNING",
             "ASSIGNED",
         ),
         (
             "node only, second cluster",
             1,
-            json!({ "nodes": ["n1"] }),
+            json!({}),
+            NodesSent::Named(1),
             Value::Null,
-            json!(["n1"]),
             "ASSIGNING",
             "ASSIGNED",
         ),
@@ -222,29 +281,41 @@ async fn a_created_group_is_read_back_by_describe() {
             "tags too, second cluster",
             1,
             json!({ "name": "tagged", "tags": { "team": "news" } }),
+            NodesSent::Absent,
             json!("tagged"),
-            json!([]),
             "UNASSIGNED",
             "UNASSIGNED",
         ),
         (
             "an empty node list",
             0,
-            json!({ "name": "no-nodes", "nodes": [] }),
+            json!({ "name": "no-nodes" }),
+            NodesSent::Named(0),
             json!("no-nodes"),
-            json!([]),
             "UNASSIGNED",
             "UNASSIGNED",
         ),
     ];
 
-    for (case, which, request, name, nodes, state, settled_state) in rows {
+    for (case, which, request, sent, name, state, settled_state) in rows {
         let router = medialive();
         let clusters = [
             create_cluster(&router, case, "primary").await,
             create_cluster(&router, case, "secondary").await,
         ];
         let cluster = clusters[which].clone();
+
+        let mut request = request;
+        // A node named by the request is one the cluster really has, and an
+        // absent member reports the empty list just as `Named(0)` does.
+        let nodes = match sent {
+            NodesSent::Absent => json!([]),
+            NodesSent::Named(count) => {
+                let minted = create_nodes(&router, case, &cluster, count).await;
+                request["nodes"] = json!(minted);
+                json!(minted)
+            }
+        };
 
         let group = created(&router, case, &cluster, request).await;
         let id = id_of(&group);
@@ -458,23 +529,31 @@ async fn a_group_needs_a_cluster_that_exists() {
 /// the member, and stores nothing.
 ///
 /// The rows span the published bound (one node), below it (none) and past it
-/// (two and three), because that is what the rule generalises over.
+/// (two and three), because that is what the rule generalises over. Every id
+/// named is a node the cluster really has, so the COUNT is the only thing each
+/// row varies.
 #[tokio::test]
 async fn nodes_accepts_at_most_one_node_id() {
-    // (case, nodes, accepted)
-    let rows: [(&str, Value, bool); 4] = [
-        ("no node", json!([]), true),
-        ("one node", json!(["node-a"]), true),
-        ("two nodes", json!(["node-a", "node-b"]), false),
-        ("three nodes", json!(["node-a", "node-b", "node-c"]), false),
+    // (case, how many of the cluster's nodes the create names, accepted)
+    let rows: [(&str, usize, bool); 4] = [
+        ("no node", 0, true),
+        ("one node", 1, true),
+        ("two nodes", 2, false),
+        ("three nodes", 3, false),
     ];
 
-    for (case, nodes, accepted) in rows {
+    for (case, count, accepted) in rows {
         let router = medialive();
         let cluster = create_cluster(&router, case, "primary").await;
         // A group that already exists, so a refusal can be shown to have left
         // the store exactly as it was.
         let existing = created(&router, case, &cluster, json!({ "name": "existing" })).await;
+        // The nodes this row names, all of them nodes the cluster really has, so
+        // the COUNT is the only thing it varies. At least one is minted even for
+        // the zero-node row, because the retry at the end of a refused row needs
+        // a node it can legitimately name.
+        let minted = create_nodes(&router, case, &cluster, count.max(1)).await;
+        let nodes = json!(minted[..count]);
 
         let (status, body) = create_group(
             &router,
@@ -522,15 +601,134 @@ async fn nodes_accepts_at_most_one_node_id() {
             &router,
             case,
             &cluster,
-            json!({ "name": "under-test", "nodes": ["node-a"] }),
+            json!({ "name": "under-test", "nodes": [minted[0].clone()] }),
         )
         .await;
         assert_eq!(
             retried["nodes"],
-            json!(["node-a"]),
+            json!([minted[0].clone()]),
             "case {case:?}: expected the name the refused create asked for to still be free, got {retried}"
         );
     }
+}
+
+/// Rule: `Nodes` is a REFERENCE — "An array of one ID for the Node that you want
+/// to associate with the ChannelPlacementGroup", where "The Node and the
+/// ChannelPlacementGroup must be in the same Cluster" — so a create naming an id
+/// that is not a node of that cluster the account can still associate is refused
+/// with `UnprocessableEntityException` (HTTP 422) naming the member, and stores
+/// nothing.
+///
+/// The rows differ along the shape of the id that does not resolve (an id no
+/// node has, a node of another cluster, ids from two other resource id spaces, a
+/// non-numeric id, and a node whose deregistration has been accepted), because
+/// that is what the rule generalises over. The accepted control at the end
+/// reports the association from BOTH ends, which is what a dangling reference
+/// would break.
+#[tokio::test]
+async fn nodes_must_name_a_node_of_the_groups_own_cluster() {
+    let router = medialive();
+    let setup = "node resolution";
+    let cluster = create_cluster(&router, setup, "primary").await;
+    let elsewhere = create_cluster(&router, setup, "secondary").await;
+    // Two nodes of the group's own cluster — one to associate, one to
+    // deregister — and one node of another cluster.
+    let mut mine = create_nodes(&router, setup, &cluster, 2).await;
+    let doomed = mine.remove(1);
+    let node = mine.remove(0);
+    let far = create_nodes(&router, setup, &elsewhere, 1)
+        .await
+        .remove(0);
+    // A resource of another type, to show that an id of another of this
+    // service's id spaces resolves no better than one nothing holds.
+    let channel = create_channel(&router, setup, "unplaced", None).await;
+    // A group that already exists, so each refusal can be shown to have left the
+    // store exactly as it was.
+    let existing = created(&router, setup, &cluster, json!({ "name": "existing" })).await;
+    // A node on its way out of the account is nothing a new association can be
+    // made with.
+    deregister_node(&router, setup, &cluster, &doomed).await;
+
+    let rows: [(&str, String); 6] = [
+        ("a numeric id no node has", "9999999".to_string()),
+        ("a node of another cluster", far.clone()),
+        ("the cluster's own id", cluster.clone()),
+        ("a channel's id", channel.clone()),
+        ("a non-numeric id", "not-a-node".to_string()),
+        (
+            "a node whose deregistration was accepted",
+            doomed.clone(),
+        ),
+    ];
+
+    for (case, unresolvable) in rows {
+        let (status, body) = create_group(
+            &router,
+            &cluster,
+            json!({ "name": "under-test", "nodes": [unresolvable.clone()] }),
+        )
+        .await;
+        assert_eq!(
+            status, 422,
+            "case {case:?}: expected 422 for node {unresolvable:?}, got {status}: {body}"
+        );
+        assert_eq!(
+            error_code(status, &body),
+            "UnprocessableEntityException",
+            "case {case:?}: expected UnprocessableEntityException, got {body}"
+        );
+        assert_eq!(
+            body["validationErrors"][0]["elementPath"],
+            json!("nodes"),
+            "case {case:?}: expected the validation error to name the member, got {body}"
+        );
+        assert!(
+            body["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(&unresolvable),
+            "case {case:?}: expected the refusal to name the id it could not resolve, got {body}"
+        );
+
+        // Nothing was stored: the group that existed before is untouched, and
+        // the cluster still holds exactly that one group.
+        let read = described(&router, case, &cluster, &id_of(&existing)).await;
+        assert_eq!(
+            without_state(&read),
+            without_state(&existing),
+            "case {case:?}: expected the refused create to change nothing, got {read}"
+        );
+    }
+
+    // The same request naming a node the cluster really has is accepted, so the
+    // refusals were about the reference rather than about the rest of the
+    // request — and the association is then reported from both ends: the group
+    // names the node, and the node names the group.
+    let case = "a node of this cluster";
+    let group = created(
+        &router,
+        case,
+        &cluster,
+        json!({ "name": "under-test", "nodes": [node.clone()] }),
+    )
+    .await;
+    assert_eq!(
+        group["nodes"],
+        json!([node.clone()]),
+        "case {case:?}: expected the group to name the node it was created with, got {:?}",
+        group["nodes"]
+    );
+    let (status, reported_node) = call(&router, "GET", &node_uri(&cluster, &node), None).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: DescribeNode: expected 200, got {status}: {reported_node}"
+    );
+    assert_eq!(
+        reported_node["channelPlacementGroups"],
+        json!([id_of(&group)]),
+        "case {case:?}: expected the node to report the group that names it, got {:?}",
+        reported_node["channelPlacementGroups"]
+    );
 }
 
 /// Rule: a group's `Name` is unique in its CLUSTER and case-sensitive ("Specify
@@ -641,8 +839,11 @@ async fn a_retried_create_returns_the_group_the_first_one_created() {
             create_cluster(&router, case, "secondary").await,
         ];
         let second_cluster = clusters[which].clone();
+        // The node the FIRST create associates its group with: a node of that
+        // group's own cluster, which is the only kind a group may name.
+        let node = create_nodes(&router, case, &clusters[0], 1).await.remove(0);
 
-        let mut first = json!({ "name": "first", "nodes": ["node-a"] });
+        let mut first = json!({ "name": "first", "nodes": [node.clone()] });
         if let Some(token) = first_token {
             first["requestId"] = json!(token);
         }
@@ -671,7 +872,7 @@ async fn a_retried_create_returns_the_group_the_first_one_created() {
             );
             assert_eq!(
                 read["nodes"],
-                json!(["node-a"]),
+                json!([node.clone()]),
                 "case {case:?}: expected the retry to leave the stored nodes alone, got {:?}",
                 read["nodes"]
             );
