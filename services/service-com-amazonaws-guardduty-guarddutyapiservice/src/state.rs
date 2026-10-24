@@ -1366,6 +1366,16 @@ pub const RELATIONSHIP_INVITED: &str = "Invited";
 /// values come from.
 pub const RELATIONSHIP_ENABLED: &str = "Enabled";
 
+/// `Member.RelationshipStatus` for a member account the administrator has stopped
+/// monitoring with `StopMonitoringMembers` — "stops GuardDuty monitoring for the
+/// specified member accounts. Use the StartMonitoringMembers operation to restart
+/// monitoring for those accounts"
+/// (`smithy_query(query="doc",shape="StopMonitoringMembers")`). The member stays
+/// ASSOCIATED ([`MemberRecord::is_associated`]): only `DisassociateMembers` ends
+/// the association and only `DeleteMembers` drops the record. See
+/// [`RELATIONSHIP_CREATED`] for where the values come from.
+pub const RELATIONSHIP_DISABLED: &str = "Disabled";
+
 /// How many received invitations one detector's inbox retains.
 ///
 /// A bound on [`Detector::received_invitations`], whose key is an ACCOUNT ID and
@@ -2002,8 +2012,10 @@ pub struct MemberRecord {
     /// The member account's email address, as the request that recorded the account
     /// gave it.
     pub email: String,
-    /// `Member.RelationshipStatus`: [`RELATIONSHIP_CREATED`] or
-    /// [`RELATIONSHIP_REMOVED`].
+    /// `Member.RelationshipStatus`: [`RELATIONSHIP_CREATED`],
+    /// [`RELATIONSHIP_DISABLED`] once `StopMonitoringMembers` has stopped
+    /// monitoring the account, or [`RELATIONSHIP_REMOVED`] once
+    /// `DisassociateMembers` has ended the association.
     pub relationship_status: String,
     /// When the relationship last changed, in epoch milliseconds — the member's
     /// `UpdatedAt`.

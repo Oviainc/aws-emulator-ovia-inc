@@ -39,6 +39,8 @@ mod job_template_crud;
 mod job_templates;
 #[path = "all/jobs_query.rs"]
 mod jobs_query;
+#[path = "all/policy_enforcement.rs"]
+mod policy_enforcement;
 #[path = "all/policy_lifecycle.rs"]
 mod policy_lifecycle;
 #[path = "all/preset_deletion.rs"]

@@ -44,7 +44,7 @@ const ENVELOPE: &str = "BadRequestException";
 /// Member accounts to record: 12 decimal digits each, which is the form `AccountId`
 /// takes (`len 12..12` — `smithy_query(shape="AccountId")`). The rows differ along
 /// the account id and along the email's shape, which is all `CreateMembers` stores.
-const MEMBERS: [(&str, &str); 3] = [
+pub(crate) const MEMBERS: [(&str, &str); 3] = [
     ("111122223333", "member-one@example.com"),
     ("222233334444", "first.last@sub.example-corp.com"),
     ("333344445555", "m+tag@example.io"),
@@ -53,7 +53,7 @@ const MEMBERS: [(&str, &str); 3] = [
 /// Well-formed account ids no `CreateMembers` in a test records, differing along the
 /// digit space: the low and high ends, an id one digit away from a recorded member,
 /// and a plausible mid-range id.
-const NON_MEMBER_ACCOUNT_IDS: [(&str, &str); 4] = [
+pub(crate) const NON_MEMBER_ACCOUNT_IDS: [(&str, &str); 4] = [
     ("000000000000", "the low end of the account-id space"),
     ("999999999999", "the high end of the account-id space"),
     ("111122223334", "one digit away from a recorded member"),
@@ -65,7 +65,7 @@ const NON_MEMBER_ACCOUNT_IDS: [(&str, &str); 4] = [
 /// An account id is 12 decimal digits; the model constrains the LENGTH only, so
 /// every row below is exactly 12 characters and reaches the handler instead of being
 /// refused at the boundary.
-const MALFORMED_ACCOUNT_IDS: [(&str, &str); 5] = [
+pub(crate) const MALFORMED_ACCOUNT_IDS: [(&str, &str); 5] = [
     ("abcdefghijkl", "12 letters: not digits at all"),
     ("12345678901a", "11 digits and a letter"),
     ("1234 6789012", "12 characters, one of them a space"),
@@ -75,12 +75,12 @@ const MALFORMED_ACCOUNT_IDS: [(&str, &str); 5] = [
 
 /// The administrator account every member recorded by these tests belongs to: the
 /// account this emulator serves.
-fn administrator() -> String {
+pub(crate) fn administrator() -> String {
     ::engine::emulator_account_id().to_string()
 }
 
 /// The reason `GetMembers` reports an account with no member record with.
-fn not_a_member() -> String {
+pub(crate) fn not_a_member() -> String {
     format!(
         "The request is rejected because the given account ID is not an associated member of account {}.",
         administrator()
@@ -159,7 +159,7 @@ pub(crate) async fn disassociate_members(
 }
 
 /// The `members` entry for `account_id`, if the response carries one.
-fn member_of(body: &Value, account_id: &str) -> Option<Value> {
+pub(crate) fn member_of(body: &Value, account_id: &str) -> Option<Value> {
     body["members"]
         .as_array()
         .into_iter()
@@ -169,7 +169,7 @@ fn member_of(body: &Value, account_id: &str) -> Option<Value> {
 }
 
 /// The account ids in `unprocessedAccounts`, in the order the response lists them.
-fn unprocessed_ids(body: &Value) -> Vec<String> {
+pub(crate) fn unprocessed_ids(body: &Value) -> Vec<String> {
     body["unprocessedAccounts"]
         .as_array()
         .into_iter()
@@ -179,7 +179,7 @@ fn unprocessed_ids(body: &Value) -> Vec<String> {
 }
 
 /// The `result` reported for `account_id` in `unprocessedAccounts`, if any.
-fn unprocessed_result(body: &Value, account_id: &str) -> Option<String> {
+pub(crate) fn unprocessed_result(body: &Value, account_id: &str) -> Option<String> {
     body["unprocessedAccounts"]
         .as_array()
         .into_iter()

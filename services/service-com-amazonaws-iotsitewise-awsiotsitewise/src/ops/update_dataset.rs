@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDataset
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDataset`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDataset::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: the handler below resolves the dataset the request names out of
+//! this service's store, replaces the caller-owned members of the stored record
+//! with what this request carries, and starts the `UPDATING` -> `ACTIVE`
+//! transition the call owes, so a later `DescribeDataset` reports exactly what was
+//! written here.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +176,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDataset` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDatasetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDataset"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateDatasetError::Modeled(UpdateDatasetErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: "the IoT SiteWise store is unavailable".to_string(),
+                },
+            ))
+        })?;
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        // `clientToken` is NOT honoured for idempotent replay: this change stores no
+        // token -> answer mapping, so a retry with the same token updates the dataset
+        // a second time rather than replaying the first answer. Left to the
+        // idempotency issue, exactly as `UpdateAsset` leaves it.
+        let mut store = state.lock();
+
+        let dataset = store
+            .datasets
+            .get_mut(&input.dataset_id)
+            .filter(|dataset| {
+                // `workspaceName` names "the workspace that contains the dataset", so
+                // a request that names one scopes the lookup: a dataset held by
+                // another workspace, or by none, is not the dataset this request
+                // addresses.
+                input
+                    .workspace_name
+                    .is_none()
+                    || input.workspace_name == dataset.workspace_name
+            })
+            .ok_or_else(|| not_found(&input.dataset_id))?;
+
+        // The caller-owned members are REPLACED by what this request carries, so an
+        // omitted optional member clears the stored one: the request describes the
+        // dataset's new state rather than patching selected members. The dataset's
+        // identity and provenance — its id, its ARN, its type, its workspace and its
+        // creation date — are not the caller's to change here, and no member of this
+        // operation's input carries them.
+        dataset.name = input.dataset_name.clone();
+        dataset.description = input.dataset_description.clone();
+        dataset.config = input.dataset_config.clone();
+        dataset.metadata = input.metadata.clone().unwrap_or_default();
+        dataset.source = input.dataset_source.clone();
+        // The dataset reports UPDATING, at its next version, until the transition
+        // this call owes falls due.
+        dataset.begin_update(now);
+
+        Ok(UpdateDatasetOutput {
+            dataset_id: Some(dataset.id.clone()),
+            dataset_arn: Some(dataset.arn.clone()),
+            dataset_status: Some(dataset.status(now)),
+        })
     }
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the id that resolved to nothing.
+fn not_found(dataset_id: &str) -> UpdateDatasetError {
+    UpdateDatasetError::Modeled(UpdateDatasetErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: crate::state::not_found_message(crate::state::RESOURCE_DATASET, dataset_id),
+        },
+    ))
 }
