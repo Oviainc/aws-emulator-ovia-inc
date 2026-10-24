@@ -21,9 +21,10 @@
 //! * `UntagResource` deletes only the keys `tagKeys` names, and a key the resource does
 //!   not hold is removed vacuously, so repeating an untag changes nothing;
 //! * an ARN this service holds no resource for — a name nothing was created under,
-//!   another region or account, an unknown resource kind, or a bare name rather than an
-//!   ARN — is refused with the modelled `ClientException` (HTTP 400) by all three
-//!   operations, and stores nothing;
+//!   another region or account, or an unknown resource kind — is refused with the
+//!   modelled `ClientException` (HTTP 400) by all three operations, and stores nothing,
+//!   while a `resourceArn` that is not an ARN at all is refused one layer earlier, by the
+//!   tag frontend's own read of it, under that frontend's code and its one fixed detail;
 //! * the bounds `TagrisTagsMap` declares hold: a key of 1..128 characters and a value of
 //!   0..256 are accepted at each bound and refused one past it, at most 50 tags travel in
 //!   one request, and a merge that would take one resource past 50 tags is refused rather
@@ -35,12 +36,23 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 
+use service_com_amazonaws_batch_awsbatchv20160810::scaffolded::TAGGING_REFUSAL_CODE;
 use service_com_amazonaws_batch_awsbatchv20160810::state::{self, limits};
 
 use crate::job_lifecycle::{
     arn, compute_environment, container_properties, error_code, error_message, job_definition,
     job_queue, Batch,
 };
+
+/// The wire error code a `batch` client reads off a tagging call whose `resourceArn` is
+/// not an ARN, and the detail that comes with it.
+///
+/// Written out as the LITERALS a client sees rather than taken from the handler's own
+/// constants, so changing either constant fails this suite instead of moving with it. The
+/// two assertions below the table check that the crate's constants still say exactly this,
+/// which is what ties the wording a handler emits to the wording asserted here.
+const FRONTEND_REFUSAL_CODE: &str = "BadRequestException";
+const FRONTEND_REFUSAL_DETAIL: &str = "Invalid input resource arn: bad syntax";
 
 /// The longest `TagKey` the model admits. Source: `com.amazonaws.batch#TagKey`
 /// (`smithy_query(query="shape", shape="TagrisTagsMap")`), `@length(min: 1, max: 128)`.
@@ -491,9 +503,15 @@ async fn the_tags_tagresource_writes_are_the_map_every_reader_reports() {
     }
 }
 
-/// An ARN no resource answers to is refused by all three operations with the modelled
-/// `ClientException` (HTTP 400) — over the SET of ways an ARN can name nothing — and the
-/// refusal stores nothing.
+/// A `resourceArn` no resource answers to is refused by all three operations with HTTP
+/// 400 — over the SET of ways a reference can name nothing — and the refusal stores
+/// nothing.
+///
+/// WHICH 400 follows where the reference fails. A value that is not an ARN fails the tag
+/// frontend's own read of it, before anything is resolved, so it carries that frontend's
+/// code (`scaffolded::TAGGING_REFUSAL_CODE`) and its one fixed detail, which names nothing
+/// from the request. A well-formed ARN that simply names nothing reaches this service's
+/// lookup, so it carries the modelled `ClientException` naming the reference it was given.
 #[tokio::test]
 async fn an_arn_naming_no_resource_is_refused_by_every_tagging_operation() {
     let batch = Batch::new();
@@ -504,73 +522,126 @@ async fn an_arn_naming_no_resource_is_refused_by_every_tagging_operation() {
         "arn:aws:batch:eu-west-1:{}:job-queue/refusal-queue",
         engine::EMULATOR_ACCOUNT_ID
     );
-    let references: Vec<(&str, String)> = vec![
-        ("a name nothing was created under", arn("job-queue/absent")),
+    // (case, the reference the caller sends, whether that value is an ARN at all — which
+    // is what decides which layer refuses it)
+    let references: Vec<(&str, String, bool)> = vec![
+        (
+            "a name nothing was created under",
+            arn("job-queue/absent"),
+            true,
+        ),
         (
             "a compute environment nothing was created under",
             arn("compute-environment/absent"),
+            true,
         ),
         (
             "a job definition revision nothing registered",
             arn("job-definition/absent:1"),
+            true,
         ),
-        ("a job nothing submitted", arn("job/0123456789abcdef")),
+        ("a job nothing submitted", arn("job/0123456789abcdef"), true),
         (
             "a quota share nothing created",
             arn("job-queue/refusal-queue/quota-share/absent"),
+            true,
         ),
-        ("another region", other_region),
+        ("another region", other_region, true),
         (
             "another account",
             "arn:aws:batch:us-east-1:999988887777:job-queue/refusal-queue".to_string(),
+            true,
         ),
         (
             "a resource kind Batch does not tag",
             arn("fleet/refusal-queue"),
+            true,
         ),
-        ("a bare name rather than an ARN", "refusal-queue".to_string()),
-        ("an ARN of another service", "arn:aws:sqs:us-east-1:000000000000:queue".to_string()),
+        (
+            "an ARN of another service",
+            "arn:aws:sqs:us-east-1:000000000000:queue".to_string(),
+            true,
+        ),
+        // Not ARNs at all: each one fails the frontend's read of the value, so each gets
+        // that frontend's refusal rather than this service's lookup refusal.
+        (
+            "a bare name rather than an ARN",
+            "refusal-queue".to_string(),
+            false,
+        ),
+        (
+            "a value that merely mentions an ARN",
+            "this-is-not-an-arn".to_string(),
+            false,
+        ),
+        (
+            "an ARN missing its resource field entirely",
+            "arn:aws:batch:us-east-1:000000000000".to_string(),
+            false,
+        ),
+        (
+            "an ARN whose resource field is empty",
+            "arn:aws:batch:us-east-1:000000000000:".to_string(),
+            false,
+        ),
+        (
+            "a value whose first field is not 'arn'",
+            "urn:aws:batch:us-east-1:000000000000:job-queue/refusal-queue".to_string(),
+            false,
+        ),
     ];
 
-    for (case, reference) in references {
-        let (status, refused) = tag(&batch, &reference, json!({"team": "batch"})).await;
-        assert_eq!(
-            status, 400,
-            "case {case:?}: expected HTTP 400 from TagResource, got {status} {refused}"
-        );
-        assert_eq!(
-            error_code(&refused),
-            "ClientException",
-            "case {case:?}: expected the modelled ClientException, got {refused}"
-        );
-        assert!(
-            error_message(&refused).contains(&reference),
-            "case {case:?}: expected the refusal to name the reference it was given, got {:?}",
-            error_message(&refused)
-        );
-
-        let (status, refused) = list(&batch, &reference).await;
-        assert_eq!(
-            status, 400,
-            "case {case:?}: expected HTTP 400 from ListTagsForResource, got {status} {refused}"
-        );
-        assert_eq!(
-            error_code(&refused),
-            "ClientException",
-            "case {case:?}: expected the modelled ClientException, got {refused}"
-        );
-
-        let (status, refused) = untag(&batch, &reference, &["team".to_string()]).await;
-        assert_eq!(
-            status, 400,
-            "case {case:?}: expected HTTP 400 from UntagResource, got {status} {refused}"
-        );
-        assert_eq!(
-            error_code(&refused),
-            "ClientException",
-            "case {case:?}: expected the modelled ClientException, got {refused}"
-        );
+    for (case, reference, is_arn) in references {
+        for operation in ["TagResource", "ListTagsForResource", "UntagResource"] {
+            let (status, refused) = match operation {
+                "TagResource" => tag(&batch, &reference, json!({"team": "batch"})).await,
+                "ListTagsForResource" => list(&batch, &reference).await,
+                _ => untag(&batch, &reference, &["team".to_string()]).await,
+            };
+            assert_eq!(
+                status, 400,
+                "case {case:?} / {operation}: expected HTTP 400, got {status} {refused}"
+            );
+            let code = error_code(&refused);
+            let message = error_message(&refused);
+            if is_arn {
+                assert_eq!(
+                    code, "ClientException",
+                    "case {case:?} / {operation}: expected the modelled ClientException, got \
+                     {refused}"
+                );
+                assert!(
+                    message.contains(&reference),
+                    "case {case:?} / {operation}: expected the refusal to name the reference it \
+                     was given, got {message:?}"
+                );
+            } else {
+                assert_eq!(
+                    code, FRONTEND_REFUSAL_CODE,
+                    "case {case:?} / {operation}: a value that is no ARN is the tag frontend's \
+                     refusal, expected {FRONTEND_REFUSAL_CODE}, got {refused}"
+                );
+                assert_eq!(
+                    message, FRONTEND_REFUSAL_DETAIL,
+                    "case {case:?} / {operation}: expected the frontend's fixed detail \
+                     {FRONTEND_REFUSAL_DETAIL:?}, got {message:?}"
+                );
+            }
+        }
     }
+
+    // The wording the handlers emit is the wording asserted above, so neither can drift
+    // from the other without this failing.
+    assert_eq!(
+        TAGGING_REFUSAL_CODE, FRONTEND_REFUSAL_CODE,
+        "case the code the handlers answer with: expected {FRONTEND_REFUSAL_CODE}, got \
+         {TAGGING_REFUSAL_CODE}"
+    );
+    assert_eq!(
+        state::BAD_RESOURCE_ARN_MESSAGE, FRONTEND_REFUSAL_DETAIL,
+        "case the detail the handlers answer with: expected {FRONTEND_REFUSAL_DETAIL:?}, got {:?}",
+        state::BAD_RESOURCE_ARN_MESSAGE
+    );
 
     // None of those refusals wrote anything to the resource that DOES exist.
     let actual = listed(&batch, "the queue that exists", &queue).await;

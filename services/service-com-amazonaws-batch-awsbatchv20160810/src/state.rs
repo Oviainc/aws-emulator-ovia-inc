@@ -2942,6 +2942,32 @@ pub fn not_found_exception(kind: &str, reference: &str) -> ClientException {
     }
 }
 
+/// The detail a tagging call's `resourceArn` is refused with when the value is not an ARN
+/// at all.
+///
+/// One fixed sentence for the one condition, carrying nothing from the request: the tag
+/// frontend reads the value AS an ARN before it resolves anything, so there is no
+/// resource, kind or reference for it to name yet.
+pub const BAD_RESOURCE_ARN_MESSAGE: &str = "Invalid input resource arn: bad syntax";
+
+/// The refusal a tagging operation answers a `resourceArn` that is not an ARN with, and
+/// `None` for a value that IS one (whether or not it names a resource this service holds).
+///
+/// Resolving a tagging call's `resourceArn` is the tag frontend's work, not this
+/// service's, so a value of the wrong SHAPE is refused there, under that frontend's code
+/// ([`crate::scaffolded::TAGGING_REFUSAL_CODE`], HTTP 400) — the same code it refuses a
+/// tag MAP outside its declared bounds with — and never reaches this service's lookup. An
+/// ARN the lookup then misses is the service's own `ClientException`
+/// ([`not_found_exception`]): a well-formed reference to a resource that is not there.
+///
+/// Shared by `ListTagsForResource`, `TagResource` and `UntagResource` so one endpoint
+/// answers one refusal, and generic over the operation's modeled error enum so each one
+/// returns it through its own error channel.
+pub fn malformed_resource_arn<E>(resource_arn: &str) -> Option<crate::scaffolded::Scaffolded<E>> {
+    let is_arn = arn_resource(resource_arn).is_some_and(|resource| !resource.is_empty());
+    (!is_arn).then(|| crate::scaffolded::Scaffolded::tagging_refusal(BAD_RESOURCE_ARN_MESSAGE))
+}
+
 /// The container a job actually gets: the definition's `containerProperties` with
 /// the submit request's `containerOverrides` applied over it.
 ///

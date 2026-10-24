@@ -177,6 +177,83 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The error code a refusal raised by this service's TAGGING surface carries.
+///
+/// Tagging is served by the tag frontend rather than by this service's own request
+/// validator, so a refusal that frontend raises — a tag map outside the bounds
+/// `TagrisTagsMap` declares (`@length(min: 1, max: 50)`), or a `resourceArn` that is not
+/// an ARN at all, which it reads before it resolves anything — is HTTP 400
+/// `BadRequestException` rather than the `ClientException` this service's own operations
+/// declare. Recorded for a 51-entry `tags` map on a Batch resource and for the tagging
+/// endpoint's refusal of a `resourceArn` of the wrong shape; the model declares neither,
+/// so the code lives here rather than in a modeled shape. The service's refusal seam
+/// (`crate::service`) words boundary refusals of the tag map with this same code, so both
+/// layers answer one code.
+pub const TAGGING_REFUSAL_CODE: &str = "BadRequestException";
+
+/// The `message` member of the synthetic tagging-refusal error shape.
+static TAGGING_REFUSAL_MESSAGE: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#TaggingRefusal$message",
+        "smithy.framework",
+        "message",
+    ),
+    ShapeType::String,
+    "message",
+    0,
+)
+.with_xml_name("Message");
+
+/// Schema for the synthetic tagging-refusal error shape.
+///
+/// In the `smithy.framework` namespace for the same reason as [`NOT_IMPLEMENTED_SCHEMA`]:
+/// the shape is in no service's model, so it must not claim a modeled shape's id. The
+/// wire code comes from [`OperationError::shape_name`] ([`TAGGING_REFUSAL_CODE`]), not
+/// from this id.
+pub static TAGGING_REFUSAL_SCHEMA: Schema = Schema::new_struct(
+    ShapeId::from_static(
+        "smithy.framework#TaggingRefusal",
+        "smithy.framework",
+        "TaggingRefusal",
+    ),
+    ShapeType::Structure,
+    &[&TAGGING_REFUSAL_MESSAGE],
+);
+
+/// The payload of a tagging refusal: which part of the request the tag frontend would
+/// not accept.
+#[derive(Debug, Clone)]
+pub struct TaggingRefusal {
+    pub message: String,
+}
+
+impl TaggingRefusal {
+    /// A tagging refusal carrying `message`.
+    ///
+    /// Build `message` from the REQUEST — the member at fault and the rule it broke — so
+    /// a caller can fix the call from the text alone.
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for TaggingRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{TAGGING_REFUSAL_CODE}: {}", self.message)
+    }
+}
+
+impl std::error::Error for TaggingRefusal {}
+
+impl SerializableStruct for TaggingRefusal {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&TAGGING_REFUSAL_MESSAGE, self.message.as_str())?;
+        Ok(())
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
@@ -185,6 +262,9 @@ pub enum Scaffolded<E> {
     NotImplemented(NotImplemented),
     /// A modeled error the operation declares. Renders with the model's own status.
     Modeled(E),
+    /// A refusal raised by the TAGGING surface, carried under
+    /// [`TAGGING_REFUSAL_CODE`]. HTTP 400.
+    TaggingRefusal(TaggingRefusal),
     /// A modeled error answered with the status the REAL service returns, where
     /// that is not the status the model annotates.
     ///
@@ -238,12 +318,27 @@ impl<E> Scaffolded<E> {
     pub fn validation(message: impl Into<String>) -> Self {
         Self::ValidationException(ValidationException::new(message))
     }
+
+    /// Refuse a TAGGING request the way the tag frontend does: HTTP 400 under
+    /// [`TAGGING_REFUSAL_CODE`], in both the body's `__type` and the
+    /// `x-amzn-errortype` header.
+    ///
+    /// Reach for this ONLY from an operation on this service's tagging endpoint, for a
+    /// request that frontend refuses before this service resolves anything — a
+    /// `resourceArn` that is not an ARN at all
+    /// ([`crate::state::malformed_resource_arn`]), or a tag map outside its declared
+    /// bounds. Every other client refusal, the lookup that finds no such resource
+    /// included, is this service's own modeled `ClientException`.
+    pub fn tagging_refusal(message: impl Into<String>) -> Self {
+        Self::TaggingRefusal(TaggingRefusal::new(message))
+    }
 }
 
 impl<E: std::fmt::Display> std::fmt::Display for Scaffolded<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotImplemented(e) => write!(f, "{e}"),
+            Self::TaggingRefusal(e) => write!(f, "{e}"),
             Self::Modeled(e) | Self::ModeledWithStatus { error: e, .. } => write!(f, "{e}"),
             Self::ValidationException(e) => write!(f, "{e}"),
         }
@@ -256,6 +351,7 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::NotImplemented(e) => e.source(),
+            Self::TaggingRefusal(e) => e.source(),
             Self::Modeled(e) | Self::ModeledWithStatus { error: e, .. } => e.source(),
             Self::ValidationException(e) => e.source(),
         }
@@ -270,6 +366,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
     fn as_serializable(&self) -> &dyn SerializableStruct {
         match self {
             Self::NotImplemented(e) => e,
+            Self::TaggingRefusal(e) => e,
             Self::Modeled(e) | Self::ModeledWithStatus { error: e, .. } => e.as_serializable(),
             Self::ValidationException(e) => e,
         }
@@ -278,6 +375,7 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
     fn variant_schema(&self) -> &'static Schema {
         match self {
             Self::NotImplemented(_) => &NOT_IMPLEMENTED_SCHEMA,
+            Self::TaggingRefusal(_) => &TAGGING_REFUSAL_SCHEMA,
             Self::Modeled(e) | Self::ModeledWithStatus { error: e, .. } => e.variant_schema(),
             Self::ValidationException(_) => &VALIDATION_EXCEPTION_SCHEMA,
         }
@@ -290,6 +388,8 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
     fn shape_name(&self) -> &'static str {
         match self {
             Self::NotImplemented(_) => "NotImplemented",
+            // The tag frontend's code, not a shape this service's model declares.
+            Self::TaggingRefusal(_) => TAGGING_REFUSAL_CODE,
             Self::Modeled(e) | Self::ModeledWithStatus { error: e, .. } => e.shape_name(),
             Self::ValidationException(_) => "ValidationException",
         }
@@ -306,6 +406,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
         match self {
             Self::NotImplemented(_) => 501,
             Self::Modeled(e) => e.http_status(),
+            // The tagging surface refuses a request it cannot accept with 400, the
+            // status every client refusal of this service carries.
+            Self::TaggingRefusal(_) => 400,
             // The one variant whose status is NOT the model's: the handler stated the
             // status the service answers with.
             Self::ModeledWithStatus { status, .. } => *status,
@@ -319,6 +422,9 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
             // no `awsQueryError` trait to honour. The 501 + `<Code>NotImplemented`
             // envelope carries the signal on the query protocols too.
             Self::NotImplemented(_) => None,
+            // Same reason: the synthetic shape carries no `awsQueryError` trait, and
+            // this service is restJson1 only.
+            Self::TaggingRefusal(_) => None,
             Self::Modeled(e) | Self::ModeledWithStatus { error: e, .. } => e.query_error_code(),
             // Same reason: the synthetic shape carries no `awsQueryError` trait.
             Self::ValidationException(_) => None,

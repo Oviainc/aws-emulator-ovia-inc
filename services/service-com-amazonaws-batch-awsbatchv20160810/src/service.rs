@@ -45,13 +45,11 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
-/// The error code AWS answers a refusal of this service's TAG MAP with.
-///
-/// Tagging is served by the Tagris frontend rather than by Batch's own request
-/// validator, and its refusal of a tag map outside the bounds `TagrisTagsMap` declares
-/// (`@length(min: 1, max: 50)`) is HTTP 400 `BadRequestException` — the code recorded for
-/// a 51-entry `tags` map on a Batch resource.
-const TAG_REFUSAL_CODE: &str = "BadRequestException";
+// The code a refusal of this service's TAG MAP carries is the tag frontend's, not Batch's
+// own: one definition, in `crate::scaffolded`, which the handlers on the tagging endpoint
+// answer through as well, so the boundary and the handlers cannot drift to two codes for
+// one layer.
+use crate::scaffolded::TAGGING_REFUSAL_CODE;
 
 /// The error code AWS answers every OTHER refusal of a Batch request with.
 ///
@@ -140,7 +138,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         match refusal {
             Refusal::Invalid(violations) => {
                 let code = if violations.iter().any(is_tag_violation) {
-                    TAG_REFUSAL_CODE
+                    TAGGING_REFUSAL_CODE
                 } else {
                     REFUSAL_CODE
                 };

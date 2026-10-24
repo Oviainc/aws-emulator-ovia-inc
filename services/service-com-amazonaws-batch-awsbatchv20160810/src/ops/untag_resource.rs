@@ -160,6 +160,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resource is already gone is refused rather than written to.
         state.materialize_due(now);
 
+        // As in `ListTagsForResource`: the tag frontend reads the `resourceArn` AS an ARN
+        // before it resolves anything, so a value that is no ARN at all is refused on its
+        // syntax, under that frontend's code, and nothing is written.
+        if let Some(refusal) = batch::malformed_resource_arn(&input.resource_arn) {
+            return Err(refusal);
+        }
+
         let Some(tags) = state.resource_tags_mut(&input.resource_arn) else {
             return Err(UntagResourceErrorModeled::ClientException(
                 batch::not_found_exception("Resource", &input.resource_arn),

@@ -6,7 +6,11 @@
 //! writes and `UntagResource` deletes from, not a copy. A resource that holds no tag
 //! answers an EMPTY map rather than no map at all, so a caller can tell "nothing is
 //! tagged" from "no such resource": the latter is the modelled `ClientException`
-//! (HTTP 400).
+//! (HTTP 400). A `resourceArn` that is not an ARN at all never reaches that lookup — it
+//! is refused on its SYNTAX by the tag frontend, HTTP 400
+//! [`crate::scaffolded::TAGGING_REFUSAL_CODE`]
+//! ([`crate::state::malformed_resource_arn`]), the same layer this service answers a
+//! refusal of a tag MAP with.
 //!
 //! This is a REPORTING operation: it writes nothing of its own, and the only state it
 //! touches is what the clock already owed at the instant it was called
@@ -72,6 +76,10 @@
 //!   permissions to use the action or resource. Another cause is specifying an identifier
 //!   that's not valid.
 //! * `ServerException` (HTTP 500) — These errors are usually caused by a server issue.
+//!
+//! The model declares those two; the tagging endpoint additionally answers the tag
+//! frontend's HTTP 400 `BadRequestException` for a `resourceArn` it cannot resolve, which
+//! no Batch operation models (see [`crate::scaffolded::TAGGING_REFUSAL_CODE`]).
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -158,6 +166,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.materialize_due(now);
 
+        // The tag frontend reads the `resourceArn` AS an ARN before it resolves
+        // anything, so a value that is no ARN at all is refused on its syntax, under
+        // that frontend's code, and never reaches the lookup below.
+        if let Some(refusal) = batch::malformed_resource_arn(&input.resource_arn) {
+            return Err(refusal);
+        }
+
         let Some(tags) = state.resource_tags(&input.resource_arn) else {
             return Err(ListTagsForResourceErrorModeled::ClientException(
                 batch::not_found_exception("Resource", &input.resource_arn),
@@ -172,3 +187,4 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
+
