@@ -37,6 +37,8 @@ mod application_grants;
 mod application_provider_describe;
 #[path = "all/application_providers.rs"]
 mod application_providers;
+#[path = "all/application_update.rs"]
+mod application_update;
 #[path = "all/customer_managed_policy_references.rs"]
 mod customer_managed_policy_references;
 #[path = "all/inline_policy.rs"]

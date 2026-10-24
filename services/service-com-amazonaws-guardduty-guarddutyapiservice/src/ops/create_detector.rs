@@ -270,6 +270,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // what establishes the administrator relationship.
             received_invitations: std::collections::BTreeMap::new(),
             administrator: None,
+            // Nothing is auto-enabled for the organization's accounts until an
+            // `UpdateOrganizationConfiguration` says so.
+            organization: crate::state::OrganizationConfiguration::default(),
         };
         // The deprecated `DataSources` view is applied first so an explicit
         // `Features` entry for the same switch wins.

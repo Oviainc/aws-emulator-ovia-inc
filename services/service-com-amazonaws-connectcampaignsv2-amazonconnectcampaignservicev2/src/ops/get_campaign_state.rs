@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCampaignState
-//! Reports the stored campaign's lifecycle state. A pure read of the record
-//! `Start`/`Pause`/`StopCampaign` write — never a constant.
+//! Reports the campaign's lifecycle state at the instant of the call: the record
+//! `Start`/`Pause`/`StopCampaign` write, as the stored schedule and the clock leave
+//! it (`StoredCampaign::state_at`) — never a constant, and never a write.
 //!
 //! ## Shape of an operation
 //!
@@ -161,8 +162,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The state the clock leaves the stored record at: a campaign that has
+        // entered its run reports the terminal `Completed` once its schedule's
+        // `endTime` has passed, which is the value a client polls for. Derived, not
+        // written: reporting the state leaves the store exactly as it was.
+        let state = stored.state_at(::std::time::SystemTime::now());
+
         Ok(GetCampaignStateOutput {
-            state: Some(stored.state.as_wire().to_string()),
+            state: Some(state.as_wire().to_string()),
         })
     }
 }

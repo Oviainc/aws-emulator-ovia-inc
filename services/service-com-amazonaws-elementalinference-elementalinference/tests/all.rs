@@ -27,6 +27,8 @@ mod feed_association;
 mod feed_lifecycle;
 #[path = "all/feed_policy.rs"]
 mod feed_policy;
+#[path = "all/feed_release_retry.rs"]
+mod feed_release_retry;
 #[path = "all/feed_usable_on_create.rs"]
 mod feed_usable_on_create;
 #[path = "all/fixture_catalog.rs"]

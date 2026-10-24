@@ -198,6 +198,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         let now = crate::state::now_millis();
+        // The tags a create carries are the same `Tag`s `TagResource` writes, so the
+        // documented character set and the reserved `aws:` key prefix bound them too;
+        // neither is expressible in the model, so a create carrying a tag outside them
+        // is refused with the modelled `ValidationException` and no plan is minted.
+        if let Some(rejection) = input
+            .tags
+            .as_deref()
+            .and_then(|tags| crate::state::tag_set_rejection(TAGS_MEMBER, tags))
+        {
+            return Err(
+                CreateRescoreExecutionPlanErrorModeled::ValidationException(rejection).into(),
+            );
+        }
+
         let mut store = state.lock();
 
         // "Multiple calls to the CreateRescoreExecutionPlanRequest API with the same
@@ -291,3 +305,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(CreateRescoreExecutionPlanOutput { id, arn })
     }
 }
+
+/// The request member holding the tags a create writes, as the dotted path of a
+/// validation clause spells it.
+const TAGS_MEMBER: &str = "tags";

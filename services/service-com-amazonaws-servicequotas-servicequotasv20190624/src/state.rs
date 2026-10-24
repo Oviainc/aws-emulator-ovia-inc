@@ -162,6 +162,17 @@ pub const TEMPLATE_HOME_REGION: &str = "us-east-1";
 /// read that is already past it.
 pub const REQUEST_DECISION_DELAY: Duration = Duration::from_millis(500);
 
+/// How far back the SERVICE-WIDE quota request history reaches.
+///
+/// AWS-DOCUMENTED, so it keeps its value:
+/// `ListRequestedServiceQuotaChangeHistory`'s own documentation says "Responses
+/// include any open or closed requests within 90 days"
+/// (`smithy_query(query="doc", shape="ListRequestedServiceQuotaChangeHistory")`).
+/// A request older than this is still STORED — its id keeps resolving through
+/// `GetRequestedServiceQuotaChange` — it is only outside the window that listing
+/// reports, so the window filters a read rather than deleting anything.
+pub const REQUEST_HISTORY_WINDOW: Duration = Duration::from_secs(90 * 24 * 60 * 60);
+
 /// The largest page size a CALLER may ask for: the maximum the model's `MaxResults`
 /// range declares (1..100). It bounds `MaxResults`, NOT the page a caller that names
 /// none is served — that is [`UNASKED_PAGE_SIZE`], applied by [`paginate`].
@@ -825,6 +836,34 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
             .collect()
     }
 
+    /// Every stored request of a region that the history window still covers, NEWEST
+    /// FIRST, narrowed to one `ServiceCode` when `service_code` names one.
+    ///
+    /// This is the service-wide half of the history: `None` spans every service the
+    /// region holds requests for. Requests created longer ago than
+    /// [`REQUEST_HISTORY_WINDOW`] are left out, which is the window the listing
+    /// documents.
+    pub fn requests_in_history(
+        &self,
+        region: &str,
+        service_code: Option<&str>,
+        now: SystemTime,
+    ) -> Vec<QuotaRequest> {
+        let Some(state) = self.regions.get(region) else {
+            return Vec::new();
+        };
+        let cutoff = now.checked_sub(REQUEST_HISTORY_WINDOW);
+        state
+            .request_order
+            .iter()
+            .rev()
+            .filter_map(|id| state.quota_requests.get(id))
+            .filter(|request| service_code.is_none_or(|code| request.service_code == code))
+            .filter(|request| cutoff.is_none_or(|cutoff| request.created >= cutoff))
+            .cloned()
+            .collect()
+    }
+
     /// A stored request as `RequestedServiceQuotaChange` on the wire.
     pub fn request_view(&self, request: &QuotaRequest) -> RequestedServiceQuotaChange {
         let default = self.default_quota(&request.service_code, &request.quota_code);
@@ -1395,6 +1434,20 @@ fn compare_utilization(
     by_utilization
         .then_with(|| left.service_code.cmp(&right.service_code))
         .then_with(|| left.quota_code.cmp(&right.quota_code))
+}
+
+/// Whether a request made at `level` belongs in a history listing filtered to
+/// `requested`.
+///
+/// `ALL` is the level that covers every other one, so it keeps the whole listing; any
+/// other value keeps the requests made at exactly that level. A caller that names no
+/// level gets [`LEVEL_ACCOUNT`], the documented default of the member on both history
+/// listings (`smithy_query(query="doc",
+/// shape="ListRequestedServiceQuotaChangeHistoryRequest",
+/// member="QuotaRequestedAtLevel")`: "ACCOUNT is the default").
+pub fn requested_at_level(level: &str, requested: Option<&str>) -> bool {
+    let filter = requested.unwrap_or(LEVEL_ACCOUNT);
+    filter == LEVEL_ALL || level == filter
 }
 
 /// One page of an ordered listing.

@@ -178,9 +178,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Reached in the region this request was addressed to, as every id-keyed read
         // is: an ARN naming a data store of another region names a resource this
         // request cannot see.
-        let tags = store.resource_tags(&region, &arn).ok_or_else(|| {
+        // Stated by the KIND that is absent, as a constant of this service: no
+        // identifier the caller supplied is reflected back
+        // (`crate::state::MissingResource::message`).
+        let tags = store.resource_tags(&region, &arn).map_err(|missing| {
             ListTagsForResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: format!("Resource {} was not found", input.resource_arn),
+                message: missing.message().to_string(),
             })
         })?;
 

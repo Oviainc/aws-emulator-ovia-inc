@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListResourceTags
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListResourceTags`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListResourceTags::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +165,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListResourceTags` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListResourceTagsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListResourceTags"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListResourceTagsErrorModeled::KMSInternalException(
+                KMSInternalException {
+                    message: Some("the KMS state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // "If you include a value, it must be between 1 and 50, inclusive"
+        // (`smithy_query(query="doc",shape="ListResourceTagsRequest",member="Limit")`).
+        // `LimitType`'s modelled range is 1..1000 — it is shared with the other
+        // listings — so the boundary validator passes a value this operation's own
+        // documented bound refuses; the refusal names the member and the constraint.
+        if let Some(limit) = input.limit {
+            if limit > MAX_LIMIT {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "Value '{limit}' at 'limit' failed to satisfy constraint: Member must \
+                     have value less than or equal to {MAX_LIMIT}"
+                )));
+            }
+        }
+
+        let region = crate::state::request_region(ctx);
+        let state = state.lock();
+        // Reporting a key's tags is reporting the key: an identifier that names no key
+        // of this account and Region has no tag list at all. A key in any key state
+        // has one — this operation models no state error, and "to confirm that the
+        // operation worked, use ListResourceTags"
+        // (`smithy_query(query="doc",shape="UntagResource")`) makes it the reader for
+        // the tag writers.
+        let key = match state.resolve(&region, &input.key_id) {
+            crate::state::KeyRef::Found(key) => key,
+            crate::state::KeyRef::MalformedArn => {
+                return Err(ListResourceTagsErrorModeled::InvalidArnException(
+                    InvalidArnException {
+                        message: Some(crate::state::invalid_arn_message(&input.key_id)),
+                    },
+                )
+                .into());
+            }
+            crate::state::KeyRef::NotFound => {
+                return Err(ListResourceTagsErrorModeled::NotFoundException(
+                    NotFoundException {
+                        message: Some(crate::state::key_not_found_message(&region, &input.key_id)),
+                    },
+                )
+                .into());
+            }
+        };
+
+        let listed = key.tag_list();
+
+        // "Use this parameter in a subsequent request after you receive a response
+        // with truncated results. Set it to the value of NextMarker from the truncated
+        // response you just received"
+        // (`smithy_query(query="doc",shape="ListResourceTagsRequest",member="Marker")`),
+        // so a marker resumes after the last tag the previous page returned. Anything
+        // else "is not valid" (`InvalidMarkerException`).
+        // "Set it to the value of NextMarker from the truncated response you just
+        // received" — a marker names the tag the previous page ended at, so a token
+        // whose tag key the key no longer carries (it was removed between pages)
+        // resumes nowhere and is reported as not valid rather than silently resuming
+        // at whichever tag now sits in that position.
+        let start = match input.marker.as_deref() {
+            None => 0,
+            Some(marker) => {
+                let resume_after = crate::state::decode_resource_tag_marker(marker)
+                    .and_then(|tag_key| listed.iter().position(|tag| tag.tag_key == tag_key));
+                match resume_after {
+                    Some(position) => position + 1,
+                    None => {
+                        return Err(ListResourceTagsErrorModeled::InvalidMarkerException(
+                            InvalidMarkerException {
+                                message: Some(
+                                    "The marker that specifies where pagination should next \
+                                     begin is not valid."
+                                        .to_string(),
+                                ),
+                            },
+                        )
+                        .into());
+                    }
+                }
+            }
+        };
+
+        // "If you do not include a value, it defaults to 50." A `Limit` that reached
+        // here is already within 1..=MAX_LIMIT — the modelled `LimitType` range floors
+        // it at 1 and the check above refuses anything larger — so the clamp only
+        // carries that bound into the `usize` the page size needs.
+        let limit =
+            usize::try_from(input.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT)).unwrap_or(1);
+        let page: Vec<Tag> = listed.iter().skip(start).take(limit).cloned().collect();
+
+        let truncated = start + page.len() < listed.len();
+        let next_marker = page
+            .last()
+            .filter(|_| truncated)
+            .map(|tag| crate::state::encode_resource_tag_marker(&tag.tag_key));
+
+        Ok(ListResourceTagsOutput {
+            tags: Some(page),
+            next_marker,
+            truncated,
+        })
     }
 }
+
+/// The page size `ListResourceTags` uses when the request names none: "If you do not
+/// include a value, it defaults to 50."
+/// (`smithy_query(query="doc",shape="ListResourceTagsRequest",member="Limit")`).
+const DEFAULT_LIMIT: i32 = 50;
+
+/// The largest page this operation accepts: "If you include a value, it must be
+/// between 1 and 50, inclusive." (same member's documentation).
+const MAX_LIMIT: i32 = 50;

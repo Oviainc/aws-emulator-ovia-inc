@@ -5,7 +5,10 @@
 //! [`crate::state`] — the one tag set `ListTagsForResource` and that resource's own
 //! Get/Describe report. A key in the reserved namespace
 //! ([`crate::state::RESERVED_TAG_KEY_PREFIX`], matched however it is cased) is not a key a
-//! caller may write, so such a request is refused whole and stores nothing.
+//! caller may write, so such a request is refused whole and stores nothing. A resource the
+//! service is still creating, or has already begun removing, isn't in a status that can
+//! complete the operation either, so that request is refused whole as well
+//! ([`crate::state::is_transient_status`]) and the resource's tag set is left as it was.
 //!
 //! ## Shape of an operation
 //!
@@ -195,6 +198,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         guard.settle(::std::time::SystemTime::now());
 
         let resource_arn = input.resource_arn;
+        // "The requested resource exists but isn't in a status that can complete the
+        // operation" (`ResourceNotReadyException`, HTTP 409): a resource the service has
+        // not finished creating, or has already begun removing, cannot be tagged. Judged
+        // BEFORE the write borrow is taken, so the refusal stores nothing and the
+        // resource's tag set is left exactly as it was.
+        if let Some(refusal) = guard.not_ready_refusal(&region, resource_type, &resource_arn) {
+            return Err(TagResourceErrorModeled::ResourceNotReadyException(refusal).into());
+        }
+
         // An ARN of another Region names no resource this Region holds, which is the same
         // answer as a resource that was never created — the answer the stored-ARN lookup
         // below already gives for every record minted in another Region, stated here so it

@@ -36,10 +36,11 @@ pub struct ComAmazonawsBudgetsAwsbudgetservicegatewayState {
 /// members the service owns stamped over it ([`stamp_service_owned`]), plus the
 /// notifications and tags created alongside it.
 ///
-/// No ARN is stored: nothing in this slice reports one. The operations that resolve a
-/// budget by ARN (`TagResource` / `UntagResource` / `ListTagsForResource`) are still
-/// 501 and filed as their own issues, and they should build it through the runtime's
-/// `engine::emulator_arn` rather than a string this module formats.
+/// No ARN is stored: nothing in this slice reports one. The operations that name a
+/// budget by ARN (`TagResource` / `ListTagsForResource`, and `UntagResource` once it is
+/// written) resolve it the other way round — [`parse_resource_arn`] reads the account and
+/// the budget name out of the ARN and looks the budget up under the key it already has,
+/// so no second copy of a budget's identity is persisted.
 #[derive(Debug, Clone)]
 pub struct StoredBudget {
     /// The budget as `DescribeBudget` / `DescribeBudgets` read it back.
@@ -1455,6 +1456,216 @@ pub fn action_history_in_period(
                     .cloned()
                     .collect(),
             )
+        }
+    }
+}
+
+/// The ARN namespace this service's resources are named under: the model's own
+/// `arnNamespace` (`smithy_query(query="service_info")`), which is also this service's
+/// signing name.
+pub const ARN_SERVICE: &str = "budgets";
+
+/// The resource part of a budget's ARN opens with this collection name, so the budget
+/// name is what follows it: `budget/{BudgetName}`.
+const ARN_BUDGET_PREFIX: &str = "budget/";
+
+/// A budget ACTION is named beneath the budget it acts on (`Action$BudgetName`), so its
+/// ARN is the budget's with the action's own id below it:
+/// `budget/{BudgetName}/action/{ActionId}`. That is the substring `BudgetName`'s
+/// `@pattern` forbids inside a name ("the '/action/' substring aren't allowed"), so the
+/// split below is unambiguous however many slashes a budget name holds.
+const ARN_ACTION_INFIX: &str = "/action/";
+
+/// The resource an `AmazonResourceName` handed to the tagging operations names: a budget
+/// or a budget action — "a budget or budget action resource" is what `TagResource`,
+/// `UntagResource` and `ListTagsForResource` document as taggable here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaggedResource {
+    /// `arn:{partition}:budgets::{AccountId}:budget/{BudgetName}`.
+    Budget {
+        account_id: String,
+        budget_name: String,
+    },
+    /// `arn:{partition}:budgets::{AccountId}:budget/{BudgetName}/action/{ActionId}`.
+    Action {
+        account_id: String,
+        budget_name: String,
+        action_id: String,
+    },
+}
+
+/// The resource `arn` names, or `Err` with the sentence that goes in
+/// `InvalidParameterException$Message` for a value that is not an ARN of a resource this
+/// service holds.
+///
+/// An ARN has six colon-separated fields — `arn:{partition}:{service}:{region}:{account}:{resource}`
+/// — and only the resource field may itself hold colons, which is why the split is
+/// bounded. A budgets resource is global, so the region field is empty; the account
+/// field is the account that owns the budget, spelled the way `AccountId` is modelled
+/// (`@pattern ^\d{12}$`), since that half of a budget's identity cannot be read off the
+/// name alone.
+///
+/// The refused value is NOT echoed back: an ARN carries a caller-supplied budget name,
+/// and a name is never reflected into a refusal.
+pub fn parse_resource_arn(arn: &str) -> Result<TaggedResource, String> {
+    let malformed = || {
+        format!(
+            "Unable to resolve ResourceARN: expected an ARN of the form \
+             arn:<partition>:{ARN_SERVICE}::<account-id>:{ARN_BUDGET_PREFIX}<budget-name> or \
+             arn:<partition>:{ARN_SERVICE}::<account-id>:{ARN_BUDGET_PREFIX}<budget-name>\
+             {ARN_ACTION_INFIX}<action-id>."
+        )
+    };
+    let fields: Vec<&str> = arn.splitn(6, ':').collect();
+    // Destructured rather than indexed, so a value with fewer fields is a refusal rather
+    // than a panic on the request path.
+    let [prefix, partition, service, region, account_id, resource] = fields.as_slice() else {
+        return Err(malformed());
+    };
+    // `arn`, a non-empty partition, this service's namespace, and the empty region every
+    // global service's ARN carries.
+    if *prefix != "arn" || partition.is_empty() || *service != ARN_SERVICE || !region.is_empty() {
+        return Err(malformed());
+    }
+    if account_id.len() != 12 || !account_id.chars().all(|digit| digit.is_ascii_digit()) {
+        return Err(malformed());
+    }
+    let resource = resource.strip_prefix(ARN_BUDGET_PREFIX).ok_or_else(malformed)?;
+    match resource.split_once(ARN_ACTION_INFIX) {
+        Some((budget_name, action_id)) => {
+            if budget_name.is_empty() || action_id.is_empty() {
+                return Err(malformed());
+            }
+            Ok(TaggedResource::Action {
+                account_id: account_id.to_string(),
+                budget_name: budget_name.to_string(),
+                action_id: action_id.to_string(),
+            })
+        }
+        None => {
+            if resource.is_empty() {
+                return Err(malformed());
+            }
+            Ok(TaggedResource::Budget {
+                account_id: account_id.to_string(),
+                budget_name: resource.to_string(),
+            })
+        }
+    }
+}
+
+/// The tags `target` holds, or `None` when this store holds no such resource — which the
+/// caller answers with `NotFoundException`.
+///
+/// A READ path: it does not materialise an action's owed settle, because a tag list does
+/// not depend on an action's status.
+pub fn resource_tags<'a>(
+    state: &'a ComAmazonawsBudgetsAwsbudgetservicegatewayState,
+    target: &TaggedResource,
+) -> Option<&'a Vec<ResourceTag>> {
+    match target {
+        TaggedResource::Budget {
+            account_id,
+            budget_name,
+        } => state
+            .budgets
+            .get(&(account_id.clone(), budget_name.clone()))
+            .map(|stored| &stored.tags),
+        TaggedResource::Action {
+            account_id,
+            budget_name,
+            action_id,
+        } => state
+            .budgets
+            .get(&(account_id.clone(), budget_name.clone()))?
+            .actions
+            .iter()
+            .find(|held| &held.action.action_id == action_id)
+            .map(|held| &held.tags),
+    }
+}
+
+/// As [`resource_tags`], for a call that writes them.
+pub fn resource_tags_mut<'a>(
+    state: &'a mut ComAmazonawsBudgetsAwsbudgetservicegatewayState,
+    target: &TaggedResource,
+) -> Option<&'a mut Vec<ResourceTag>> {
+    match target {
+        TaggedResource::Budget {
+            account_id,
+            budget_name,
+        } => state
+            .budgets
+            .get_mut(&(account_id.clone(), budget_name.clone()))
+            .map(|stored| &mut stored.tags),
+        TaggedResource::Action {
+            account_id,
+            budget_name,
+            action_id,
+        } => state
+            .budgets
+            .get_mut(&(account_id.clone(), budget_name.clone()))?
+            .actions
+            .iter_mut()
+            .find(|held| &held.action.action_id == action_id)
+            .map(|held| &mut held.tags),
+    }
+}
+
+/// How many tags one resource will hold: `ResourceTagList` is `@length(0, 200)`, so a
+/// list of 200 is the longest tag set this service can report for a resource or accept
+/// for one. A write that would take a resource past it is answered with the modelled
+/// `ServiceQuotaExceededException` ("You've reached a Service Quota limit on this
+/// resource"), since the per-REQUEST half of that bound is already refused at the
+/// boundary.
+pub const MAX_TAGS_PER_RESOURCE: usize = 200;
+
+/// The refusal a tag set naming one key twice takes, or `None` when every key in it is
+/// distinct: "each key must be unique for the resource" (`ResourceTags`), so a request
+/// that gives one key two values states no single value for it.
+///
+/// `Err` carries the sentence that goes in `InvalidParameterException$Message`. The key
+/// IS named: it is the caller's own tag key, and the caller cannot fix the request
+/// without knowing which one repeated.
+pub fn duplicate_tag_key_violation(supplied: &[ResourceTag]) -> Option<String> {
+    let mut seen: Vec<&str> = Vec::with_capacity(supplied.len());
+    for tag in supplied {
+        if seen.contains(&tag.key.as_str()) {
+            return Some(format!(
+                "Unable to apply ResourceTags: the tag key {} is given more than once, and \
+                 each key must be unique for the resource.",
+                tag.key
+            ));
+        }
+        seen.push(tag.key.as_str());
+    }
+    None
+}
+
+/// How many tags `held` would hold once `supplied` is applied over it — the count the
+/// ceiling above is checked against, counted BEFORE anything is written so a refused
+/// write changes nothing. A supplied key the resource already carries replaces that
+/// tag's value rather than adding a tag, so only the keys that are new count.
+pub fn tag_count_after(held: &[ResourceTag], supplied: &[ResourceTag]) -> usize {
+    held.len()
+        + supplied
+            .iter()
+            .filter(|tag| !held.iter().any(|existing| existing.key == tag.key))
+            .count()
+}
+
+/// Apply `supplied` over the tags `held` by a resource: a key the resource already
+/// carries takes the supplied value IN PLACE, and a key it does not carry is appended.
+///
+/// Both halves follow from one rule — "each key must be unique for the resource"
+/// (`ResourceTags`): a resource holds at most one tag per key, so tagging a key twice
+/// re-values it. Keeping the existing tag's position makes the tag list's order the
+/// order the keys were first created in, which is what a read reports.
+pub fn apply_tags(held: &mut Vec<ResourceTag>, supplied: Vec<ResourceTag>) {
+    for tag in supplied {
+        match held.iter_mut().find(|existing| existing.key == tag.key) {
+            Some(existing) => existing.value = tag.value,
+            None => held.push(tag),
         }
     }
 }

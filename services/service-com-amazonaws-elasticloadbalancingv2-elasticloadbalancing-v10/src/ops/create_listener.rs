@@ -258,6 +258,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .flatten()
                 .map(|tag| (tag.key.clone(), tag.value.clone().unwrap_or_default()))
                 .collect(),
+            list_certificate_arns: Vec::new(),
+            default_rule_id: String::new(),
             rule_arns: Vec::new(),
         };
 
@@ -335,6 +337,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let id = guard.mint_id();
+        // Every listener has a default rule, minted with it: the rule that carries the
+        // listener's default actions, which `DescribeRules` reports.
+        let default_rule_id = guard.mint_id();
         let type_code = crate::state::load_balancer_type_code(&lb_type);
         let arn = emulator_server::emulator_arn(
             crate::state::SERVICE_NAMESPACE,
@@ -343,6 +348,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         let stored = ListenerRecord {
             arn: arn.clone(),
+            default_rule_id,
             ..candidate
         };
         guard.listeners.insert(arn.clone(), stored);
@@ -360,18 +366,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The listener protocols that terminate TLS at the load balancer, and so are the ones
-/// the model brackets the certificate members for.
-///
-/// From this model's own documentation of `CreateListenerInput$Certificates` —
-/// "[HTTPS and TLS listeners] The default certificate for the listener. You must
-/// provide exactly one certificate." — and of `SslPolicy`, bracketed the same way
-/// (`smithy_query(query="operation",operation="CreateListener")`). `ProtocolEnum`'s
-/// other values (GENEVE, HTTP, QUIC, TCP, TCP_QUIC, TCP_UDP, UDP) are outside that
-/// bracket, as is a listener that names no protocol at all — the model: "You can't
-/// specify a protocol for a Gateway Load Balancer".
-const TLS_TERMINATING_PROTOCOLS: &[&str] = &["HTTPS", "TLS"];
-
 /// Enforce that bracket on the listener's default certificate: a TLS-terminating
 /// listener is created with EXACTLY ONE certificate, carrying the ARN that names it,
 /// and a listener that terminates no TLS is created with none.
@@ -385,7 +379,7 @@ fn check_default_certificate(
     certificates: Option<&[Certificate]>,
 ) -> Result<(), CreateListenerError> {
     let certificates = certificates.unwrap_or_default();
-    let terminates_tls = protocol.is_some_and(|value| TLS_TERMINATING_PROTOCOLS.contains(&value));
+    let terminates_tls = crate::state::terminates_tls(protocol);
     // How the refusal names what it judged, for a listener that names no protocol as
     // well as for one that does.
     let listener = match protocol {
@@ -400,7 +394,7 @@ fn check_default_certificate(
         return Err(crate::scaffolded::Scaffolded::validation_error(format!(
             "Certificates cannot be specified for {listener}: the default certificate \
              applies only to {} listeners",
-            TLS_TERMINATING_PROTOCOLS.join(" and ")
+            crate::state::TLS_TERMINATING_PROTOCOLS.join(" and ")
         )));
     }
 

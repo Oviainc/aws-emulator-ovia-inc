@@ -21,8 +21,9 @@
 //!   NOTHING, and the next `ListTags` proves it;
 //! * a tag set belongs to ONE resource: an ARN that resolves to no resource of this
 //!   store is that resource kind's modelled not-found fault, an ARN that is not a MemoryDB resource
-//!   ARN at all is the modelled 400 `InvalidARNFault`, and an ARN is resolved whole, so
-//!   another region's or partition's copy of a stored name resolves to nothing;
+//!   ARN at all is the modelled 400 `InvalidARNFault`, an ARN whose Region or account is
+//!   not the endpoint's is the modelled 400 `InvalidParameterValueException`, and an ARN
+//!   is resolved whole, so another partition's copy of a stored name resolves to nothing;
 //! * tags are a caller's own metadata on a caller's own resource: a tag key under AWS's
 //!   reserved `aws:` prefix, and a tag mutation on one of the service's own default
 //!   resources, are both the modelled 400;
@@ -934,14 +935,16 @@ async fn an_arn_from_another_scope_does_not_resolve_to_a_stored_resource() {
 
     // And the resource is read from the endpoint whose scope its ARN names, while the
     // SAME ARN sent to another region's endpoint is refused: a regional endpoint serves
-    // its own region's resources.
+    // its own region's resources. The refusals above changed neither.
     let case = "the stored ARN read from its own region";
-    let (status, answered) = call(&router, "ListTags", &json!({ "ResourceArn": resource_arn })).await;
-    assert_eq!(
-        status, 200,
-        "case {case:?}: got {status} with {answered}"
-    );
-    let reported = tag_list(&answered, case);
+    let tags = ok(
+        &router,
+        "ListTags",
+        &json!({ "ResourceArn": resource_arn }),
+        case,
+    )
+    .await;
+    let reported = tag_list(&tags, case);
     assert_eq!(
         reported,
         expected(&[("env", Some("test"))]),

@@ -142,6 +142,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let now = ::std::time::SystemTime::now();
+        // An environment lives in the Region it was created in, so a name is resolved in
+        // the Region this request was signed for and nowhere else.
+        let region = crate::state::request_region(ctx);
 
         // This operation models ONE error (`ResourceNotFoundException`), so there is no
         // modeled server fault to report a missing store with: an engine this service was
@@ -163,7 +166,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // server: it is that front door that refuses an unresolvable name, with its own
         // FIXED, environment-free sentence, not the control plane's request-derived builder
         // (see `crate::state::ENVIRONMENT_ENDPOINT_NOT_FOUND_MESSAGE`).
-        let stored = store.environments.get(&input.name).ok_or_else(|| {
+        let stored = store.environment(&region, &input.name).ok_or_else(|| {
             CreateCliTokenErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
                 message: Some(crate::state::ENVIRONMENT_ENDPOINT_NOT_FOUND_MESSAGE.to_string()),
             })

@@ -1961,6 +1961,22 @@ pub fn resolve_warm_throughput(
     })
 }
 
+/// Whether `candidate` names an Amazon Web Services Region.
+///
+/// `region` is modelled as a plain string (`len 2..25`, with NO pattern and no value
+/// set — smithy_query shape="region"), so the set of values a Region member may name is
+/// not on the wire and cannot be checked at the boundary. The set is the shared catalog
+/// `emulator_telemetry::policy::KNOWN_REGIONS` ("every AWS region the wire may carry,
+/// sorted for binary search", maintained centrally and already a dependency of this
+/// crate) rather than a list copied into this service, so the Regions this service
+/// accepts cannot drift from the ones the rest of the emulator knows. The lookup is the
+/// binary search that ordering is maintained for.
+pub fn is_aws_region(candidate: &str) -> bool {
+    ::emulator_telemetry::policy::KNOWN_REGIONS
+        .binary_search(&candidate)
+        .is_ok()
+}
+
 /// The replication strategy and region list a keyspace is created with.
 ///
 /// A `MULTI_REGION` keyspace's "`regionList` requires the current Region and at
@@ -1969,6 +1985,12 @@ pub fn resolve_warm_throughput(
 /// the list's minimum length, and nothing about the current region or about the
 /// list being required at all, so both are checked here. A `SINGLE_REGION`
 /// keyspace is replicated in the region it was created in.
+///
+/// `regionList` holds "the Amazon Web Services Regions where the keyspace is replicated
+/// in" (`ReplicationSpecification$regionList`), and a keyspace can only be replicated in
+/// a Region that exists — a value naming none is the "invalid or malformed request" the
+/// `ValidationException` covers — so every entry is held to [`is_aws_region`] whatever
+/// the strategy is.
 pub fn resolve_replication(
     supplied: Option<&crate::ops::types::ReplicationSpecification>,
     region: &str,
@@ -1990,6 +2012,16 @@ pub fn resolve_replication(
                  per keyspace",
                 regions.len()
             ));
+        }
+        // Every entry names a Region the keyspace is replicated in, so a value that names
+        // no Region is refused here: the model carries the member's length only.
+        for (index, listed) in regions.iter().enumerate() {
+            if !is_aws_region(listed) {
+                return Err(format!(
+                    "replicationSpecification.regionList[{index}] is '{listed}', which is \
+                     not an Amazon Web Services Region"
+                ));
+            }
         }
     }
     if specification.replication_strategy != MULTI_REGION_STRATEGY {

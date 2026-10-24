@@ -704,6 +704,33 @@ pub fn parameter_group_not_found_message(name: &str) -> String {
     format!("ParameterGroup not found: {name}")
 }
 
+/// The message the `*NotFoundFault` of `kind` carries for the `name` a request named
+/// the resource by DIRECTLY — in a name member, rather than inside an ARN.
+///
+/// ONE sentence per kind, built from the name the request carried, so every operation
+/// that resolves a resource of that kind reports an absent one in the same words. The
+/// sentence differs per kind because the service words it per kind, down to its
+/// punctuation; a call that named the resource through an ARN has its own sentence again
+/// ([`ResourceKind::absent_in_arn_message`]). Where the service is RECORDED wording ONE
+/// operation differently — the delete's [`NO_SUCH_CLUSTER_MESSAGE`] — that operation
+/// states its own sentence rather than this one.
+pub fn not_found_message(kind: ResourceKind, name: &str) -> String {
+    match kind {
+        // The ACL sentence carries no full stop, and the parameter group's names the
+        // group after the complaint rather than before it.
+        ResourceKind::Acl => format!("ACL {name} not found"),
+        ResourceKind::ParameterGroup => parameter_group_not_found_message(name),
+        ResourceKind::Cluster
+        | ResourceKind::User
+        | ResourceKind::Snapshot
+        | ResourceKind::SubnetGroup
+        | ResourceKind::MultiRegionCluster
+        | ResourceKind::MultiRegionParameterGroup => {
+            format!("{} {name} not found.", kind.label())
+        }
+    }
+}
+
 /// The engine default parameter of one family by name, or `None` when that family
 /// carries no parameter with that name.
 pub fn family_parameter(family: &str, name: &str) -> Option<&'static EngineParameter> {
@@ -1702,10 +1729,12 @@ impl ComAmazonawsMemorydbAmazonmemorydbState {
     ///
     /// Tags belong to a resource, so each of `ListTags`, `TagResource` and
     /// `UntagResource` resolves the ARN against this store before reading or writing a
-    /// tag, rather than serving a tag set for an ARN nothing answers for:
+    /// tag, rather than serving a tag set for an ARN nothing answers for. The ARN is
+    /// read in the order the service reads it, and each stage has its own refusal:
     ///
-    /// * an ARN that is not a MemoryDB resource ARN at all —
-    ///   [`TagTargetRejection::InvalidArn`], the 400 `InvalidARNFault`;
+    /// * a value that is not a MemoryDB resource ARN at all —
+    ///   [`TagTargetRejection::InvalidArn`], the 400 `InvalidARNFault`, worded by the
+    ///   stage that refused it ([`ArnRejection::message`]);
     /// * a well-formed one whose region or account is not this endpoint's —
     ///   [`TagTargetRejection::ForeignScope`], the 400
     ///   `InvalidParameterValueException` ([`arn_scope_rejection`]), decided BEFORE the
@@ -1720,11 +1749,8 @@ impl ComAmazonawsMemorydbAmazonmemorydbState {
         resource_arn: &str,
         request_region: &str,
     ) -> Result<String, TagTargetRejection> {
-        let Some(parts) = parse_resource_arn(resource_arn) else {
-            return Err(TagTargetRejection::InvalidArn(format!(
-                "{resource_arn} is not a valid MemoryDB resource ARN."
-            )));
-        };
+        let parts = resolve_resource_arn(resource_arn)
+            .map_err(|rejection| TagTargetRejection::InvalidArn(rejection.message(resource_arn)))?;
         if let Some(message) = arn_scope_rejection(&parts, request_region) {
             return Err(TagTargetRejection::ForeignScope(message));
         }
@@ -1751,7 +1777,7 @@ impl ComAmazonawsMemorydbAmazonmemorydbState {
         }
         Err(TagTargetRejection::NotFound(
             kind,
-            format!("{} {name} not found.", kind.label()),
+            kind.absent_in_arn_message(name),
         ))
     }
 
@@ -2921,6 +2947,30 @@ impl ResourceKind {
         }
     }
 
+    /// How this service states that the resource an ARN-ADDRESSED call named is not
+    /// there, built from the name the ARN carried.
+    ///
+    /// An ARN-addressed call (the three tagging operations) states this in the
+    /// service's own "is either not present or not available" sentence about the NAME —
+    /// not in the "<Kind> <name> not found" form the name-addressed operations use,
+    /// which is why this is its own sentence rather than one built from [`label`].
+    /// The sentence is per kind, down to whether it ends in a full stop, because the
+    /// service words it per kind; the rows are the wording this service's wire answers
+    /// with, and a kind no recorded call covers takes the majority form.
+    ///
+    /// [`label`]: ResourceKind::label
+    pub fn absent_in_arn_message(self, name: &str) -> String {
+        match self {
+            Self::User | Self::Snapshot => format!("{name} is either not present or not available"),
+            Self::Acl => format!("{name} is either not present or not available."),
+            Self::Cluster
+            | Self::ParameterGroup
+            | Self::SubnetGroup
+            | Self::MultiRegionCluster
+            | Self::MultiRegionParameterGroup => format!("{name} is not present"),
+        }
+    }
+
     /// How the service names this kind of resource's IDENTIFIER when it refuses one:
     /// a user is identified by its "User id", every other kind by its name.
     ///
@@ -2998,42 +3048,106 @@ pub struct ResourceArnParts<'a> {
 /// The REGION segment is required only for a regional resource type: a global resource
 /// ([`ResourceKind::is_global`]) belongs to no single region, so its ARN carries no
 /// region and one that omits it is well formed rather than malformed.
+///
+/// This is the `Option` view of [`resolve_resource_arn`], for a caller that only needs
+/// to know WHETHER the value is one of this service's ARNs.
 pub fn parse_resource_arn(resource_arn: &str) -> Option<ResourceArnParts<'_>> {
-    let mut fields = resource_arn.splitn(6, ':');
-    let prefix = fields.next()?;
-    let partition = fields.next()?;
-    let service = fields.next()?;
-    let region = fields.next()?;
-    let account = fields.next()?;
-    let resource = fields.next()?;
-    if prefix != "arn" || partition.is_empty() || service != ARN_NAMESPACE || account.is_empty() {
-        return None;
+    resolve_resource_arn(resource_arn).ok()
+}
+
+/// How many components a resource ARN has: the five of its identity
+/// (`arn`, partition, service, region, account) plus the resource type and the resource
+/// name the resource field carries.
+const ARN_COMPONENTS: usize = 7;
+
+/// Why a value this service was handed as a resource ARN names no MemoryDB resource.
+///
+/// The variants exist because the service reads an ARN in STAGES and states each stage's
+/// failure in its own words: a value that does not even carry the components of a
+/// resource ARN is a different complaint from one that carries them all and names a
+/// resource type this service does not have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArnRejection {
+    /// The value does not carry [`ARN_COMPONENTS`] components at all — it is too short,
+    /// or its resource field names no resource type and name.
+    ComponentCount,
+    /// Every component is there, but the value's identity is not this service's in this
+    /// partition, region and account: the wrong prefix, an empty identity field, or
+    /// another service's namespace.
+    ForeignIdentity,
+    /// A resource ARN of this service whose resource-TYPE component names no resource
+    /// type this service has.
+    UnsupportedResourceType,
+}
+
+impl ArnRejection {
+    /// How the service states this rejection of `resource_arn`.
+    ///
+    /// Each sentence says what the stage that refused the value was reading: how many
+    /// components a resource ARN has, the resource type it names, or — for a value that
+    /// carried both and is still none of this service's ARNs — the value itself, which
+    /// is the only thing left to show the caller.
+    pub fn message(self, resource_arn: &str) -> String {
+        match self {
+            Self::ComponentCount => {
+                format!("Input ARN string does not have {ARN_COMPONENTS} components.")
+            }
+            Self::UnsupportedResourceType => {
+                "Resource Type is either not supported or invalid.".to_string()
+            }
+            Self::ForeignIdentity => {
+                format!("{resource_arn} is not a valid MemoryDB resource ARN.")
+            }
+        }
     }
-    let (resource_type, name) = resource.split_once('/')?;
-    if name.is_empty() {
-        return None;
-    }
-    let (_, kind) = RESOURCE_TYPE_SEGMENTS
+}
+
+/// What a MemoryDB resource ARN names, or WHY it names nothing — the staged read
+/// [`parse_resource_arn`] reports as a plain `Option`.
+///
+/// The stages are in the order the service applies them, which is what decides which
+/// sentence a caller is told (see [`ArnRejection::message`]): the components first, so a
+/// value too short to carry a resource type is never refused for its resource type; then
+/// the resource type, which is what says WHICH resource the rest of the ARN has to
+/// identify; then that identity.
+pub fn resolve_resource_arn(resource_arn: &str) -> Result<ResourceArnParts<'_>, ArnRejection> {
+    let mut fields = resource_arn.splitn(ARN_COMPONENTS - 1, ':');
+    let mut field = || fields.next().ok_or(ArnRejection::ComponentCount);
+    let prefix = field()?;
+    let partition = field()?;
+    let service = field()?;
+    let region = field()?;
+    let account = field()?;
+    // The resource field carries the last TWO components, so a field with no separator
+    // in it leaves the ARN one component short.
+    let (resource_type, name) = field()?
+        .split_once('/')
+        .ok_or(ArnRejection::ComponentCount)?;
+    let Some((_, kind)) = RESOURCE_TYPE_SEGMENTS
         .iter()
-        .find(|(segment, _)| *segment == resource_type)?;
-    if region.is_empty() && !kind.is_global() {
-        return None;
+        .find(|(segment, _)| *segment == resource_type)
+    else {
+        return Err(ArnRejection::UnsupportedResourceType);
+    };
+    // The region segment is part of a REGIONAL resource's identity and is absent from a
+    // global one's, so which of the two this type is decides whether an empty region
+    // segment is an incomplete identity or the only correct one.
+    if prefix != "arn"
+        || partition.is_empty()
+        || service != ARN_NAMESPACE
+        || (region.is_empty() && !kind.is_global())
+        || account.is_empty()
+        || name.is_empty()
+    {
+        return Err(ArnRejection::ForeignIdentity);
     }
-    Some(ResourceArnParts {
+    Ok(ResourceArnParts {
         kind: *kind,
         name,
         region,
         account,
     })
 }
-
-/// What the service answers a well-formed ARN whose scope is not the endpoint's with.
-///
-/// Fixed text: the request named a region or an account this endpoint does not serve,
-/// so there is no value of the request to quote back — the caller is told which two
-/// parts of the ARN to look at.
-pub const FOREIGN_SCOPE_MESSAGE: &str =
-    "Please check the region or customer ID specified in the request.";
 
 /// Why `parts` names a scope this endpoint does not serve, or `None` when it names this
 /// endpoint's own region and account.
@@ -3042,12 +3156,33 @@ pub const FOREIGN_SCOPE_MESSAGE: &str =
 /// caller's account, so an ARN naming another region or another account names nothing
 /// this endpoint can act on — which is a parameter VALUE the service refuses, not a
 /// resource that happens to be missing. A global resource has no region of its own, so
-/// only its account is compared.
+/// only its account is compared. Which of the two it is decides the sentence: the
+/// service words a foreign region and a foreign account differently
+/// ([`FOREIGN_REGION_MESSAGE`], [`FOREIGN_ACCOUNT_MESSAGE`]).
 pub fn arn_scope_rejection(parts: &ResourceArnParts<'_>, request_region: &str) -> Option<String> {
-    let foreign_account = parts.account != ::engine::emulator_account_id();
-    let foreign_region = !parts.kind.is_global() && parts.region != request_region;
-    (foreign_account || foreign_region).then(|| FOREIGN_SCOPE_MESSAGE.to_string())
+    if !parts.kind.is_global() && parts.region != request_region {
+        return Some(FOREIGN_REGION_MESSAGE.to_string());
+    }
+    (parts.account != ::engine::emulator_account_id())
+        .then(|| FOREIGN_ACCOUNT_MESSAGE.to_string())
 }
+
+/// How this service states that a resource ARN names another REGION than the one the
+/// call was served in.
+///
+/// It names both the Region and the account because the service does not say which of
+/// the two it read the ARN's Region against: the caller's fix is to make the ARN and the
+/// endpoint agree.
+pub const FOREIGN_REGION_MESSAGE: &str =
+    "Please check the region or customer ID specified in the request.";
+
+/// How this service states that a resource ARN names another ACCOUNT than the caller's.
+///
+/// A separate sentence from [`FOREIGN_REGION_MESSAGE`], because an ARN in the right
+/// Region and the wrong account is a different thing for the caller to fix: no endpoint
+/// of theirs reaches it.
+pub const FOREIGN_ACCOUNT_MESSAGE: &str =
+    "The resource ARN does not belong to the caller's account.";
 
 /// Why a tagging call's `ResourceArn` names no resource of this service
 /// (see [`ComAmazonawsMemorydbAmazonmemorydbState::tag_target`]).
@@ -3060,11 +3195,13 @@ pub fn arn_scope_rejection(parts: &ResourceArnParts<'_>, request_region: &str) -
 pub enum TagTargetRejection {
     /// The ARN is not a MemoryDB resource ARN at all: the 400 `InvalidARNFault`.
     InvalidArn(String),
-    /// The ARN is well formed but names another region or another account: the 400
-    /// `InvalidParameterValueException` (see [`arn_scope_rejection`]).
+    /// The ARN is one of this service's, but names another region or another account:
+    /// the 400 `InvalidParameterValueException`, worded for whichever of the two it is
+    /// ([`arn_scope_rejection`]). It is the REQUEST that is at odds with the ARN, not
+    /// the resource that is missing, so this is not a not-found fault.
     ForeignScope(String),
-    /// The ARN is well formed but names no resource in this store: that kind's
-    /// not-found fault.
+    /// The ARN is well formed and in scope but names no resource in this store: that
+    /// kind's not-found fault.
     NotFound(ResourceKind, String),
 }
 

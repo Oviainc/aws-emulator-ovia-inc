@@ -224,6 +224,11 @@ pub(crate) async fn taggable_resources(
     );
     let proposal_id = answer.text(&["ProposalId"]);
 
+    // The node was just created, and so were the network and its founding member: a
+    // tagging operation is refused while a resource is still `CREATING`, so the caller
+    // gets back resources the clock owes nothing.
+    tokio::time::sleep(PAST_TRANSITION).await;
+
     vec![
         Resource {
             case: "accessor",

@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateRumMetricDefinition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateRumMetricDefinition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateRumMetricDefinition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces ONE metric definition of one extended-metrics destination of the app monitor
+//! the request names, in this service's persisted state. The definition is addressed by
+//! the destination it was created under (`Destination` plus the Evidently experiment ARN,
+//! [`crate::state::MetricDestinationKey`]) and by its `MetricDefinitionId`, and the WHOLE
+//! definition is replaced under that id — the request carries "the new definition that you
+//! want to use for this metric" — so the id a caller holds keeps naming the same metric.
+//! `BatchGetRumMetricDefinitions` reads the same map back.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +159,128 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateRumMetricDefinition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateRumMetricDefinitionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateRumMetricDefinition"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateRumMetricDefinitionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::NO_STORE.to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        // `DestinationArn` is modelled `length 0..2048`, so an empty ARN can reach here;
+        // it names no experiment, so it is the same input as an absent one and addresses
+        // the destination that has no ARN.
+        let destination_arn = input
+            .destination_arn
+            .as_deref()
+            .map(str::trim)
+            .filter(|arn| !arn.is_empty());
+
+        // The prose-only pairing every metrics call of this service shares: an Evidently
+        // destination is identified by an experiment ARN and a CloudWatch one carries
+        // none.
+        if let Some(message) =
+            crate::state::metric_destination_choice_refusal(&input.destination, destination_arn)
+        {
+            return Err(UpdateRumMetricDefinitionErrorModeled::ValidationException(
+                ValidationException { message },
+            )
+            .into());
+        }
+        // The new definition is judged exactly as the batch create judges one, so an
+        // update cannot store a definition a create would have refused.
+        if let Some(message) = crate::state::metric_definition_refusal(&input.metric_definition) {
+            return Err(UpdateRumMetricDefinitionErrorModeled::ValidationException(
+                ValidationException { message },
+            )
+            .into());
+        }
+
+        // May this caller change THIS app monitor's metrics? Decided per call from the
+        // caller's identity-based policies and the monitor's resource policy, with the
+        // monitor and the policy in force read under a SHORT lock.
+        let (resource_arn, held_policy) = {
+            let store = state.lock();
+            let Some(record) = store.app_monitors.get(&input.app_monitor_name) else {
+                return Err(
+                    UpdateRumMetricDefinitionErrorModeled::ResourceNotFoundException(
+                        crate::state::app_monitor_not_found(&input.app_monitor_name),
+                    )
+                    .into(),
+                );
+            };
+            (record.arn.clone(), record.resource_policy_document())
+        };
+        if let Err(denial) = crate::state::authorization::authorize(
+            &*self.engine,
+            ctx,
+            crate::state::authorization::UPDATE_RUM_METRIC_DEFINITION,
+            &resource_arn,
+            held_policy.as_deref(),
+            &[],
+        ) {
+            return Err(UpdateRumMetricDefinitionErrorModeled::AccessDeniedException(
+                crate::state::access_denied(&denial),
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        let Some(monitor) = store.app_monitors.get_mut(&input.app_monitor_name) else {
+            return Err(
+                UpdateRumMetricDefinitionErrorModeled::ResourceNotFoundException(
+                    crate::state::app_monitor_not_found(&input.app_monitor_name),
+                )
+                .into(),
+            );
+        };
+
+        // A definition lives under the destination it was created for, so a pair naming a
+        // destination this monitor does not have addresses no definition at all — a
+        // different missing resource from a definition id that is not there, and reported
+        // as such.
+        if !monitor.has_metric_destination(&input.destination, destination_arn) {
+            return Err(
+                UpdateRumMetricDefinitionErrorModeled::ResourceNotFoundException(
+                    crate::state::metric_destination_not_found(
+                        &input.app_monitor_name,
+                        &input.destination,
+                        destination_arn,
+                    ),
+                )
+                .into(),
+            );
+        }
+        let Some(stored) = monitor.metric_definition_mut(
+            &input.destination,
+            destination_arn,
+            &input.metric_definition_id,
+        ) else {
+            return Err(
+                UpdateRumMetricDefinitionErrorModeled::ResourceNotFoundException(
+                    crate::state::metric_definition_not_found(
+                        &input.app_monitor_name,
+                        &input.metric_definition_id,
+                    ),
+                )
+                .into(),
+            );
+        };
+
+        // "Modifies one existing metric definition": the whole definition is replaced by
+        // the one the request carried, and the id is NOT part of what a caller may change
+        // — it stays the id the create minted, which is what makes this an update of that
+        // metric rather than the creation of a second one.
+        *stored = crate::state::MetricDefinitionRecord::from_request(
+            &input.metric_definition_id,
+            &input.metric_definition,
+        );
+
+        // `UpdateRumMetricDefinitionResponse` models no members: what the call did is
+        // observable through `BatchGetRumMetricDefinitions`, which reads the map this
+        // write changed.
+        Ok(UpdateRumMetricDefinitionOutput {})
     }
 }

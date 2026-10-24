@@ -27,8 +27,9 @@
 //!   express — and one judged over the whole value, including the non-ASCII word
 //!   characters that pattern admits;
 //! * `DisassociateFeed` RELEASES the named resource, disables every output and archives
-//!   the feed, irreversibly: an `ARCHIVED` feed takes no further association and cannot
-//!   be released again; a name that is not the associated resource's is refused;
+//!   the feed, irreversibly: an `ARCHIVED` feed takes no further association and no other
+//!   resource can be released from it (a RETRY of the release that was served is
+//!   `feed_release_retry.rs`); a name that is not the associated resource's is refused;
 //! * `dryRun` on either operation validates and persists NOTHING, so a later read
 //!   reports the feed unchanged;
 //! * an id no live feed has is `ResourceNotFoundException` (HTTP 404) on both.
@@ -745,17 +746,25 @@ async fn disassociate_releases_the_resource_and_archives_the_feed_irreversibly()
             "case {label:?}: every output in the feed becomes DISABLED, got {statuses:?}"
         );
 
-        // Irreversible: the feed takes no further association, and cannot be released
-        // again.
+        // Irreversible: the feed takes no further association, and no OTHER resource can
+        // be released from it. (Repeating the release that WAS served is that one release
+        // again under its idempotency token, not a second release — `feed_release_retry.rs`.)
         let (status, error) = associate(&router, &id, &case.resource, json!([])).await;
         assert_eq!(
             status, 400,
             "case {label:?}: re-associating an ARCHIVED feed is a 400, got {status} with {error}"
         );
-        let (status, error) = disassociate(&router, &id, &case.resource).await;
+        // A name no row releases, and well inside the member's `@length` 1..2048.
+        let other_resource = "another-media";
+        assert_ne!(
+            other_resource, case.resource,
+            "case {label:?}: the other name must not be the released resource's"
+        );
+        let (status, error) = disassociate(&router, &id, other_resource).await;
         assert_eq!(
             status, 400,
-            "case {label:?}: releasing it again is a 400, got {status} with {error}"
+            "case {label:?}: releasing another resource from it is a 400, got {status} with \
+             {error}"
         );
         assert_eq!(
             error["__type"],

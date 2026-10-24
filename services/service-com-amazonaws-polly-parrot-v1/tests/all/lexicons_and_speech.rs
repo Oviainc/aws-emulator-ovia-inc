@@ -54,13 +54,27 @@ impl Polly {
         path: &str,
         body: &str,
     ) -> http::Response<Bytes> {
+        self.call_in_region(REGION, method, path, body).await
+    }
+
+    /// The same call signed for `region`, for a suite about a Region-scoped resource.
+    ///
+    /// The credential scope is what names the Region, exactly as it does for a real
+    /// SDK client configured for one.
+    pub(crate) async fn call_in_region(
+        &self,
+        region: &str,
+        method: &str,
+        path: &str,
+        body: &str,
+    ) -> http::Response<Bytes> {
         let request = http::Request::builder()
             .method(method)
-            .uri(format!("https://polly.{REGION}.amazonaws.com{path}"))
+            .uri(format!("https://polly.{region}.amazonaws.com{path}"))
             .header(
                 "authorization",
                 format!(
-                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/polly/aws4_request, \
+                    "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/polly/aws4_request, \
                      SignedHeaders=host, Signature=0"
                 ),
             )
@@ -71,20 +85,57 @@ impl Polly {
     }
 
     pub(crate) async fn put_lexicon(&self, name: &str, content: &str) -> http::Response<Bytes> {
+        self.put_lexicon_in(REGION, name, content).await
+    }
+
+    /// `PutLexicon` signed for `region`.
+    pub(crate) async fn put_lexicon_in(
+        &self,
+        region: &str,
+        name: &str,
+        content: &str,
+    ) -> http::Response<Bytes> {
         let body = serde_json::json!({ "Content": content }).to_string();
-        self.call("PUT", &format!("/v1/lexicons/{name}"), &body).await
+        self.call_in_region(region, "PUT", &format!("/v1/lexicons/{name}"), &body)
+            .await
     }
 
     pub(crate) async fn get_lexicon(&self, name: &str) -> http::Response<Bytes> {
-        self.call("GET", &format!("/v1/lexicons/{name}"), "").await
+        self.get_lexicon_in(REGION, name).await
+    }
+
+    /// `GetLexicon` signed for `region`.
+    pub(crate) async fn get_lexicon_in(&self, region: &str, name: &str) -> http::Response<Bytes> {
+        self.call_in_region(region, "GET", &format!("/v1/lexicons/{name}"), "")
+            .await
     }
 
     pub(crate) async fn delete_lexicon(&self, name: &str) -> http::Response<Bytes> {
-        self.call("DELETE", &format!("/v1/lexicons/{name}"), "").await
+        self.delete_lexicon_in(REGION, name).await
+    }
+
+    /// `DeleteLexicon` signed for `region`.
+    pub(crate) async fn delete_lexicon_in(
+        &self,
+        region: &str,
+        name: &str,
+    ) -> http::Response<Bytes> {
+        self.call_in_region(region, "DELETE", &format!("/v1/lexicons/{name}"), "")
+            .await
     }
 
     pub(crate) async fn list_lexicons(&self, query: &str) -> http::Response<Bytes> {
-        self.call("GET", &format!("/v1/lexicons{query}"), "").await
+        self.list_lexicons_in(REGION, query).await
+    }
+
+    /// `ListLexicons` signed for `region`.
+    pub(crate) async fn list_lexicons_in(
+        &self,
+        region: &str,
+        query: &str,
+    ) -> http::Response<Bytes> {
+        self.call_in_region(region, "GET", &format!("/v1/lexicons{query}"), "")
+            .await
     }
 
     pub(crate) async fn describe_voices(&self, query: &str) -> http::Response<Bytes> {
@@ -93,6 +144,16 @@ impl Polly {
 
     pub(crate) async fn synthesize(&self, request: &serde_json::Value) -> http::Response<Bytes> {
         self.call("POST", "/v1/speech", &request.to_string()).await
+    }
+
+    /// `SynthesizeSpeech` signed for `region`.
+    pub(crate) async fn synthesize_in(
+        &self,
+        region: &str,
+        request: &serde_json::Value,
+    ) -> http::Response<Bytes> {
+        self.call_in_region(region, "POST", "/v1/speech", &request.to_string())
+            .await
     }
 }
 
@@ -128,7 +189,10 @@ fn header(response: &http::Response<Bytes>, name: &str) -> String {
 }
 
 /// A PLS lexicon with `lexemes` lexemes in `alphabet` for `language`.
-fn pls(alphabet: &str, language: &str, lexemes: usize) -> String {
+///
+/// `pub(crate)` for the same reason as the harness: every suite builds its documents
+/// here rather than keeping a second definition of a valid one.
+pub(crate) fn pls(alphabet: &str, language: &str, lexemes: usize) -> String {
     let body: String = (0..lexemes)
         .map(|i| {
             format!(
@@ -247,7 +311,7 @@ async fn a_lexicon_round_trips_through_state_and_is_replaced_in_place() {
 }
 
 /// The names `ListLexicons` reported.
-fn listed_names(body: &serde_json::Value) -> BTreeSet<String> {
+pub(crate) fn listed_names(body: &serde_json::Value) -> BTreeSet<String> {
     body["Lexicons"]
         .as_array()
         .expect("Lexicons is a list")

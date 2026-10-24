@@ -25,10 +25,11 @@
 //! `DetectorId` this account/Region does not own is refused the same way.
 //!
 //! The contract below also refuses a disassociation "with autoEnableOrganizationMembers
-//! configuration for your organization set to ALL". That configuration is not modelled
-//! yet — `UpdateOrganizationConfiguration` and `DescribeOrganizationConfiguration` are
-//! still scaffolds — so no request can set it and no call can be refused for it; when
-//! they are implemented, that refusal belongs here.
+//! configuration for your organization set to ALL". That configuration is now stored —
+//! `UpdateOrganizationConfiguration` writes it and `DescribeOrganizationConfiguration`
+//! reports it — so the refusal is implementable here; it is this operation's own
+//! behaviour and is not modelled yet, so a disassociation succeeds whatever the
+//! organization's auto-enablement says.
 //!
 //! The deprecated twin `DisassociateFromMasterAccount` ("this operation is deprecated,
 //! use DisassociateFromAdministratorAccount instead",

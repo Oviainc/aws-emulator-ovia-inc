@@ -216,8 +216,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A campaign in a terminal lifecycle state takes no further configuration
         // change (see `CampaignState::accepts_configuration_change`), which is what
-        // this operation's `InvalidCampaignStateException` reports.
-        let current = campaign.state;
+        // this operation's `InvalidCampaignStateException` reports. The state is the
+        // one the campaign is at NOW: a campaign whose scheduled run window has
+        // closed has finished, so it is past being reconfigured.
+        let current = campaign.state_at(::std::time::SystemTime::now());
         if !current.accepts_configuration_change() {
             return Err(
                 UpdateCampaignCommunicationLimitsErrorModeled::InvalidCampaignStateException(

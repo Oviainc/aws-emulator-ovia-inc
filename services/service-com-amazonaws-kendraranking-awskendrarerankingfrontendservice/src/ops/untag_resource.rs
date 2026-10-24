@@ -157,6 +157,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut store = state.lock();
+        // Every key here is a `TagKey`, so the documented character set applies to it
+        // as it does to a key being written ("A tag key and value can consist of
+        // Unicode letters, digits, white space, and any of the following symbols:
+        // _ . : / = + - @." — `Tag`): a key outside it is refused with the modelled
+        // `ValidationException` before any removal, and the request names nothing the
+        // service could hold.
+        if let Some(rejection) = crate::state::tag_key_rejection(TAG_KEYS_MEMBER, &input.tag_keys) {
+            return Err(UntagResourceErrorModeled::ValidationException(rejection).into());
+        }
+
         // An ARN this emulator holds no rescore execution plan under names no taggable
         // resource: the modelled `ResourceUnavailableException` (HTTP 404).
         let Some(plan) = store.plan_by_arn_mut(&input.resource_arn) else {
@@ -181,3 +191,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(UntagResourceOutput {})
     }
 }
+
+/// The request member holding the keys this operation removes, as the dotted path of a
+/// validation clause spells it.
+const TAG_KEYS_MEMBER: &str = "tagKeys";

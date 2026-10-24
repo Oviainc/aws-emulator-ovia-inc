@@ -167,6 +167,9 @@ mod node_lifecycle;
 #[path = "all/offering_catalog.rs"]
 mod offering_catalog;
 
+#[path = "all/partner_input.rs"]
+mod partner_input;
+
 #[path = "all/rejection_messages.rs"]
 mod rejection_messages;
 

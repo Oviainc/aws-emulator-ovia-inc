@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateApplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: a PARTIAL UPDATE of one stored application. `ApplicationArn` names the
+//! application to update; every other member is optional, and only the ones the request
+//! CARRIES are written, so an absent member leaves the stored value exactly as it was.
+//! This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `UpdateApplicationPortalOptions` carries ONLY `SignInOptions`
+//! (`smithy_query(query="shape",shape="UpdateApplicationPortalOptions")`), so a portal
+//! options update replaces the application's sign-in options and leaves its stored
+//! `Visibility` alone: this operation cannot change visibility at all.
+//!
+//! An `ApplicationArn` this account holds no application for is a
+//! `ResourceNotFoundException` (404), and a `SignInOptions` naming the `APPLICATION`
+//! origin without an `ApplicationUrl` is refused with the modelled `ValidationException`
+//! (400) — the same conditional requirement `CreateApplication` enforces.
+//!
+//! The response models no members: the updated record is read back through
+//! `DescribeApplication`.
 //!
 //! ## Shape of an operation
 //!
@@ -123,6 +131,21 @@ impl From<UpdateApplicationErrorModeled> for UpdateApplicationError {
     }
 }
 
+/// The modelled refusal for a request this operation's documented rules reject.
+///
+/// This operation's model declares its own `ValidationException` ("The request failed
+/// because it contains a syntax error", HTTP 400), so a refusal uses THAT shape rather
+/// than the scaffold's synthetic one. `Reason` is left absent: every value the model's
+/// `ValidationExceptionReason` enum carries reports a KMS key fault, and this refusal
+/// inspects no key.
+fn validation(message: impl Into<String>) -> UpdateApplicationError {
+    UpdateApplicationErrorModeled::ValidationException(ValidationException {
+        message: Some(message.into()),
+        reason: None,
+    })
+    .into()
+}
+
 /// The `UpdateApplication` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -159,18 +182,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateApplication"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateApplicationErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the SSO Admin state store is unavailable".to_string()),
+            })
+        })?;
+
+        // `SignInOptions$ApplicationUrl` is "a required parameter if the Origin parameter
+        // is APPLICATION" — a conditional requirement the model cannot express, so the
+        // boundary validator passed the request and this is where it is refused. The
+        // update REPLACES the sign-in options rather than merging into them (the member is
+        // a structure, not a map of fields), so the URL has to arrive with the origin
+        // instead of being inherited from the options this call overwrites.
+        if let Some(options) = input
+            .portal_options
+            .as_ref()
+            .and_then(|portal| portal.sign_in_options.as_ref())
+        {
+            if options.origin == crate::state::SIGN_IN_ORIGIN_APPLICATION
+                && options
+                    .application_url
+                    .as_ref()
+                    .is_none_or(|url| url.is_empty())
+            {
+                return Err(validation(crate::state::APPLICATION_URL_REQUIRED_MESSAGE));
+            }
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // What the CLOCK already owes every instance, plus the account's ambient instance
+        // if nothing has enabled one yet, so this update resolves the same application a
+        // read at this instant would resolve — an application whose instance has since
+        // gone is gone with it.
+        store.on_request(&region, ::std::time::SystemTime::now());
+
+        // Never created, or created under an instance that has since gone — the same
+        // answer either way: there is no such application to update.
+        let record = store.application_mut(&input.application_arn).ok_or_else(|| {
+            UpdateApplicationErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(crate::state::application_not_found_message(
+                    &input.application_arn,
+                )),
+                // The model's `ResourceNotFoundExceptionReason` enum carries only KMS key
+                // states, none of which this refusal is.
+                reason: None,
+            })
+        })?;
+
+        // Only the members the request CARRIES are written: an absent member leaves the
+        // stored value alone, so a caller renaming an application cannot silently clear
+        // its description or re-enable it.
+        if let Some(name) = input.name {
+            record.name = name;
+        }
+        if let Some(description) = input.description {
+            record.description = Some(description);
+        }
+        if let Some(status) = input.status {
+            record.status = status;
+        }
+        if let Some(portal_options) = input.portal_options {
+            // `UpdateApplicationPortalOptions` models `SignInOptions` ONLY, so the stored
+            // `Visibility` survives this update: no member of this request could carry
+            // another value for it.
+            if let Some(sign_in_options) = portal_options.sign_in_options {
+                record.portal_options.sign_in_options = Some(sign_in_options);
+            }
+        }
+        // `client_token` and `request_fingerprint` are deliberately untouched: they record
+        // the CREATE this application came from, which is what tells a retry of that
+        // create from the same token carrying a different request.
+
+        // `UpdateApplicationResponse` models no members: the updated record is read back
+        // through `DescribeApplication`.
+        Ok(UpdateApplicationOutput {})
     }
 }

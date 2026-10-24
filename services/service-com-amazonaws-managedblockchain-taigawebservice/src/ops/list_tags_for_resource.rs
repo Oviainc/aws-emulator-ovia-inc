@@ -3,7 +3,9 @@
 //! @op ListTagsForResource
 //! Implemented: reports the tag set the resource named by `ResourceArn` holds in
 //! [`crate::state`] — the one set `TagResource`, `UntagResource` and every create's
-//! `Tags` write to.
+//! `Tags` write to. A resource the service is still creating, or has already begun
+//! removing, isn't in a status that can complete the operation
+//! ([`crate::state::is_transient_status`]), so such a request is refused.
 //!
 //! ## Shape of an operation
 //!
@@ -174,6 +176,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut guard = state.lock();
         guard.settle(::std::time::SystemTime::now());
+
+        // "The requested resource exists but isn't in a status that can complete the
+        // operation" (`ResourceNotReadyException`, HTTP 409): a resource the service has
+        // not finished creating, or has already begun removing, has no tag set this
+        // operation can report yet.
+        if let Some(refusal) =
+            guard.not_ready_refusal(&region, resource_type, &input.resource_arn)
+        {
+            return Err(
+                ListTagsForResourceErrorModeled::ResourceNotReadyException(refusal).into(),
+            );
+        }
 
         // An ARN of another Region names no resource this Region holds — see the same
         // Region check in `tag_resource.rs`.

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListUserPools
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListUserPools`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListUserPools::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! REPORTS every stored user pool as a short description, in ascending
+//! `UserPoolId` order, a page of at most `MaxResults` entries at a time.
+//! `src/state.rs` owns the pool record, the short rendering of it and the page
+//! token codec; this file owns this request's own refusal.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +155,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListUserPools` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListUserPoolsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListUserPools"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        // A read: this handler takes the lock to READ and writes nothing.
+        let guard = state.lock();
+        // The pools are stored keyed by their minted id, so ascending id is a
+        // stable order over the whole store — the order a page token indexes
+        // into.
+        let mut ids: Vec<String> = guard.user_pools.keys().cloned().collect();
+        ids.sort();
+
+        // The listing a page token belongs to: this operation, over every pool
+        // this emulator holds.
+        let page = crate::state::page_of(
+            Self::NAME,
+            &ids,
+            Some(input.max_results),
+            input.next_token.as_deref(),
+        )
+        .ok_or_else(invalid_next_token)?;
+
+        // Rendered from the STORED pools, so an entry is what a later read of
+        // that one pool sees.
+        let user_pools: Vec<UserPoolDescriptionType> = page
+            .keys
+            .iter()
+            .filter_map(|id| guard.pool(id))
+            .map(crate::state::UserPool::to_user_pool_description_type)
+            .collect();
+
+        // A listing's result member is PRESENT and empty when the account holds
+        // no pool, which is what a paginating client reads.
+        Ok(ListUserPoolsOutput {
+            user_pools: Some(user_pools),
+            next_token: page.next_token,
+        })
     }
 }
+
+/// This operation's `InvalidParameterException` for a `NextToken` that names no
+/// page of this listing.
+fn invalid_next_token() -> ListUserPoolsError {
+    ListUserPoolsErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some("NextToken is not a pagination token this operation issued".to_string()),
+        // `reasonCode` is AWS's own classification of the bad parameter and
+        // this service's model documents no value for it, so nothing is
+        // invented here.
+        reason_code: None,
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> ListUserPoolsError {
+    ListUserPoolsErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
+}
+

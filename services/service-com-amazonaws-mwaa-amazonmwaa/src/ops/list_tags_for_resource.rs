@@ -139,8 +139,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let now = ::std::time::SystemTime::now();
+        // An environment lives in the Region it was created in, so an ARN is resolved in
+        // the Region this request was signed for and nowhere else.
+        let region = crate::state::request_region(ctx);
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListTagsForResourceErrorModeled::InternalServerException(InternalServerException {
@@ -151,11 +153,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The only write a report may make: the transitions the clock already owes.
         store.settle(now);
 
-        let stored = store.environment_by_arn(&input.resource_arn).ok_or_else(|| {
-            // The same refusal the other two tagging operations answer for the same
-            // lookup: HTTP 404 with the published wire code `NotFoundException`.
-            crate::scaffolded::Scaffolded::not_found(crate::state::RESOURCE_NOT_FOUND_MESSAGE)
-        })?;
+        let stored = store
+            .environment_by_arn(&region, &input.resource_arn)
+            .ok_or_else(|| {
+                // The same refusal the other two tagging operations answer for the same
+                // lookup: HTTP 404 with the published wire code `NotFoundException`.
+                crate::scaffolded::Scaffolded::not_found(crate::state::RESOURCE_NOT_FOUND_MESSAGE)
+            })?;
 
         // `TagMap` is `@length(1, 50)`, so an untagged environment reports no `Tags`
         // member rather than an empty map outside that bound.

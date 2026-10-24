@@ -323,7 +323,7 @@ async fn a_scaffolded_operation_still_answers_501() {
     // Rows: operations this crate has not implemented yet, control plane and data
     // plane (`grep -l 'SCAFFOLDED, NOT IMPLEMENTED' src/ops/`).
     let cases: Vec<(&str, Value)> = vec![
-        ("ListResourceTags", json!({"KeyId": key_id})),
+        ("ListKeyRotations", json!({"KeyId": key_id})),
         ("ListKeyPolicies", json!({"KeyId": key_id})),
         ("ListKeyRotations", json!({"KeyId": key_id})),
         (
@@ -432,6 +432,9 @@ async fn a_failed_key_id_lookup_names_the_resource_the_request_asked_for() {
             "EnableKey",
             "CancelKeyDeletion",
             "UpdateKeyDescription",
+            "TagResource",
+            "UntagResource",
+            "ListResourceTags",
             "Encrypt",
         ] {
             let mut body = json!({"KeyId": identifier});
@@ -440,6 +443,12 @@ async fn a_failed_key_id_lookup_names_the_resource_the_request_asked_for() {
             }
             if operation == "UpdateKeyDescription" {
                 body["Description"] = json!("nowhere");
+            }
+            if operation == "TagResource" {
+                body["Tags"] = json!([{"TagKey": "owner", "TagValue": "nobody"}]);
+            }
+            if operation == "UntagResource" {
+                body["TagKeys"] = json!(["owner"]);
             }
             let (status, payload) = call(&router, region, operation, &body).await;
             let code = error_code(&payload);

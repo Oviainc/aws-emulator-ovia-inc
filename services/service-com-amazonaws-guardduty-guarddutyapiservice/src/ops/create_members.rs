@@ -19,10 +19,9 @@
 //!
 //! What this does NOT model yet, each belonging to its own operation: enabling
 //! GuardDuty in the member account (the member account's own detector is not a
-//! resource this emulator holds), the organization auto-enable settings
-//! (`UpdateOrganizationConfiguration` is still a scaffold) and the invitation flow
-//! (`InviteMembers` is still a scaffold), so a recorded member's
-//! `RelationshipStatus` is `Created` until an invitation is modelled.
+//! resource this emulator holds) and the invitation flow (`InviteMembers` is still
+//! a scaffold), so a recorded member's `RelationshipStatus` is `Created` until an
+//! invitation is modelled.
 //!
 //! This is the ONLY file to touch for this operation.
 //!

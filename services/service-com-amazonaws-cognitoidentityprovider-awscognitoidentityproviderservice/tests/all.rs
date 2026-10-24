@@ -33,6 +33,8 @@ mod identity_provider_lifecycle;
 mod initiate_auth;
 #[path = "all/list_devices.rs"]
 mod list_devices;
+#[path = "all/list_user_pools.rs"]
+mod list_user_pools;
 #[path = "all/resource_server_lifecycle.rs"]
 mod resource_server_lifecycle;
 #[path = "all/state_roundtrip.rs"]

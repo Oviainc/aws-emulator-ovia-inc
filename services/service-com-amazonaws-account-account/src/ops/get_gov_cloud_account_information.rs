@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetGovCloudAccountInformation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetGovCloudAccountInformation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the GovCloud account LINKED to a standard account: the 12-digit id of
+//! that GovCloud account and the GovCloud account's own state, read from the
+//! link the store holds against the standard account record
+//! (`crate::state::GovCloudAccountLink`). A REPORT only — it creates and changes
+//! nothing, so the link a caller reads is the one the store already held.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetGovCloudAccountInformation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The standard account is the one `StandardAccountId` names, else the caller's
+//! own (`crate::state::resolve_account_id`), which is the standalone call the
+//! model documents. A standard account this emulator holds no record of is the
+//! same authorization refusal every other reader of this service answers
+//! (`AccessDeniedException`); a record that carries no link has no GovCloud
+//! account to report, which is the modelled `ResourceNotFoundException`.
+//! `ResourceUnavailableException` is never answered: nothing here makes a
+//! GovCloud account a resource that exists and is momentarily unavailable.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +168,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetGovCloudAccountInformation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetGovCloudAccountInformationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetGovCloudAccountInformation"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetGovCloudAccountInformationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: crate::state::STORE_UNAVAILABLE.to_string(),
+                        error_type: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let standard_account_id =
+            crate::state::resolve_account_id(input.standard_account_id.as_deref());
+        // A REPORTING operation: the store is read, never written, so no record
+        // and no link is created here and a later caller sees exactly what this
+        // one saw.
+        let store = state.lock();
+        let Some(account) = store.account(&standard_account_id) else {
+            // Naming another account requires the caller to be an identity in
+            // the organization's management account, with the named account a
+            // member of the same organization. An account this emulator holds
+            // no record of is outside that organization, so the refusal is the
+            // authorization one every other reader of this service answers —
+            // not the "resource can't be found" below, which is about the
+            // GovCloud account of an account the caller may read.
+            return Err(
+                GetGovCloudAccountInformationErrorModeled::AccessDeniedException(
+                    crate::state::account_not_accessible(&standard_account_id),
+                )
+                .into(),
+            );
+        };
+
+        let Some(link) = account.gov_cloud_account.as_ref() else {
+            // The account is readable and simply has no GovCloud account linked
+            // to it: the operation reports a linked GovCloud account "if it
+            // exists", so there is no resource to report.
+            return Err(
+                GetGovCloudAccountInformationErrorModeled::ResourceNotFoundException(
+                    crate::state::gov_cloud_account_not_linked(&standard_account_id),
+                )
+                .into(),
+            );
+        };
+
+        Ok(GetGovCloudAccountInformationOutput {
+            gov_cloud_account_id: link.gov_cloud_account_id.clone(),
+            // The LINKED account's own state, as the store holds it — never the
+            // standard account's.
+            account_state: link.state.clone(),
+        })
     }
 }

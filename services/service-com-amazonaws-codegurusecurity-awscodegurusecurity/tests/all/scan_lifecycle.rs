@@ -180,7 +180,7 @@ pub(crate) async fn create_scan(
 }
 
 /// `CreateUploadUrl` + `CreateScan` for `scan_name`, asserting both succeeded.
-async fn start_scan(router: &MultiServiceRouter, scan_name: &str) -> Answer {
+pub(crate) async fn start_scan(router: &MultiServiceRouter, scan_name: &str) -> Answer {
     let artifact = artifact_for(router, scan_name).await;
     let answer = create_scan(router, json!({ "scanName": scan_name }), &artifact).await;
     assert_eq!(
@@ -210,7 +210,7 @@ async fn list_scans(router: &MultiServiceRouter, query: &str) -> Answer {
     call(router, "GET", &format!("/scans{query}"), None).await
 }
 
-async fn batch_get_findings(router: &MultiServiceRouter, identifiers: Value) -> Answer {
+pub(crate) async fn batch_get_findings(router: &MultiServiceRouter, identifiers: Value) -> Answer {
     call(
         router,
         "POST",
@@ -478,11 +478,13 @@ async fn upload_url_then_scan_round_trips_through_get_scan_list_scans_and_findin
         findings.json
     );
 
-    // 9. BatchGetFindings resolves against the same store: every id GetFindings did not
-    //    list is a failedFindings entry, not a 404 for the whole call.
+    // 9. BatchGetFindings resolves against the same store: an identifier GetFindings did
+    //    not list is a failedFindings entry, not a 404 for the whole call. The id carries
+    //    the modelled `Uuid` form every identifier this service issues, so the entry
+    //    reports it as naming nothing.
     let batch = batch_get_findings(
         &router,
-        json!([{ "scanName": scan_name, "findingId": "does-not-exist" }]),
+        json!([{ "scanName": scan_name, "findingId": "9c8b7a65-4321-0fed-cba9-876543210fed" }]),
     )
     .await;
     assert_eq!(
@@ -499,7 +501,8 @@ async fn upload_url_then_scan_round_trips_through_get_scan_list_scans_and_findin
     assert_eq!(
         batch.get("failedFindings")[0]["errorCode"].as_str(),
         Some("ITEM_DOES_NOT_EXIST"),
-        "BatchGetFindings: an unknown findingId of a known scan is ITEM_DOES_NOT_EXIST, got {}",
+        "BatchGetFindings: a well-formed findingId no stored finding carries is \
+         ITEM_DOES_NOT_EXIST, got {}",
         batch.json
     );
 }
@@ -767,64 +770,9 @@ async fn list_scans_pages_every_scan_exactly_once_for_every_page_size() {
     }
 }
 
-// ---------------------------------------------------------------------------------
-// BatchGetFindings classification
-// ---------------------------------------------------------------------------------
-
-#[tokio::test]
-async fn batch_get_findings_classifies_every_identifier_it_cannot_resolve() {
-    let (_engine, router) = harness();
-    start_scan(&router, "known-scan").await;
-
-    // Rows: each `ErrorCode` the store can justify for an unresolvable identifier.
-    let identifiers = json!([
-        { "scanName": "known-scan", "findingId": "absent-finding" },
-        { "scanName": "no-such-scan", "findingId": "absent-finding" },
-        { "scanName": "known-scan", "findingId": "absent-finding" },
-    ]);
-    let expected = ["ITEM_DOES_NOT_EXIST", "INVALID_SCAN_NAME", "DUPLICATE_IDENTIFIER"];
-
-    let answer = batch_get_findings(&router, identifiers).await;
-    assert_eq!(
-        answer.status, 200,
-        "BatchGetFindings: an unresolvable identifier is reported per entry, not as a \
-         failure of the call; got {} {}",
-        answer.status, answer.json
-    );
-    assert_eq!(
-        answer.get("findings").as_array().map(Vec::len),
-        Some(0),
-        "BatchGetFindings: nothing resolves out of an empty finding store, got {}",
-        answer.json
-    );
-    let failed = answer
-        .get("failedFindings")
-        .as_array()
-        .cloned()
-        .unwrap_or_default();
-    assert_eq!(
-        failed.len(),
-        expected.len(),
-        "BatchGetFindings: one failedFindings entry per unresolvable identifier, got {}",
-        answer.json
-    );
-    for (index, expected_code) in expected.iter().enumerate() {
-        assert_eq!(
-            failed[index]["errorCode"].as_str(),
-            Some(*expected_code),
-            "case identifier {index}: expected {expected_code}, got {}",
-            failed[index]
-        );
-        assert!(
-            !failed[index]["message"]
-                .as_str()
-                .unwrap_or_default()
-                .is_empty(),
-            "case identifier {index}: message is required, got {}",
-            failed[index]
-        );
-    }
-}
+// `BatchGetFindings`' classification of an identifier it cannot resolve — which
+// `ErrorCode` each unresolvable identifier is reported with — is asserted over the whole
+// class of identifiers in `crate::batch_get_findings_classification`.
 
 // ---------------------------------------------------------------------------------
 // Findings of a scan: the status filter and the page cursor, over a POPULATED store
@@ -958,12 +906,16 @@ async fn get_findings_partitions_and_pages_the_stored_list() {
     }
 
     // And an id GetFindings listed resolves through BatchGetFindings, out of the same
-    // store, while one it did not list fails per entry.
+    // store, while a well-formed identifier it did not list fails per entry. The absent
+    // id carries the modelled `Uuid` form every identifier this service issues has, so
+    // the entry reports it as naming nothing rather than as not being an identifier;
+    // `crate::batch_get_findings_classification` asserts that split over the whole class.
+    let absent_id = "00000000-0000-4000-8000-0000000000ff";
     let batch = batch_get_findings(
         &router,
         json!([
             { "scanName": scan_name, "findingId": "f-2" },
-            { "scanName": scan_name, "findingId": "f-404" },
+            { "scanName": scan_name, "findingId": absent_id },
             { "scanName": scan_name, "findingId": "f-5" },
         ]),
     )
@@ -996,7 +948,7 @@ async fn get_findings_partitions_and_pages_the_stored_list() {
             failed[0]["findingId"].as_str(),
             failed[0]["errorCode"].as_str()
         ),
-        (Some("f-404"), Some("ITEM_DOES_NOT_EXIST")),
+        (Some(absent_id), Some("ITEM_DOES_NOT_EXIST")),
         "BatchGetFindings: the unresolvable identifier must be reported as itself, got {}",
         failed[0]
     );

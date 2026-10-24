@@ -23,8 +23,8 @@ use crate::ops::types::{
     ResourceServerScopeType, ResourceServerType, RoutingType,
     SchemaAttributeType, SignInPolicyType, SmsConfigurationType, StringAttributeConstraintsType,
     TokenValidityUnitsType, UserAttributeUpdateSettingsType, UserPoolAddOnsType,
-    UserPoolClientType, UserPoolPolicyType, UserPoolType, UserType, UsernameConfigurationType,
-    VerificationMessageTemplateType,
+    UserPoolClientType, UserPoolDescriptionType, UserPoolPolicyType, UserPoolType, UserType,
+    UsernameConfigurationType, VerificationMessageTemplateType,
 };
 
 /// The region a request that carries no SigV4 credential scope falls back to, so
@@ -949,6 +949,29 @@ impl UserPool {
             key_configuration: self.key_configuration.clone(),
             issuer_configuration: self.issuer_configuration.clone(),
             acr_configuration: self.acr_configuration.clone(),
+        }
+    }
+
+    /// The SHORT modelled view of this pool, rendered from what is stored: the
+    /// entry a listing of several pools serves ("A short description of a user
+    /// pool", `UserPoolDescriptionType`). Every member it shares with
+    /// [`UserPool::to_user_pool_type`] renders the same stored value, so a
+    /// listing entry and a read of the one pool never disagree.
+    pub fn to_user_pool_description_type(&self) -> UserPoolDescriptionType {
+        UserPoolDescriptionType {
+            id: Some(self.id.clone()),
+            name: Some(self.name.clone()),
+            lambda_config: self.lambda_config.clone(),
+            // `UserPoolDescriptionType.Status` is `@deprecated` ("This property
+            // is no longer available."), so it is left out rather than
+            // invented — as `to_user_pool_type` leaves it out too.
+            status: None,
+            last_modified_date: Some(to_date_time(self.last_modified_date)),
+            creation_date: Some(to_date_time(self.creation_date)),
+            // "A list of Amazon Web Services Regions where replicas of this
+            // user pool exist" — nothing in this emulator stores a replica, so
+            // there is no replication to report for any pool.
+            replica_regions: None,
         }
     }
 }

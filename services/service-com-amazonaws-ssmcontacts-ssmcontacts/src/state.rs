@@ -14,8 +14,9 @@
 //!
 //! `engagements` is keyed by `EngagementArn` for the same reason: `StopEngagement` and
 //! `DescribeEngagement` both name an engagement by its ARN. `pages` — the channels one
-//! engagement engaged — is keyed by `PageArn`, which `AcceptPage` and `DescribePage` name a
-//! page by.
+//! engagement engaged — is keyed by `PageArn`, which `AcceptPage`, `DescribePage` and
+//! `ListPageReceipts` name a page by; a page's acknowledgements live on that page's own
+//! record, so listing them is a read of one map entry rather than a scan.
 //!
 //! Besides the state itself this module holds the helpers more than one operation needs —
 //! ARN minting, the page/token codec, the shared enum check and the output-shape
@@ -31,7 +32,7 @@ use std::time::SystemTime;
 
 use crate::ops::types::{
     Contact, ContactChannel, ContactChannelAddress, DescribeEngagementOutput, DescribePageOutput,
-    Engagement, Plan, RecurrenceSettings, Rotation, RotationOverride, Tag,
+    Engagement, Plan, Receipt, RecurrenceSettings, Rotation, RotationOverride, Tag,
 };
 
 /// What `CreateContact` persists, and what `GetContact`/`ListContacts` rebuild their
@@ -1027,6 +1028,20 @@ pub fn page_details(record: &PageRecord) -> DescribePageOutput {
     }
 }
 
+/// The `Receipt` `ListPageReceipts` returns for one stored event.
+///
+/// Every member the modelled `Receipt` carries is rebuilt from what recorded the event, so a
+/// listed receipt reports the channel that was engaged, what kind of event it was, the note
+/// an acknowledgement carried and the instant it happened.
+pub fn receipt_summary(record: &ReceiptRecord) -> Receipt {
+    Receipt {
+        contact_channel_arn: Some(record.contact_channel_arn.clone()),
+        receipt_type: record.receipt_type.clone(),
+        receipt_info: record.receipt_info.clone(),
+        receipt_time: ::aws_smithy_types::DateTime::from(record.receipt_time),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Pagination
 // ---------------------------------------------------------------------------
@@ -1088,6 +1103,9 @@ pub const TOKEN_SCOPE_ENGAGEMENTS: &str = "engagements";
 
 /// The `NextToken` scope `ListRotationOverrides` issues and accepts.
 pub const TOKEN_SCOPE_ROTATION_OVERRIDES: &str = "rotation-overrides";
+
+/// The `NextToken` scope `ListPageReceipts` issues and accepts.
+pub const TOKEN_SCOPE_PAGE_RECEIPTS: &str = "page-receipts";
 
 /// The `NextToken` scope `ListPageResolutions` issues and accepts.
 pub const TOKEN_SCOPE_PAGE_RESOLUTIONS: &str = "page-resolutions";

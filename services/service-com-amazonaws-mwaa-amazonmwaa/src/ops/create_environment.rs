@@ -390,11 +390,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle(now);
 
         // The operation is `@idempotent`: replaying the SAME create of a name that is
-        // already stored answers with the stored ARN and writes nothing. A create of that
-        // name with different members is a different request, and is refused rather than
-        // allowed to clobber the stored record. (Tags are deliberately outside the
-        // comparison: `TagResource` / `UntagResource` own them after the create.)
-        if let Some(existing) = store.environments.get(&input.name) {
+        // already stored IN THIS REGION answers with the stored ARN and writes nothing. A
+        // create of that name with different members is a different request, and is
+        // refused rather than allowed to clobber the stored record. (Tags are deliberately
+        // outside the comparison: `TagResource` / `UntagResource` own them after the
+        // create.) A name stored in ANOTHER Region is a different environment and no
+        // obstacle here: a name identifies an environment only within its Region.
+        if let Some(existing) = store.environment(&region, &input.name) {
             if existing.spec == spec {
                 return Ok(CreateEnvironmentOutput {
                     arn: Some(existing.arn.clone()),
@@ -427,7 +429,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
             name: name.clone(),
             arn,
-            region,
+            region: region.clone(),
             // A new environment is not ready yet: the clock owes it AVAILABLE.
             status: crate::state::STATUS_CREATING.to_string(),
             pending: [crate::state::PendingTransition {
@@ -445,8 +447,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Answer with the ARN read back out of the stored record, so this response cannot
         // drift from the state a later read sees.
         let stored = store
-            .environments
-            .get(&name)
+            .environment(&region, &name)
             .ok_or_else(store_unavailable)?;
         Ok(CreateEnvironmentOutput {
             arn: Some(stored.arn.clone()),

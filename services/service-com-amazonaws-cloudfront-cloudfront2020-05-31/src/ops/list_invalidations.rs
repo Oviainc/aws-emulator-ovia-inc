@@ -179,69 +179,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // "Because the results are returned in decreasing order from most recent to
-        // oldest, the most recent results are on the first page": the order is a property
-        // of the stored records, not of the request.
-        let ordered = stored.invalidations_most_recent_first();
-
+        // The page contract - the documented order, the cut at `MaxItems`, the marker that
+        // resumes after the invalidation it names, `NextMarker`/`IsTruncated`/`Quantity` -
+        // is the one every invalidation listing serves, so it is read from the stored
+        // records by `crate::state::invalidation_page`.
+        //
         // "To get the next page of results, set Marker to the value of the NextMarker
         // from the current page's response. This value is the same as the ID of the last
         // invalidation batch on that page." So the marker is a resume point this service
-        // handed out - the id of one of THIS distribution's invalidations - and this page
-        // starts after it. A value naming none of them was never such a resume point, and
-        // resuming at no position at all would silently serve the first page again.
-        let start = match input.marker.as_deref() {
-            Some(marker) => {
-                let Some(position) = ordered
-                    .iter()
-                    .position(|invalidation| invalidation.id == marker)
-                else {
-                    return Err(ListInvalidationsErrorModeled::InvalidArgument(
-                        InvalidArgument {
-                            message: Some(format!(
-                                "Marker {marker} is not the id of an invalidation of \
-                                 distribution {}",
-                                input.distribution_id
-                            )),
-                        },
-                    )
-                    .into());
-                };
-                position + 1
-            }
-            None => 0,
+        // handed out - the id of one of THIS distribution's invalidations. A value naming
+        // none of them was never such a resume point, and resuming at no position at all
+        // would silently serve the first page again.
+        let Some(invalidation_list) = crate::state::invalidation_page(
+            &stored.invalidations,
+            input.marker.as_deref(),
+            max_items,
+            page_size,
+        ) else {
+            return Err(ListInvalidationsErrorModeled::InvalidArgument(InvalidArgument {
+                message: Some(format!(
+                    "Marker {} is not the id of an invalidation of distribution {}",
+                    input.marker.unwrap_or_default(),
+                    input.distribution_id
+                )),
+            })
+            .into());
         };
 
-        let remaining = &ordered[start..];
-        let served = remaining.len().min(page_size);
-        let items: Vec<InvalidationSummary> = remaining[..served]
-            .iter()
-            .map(|invalidation| invalidation.to_summary())
-            .collect();
-        // "A flag that indicates whether more invalidation batch requests remain to be
-        // listed": exactly when this page did not reach the end of the order.
-        let is_truncated = remaining.len() > served;
-
         Ok(ListInvalidationsOutput {
-            invalidation_list: Some(InvalidationList {
-                // "The value that you provided for the Marker request parameter."
-                marker: input.marker.unwrap_or_default(),
-                // Present exactly when more invalidations remain, carrying the id of the
-                // last invalidation batch on this page.
-                next_marker: if is_truncated {
-                    items.last().map(|summary| summary.id.clone())
-                } else {
-                    None
-                },
-                // "The value that you provided for the MaxItems request parameter."
-                max_items,
-                is_truncated,
-                // The number of invalidation batches in this page: the length of `Items`.
-                quantity: i32::try_from(items.len()).unwrap_or(i32::MAX),
-                // A page that lists nothing carries no `Items` element at all, rather
-                // than an empty one.
-                items: if items.is_empty() { None } else { Some(items) },
-            }),
+            invalidation_list: Some(invalidation_list),
         })
     }
 }

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetRumMetricDefinitions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetRumMetricDefinitions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetRumMetricDefinitions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the metric definitions one extended-metrics destination of the app monitor the
+//! request names holds, read off this service's persisted state: the map
+//! `BatchCreateRumMetricDefinitions` writes and `UpdateRumMetricDefinition` replaces
+//! entries of. `@readonly` and `@paginated`, so a page is a window onto that map in
+//! definition-id order and paging it changes nothing a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +156,237 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetRumMetricDefinitions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetRumMetricDefinitionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetRumMetricDefinitions"))
+        // `@readonly`: paging this listing never changes what a later caller sees. `ctx`
+        // carries the credential the authorization decision below is made for.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                BatchGetRumMetricDefinitionsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: crate::state::NO_STORE.to_string(),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // An empty `DestinationArn` (the member is modelled `length 0..2048`) names no
+        // experiment, so it is the same input as an absent one.
+        let destination_arn = input
+            .destination_arn
+            .as_deref()
+            .map(str::trim)
+            .filter(|arn| !arn.is_empty());
+
+        // The prose-only pairing every metrics call of this service shares: an Evidently
+        // destination is identified by an experiment ARN and a CloudWatch one carries
+        // none.
+        if let Some(message) =
+            crate::state::metric_destination_choice_refusal(&input.destination, destination_arn)
+        {
+            return Err(
+                BatchGetRumMetricDefinitionsErrorModeled::ValidationException(
+                    ValidationException { message },
+                )
+                .into(),
+            );
+        }
+
+        // No token starts at the beginning; a token resumes strictly after the last
+        // definition the page that produced it returned. A token this operation never
+        // issued — or issued for ANOTHER app monitor or destination — is refused rather
+        // than read as some other resume point.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                decode_next_token(
+                    &input.app_monitor_name,
+                    &input.destination,
+                    destination_arn,
+                    token,
+                )
+                .ok_or_else(|| {
+                    BatchGetRumMetricDefinitionsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: format!(
+                                "NextToken {token} is not a pagination token this service \
+                                 issued for app monitor {}.",
+                                input.app_monitor_name
+                            ),
+                        },
+                    )
+                })?,
+            ),
+        };
+
+        // `MaxResults` is modelled `range 1..100`, so the boundary validator has already
+        // refused anything outside it; an absent one pages at the documented default
+        // (`BatchGetRumMetricDefinitionsRequest$MaxResults`: "The default is 50. The
+        // maximum that you can specify is 100.").
+        let page_size = input
+            .max_results
+            .and_then(|requested| usize::try_from(requested).ok())
+            .unwrap_or(DEFAULT_PAGE_SIZE)
+            .clamp(1, MAX_PAGE_SIZE);
+
+        // May this caller read THIS app monitor's metric definitions? Decided per call,
+        // like every other operation's, with the monitor and the policy in force read
+        // under a SHORT lock.
+        let (resource_arn, held_policy) = {
+            let store = state.lock();
+            let Some(record) = store.app_monitors.get(&input.app_monitor_name) else {
+                return Err(
+                    BatchGetRumMetricDefinitionsErrorModeled::ResourceNotFoundException(
+                        crate::state::app_monitor_not_found(&input.app_monitor_name),
+                    )
+                    .into(),
+                );
+            };
+            (record.arn.clone(), record.resource_policy_document())
+        };
+        if let Err(denial) = crate::state::authorization::authorize(
+            &*self.engine,
+            ctx,
+            crate::state::authorization::BATCH_GET_RUM_METRIC_DEFINITIONS,
+            &resource_arn,
+            held_policy.as_deref(),
+            &[],
+        ) {
+            return Err(
+                BatchGetRumMetricDefinitionsErrorModeled::AccessDeniedException(
+                    crate::state::access_denied(&denial),
+                )
+                .into(),
+            );
+        }
+
+        let store = state.lock();
+        let Some(monitor) = store.app_monitors.get(&input.app_monitor_name) else {
+            return Err(
+                BatchGetRumMetricDefinitionsErrorModeled::ResourceNotFoundException(
+                    crate::state::app_monitor_not_found(&input.app_monitor_name),
+                )
+                .into(),
+            );
+        };
+        // The listing is scoped to ONE destination, which is itself a resource of the
+        // monitor: a pair naming a destination the monitor does not have asks about a
+        // resource that is not there, which is not the same answer as a destination that
+        // exists and defines no metric yet (an empty list).
+        if !monitor.has_metric_destination(&input.destination, destination_arn) {
+            return Err(
+                BatchGetRumMetricDefinitionsErrorModeled::ResourceNotFoundException(
+                    crate::state::metric_destination_not_found(
+                        &input.app_monitor_name,
+                        &input.destination,
+                        destination_arn,
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        // A range query over the id-ordered map, not a scan: resuming costs
+        // O(log n) + O(page) and a page boundary cannot drift from the map it indexes.
+        let start = match resume_after.as_deref() {
+            Some(after) => ::std::ops::Bound::Excluded(after),
+            None => ::std::ops::Bound::Unbounded,
+        };
+        let (definitions, last_id, more) =
+            match monitor.metric_definitions_for(&input.destination, destination_arn) {
+                Some(held) => {
+                    let mut remaining =
+                        held.range::<str, _>((start, ::std::ops::Bound::Unbounded));
+                    let mut last_id = None;
+                    let page: Vec<MetricDefinition> = remaining
+                        .by_ref()
+                        .take(page_size)
+                        .map(|(id, record)| {
+                            last_id = Some(id.clone());
+                            record.to_metric_definition()
+                        })
+                        .collect();
+                    let more = remaining.next().is_some();
+                    (page, last_id, more)
+                }
+                // The destination exists and holds no definition yet.
+                None => (Vec::new(), None, false),
+            };
+
+        // A token is emitted only when something is actually left to return, so the last
+        // page carries none.
+        let next_token = match last_id {
+            Some(last) if more => Some(encode_next_token(
+                &input.app_monitor_name,
+                &input.destination,
+                destination_arn,
+                &last,
+            )),
+            _ => None,
+        };
+
+        Ok(BatchGetRumMetricDefinitionsOutput {
+            metric_definitions: Some(definitions),
+            next_token,
+        })
     }
+}
+
+/// The page this operation returns when the request names no `MaxResults`.
+/// From the model: `BatchGetRumMetricDefinitionsRequest$MaxResults` documents "The default
+/// is 50."
+const DEFAULT_PAGE_SIZE: usize = 50;
+
+/// The largest page this operation returns: `MaxResults`' modelled maximum
+/// (`MaxResultsInteger`, range 1..100).
+const MAX_PAGE_SIZE: usize = 100;
+
+/// The marker every token this operation issues carries, so a token the service did not
+/// issue — or one another list issued — is recognisable rather than being read as some
+/// other resume point. The codec itself is shared:
+/// [`crate::state::encode_pagination_token`].
+const TOKEN_MARKER: &str = "BatchGetRumMetricDefinitions/1/";
+
+/// An opaque continuation token for the last definition of a page.
+///
+/// The app monitor AND the destination the listing is scoped to are part of the key, so a
+/// token is only honoured by the listing that issued it: definitions are per-destination,
+/// and two destinations' maps can hold the same ids. The `DestinationArn` goes LAST
+/// because it is the one component whose modelled pattern ends in an unconstrained `.*`,
+/// and the codec delimits every component but the last (see
+/// [`crate::state::decode_pagination_token`]); the definition id ahead of it is minted by
+/// this service, so it carries no separator.
+fn encode_next_token(
+    app_monitor_name: &str,
+    destination: &str,
+    destination_arn: Option<&str>,
+    last_returned: &str,
+) -> String {
+    crate::state::encode_pagination_token(
+        TOKEN_MARKER,
+        &[
+            app_monitor_name,
+            destination,
+            last_returned,
+            destination_arn.unwrap_or_default(),
+        ],
+    )
+}
+
+/// The definition id a token issued by [`encode_next_token`] for this app monitor and
+/// destination resumes after, or `None` for any value this operation never issued for
+/// them.
+fn decode_next_token(
+    app_monitor_name: &str,
+    destination: &str,
+    destination_arn: Option<&str>,
+    token: &str,
+) -> Option<String> {
+    let key = crate::state::decode_pagination_token(TOKEN_MARKER, token, 4)?;
+    let [issued_for, issued_destination, last_returned, issued_arn] =
+        <[String; 4]>::try_from(key).ok()?;
+    (issued_for == app_monitor_name
+        && issued_destination == destination
+        && issued_arn == destination_arn.unwrap_or_default())
+    .then_some(last_returned)
 }

@@ -25,5 +25,7 @@ mod rescore_execution_plan_lifecycle;
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_character_set.rs"]
+mod tag_character_set;
 #[path = "all/wire_error_status.rs"]
 mod wire_error_status;
