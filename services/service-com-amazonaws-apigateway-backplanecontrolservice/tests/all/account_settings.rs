@@ -27,7 +27,7 @@ use service_com_amazonaws_apigateway_backplanecontrolservice::state::{
 use crate::rest_api_lifecycle::{create_api, Gateway};
 
 /// `GetAccount`.
-async fn get_account(gateway: &Gateway) -> Value {
+pub(crate) async fn get_account(gateway: &Gateway) -> Value {
     let answer = gateway.call("GET", "/account", None).await;
     assert_eq!(
         answer.status, 200,
@@ -37,8 +37,15 @@ async fn get_account(gateway: &Gateway) -> Value {
     answer.body
 }
 
-/// `UpdateAccount` with one patch operation.
-async fn patch_account(gateway: &Gateway, op: &str, path: &str, value: Option<&str>) -> Value {
+/// `UpdateAccount` with one patch operation. Shared with the sibling
+/// `execution_logging_prerequisites` suite, which establishes the account's CloudWatch
+/// role the same way a caller wiring execution logging does.
+pub(crate) async fn patch_account(
+    gateway: &Gateway,
+    op: &str,
+    path: &str,
+    value: Option<&str>,
+) -> Value {
     let mut operation = json!({ "op": op, "path": path });
     if let (Some(target), Some(value)) = (operation.as_object_mut(), value) {
         target.insert("value".to_string(), Value::String(value.to_string()));
@@ -58,8 +65,9 @@ async fn patch_account(gateway: &Gateway, op: &str, path: &str, value: Option<&s
     answer.body
 }
 
-/// An IAM role ARN of the kind API Gateway's account-level CloudWatch role is.
-fn role_arn(name: &str) -> String {
+/// An IAM role ARN of the kind API Gateway's account-level CloudWatch role is. Shared
+/// with the sibling `execution_logging_prerequisites` suite.
+pub(crate) fn role_arn(name: &str) -> String {
     format!("arn:aws:iam::000000000000:role/{name}")
 }
 
