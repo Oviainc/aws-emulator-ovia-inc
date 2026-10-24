@@ -1,16 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RevokeIpRules
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RevokeIpRules`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RevokeIpRules::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
-//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -80,13 +70,21 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-workspaces-workspacesse
 // here — hence the `RevokeIpRulesError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.workspaces#RevokeIpRules")]
+// `InternalServerException` is widened in with `extra_errors`: the service models it
+// ("Unexpected server error occured.") but does not list it on this operation, and it
+// is the only shape that can carry the one fault this handler can hit — the engine not
+// being the in-memory engine this service's store lives in.
+#[smithy_macros::operation_error(
+    "com.amazonaws.workspaces#RevokeIpRules",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum RevokeIpRulesErrorModeled {
     AccessDeniedException(AccessDeniedException),
     InvalidParameterValuesException(InvalidParameterValuesException),
     InvalidResourceStateException(InvalidResourceStateException),
     ResourceNotFoundException(ResourceNotFoundException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -140,18 +138,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RevokeIpRules` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RevokeIpRulesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+
+        // `UserRules` here is an `IpRevokedRuleList`: a list of `IpRule` values,
+        // "The IP address range, in CIDR notation" — the ranges to remove, not whole
+        // rules. A value that is not an address range names no rule this emulator
+        // could ever have stored, so it is refused rather than silently matching
+        // nothing, and it is refused before anything is written.
+        for ip_rule in &input.user_rules {
+            if !crate::state::is_ip_range(ip_rule) {
+                return Err(invalid_parameters(format!(
+                    "UserRules holds '{ip_rule}', which is not an IP address range in CIDR notation."
+                )));
+            }
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            RevokeIpRulesErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the WorkSpaces state store is unavailable".to_string()),
+            })
+        })?;
+        // One lock covers reading the group's rules and writing the ones it keeps, so
+        // a concurrent describe reports the rule set either before or after the
+        // revoke, never a partially revoked one.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RevokeIpRules"))
+        // `InvalidResourceStateException` is modelled for this operation but is not
+        // reachable here: an IP access control group carries no lifecycle state in
+        // the model, so no stored group can be in a state that refuses a revoke.
+        let revoked = state
+            .lock()
+            .revoke_ip_group_rules(&input.group_id, &input.user_rules);
+
+        if revoked.is_none() {
+            // The model states this shape's message: `ResourceNotFoundException` and
+            // its `message` member are both documented as "The resource could not be
+            // found.", and the shape carries a separate `ResourceId` member — "The ID
+            // of the resource that could not be found" — which is where the group the
+            // caller asked for is named.
+            return Err(RevokeIpRulesErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some("The resource could not be found.".to_string()),
+                    resource_id: Some(input.group_id.clone()),
+                },
+            )
+            .into());
+        }
+
+        Ok(RevokeIpRulesOutput {})
     }
+}
+
+/// A refusal of an input value this operation's own rules reject, as the modelled
+/// `InvalidParameterValuesException` ("One or more parameter values are not valid").
+fn invalid_parameters(message: String) -> RevokeIpRulesError {
+    RevokeIpRulesErrorModeled::InvalidParameterValuesException(InvalidParameterValuesException {
+        message: Some(message),
+    })
+    .into()
 }

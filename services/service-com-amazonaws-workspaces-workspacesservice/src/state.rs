@@ -8,8 +8,10 @@
 //! transitions live here rather than in one of the operation files because all
 //! four batch operations apply the same rules to the same records.
 //!
-//! It also owns the IP access control groups `CreateIpGroup` mints and
-//! `DescribeIpGroups` reports: the registry keyed by `GroupId`, the name index
+//! It also owns the IP access control groups `CreateIpGroup` mints,
+//! `AuthorizeIpRules`, `RevokeIpRules`, `UpdateRulesOfIpGroup` and
+//! `DeleteIpGroup` change and `DescribeIpGroups`
+//! reports: the registry keyed by `GroupId`, the name index
 //! that makes a group name unique across the account, and the creation order
 //! `DescribeIpGroups` paginates over.
 //!
@@ -549,12 +551,19 @@ pub struct IpGroupRecord {
 
 impl IpGroupRecord {
     /// This record as the modelled `WorkspacesIpGroup` structure.
+    ///
+    /// A group holding no rules reports NO `userRules` member rather than an
+    /// empty list: that is what a recorded WorkSpaces `DescribeIpGroups`
+    /// response carries for a group whose rule set is empty, and the member is
+    /// optional in the model, so "no rules" and "an empty list of rules" are
+    /// the same state and are reported the same way however the group reached
+    /// it (created without rules, or had its rules replaced by none).
     pub fn to_ip_group(&self) -> WorkspacesIpGroup {
         WorkspacesIpGroup {
             group_id: Some(self.group_id.clone()),
             group_name: Some(self.group_name.clone()),
             group_desc: self.group_desc.clone(),
-            user_rules: Some(self.user_rules.clone()),
+            user_rules: (!self.user_rules.is_empty()).then(|| self.user_rules.clone()),
         }
     }
 }
@@ -964,6 +973,91 @@ pub enum IpGroupCreateError {
     LimitExceeded,
 }
 
+/// Why a submitted `IpRuleList` was refused before any of it was persisted.
+///
+/// The model constrains neither `IpRuleList`'s length nor `IpRuleDesc`'s, so
+/// every rule here is this emulator's own bound (see [`MAX_RULES_PER_IP_GROUP`]
+/// and [`MAX_IP_GROUP_TEXT_CHARS`]) or the `ipRule` format the model documents.
+/// Each variant carries the message of the `InvalidParameterValuesException`
+/// ("One or more parameter values are not valid") the handler answers with, so
+/// the decision lives next to the state it is made from and every operation
+/// that takes a rule list answers the same refusal the same way.
+#[derive(Debug, Clone)]
+pub enum IpRuleListRefusal {
+    /// The list holds more than [`MAX_RULES_PER_IP_GROUP`] rules; this is how
+    /// many it holds.
+    TooManyRules(usize),
+    /// A rule's `ipRule` is not an IP address range in CIDR notation (see
+    /// [`is_ip_range`]); this is the value sent.
+    NotAnIpRange(String),
+    /// A rule's `ruleDesc` is longer than [`MAX_IP_GROUP_TEXT_CHARS`]; this is
+    /// how long it is.
+    RuleDescTooLong(usize),
+}
+
+impl IpRuleListRefusal {
+    /// The refusal's message, for the modelled error's `Message` member.
+    pub fn message(&self) -> String {
+        match self {
+            Self::TooManyRules(count) => format!(
+                "UserRules holds {count} rules; an IP access control group can hold at most {}.",
+                MAX_RULES_PER_IP_GROUP
+            ),
+            Self::NotAnIpRange(ip_rule) => format!(
+                "UserRules holds ipRule '{ip_rule}', which is not an IP address range in CIDR notation."
+            ),
+            Self::RuleDescTooLong(length) => format!(
+                "UserRules ruleDesc is {length} characters long; at most {} are accepted.",
+                MAX_IP_GROUP_TEXT_CHARS
+            ),
+        }
+    }
+}
+
+/// Why rules could not be added to an IP access control group.
+///
+/// Each variant names one of `AuthorizeIpRules`' own modelled errors, so the
+/// decision lives next to the state it is made from and the wording next to the
+/// wire.
+#[derive(Debug, Clone)]
+pub enum IpRuleAuthorizeRefusal {
+    /// No stored group carries the requested `GroupId` — answered as
+    /// `ResourceNotFoundException`.
+    NoSuchGroup,
+    /// Adding the submitted rules would leave the group holding more than
+    /// [`MAX_RULES_PER_IP_GROUP`] rules; this is how many it would hold.
+    /// Answered as `ResourceLimitExceededException`.
+    LimitExceeded(usize),
+}
+
+/// Check a submitted `UserRules` list before any of it is persisted.
+///
+/// Shared by every operation that takes an `IpRuleList` for an IP access
+/// control group, so one list is accepted — or refused — identically whichever
+/// operation it arrives on.
+pub fn validate_ip_rules(user_rules: &[IpRuleItem]) -> Result<(), IpRuleListRefusal> {
+    if user_rules.len() > MAX_RULES_PER_IP_GROUP {
+        return Err(IpRuleListRefusal::TooManyRules(user_rules.len()));
+    }
+    for rule in user_rules {
+        // `IpRuleItem$ipRule`: "The IP address range, in CIDR notation." A value
+        // that is not an IP address range is refused rather than persisted as a
+        // rule that could never match a client address.
+        if let Some(ip_rule) = rule.ip_rule.as_deref() {
+            if !is_ip_range(ip_rule) {
+                return Err(IpRuleListRefusal::NotAnIpRange(ip_rule.to_string()));
+            }
+        }
+        if let Some(rule_desc) = rule.rule_desc.as_deref() {
+            let length = rule_desc.chars().count();
+            if length > MAX_IP_GROUP_TEXT_CHARS {
+                return Err(IpRuleListRefusal::RuleDescTooLong(length));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Whether `value` is an IP address range in CIDR notation, or a single address.
 ///
 /// The model's `IpRuleItem$ipRule` doc says "The IP address range, in CIDR
@@ -1153,8 +1247,10 @@ fn catalog_user_capacity_gib(compute: &str) -> u32 {
 ///
 /// The IP access control group maps are the same shape, and private for the same
 /// reason: a name index that outlived its group would make that group name
-/// permanently unusable. They are written only by [`Self::create_ip_group`] and
-/// read through [`Self::ip_group`], [`Self::ip_group_count`] and
+/// permanently unusable. They are written only by [`Self::create_ip_group`],
+/// [`Self::authorize_ip_group_rules`], [`Self::revoke_ip_group_rules`],
+/// [`Self::replace_ip_group_rules`] and [`Self::delete_ip_group`], and read
+/// through [`Self::ip_group`], [`Self::ip_group_count`] and
 /// [`Self::ordered_ip_groups`].
 ///
 /// The connection-alias maps are the same arrangement for a further resource,
@@ -1762,6 +1858,114 @@ impl ComAmazonawsWorkspacesWorkspacesserviceState {
         self.ip_group_order.insert(seq, group_id.clone());
         self.ip_groups.insert(group_id, record.clone());
         Ok(record)
+    }
+
+    /// Replace the rule set of the IP access control group `group_id` names.
+    ///
+    /// `UpdateRulesOfIpGroup` "Replaces the current rules of the specified IP
+    /// access control group with the specified rules": the submitted list is
+    /// written WHOLE, so nothing of the previous list survives — including when
+    /// the submitted list is empty, which leaves the group holding no rules at
+    /// all rather than its previous ones.
+    ///
+    /// The returned record is a snapshot of what was persisted, so the caller
+    /// can answer from it without holding the map borrow. `None` means no
+    /// stored group carries that id.
+    pub fn replace_ip_group_rules(
+        &mut self,
+        group_id: &str,
+        user_rules: Vec<IpRuleItem>,
+    ) -> Option<IpGroupRecord> {
+        let record = self.ip_groups.get_mut(group_id)?;
+        record.user_rules = user_rules;
+        Some(record.clone())
+    }
+
+    /// Add the submitted rules to the IP access control group `group_id` names.
+    ///
+    /// `AuthorizeIpRules` "Adds one or more rules to the specified IP access
+    /// control group", so the group keeps the rules it already held: the
+    /// submitted ones are added to them rather than replacing them.
+    ///
+    /// A rule is identified by its address range (`IpRuleItem$ipRule`, "The IP
+    /// address range, in CIDR notation") and a group holds at most ONE rule per
+    /// range, so authorizing a range the group already holds re-authorizes it
+    /// — the submitted `ruleDesc` becomes the stored one — rather than storing
+    /// the range twice. The rules just authorized are the most recently
+    /// authorized ones and are reported FIRST, in the order submitted,
+    /// followed by the rules the group already held in the order it held them.
+    ///
+    /// Nothing is written when the merged set would hold more rules than this
+    /// emulator stores, so a refused authorize leaves the group as it was.
+    pub fn authorize_ip_group_rules(
+        &mut self,
+        group_id: &str,
+        user_rules: Vec<IpRuleItem>,
+    ) -> Result<IpGroupRecord, IpRuleAuthorizeRefusal> {
+        let record = self
+            .ip_groups
+            .get_mut(group_id)
+            .ok_or(IpRuleAuthorizeRefusal::NoSuchGroup)?;
+
+        let mut seen: BTreeSet<Option<String>> = BTreeSet::new();
+        let mut merged: Vec<IpRuleItem> = Vec::with_capacity(user_rules.len() + record.user_rules.len());
+        for rule in user_rules
+            .into_iter()
+            .chain(record.user_rules.iter().cloned())
+        {
+            if seen.insert(rule.ip_rule.clone()) {
+                merged.push(rule);
+            }
+        }
+        if merged.len() > MAX_RULES_PER_IP_GROUP {
+            return Err(IpRuleAuthorizeRefusal::LimitExceeded(merged.len()));
+        }
+
+        record.user_rules = merged;
+        Ok(record.clone())
+    }
+
+    /// Remove the rules naming the address ranges in `ip_rules` from the IP
+    /// access control group `group_id` names.
+    ///
+    /// `RevokeIpRules` "Removes one or more rules from the specified IP access
+    /// control group", and a rule is identified by its address range, so every
+    /// rule the request does not name is kept, in the order the group held it.
+    /// A range the group does not hold removes nothing: the group ends in the
+    /// state the caller asked for either way, and the operation models no error
+    /// for a rule a group does not hold (its `ResourceNotFoundException` is
+    /// about the GROUP). `None` means no stored group carries that id.
+    pub fn revoke_ip_group_rules(
+        &mut self,
+        group_id: &str,
+        ip_rules: &[String],
+    ) -> Option<IpGroupRecord> {
+        let record = self.ip_groups.get_mut(group_id)?;
+        let revoked: BTreeSet<&str> = ip_rules.iter().map(String::as_str).collect();
+        record
+            .user_rules
+            // A rule carrying no `ipRule` names no range, so no revoke can name
+            // it either: it is kept.
+            .retain(|rule| {
+                rule.ip_rule
+                    .as_deref()
+                    .is_none_or(|ip_rule| !revoked.contains(ip_rule))
+            });
+        Some(record.clone())
+    }
+
+    /// Delete the IP access control group `group_id` names.
+    ///
+    /// An IP access control group carries no lifecycle state in the model, so
+    /// the deletion is complete when this returns: the group is dropped from
+    /// the registry together with every index entry for it, which releases the
+    /// name it held for a later create. `None` means no stored group carries
+    /// that id.
+    pub fn delete_ip_group(&mut self, group_id: &str) -> Option<IpGroupRecord> {
+        let record = self.ip_groups.remove(group_id)?;
+        self.ip_group_names.remove(&record.group_name);
+        self.ip_group_order.remove(&record.seq);
+        Some(record)
     }
 
     /// Every stored connection alias in creation order.
