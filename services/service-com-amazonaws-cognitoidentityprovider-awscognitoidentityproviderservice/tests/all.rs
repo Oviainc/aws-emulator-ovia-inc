@@ -25,6 +25,8 @@ mod error_message_wording;
 mod group_lifecycle;
 #[path = "all/group_membership.rs"]
 mod group_membership;
+#[path = "all/identity_provider_lifecycle.rs"]
+mod identity_provider_lifecycle;
 #[path = "all/initiate_auth.rs"]
 mod initiate_auth;
 #[path = "all/list_devices.rs"]

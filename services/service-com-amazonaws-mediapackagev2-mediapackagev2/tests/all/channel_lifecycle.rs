@@ -18,8 +18,10 @@
 //!    issued only while something is left.
 //! 5. A delete removes the resource (so the read then answers 404), refuses while
 //!    children remain (409), and succeeds again on an already-absent resource.
-//! 6. Every store a create grows is bounded: at its ceiling the create is refused with
-//!    `ServiceQuotaExceededException` (402) and stores nothing.
+//! 6. Every store a create grows is bounded: past its ceiling the create is refused and
+//!    stores nothing — with `ServiceQuotaExceededException` (402) for a resource-count
+//!    quota, and with `ValidationException` (400) / `NUM_MANIFESTS_HIGH` for an
+//!    over-sized manifest set, which the model declares as an input failure.
 
 use std::sync::Arc;
 
@@ -921,13 +923,16 @@ async fn deletes_refuse_non_empty_parents_are_effective_and_are_idempotent() {
     }
 }
 
-/// RULE 6 — every store a create grows is BOUNDED: at its ceiling the create is refused
-/// with the modelled `ServiceQuotaExceededException` (HTTP 402, "The request would cause
-/// a service quota to be exceeded") and stores nothing, so what the emulator holds is set
-/// by the ceiling rather than by how many requests arrive.
+/// RULE 6 — every store a create grows is BOUNDED: past its ceiling the create is refused
+/// and stores nothing, so what the emulator holds is set by the ceiling rather than by how
+/// many requests arrive. A resource-COUNT ceiling is the modelled
+/// `ServiceQuotaExceededException` (HTTP 402, "The request would cause a service quota to
+/// be exceeded"); an over-sized manifest SET is the input failure the model names,
+/// `ValidationException` / `NUM_MANIFESTS_HIGH` (see
+/// `tests/all/manifest_count_range.rs` for that rule over a table of counts).
 ///
-/// The ceilings are the emulator's own, declared as constants in `src/state.rs` — the
-/// model carries no quota and no `@length` on the manifest lists — and the four blocks
+/// The ceiling VALUES are the emulator's own, declared as constants in `src/state.rs` —
+/// the model carries no quota and no `@length` on the manifest lists — and the four blocks
 /// below drive one each: the record COUNT at all three levels of the hierarchy, and the
 /// per-record manifest count that decides how large one endpoint record gets.
 #[tokio::test]
@@ -1093,13 +1098,18 @@ async fn a_create_at_a_store_ceiling_is_refused_and_stores_nothing() {
         )
         .await;
     assert_eq!(
-        status, 402,
-        "case \"manifests past the ceiling\": expected 402, got {status} {body}"
+        status, 400,
+        "case \"manifests past the ceiling\": expected 400, got {status} {body}"
     );
     assert_eq!(
         error_type(&body),
-        "ServiceQuotaExceededException",
-        "case \"manifests past the ceiling\": expected ServiceQuotaExceededException, got {body}"
+        "ValidationException",
+        "case \"manifests past the ceiling\": expected ValidationException, got {body}"
+    );
+    assert_eq!(
+        body.get("ValidationExceptionType").and_then(Value::as_str),
+        Some("NUM_MANIFESTS_HIGH"),
+        "case \"manifests past the ceiling\": expected NUM_MANIFESTS_HIGH, got {body}"
     );
     assert_eq!(
         emulator.get_endpoint("grp", "chan", "one-too-many").await.0,

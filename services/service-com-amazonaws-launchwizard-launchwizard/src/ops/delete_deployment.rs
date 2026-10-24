@@ -175,7 +175,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // non-terminal/terminal steps the CLOCK owes, so each is scheduled one
             // `TRANSITION_SPAN` after the previous one and a caller reading straight
             // back still observes `DELETE_INITIATING`.
-            deployment.status = crate::state::STATUS_DELETE_INITIATING.to_string();
+            deployment.enter_status(crate::state::STATUS_DELETE_INITIATING.to_string());
             deployment.modified_at = now;
             deployment.append_event(crate::state::DeploymentEvent::new(
                 "DeleteInitiating",

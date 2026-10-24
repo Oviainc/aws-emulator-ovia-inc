@@ -21,6 +21,8 @@ mod delete_deployment_status_sequence;
 mod deployment_lifecycle;
 #[path = "all/deployment_pattern_versions.rs"]
 mod deployment_pattern_versions;
+#[path = "all/deployment_resource_group.rs"]
+mod deployment_resource_group;
 #[path = "all/deployment_update.rs"]
 mod deployment_update;
 #[path = "all/harness.rs"]

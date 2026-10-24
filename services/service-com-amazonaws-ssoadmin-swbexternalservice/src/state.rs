@@ -1274,6 +1274,19 @@ pub const PERMISSIONS_BOUNDARY_CHOICE_MESSAGE: &str =
     "Specify either CustomerManagedPolicyReference or ManagedPolicyArn in \
      PermissionsBoundary, but not both.";
 
+/// The refusal a delete of a permissions boundary a permission set does not carry earns, as
+/// the message of the modelled `ResourceNotFoundException` (HTTP 404).
+///
+/// The BOUNDARY is the resource of that call ("Deletes the permissions boundary from a
+/// specified PermissionSet"), so a permission set carrying none has nothing for the request
+/// to name — the same answer an absent singleton child earns elsewhere in this service. The
+/// message is built from the request, which names the permission set it was looked for on,
+/// because an absent boundary on a known permission set is a different failure from an
+/// unknown permission set.
+pub fn permissions_boundary_not_attached_message(permission_set_arn: &str) -> String {
+    format!("Could not find permissions boundary for permission set {permission_set_arn}.")
+}
+
 /// A permission set, keyed in [`ComAmazonawsSsoadminSwbexternalserviceState::permission_sets`]
 /// by the ARN minted for it at creation.
 ///
