@@ -27,6 +27,8 @@ mod contact_cancellation;
 mod contact_version_listing;
 #[path = "all/contact_versions.rs"]
 mod contact_versions;
+#[path = "all/dataflow_endpoint_group_deletion.rs"]
+mod dataflow_endpoint_group_deletion;
 #[path = "all/dataflow_endpoint_group_listing.rs"]
 mod dataflow_endpoint_group_listing;
 #[path = "all/dataflow_endpoint_groups.rs"]

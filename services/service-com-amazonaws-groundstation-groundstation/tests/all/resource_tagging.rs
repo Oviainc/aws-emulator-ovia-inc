@@ -91,7 +91,10 @@ async fn tag_resource_body(
 }
 
 /// `GET /tags/{resourceArn}` — `ListTagsForResource`.
-async fn list_tags(router: &MultiServiceRouter, arn: &str) -> Reply {
+///
+/// `pub(crate)` so a suite asserting what the tag read of a DELETED resource answers
+/// reaches the tag reader through this one helper.
+pub(crate) async fn list_tags(router: &MultiServiceRouter, arn: &str) -> Reply {
     send(router, "GET", &format!("/tags/{}", label(arn)), None).await
 }
 

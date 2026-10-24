@@ -32,12 +32,13 @@ use std::time::Duration;
 
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_groundstation_groundstation::state::{
-    AGENT_INACTIVE, BAD_REQUEST_ERROR_CODE, DATAFLOW_ENDPOINT_GROUP_NOT_FOUND, ENDPOINT_CREATED,
-    ENDPOINT_CREATING, HEALTH_HEALTHY, HEALTH_UNHEALTHY, INVALID_REQUEST_BODY,
-    REASON_HEALTHY, REASON_INITIALIZING_DATAPLANE, REASON_NO_REGISTERED_AGENT,
+    AGENT_INACTIVE, BAD_REQUEST_ERROR_CODE, ENDPOINT_CREATED, ENDPOINT_CREATING, HEALTH_HEALTHY,
+    HEALTH_UNHEALTHY, INVALID_REQUEST_BODY, REASON_HEALTHY, REASON_INITIALIZING_DATAPLANE,
+    REASON_NO_REGISTERED_AGENT,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::dataflow_endpoint_group_deletion::assert_group_absent;
 use crate::dataflow_endpoint_group_listing::listed_ids;
 use crate::scheduling_loop::{harness, is_uuid, send, Reply, ABSENT_UUID, REGION};
 
@@ -51,19 +52,24 @@ const AFTER_SETTLE: Duration = Duration::from_millis(600);
 
 /// The published bounds of `DataflowEndpointGroupDurationInSeconds` (range 30..480 —
 /// `smithy_query(query="shape", shape="DataflowEndpointGroupDurationInSeconds")`).
-const DURATION_MIN: i64 = 30;
+///
+/// `pub(crate)` so the sibling suites assert the same published bounds from one place.
+pub(crate) const DURATION_MIN: i64 = 30;
 /// See [`DURATION_MIN`].
-const DURATION_MAX: i64 = 480;
+pub(crate) const DURATION_MAX: i64 = 480;
 
 /// One row of the endpoint-kind table: a member of `EndpointDetails` that describes an
 /// endpoint, the value a request carries in it, and what the SERVICE adds to it.
-struct Kind {
+///
+/// `pub(crate)` here and on [`endpoint_kinds`] so the deletion suite spans the same four
+/// endpoint kinds from this one table rather than keeping a second copy of it.
+pub(crate) struct Kind {
     /// Names the row in every assertion.
-    label: &'static str,
+    pub(crate) label: &'static str,
     /// The modelled member name, as the wire spells it.
-    member: &'static str,
+    pub(crate) member: &'static str,
     /// The member's value as the request carries it.
-    body: Value,
+    pub(crate) body: Value,
     /// The member the service fills in on the endpoint itself, and the value it reports.
     derived: (&'static str, Value),
     /// The one `CapabilityHealthReason` the service reports for a freshly created
@@ -87,7 +93,7 @@ struct Kind {
 /// `awsGroundStationAgentEndpoint`, `uplinkAwsGroundStationAgentEndpoint` and
 /// `downlinkAwsGroundStationAgentEndpoint` — and the shape of each member's own target
 /// (`smithy_query(query="closure", operation="CreateDataflowEndpointGroup")`).
-fn endpoint_kinds() -> Vec<Kind> {
+pub(crate) fn endpoint_kinds() -> Vec<Kind> {
     vec![
         Kind {
             label: "a dataflow endpoint",
@@ -217,7 +223,7 @@ pub(crate) async fn get_group(router: &MultiServiceRouter, id: &str) -> Reply {
 }
 
 /// `DELETE /dataflowEndpointGroup/{dataflowEndpointGroupId}`.
-async fn delete_group(router: &MultiServiceRouter, id: &str) -> Reply {
+pub(crate) async fn delete_group(router: &MultiServiceRouter, id: &str) -> Reply {
     send(
         router,
         "DELETE",
@@ -902,23 +908,8 @@ async fn the_listing_returns_every_group_once_and_a_deleted_group_is_gone() {
         ("the same delete repeated", delete_group(&router, &removed).await),
         ("a read of a group never created", get_group(&router, ABSENT_UUID).await),
     ] {
-        assert_eq!(
-            reply.status, 434,
-            "case {label}: expected 434, got {} {}",
-            reply.status, reply.body
-        );
-        assert_eq!(
-            reply.error_code(),
-            "ResourceNotFoundException",
-            "case {label}: wrong error shape, got {}",
-            reply.body
-        );
-        assert_eq!(
-            reply.string("message"),
-            DATAFLOW_ENDPOINT_GROUP_NOT_FOUND,
-            "case {label}: wrong refusal text, got {}",
-            reply.body
-        );
+        // The not-found shape has ONE owner in this target: the deletion suite's helper.
+        assert_group_absent(label, &reply);
     }
 
     let listed = listed_ids(&router, Some(2), created.len()).await;
