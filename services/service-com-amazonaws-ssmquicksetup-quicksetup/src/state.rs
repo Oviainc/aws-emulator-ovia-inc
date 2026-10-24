@@ -290,6 +290,25 @@ impl StatusSummaryRecord {
     }
 }
 
+/// Submit `summaries` for deployment again: the `Deployment` summary becomes a fresh
+/// one in its transient status, due to settle [`TRANSITION_SPAN`] later, and every
+/// other kind of summary is left as it was.
+///
+/// A mutation that changes what the service deploys (`UpdateConfigurationDefinition`)
+/// starts a deployment exactly as `CreateConfigurationManager` does, so the same record
+/// and the same clock-owed transition serve both; this is the one place that
+/// construction lives.
+pub fn restart_deployment(summaries: &mut Vec<StatusSummaryRecord>, now: SystemTime) {
+    let fresh = StatusSummaryRecord::deployment(now);
+    match summaries
+        .iter_mut()
+        .find(|summary| summary.status_type == STATUS_TYPE_DEPLOYMENT)
+    {
+        Some(existing) => *existing = fresh,
+        None => summaries.push(fresh),
+    }
+}
+
 /// One configuration definition of a stored manager, with the `Id` the service
 /// assigned it.
 #[derive(Debug, Clone)]

@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetServerDetails
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetServerDetails`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetServerDetails::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports ONE server of this account's portfolio: the [`crate::state::ServerRecord`] the
+//! `serverId` names, as the `ServerDetail` every read of this service reports it
+//! ([`crate::state::ServerRecord::to_server_detail`]), beside the applications that
+//! server is associated with — the paginated member of this operation, handed out a page
+//! of at most `maxResults` at a time and resumed by the `nextToken` the previous page
+//! carried.
+//!
+//! A read: it computes its answer from the stored record and writes nothing, so two
+//! identical calls answer the same thing. A `serverId` naming no server of the portfolio
+//! is refused with the modelled 404 `ResourceNotFoundException`, and a page this operation
+//! cannot serve (a `maxResults` past the documented maximum, a token it never issued or
+//! one issued for another server) with the modelled 400 `ValidationException`.
 //!
 //! ## Shape of an operation
 //!
@@ -84,6 +88,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{
+    decode_page_token, encode_page_token, invalid_request_body, page_token_not_accepted,
+    server_not_found, MAX_LIST_PAGE_SIZE, SERVER_DETAIL_PAGE_MARKER,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -118,6 +127,96 @@ impl From<GetServerDetailsErrorModeled> for GetServerDetailsError {
     fn from(modeled: GetServerDetailsErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
+}
+
+/// What a `nextToken` of this operation carries, beside the marker: the server whose
+/// associated applications the page was taken from, and how far into that server's list
+/// the next page starts.
+///
+/// The server id is part of the token because a token names a position in ONE list:
+/// handed back for a different server it is refused rather than resumed at whatever
+/// position that offset happens to name in another server's list. The page SIZE is
+/// deliberately not part of it — `maxResults` is documented per call ("if a previous call
+/// to this action returned 100 items, but you set maxResults to 10"), so changing it
+/// between pages is the caller's business.
+struct Cursor {
+    server_id: String,
+    resume_at: usize,
+}
+
+impl Cursor {
+    /// This cursor as the opaque `nextToken` the caller hands back, through the service's
+    /// one page-token codec. The offset comes first, so a server id carrying a `:` of its
+    /// own (`ServerId` is `.*\S.*`) still round-trips whole.
+    fn to_token(&self) -> String {
+        encode_page_token(
+            SERVER_DETAIL_PAGE_MARKER,
+            &format!("{}:{}", self.resume_at, self.server_id),
+        )
+    }
+
+    /// The cursor a token carries, or `None` for anything this operation did not mint.
+    fn from_token(token: &str) -> Option<Self> {
+        let payload = decode_page_token(SERVER_DETAIL_PAGE_MARKER, token)?;
+        let (resume_at, server_id) = payload.split_once(':')?;
+        Some(Self {
+            server_id: server_id.to_string(),
+            resume_at: resume_at.parse().ok()?,
+        })
+    }
+}
+
+/// This operation's refusal of a request the model admits member by member but that it
+/// cannot act on, in the service's own wording.
+fn refused() -> GetServerDetailsError {
+    GetServerDetailsErrorModeled::ValidationException(invalid_request_body()).into()
+}
+
+/// This operation's refusal of a `nextToken` it cannot resolve, worded the way the service
+/// words any unresolvable parameter — the same refusal its sibling lists answer for a
+/// cursor of their own that resolves to nothing.
+fn token_refused() -> GetServerDetailsError {
+    GetServerDetailsErrorModeled::ValidationException(page_token_not_accepted()).into()
+}
+
+/// How many associated applications this page holds, and the offset it starts at.
+struct Page {
+    size: usize,
+    start: usize,
+}
+
+/// Hold `maxResults` to the documented maximum and `nextToken` to a token this operation
+/// issued for THIS server.
+///
+/// `maxResults` is documented "The maximum number of items to include in the response. The
+/// maximum value is 100" and its target shape carries no `@range`, so a request past that
+/// bound (or one asking for a page of nothing) is refused rather than silently clamped: a
+/// caller that asked for more than the service gives has to learn it cannot have it. An
+/// absent `maxResults` takes the documented maximum.
+fn page_of(
+    max_results: Option<i32>,
+    next_token: Option<&str>,
+    server_id: &str,
+) -> Result<Page, GetServerDetailsError> {
+    let size = match max_results {
+        None => MAX_LIST_PAGE_SIZE,
+        Some(requested) if (1..=MAX_LIST_PAGE_SIZE).contains(&requested) => requested,
+        Some(_) => return Err(refused()),
+    };
+    let start = match next_token {
+        None => 0,
+        Some(token) => {
+            let cursor = Cursor::from_token(token).ok_or_else(token_refused)?;
+            if cursor.server_id != server_id {
+                return Err(token_refused());
+            }
+            cursor.resume_at
+        }
+    };
+    Ok(Page {
+        size: usize::try_from(size).unwrap_or(0),
+        start,
+    })
 }
 
 /// The `GetServerDetails` operation.
@@ -156,18 +255,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetServerDetails` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetServerDetailsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetServerDetails"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetServerDetailsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the migrationhub-strategy server inventory is unavailable".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // The page is decided from the request alone, before the store is read.
+        let page = page_of(
+            input.max_results,
+            input.next_token.as_deref(),
+            &input.server_id,
+        )?;
+
+        // A read: the store is only looked at here, so running GetServerDetails changes
+        // nothing a later caller sees.
+        let store = state.lock();
+        let Some(server) = store.servers.get(&input.server_id) else {
+            return Err(
+                GetServerDetailsErrorModeled::ResourceNotFoundException(server_not_found()).into(),
+            );
+        };
+
+        let applications = &server.associated_applications;
+        // A token is only ever minted for an offset another application follows, so an
+        // offset the list no longer reaches means the record changed between pages: the
+        // token is refused rather than answered with a page from somewhere else. Offset 0
+        // is every list's start, including an empty one's.
+        if page.start > 0 && page.start >= applications.len() {
+            return Err(token_refused());
+        }
+        let end = page.start.saturating_add(page.size).min(applications.len());
+        let associated_applications = applications
+            .get(page.start..end)
+            .unwrap_or_default()
+            .to_vec();
+        // The cursor the next page resumes from, or none once this page ended the list.
+        let next_token = (end < applications.len()).then(|| {
+            Cursor {
+                server_id: input.server_id.clone(),
+                resume_at: end,
+            }
+            .to_token()
+        });
+
+        Ok(GetServerDetailsOutput {
+            // The detail is the server itself, so every page of its applications reports
+            // it: the caller asked for the server, not for one page of it.
+            server_detail: Some(server.to_server_detail()),
+            associated_applications: Some(associated_applications),
+            next_token,
+        })
     }
 }

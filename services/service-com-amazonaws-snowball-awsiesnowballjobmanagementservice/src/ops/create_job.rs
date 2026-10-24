@@ -5,6 +5,12 @@
 //! Mints a `JobId`, persists every supplied input against it and starts the job in
 //! `JobState` `New`, so `DescribeJob` and `ListJobs` report what was stored.
 //!
+//! A request to create an EXPORT job mints an *order*, not a single job: a main job
+//! (`MID…`), associated with no device and reported by `ListJobs` with `IsMaster=true`,
+//! plus a job part (`JID…`) per device, which `DescribeJob` on the main job reports in
+//! `SubJobMetadata`. Every other job type is one plain job. The `JobId` answered is the
+//! main job's for an export order, the job's own otherwise.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -213,6 +219,21 @@ impl From<CreateJobErrorModeled> for CreateJobError {
     }
 }
 
+/// The `JobType` whose create produces a main job and its job parts rather than a single
+/// plain job, spelled as `JobType` spells it (`shared_types::JOB_TYPE_VALUES`).
+///
+/// `JobListEntry$IsMaster`: "A main job represents a successful request to create an
+/// export job." No other job type mints one.
+pub const EXPORT_JOB_TYPE: &str = "EXPORT";
+
+/// How many job parts an export order is split into.
+///
+/// `JobListEntry$IsMaster` guarantees "each main job will have at least one job part, and
+/// each job part is associated with a Snowball": the real service splits the exported
+/// data over as many devices as it takes to hold it, and this emulator stages no data for
+/// an export, so an order is one device's worth — the documented minimum.
+pub const JOB_PARTS_PER_EXPORT_JOB: usize = 1;
+
 /// The `CreateJob` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -320,7 +341,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        let job_id = store.mint_job_id();
+        // "A main job represents a successful request to create an export job. Main jobs
+        // aren't associated with any Snowballs. Instead, each main job will have at least
+        // one job part, and each job part is associated with a Snowball"
+        // (`JobListEntry$IsMaster`). So an EXPORT create mints a main job in the `MID`
+        // form the modelled `JobId` pattern's `M` alternative is for, plus its job parts;
+        // every other job type mints one plain job in the `JID` form.
+        let is_export_order = input.job_type.as_deref() == Some(EXPORT_JOB_TYPE);
+        let job_id = if is_export_order {
+            store.mint_main_job_id()
+        } else {
+            store.mint_job_id()
+        };
         let job = crate::state::StoredJob {
             job_id: job_id.clone(),
             // A job AWS has accepted but not started preparing a device for is `New`,
@@ -348,13 +380,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             remote_management: input.remote_management,
             impact_level: input.impact_level,
             pickup_details: input.pickup_details,
+            // Filled in below for an export order's main job; a plain job and a job part
+            // have no parts of their own.
+            job_part_ids: Vec::new(),
         };
 
+        // The order this create stores: one record for a plain job, and for an export the
+        // main job followed by its job parts. A part is the device-bearing half of the
+        // same order, so it inherits the order's attributes — the address its device ships
+        // to, the buckets and key ranges to export, the role, the key, the notification —
+        // and is minted by the same call, so it carries the order's creation instant.
+        let mut order = Vec::with_capacity(1 + JOB_PARTS_PER_EXPORT_JOB);
+        let mut main_job = job;
+        if is_export_order {
+            let mut parts = Vec::with_capacity(JOB_PARTS_PER_EXPORT_JOB);
+            for _ in 0..JOB_PARTS_PER_EXPORT_JOB {
+                let part_id = store.mint_job_id();
+                let mut part = main_job.clone();
+                part.job_id = part_id.clone();
+                main_job.job_part_ids.push(part_id);
+                parts.push(part);
+            }
+            order.push(main_job);
+            order.extend(parts);
+        } else {
+            order.push(main_job);
+        }
+
         // This emulator holds a bounded number of jobs, and `CancelJob` does not remove
-        // one, so a store at its ceiling refuses the create rather than growing the
-        // process further. The model declares no quota error on this operation, so the
-        // refusal travels on the framework's channel, naming the limit reached.
-        if !store.insert_job(job) {
+        // one, so a store that cannot hold the whole order refuses the create rather than
+        // growing the process further. The model declares no quota error on this
+        // operation, so the refusal travels on the framework's channel, naming the limit
+        // reached.
+        if !store.insert_job_order(order) {
             return Err(crate::scaffolded::Scaffolded::validation(format!(
                 "this emulator stores at most {} jobs, and that limit has been reached",
                 crate::state::MAX_STORED_JOBS
@@ -362,6 +420,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         Ok(CreateJobOutput {
+            // The id a caller keeps: the main job's for an export order — the job parts
+            // hang off it and `DescribeJob` on it reports them — the job's own otherwise.
             job_id: Some(job_id),
         })
     }

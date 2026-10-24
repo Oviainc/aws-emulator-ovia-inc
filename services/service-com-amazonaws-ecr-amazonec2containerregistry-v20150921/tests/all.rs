@@ -33,6 +33,8 @@ mod layer_availability;
 mod layer_part_upload;
 #[path = "all/layer_upload_commit.rs"]
 mod layer_upload_commit;
+#[path = "all/layer_upload_completion_digest_set.rs"]
+mod layer_upload_completion_digest_set;
 #[path = "all/layer_upload_sessions.rs"]
 mod layer_upload_sessions;
 #[path = "all/lifecycle_policy.rs"]
