@@ -87,7 +87,8 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// every reference to an Outpost is the modelled 404. An entry whose owner is
 /// another account is one shared with the caller through Resource Access
 /// Manager, which is what `Outpost$OwnerId` ("useful for comparing owned versus
-/// shared outposts") distinguishes and what `ListSharedEndpoints` lists over.
+/// shared outposts") distinguishes and what a caller can create endpoints on and
+/// list with `ListSharedEndpoints`.
 pub const PROVISIONED_OUTPOSTS_ENV: &str = "S3_OUTPOSTS_PROVISIONED_OUTPOSTS";
 
 /// The Outposts `setting` declares: comma-separated
