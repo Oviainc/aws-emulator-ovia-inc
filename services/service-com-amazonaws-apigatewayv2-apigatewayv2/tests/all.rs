@@ -27,6 +27,8 @@ mod deployment_lifecycle;
 mod deployment_pagination;
 #[path = "all/deployment_stage_release.rs"]
 mod deployment_stage_release;
+#[path = "all/domain_name_endpoint_required.rs"]
+mod domain_name_endpoint_required;
 #[path = "all/domain_name_lifecycle.rs"]
 mod domain_name_lifecycle;
 #[path = "all/http_api_servable_stage.rs"]

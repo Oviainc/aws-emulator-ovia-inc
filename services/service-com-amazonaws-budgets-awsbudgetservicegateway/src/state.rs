@@ -307,6 +307,25 @@ pub fn find_action_mut<'a>(
     Some(found)
 }
 
+/// Every action `stored` holds, as a read reports it at `now`, in the order they were
+/// created — the order a paginated read's token indexes into, so it does not depend on
+/// anything a later call can reshuffle.
+///
+/// Each action's owed settle is materialised first ([`StoredAction::settle_due`]), for
+/// the same reason [`find_action_mut`] does it: the move fell due whether or not anybody
+/// called, so a list reports the status the action already carried rather than a stale
+/// one — and agrees with what `DescribeBudgetAction` reports for the same action.
+pub fn actions_for_budget(stored: &mut StoredBudget, now: SystemTime) -> Vec<Action> {
+    stored
+        .actions
+        .iter_mut()
+        .map(|held| {
+            held.settle_due(now);
+            held.action.clone()
+        })
+        .collect()
+}
+
 /// The number of actions one budget will hold.
 ///
 /// Not an AWS quota reproduced here: it is this emulator's own ceiling, so a caller

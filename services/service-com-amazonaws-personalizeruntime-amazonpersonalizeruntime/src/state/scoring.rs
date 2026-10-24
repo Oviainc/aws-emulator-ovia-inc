@@ -91,29 +91,31 @@ pub fn context_seed(context: Option<&HashMap<String, String>>) -> String {
     pairs.join(",")
 }
 
-/// Rescale `scores` in place so that they sum to 1.0, as Amazon Personalize does
-/// across the candidate set it scored ("a numeric representation of the model's
-/// certainty that the item will be the next user selection").
+/// Rescale `scores` in place into each entry's share of the certainty Amazon
+/// Personalize reports ("a numeric representation of the model's certainty that the
+/// item will be the next user selection").
 ///
-/// `scores` must be the WHOLE candidate set the request scored — every entry the
-/// resolved resource's catalog holds that the request's filter kept — and never the
-/// slice a caller's result count happens to ask back. The score of one entry is a
-/// property of the resource, the request's personalization inputs and the entry, so
-/// the denominator may not depend on how many entries the caller asked for; a
-/// response that reports a subset of the candidates therefore sums to at most 1.0,
-/// and reports the same score for an entry whatever its result count was.
+/// `scores` must be the relevance of EVERY entry the resolved resource's stored
+/// catalog holds for this request — the whole scored catalog, settled BEFORE any
+/// member of the request that merely selects which entries come back (which ids the
+/// caller listed, which filter it named, how many results it asked for, which of them
+/// a promotion takes). The reported score of one entry is the model's certainty for
+/// that (resource, personalization inputs, entry) tuple, so the denominator may not
+/// depend on a selection member: a response that reports a subset of the catalog
+/// therefore sums to at most 1.0, and reports the same score for an entry whatever
+/// the rest of the request asked for.
 ///
 /// Rescaling is strictly positive and uniform, so it cannot change the ordering the
 /// caller is promised. When every score is 0 (a catalog whose entries carry no
-/// popularity) the certainty is spread evenly over the candidate set rather than
-/// left at 0.
+/// popularity) every share stays 0: there is no certainty to report, and spreading
+/// a full 1.0 over such a catalog would invent one.
 pub fn normalize(scores: &mut [f64]) {
     normalize_by(scores, |score| score);
 }
 
-/// [`normalize`] over the score field of a scored candidate set, for a caller whose
-/// candidates are tuples or structs: the candidates are normalized IN PLACE, so each
-/// keeps carrying its own share of 1.0 through sorting and selection.
+/// [`normalize`] over the score field of a scored catalog, for a caller whose entries
+/// are tuples or structs: the entries are normalized IN PLACE, so each keeps carrying
+/// its own share of 1.0 through filtering, sorting and selection.
 ///
 /// `score` names the field to rescale; the set is walked twice (the sum, then the
 /// rescale) straight over the slice, so nothing is allocated.
@@ -125,18 +127,14 @@ pub fn normalize_by<T>(candidates: &mut [T], score: impl Fn(&mut T) -> &mut f64)
     for candidate in candidates.iter_mut() {
         total += *score(candidate);
     }
-    if total > 0.0 {
-        for candidate in candidates.iter_mut() {
-            let score = score(candidate);
-            *score /= total;
-        }
-    } else {
-        // Every candidate scored 0 (a catalog whose entries carry no popularity), so
-        // the certainty is spread evenly over the set rather than left at 0.
-        let share = 1.0 / candidates.len() as f64;
-        for candidate in candidates.iter_mut() {
-            *score(candidate) = share;
-        }
+    // A total of 0 means every entry of the scored catalog carries no popularity, so
+    // the model has no certainty to apportion and every share stays 0.
+    if total <= 0.0 {
+        return;
+    }
+    for candidate in candidates.iter_mut() {
+        let score = score(candidate);
+        *score /= total;
     }
 }
 
