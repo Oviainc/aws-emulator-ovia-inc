@@ -56,7 +56,7 @@ fn contact_arn(index: usize) -> String {
 ///
 /// A row that already created a contact gets the conflict the create answers for a
 /// duplicate alias, which is as good as having created it.
-async fn ensure_contacts(emulator: &Emulator, count: usize, case: &str) -> Vec<String> {
+pub(crate) async fn ensure_contacts(emulator: &Emulator, count: usize, case: &str) -> Vec<String> {
     for index in 0..count {
         let (status, body) = emulator
             .call(
@@ -78,7 +78,7 @@ async fn ensure_contacts(emulator: &Emulator, count: usize, case: &str) -> Vec<S
 }
 
 /// Create a rotation whose team is one contact, and answer its `RotationArn`.
-async fn create_rotation(emulator: &Emulator, name: &str, case: &str) -> String {
+pub(crate) async fn create_rotation(emulator: &Emulator, name: &str, case: &str) -> String {
     let team = ensure_contacts(emulator, 1, case).await;
     let (status, body) = emulator
         .call(
@@ -107,7 +107,7 @@ async fn create_rotation(emulator: &Emulator, name: &str, case: &str) -> String 
 }
 
 /// Create an override, asserting the call succeeded, and answer its `RotationOverrideId`.
-async fn create_override(emulator: &Emulator, request: Value, case: &str) -> String {
+pub(crate) async fn create_override(emulator: &Emulator, request: Value, case: &str) -> String {
     let (status, body) = emulator.call("CreateRotationOverride", request).await;
     assert_eq!(
         status, 200,

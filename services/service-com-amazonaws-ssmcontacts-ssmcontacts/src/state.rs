@@ -29,7 +29,7 @@ use std::time::SystemTime;
 
 use crate::ops::types::{
     Contact, ContactChannel, ContactChannelAddress, DescribeEngagementOutput, Engagement, Plan,
-    RecurrenceSettings, Rotation, Tag,
+    RecurrenceSettings, Rotation, RotationOverride, Tag,
 };
 
 /// What `CreateContact` persists, and what `GetContact`/`ListContacts` rebuild their
@@ -713,6 +713,23 @@ pub fn rotation_summary(record: &RotationRecord) -> Rotation {
     }
 }
 
+/// The `RotationOverride` summary `ListRotationOverrides` returns for a stored record.
+///
+/// Every member the modelled `RotationOverride` carries is rebuilt from what the create
+/// persisted, `CreateTime` included, so a listed override reports the same window and the
+/// same creation instant `GetRotationOverride` reports for it. The overridden rotation's
+/// ARN is deliberately absent: the modelled shape does not carry it, and a caller already
+/// named the rotation to list under.
+pub fn rotation_override_summary(record: &RotationOverrideRecord) -> RotationOverride {
+    RotationOverride {
+        rotation_override_id: record.rotation_override_id.clone(),
+        new_contact_ids: record.new_contact_ids.clone(),
+        start_time: record.start_time,
+        end_time: record.end_time,
+        create_time: ::aws_smithy_types::DateTime::from(record.create_time),
+    }
+}
+
 /// The `DescribeEngagement` response for a stored engagement.
 ///
 /// `StopTime` is present exactly when the engagement has been stopped, so a caller reads
@@ -807,6 +824,9 @@ pub const TOKEN_SCOPE_ROTATIONS: &str = "rotations";
 /// The `NextToken` scope `ListEngagements` issues and accepts.
 pub const TOKEN_SCOPE_ENGAGEMENTS: &str = "engagements";
 
+/// The `NextToken` scope `ListRotationOverrides` issues and accepts.
+pub const TOKEN_SCOPE_ROTATION_OVERRIDES: &str = "rotation-overrides";
+
 /// Cut `items` (already filtered, in key order, and already positioned past any
 /// `NextToken`) down to one page.
 ///
@@ -831,6 +851,19 @@ pub fn take_page<T>(
 /// The message a `List*` refuses an unreadable `NextToken` with.
 pub fn invalid_next_token_message(token: &str) -> String {
     format!("Value '{token}' at 'nextToken' failed to satisfy constraint: Member must be a pagination token this service issued")
+}
+
+// ---------------------------------------------------------------------------
+// Time
+// ---------------------------------------------------------------------------
+
+/// One instant as a total-ordering key, so two `DateTime`s compare to the nanosecond.
+///
+/// Every operation that compares a window's ends, or tests a stored window against a
+/// requested range, orders instants the same way, so the key lives here rather than once
+/// per handler.
+pub fn instant(at: &::aws_smithy_types::DateTime) -> (i64, u32) {
+    (at.secs(), at.subsec_nanos())
 }
 
 // ---------------------------------------------------------------------------
