@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteApprovalRuleTemplate
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteApprovalRuleTemplate`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteApprovalRuleTemplate::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +139,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteApprovalRuleTemplate` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteApprovalRuleTemplateErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Nothing about the deletion depends on WHO asked: the operation reports an
+        // id it stored, and records no `lastModifiedUser` because the template the
+        // call removes is gone.
+        let _ = ctx;
+
+        // `approvalRuleTemplateName` is `@required` and `@length` 1..100, so a
+        // missing, empty or over-long name is already refused at the request
+        // boundary as `ApprovalRuleTemplateNameRequiredException` /
+        // `InvalidApprovalRuleTemplateNameException` (`crate::service::refusal_for`).
+        // What is left is the part of the rule the model cannot express, decided in
+        // the one place this crate decides it.
+        if !crate::state::is_approval_rule_template_name(&input.approval_rule_template_name) {
+            return Err(
+                DeleteApprovalRuleTemplateErrorModeled::InvalidApprovalRuleTemplateNameException(
+                    InvalidApprovalRuleTemplateNameException {
+                        message: Some(crate::state::invalid_approval_rule_template_name_message(
+                            &input.approval_rule_template_name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        let mut store = state.lock();
+
+        // "You cannot delete a template that is associated with a repository. Remove
+        // all associations, and then try again." Decided BEFORE the removal, so a
+        // refused delete leaves the template stored and every association it has
+        // intact; the release path is disassociating it, or deleting the
+        // repositories that hold it, which releases their associations with it.
+        if store.template_is_associated(&input.approval_rule_template_name) {
+            return Err(
+                DeleteApprovalRuleTemplateErrorModeled::ApprovalRuleTemplateInUseException(
+                    ApprovalRuleTemplateInUseException {
+                        message: Some(
+                            crate::state::APPROVAL_RULE_TEMPLATE_IN_USE_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "Deletes a specified approval rule template." The record is dropped from
+        // the store — which is what releases its slot in
+        // `APPROVAL_RULE_TEMPLATE_QUOTA` and what makes every later read of it
+        // answer `ApprovalRuleTemplateDoesNotExistException` — and the answer is the
+        // id of the template THIS call removed, read off that record rather than
+        // recomputed from the request.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteApprovalRuleTemplate"))
+        // The delete is idempotent and models no does-not-exist error: "If the
+        // template has been previously deleted, the only response is a 200 OK." The
+        // output member is `@required`, so a call that removed nothing answers 200
+        // carrying no id rather than inventing one — a name no template holds has no
+        // stored id to report.
+        let removed = store
+            .approval_rule_templates
+            .remove(&input.approval_rule_template_name);
+
+        Ok(DeleteApprovalRuleTemplateOutput {
+            approval_rule_template_id: removed
+                .map(|template| template.template_id)
+                .unwrap_or_default(),
+        })
     }
 }
