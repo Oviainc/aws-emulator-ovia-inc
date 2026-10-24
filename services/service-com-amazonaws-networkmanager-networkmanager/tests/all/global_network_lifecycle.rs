@@ -306,18 +306,20 @@ async fn global_network_and_site_lifecycle_round_trips_through_stored_state() {
         "UpdateGlobalNetwork must leave unsupplied members alone, got {described}"
     );
 
-    // DELETE is refused while the network still owns a site.
-    let (status, conflict) = emulator
+    // DELETE is refused while the network still owns a site: a dependency refusal, which
+    // this service reports as the 400 ValidationException (the children must go first, so
+    // retrying this call can never succeed).
+    let (status, refused) = emulator
         .delete(&format!("/global-networks/{network_id}"))
         .await;
     assert_eq!(
-        status, 409,
-        "DeleteGlobalNetwork with a child site: expected 409, got {status} with {conflict}"
+        status, 400,
+        "DeleteGlobalNetwork with a child site: expected 400, got {status} with {refused}"
     );
     assert_eq!(
-        error_code(&conflict),
-        "ConflictException",
-        "DeleteGlobalNetwork with a child site: wrong error code in {conflict}"
+        error_code(&refused),
+        "ValidationException",
+        "DeleteGlobalNetwork with a child site: wrong error code in {refused}"
     );
 
     // Empty it, then the delete succeeds and the record is gone.

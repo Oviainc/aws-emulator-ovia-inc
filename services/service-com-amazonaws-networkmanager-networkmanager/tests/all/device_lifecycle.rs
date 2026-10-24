@@ -229,7 +229,7 @@ async fn create_device(emulator: &Emulator, network: &str, body: Value) -> (u16,
 }
 
 /// `CreateDevice` that must succeed, answering the minted `DeviceId`.
-async fn create_device_ok(emulator: &Emulator, network: &str, body: Value) -> String {
+pub(crate) async fn create_device_ok(emulator: &Emulator, network: &str, body: Value) -> String {
     let (status, created) = create_device(emulator, network, body.clone()).await;
     assert_eq!(
         status, 200,
@@ -696,12 +696,12 @@ async fn a_parent_that_still_holds_a_device_cannot_be_deleted() {
         .delete(&format!("/global-networks/{network}/sites/{held}"))
         .await;
     assert_eq!(
-        status, 409,
-        "DeleteSite with a device: expected 409, got {status} with {refused}"
+        status, 400,
+        "DeleteSite with a device: expected 400, got {status} with {refused}"
     );
     assert_eq!(
         error_code(&refused),
-        "ConflictException",
+        "ValidationException",
         "DeleteSite with a device: wrong error code in {refused}"
     );
 
@@ -717,12 +717,12 @@ async fn a_parent_that_still_holds_a_device_cannot_be_deleted() {
     // A device is a child of the global network too, so that delete is refused as well.
     let (status, refused) = emulator.delete(&format!("/global-networks/{network}")).await;
     assert_eq!(
-        status, 409,
-        "DeleteGlobalNetwork with a device: expected 409, got {status} with {refused}"
+        status, 400,
+        "DeleteGlobalNetwork with a device: expected 400, got {status} with {refused}"
     );
     assert_eq!(
         error_code(&refused),
-        "ConflictException",
+        "ValidationException",
         "DeleteGlobalNetwork with a device: wrong error code in {refused}"
     );
 

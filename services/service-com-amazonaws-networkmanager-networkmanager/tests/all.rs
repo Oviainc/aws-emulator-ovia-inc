@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/core_network_lifecycle.rs"]
 mod core_network_lifecycle;
+#[path = "all/delete_dependency_refusal.rs"]
+mod delete_dependency_refusal;
 #[path = "all/device_lifecycle.rs"]
 mod device_lifecycle;
 #[path = "all/global_network_lifecycle.rs"]
