@@ -101,6 +101,8 @@ mod model_card_updates;
 mod model_package_group_lifecycle;
 #[path = "all/model_package_group_policy.rs"]
 mod model_package_group_policy;
+#[path = "all/model_package_group_policy_names.rs"]
+mod model_package_group_policy_names;
 #[path = "all/model_package_registry.rs"]
 mod model_package_registry;
 #[path = "all/model_package_updates.rs"]

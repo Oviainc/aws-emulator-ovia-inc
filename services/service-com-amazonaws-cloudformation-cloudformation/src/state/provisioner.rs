@@ -54,6 +54,10 @@
 //!   sides, so its arm passes them through as `CreateQueue`'s `Attributes` map, lifting
 //!   out the two that are not attributes (the name CloudFormation decides, and the tag
 //!   list the create takes as its own member);
+//! * `AWS::SageMaker::ModelPackageGroup`'s are its create's members EXCEPT ONE — a model
+//!   group's resource policy is attached through SageMaker's own
+//!   `PutModelPackageGroupPolicy` — so its arm passes the properties through and then makes
+//!   that second call, the same pair a client makes;
 //! * `AWS::SNS::Topic`'s are the topic's attributes in the same way, with the three that
 //!   are not attributes lifted out (the name, the tag list and the data-protection policy,
 //!   each a `CreateTopic` member of its own), the inline `Subscription` list made by
@@ -95,7 +99,8 @@
 //! ([`super::provisioning::StackProvenance`]). That SET is the same for every type, so it is
 //! computed once there; APPLYING it is per type, because each owning API takes a tag set its
 //! own way — a `Tags` member of the create whose `Tag` shape spells `Key`/`Value` (Amazon
-//! SNS, Amazon Data Firehose, Amazon ECR Public, Amazon CloudWatch, Amazon EMR, IAM), the
+//! SNS, Amazon Data Firehose, Amazon ECR Public, Amazon CloudWatch, Amazon EMR, Amazon
+//! SageMaker, IAM), the
 //! same list spelled `key`/`value`
 //! (Amazon ECS, CodePipeline), a map of key to value (Amazon SQS, AWS FIS), or a tagging
 //! call of its own where the create takes no tags at all (Amazon S3's `PutBucketTagging`).
@@ -124,8 +129,8 @@ use super::provisioning::{
 };
 use super::template::{
     CLOUDWATCH_METRIC_STREAM, ECR_PUBLIC_REPOSITORY, ECS_CLUSTER, EMR_CLUSTER,
-    FIREHOSE_DELIVERY_STREAM, FIS_EXPERIMENT_TEMPLATE, GUARDDUTY_DETECTOR, SNS_TOPIC, SQS_QUEUE,
-    WAF_REGIONAL_IP_SET,
+    FIREHOSE_DELIVERY_STREAM, FIS_EXPERIMENT_TEMPLATE, GUARDDUTY_DETECTOR,
+    SAGEMAKER_MODEL_PACKAGE_GROUP, SNS_TOPIC, SQS_QUEUE, WAF_REGIONAL_IP_SET,
 };
 use super::StoredResource;
 
@@ -157,6 +162,7 @@ pub(super) enum Provisioner {
     CodePipelinePipeline,
     EcsCluster,
     SqsQueue,
+    SageMakerModelPackageGroup,
     SnsTopic,
     FisExperimentTemplate,
     WafRegionalIpSet,
@@ -176,6 +182,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         CODEPIPELINE_PIPELINE => Some(Provisioner::CodePipelinePipeline),
         ECS_CLUSTER => Some(Provisioner::EcsCluster),
         SQS_QUEUE => Some(Provisioner::SqsQueue),
+        SAGEMAKER_MODEL_PACKAGE_GROUP => Some(Provisioner::SageMakerModelPackageGroup),
         SNS_TOPIC => Some(Provisioner::SnsTopic),
         FIS_EXPERIMENT_TEMPLATE => Some(Provisioner::FisExperimentTemplate),
         WAF_REGIONAL_IP_SET => Some(Provisioner::WafRegionalIpSet),
@@ -226,6 +233,9 @@ impl Provisioner {
             }
             Self::EcsCluster => create_cluster(ctx, region, resource, propagated).await,
             Self::SqsQueue => create_queue(ctx, region, resource, propagated).await,
+            Self::SageMakerModelPackageGroup => {
+                create_model_package_group(ctx, region, resource, propagated).await
+            }
             Self::SnsTopic => create_topic(ctx, region, resource, propagated).await,
             Self::FisExperimentTemplate => {
                 create_experiment_template(ctx, region, resource, propagated).await
@@ -307,9 +317,10 @@ impl Provisioner {
     }
 
     /// Delete one resource from the service that owns it. A resource that service no
-    /// longer holds is already in the state the delete asks for, so each arm treats its
-    /// own not-found CODE — never a message, which carries the request's own name — as
-    /// success.
+    /// longer holds is already in the state the delete asks for, so each arm decides that
+    /// on the answer's own terms: on its not-found CODE where the service models one —
+    /// never on a message, which carries the request's own name — and, where it models
+    /// none (SageMaker's model group), by READING the resource back.
     pub(super) async fn delete(
         self,
         ctx: &smithy_server_runtime::OperationContext<'_>,
@@ -337,6 +348,9 @@ impl Provisioner {
             }
             Self::EcsCluster => delete_cluster(ctx, region, physical_resource_id).await,
             Self::SqsQueue => delete_queue(ctx, region, physical_resource_id).await,
+            Self::SageMakerModelPackageGroup => {
+                delete_model_package_group(ctx, region, physical_resource_id).await
+            }
             Self::SnsTopic => delete_topic(ctx, region, physical_resource_id).await,
             Self::FisExperimentTemplate => {
                 delete_experiment_template(ctx, region, physical_resource_id).await
@@ -381,6 +395,9 @@ impl Provisioner {
             }
             Self::EcsCluster => describe_cluster(ctx, region, physical_resource_id).await,
             Self::SqsQueue => describe_queue(ctx, region, physical_resource_id).await,
+            Self::SageMakerModelPackageGroup => {
+                describe_model_package_group(ctx, region, physical_resource_id).await
+            }
             Self::SnsTopic => describe_topic(ctx, region, physical_resource_id).await,
             Self::FisExperimentTemplate => {
                 describe_experiment_template(ctx, region, physical_resource_id).await
@@ -2754,6 +2771,221 @@ fn declared_subscriptions(properties: &Value) -> Vec<Vec<(String, String)>> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// Amazon SageMaker: AWS::SageMaker::ModelPackageGroup
+// ---------------------------------------------------------------------------
+
+/// SageMaker's signing name and `X-Amz-Target` prefix, from its model (`sigv4Name:
+/// sagemaker`, service shape `SageMaker`), which speaks `awsJson1_1`.
+const SAGEMAKER_SIGNING_NAME: &str = "sagemaker";
+const SAGEMAKER_TARGET_PREFIX: &str = "SageMaker";
+
+/// The property `AWS::SageMaker::ModelPackageGroup` carries the model group's resource
+/// policy under.
+///
+/// It is the ONE property of that type which is not a `CreateModelPackageGroup` member:
+/// SageMaker attaches a model group's resource policy through its own
+/// `PutModelPackageGroupPolicy`, so the property is taken out of the create request and
+/// applied with that call once the group exists — the same two calls a client makes.
+const MODEL_PACKAGE_GROUP_POLICY: &str = "ModelPackageGroupPolicy";
+
+/// Create the model group an `AWS::SageMaker::ModelPackageGroup` declares, with the
+/// resource policy it declares for it.
+///
+/// `ModelPackageGroupName`, `ModelPackageGroupDescription` and `Tags` are named identically
+/// on the type and on `CreateModelPackageGroup`, so the resolved properties ARE the
+/// request, with the one member CloudFormation decides (the group's name, which is this
+/// resource's physical id) set on the way out, and the `Tags` list carrying the tags
+/// CloudFormation propagates beside the declared ones ([`tags_of`]) — `CreateModelPackageGroup$Tags`
+/// is the same `Tag{Key, Value}` list the type's property is. [`MODEL_PACKAGE_GROUP_POLICY`]
+/// is the exception, and is attached afterwards through the operation that owns it; a group
+/// whose policy SageMaker refuses is not left behind half-configured — it is deleted again,
+/// and the refusal is what the deployment reports, with a cleanup that itself failed named
+/// in it rather than swallowed.
+async fn create_model_package_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let mut request = match &resource.properties {
+        Value::Object(object) => object.clone(),
+        _ => Map::new(),
+    };
+    let policy = request.remove(MODEL_PACKAGE_GROUP_POLICY);
+    let name = resource.physical_resource_id.clone();
+    request.insert(
+        "ModelPackageGroupName".to_string(),
+        Value::String(name.clone()),
+    );
+    let tags = tags_of(&resource.properties, propagated);
+    if tags.is_empty() {
+        request.remove("Tags");
+    } else {
+        request.insert("Tags".to_string(), tags_as_list(&tags, UPPER_CASED_TAG));
+    }
+    let reported = call_json_rpc(
+        ctx,
+        SAGEMAKER_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{SAGEMAKER_TARGET_PREFIX}.CreateModelPackageGroup"),
+        &Value::Object(request),
+    )
+    .await?;
+    let mut attributes = BTreeMap::new();
+    if let Some(arn) = reported.get("ModelPackageGroupArn").and_then(Value::as_str) {
+        // The group's real ARN, which is the ARN its `Fn::GetAtt` reports.
+        attributes.insert("Arn".to_string(), arn.to_string());
+        attributes.insert("ModelPackageGroupArn".to_string(), arn.to_string());
+    }
+
+    let Some(policy) = policy.filter(|policy| !policy.is_null()) else {
+        return Ok(Created::attributes(attributes));
+    };
+    // The type's property is a `Json` document, which a template may spell as the document
+    // itself or as the text of one; `PutModelPackageGroupPolicy$ResourcePolicy` is modelled
+    // a string either way, so the one JSON-to-text rendering this module has is what
+    // renders it: text stays itself, a document becomes its own compact JSON.
+    let document = attribute_text(&policy);
+    let attached = call_json_rpc(
+        ctx,
+        SAGEMAKER_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{SAGEMAKER_TARGET_PREFIX}.PutModelPackageGroupPolicy"),
+        &serde_json::json!({
+            "ModelPackageGroupName": name,
+            "ResourcePolicy": document,
+        }),
+    )
+    .await;
+    let Err(refusal) = attached else {
+        return Ok(Created::attributes(attributes));
+    };
+    // The group exists but carries none of the policy the template declared, and the
+    // deployment will not record it as created: delete it rather than leave a group behind
+    // that no stack would ever clean up. A cleanup SageMaker refuses leaves one there, so
+    // that refusal is reported alongside the one that caused it.
+    match delete_model_package_group(ctx, region, &name).await {
+        Ok(()) => Err(refusal),
+        Err(cleanup) => Err(Refusal {
+            code: refusal.code,
+            message: format!(
+                "{}; the model package group could not be deleted again: {cleanup}",
+                refusal.message
+            ),
+        }),
+    }
+}
+
+/// The error code SageMaker answers for a model group it does not have: it validates the
+/// group's existence before the call rather than modelling a not-found error, so this is
+/// what `DescribeModelPackageGroup` answers for a group that is absent.
+const SAGEMAKER_VALIDATION_EXCEPTION: &str = "ValidationException";
+
+/// Delete the model group a stack created. SageMaker releases a group's resource policy
+/// with the group, so the one call removes both.
+///
+/// A group SageMaker no longer has is already in the state the delete asks for. This
+/// operation models no not-found error — the service validates the group's existence and
+/// answers `ValidationException`, which is also what it answers for a group it refuses to
+/// delete (one that still contains model package versions) — so "already gone" is decided
+/// by READING the group back rather than by matching the refusal's text. Only the read's
+/// OWN `ValidationException` means absence: any other answer (a transport fault, an
+/// internal failure) leaves the delete's refusal standing rather than reporting a deletion
+/// nothing carried out.
+async fn delete_model_package_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let request = serde_json::json!({ "ModelPackageGroupName": physical_resource_id });
+    let refusal = match call_json_rpc(
+        ctx,
+        SAGEMAKER_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{SAGEMAKER_TARGET_PREFIX}.DeleteModelPackageGroup"),
+        &request,
+    )
+    .await
+    {
+        Ok(_) => return Ok(()),
+        Err(refusal) => refusal,
+    };
+    let described = call_json_rpc(
+        ctx,
+        SAGEMAKER_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{SAGEMAKER_TARGET_PREFIX}.DescribeModelPackageGroup"),
+        &request,
+    )
+    .await;
+    if matches!(&described, Err(absence) if absence.code == SAGEMAKER_VALIDATION_EXCEPTION) {
+        // SageMaker does not have the group, which is the state the delete asked for.
+        return Ok(());
+    }
+    Err(refusal)
+}
+
+/// The model group's configuration as SageMaker reports it, for drift detection.
+///
+/// A group SageMaker no longer holds answers `ValidationException` (it validates the
+/// group's existence rather than modelling a not-found error), which is the `DELETED`
+/// drift status. The group's own resource policy is not part of that answer, so it is read
+/// through the operation that owns it and reported under the property the template declares
+/// it as; a group carrying none simply has no such property, and a property the owning
+/// service does not report is not evidence of drift.
+async fn describe_model_package_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let request = serde_json::json!({ "ModelPackageGroupName": physical_resource_id });
+    let described = match call_json_rpc(
+        ctx,
+        SAGEMAKER_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{SAGEMAKER_TARGET_PREFIX}.DescribeModelPackageGroup"),
+        &request,
+    )
+    .await
+    {
+        Ok(described) => described,
+        Err(refusal) if refusal.code == SAGEMAKER_VALIDATION_EXCEPTION => return Ok(None),
+        Err(refusal) => return Err(refusal),
+    };
+    let Some(mut configuration) = described.as_object().cloned() else {
+        return Ok(Some(described));
+    };
+    // The policy read's own absence refusal means the group carries no policy, which is a
+    // configuration without that property. Any OTHER refusal is a read that did not
+    // happen, and is propagated rather than reported as a property the service does not
+    // have.
+    match call_json_rpc(
+        ctx,
+        SAGEMAKER_SIGNING_NAME,
+        region,
+        AWS_JSON_1_1,
+        &format!("{SAGEMAKER_TARGET_PREFIX}.GetModelPackageGroupPolicy"),
+        &request,
+    )
+    .await
+    {
+        Ok(policy) => {
+            if let Some(document) = policy.get("ResourcePolicy") {
+                configuration.insert(MODEL_PACKAGE_GROUP_POLICY.to_string(), document.clone());
+            }
+        }
+        Err(refusal) if refusal.code == SAGEMAKER_VALIDATION_EXCEPTION => {}
+        Err(refusal) => return Err(refusal),
+    }
+    Ok(Some(Value::Object(configuration)))
 }
 
 // ---------------------------------------------------------------------------

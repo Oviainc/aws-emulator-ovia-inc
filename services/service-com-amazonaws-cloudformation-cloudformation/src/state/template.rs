@@ -3070,6 +3070,23 @@ pub const EMR_CLUSTER: &str = "AWS::EMR::Cluster";
 /// `awsService.cloudFormationName: SQS`.
 pub const SQS_QUEUE: &str = "AWS::SQS::Queue";
 
+/// The `AWS::<cloudFormationName>::<Resource>` type of a SageMaker model package group —
+/// the model registry's container for the versioned model packages registered into it, and
+/// the carrier of the registry's resource policy. The middle segment is the SageMaker
+/// model's own `awsService.cloudFormationName`
+/// (`smithy_query(query="service_info")` on that service's model reports `SageMaker`).
+///
+/// This type deliberately carries NO [`return_values`] arm, so the default applies: its
+/// physical resource id is the group's NAME. That is what every SageMaker model-registry
+/// operation addresses the group by — `ModelPackageGroupName` is modelled `EntityName`,
+/// name-only on the policy operations — so the name is the identifier a client can use,
+/// and it is what the provisioner passes to `CreateModelPackageGroup`. The group's ARN is
+/// not computed here either: `Arn`/`ModelPackageGroupArn` are the ARN SageMaker itself
+/// answered, which the provisioner records on the resource, rather than one minted from a
+/// pattern. SageMaker's own model says nothing about this type's `Ref`, so the identifier a
+/// client can resolve is preferred over a guess at CloudFormation's.
+pub const SAGEMAKER_MODEL_PACKAGE_GROUP: &str = "AWS::SageMaker::ModelPackageGroup";
+
 /// An Amazon CloudWatch metric stream's resource type (the CloudWatch model:
 /// `cloudFormationName: CloudWatch`). This is the type `super::provisioning` creates in
 /// CloudWatch itself, through that service's own `PutMetricStream`.

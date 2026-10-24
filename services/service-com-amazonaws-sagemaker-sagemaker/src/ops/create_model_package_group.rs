@@ -168,7 +168,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // A name already in use is refused, never overwritten: otherwise the caller reads a
         // 200 for a group it did not create, and the model packages already registered
-        // under that name would be re-parented to a group with different metadata.
+        // under that name would be re-parented to a group with different metadata, or its
+        // resource policy silently discarded.
         if store
             .model_package_groups
             .contains_key(&input.model_package_group_name)

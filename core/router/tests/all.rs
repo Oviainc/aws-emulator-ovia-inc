@@ -48,6 +48,8 @@ mod boot_serve;
 // merges cleanly beside them.
 #[path = "all/cfn_provisions_declared_resources.rs"]
 mod cfn_provisions_declared_resources;
+#[path = "all/cloudformation_provisions_sagemaker_model_package_group.rs"]
+mod cloudformation_provisions_sagemaker_model_package_group;
 #[path = "all/cloudformation_provisions_stack_resources.rs"]
 mod cloudformation_provisions_stack_resources;
 #[path = "all/cloudfront_key_value_store_handshake.rs"]

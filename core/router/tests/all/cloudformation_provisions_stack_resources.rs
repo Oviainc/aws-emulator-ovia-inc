@@ -87,16 +87,7 @@ fn authorization(service: &str) -> String {
 /// Percent-encode one `application/x-www-form-urlencoded` value the way an AWS SDK does,
 /// so a template body full of `{`, `"` and `&` survives the body.
 fn form_encode(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.as_bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(*byte as char);
-            }
-            other => out.push_str(&format!("%{other:02X}")),
-        }
-    }
-    out
+    crate::query_wire::form_encode(value)
 }
 
 /// Call one CloudFormation operation over its awsQuery wire.
@@ -198,8 +189,8 @@ async fn given_delivery_role(router: &MultiServiceRouter, case: &str, role_name:
 }
 
 /// Every `<tag>` text of an XML body, in document order, with the serializer's escaping
-/// undone.
-fn xml_texts(xml: &str, tag: &str) -> Vec<String> {
+/// undone. `pub(crate)` so a sibling suite reads an awsQuery answer the same way.
+pub(crate) fn xml_texts(xml: &str, tag: &str) -> Vec<String> {
     let (open, close) = (format!("<{tag}>"), format!("</{tag}>"));
     let mut found = Vec::new();
     let mut rest = xml;
@@ -219,14 +210,14 @@ fn xml_texts(xml: &str, tag: &str) -> Vec<String> {
     found
 }
 
-fn xml_text(xml: &str, tag: &str) -> Option<String> {
+pub(crate) fn xml_text(xml: &str, tag: &str) -> Option<String> {
     xml_texts(xml, tag).into_iter().next()
 }
 
 /// A `DescribeStacks` answer's `Outputs`, as the key/value map a client reads it as. Each
 /// `member` of the list carries exactly one `OutputKey` and one `OutputValue`, so the two
 /// document-ordered lists pair up.
-fn outputs_of(xml: &str) -> BTreeMap<String, String> {
+pub(crate) fn outputs_of(xml: &str) -> BTreeMap<String, String> {
     xml_texts(xml, "OutputKey")
         .into_iter()
         .zip(xml_texts(xml, "OutputValue"))
