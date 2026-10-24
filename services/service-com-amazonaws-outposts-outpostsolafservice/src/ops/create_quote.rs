@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateQuote
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateQuote`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateQuote::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints a `QuoteId`, persists the quote the request describes, and
+//! answers it from what was persisted. The quote records the capacities,
+//! constraints, payment options and payment terms the request specified, the
+//! country code, the ARN of the Outpost it was associated with (when one was
+//! named), and the instants it was created at and expires at. No pricing is
+//! reported: a `QuoteOption`'s prices come from AWS's own price list, which this
+//! emulator does not have, so the member is absent rather than invented.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +161,122 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateQuote` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateQuoteErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateQuote"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateQuoteErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the Outposts store is unavailable".to_string()),
+            })
+        })?;
+
+        // `OutpostIdentifier` is optional: "If not specified, the quote is created
+        // without an Outpost association." When it IS named it accepts the bare id
+        // or the full Outpost ARN, both naming the same stored Outpost.
+        let outpost_identifier = crate::state::non_empty(input.outpost_identifier);
+        let outpost_id = match outpost_identifier.as_deref() {
+            Some(identifier) => {
+                Some(crate::state::resolve_outpost_id(identifier).ok_or_else(|| {
+                    CreateQuoteErrorModeled::ValidationException(ValidationException {
+                        message: Some(crate::state::outpost_identifier_pattern_report()),
+                    })
+                })?)
+            }
+            None => None,
+        };
+
+        let mut store = state.lock();
+        // A quote may be associated only with an Outpost that exists, so an
+        // identifier naming none is the not-found error this operation models. The
+        // ARN the quote reports is the Outpost's OWN `OutpostArn`, so it carries the
+        // region that Outpost was created in rather than this request's.
+        let outpost_arn = outpost_id
+            .as_deref()
+            .zip(outpost_identifier.as_deref())
+            .map(|(outpost_id, supplied)| {
+                store
+                    .outposts
+                    .get(outpost_id)
+                    .and_then(|record| record.outpost.outpost_arn.clone())
+                    .ok_or_else(|| {
+                        CreateQuoteErrorModeled::NotFoundException(NotFoundException {
+                            // The identifier echo names the member the absent
+                            // identifier arrived in and echoes the value AS
+                            // SUPPLIED.
+                            message: Some(crate::state::identifier_not_found(
+                                crate::state::OUTPOST_IDENTIFIER_MEMBER,
+                                supplied,
+                            )),
+                        })
+                    })
+            })
+            .transpose()?;
+        // See `CreateSite`: the store's growth is capped. `CreateQuote` models no
+        // quota error, so the cap is reported as what it is from the caller's side —
+        // a request this service will not accept (400 `ValidationException`) — and
+        // never as a 501 or an invented error code. The wording is the one the two
+        // creates that DO model the quota error use.
+        if store.quotes.len() >= crate::state::MAX_RESOURCES {
+            return Err(CreateQuoteErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "the number of quotes would exceed the limit of {}",
+                        crate::state::MAX_RESOURCES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let (quote_id, sequence) = store.mint_id("oq");
+        let created = ::std::time::SystemTime::now();
+        let quote = Quote {
+            quote_id: Some(quote_id.clone()),
+            account_id: Some(::engine::emulator_account_id().to_string()),
+            // A created quote is usable: it is created to be read and ordered from.
+            // Its one clock-owed transition is the expiry below, which every read
+            // materialises through `settle_quotes`.
+            quote_status: Some(crate::state::QUOTE_STATUS_CREATED.to_string()),
+            // `StatusMessage` explains a status that needs explaining; a quote that
+            // was created normally has nothing to explain.
+            status_message: None,
+            outpost_arn,
+            country_code: Some(input.country_code),
+            // Every `Requested…` member is "the … specified in the quote request",
+            // so each is the request's own value: present as sent, absent when the
+            // request named none. `RequestedCapacities` is `@required`, so it is
+            // always present — including as the empty list the modelled
+            // `length(min: 0)` allows.
+            requested_capacities: Some(input.requested_capacities),
+            requested_constraints: input.requested_constraints,
+            requested_payment_options: input.requested_payment_options,
+            requested_payment_terms: input.requested_payment_terms,
+            // A `QuoteOption` carries upfront and monthly prices from AWS's price
+            // list, and an `OrderingRequirement` is the outcome of a check AWS runs
+            // against the order pipeline. The emulator has neither, so it reports
+            // neither rather than synthesising numbers or check results.
+            quote_options: None,
+            ordering_requirements: None,
+            // Set by submitting an order from this quote, which nothing in this
+            // slice does.
+            submitted_order_id: None,
+            created_date: Some(crate::state::timestamp(created)),
+            expiration_date: Some(crate::state::timestamp(
+                created + crate::state::QUOTE_VALIDITY,
+            )),
+            // `QuoteDescription` is modelled `length(min: 0)` with a pattern that
+            // admits the empty string, so a description is stored exactly as sent —
+            // including empty — and absent only when the request carried none.
+            description: input.description,
+        };
+        store.quotes.insert(
+            quote_id,
+            crate::state::QuoteRecord {
+                sequence,
+                quote: quote.clone(),
+            },
+        );
+
+        Ok(CreateQuoteOutput {
+            quote: Some(quote),
+        })
     }
 }

@@ -46,3 +46,19 @@ The ELBv2 side of this scenario works: `CreateLoadBalancer`, `CreateTargetGroup`
 back from state (see
 `services/service-com-amazonaws-elasticloadbalancing-elasticloadbalancing-v7/tests/all/shared_endpoint_api_versions.rs`).
 Only the ECS-side validation of the pairing is missing.
+
+## Resolution
+Fixed in `src/state.rs` (`required_target_type`, `requested_target_group_arns`,
+`target_group_target_types`, `load_balancer_refusal`, `target_group_type_refusal`),
+applied by `CreateService` and `UpdateService`, with
+`services/service-com-amazonaws-ecs-amazonec2containerservicev20141113/tests/all/load_balancer_target_groups.rs`
+driving the pairing class across both services over the wire.
+
+One correction to the Description above, recorded so a later reader does not take the
+issue text for the rule: this report says an `awsvpc` service's target group "must be `ip`
+(or `alb`)". The fix accepts `ip` ONLY, following the model — `LoadBalancer$targetGroupArn`
+says "you must choose `ip` as the target type" because an `awsvpc` task is registered by
+the IP of its own elastic network interface, while the targets of an `alb` target group
+are load balancers, which no ECS task registration produces. `alb` is refused for every
+network mode, and the test table pins that.
+

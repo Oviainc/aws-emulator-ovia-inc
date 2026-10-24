@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ResetClusterParameterGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ResetClusterParameterGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ResetClusterParameterGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Puts the parameters of one cluster parameter group back to their family's
+//! engine defaults: the values a caller SET on the group are dropped (all of
+//! them for `ResetAllParameters`, the named subset otherwise), so every later
+//! `DescribeClusterParameters` reports those parameters with `Source`
+//! `engine-default` again.
 //!
 //! ## Shape of an operation
 //!
@@ -94,11 +91,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `ResetClusterParameterGroupError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#ResetClusterParameterGroup")]
+// `DependentServiceUnavailableFault` is widened in: the model does not list it for
+// this operation, but the service declares the shape, and it is the only modelled
+// way to say "the control-plane store could not be reached" (the same widening
+// `ModifyClusterParameterGroup` makes).
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#ResetClusterParameterGroup",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum ResetClusterParameterGroupErrorModeled {
     ClusterParameterGroupNotFoundFault(ClusterParameterGroupNotFoundFault),
     InvalidClusterParameterGroupStateFault(InvalidClusterParameterGroupStateFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -147,23 +152,181 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::RESET_CLUSTER_PARAMETER_GROUP_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Put the parameters of one cluster parameter group back to their family's
+    /// engine defaults.
+    ///
+    /// A MUTATION: "Sets one or more parameters of the specified parameter group
+    /// to their default values and sets the source values of the parameters to
+    /// 'engine-default'". A group stores only the values a caller SET on it (see
+    /// `crate::state::StoredParameterGroup::parameter_values`), so putting a
+    /// parameter back to its engine default IS dropping the override — which is
+    /// also what flips its reported `Source` back to `engine-default`. A request
+    /// the service refuses changes NOTHING: every name is resolved against the
+    /// family's published catalog before the first override is dropped.
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ResetClusterParameterGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ResetClusterParameterGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ResetClusterParameterGroup"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                ResetClusterParameterGroupErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "An array of names of parameters to be reset" — the list carries names,
+        // and any `ParameterValue` a caller put beside one says nothing about
+        // what a reset does, so only the names are read.
+        let named = input.parameters.as_deref().unwrap_or_default();
+
+        // "If true, all parameters in the specified parameter group will be reset
+        // to their default values. Default: true", read together with "If
+        // ResetAllParameters option is not used, then at least one parameter name
+        // must be supplied": the documented default governs the request that
+        // names no parameter, which is the only request it can mean anything for.
+        // A request that names parameters and asks for all of them anyway resets
+        // all of them — the named subset is already included.
+        let reset_all = input.reset_all_parameters.unwrap_or(named.is_empty());
+        if !reset_all && named.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "Invalid value for Parameters: at least one parameter name must be supplied when ResetAllParameters is false."
+                    .to_string(),
+            ));
+        }
+        // "Constraints: A maximum of 20 parameters can be reset in a single
+        // request" — a request naming more is refused before the store is read.
+        if named.len() > st::MAX_RESETTABLE_PARAMETERS {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Invalid value for Parameters: {} parameters. A maximum of {} parameters can be reset in a single request.",
+                named.len(),
+                st::MAX_RESETTABLE_PARAMETERS
+            )));
+        }
+
+        let mut store = state.lock();
+
+        let Some(position) = store.parameter_group_position(&input.parameter_group_name) else {
+            return Err(
+                ResetClusterParameterGroupErrorModeled::ClusterParameterGroupNotFoundFault(
+                    ClusterParameterGroupNotFoundFault {
+                        message: Some(format!(
+                            "Cluster parameter group not found: {}",
+                            input.parameter_group_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        let group = &store.parameter_groups[position];
+
+        // A DEFAULT parameter group is Redshift's own: the Amazon Redshift
+        // Cluster Management Guide ("Amazon Redshift parameter groups") says you
+        // can't change parameter values in one, and a group whose values cannot
+        // be changed has none to put back either. Refused exactly as
+        // `ModifyClusterParameterGroup` refuses the write, and for the same
+        // reason it is the generic refusal rather than a group-state fault:
+        // nothing about this group is in a transient state.
+        if group.default_group {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Invalid value for ParameterGroupName: '{}'. Default parameter group cannot be reset.",
+                input.parameter_group_name
+            )));
+        }
+
+        // Resolve every named parameter against the catalog its family publishes
+        // FIRST — whether or not the request also asks for all of them, so a name
+        // the family does not publish is answered the same way either way, and a
+        // refused request leaves the whole group as it was.
+        let mut named_entries: Vec<&'static st::EngineParameter> = Vec::with_capacity(named.len());
+        for (index, requested) in named.iter().enumerate() {
+            // The wire numbers a list member from 1, so a refusal names the
+            // member the caller sent.
+            let member = format!("Parameters.Parameter.{}", index + 1);
+            let name = requested.parameter_name.as_deref().unwrap_or_default();
+            if name.is_empty() {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "Invalid value for {member}.ParameterName: a parameter name must be supplied for each parameter to be reset."
+                )));
+            }
+            let Some(parameter) = group.family_parameter(name) else {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "Invalid value for {member}.ParameterName: '{name}' is not a parameter of parameter group family {}.",
+                    group
+                        .group
+                        .parameter_group_family
+                        .as_deref()
+                        .unwrap_or_default()
+                )));
+            };
+            named_entries.push(parameter);
+        }
+
+        // The parameters this reset actually puts back: the ones the group was
+        // holding a value for. A parameter already on its engine default is
+        // reset to what it already reports, so the call is idempotent and leaves
+        // no cluster waiting for a change that is not there.
+        let mut restored: Vec<&'static st::EngineParameter> = Vec::new();
+        let candidates: Vec<&'static st::EngineParameter> = if reset_all {
+            group
+                .parameter_values
+                .keys()
+                .filter_map(|held| group.family_parameter(held))
+                .collect()
+        } else {
+            named_entries
+                .iter()
+                .copied()
+                .filter(|parameter| group.parameter_values.contains_key(parameter.name))
+                .collect()
+        };
+        for parameter in candidates {
+            // The same name may be listed twice in one request, and it is one
+            // parameter either way.
+            if !restored.iter().any(|held| held.name == parameter.name) {
+                restored.push(parameter);
+            }
+        }
+
+        let group_name = group
+            .group
+            .parameter_group_name
+            .clone()
+            .unwrap_or_else(|| input.parameter_group_name.clone());
+
+        // Nothing can be refused any more, so the overrides go: dropping one is
+        // what puts the parameter back on its family's engine default, with
+        // `engine-default` as the `Source` a later read reports.
+        let group = &mut store.parameter_groups[position];
+        if reset_all {
+            group.parameter_values.clear();
+        } else {
+            for parameter in &named_entries {
+                group.parameter_values.remove(parameter.name);
+            }
+        }
+
+        // "For parameter changes to take effect you must reboot any associated
+        // clusters" — but only a STATIC parameter waits for one, exactly as on
+        // the modify path: putting a dynamic parameter back is applied without a
+        // reboot, so it leaves nothing pending.
+        let pending_reboot: Vec<String> = restored
+            .iter()
+            .filter(|parameter| parameter.apply_type == st::APPLY_TYPE_STATIC)
+            .map(|parameter| parameter.name.to_string())
+            .collect();
+        store.mark_parameter_group_pending_reboot(&group_name, &pending_reboot);
+
+        Ok(ResetClusterParameterGroupOutput {
+            parameter_group_name: Some(group_name),
+            parameter_group_status: Some(st::PARAMETER_GROUP_STATUS_UPDATED.to_string()),
+        })
     }
 }

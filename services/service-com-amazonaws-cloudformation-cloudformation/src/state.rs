@@ -1092,6 +1092,25 @@ impl StoredStack {
         }
     }
 
+    /// What CloudFormation records on, and propagates to, every resource it provisions for
+    /// this stack: the stack's identity and the stack-level `Tags` in force
+    /// ([`provisioning::StackProvenance`]).
+    ///
+    /// Read off the stack under the store lock, so the deployment that follows — which runs
+    /// with the lock released — carries the tags the stack really has rather than a second
+    /// idea of them.
+    pub fn provenance(&self) -> provisioning::StackProvenance {
+        provisioning::StackProvenance {
+            stack_name: self.stack_name.clone(),
+            stack_id: self.stack_id.clone(),
+            tags: self
+                .tags
+                .iter()
+                .map(|tag| (tag.key.clone(), tag.value.clone()))
+                .collect(),
+        }
+    }
+
     /// Replace the resources of [`Self::current_resources`] with what the services that
     /// own them answered — the identifier each one minted, the attributes they reported,
     /// and whether each resource was really created there.

@@ -87,6 +87,25 @@
 //!   `detectorId` — so, as for the FIS, AWS WAF Classic and Amazon EMR types above, what
 //!   the stack reports for the resource is the id that create answered with.
 //!
+//! ## The tags every created resource carries
+//!
+//! Beside what its declaration asks for, a resource CloudFormation creates carries the tags
+//! CloudFormation gives it: the stack-level `Tags` plus `aws:cloudformation:stack-name`,
+//! `aws:cloudformation:stack-id` and `aws:cloudformation:logical-id`
+//! ([`super::provisioning::StackProvenance`]). That SET is the same for every type, so it is
+//! computed once there; APPLYING it is per type, because each owning API takes a tag set its
+//! own way — a `Tags` member of the create whose `Tag` shape spells `Key`/`Value` (Amazon
+//! SNS, Amazon Data Firehose, Amazon ECR Public, Amazon CloudWatch, Amazon EMR, IAM), the
+//! same list spelled `key`/`value`
+//! (Amazon ECS, CodePipeline), a map of key to value (Amazon SQS, AWS FIS), or a tagging
+//! call of its own where the create takes no tags at all (Amazon S3's `PutBucketTagging`).
+//! [`tags_of`] is the one place the declared and the propagated halves are merged, and a key
+//! the declaration itself states keeps the declaration's value. A type that is not taggable
+//! — `AWS::WAFRegional::IPSet`, which publishes no `Tags` property — is tagged with nothing,
+//! because CloudFormation propagates no tags to one, and a type whose owning API refuses the
+//! reserved `aws:` namespace to its callers carries the stack's own tags without the three
+//! ([`Provisioner::applicable_tags`]).
+//!
 //! No arm invents a value: a property the template does not declare is absent from the
 //! request, and what the owning service answers is what the stack records. A property an
 //! arm does not map onto the create's request at all is REFUSED rather than dropped, so a
@@ -172,29 +191,75 @@ impl Provisioner {
     /// whose identity is that service's
     /// ([`super::template::identity_is_service_assigned`]) — the physical id it assigned.
     /// `Err` is that service's own refusal.
+    ///
+    /// `propagated` are the tags CloudFormation gives the resource — the stack's own plus
+    /// the three that name the stack and this resource's place in it
+    /// ([`super::provisioning::StackProvenance::tags_for`]) — and every arm whose type is
+    /// taggable applies them ([`tags_of`]) beside the ones the declaration itself asks for,
+    /// so the owning service's tag read on the handle the stack publishes answers with
+    /// them. The one arm that applies none is `AWS::WAFRegional::IPSet`, whose type
+    /// publishes no `Tags` property at all: CloudFormation propagates no tags to a resource
+    /// type that is not taggable.
     pub(super) async fn create(
         self,
         ctx: &smithy_server_runtime::OperationContext<'_>,
         region: &str,
         resource: &StoredResource,
+        propagated: &[(String, String)],
     ) -> Result<Created, Refusal> {
+        let propagated = &self.applicable_tags(propagated);
         match self {
-            Self::FirehoseDeliveryStream => create_delivery_stream(ctx, region, resource).await,
-            Self::CloudWatchMetricStream => put_metric_stream(ctx, region, resource).await,
-            Self::EcrPublicRepository => create_public_repository(ctx, region, resource).await,
-            Self::S3Bucket => create_bucket(ctx, region, resource).await,
-            Self::EmrCluster => run_job_flow(ctx, region, resource).await,
-            Self::IamRole => create_role(ctx, region, resource).await,
-            Self::CodePipelinePipeline => create_pipeline(ctx, region, resource).await,
-            Self::EcsCluster => create_cluster(ctx, region, resource).await,
-            Self::SqsQueue => create_queue(ctx, region, resource).await,
-            Self::SnsTopic => create_topic(ctx, region, resource).await,
-            Self::FisExperimentTemplate => {
-                create_experiment_template(ctx, region, resource).await
+            Self::FirehoseDeliveryStream => {
+                create_delivery_stream(ctx, region, resource, propagated).await
             }
+            Self::CloudWatchMetricStream => {
+                put_metric_stream(ctx, region, resource, propagated).await
+            }
+            Self::EmrCluster => run_job_flow(ctx, region, resource, propagated).await,
+            Self::EcrPublicRepository => {
+                create_public_repository(ctx, region, resource, propagated).await
+            }
+            Self::S3Bucket => create_bucket(ctx, region, resource, propagated).await,
+            Self::IamRole => create_role(ctx, region, resource, propagated).await,
+            Self::CodePipelinePipeline => {
+                create_pipeline(ctx, region, resource, propagated).await
+            }
+            Self::EcsCluster => create_cluster(ctx, region, resource, propagated).await,
+            Self::SqsQueue => create_queue(ctx, region, resource, propagated).await,
+            Self::SnsTopic => create_topic(ctx, region, resource, propagated).await,
+            Self::FisExperimentTemplate => {
+                create_experiment_template(ctx, region, resource, propagated).await
+            }
+            // `AWS::WAFRegional::IPSet` publishes `Name` and `IPSetDescriptors` and no
+            // `Tags`: the type is not taggable, so no tags are propagated to it.
             Self::WafRegionalIpSet => create_ip_set(ctx, region, resource).await,
-            Self::GuardDutyDetector => create_detector(ctx, region, resource).await,
+            Self::GuardDutyDetector => {
+                create_detector(ctx, region, resource, propagated).await
+            }
         }
+    }
+
+    /// Those of the tags CloudFormation gives a resource that the owning service's own API
+    /// will take.
+    ///
+    /// Every create here is made through the owning service's PUBLIC API — the same path a
+    /// client's own call takes, which is what makes a stack's resource indistinguishable
+    /// from one a client created. Some of those APIs refuse a tag key in AWS's reserved
+    /// `aws:` namespace, which is AWS's rule for a CALLER's request ("don't use the `aws:`
+    /// prefix ... it is reserved for AWS use"): IAM's `CreateRole` and CodePipeline's
+    /// `CreatePipeline` both do, in their own crates' tag validation. AWS sets the
+    /// `aws:cloudformation:*` tags from inside itself, which no public API models and this
+    /// emulator has no privileged channel for, so for such a type those three are left off
+    /// rather than sent to be refused — a stack must not fail over tags CloudFormation adds
+    /// of its own accord. The stack's own tags, which are ordinary keys, are applied either
+    /// way.
+    fn applicable_tags(self, propagated: &[(String, String)]) -> Vec<(String, String)> {
+        let refuses_reserved_keys = matches!(self, Self::IamRole | Self::CodePipelinePipeline);
+        propagated
+            .iter()
+            .filter(|(key, _)| !(refuses_reserved_keys && is_reserved_tag_key(key)))
+            .cloned()
+            .collect()
     }
 
     /// Apply a CHANGED configuration to a resource that already exists, through the owning
@@ -346,10 +411,15 @@ const RESOURCE_NOT_FOUND: &str = "ResourceNotFoundException";
 /// `DeliveryStreamEncryptionConfigurationInput` and `Tags` are named identically on both
 /// sides — so the resolved properties ARE the request, with the one member CloudFormation
 /// decides (the stream's name, which is this resource's physical id) set to it.
+///
+/// `Tags` is the one member the request does not carry verbatim: the stream carries the
+/// tags CloudFormation gives it beside the declared ones ([`tags_of`]), as the `[{Key,
+/// Value}]` list Firehose's own `Tag` shape spells.
 async fn create_delivery_stream(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     resource: &StoredResource,
+    propagated: &[(String, String)],
 ) -> Result<Created, Refusal> {
     let mut request = match &resource.properties {
         Value::Object(object) => object.clone(),
@@ -359,6 +429,10 @@ async fn create_delivery_stream(
         "DeliveryStreamName".to_string(),
         Value::String(resource.physical_resource_id.clone()),
     );
+    let tags = tags_of(&resource.properties, propagated);
+    if !tags.is_empty() {
+        request.insert("Tags".to_string(), tags_as_list(&tags, UPPER_CASED_TAG));
+    }
     let reported = call_json_rpc(
         ctx,
         FIREHOSE_SIGNING_NAME,
@@ -455,12 +529,27 @@ async fn put_metric_stream(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     resource: &StoredResource,
+    propagated: &[(String, String)],
 ) -> Result<Created, Refusal> {
+    let mut properties = match &resource.properties {
+        Value::Object(object) => object.clone(),
+        _ => Map::new(),
+    };
+    // The stream carries the tags the declaration asks for plus the ones CloudFormation
+    // gives the resource ([`tags_of`]), as the `[{Key, Value}]` list CloudWatch's own `Tag`
+    // shape spells. Only on the CREATE: "If you're using PutMetricStream to update an
+    // existing stream, you can't change the tags of the existing stream"
+    // (`PutMetricStream`), which is why the update path below sends the declaration as it
+    // stands.
+    let tags = tags_of(&resource.properties, propagated);
+    if !tags.is_empty() {
+        properties.insert("Tags".to_string(), tags_as_list(&tags, UPPER_CASED_TAG));
+    }
     put_metric_stream_configuration(
         ctx,
         region,
         &resource.physical_resource_id,
-        &resource.properties,
+        &Value::Object(properties),
     )
     .await
 }
@@ -585,6 +674,7 @@ async fn create_public_repository(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     resource: &StoredResource,
+    propagated: &[(String, String)],
 ) -> Result<Created, Refusal> {
     let properties = match &resource.properties {
         Value::Object(object) => object.clone(),
@@ -607,9 +697,11 @@ async fn create_public_repository(
         request.insert("catalogData".to_string(), Value::Object(catalog_data));
     }
     // `Tags` is a list of `{Key, Value}` on both sides: ECR Public's own `Tag` shape
-    // spells its members `Key` and `Value` too, so the list goes through as declared.
-    if let Some(tags) = properties.get("Tags") {
-        request.insert("tags".to_string(), tags.clone());
+    // spells its members `Key` and `Value` too, so the declared list goes through as
+    // declared, carrying the tags CloudFormation gives the repository beside them.
+    let tags = tags_of(&resource.properties, propagated);
+    if !tags.is_empty() {
+        request.insert("tags".to_string(), tags_as_list(&tags, UPPER_CASED_TAG));
     }
     let reported = call_json_rpc(
         ctx,
@@ -696,20 +788,27 @@ const BUCKET_ALREADY_THERE: [&str; 2] = ["BucketAlreadyOwnedByYou", "BucketAlrea
 const NO_SUCH_BUCKET: &str = "NoSuchBucket";
 
 /// Create the bucket an `AWS::S3::Bucket` declares, and apply the
-/// `VersioningConfiguration` it declares for it.
+/// `VersioningConfiguration` and the tags it carries.
 ///
 /// "Ref returns the bucket name" for this type, so the physical resource id the stack
 /// reports IS the bucket a client addresses, and it is the bucket created here.
 /// `CreateBucketConfiguration$LocationConstraint` is what decides a bucket's Region and
 /// "buckets in Region us-east-1 have a LocationConstraint of null", so the stack's own
 /// Region is sent as that constraint for every other Region and as nothing for that one.
+///
+/// `CreateBucket` takes no tag set at all, so the bucket's tags are a `PutBucketTagging` of
+/// its own — "sets the tags for a bucket", the one call S3 publishes for them — carrying
+/// the tags the declaration asks for plus the ones CloudFormation gives the resource
+/// ([`tags_of`]). It is sent only where there are tags to set: an empty tag set is no
+/// tagging rather than a call that would clear one.
 async fn create_bucket(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     resource: &StoredResource,
+    propagated: &[(String, String)],
 ) -> Result<Created, Refusal> {
     use ::aws_sdk_s3::types::{
-        BucketLocationConstraint, BucketVersioningStatus, CreateBucketConfiguration,
+        BucketLocationConstraint, BucketVersioningStatus, CreateBucketConfiguration, Tag, Tagging,
         VersioningConfiguration,
     };
 
@@ -752,6 +851,37 @@ async fn create_bucket(
                     .status(BucketVersioningStatus::from(status))
                     .build(),
             )
+            .send()
+            .await
+            .map_err(|error| refusal_of(&error))?;
+    }
+    // The bucket's whole tag set, in the one call Amazon S3 takes it through.
+    let tags = tags_of(&resource.properties, propagated);
+    if !tags.is_empty() {
+        let mut tag_set = Vec::with_capacity(tags.len());
+        for (key, value) in &tags {
+            tag_set.push(
+                Tag::builder()
+                    .key(key)
+                    .value(value)
+                    .build()
+                    .map_err(|error| Refusal {
+                        code: "InternalFailure".to_string(),
+                        message: format!("the tag {key} cannot be sent to Amazon S3: {error}"),
+                    })?,
+            );
+        }
+        let tagging = Tagging::builder()
+            .set_tag_set(Some(tag_set))
+            .build()
+            .map_err(|error| Refusal {
+                code: "InternalFailure".to_string(),
+                message: format!("the tag set for {bucket} cannot be sent: {error}"),
+            })?;
+        client
+            .put_bucket_tagging()
+            .bucket(bucket)
+            .tagging(tagging)
             .send()
             .await
             .map_err(|error| refusal_of(&error))?;
@@ -895,10 +1025,15 @@ const INSTANCE_FLEET_ROLES: &[(&str, &str)] = &[
 /// `ConfigurationProperties` where the API spells it `Properties`. `Name` is the one member
 /// CloudFormation decides when the template declares none: EMR requires a cluster name, so
 /// the generated resource name is used.
+///
+/// The cluster carries the tags the declaration asks for plus the ones CloudFormation gives
+/// the resource ([`tags_of`]), as `RunJobFlow`'s own `Tags` list — the `[{Key, Value}]`
+/// spelling Amazon EMR's `Tag` shape uses, which is the type's own spelling too.
 async fn run_job_flow(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     resource: &StoredResource,
+    propagated: &[(String, String)],
 ) -> Result<Created, Refusal> {
     let declared = match &resource.properties {
         Value::Object(object) => object.clone(),
@@ -917,6 +1052,10 @@ async fn run_job_flow(
                 request.insert(member.clone(), value.clone());
             }
         }
+    }
+    let tags = tags_of(&resource.properties, propagated);
+    if !tags.is_empty() {
+        request.insert("Tags".to_string(), tags_as_list(&tags, UPPER_CASED_TAG));
     }
     let name = declared
         .get("Name")
@@ -1164,10 +1303,14 @@ const NO_SUCH_ENTITY: &str = "NoSuchEntity";
 /// judges whether a policy ARN is attachable, so a policy it refuses fails the resource
 /// like any other refusal rather than leaving the stack complete over a role without the
 /// permissions its template declared.
+///
+/// The role carries the tags the declaration asks for plus the ones CloudFormation gives
+/// the resource ([`tags_of`]), as `CreateRole`'s own `Tags` member.
 async fn create_role(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     resource: &StoredResource,
+    propagated: &[(String, String)],
 ) -> Result<Created, Refusal> {
     let Some(trust_policy) = resource
         .properties
@@ -1184,6 +1327,19 @@ async fn create_role(
     };
     let client = iam_client(ctx, region);
     let role_name = &resource.physical_resource_id;
+    let mut role_tags = Vec::new();
+    for (key, value) in tags_of(&resource.properties, propagated) {
+        role_tags.push(
+            ::aws_sdk_iam::types::Tag::builder()
+                .key(&key)
+                .value(&value)
+                .build()
+                .map_err(|error| Refusal {
+                    code: "InternalFailure".to_string(),
+                    message: format!("the tag {key} cannot be sent to IAM: {error}"),
+                })?,
+        );
+    }
     let created = client
         .create_role()
         .role_name(role_name)
@@ -1194,6 +1350,7 @@ async fn create_role(
         .set_path(resource.properties.get("Path").and_then(scalar_text))
         .set_description(resource.properties.get("Description").and_then(scalar_text))
         .set_max_session_duration(whole_number(resource.properties.get("MaxSessionDuration")))
+        .set_tags((!role_tags.is_empty()).then_some(role_tags))
         .send()
         .await;
     let mut attributes = BTreeMap::new();
@@ -1398,10 +1555,15 @@ const PIPELINE_NOT_FOUND: &str = "PipelineNotFoundException";
 /// `DisableInboundStageTransitions` and `RestartExecutionOnUpdate` are CloudFormation's
 /// own (a held transition is `DisableStageTransition`'s business, and restart-on-update is
 /// a deployment instruction) — so the request carries only what the model declares.
+///
+/// The pipeline carries the tags the declaration asks for plus the ones CloudFormation
+/// gives the resource ([`tags_of`]), as the list CodePipeline's own `Tag` shape spells in
+/// lower camel case.
 async fn create_pipeline(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     resource: &StoredResource,
+    propagated: &[(String, String)],
 ) -> Result<Created, Refusal> {
     let mut declaration = match camel_cased(&resource.properties) {
         Value::Object(object) => object,
@@ -1412,7 +1574,9 @@ async fn create_pipeline(
         "name".to_string(),
         Value::String(resource.physical_resource_id.clone()),
     );
-    let tags = declaration.remove("tags");
+    // `Tags` is the request's own member, not the declaration's, so it comes out of the
+    // document the pipeline is.
+    declaration.remove("tags");
     declaration.remove("disableInboundStageTransitions");
     declaration.remove("restartExecutionOnUpdate");
     // `ArtifactStores` is a LIST of `{Region, ArtifactStore}` in a template and
@@ -1438,8 +1602,9 @@ async fn create_pipeline(
     }
     let mut request = Map::new();
     request.insert("pipeline".to_string(), Value::Object(declaration));
-    if let Some(tags) = tags {
-        request.insert("tags".to_string(), tags);
+    let tags = tags_of(&resource.properties, propagated);
+    if !tags.is_empty() {
+        request.insert("tags".to_string(), tags_as_list(&tags, LOWER_CASED_TAG));
     }
     match call_json_rpc(
         ctx,
@@ -1711,7 +1876,8 @@ const CLUSTER_NOT_FOUND: &str = "ClusterNotFoundException";
 /// one property's documented name is not its member's at all — a cluster's
 /// `ClusterSettings` sets `settings` ("The setting to use when creating a cluster").
 /// A property these pairs do not name is one `CreateCluster` has no member for; the
-/// cluster's `ClusterName` is set from the physical id instead.
+/// cluster's `ClusterName` is set from the physical id instead, and its `tags` by
+/// [`tags_of`], which carries the stack's propagated tags beside the declared ones.
 const ECS_CLUSTER_MEMBERS: &[(&str, &str)] = &[
     ("CapacityProviders", "capacityProviders"),
     ("ClusterSettings", "settings"),
@@ -1721,7 +1887,6 @@ const ECS_CLUSTER_MEMBERS: &[(&str, &str)] = &[
         "defaultCapacityProviderStrategy",
     ),
     ("ServiceConnectDefaults", "serviceConnectDefaults"),
-    ("Tags", "tags"),
 ];
 
 /// Create the cluster an `AWS::ECS::Cluster` declares, so a client reading the stack's
@@ -1731,10 +1896,15 @@ const ECS_CLUSTER_MEMBERS: &[(&str, &str)] = &[
 /// `Ref` of this type returns the cluster NAME, which is this resource's physical id, so
 /// the cluster is created under exactly the name the stack reports for it; the ARN it
 /// reports back is the resource's real identity and replaces the computed one.
+///
+/// The cluster carries the tags the declaration asks for plus the ones CloudFormation gives
+/// the resource ([`tags_of`]), as the list Amazon ECS's own `Tag` shape spells in lower
+/// camel case.
 async fn create_cluster(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     resource: &StoredResource,
+    propagated: &[(String, String)],
 ) -> Result<Created, Refusal> {
     let mut request = Map::new();
     if let Value::Object(properties) = &resource.properties {
@@ -1743,6 +1913,10 @@ async fn create_cluster(
                 request.insert((*member).to_string(), lower_camel_members(value));
             }
         }
+    }
+    let tags = tags_of(&resource.properties, propagated);
+    if !tags.is_empty() {
+        request.insert("tags".to_string(), tags_as_list(&tags, LOWER_CASED_TAG));
     }
     request.insert(
         "clusterName".to_string(),
@@ -1878,10 +2052,14 @@ const QUEUE_DOES_NOT_EXIST: &str = "QueueDoesNotExist";
 /// `QueueUrl` by exactly that pair (`queue_name_from_url` in its own state module), so
 /// the handle the stack publishes addresses the queue this call created however a client
 /// reaches SQS.
+///
+/// The queue carries the tags the declaration asks for plus the ones CloudFormation gives
+/// the resource ([`tags_of`]), as `CreateQueue`'s own `tags` map.
 async fn create_queue(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     resource: &StoredResource,
+    propagated: &[(String, String)],
 ) -> Result<Created, Refusal> {
     let mut request = Map::new();
     request.insert("QueueName".to_string(), Value::String(queue_name(resource)));
@@ -1889,7 +2067,7 @@ async fn create_queue(
     if !attributes.is_empty() {
         request.insert("Attributes".to_string(), Value::Object(attributes));
     }
-    let tags = queue_tags(&resource.properties);
+    let tags = tags_as_map(&tags_of(&resource.properties, propagated));
     if !tags.is_empty() {
         request.insert("tags".to_string(), Value::Object(tags));
     }
@@ -2129,32 +2307,137 @@ fn attribute_text(value: &Value) -> String {
 /// The `tags` map an `AWS::SQS::Queue`'s `Tags` property is.
 ///
 /// CloudFormation's tag property is a LIST of `{Key, Value}` pairs and `CreateQueue`
-/// takes a map, which is the conversion [`tag_map`] does.
+/// takes a map, which is the conversion [`declared_tags`] and [`tags_as_map`] do.
 fn queue_tags(properties: &Value) -> Map<String, Value> {
-    properties.get("Tags").map(tag_map).unwrap_or_default()
+    tags_as_map(&declared_tags(properties))
 }
 
-/// CloudFormation's `[{Key, Value}]` tag spelling as the MAP of tag key to value a
-/// creating API takes.
+// ---------------------------------------------------------------------------
+// The tags a provisioned resource carries
+// ---------------------------------------------------------------------------
+
+/// The tags ONE provisioned resource carries: the ones its own declaration asks for, then
+/// the ones CloudFormation propagates to it under every key that declaration does not use.
 ///
-/// A tag with no key is not a tag and is dropped rather than sent as an empty one; a value
-/// that is not a string is sent as the text it is, since a tag value is a string on every
-/// wire that takes one.
-fn tag_map(tags: &Value) -> Map<String, Value> {
-    tags.as_array()
-        .map(|tags| {
-            tags.iter()
-                .filter_map(|tag| {
-                    let key = tag.get("Key").and_then(Value::as_str)?;
-                    if key.is_empty() {
-                        return None;
-                    }
-                    let value = tag.get("Value").map(attribute_text).unwrap_or_default();
-                    Some((key.to_string(), Value::String(value)))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+/// The rule: a resource CloudFormation creates carries the stack-level tags plus the three
+/// `aws:cloudformation:*` tags ([`super::provisioning::StackProvenance::tags_for`]), and a
+/// key the resource's own `Tags` property states keeps the value that property gives it —
+/// the declaration is the more specific statement about that one resource. The three
+/// CloudFormation records itself are the exception, exactly as they are in `tags_for`: they
+/// are CloudFormation's to set, so a declaration spelling one of them does not displace it.
+/// The result is ORDERED (declared first, in declaration order), so the same declaration
+/// builds the same request however the maps behind it happen to iterate.
+fn tags_of(properties: &Value, propagated: &[(String, String)]) -> Vec<(String, String)> {
+    let mut tags = declared_tags(properties);
+    for (key, value) in propagated {
+        if key.is_empty() {
+            continue;
+        }
+        match tags.iter().position(|(held, _)| held == key) {
+            Some(index) if is_cloudformation_tag(key) => tags[index].1 = value.clone(),
+            Some(_) => {}
+            None => tags.push((key.clone(), value.clone())),
+        }
+    }
+    tags
+}
+
+/// Whether `key` is one of the three tags CloudFormation records on every resource it
+/// provisions, which no declaration of its own may displace.
+fn is_cloudformation_tag(key: &str) -> bool {
+    [
+        super::provisioning::STACK_NAME_TAG,
+        super::provisioning::STACK_ID_TAG,
+        super::provisioning::LOGICAL_ID_TAG,
+    ]
+    .contains(&key)
+}
+
+/// The tags a resource's own declaration asks for, in the order it writes them.
+///
+/// CloudFormation spells a type's `Tags` property either as the `[{Key, Value}]` list most
+/// types publish or as the MAP of tag key to value a few do
+/// (`AWS::FIS::ExperimentTemplate`), and both are read here, so a declaration reaches the
+/// owning service whichever spelling the type uses. A tag with no key is not a tag and is
+/// dropped rather than sent as an empty one; a value that is not a string is sent as the
+/// text it is, since a tag value is a string on every wire that takes one.
+///
+/// A key the LIST form states twice is one tag, not two — a tag set is a map from key to
+/// value, so a repeated key keeps its first position with the later value, which is the
+/// same rule [`super::provisioning::StackProvenance::tags_for`] applies to a stack's own
+/// tags. (The map form cannot state a key twice.)
+fn declared_tags(properties: &Value) -> Vec<(String, String)> {
+    let declared: Vec<(String, String)> = match properties.get("Tags") {
+        Some(Value::Array(tags)) => tags
+            .iter()
+            .filter_map(|tag| {
+                let key = tag.get("Key").and_then(Value::as_str)?;
+                if key.is_empty() {
+                    return None;
+                }
+                Some((
+                    key.to_string(),
+                    tag.get("Value").map(attribute_text).unwrap_or_default(),
+                ))
+            })
+            .collect(),
+        Some(Value::Object(tags)) => tags
+            .iter()
+            .filter(|(key, _)| !key.is_empty())
+            .map(|(key, value)| (key.clone(), attribute_text(value)))
+            .collect(),
+        _ => Vec::new(),
+    };
+    let mut tags: Vec<(String, String)> = Vec::with_capacity(declared.len());
+    for (key, value) in declared {
+        match tags.iter().position(|(held, _)| *held == key) {
+            Some(index) => tags[index].1 = value,
+            None => tags.push((key, value)),
+        }
+    }
+    tags
+}
+
+/// AWS's reserved tag-key namespace: "the `aws:` prefix is reserved for AWS use", so it is
+/// the namespace a caller's own request may not write into. Matched case-insensitively, as
+/// the services that refuse it match it.
+const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Whether `key` is in the reserved [`RESERVED_TAG_KEY_PREFIX`] namespace.
+fn is_reserved_tag_key(key: &str) -> bool {
+    key.get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
+}
+
+/// The member names a service's own `Tag` shape spells a tag's key and value with: upper
+/// camel on Amazon Data Firehose and Amazon ECR Public (`Key`/`Value`), lower camel on
+/// Amazon ECS and CodePipeline (`key`/`value`), which is the one difference between the
+/// list each of them takes.
+const UPPER_CASED_TAG: (&str, &str) = ("Key", "Value");
+const LOWER_CASED_TAG: (&str, &str) = ("key", "value");
+
+/// A tag set as the list of `Tag` structures a creating API takes, with each structure's
+/// members spelled the way that service's model spells them ([`UPPER_CASED_TAG`],
+/// [`LOWER_CASED_TAG`]).
+fn tags_as_list(tags: &[(String, String)], members: (&str, &str)) -> Value {
+    Value::Array(
+        tags.iter()
+            .map(|(key, value)| {
+                let mut tag = Map::new();
+                tag.insert(members.0.to_string(), Value::String(key.clone()));
+                tag.insert(members.1.to_string(), Value::String(value.clone()));
+                Value::Object(tag)
+            })
+            .collect(),
+    )
+}
+
+/// A tag set as the MAP of tag key to value a creating API that takes one takes (Amazon
+/// SQS's `tags`, AWS FIS's `tags`).
+fn tags_as_map(tags: &[(String, String)]) -> Map<String, Value> {
+    tags.iter()
+        .map(|(key, value)| (key.clone(), Value::String(value.clone())))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -2224,10 +2507,16 @@ const LOGGING_CONFIG_MEMBERS: &[&str] = &[
 /// id this emulator mints and the topic's own name — and SNS keys a topic by exactly that
 /// ARN, so the handle the stack publishes addresses the topic this call created however a
 /// client reaches SNS.
+///
+/// The topic carries the tags the declaration asks for plus the ones CloudFormation gives
+/// the resource ([`tags_of`]), as `CreateTopic`'s own `Tags` list — so `ListTagsForResource`
+/// on the ARN the stack publishes answers with the stack's tags and the
+/// `aws:cloudformation:*` ones.
 async fn create_topic(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     resource: &StoredResource,
+    propagated: &[(String, String)],
 ) -> Result<Created, Refusal> {
     let mut parameters = vec![("Name".to_string(), topic_name(resource))];
     for (index, (name, value)) in topic_attributes(&resource.properties).iter().enumerate() {
@@ -2235,7 +2524,10 @@ async fn create_topic(
         parameters.push((format!("Attributes.entry.{entry}.key"), name.clone()));
         parameters.push((format!("Attributes.entry.{entry}.value"), value.clone()));
     }
-    for (index, (key, value)) in topic_tags(&resource.properties).iter().enumerate() {
+    for (index, (key, value)) in tags_of(&resource.properties, propagated)
+        .iter()
+        .enumerate()
+    {
         let member = index + 1;
         parameters.push((format!("Tags.member.{member}.Key"), key.clone()));
         parameters.push((format!("Tags.member.{member}.Value"), value.clone()));
@@ -2439,31 +2731,6 @@ fn delivery_status_attributes(declared: &Value) -> BTreeMap<String, String> {
     attributes
 }
 
-/// The `Tags` list an `AWS::SNS::Topic`'s `Tags` property is, as `CreateTopic` takes it:
-/// the same `{Key, Value}` pairs, since SNS's own `Tag` shape spells its members `Key` and
-/// `Value` too. A tag with no key is not a tag and is dropped rather than sent as an empty
-/// one.
-fn topic_tags(properties: &Value) -> Vec<(String, String)> {
-    properties
-        .get("Tags")
-        .and_then(Value::as_array)
-        .map(|tags| {
-            tags.iter()
-                .filter_map(|tag| {
-                    let key = tag.get("Key").and_then(Value::as_str)?;
-                    if key.is_empty() {
-                        return None;
-                    }
-                    Some((
-                        key.to_string(),
-                        tag.get("Value").map(attribute_text).unwrap_or_default(),
-                    ))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 /// The `Subscribe` parameters each entry of a `Subscription` property declares: its
 /// `Protocol` and its `Endpoint`, named identically on both sides. A member the entry does
 /// not declare is absent from the call, so SNS's own validation is what refuses an
@@ -2585,6 +2852,7 @@ async fn create_experiment_template(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     resource: &StoredResource,
+    propagated: &[(String, String)],
 ) -> Result<Created, Refusal> {
     let properties = resource
         .properties
@@ -2644,7 +2912,8 @@ async fn create_experiment_template(
             mapped_members(options, FIS_EXPERIMENT_OPTIONS_MEMBERS),
         );
     }
-    if let Some(tags) = experiment_template_tags(&properties) {
+    let tags = tags_as_map(&tags_of(&resource.properties, propagated));
+    if !tags.is_empty() {
         request.insert("tags".to_string(), Value::Object(tags));
     }
     let reported = call_rest_json(
@@ -2766,21 +3035,6 @@ fn log_configuration(configuration: &Value) -> Value {
         );
     }
     mapped
-}
-
-/// The `tags` map an `AWS::FIS::ExperimentTemplate`'s `Tags` property is.
-///
-/// The type spells its tags as a MAP of tag key to value, which is the shape
-/// `CreateExperimentTemplate`'s own `tags` member takes, so such a declaration goes
-/// through as written. A declaration that wrote CloudFormation's other tag spelling — the
-/// `[{Key, Value}]` list most resource types use — is converted by [`tag_map`], so the tags
-/// the template asked for reach FIS either way. `None` where the template declares none.
-fn experiment_template_tags(properties: &Map<String, Value>) -> Option<Map<String, Value>> {
-    match properties.get("Tags")? {
-        Value::Object(tags) => Some(tags.clone()),
-        list @ Value::Array(_) => Some(tag_map(list)),
-        _ => None,
-    }
 }
 
 /// One declared structure with the members `pairs` names mapped onto the member names the
@@ -3086,7 +3340,8 @@ const GUARDDUTY_BAD_REQUEST: &str = "BadRequestException";
 /// mapped member by member, which is the same re-casing `AWS::ECS::Cluster` needs and is
 /// safe for the same reason: no property of this type carries a MAP of caller data. The
 /// one exception is `Tags`, a list of `{Key, Value}` pairs where the create takes a map
-/// ([`tag_map`]), lifted out before the walk.
+/// ([`tags_as_map`]), lifted out before the walk — carrying the tags CloudFormation gives
+/// the resource beside the declared ones ([`tags_of`]).
 ///
 /// VALUES are untouched: an enum value, a boolean and a number are what the template
 /// declared, and GuardDuty's own validation is what judges them — its refusal leaves the
@@ -3101,6 +3356,7 @@ async fn create_detector(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     resource: &StoredResource,
+    propagated: &[(String, String)],
 ) -> Result<Created, Refusal> {
     let mut request = Map::new();
     if let Some(properties) = resource.properties.as_object() {
@@ -3111,11 +3367,7 @@ async fn create_detector(
             request.insert(lower_initial(property), lower_camel_members(value));
         }
     }
-    let tags = resource
-        .properties
-        .get("Tags")
-        .map(tag_map)
-        .unwrap_or_default();
+    let tags = tags_as_map(&tags_of(&resource.properties, propagated));
     if !tags.is_empty() {
         request.insert("tags".to_string(), Value::Object(tags));
     }

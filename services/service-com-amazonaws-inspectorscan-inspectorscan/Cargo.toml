@@ -21,13 +21,26 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The SBOM content digest (idempotent repeat detection) and its hex rendering.
+# Both are the workspace's own entries and were already declared by this crate's
+# scaffold, so naming them here leaves the workspace `Cargo.lock` byte-identical:
+# a package's dev and normal dependencies are one list in the lockfile.
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+# NO OTHER dependency is declared, and none is removed, so this change leaves
+# the workspace `Cargo.lock` untouched — the one file nearly every other
+# service's change rewrites. The percent-decoding a `purl` segment needs comes
+# from `smithy_server_runtime::percent_decode`, already a dependency above, and
+# the one thing left in this crate is purl's own decomposition of a coordinate
+# per the specification's layout, plus a release compared against an advisory's
+# two bounds, which `crate::state` holds as DATA so there is no range expression
+# to evaluate. See
+# services/service-com-amazonaws-ssmguiconnect-ssmguiconnect's manifest for the
+# same note.
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true

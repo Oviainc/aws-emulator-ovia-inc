@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeMetricFilters
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeMetricFilters`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeMetricFilters::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports the metric filters stored on this account's log groups, filtered
+//! by log group, filter-name prefix and metric identity, ASCII-sorted by filter name.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -120,6 +114,68 @@ impl From<DescribeMetricFiltersErrorModeled> for DescribeMetricFiltersError {
     }
 }
 
+/// The kind tag this operation's pagination cursor carries, so a token minted by another
+/// paginated operation is refused rather than misread.
+const CURSOR_KIND: &str = "DescribeMetricFilters";
+
+/// Where the next page resumes: the position the last page ended on — a `(filterName,
+/// logGroupName)` pair, because one filter name can be used on several log groups and this
+/// operation enumerates across them — plus the enumeration it belongs to. A continuation
+/// that changes any of the request's filters is refused, because the token is only a
+/// position within one filtered enumeration.
+#[derive(Debug, Clone)]
+struct Cursor {
+    log_group_name: Option<String>,
+    filter_name_prefix: Option<String>,
+    metric_name: Option<String>,
+    metric_namespace: Option<String>,
+    after_filter_name: String,
+    after_log_group_name: String,
+}
+
+impl Cursor {
+    fn encode(&self) -> String {
+        crate::state::encode_token(&::serde_json::json!({
+            "kind": CURSOR_KIND,
+            "logGroupName": self.log_group_name,
+            "filterNamePrefix": self.filter_name_prefix,
+            "metricName": self.metric_name,
+            "metricNamespace": self.metric_namespace,
+            "afterFilterName": self.after_filter_name,
+            "afterLogGroupName": self.after_log_group_name,
+        }))
+    }
+
+    fn decode(token: &str) -> Option<Self> {
+        let value = crate::state::decode_token(token)?;
+        if value.get("kind")?.as_str()? != CURSOR_KIND {
+            return None;
+        }
+        let optional = |key: &str| {
+            value
+                .get(key)
+                .and_then(::serde_json::Value::as_str)
+                .map(ToString::to_string)
+        };
+        Some(Self {
+            log_group_name: optional("logGroupName"),
+            filter_name_prefix: optional("filterNamePrefix"),
+            metric_name: optional("metricName"),
+            metric_namespace: optional("metricNamespace"),
+            after_filter_name: value.get("afterFilterName")?.as_str()?.to_string(),
+            after_log_group_name: value.get("afterLogGroupName")?.as_str()?.to_string(),
+        })
+    }
+}
+
+/// The refusal for a request that names one half of the metric-identity pair: `metricName`
+/// — "If you include this parameter in your request, you must also include the
+/// metricNamespace parameter" — and `metricNamespace`, which documents the same of
+/// `metricName`. A metric is identified by both together, so one without the other selects
+/// nothing the service can resolve.
+const METRIC_IDENTITY_PAIR_REQUIRED: &str =
+    "metricName and metricNamespace must be specified together";
+
 /// The `DescribeMetricFilters` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -156,18 +212,156 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeMetricFilters` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeMetricFiltersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeMetricFilters"))
+        // `ctx` carries only request metadata, and this operation reports: it reads the
+        // store and writes nothing.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeMetricFiltersError::from(
+                DescribeMetricFiltersErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let store = state.lock();
+
+        let invalid = |message: &str| {
+            DescribeMetricFiltersError::from(
+                DescribeMetricFiltersErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message.to_string()),
+                    },
+                ),
+            )
+        };
+
+        // The two metric-identity members document each other as required: either both or
+        // neither.
+        if input.metric_name.is_some() != input.metric_namespace.is_some() {
+            return Err(invalid(METRIC_IDENTITY_PAIR_REQUIRED));
+        }
+
+        // "Lists the specified metric filters" — a request that names a log group lists
+        // that group's filters, and a group that does not exist has none to list, which is
+        // a refusal rather than an empty page. A request that names none lists the
+        // account's filters across every log group.
+        if let Some(name) = input.log_group_name.as_deref() {
+            if !store.log_groups.contains_key(name) {
+                return Err(
+                    DescribeMetricFiltersErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(crate::state::resource_not_found_message("log group")),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let cursor = match input.next_token.as_deref() {
+            Some(token) => {
+                let Some(cursor) = Cursor::decode(token) else {
+                    return Err(invalid("nextToken is not a valid token"));
+                };
+                if cursor.log_group_name != input.log_group_name
+                    || cursor.filter_name_prefix != input.filter_name_prefix
+                    || cursor.metric_name != input.metric_name
+                    || cursor.metric_namespace != input.metric_namespace
+                {
+                    return Err(invalid(
+                        "nextToken was issued for a different DescribeMetricFilters request",
+                    ));
+                }
+                Some(cursor)
+            }
+            None => None,
+        };
+
+        // "The prefix to match. CloudWatch Logs uses the value that you set here only if
+        // you also include the logGroupName parameter in your request."
+        let prefix = input
+            .filter_name_prefix
+            .as_deref()
+            .filter(|_| input.log_group_name.is_some());
+
+        // "The results are ASCII-sorted by filter name": the store holds one group's
+        // filters in that order already, and an enumeration spanning groups is sorted into
+        // it here. The log group name breaks a tie between two groups' filters of the same
+        // name, so the order — and the cursor that resumes in it — is total.
+        let mut matching: Vec<(&str, &crate::state::MetricFilterRecord)> = store
+            .log_groups
+            .values()
+            .filter(|group| {
+                input
+                    .log_group_name
+                    .as_deref()
+                    .is_none_or(|name| group.name == name)
+            })
+            .flat_map(|group| {
+                group
+                    .metric_filters
+                    .values()
+                    .map(move |filter| (group.name.as_str(), filter))
+            })
+            .filter(|(_, filter)| {
+                prefix.is_none_or(|prefix| filter.filter_name.starts_with(prefix))
+            })
+            // "Filters results to include only those with the specified metric name" /
+            // "only those in the specified namespace" — a filter qualifies when one of its
+            // transformations emits that metric in that namespace.
+            .filter(|(_, filter)| {
+                input.metric_name.as_deref().is_none_or(|metric_name| {
+                    let namespace = input.metric_namespace.as_deref().unwrap_or_default();
+                    filter.transformations.iter().any(|transformation| {
+                        transformation.metric_name == metric_name
+                            && transformation.metric_namespace == namespace
+                    })
+                })
+            })
+            .collect();
+        matching.sort_by(|(left_group, left), (right_group, right)| {
+            (&left.filter_name, left_group).cmp(&(&right.filter_name, right_group))
+        });
+
+        let first = match &cursor {
+            Some(cursor) => matching.partition_point(|(group, filter)| {
+                (&filter.filter_name, group)
+                    <= (&cursor.after_filter_name, &cursor.after_log_group_name.as_str())
+            }),
+            None => 0,
+        };
+        // `limit` is modelled `range 1..50`, so the boundary validator has already refused
+        // a value outside it; `max(1)` only keeps the page bounds sane.
+        let limit = usize::try_from(input.limit.unwrap_or(crate::state::DEFAULT_DESCRIBE_LIMIT))
+            .unwrap_or(0)
+            .max(1);
+        let last = first.saturating_add(limit).min(matching.len());
+        let page = &matching[first..last];
+
+        let next_token = page
+            .last()
+            .filter(|_| last < matching.len())
+            .map(|(group, filter)| {
+                Cursor {
+                    log_group_name: input.log_group_name.clone(),
+                    filter_name_prefix: input.filter_name_prefix.clone(),
+                    metric_name: input.metric_name.clone(),
+                    metric_namespace: input.metric_namespace.clone(),
+                    after_filter_name: filter.filter_name.clone(),
+                    after_log_group_name: (*group).to_string(),
+                }
+                .encode()
+            });
+
+        Ok(DescribeMetricFiltersOutput {
+            metric_filters: Some(
+                page.iter()
+                    .map(|(group, filter)| filter.to_shape(group))
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }

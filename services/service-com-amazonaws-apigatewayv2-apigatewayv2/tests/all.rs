@@ -31,6 +31,8 @@ mod integration_lifecycle;
 mod integration_pagination;
 #[path = "all/model_lifecycle.rs"]
 mod model_lifecycle;
+#[path = "all/portal_product_lifecycle.rs"]
+mod portal_product_lifecycle;
 #[path = "all/protocol_type_gating.rs"]
 mod protocol_type_gating;
 #[path = "all/route_request_parameter.rs"]
