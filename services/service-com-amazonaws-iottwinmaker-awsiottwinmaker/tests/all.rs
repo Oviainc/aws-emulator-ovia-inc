@@ -53,6 +53,9 @@ mod pricing_plan;
 #[path = "all/pricing_plan_update.rs"]
 mod pricing_plan_update;
 
+#[path = "all/property_value_read.rs"]
+mod property_value_read;
+
 #[path = "all/reported_members.rs"]
 mod reported_members;
 
