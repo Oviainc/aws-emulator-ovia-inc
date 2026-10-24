@@ -339,6 +339,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // "A platform version is only specified for tasks hosted on Fargate. If one
+        // isn't specified, the LATEST platform version is used" — and one that names no
+        // platform version this service knows names no platform at all, which is what
+        // `PlatformUnknownException` is modelled for.
+        if crate::state::is_unknown_platform_version(input.platform_version.as_deref()) {
+            return Err(RunTaskErrorModeled::PlatformUnknownException(
+                PlatformUnknownException {
+                    message: Some(crate::state::PLATFORM_UNKNOWN_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
         let Some((family, requested_revision)) =
             crate::state::parse_task_definition_reference(&input.task_definition)
         else {
@@ -382,6 +395,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A revision is placed with a launch type only where it was validated against
+        // it (`TaskDefinition$compatibilities`), so a request that asks for one the
+        // stored revision does not support is refused before any task is created.
+        if let Some(launch_type) = input.launch_type.as_deref() {
+            if let Err(message) = crate::state::validate_launch_type(&definition, launch_type) {
+                return Err(RunTaskErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+        }
+
         let requested = usize::try_from(count).unwrap_or(usize::MAX);
         if guard.tasks.len() + requested > crate::state::MAX_TASKS {
             return Err(RunTaskErrorModeled::ClientException(ClientException {
@@ -408,6 +435,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => (Some(crate::state::DEFAULT_LAUNCH_TYPE.to_string()), None),
             },
         };
+
+        // "The EC2 launch type runs your tasks on Amazon EC2 instances registered to
+        // your cluster" (and `EXTERNAL` on the on-premises capacity registered to it), so
+        // a cluster with no container instance registered has nowhere to place the task:
+        // the request is refused rather than persisting a task that could never run.
+        if crate::state::needs_registered_capacity(launch_type.as_deref())
+            && guard.registered_container_instances(&cluster_name) == 0
+        {
+            return Err(RunTaskErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(crate::state::NO_CONTAINER_INSTANCES_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
 
         // "The default value is the family name of the task definition (for example,
         // family:my-family-name)."

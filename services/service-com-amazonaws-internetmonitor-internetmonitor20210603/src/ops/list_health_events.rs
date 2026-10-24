@@ -108,13 +108,6 @@ use super::types::*;
 /// takes a full page.
 const MAX_PAGE_SIZE: i32 = 25;
 
-/// A stored instant as the epoch seconds the request's `StartTime` and `EndTime` are
-/// compared in: one scale for both sides of the window test, through the same wire
-/// conversion the reported timestamps go through.
-fn epoch_secs(at: ::std::time::SystemTime) -> f64 {
-    crate::state::wire_timestamp(at).as_secs_f64()
-}
-
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -210,20 +203,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `EventStatus` targets the `HealthEventStatus` enum, so the boundary validator
         // refuses a value outside it before this handler runs; the check is kept so a
         // value that ever reached here unvalidated is a refusal rather than a silently
-        // empty page.
-        let status_filter = input.event_status.as_deref();
-        if let Some(filter) = status_filter {
-            if !HEALTH_EVENT_STATUS_VALUES.contains(&filter) {
-                return Err(ListHealthEventsErrorModeled::ValidationException(ValidationException {
-                    message: Some(format!(
-                        "EventStatus {} is not one of: {}.",
-                        filter,
-                        HEALTH_EVENT_STATUS_VALUES.join(", ")
-                    )),
-                })
-                .into());
-            }
-        }
+        // empty page. The rule lives in `crate::state` because three listings share it.
+        let status_filter = crate::state::enum_filter(
+            "EventStatus",
+            input.event_status.as_deref(),
+            HEALTH_EVENT_STATUS_VALUES,
+        )
+        .map_err(ListHealthEventsErrorModeled::ValidationException)?;
 
         let window_start = input.start_time.map(|at| at.as_secs_f64());
         let window_end = input.end_time.map(|at| at.as_secs_f64());
@@ -291,8 +277,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // The requested window and the event's own interval have to overlap: the
                 // event cannot start after the window ends, and cannot end before the
                 // window starts.
-                let started = epoch_secs(event.started_at);
-                let ended = epoch_secs(event.interval_end(now));
+                let started = crate::state::epoch_seconds(event.started_at);
+                let ended = crate::state::epoch_seconds(event.interval_end(now));
                 window_end.is_none_or(|end| started <= end)
                     && window_start.is_none_or(|start| ended >= start)
             })

@@ -9,7 +9,9 @@
 //! promises. A cluster that still holds a task the caller has not asked to stop is
 //! refused with `ClusterContainsTasksException`, and one that still holds an `ACTIVE`
 //! service with `ClusterContainsServicesException` ("You can't delete a cluster that
-//! contains services").
+//! contains services"). The resources the deleted cluster held — its drained services,
+//! its stopping tasks and the container instances registered into it — go with it, so
+//! the tombstone it reports counts none of them.
 //!
 //! ## Shape of an operation
 //!
@@ -231,7 +233,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 payload: DeleteClusterOutput {
                     cluster: Some(view),
                 },
-                cluster_count: guard.cluster_count(),
+                cluster_count: guard.cluster_count_for(&cluster_name),
                 member: &CLUSTER_COUNT_MEMBER,
             });
         }
@@ -280,14 +282,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The resources the cluster held go with it. Nothing still wanted can be among
         // them: a service that is not deleted and a task still wanted RUNNING were both
         // refused above, so what is dropped here is a service already deleted and a task
-        // already asked to stop (whose `lastStatus` may still be settling). Dropping them
-        // is what lets a cluster created over this tombstone start empty — both maps are
-        // keyed by the cluster NAME, which a new cluster of the same name reuses — and it
-        // settles the tombstone's counters at zero.
+        // already asked to stop (whose `lastStatus` may still be settling). A container
+        // instance is registered INTO a cluster (`registeredContainerInstancesCount`:
+        // "the number of container instances registered into the cluster"), so once the
+        // cluster is gone its registrations are gone with it. Dropping them
+        // is what lets a cluster created over this tombstone start empty — all three maps
+        // are keyed by, or carry, the cluster NAME, which a new cluster of the same name
+        // reuses — and it settles the tombstone's counters at zero.
         guard.tasks.retain(|_, task| task.cluster_name != cluster_name);
         guard
             .services
             .retain(|_, service| service.cluster_name != cluster_name);
+        guard
+            .container_instances
+            .retain(|_, instance| instance.cluster_name != cluster_name);
         // The cluster itself is KEPT as a tombstone: "Clusters with an INACTIVE status
         // may remain discoverable in your account for a period of time."
         let record = guard
@@ -306,7 +314,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             payload: DeleteClusterOutput {
                 cluster: Some(view),
             },
-            cluster_count: guard.cluster_count(),
+            cluster_count: guard.cluster_count_for(&cluster_name),
             member: &CLUSTER_COUNT_MEMBER,
         })
     }

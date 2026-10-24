@@ -443,6 +443,60 @@ pub const DYNAMIC_HOST_PORT: i32 = 0;
 /// what the stored revision's parameters support.
 pub const COMPATIBILITY_ORDER: [&str; 4] = ["EXTERNAL", "EC2", "MANAGED_INSTANCES", "FARGATE"];
 
+/// The launch types `Cluster$statistics` separates a cluster's counts by, each paired
+/// with the segment its four statistic names carry (`running<segment>TasksCount`,
+/// `pending<segment>TasksCount`, `active<segment>ServiceCount`,
+/// `draining<segment>ServiceCount`).
+///
+/// The membership is the `LaunchType` enum (`smithy_query(query="shape",
+/// shape="LaunchType")`: `EC2`, `FARGATE`, `EXTERNAL`, `MANAGED_INSTANCES`), so every
+/// launch type a task or a service can be placed with has its own counters: the
+/// `Cluster$statistics` doc lists the first [`DOCUMENTED_STATISTICS_LAUNCH_TYPES`] of
+/// them by name and introduces the list with "They include the following", so the
+/// remaining launch types' counters are reported too. [`cluster_statistics`] fixes the
+/// order the entries come in.
+pub const STATISTICS_LAUNCH_TYPES: [(&str, &str); 4] = [
+    ("EC2", "EC2"),
+    ("FARGATE", "Fargate"),
+    ("EXTERNAL", "External"),
+    ("MANAGED_INSTANCES", "ManagedInstances"),
+];
+
+/// How many of [`STATISTICS_LAUNCH_TYPES`] the `Cluster$statistics` doc itself names.
+/// Those launch types' counters come first, counter by counter, as the doc lists them.
+const DOCUMENTED_STATISTICS_LAUNCH_TYPES: usize = 2;
+
+/// The platform versions this service knows, as the `platformVersion` doc's "Fargate
+/// platform versions" page lists them: the Linux platform versions `1.4.0`, `1.3.0`,
+/// `1.2.0`, `1.1.0` and `1.0.0` (the Windows one is `1.0.0` too), plus the `LATEST`
+/// alias the member's own doc names ("If one isn't specified, the LATEST platform
+/// version is used").
+///
+/// A platform version outside this list names no platform, which is what
+/// `PlatformUnknownException` ("The specified platform version doesn't exist.") is
+/// modelled for.
+pub const PLATFORM_VERSIONS: [&str; 6] = ["LATEST", "1.4.0", "1.3.0", "1.2.0", "1.1.0", "1.0.0"];
+
+/// The message a `PlatformUnknownException` carries: the FIXED sentence Amazon ECS
+/// answers for this condition, as the recorded refusal carries it (the error shape's
+/// own doc words the same condition as "The specified platform version doesn't
+/// exist."). It names nothing from the request.
+pub const PLATFORM_UNKNOWN_MESSAGE: &str = "The specified platform does not exist.";
+
+/// The launch types whose capacity is REGISTERED to the cluster, so a task placed with
+/// one of them needs a container instance of the cluster to run on. The `launchType`
+/// doc: "The EC2 launch type runs your tasks on Amazon EC2 instances registered to your
+/// cluster. ... The EXTERNAL launch type runs your tasks on your on-premises server or
+/// virtual machine (VM) capacity registered to your cluster." The other launch types run
+/// on capacity Amazon Web Services manages, which the cluster does not hold.
+pub const REGISTERED_CAPACITY_LAUNCH_TYPES: [&str; 2] = ["EC2", "EXTERNAL"];
+
+/// The message the `InvalidParameterException` carries when a task would be placed on
+/// capacity registered to a cluster that has none. A FIXED sentence naming nothing from
+/// the request, as the recorded refusal carries it.
+pub const NO_CONTAINER_INSTANCES_MESSAGE: &str =
+    "No Container Instances were found in your cluster.";
+
 /// The container-instance attribute an `awsvpc` task needs: its own elastic network
 /// interface. One of the Amazon ECS container-agent capabilities (the ECS developer
 /// guide's "awsvpc network mode" requirements), reported through
@@ -2180,20 +2234,16 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             .values()
             .filter(|task| task.cluster_name == cluster_name)
         {
-            let launch_type = task.launch_type.as_deref();
+            let launch_type = statistics_launch_type_index(task.launch_type.as_deref());
             if task.last_status == STATUS_RUNNING {
                 tally.running += 1;
-                match launch_type {
-                    Some("EC2") => tally.running_ec2 += 1,
-                    Some("FARGATE") => tally.running_fargate += 1,
-                    _ => {}
+                if let Some(index) = launch_type {
+                    tally.by_launch_type[index].running_tasks += 1;
                 }
             } else if task.last_status == STATUS_PENDING {
                 tally.pending += 1;
-                match launch_type {
-                    Some("EC2") => tally.pending_ec2 += 1,
-                    Some("FARGATE") => tally.pending_fargate += 1,
-                    _ => {}
+                if let Some(index) = launch_type {
+                    tally.by_launch_type[index].pending_tasks += 1;
                 }
             }
         }
@@ -2202,19 +2252,15 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             .values()
             .filter(|service| service.cluster_name == cluster_name)
         {
-            let launch_type = service.launch_type.as_deref();
+            let launch_type = statistics_launch_type_index(service.launch_type.as_deref());
             if service.is_active() {
                 tally.active_services += 1;
-                match launch_type {
-                    Some("EC2") => tally.active_ec2_services += 1,
-                    Some("FARGATE") => tally.active_fargate_services += 1,
-                    _ => {}
+                if let Some(index) = launch_type {
+                    tally.by_launch_type[index].active_services += 1;
                 }
             } else if service.status == SERVICE_DRAINING {
-                match launch_type {
-                    Some("EC2") => tally.draining_ec2_services += 1,
-                    Some("FARGATE") => tally.draining_fargate_services += 1,
-                    _ => {}
+                if let Some(index) = launch_type {
+                    tally.by_launch_type[index].draining_services += 1;
                 }
             }
         }
@@ -2490,20 +2536,24 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         view
     }
 
-    /// How many clusters the account holds — the top-level `clusterCount` a
-    /// cluster-mutating response carries, read after the call has been applied. See
-    /// [`ClusterCountEnvelope`] for why it is not a modelled member.
+    /// How many clusters the account holds under `cluster_name` — the top-level
+    /// `clusterCount` a cluster-mutating response carries, read AFTER the call has been
+    /// applied. See [`ClusterCountEnvelope`] for why it is not a modelled member.
     ///
-    /// A DELETED cluster is not one of them: the record stays as a tombstone so a reader
-    /// can still describe it ("The cluster has been deleted"), but the account no longer
-    /// holds that cluster, so it is not counted.
-    pub fn cluster_count(&self) -> i32 {
-        let live = self
-            .clusters
-            .values()
-            .filter(|cluster| cluster.status != CLUSTER_INACTIVE)
-            .count();
-        i32::try_from(live).unwrap_or(i32::MAX)
+    /// A cluster NAME identifies one cluster ("you create a cluster that's named
+    /// default" / "the short name ... of the cluster"), and a DELETED cluster is not one
+    /// the account holds: the record stays as a tombstone so a reader can still describe
+    /// it ("The cluster has been deleted"), but the account no longer holds that cluster,
+    /// so it is not counted. A create therefore answers `1` and a delete `0`, whatever
+    /// else the account holds beside the cluster the call named — which is what every
+    /// recorded `clusterCount` carries, including the ones recorded while a second,
+    /// untouched cluster was live.
+    pub fn cluster_count_for(&self, cluster_name: &str) -> i32 {
+        i32::from(
+            self.clusters
+                .get(cluster_name)
+                .is_some_and(|cluster| cluster.status != CLUSTER_INACTIVE),
+        )
     }
 }
 
@@ -2515,41 +2565,90 @@ struct TaskTally {
     running: usize,
     pending: usize,
     active_services: usize,
-    active_ec2_services: usize,
-    active_fargate_services: usize,
-    draining_ec2_services: usize,
-    draining_fargate_services: usize,
-    running_ec2: usize,
-    running_fargate: usize,
-    pending_ec2: usize,
-    pending_fargate: usize,
+    /// One entry per [`STATISTICS_LAUNCH_TYPES`] entry, in that order.
+    by_launch_type: [LaunchTypeTally; STATISTICS_LAUNCH_TYPES.len()],
+}
+
+/// What a cluster's tasks and services count for ONE launch type: the four
+/// `Cluster$statistics` counters that launch type contributes.
+#[derive(Debug, Clone, Copy, Default)]
+struct LaunchTypeTally {
+    running_tasks: usize,
+    pending_tasks: usize,
+    active_services: usize,
+    draining_services: usize,
+}
+
+/// Where `launch_type` sits in [`STATISTICS_LAUNCH_TYPES`], or `None` when the task or
+/// service was placed through a capacity provider rather than a launch type — there is
+/// no launch-type counter for it to contribute to.
+fn statistics_launch_type_index(launch_type: Option<&str>) -> Option<usize> {
+    let launch_type = launch_type?;
+    STATISTICS_LAUNCH_TYPES
+        .iter()
+        .position(|(name, _)| *name == launch_type)
 }
 
 /// `Cluster$statistics`: "the task and service count ... separated by launch type".
-/// Read off the single pass in [`ComAmazonawsEcsAmazonec2containerservicev20141113State::tally`].
+///
+/// One entry per counter per launch type ([`STATISTICS_LAUNCH_TYPES`]), read off the
+/// single pass in [`ComAmazonawsEcsAmazonec2containerservicev20141113State::tally`]. The
+/// ORDER is the one recorded ECS responses carry, so a client that reads the list
+/// positionally reads the same metric the real service named: the launch types the
+/// `Cluster$statistics` doc lists come first, counter by counter in the order it lists
+/// them, and the launch types it does not name follow, each one's task counters before
+/// any of their service counters.
 fn cluster_statistics(tally: &TaskTally) -> Vec<KeyValuePair> {
-    vec![
-        pair("runningEC2TasksCount", tally.running_ec2.to_string()),
-        pair("runningFargateTasksCount", tally.running_fargate.to_string()),
-        pair("pendingEC2TasksCount", tally.pending_ec2.to_string()),
-        pair("pendingFargateTasksCount", tally.pending_fargate.to_string()),
+    let segment = |index: usize| STATISTICS_LAUNCH_TYPES[index].1;
+    let running_tasks = |index: usize| {
         pair(
-            "activeEC2ServiceCount",
-            tally.active_ec2_services.to_string(),
-        ),
+            &format!("running{}TasksCount", segment(index)),
+            tally.by_launch_type[index].running_tasks.to_string(),
+        )
+    };
+    let pending_tasks = |index: usize| {
         pair(
-            "activeFargateServiceCount",
-            tally.active_fargate_services.to_string(),
-        ),
+            &format!("pending{}TasksCount", segment(index)),
+            tally.by_launch_type[index].pending_tasks.to_string(),
+        )
+    };
+    let active_services = |index: usize| {
         pair(
-            "drainingEC2ServiceCount",
-            tally.draining_ec2_services.to_string(),
-        ),
+            &format!("active{}ServiceCount", segment(index)),
+            tally.by_launch_type[index].active_services.to_string(),
+        )
+    };
+    let draining_services = |index: usize| {
         pair(
-            "drainingFargateServiceCount",
-            tally.draining_fargate_services.to_string(),
-        ),
-    ]
+            &format!("draining{}ServiceCount", segment(index)),
+            tally.by_launch_type[index].draining_services.to_string(),
+        )
+    };
+
+    let documented = 0..DOCUMENTED_STATISTICS_LAUNCH_TYPES;
+    let rest = DOCUMENTED_STATISTICS_LAUNCH_TYPES..STATISTICS_LAUNCH_TYPES.len();
+    let mut statistics = Vec::with_capacity(4 * STATISTICS_LAUNCH_TYPES.len());
+    for index in documented.clone() {
+        statistics.push(running_tasks(index));
+    }
+    for index in documented.clone() {
+        statistics.push(pending_tasks(index));
+    }
+    for index in documented.clone() {
+        statistics.push(active_services(index));
+    }
+    for index in documented {
+        statistics.push(draining_services(index));
+    }
+    for index in rest.clone() {
+        statistics.push(running_tasks(index));
+        statistics.push(pending_tasks(index));
+    }
+    for index in rest {
+        statistics.push(active_services(index));
+        statistics.push(draining_services(index));
+    }
+    statistics
 }
 
 /// A cluster response plus the top-level `clusterCount` Amazon ECS answers a
@@ -2559,8 +2658,10 @@ fn cluster_statistics(tally: &TaskTally) -> Vec<KeyValuePair> {
 /// `CreateClusterResponse`/`DeleteClusterResponse` declare the single member `cluster`
 /// (`smithy_query(query="operation", operation="CreateCluster,DeleteCluster")`), while
 /// every recorded 200 from either operation carries `clusterCount` beside `cluster`,
-/// counting the clusters the account holds once the call has been applied (1 after the
-/// first create, 0 after the last delete). Because the member is not in the model it has
+/// counting the clusters the account holds under the name the call named once the call
+/// has been applied (1 from a create, 0 from a delete — see
+/// [`ComAmazonawsEcsAmazonec2containerservicev20141113State::cluster_count_for`]).
+/// Because the member is not in the model it has
 /// no generated field to fill, so this envelope writes it after the modelled payload's
 /// own members, with the member schema the operation declares — the modelled shapes and
 /// the model file stay exactly as shipped, and an SDK that knows only the modelled shape
@@ -2634,6 +2735,57 @@ pub fn missing_failure(arn: &str) -> Failure {
         reason: Some(FAILURE_MISSING.to_string()),
         detail: None,
     }
+}
+
+/// Check a requested `launch_type` against the launch types `definition` supports,
+/// answering the message an `InvalidParameterException` carries when it is not one of
+/// them.
+///
+/// `TaskDefinition$compatibilities`: "Amazon ECS validates the task definition
+/// parameters with those supported by the launch type" — a revision whose parameters do
+/// not support a launch type was never validated against it, so it cannot be placed
+/// with it, whichever operation does the placing. Shared by every operation that takes a
+/// `launchType`, so a launch type `RunTask` refuses is refused by `CreateService` too.
+pub fn validate_launch_type(
+    definition: &TaskDefinitionRecord,
+    launch_type: &str,
+) -> Result<(), String> {
+    if definition
+        .compatibilities()
+        .iter()
+        .any(|supported| supported == launch_type)
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "Task definition does not support launch_type {launch_type}."
+    ))
+}
+
+/// The platform version a request asks for, if it names one at all: a blank member
+/// names no platform version, so it reads the same as an absent one ("If one isn't
+/// specified, the LATEST platform version is used").
+pub fn requested_platform_version(platform_version: Option<&str>) -> Option<&str> {
+    platform_version
+        .map(str::trim)
+        .filter(|version| !version.is_empty())
+}
+
+/// Whether a request's `platformVersion` names a platform version this service knows
+/// ([`PLATFORM_VERSIONS`]). A request that names one it does not is answered with
+/// `PlatformUnknownException` — "The specified platform version doesn't exist." —
+/// whichever operation carries it.
+pub fn is_unknown_platform_version(platform_version: Option<&str>) -> bool {
+    requested_platform_version(platform_version)
+        .is_some_and(|version| !PLATFORM_VERSIONS.contains(&version))
+}
+
+/// Whether a task placed with `launch_type` needs a container instance registered to
+/// its cluster ([`REGISTERED_CAPACITY_LAUNCH_TYPES`]). A task placed through a capacity
+/// provider carries no launch type, and the provider's own capacity is what places it,
+/// so it does not.
+pub fn needs_registered_capacity(launch_type: Option<&str>) -> bool {
+    launch_type.is_some_and(|launch_type| REGISTERED_CAPACITY_LAUNCH_TYPES.contains(&launch_type))
 }
 
 /// Check the `ClusterSettings` of a request against [`CLUSTER_SETTING_VALUES`],

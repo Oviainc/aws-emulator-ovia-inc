@@ -411,6 +411,43 @@ pub const APPROVAL_RULE_TEMPLATE_NAME_ALREADY_EXISTS_MESSAGE: &str =
     "The approval rule template cannot be created because a template with that name already \
      exists in your AWS account.";
 
+/// `ApprovalRuleTemplateInUseException`'s message: a FIXED sentence group carrying
+/// no value from the request.
+///
+/// CodeCommit documents the cause on the error shape itself — "The approval rule
+/// template is associated with one or more repositories. You cannot delete a
+/// template that is associated with a repository. Remove all associations, and then
+/// try again." — and words it with one constant that names neither the template nor
+/// any of the repositories holding it, so a caller is told the rule and the way out
+/// rather than which association it tripped over.
+pub const APPROVAL_RULE_TEMPLATE_IN_USE_MESSAGE: &str =
+    "The approval rule template cannot be deleted because it is associated with one or more \
+     repositories. You cannot delete a template if it is associated with a repository. \
+     Disassociate the template from all repositories in your AWS account, and then try again.";
+
+/// Is this an approval rule template NAME one that can name a template at all?
+///
+/// `ApprovalRuleTemplateName`'s `@length` 1..100 is refused at the request boundary
+/// (`crate::service::refusal_for`); this is the part of the rule the model cannot
+/// express, documented on `InvalidApprovalRuleTemplateNameException`: "Template
+/// names must be between 1 and 100 valid characters in length." A name of nothing
+/// but whitespace names no template, and neither does one carrying a control
+/// character.
+///
+/// The ONE place this crate decides it, so every operation that takes a template
+/// name — minting one, updating one, deleting one — agrees about which names are
+/// valid, and none of them can accept a name another would refuse.
+pub fn is_approval_rule_template_name(name: &str) -> bool {
+    !name.trim().is_empty() && !name.chars().any(char::is_control)
+}
+
+/// `InvalidApprovalRuleTemplateNameException`'s message, built from the name the
+/// request carried — the one place this crate words that code for a name
+/// [`is_approval_rule_template_name`] refuses.
+pub fn invalid_approval_rule_template_name_message(name: &str) -> String {
+    format!("the approval rule template name {name} is not valid")
+}
+
 /// `InvalidApprovalRuleTemplateContentException`'s (and
 /// `InvalidApprovalRuleContentException`'s) message: a FIXED sentence pair carrying
 /// nothing from the request and no diagnostic from whichever JSON reader rejected
@@ -669,6 +706,20 @@ impl ComAmazonawsCodecommitCodecommit20150413State {
         self.repositories
             .values_mut()
             .find_map(|repository| repository.comments.get_mut(comment_id))
+    }
+
+    /// Is this approval rule template associated with any repository?
+    ///
+    /// An association is held once, on the repository
+    /// ([`Repository::associated_templates`]), so the answer is a scan of the
+    /// repository map — the same stored association
+    /// `ListRepositoriesForApprovalRuleTemplate` reports and
+    /// `DeleteApprovalRuleTemplate` refuses on, rather than a second index that
+    /// could disagree with it.
+    pub fn template_is_associated(&self, template_name: &str) -> bool {
+        self.repositories
+            .values()
+            .any(|repository| repository.associated_templates.contains(template_name))
     }
 }
 

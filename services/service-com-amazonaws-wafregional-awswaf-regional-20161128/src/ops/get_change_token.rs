@@ -147,7 +147,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = (&input, ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetChangeTokenErrorModeled::WAFInternalErrorException(WAFInternalErrorException {
-                message: Some("the AWS WAF change-token store is unavailable".to_string()),
+                message: Some(crate::state::MESSAGE_INTERNAL_ERROR.to_string()),
             })
         })?;
         // Minting the token IS what this operation does, so it writes: the value it

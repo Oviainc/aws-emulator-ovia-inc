@@ -37,3 +37,6 @@ mod state_roundtrip;
 
 #[path = "all/workspace_entity_lifecycle.rs"]
 mod workspace_entity_lifecycle;
+
+#[path = "all/workspace_listing.rs"]
+mod workspace_listing;

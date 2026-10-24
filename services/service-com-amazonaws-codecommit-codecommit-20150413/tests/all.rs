@@ -15,6 +15,8 @@
 mod approval_rule_template_content_canonicalization;
 #[path = "all/approval_rule_template_content_update.rs"]
 mod approval_rule_template_content_update;
+#[path = "all/approval_rule_template_deletion.rs"]
+mod approval_rule_template_deletion;
 #[path = "all/approval_rule_template_description.rs"]
 mod approval_rule_template_description;
 #[path = "all/approval_rule_templates.rs"]

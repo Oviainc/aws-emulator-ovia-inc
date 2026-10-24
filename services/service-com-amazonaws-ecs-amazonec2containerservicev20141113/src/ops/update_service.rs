@@ -347,6 +347,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // "The platform version that your tasks in the service run on ... If one isn't
+        // specified, the LATEST platform version is used": a version this service does
+        // not know names no platform, which is what `PlatformUnknownException` is
+        // modelled for.
+        if crate::state::is_unknown_platform_version(input.platform_version.as_deref()) {
+            return Err(UpdateServiceErrorModeled::PlatformUnknownException(
+                PlatformUnknownException {
+                    message: Some(crate::state::PLATFORM_UNKNOWN_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
         // A service ARN carries the cluster that hosts it, so an ARN names the cluster
         // too; `cluster` is what names it otherwise ("If you do not specify a cluster,
         // the default cluster is assumed"). Naming two different clusters in one request
@@ -480,6 +493,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .and_then(|key| guard.task_definitions.get(key))
                 .cloned(),
         };
+
+        // A revision is placed with a launch type only where it was validated against it
+        // (`TaskDefinition$compatibilities`), so an update that moves the service onto a
+        // revision its launch type does not support is refused, as its create was. A
+        // request that moves the service onto a capacity-provider strategy takes the
+        // launch type off it, so there is none left to check.
+        let effective_launch_type = match input.capacity_provider_strategy.as_deref() {
+            Some(strategy) if !strategy.is_empty() => None,
+            _ => snapshot.launch_type.as_deref(),
+        };
+        if let (Some(found), Some(launch_type)) = (&definition, effective_launch_type) {
+            if let Err(message) = crate::state::validate_launch_type(found, launch_type) {
+                return Err(UpdateServiceErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+        }
 
         // "Determines whether to force a new deployment of the service. ... You can use
         // this option to start a new deployment with no service definition changes" —

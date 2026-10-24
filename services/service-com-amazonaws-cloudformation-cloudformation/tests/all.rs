@@ -77,3 +77,5 @@ mod unprovisioned_resources;
 mod unrecognized_resource_types;
 #[path = "all/validate_template.rs"]
 mod validate_template;
+#[path = "all/waf_regional_ip_set_resources.rs"]
+mod waf_regional_ip_set_resources;
