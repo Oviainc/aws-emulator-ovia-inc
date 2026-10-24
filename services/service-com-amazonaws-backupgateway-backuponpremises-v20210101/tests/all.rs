@@ -31,6 +31,8 @@ mod hypervisor_update;
 mod maintenance_start_time;
 #[path = "all/metadata_sync.rs"]
 mod metadata_sync;
+#[path = "all/metadata_sync_over_the_wire.rs"]
+mod metadata_sync_over_the_wire;
 #[path = "all/negative_paths.rs"]
 mod negative_paths;
 #[path = "all/put_bandwidth_rate_limit_schedule.rs"]

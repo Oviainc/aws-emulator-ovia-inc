@@ -197,6 +197,14 @@ pub const MAPPINGS_NOT_FOUND_MESSAGE: &str = "The mappings are not found.";
 /// so with no mappings SET there is no role the service was permitted to act with — a
 /// PERMISSION answer (HTTP 403), which is why it does not depend on whether the ARN names
 /// a hypervisor this store holds.
+///
+/// Both halves of that — the shape and this `ErrorCode`, answered for an ARN naming no
+/// hypervisor at all — are what the recorded unit
+/// `backup-gateway.start-metadata-sync-state-transition` pins
+/// (`issues/things-that-now-work/20261023T110543Z-backup-gateway-startvirtualmachinesmetadatasync-stub.md`,
+/// whose check asserts an `AccessDeniedException` with this code for a nonexistent
+/// `HypervisorArn` and states that the gate fires before the resource-existence lookup),
+/// so neither the value nor the order it is answered in is this emulator's choice.
 pub const MAPPINGS_NOT_CONFIGURED: &str = "MappingsNotConfigured";
 
 /// See [`MAPPINGS_NOT_CONFIGURED`]. The sentence the modelled shape itself states —

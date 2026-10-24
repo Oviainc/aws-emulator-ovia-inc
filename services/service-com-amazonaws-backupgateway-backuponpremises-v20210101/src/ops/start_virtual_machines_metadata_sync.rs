@@ -8,7 +8,13 @@
 //! under the IAM role the hypervisor's PROPERTY MAPPINGS name, so a request for an ARN no
 //! mappings are set for is refused with the modelled `AccessDeniedException` (HTTP 403)
 //! before any resource lookup — that gate answers alike whether or not the ARN names a
-//! hypervisor this store holds. This is the ONLY file to touch for this operation.
+//! hypervisor this store holds, which is the order the recorded unit
+//! `backup-gateway.start-metadata-sync-state-transition` pins (see
+//! [`crate::state::MAPPINGS_NOT_CONFIGURED`]). A client sets those mappings through
+//! `PutHypervisorPropertyMappings` on a hypervisor a gateway is associated with, so the
+//! whole workflow is reachable with wire calls alone —
+//! `tests/all/metadata_sync_over_the_wire.rs` walks it. This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -173,7 +179,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // operation cannot proceed because you have insufficient permissions". That
         // question is about the MAPPINGS, not about the hypervisor, so it is answered the
         // same way for an ARN this store holds no hypervisor under — which is why a
-        // never-imported ARN is refused here, and not as a missing resource.
+        // never-imported ARN is refused here, and not as a missing resource. That order is
+        // RECORDED and not a choice: the unit named in the module docs asserts this shape
+        // and `ErrorCode` for a `HypervisorArn` naming no hypervisor, so resolving the
+        // record first would answer that request the wrong way.
         if !store.property_mappings_configured(&input.hypervisor_arn) {
             return Err(
                 StartVirtualMachinesMetadataSyncErrorModeled::AccessDeniedException(

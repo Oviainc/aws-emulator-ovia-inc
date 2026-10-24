@@ -14,7 +14,11 @@
 //!    `MappingsNotConfigured`) whenever no mappings are set for the ARN it was asked for
 //!    — before any resource-existence lookup, so an ARN naming no hypervisor at all is
 //!    refused exactly like a hypervisor carrying no mappings, and never as a missing
-//!    resource.
+//!    resource. That is the RECORDED behaviour of this operation, pinned by the unit
+//!    `backup-gateway.start-metadata-sync-state-transition`
+//!    (`issues/things-that-now-work/20261023T110543Z-backup-gateway-startvirtualmachinesmetadatasync-stub.md`,
+//!    whose check asserts that answer for a nonexistent `HypervisorArn`), and not a rule
+//!    this emulator chose.
 //! 2. Starting a metadata sync PERSISTS it on the hypervisor the ARN resolves to, and the
 //!    `SyncMetadataStatus` a later read reports is a function of that record and the
 //!    clock — `CREATED`, then `RUNNING`, then `SUCCEEDED` dated at the instant it fell
@@ -30,12 +34,11 @@
 //! observation. One case waits for real ([`a_real_wait_alone_carries_the_sync_to_succeeded`])
 //! to prove that no further call is what moves it.
 //!
-//! `PutHypervisorPropertyMappings` is the operation that SETS mappings and is still a
-//! scaffold answering 501 under its own stub issue
-//! (`issues/things-that-do-not-work/20261023T110543Z-backup-gateway-puthypervisorpropertymappings-stub.md`),
-//! so the store is the only place mappings can come from until it is implemented —
-//! seeded here through the same `property_mappings` field that handler will write, as the
-//! sibling `hypervisor_property_mappings` suite does.
+//! `PutHypervisorPropertyMappings` is the operation that SETS mappings; the cases here
+//! seed them straight into the `property_mappings` field it writes, so a sync is asserted
+//! against a known store whatever that handler does. The workflow a client walks with wire
+//! calls only — import, create and associate a gateway, put the mappings, start the sync —
+//! is covered end-to-end by the sibling `metadata_sync_over_the_wire` suite.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
