@@ -27,6 +27,8 @@ mod ip_set_lifecycle;
 mod permission_policy;
 #[path = "all/rate_based_rule_lifecycle.rs"]
 mod rate_based_rule_lifecycle;
+#[path = "all/rate_based_rule_updates.rs"]
+mod rate_based_rule_updates;
 #[path = "all/regex_match_set.rs"]
 mod regex_match_set;
 #[path = "all/regex_pattern_set.rs"]
