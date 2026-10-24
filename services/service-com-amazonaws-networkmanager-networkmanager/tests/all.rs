@@ -17,6 +17,8 @@ mod attachment_acceptance;
 mod attachment_lifecycle;
 #[path = "all/attachment_routing_policy_associations.rs"]
 mod attachment_routing_policy_associations;
+#[path = "all/connect_peer_lifecycle.rs"]
+mod connect_peer_lifecycle;
 #[path = "all/connection_lifecycle.rs"]
 mod connection_lifecycle;
 #[path = "all/core_network_lifecycle.rs"]

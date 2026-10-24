@@ -14,7 +14,10 @@
 //! A core network in turn owns its ATTACHMENTS: each joins one resource to the edge
 //! locations that policy configures — one of them for every kind but a Direct Connect
 //! gateway attachment, which spans several — and a Connect attachment is carried over
-//! another attachment (its transport) rather than over a resource of its own. The policy's
+//! another attachment (its transport) rather than over a resource of its own. A Connect
+//! attachment in turn carries CONNECT PEERS, each a BGP peering between one edge of the
+//! core network and one appliance outside AWS, and each a resource of its own with an id,
+//! an ARN and tags. The policy's
 //! `attachment-policies` rules decide what becomes of each attachment created on the core
 //! network — which segment or network function group it joins, and whether its attachment
 //! request has to be ACCEPTED first, which is what holds it in
@@ -36,6 +39,7 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     AWSLocation, AccountStatus, Attachment, AttachmentRoutingPolicyAssociationSummary, Bandwidth,
     ConnectAttachment, ConnectAttachmentOptions,
+    ConnectPeer, ConnectPeerBgpConfiguration, ConnectPeerConfiguration, ConnectPeerSummary,
     Connection, ConnectionHealth, CoreNetwork, CoreNetworkEdge, CoreNetworkNetworkFunctionGroup,
     CoreNetworkPolicy, CoreNetworkPolicyError, CoreNetworkPolicyException, CoreNetworkSegment,
     Device, DirectConnectGatewayAttachment, GlobalNetwork, Link, LinkAssociation, Location,
@@ -127,6 +131,17 @@ pub const ATTACHMENT_KIND: &str = "attachment";
 /// `RouteAnalysisId` (`smithy_query shape=RouteAnalysis`) — so this name serves the id
 /// prefix (`route-analysis-<hex>`) and the `ResourceType` a not-found refusal reports.
 pub const ROUTE_ANALYSIS_KIND: &str = "route-analysis";
+
+/// See [`GLOBAL_NETWORK_KIND`]. A Connect peer hangs off a core network CONNECT attachment
+/// — "Creates a core network Connect peer for a specified core network connect attachment
+/// between a core network and an appliance" (`smithy_query query="doc"
+/// shape="CreateConnectPeer"`) — and is a resource of its own, with an id the model
+/// constrains (`ConnectPeerId` carries `pattern ^connect-peer-([0-9a-f]{8,17})$`,
+/// `smithy_query shape=ConnectPeerId`), an ARN and tags. The name is the same string
+/// [`CONNECT_PEER_TYPE`] holds, so one name serves the id prefix (`connect-peer-<hex>`),
+/// the ARN resource type (`connect-peer/<id>`) and the `connect-peer` entry of
+/// [`NETWORK_RESOURCE_TYPES`].
+pub const CONNECT_PEER_KIND: &str = CONNECT_PEER_TYPE;
 
 /// The state an attachment is in while a CHANGE to one that already exists is in flight,
 /// as against the [`STATE_CREATING`] of one whose creation is.
@@ -244,6 +259,14 @@ pub const FIELD_CONNECTED_DEVICE_ID: &str = "connectedDeviceId";
 pub const FIELD_LINK_ID: &str = "linkId";
 /// See [`FIELD_DEVICE_ID`].
 pub const FIELD_CONNECTED_LINK_ID: &str = "connectedLinkId";
+/// See [`FIELD_CORE_NETWORK_ID`]: the references and values a Connect peer create carries
+/// — the Connect attachment the peer is carried over, the inside IP addresses it peers
+/// over, and the subnet it reaches its appliance through.
+pub const FIELD_CONNECT_ATTACHMENT_ID: &str = "connectAttachmentId";
+/// See [`FIELD_CONNECT_ATTACHMENT_ID`].
+pub const FIELD_INSIDE_CIDR_BLOCKS: &str = "insideCidrBlocks";
+/// See [`FIELD_CONNECT_ATTACHMENT_ID`].
+pub const FIELD_SUBNET_ARN: &str = "subnetArn";
 
 /// How a resource kind of this service reads in prose: the ARN resource type
 /// ([`GLOBAL_NETWORK_KIND`] and friends) with its hyphens as spaces and a leading
@@ -525,6 +548,57 @@ pub const MAX_CORE_NETWORKS_PER_GLOBAL_NETWORK: usize = 1;
 /// [`VALIDATION_REASON_OTHER`] — the request is invalid against stored state, no single
 /// member is at fault — and stores nothing.
 pub const MAX_ATTACHMENTS_PER_CORE_NETWORK: usize = 100;
+
+/// How many Connect peers one Connect attachment may hold here, and how many inside CIDR
+/// blocks one Connect peer may peer over.
+///
+/// Both are CHOSEN, like [`MAX_ATTACHMENTS_PER_CORE_NETWORK`] and for the same reason: the
+/// model carries neither number — `ConstrainedStringList`, which `InsideCidrBlocks`
+/// targets, constrains its member string only (`smithy_query shape=ConstrainedStringList`)
+/// — and `CreateConnectPeer` models no `ServiceQuotaExceededException` (`smithy_query
+/// query="operation" operation="CreateConnectPeer"`), so their only purpose is that a
+/// repeated create cannot grow the store, or one peer's list, without end. Reaching either
+/// is refused with the modelled `ValidationException` (HTTP 400) naming the member that
+/// asked, and stores nothing.
+pub const MAX_CONNECT_PEERS_PER_ATTACHMENT: usize = 100;
+/// See [`MAX_CONNECT_PEERS_PER_ATTACHMENT`].
+pub const MAX_INSIDE_CIDR_BLOCKS_PER_CONNECT_PEER: usize = 10;
+
+/// Check the `InsideCidrBlocks` list a Connect peer create carries.
+///
+/// The LENGTH is judged first, against [`MAX_INSIDE_CIDR_BLOCKS_PER_CONNECT_PEER`], so no
+/// per-entry work is spent on a list already too long to be accepted. Then no block may
+/// repeat: a peer peers over a block once or not at all, so a repeated entry describes
+/// nothing further. What the blocks CONTAIN is not judged here — "The inside IP addresses
+/// used for BGP peering" (`smithy_query query="doc" shape="CreateConnectPeerRequest"
+/// member="InsideCidrBlocks"`) is an opaque `ConstrainedString` in the model — so the
+/// stored list is the one the request carried.
+pub fn check_inside_cidr_blocks(
+    member: &str,
+    requested: &[String],
+) -> Result<(), ValidationException> {
+    if requested.len() > MAX_INSIDE_CIDR_BLOCKS_PER_CONNECT_PEER {
+        return Err(field_rejection(
+            member,
+            VALIDATION_REASON_OTHER,
+            format!(
+                "a Connect peer peers over at most {MAX_INSIDE_CIDR_BLOCKS_PER_CONNECT_PEER} inside CIDR blocks, but {} were named",
+                requested.len()
+            ),
+        ));
+    }
+    let mut seen: BTreeSet<&str> = BTreeSet::new();
+    for block in requested {
+        if !seen.insert(block.as_str()) {
+            return Err(field_rejection(
+                member,
+                VALIDATION_REASON_OTHER,
+                format!("inside CIDR block {block} is named more than once"),
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// How many route analyses one global network may hold here.
 ///
@@ -1837,6 +1911,141 @@ impl AttachmentRecord {
     }
 }
 
+/// A stored core network Connect peer: the BGP peering one CONNECT attachment carries to
+/// an appliance outside AWS.
+///
+/// A peer belongs to ONE Connect attachment, and therefore to that attachment's core
+/// network and to the single edge location the attachment sits at: those three are read
+/// from the attachment where the peer is created and kept here, so a peer reports the edge
+/// its tunnel really lands on rather than one a request named. The tunnel PROTOCOL is the
+/// attachment's too — a Connect attachment "is a GRE-based tunnel attachment"
+/// (`smithy_query query="doc" shape="CreateConnectAttachment"`) unless its options ask for
+/// `NO_ENCAP` — which is why `CreateConnectPeer` takes no protocol of its own.
+///
+/// Like the records above, `state` is not a field but a function of what is stored and the
+/// clock ([`Self::state_at`]), so reporting a peer never writes.
+#[derive(Debug, Clone)]
+pub struct ConnectPeerRecord {
+    pub id: String,
+    pub arn: String,
+    /// The Connect attachment this peer is carried over.
+    pub connect_attachment_id: String,
+    /// The core network and edge location of that attachment. Kept here so a read never
+    /// has to resolve the attachment to report `ConnectPeer$CoreNetworkId` and
+    /// `ConnectPeer$EdgeLocation`.
+    pub core_network_id: String,
+    /// See [`Self::core_network_id`].
+    pub edge_location: String,
+    /// The tunnel protocol of that attachment — one of `ops::types::TUNNEL_PROTOCOL_VALUES`
+    /// — or `None` where its options named none, which is what the peer's configuration
+    /// reports as `ConnectPeerConfiguration$Protocol`.
+    pub protocol: Option<String>,
+    /// The addresses the tunnel's two ends carry: the core network side, which only a GRE
+    /// peering needs ("This only applies only when the protocol is GRE", `smithy_query
+    /// query="doc" shape="CreateConnectPeerRequest" member="CoreNetworkAddress"`), and the
+    /// appliance side, which every peering requires.
+    pub core_network_address: Option<String>,
+    /// See [`Self::core_network_address`].
+    pub peer_address: String,
+    /// The inside IP addresses the two ends run BGP over, as the request listed them,
+    /// bounded by [`MAX_INSIDE_CIDR_BLOCKS_PER_CONNECT_PEER`].
+    pub inside_cidr_blocks: Vec<String>,
+    /// The two ends' AS numbers: the core network's is the ASN its policy assigns the edge
+    /// this peer lands on ([`PolicyTopology::edge_asn`]), and the appliance's is the one the
+    /// request's `BgpOptions` named. Either is absent where the policy assigns the edge none
+    /// or the request named none.
+    pub core_network_asn: Option<i64>,
+    /// See [`Self::core_network_asn`].
+    pub peer_asn: Option<i64>,
+    /// The subnet the peer reaches its appliance through, which only a `NO_ENCAP` peering
+    /// needs (`smithy_query query="doc" shape="CreateConnectPeerRequest"
+    /// member="SubnetArn"`), or `None` where the request named none — the modelled pattern
+    /// admits the empty string, which names no subnet and is held as none.
+    pub subnet_arn: Option<String>,
+    pub created_at: SystemTime,
+    /// The instant the `CREATING` -> `AVAILABLE` transition the clock owes becomes due.
+    pub available_at: SystemTime,
+    /// The `ClientToken` of the request that minted this record, kept so a retry of that
+    /// request answers this record instead of minting a second peer.
+    pub client_token: Option<String>,
+    pub tags: Vec<Tag>,
+}
+
+impl ConnectPeerRecord {
+    /// This peer's lifecycle state as of `now`.
+    ///
+    /// `ConnectPeerState` enumerates CREATING, FAILED, AVAILABLE and DELETING
+    /// (`smithy_query shape=ConnectPeerState`, mirrored in
+    /// `ops::types::CONNECT_PEER_STATE_VALUES`), and shares the two the clock decides with
+    /// [`CoreNetworkRecord::state_at`]: a peer being created waits in [`STATE_CREATING`]
+    /// until the transition the clock owes falls due and is [`STATE_AVAILABLE`] after it.
+    pub fn state_at(&self, now: SystemTime) -> &'static str {
+        if now >= self.available_at {
+            STATE_AVAILABLE
+        } else {
+            STATE_CREATING
+        }
+    }
+
+    /// The modelled `ConnectPeerConfiguration` of this peer: the two tunnel addresses, the
+    /// inside CIDR blocks, the protocol it inherits from its attachment, and the BGP
+    /// session that configuration describes.
+    ///
+    /// ONE BGP configuration, because one peer joins one core network edge to one
+    /// appliance: its two AS numbers and its two addresses are exactly the stored ends of
+    /// this peering, so nothing here is invented.
+    pub fn configuration(&self) -> ConnectPeerConfiguration {
+        ConnectPeerConfiguration {
+            core_network_address: self.core_network_address.clone(),
+            peer_address: Some(self.peer_address.clone()),
+            inside_cidr_blocks: Some(self.inside_cidr_blocks.clone()),
+            protocol: self.protocol.clone(),
+            bgp_configurations: Some(vec![ConnectPeerBgpConfiguration {
+                core_network_asn: self.core_network_asn,
+                peer_asn: self.peer_asn,
+                core_network_address: self.core_network_address.clone(),
+                peer_address: Some(self.peer_address.clone()),
+            }]),
+        }
+    }
+
+    /// The modelled `ConnectPeer` for this record, as of `now`.
+    pub fn to_shape(&self, now: SystemTime) -> ConnectPeer {
+        ConnectPeer {
+            core_network_id: Some(self.core_network_id.clone()),
+            connect_attachment_id: Some(self.connect_attachment_id.clone()),
+            connect_peer_id: Some(self.id.clone()),
+            edge_location: Some(self.edge_location.clone()),
+            state: Some(self.state_at(now).to_string()),
+            created_at: Some(epoch_seconds(self.created_at)),
+            configuration: Some(self.configuration()),
+            tags: Some(self.tags.clone()),
+            subnet_arn: self.subnet_arn.clone(),
+            // "Describes the error associated with the attachment request" (`smithy_query
+            // shape=ConnectPeer`): a peer this service accepted and stored has no failed
+            // modification to report, so the member is absent rather than an empty list of
+            // errors nothing produced.
+            last_modification_errors: None,
+        }
+    }
+
+    /// The modelled `ConnectPeerSummary` for this record, as of `now`: the same stored
+    /// record `ListConnectPeers` reports, without the configuration only a read of the one
+    /// peer carries (`smithy_query shape=ConnectPeerSummary,ConnectPeer`).
+    pub fn to_summary(&self, now: SystemTime) -> ConnectPeerSummary {
+        ConnectPeerSummary {
+            core_network_id: Some(self.core_network_id.clone()),
+            connect_attachment_id: Some(self.connect_attachment_id.clone()),
+            connect_peer_id: Some(self.id.clone()),
+            edge_location: Some(self.edge_location.clone()),
+            connect_peer_state: Some(self.state_at(now).to_string()),
+            created_at: Some(epoch_seconds(self.created_at)),
+            tags: Some(self.tags.clone()),
+            subnet_arn: self.subnet_arn.clone(),
+        }
+    }
+}
+
 /// The two `Action` values `StartOrganizationServiceAccessUpdate` accepts, in the order
 /// its documentation lists them.
 ///
@@ -2302,6 +2511,13 @@ pub struct ComAmazonawsNetworkmanagerNetworkmanagerState {
     /// network-resource inventory and the core-network delete refusal all count
     /// attachments without caring which kind each is.
     pub attachments: BTreeMap<String, AttachmentRecord>,
+    /// Connect peers by `ConnectPeerId`, each carrying the Connect attachment it is carried
+    /// over and that attachment's core network and edge location. A `BTreeMap`, so listing
+    /// order is stable and a pagination token can name a key offset into it.
+    ///
+    /// Bounded by [`MAX_CONNECT_PEERS_PER_ATTACHMENT`] per attachment, on top of the
+    /// per-core-network attachment quota, so no caller can grow the map without end.
+    pub connect_peers: BTreeMap<String, ConnectPeerRecord>,
     /// Resource policies by the ARN of the resource they are attached to — the one store
     /// `PutResourcePolicy`, `GetResourcePolicy` and `DeleteResourcePolicy` share, holding
     /// the document exactly as it was accepted so a reader reports what was put.
@@ -2508,6 +2724,35 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
             .count()
     }
 
+    /// How many Connect peers are carried over the Connect attachment `attachment_id`, for
+    /// the per-attachment quota [`MAX_CONNECT_PEERS_PER_ATTACHMENT`].
+    pub fn connect_peer_count_of_attachment(&self, attachment_id: &str) -> usize {
+        self.connect_peers
+            .values()
+            .filter(|peer| peer.connect_attachment_id == attachment_id)
+            .count()
+    }
+
+    /// How many Connect peers the global network `global_network_id` holds, for the
+    /// network-resource inventory: a peer hangs off a Connect attachment's core network,
+    /// which hangs off a global network, so the count is resolved through that chain rather
+    /// than stored twice.
+    pub fn connect_peer_count_of_global_network(&self, global_network_id: &str) -> usize {
+        self.connect_peers
+            .values()
+            .filter(|peer| self.holds_core_network(global_network_id, &peer.core_network_id))
+            .count()
+    }
+
+    /// Whether the global network `global_network_id` owns the core network
+    /// `core_network_id`: the chain every resource hanging off a core network is resolved to
+    /// its global network through.
+    fn holds_core_network(&self, global_network_id: &str, core_network_id: &str) -> bool {
+        self.core_networks
+            .get(core_network_id)
+            .is_some_and(|core_network| core_network.global_network_id == global_network_id)
+    }
+
     /// How many attachments the global network `global_network_id` holds, for the
     /// network-resource inventory: an attachment hangs off a core network, which hangs off
     /// a global network, so the count is resolved through that chain rather than stored
@@ -2516,11 +2761,7 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
         self.attachments
             .values()
             .filter(|attachment| {
-                self.core_networks
-                    .get(&attachment.core_network_id)
-                    .is_some_and(|core_network| {
-                        core_network.global_network_id == global_network_id
-                    })
+                self.holds_core_network(global_network_id, &attachment.core_network_id)
             })
             .count()
     }
@@ -2540,6 +2781,7 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
             CONNECTION_KIND => self.connection_count_of(global_network_id),
             CORE_NETWORK_KIND => self.core_network_count_of(global_network_id),
             ATTACHMENT_KIND => self.attachment_count_of_global_network(global_network_id),
+            CONNECT_PEER_KIND => self.connect_peer_count_of_global_network(global_network_id),
             _ => 0,
         };
         i32::try_from(held).unwrap_or(i32::MAX)
@@ -2550,9 +2792,9 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
     /// name an offset into it.
     ///
     /// The inventory is the same one [`Self::network_resource_count`] counts, branch for
-    /// branch — attachments, connections, core networks, devices, links and sites — so the
-    /// count of a type and the resources listed for it can never disagree. A kind whose
-    /// creating operation is still a scaffold stub is held nowhere and therefore
+    /// branch — attachments, Connect peers, connections, core networks, devices, links and
+    /// sites — so the count of a type and the resources listed for it can never disagree. A
+    /// kind whose creating operation is still a scaffold stub is held nowhere and therefore
     /// contributes nothing, not a placeholder. A connection registered with a global
     /// network only for its telemetry lives in a different store
     /// ([`Self::telemetry_resources`]) that [`Self::network_resource_count`] does not count
@@ -2565,9 +2807,7 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
     ) -> Vec<(String, NetworkResource)> {
         let mut resources: BTreeMap<String, NetworkResource> = BTreeMap::new();
         for record in self.attachments.values().filter(|attachment| {
-            self.core_networks
-                .get(&attachment.core_network_id)
-                .is_some_and(|core_network| core_network.global_network_id == global_network_id)
+            self.holds_core_network(global_network_id, &attachment.core_network_id)
         }) {
             // An attachment's Describe reader is the one for its OWN kind, so the
             // definition is rendered from that kind's shape — the same shape
@@ -2592,6 +2832,22 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
                     core_network_id: Some(record.core_network_id.clone()),
                     definition,
                     ..network_resource(ATTACHMENT_KIND, &record.id, &record.arn, &record.tags, now)
+                },
+            );
+        }
+        for record in self
+            .connect_peers
+            .values()
+            .filter(|peer| self.holds_core_network(global_network_id, &peer.core_network_id))
+        {
+            resources.insert(
+                network_resource_key(CONNECT_PEER_KIND, &record.id),
+                NetworkResource {
+                    // A Connect peer belongs to the core network of the Connect attachment
+                    // it is carried over.
+                    core_network_id: Some(record.core_network_id.clone()),
+                    definition: resource_definition(&ConnectPeer::SCHEMA, &record.to_shape(now)),
+                    ..network_resource(CONNECT_PEER_KIND, &record.id, &record.arn, &record.tags, now)
                 },
             );
         }
@@ -2844,6 +3100,11 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
                 .get(parts.id)
                 .filter(|record| record.arn == arn)
                 .map(|record| &record.tags),
+            CONNECT_PEER_KIND => self
+                .connect_peers
+                .get(parts.id)
+                .filter(|record| record.arn == arn)
+                .map(|record| &record.tags),
             _ => None,
         }
     }
@@ -2884,6 +3145,11 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
                 .map(|record| &mut record.tags),
             ATTACHMENT_KIND => self
                 .attachments
+                .get_mut(parts.id)
+                .filter(|record| record.arn == arn)
+                .map(|record| &mut record.tags),
+            CONNECT_PEER_KIND => self
+                .connect_peers
                 .get_mut(parts.id)
                 .filter(|record| record.arn == arn)
                 .map(|record| &mut record.tags),
@@ -4255,6 +4521,20 @@ impl PolicyTopology {
         self.edges
             .iter()
             .any(|edge| edge.edge_location.as_deref() == Some(location))
+    }
+
+    /// The ASN this policy assigns the edge it configures in `location`, or `None` where it
+    /// configures no edge there or assigns that edge none.
+    ///
+    /// The ASN of an edge is the core network's own end of every BGP session that edge
+    /// peers over, which is what a Connect peer reports as
+    /// `ConnectPeerBgpConfiguration$CoreNetworkAsn`: it comes from the same derived topology
+    /// a read of the core network reports, so the two cannot disagree.
+    pub fn edge_asn(&self, location: &str) -> Option<i64> {
+        self.edges
+            .iter()
+            .find(|edge| edge.edge_location.as_deref() == Some(location))
+            .and_then(|edge| edge.asn)
     }
 
     /// What this policy decides about the attachment `candidate` describes.
