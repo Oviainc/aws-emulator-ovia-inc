@@ -164,9 +164,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.settle_due_transitions();
 
         let pipe = state.pipes.get_mut(&input.name).ok_or_else(|| {
-            StartPipeErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!("Pipe not found: {}", input.name)),
-            })
+            StartPipeErrorModeled::NotFoundException(crate::state::pipe_not_found(&input.name))
         })?;
 
         pipe.desired_state = crate::state::requested_state::RUNNING.to_string();

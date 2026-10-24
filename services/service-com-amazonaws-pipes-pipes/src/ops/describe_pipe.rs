@@ -193,9 +193,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.settle_due_transitions();
 
         let pipe = state.pipes.get(&input.name).ok_or_else(|| {
-            DescribePipeErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!("Pipe not found: {}", input.name)),
-            })
+            DescribePipeErrorModeled::NotFoundException(crate::state::pipe_not_found(&input.name))
         })?;
 
         Ok(DescribePipeOutput {

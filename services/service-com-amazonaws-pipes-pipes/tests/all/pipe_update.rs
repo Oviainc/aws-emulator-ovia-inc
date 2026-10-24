@@ -29,8 +29,9 @@ const SOURCE_KINESIS: &str = "arn:aws:kinesis:us-west-2:000000000000:stream/even
 const ENRICHMENT: &str = "arn:aws:lambda:us-west-2:000000000000:function:enrich";
 
 /// One `UpdatePipe` call: `PUT /v1/pipes/{Name}`. Source: the `UpdatePipe` http binding
-/// in `OPERATIONS.md`.
-async fn update(router: &MultiServiceRouter, name: &str, body: Value) -> Reply {
+/// in `OPERATIONS.md`. `pub(crate)` so `tests/all/pipe_refusal_bodies.rs` reaches the SAME
+/// one request path rather than copying it.
+pub(crate) async fn update(router: &MultiServiceRouter, name: &str, body: Value) -> Reply {
     call(
         router,
         "PUT",
@@ -42,7 +43,7 @@ async fn update(router: &MultiServiceRouter, name: &str, body: Value) -> Reply {
 }
 
 /// A `CreatePipe` body carrying the three required members plus `extra`.
-fn create_body(source: &str, target: &str, extra: Value) -> Value {
+pub(crate) fn create_body(source: &str, target: &str, extra: Value) -> Value {
     let mut body = minimal_body(source, target);
     for (member, value) in extra.as_object().expect("the extra members are an object") {
         body[member.clone()] = value.clone();

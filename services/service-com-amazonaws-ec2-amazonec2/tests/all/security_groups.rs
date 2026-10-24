@@ -43,22 +43,26 @@ fn param(name: &str, value: &str) -> (String, String) {
 /// the EC2 error code the refusal must carry.
 type RefusalCase = (&'static str, Vec<(String, String)>, &'static str);
 
-/// How many security groups the store holds — a fresh one already has the default VPC's
-/// default group, so a refusal that persists nothing leaves exactly one.
+/// How many security groups the store holds — the ambient default group of each Region the
+/// account has called in is among them, so a refusal that persists nothing leaves the count
+/// each test read before its create.
 fn held_groups(engine: &engine::InMemoryEngine) -> usize {
     engine.state::<Ec2State>().lock().security_groups.len()
 }
 
-/// The id of the account's default VPC — the one a create that names no `VpcId` must use.
+/// The id of the account's default VPC IN THE REGION these calls are signed for — the one a
+/// create that names no `VpcId` must use.
+///
+/// An account has a default VPC "in each AWS Region" (Amazon VPC User Guide, "Default
+/// VPCs"), materialised the first time it calls in that Region; this suite reads the
+/// Region's network through the store's own one writer for it, so what the handler falls
+/// back on and what the test expects cannot be two different VPCs.
 fn default_vpc_id(engine: &engine::InMemoryEngine) -> String {
     engine
         .state::<Ec2State>()
         .lock()
-        .vpcs
-        .values()
-        .find(|vpc| vpc.is_default.unwrap_or(false))
-        .and_then(|vpc| vpc.vpc_id.clone())
-        .expect("a fresh account has a default VPC")
+        .ensure_default_network(REGION)
+        .expect("an account has a default VPC in every Region")
 }
 
 /// Write a second, non-default VPC into the store, the way `CreateVpc` would, so a rule
@@ -411,6 +415,7 @@ async fn a_name_is_unique_within_the_vpc_and_not_distinguished_by_case() {
 async fn a_name_or_description_outside_its_constraints_is_refused() {
     let (router, engine) = super::ec2_query::emulator();
     let vpc_id = default_vpc_id(&engine);
+    let baseline = held_groups(&engine);
     let over_long = "x".repeat(256);
 
     // Rows: the empty value, one past the 255-character bound, a character outside the
@@ -473,8 +478,8 @@ async fn a_name_or_description_outside_its_constraints_is_refused() {
     }
     assert_eq!(
         held_groups(&engine),
-        1,
-        "a refused create must persist nothing beyond the default group"
+        baseline,
+        "a refused create must persist nothing beyond the ambient default groups"
     );
 
     // A DESCRIPTION may start with `sg-`: the rule is about names, which are ids' near
@@ -496,6 +501,7 @@ async fn a_name_or_description_outside_its_constraints_is_refused() {
 #[tokio::test]
 async fn a_vpc_id_that_names_no_vpc_is_refused() {
     let (router, engine) = super::ec2_query::emulator();
+    let baseline = held_groups(&engine);
 
     for vpc_id in ["vpc-0ffffffffffffffff", "vpc-0abc1234", "not-a-vpc-id"] {
         let params = vec![
@@ -516,12 +522,12 @@ async fn a_vpc_id_that_names_no_vpc_is_refused() {
     }
     assert_eq!(
         held_groups(&engine),
-        1,
-        "a refused create must persist nothing beyond the default group"
+        baseline,
+        "a refused create must persist nothing beyond the ambient default groups"
     );
 }
 
-/// A request that names no `VpcId` in an account with no DEFAULT VPC has no VPC to fall
+/// A request that names no `VpcId` in a Region with no DEFAULT VPC has no VPC to fall
 /// back on, so it is refused with `VPCIdNotSpecified` rather than creating a group
 /// belonging to nothing.
 #[tokio::test]
@@ -529,14 +535,14 @@ async fn no_vpc_id_and_no_default_vpc_is_refused() {
     let (router, engine) = super::ec2_query::emulator();
     let default_vpc = default_vpc_id(&engine);
 
-    // The account stops having a default VPC — the state a Region that never got one is in.
+    // The Region stops having a default VPC — the state it is in once that VPC has been
+    // DELETED, which the next call does not undo (recreating one is `CreateDefaultVpc`).
     {
         let store = engine.state::<Ec2State>();
         let mut guard = store.lock();
-        if let Some(vpc) = guard.vpcs.get_mut(&default_vpc) {
-            vpc.is_default = Some(false);
-        }
+        guard.vpcs.remove(&default_vpc);
     }
+    let baseline = held_groups(&engine);
 
     let params = vec![
         param("GroupName", "no-default-vpc"),
@@ -554,16 +560,17 @@ async fn no_vpc_id_and_no_default_vpc_is_refused() {
     );
     assert_eq!(
         held_groups(&engine),
-        1,
-        "a refused create must persist nothing beyond the default group"
+        baseline,
+        "a refused create must persist nothing beyond the ambient default groups"
     );
 
-    // Naming the VPC explicitly is still accepted: the refusal is about the request having
+    // Naming a VPC explicitly is still accepted: the refusal is about the request having
     // no VPC to resolve, not about the VPC itself.
+    let other_vpc = insert_vpc(&engine, "10.42.0.0/16");
     let named = vec![
         param("GroupName", "no-default-vpc"),
         param("GroupDescription", "there is no default VPC to use"),
-        param("VpcId", &default_vpc),
+        param("VpcId", &other_vpc),
     ];
     let (status, body) = create(&router, &named).await;
     assert_eq!(
@@ -633,6 +640,7 @@ async fn a_create_past_the_store_s_ceiling_is_refused() {
 async fn a_tag_specification_this_action_cannot_honour_is_refused() {
     let (router, engine) = super::ec2_query::emulator();
     let vpc_id = default_vpc_id(&engine);
+    let baseline = held_groups(&engine);
 
     let cases: Vec<RefusalCase> = vec![
         (
@@ -693,8 +701,8 @@ async fn a_tag_specification_this_action_cannot_honour_is_refused() {
     }
     assert_eq!(
         held_groups(&engine),
-        1,
-        "a refused create must persist nothing beyond the default group"
+        baseline,
+        "a refused create must persist nothing beyond the ambient default groups"
     );
 }
 
@@ -705,6 +713,7 @@ async fn a_tag_specification_this_action_cannot_honour_is_refused() {
 async fn dry_run_reports_the_permitted_outcome_without_creating() {
     let (router, engine) = super::ec2_query::emulator();
     let vpc_id = default_vpc_id(&engine);
+    let baseline = held_groups(&engine);
 
     let params = vec![
         param("GroupName", "dry-run-group"),
@@ -724,7 +733,7 @@ async fn dry_run_reports_the_permitted_outcome_without_creating() {
     );
     assert_eq!(
         held_groups(&engine),
-        1,
+        baseline,
         "DryRun=true must create nothing"
     );
 
@@ -760,7 +769,7 @@ async fn dry_run_reports_the_permitted_outcome_without_creating() {
     );
     assert_eq!(
         held_groups(&engine),
-        2,
+        baseline + 1,
         "DryRun=false must create the group"
     );
 }
