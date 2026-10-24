@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetLens
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetLens`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetLens::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports ONE lens of the same catalog `ListLenses` enumerates — the
+//! AWS-official lenses this emulator knows, plus the custom lenses
+//! [`crate::state::ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::lenses`]
+//! holds — at the version the request names, or at the lens's current content when it
+//! names none. A pure read: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +147,153 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetLens` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetLensErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetLens"))
+        let region = crate::state::request_region(ctx.parts());
+
+        // "For Amazon Web Services official lenses, this is either the lens alias … or
+        // the lens ARN … For custom lenses, this is the lens ARN" (`LensAlias` doc), so
+        // the name itself says which half of the catalog the lens is resolved against.
+        // An official lens is the catalog's own content, so this path never reaches the
+        // lens store.
+        if crate::state::is_aws_official_lens(&input.lens_alias) {
+            return Ok(GetLensOutput {
+                lens: Some(official_catalog_lens(&input, &region)?),
+            });
+        }
+
+        let now = std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetLensErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool lens store is unavailable".to_string(),
+            })
+        })?;
+        let store = state.lock();
+        let record = store.lens_by_alias(&input.lens_alias).ok_or_else(|| {
+            GetLensErrorModeled::ResourceNotFoundException(crate::state::lens_not_found(
+                &input.lens_alias,
+            ))
+        })?;
+
+        // "The lens version to be retrieved": a custom lens's version exists only once
+        // `CreateLensVersion` has published it, and a published version is immutable, so
+        // a request naming one is answered from that version's own content. Without a
+        // version, the lens's current content — the same content, and the same
+        // `LensVersion`, `ListLenses` describes the lens by, so a read of one lens and a
+        // listing of every lens cannot disagree about it.
+        let (lens_version, content) = match input.lens_version.as_deref() {
+            Some(requested) => {
+                let published = record.versions.get(requested).ok_or_else(|| {
+                    GetLensErrorModeled::ResourceNotFoundException(
+                        crate::state::lens_version_not_found(&input.lens_alias, requested),
+                    )
+                })?;
+                (requested.to_string(), &published.content)
+            }
+            None => {
+                let content = record.summary_content(now).ok_or_else(|| {
+                    GetLensErrorModeled::ResourceNotFoundException(crate::state::lens_not_found(
+                        &input.lens_alias,
+                    ))
+                })?;
+                let version = record
+                    .published_version(now)
+                    .map_or(crate::state::LENS_VERSION_DRAFT, |(version, _)| version);
+                (version.to_string(), content)
+            }
+        };
+
+        Ok(GetLensOutput {
+            lens: Some(Lens {
+                lens_arn: Some(record.lens_arn.clone()),
+                lens_version: Some(lens_version),
+                // The lens's name and description are lens CONTENT: they come from the
+                // document the version being read carries, never from the request.
+                name: Some(content.definition.name.clone()),
+                description: content.definition.description.clone(),
+                owner: Some(record.owner.clone()),
+                // "The ID assigned to the share invitation": only a lens the caller
+                // reached THROUGH a share invitation carries one, which is a lens another
+                // account shared in. Every request this emulator serves is attributed to
+                // its one account, and `CreateLensShare` refuses a `SharedWith` naming the
+                // sharer, so no lens here was reached through an invitation the caller
+                // accepted.
+                share_invitation_id: None,
+                // The tag map the lens carries, empty when it carries none: the
+                // `@length(min: 1)` on `TagMap` constrains the tags a REQUEST supplies,
+                // not what a projection of the stored lens reports. Tags belong to the
+                // lens rather than to one of its versions, so a version-pinned read
+                // reports the same ones.
+                tags: Some(
+                    record
+                        .tags
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect(),
+                ),
+            }),
+        })
     }
+}
+
+/// The `Lens` an AWS-OFFICIAL lens is reported by, or the modelled failure for a name or
+/// version that resolves to none.
+///
+/// A lens Amazon Web Services publishes exists whether or not this emulator carries its
+/// content, so the aliases AWS publishes are what the name resolves against; a name
+/// outside them is no lens at all. What this emulator then KNOWS about the lens is its
+/// catalog entry ([`crate::state::official_lens`]) — the SAME entry `ListLenses` reports
+/// the lens by and a lens review reads its name and version from, so no two of them can
+/// disagree about one lens — and the content members are omitted only for a published
+/// alias the catalog carries no entry for, rather than invented.
+///
+/// Such an alias is still answered rather than refused: the lens is one AWS publishes, a
+/// workload can be reviewed against it here
+/// ([`crate::state::ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::resolve_lens`]
+/// answers `Official` for it) and a review of it reports the same optional members
+/// omitted ([`crate::state::lens_metadata`]), so a lookup miss would be the one answer
+/// that is false — it would say the lens does not exist. `ListLenses` leaving it out of
+/// the enumeration is the same judgement from the other side: there is no content to
+/// describe it by, and every member that would carry that content is modelled optional.
+fn official_catalog_lens(input: &GetLensInput, region: &str) -> Result<Lens, GetLensError> {
+    if !crate::state::is_published_official_lens(&input.lens_alias) {
+        return Err(GetLensErrorModeled::ResourceNotFoundException(
+            crate::state::unknown_lens_not_found(&input.lens_alias),
+        )
+        .into());
+    }
+
+    let described = crate::state::official_lens(&input.lens_alias);
+    let lens_version = described.map(|official| official.version.to_string());
+
+    // The version of an official lens a caller can read is the version its catalog entry
+    // is carried at; any other version of that lens is not here to report.
+    if let Some(requested) = input.lens_version.as_deref() {
+        if lens_version.as_deref() != Some(requested) {
+            return Err(GetLensErrorModeled::ResourceNotFoundException(
+                crate::state::lens_version_not_found(&input.lens_alias, requested),
+            )
+            .into());
+        }
+    }
+
+    Ok(Lens {
+        // The lens is reported in the Region the request was signed for, whatever Region
+        // an ARN spelling of the name carried: a lens is named by its alias ("Each lens
+        // is identified by its `LensSummary$LensAlias`"), and every other read of an
+        // official lens here answers the ARN of that Region's endpoint
+        // ([`crate::state::official_lens_arn`], as `ListLenses` and a lens review report
+        // it), so one Region's read never echoes another's ARN back.
+        lens_arn: Some(crate::state::official_lens_arn(region, &input.lens_alias)),
+        lens_version,
+        name: described.map(|official| official.name.to_string()),
+        description: described.map(|official| official.description.to_string()),
+        // An official lens ARN names no owner account — AWS publishes the lens rather
+        // than an account owning it — and `Owner` is modelled an account id, which no
+        // placeholder would satisfy honestly.
+        owner: None,
+        // As above: an official lens is not reached through a share invitation.
+        share_invitation_id: None,
+        // Tags are assigned to a lens this account holds; AWS's own lenses carry none
+        // here, so there is no tag map to report rather than an empty one.
+        tags: None,
+    })
 }

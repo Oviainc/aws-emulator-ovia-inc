@@ -38,6 +38,9 @@ mod delete_idempotency;
 #[path = "all/get_agent_profile.rs"]
 mod get_agent_profile;
 
+#[path = "all/get_lens.rs"]
+mod get_lens;
+
 #[path = "all/lens_listing.rs"]
 mod lens_listing;
 
