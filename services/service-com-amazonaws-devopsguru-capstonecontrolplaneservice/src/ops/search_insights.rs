@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SearchInsights
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SearchInsights`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SearchInsights::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the insights DevOps Guru's analysis produced for this account that the
+//! request's `Type`, `StartTimeRange` and `Filters` select. A pure read: it never writes
+//! to the store.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +160,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SearchInsights` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SearchInsightsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SearchInsights"))
+        // This search is computed from the store alone: no request metadata beyond the
+        // deserialized input takes part, so the context is unused.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            SearchInsightsError::Modeled(SearchInsightsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the DevOps Guru insight store is unavailable".to_string(),
+                    retry_after_seconds: 0,
+                },
+            ))
+        })?;
+
+        // `SearchInsights` and the organization-wide `SearchOrganizationInsights` carry
+        // the same four filter members over the same store, so the selection is the
+        // shared one in `crate::state`; only the error channel it is reported on is this
+        // operation's.
+        let filters = input.filters.as_ref();
+        let selector = crate::state::InsightSearchSelector::of(
+            &input.r#type,
+            &input.start_time_range,
+            filters.and_then(|filters| filters.severities.as_ref()),
+            filters.and_then(|filters| filters.statuses.as_ref()),
+            filters.and_then(|filters| filters.resource_collection.as_ref()),
+            filters.and_then(|filters| filters.service_collection.as_ref()),
+        )
+        .map_err(|rejection| -> SearchInsightsError {
+            SearchInsightsErrorModeled::ValidationException(rejection.validation_exception())
+                .into()
+        })?;
+        // `SearchInsightsMaxResults` is modelled range 1..100, which the boundary
+        // validator already enforces; the clamp keeps one page bounded if the model ever
+        // widens.
+        let page_size = input
+            .max_results
+            .map_or(crate::state::PAGE_SIZE, |requested| {
+                (requested as usize).clamp(1, crate::state::PAGE_SIZE)
+            });
+
+        let guard = state.lock();
+        // Select, then page: a token names an offset into the insights THIS selection
+        // holds, so it is scoped to the whole filter set and does not resolve against
+        // another.
+        let matching: Vec<&crate::state::InsightRecord> = guard
+            .insights
+            .values()
+            .filter(|insight| selector.matches(insight))
+            .collect();
+
+        let (page, next_token) = crate::state::page_sized(
+            &matching,
+            &format!("SearchInsights/{}", selector.page_scope()),
+            input.next_token.as_deref(),
+            page_size,
+        )
+        .ok_or_else(|| -> SearchInsightsError {
+            SearchInsightsErrorModeled::ValidationException(
+                crate::state::FilterRejection::stale_cursor(
+                    "SearchInsights",
+                    "the insights this search selects",
+                    "Type, StartTimeRange and Filters",
+                )
+                .validation_exception(),
+            )
+            .into()
+        })?;
+
+        // An insight is reported in the list for ITS OWN type, so the page is partitioned
+        // rather than placed wholesale in one list. The search names ONE `InsightType`,
+        // so one of the two lists is always empty — reported as an empty list, because
+        // both members are modelled and a search that matched nothing is not an error.
+        let proactive_insights: Vec<ProactiveInsightSummary> = page
+            .iter()
+            .filter(|insight| insight.is_proactive())
+            .map(|insight| insight.to_proactive_summary())
+            .collect();
+        let reactive_insights: Vec<ReactiveInsightSummary> = page
+            .iter()
+            .filter(|insight| insight.is_reactive())
+            .map(|insight| insight.to_reactive_summary())
+            .collect();
+
+        Ok(SearchInsightsOutput {
+            proactive_insights: Some(proactive_insights),
+            reactive_insights: Some(reactive_insights),
+            next_token,
+        })
     }
 }
