@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ImportApiKeys
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ImportApiKeys`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ImportApiKeys::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reads the API key file the request carries, writes one `ApiKey` record
+//! into [`crate::state`] per row it can carry over — metered by each stored usage plan
+//! that row's `usageplanIds` cell names — and answers with those ids beside one warning
+//! per row it could not fully carry over; the whole import is refused instead when
+//! `failOnWarnings` is set. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -82,6 +78,304 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use crate::state::ApiKeyEntry;
+
+// The published length range of an API key VALUE, wherever the value came from: the
+// sibling `CreateApiKey` enforces the same range on the value a caller supplies there.
+use super::create_api_key::{MAX_VALUE_CHARS, MIN_VALUE_CHARS};
+
+/// The one input format this operation reads, as the modelled `ApiKeysFormat` enum lists
+/// it ([`API_KEYS_FORMAT_VALUES`], `one of: csv`). The boundary validator refuses any
+/// other value before this handler runs; the handler still matches on it, so a format
+/// added to the model later is refused rather than read as a CSV document.
+const FORMAT_CSV: &str = "csv";
+
+// ---------------------------------------------------------------------------
+// The API key file's columns.
+//
+// `ImportApiKeysRequest$body` documents the payload as "For the payload format, see API
+// Key File Format" — the API Gateway developer guide's "API Gateway API key file
+// format", which declares a CSV document whose first line names its columns: `key` and
+// `name` are required, `description`, `Enabled` and `usageplanIds` optional, the column
+// ORDER is free and the names are matched without regard to case. A column the catalog
+// below does not name carries nothing this service stores and is ignored.
+// ---------------------------------------------------------------------------
+
+/// The column carrying the key's value — the secret a client presents in `x-api-key`.
+/// Required.
+const COLUMN_KEY: &str = "key";
+
+/// The column carrying the key's name. Required.
+const COLUMN_NAME: &str = "name";
+
+/// The column carrying the key's description. Optional.
+const COLUMN_DESCRIPTION: &str = "description";
+
+/// The column saying whether the key may be used by callers. Optional.
+const COLUMN_ENABLED: &str = "enabled";
+
+/// The column naming the usage plans the key is to be metered by, as a comma-separated
+/// list inside the one cell. Optional. An id that names a STORED plan is carried over as
+/// the association `CreateUsagePlanKey` writes; one that names no stored plan is reported
+/// as a warning on its row.
+const COLUMN_USAGE_PLAN_IDS: &str = "usageplanids";
+
+/// Emulator resource guard, NOT an AWS quota: the largest import body this emulator
+/// reads.
+///
+/// The same bound the sibling imports use (`super::put_rest_api`'s
+/// `MAX_DEFINITION_BYTES`, `super::import_documentation_parts`'s `MAX_IMPORT_BYTES`), for
+/// the same reason: an account holds at most [`crate::state::MAX_API_KEYS`] API keys, so
+/// a body past this cannot be imported in full anyway, and bounding the body is what
+/// bounds the work the reader does.
+const MAX_IMPORT_BYTES: usize = 1024 * 1024;
+
+/// One row of an API key file, as it will be stored.
+#[derive(Debug, Clone)]
+struct ImportedKey {
+    /// Which data row of the payload this is, 1-based (the header line is not a row), so
+    /// a warning can name the row the caller has to fix.
+    row: usize,
+    value: String,
+    name: Option<String>,
+    description: Option<String>,
+    enabled: bool,
+    /// The usage plans the row asks this key to be metered by, in the order the cell
+    /// names them. Resolved against the STORED plans under the store lock (see the
+    /// handler), because whether a plan exists is a question only the store can answer.
+    usage_plan_ids: Vec<String>,
+    /// What this row asked for that the import could NOT carry over, though the key
+    /// itself is created: one reported warning per entry, tagged with [`ImportedKey::row`].
+    notes: Vec<String>,
+}
+
+/// What an import reads out of a payload: the rows it can create a key from, in row
+/// order, and what it could not carry over, each warning tagged with its row.
+#[derive(Debug, Clone, Default)]
+struct ImportedKeys {
+    keys: Vec<ImportedKey>,
+    /// Reported in the response's `warnings`, and what `failOnWarnings` rolls the import
+    /// back for.
+    warnings: Vec<(usize, String)>,
+}
+
+/// Which column of the header each catalog name sits at, matched without regard to case,
+/// the first occurrence of a repeated name winning.
+fn column_indices(header: &::csv::StringRecord) -> BTreeMap<String, usize> {
+    let mut indices = BTreeMap::new();
+    for (index, name) in header.iter().enumerate() {
+        indices.entry(name.to_ascii_lowercase()).or_insert(index);
+    }
+    indices
+}
+
+/// The cell one `column` holds in `record`, or the empty string when the header declares
+/// no such column or this row stops short of it.
+fn cell<'r>(
+    record: &'r ::csv::StringRecord,
+    indices: &BTreeMap<String, usize>,
+    column: &str,
+) -> &'r str {
+    indices
+        .get(column)
+        .and_then(|index| record.get(*index))
+        .unwrap_or_default()
+}
+
+/// The two words the `Enabled` column carries, as the API key file format's own example
+/// file spells them (upper case there, matched here without regard to case because the
+/// rest of the document's column names are too).
+const ENABLED_WORDS: [(&str, bool); 2] = [("true", true), ("false", false)];
+
+/// Whether an `Enabled` cell says the key may be used by callers, or `None` when the cell
+/// carries something that is not one of [`ENABLED_WORDS`] at all.
+///
+/// An EMPTY cell (no such column, or a row that stops short of it) is `Some(false)`: the
+/// default `CreateApiKey$enabled` declares (`default false`). A cell carrying any other
+/// text is a cell this service could not read, which the import reports as a warning on
+/// that row rather than silently treating as disabled.
+fn enabled_cell(cell: &str) -> Option<bool> {
+    if cell.is_empty() {
+        return Some(false);
+    }
+    ENABLED_WORDS
+        .iter()
+        .find(|(word, _)| cell.eq_ignore_ascii_case(word))
+        .map(|(_, enabled)| *enabled)
+}
+
+/// One data row as it will be stored.
+///
+/// `Err` carries what is wrong with this one row, which the import reports as a warning:
+/// the row creates nothing and the rows around it are still imported.
+fn imported_key(
+    row: usize,
+    record: &::csv::StringRecord,
+    indices: &BTreeMap<String, usize>,
+) -> Result<ImportedKey, String> {
+    use crate::state::{bound_chars, bound_entries, MAX_COLLECTION_ENTRIES, MAX_STRING_CHARS};
+
+    let value = cell(record, indices, COLUMN_KEY);
+    if value.is_empty() {
+        return Err(format!("{COLUMN_KEY} is required"));
+    }
+    // The value is what a client will present in `x-api-key`, so it must be long enough
+    // to be a key at all: the SAME published range `CreateApiKey` holds a supplied value
+    // to. The refusal names the bound and the length, never the value, which is a secret.
+    let length = value.chars().count();
+    if !(MIN_VALUE_CHARS..=MAX_VALUE_CHARS).contains(&length) {
+        return Err(format!(
+            "{COLUMN_KEY} must be between {MIN_VALUE_CHARS} and {MAX_VALUE_CHARS} characters, \
+             got {length}"
+        ));
+    }
+    let name = cell(record, indices, COLUMN_NAME);
+    if name.is_empty() {
+        return Err(format!("{COLUMN_NAME} is required"));
+    }
+    bound_chars(COLUMN_NAME, name, MAX_STRING_CHARS)?;
+    let description = cell(record, indices, COLUMN_DESCRIPTION);
+    bound_chars(COLUMN_DESCRIPTION, description, MAX_STRING_CHARS)?;
+    // One cell holding a comma-separated list, so an empty cell names no plan at all.
+    let usage_plan_ids: Vec<String> = cell(record, indices, COLUMN_USAGE_PLAN_IDS)
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+        .collect();
+    bound_entries(
+        COLUMN_USAGE_PLAN_IDS,
+        usage_plan_ids.len(),
+        MAX_COLLECTION_ENTRIES,
+    )?;
+    for id in &usage_plan_ids {
+        bound_chars(COLUMN_USAGE_PLAN_IDS, id, MAX_STRING_CHARS)?;
+    }
+
+    // What the row asked for and this import cannot carry over, though the key itself is
+    // created from the rest of the row.
+    let mut notes: Vec<String> = Vec::new();
+    // A cell that is not one of the format's boolean words is a cell this service could
+    // not read: the key keeps the modelled default (`enabled` is `default false`) and the
+    // caller is told, rather than reading a typo as a deliberate `false`.
+    let enabled = match enabled_cell(cell(record, indices, COLUMN_ENABLED)) {
+        Some(enabled) => enabled,
+        None => {
+            notes.push(format!(
+                "{COLUMN_ENABLED} must be one of {}, so the imported API Key was left \
+                 disabled",
+                ENABLED_WORDS
+                    .iter()
+                    .map(|(word, _)| word.to_ascii_uppercase())
+                    .collect::<Vec<String>>()
+                    .join(", ")
+            ));
+            false
+        }
+    };
+
+    Ok(ImportedKey {
+        row,
+        value: value.to_owned(),
+        name: Some(name.to_owned()),
+        description: (!description.is_empty()).then(|| description.to_owned()),
+        enabled,
+        usage_plan_ids,
+        notes,
+    })
+}
+
+/// Read the API keys out of a `csv` payload.
+///
+/// The document is parsed by the `csv` crate — the maintained reader for the format, the
+/// same one the sibling comprehend service reads an AWS CSV payload with, so a quoted
+/// cell carrying a comma, a line ending or a doubled quote is read as one value — under
+/// [`MAX_IMPORT_BYTES`], so the reader cannot amplify what the body carries. Its header
+/// line names the columns and every record after it is one API key row.
+///
+/// `Err` carries the message for a payload that is not an API key file at all: the caller
+/// has to fix it from this text alone.
+fn parse_import(body: &[u8]) -> Result<ImportedKeys, String> {
+    if body.len() > MAX_IMPORT_BYTES {
+        return Err(format!(
+            "body may be at most {MAX_IMPORT_BYTES} bytes, got {}",
+            body.len()
+        ));
+    }
+    let document = ::std::str::from_utf8(body).map_err(|_| {
+        "body must be a UTF-8 encoded CSV document carrying the API keys to import".to_string()
+    })?;
+    // A spreadsheet export prefixes the document with a byte order mark; it belongs to
+    // the encoding, not to the name of the first column.
+    let document = document.trim_start_matches('\u{feff}');
+    if document.trim().is_empty() {
+        return Err(format!(
+            "body must carry the CSV header line declaring at least the {COLUMN_KEY} and \
+             {COLUMN_NAME} columns"
+        ));
+    }
+    let mut reader = ::csv::ReaderBuilder::new()
+        .has_headers(true)
+        // A row that stops short of the header's width is read as far as it goes, so one
+        // short row is a warning about that row rather than a refusal of the document.
+        .flexible(true)
+        .trim(::csv::Trim::All)
+        .from_reader(document.as_bytes());
+    let header = reader
+        .headers()
+        .map_err(|_| {
+            "body could not be read as a CSV document: its header line is malformed".to_string()
+        })?
+        .clone();
+    let indices = column_indices(&header);
+    for required in [COLUMN_KEY, COLUMN_NAME] {
+        if !indices.contains_key(required) {
+            return Err(format!(
+                "the CSV header line must declare the required {required} column"
+            ));
+        }
+    }
+
+    let mut read = ImportedKeys::default();
+    for (index, record) in reader.records().enumerate() {
+        let row = index + 1;
+        // The row count is NOT checked here: how many keys the account may hold is one
+        // quota, answered in one way — the modelled `LimitExceededException` the handler
+        // raises once it knows how many rows would be created. What bounds the work this
+        // reader does is [`MAX_IMPORT_BYTES`] on the body above.
+        //
+        // A row the reader itself could not read is one row the import could not carry
+        // over, like a row whose cells it read and this service refused: the rows around
+        // it are still imported. Only an error that makes the DOCUMENT unreadable (a
+        // malformed header, a non-UTF-8 or over-sized body) refuses the request.
+        //
+        // The reader is set `flexible`, over text already known to be UTF-8, so this is
+        // the reader's own error channel rather than a path a payload can drive: it is
+        // handled because a record error must not become a refusal of the whole import.
+        let record = match record {
+            Ok(record) => record,
+            Err(_) => {
+                read.warnings.push((row, "the row is malformed".to_string()));
+                continue;
+            }
+        };
+        match imported_key(row, &record, &indices) {
+            Ok(mut key) => {
+                // The key itself is still imported: every note is one thing about this
+                // row the import could not carry over, reported as that row's warning.
+                for note in ::std::mem::take(&mut key.notes) {
+                    read.warnings.push((row, note));
+                }
+                read.keys.push(key);
+            }
+            Err(message) => read.warnings.push((row, message)),
+        }
+    }
+    Ok(read)
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -156,18 +450,215 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ImportApiKeys` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ImportApiKeysErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Every refusal below is the modelled 400: the request's format or payload is
+        // wrong, or a warning plus `failOnWarnings` says not to import at all, and the
+        // message names what to fix.
+        fn bad_request(message: String) -> ImportApiKeysError {
+            ImportApiKeysErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+            .into()
+        }
+
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        if input.format != FORMAT_CSV {
+            return Err(bad_request(format!(
+                "the only input format this operation reads is {FORMAT_CSV}"
+            )));
+        }
+
+        // The payload is read and bounded BEFORE the store lock is taken, so a malformed
+        // or over-sized import never reaches the records at all.
+        let ImportedKeys { keys, mut warnings } = parse_import(&input.body).map_err(bad_request)?;
+
+        let now = crate::state::now();
+        let mut store = state.lock();
+
+        // A key value identifies the caller presenting it, so two keys cannot share one.
+        // A row whose value is already taken — by a stored key, or by an earlier row of
+        // this same import — creates nothing and is reported as a warning, which is how
+        // this operation reports a row it could not carry over while importing the rest.
+        let mut taken: BTreeSet<String> = store
+            .api_keys
+            .values()
+            .map(|key| key.value.clone())
+            .collect();
+        let mut creatable: Vec<ImportedKey> = Vec::with_capacity(keys.len());
+        for key in keys {
+            if taken.insert(key.value.clone()) {
+                creatable.push(key);
+            } else {
+                warnings.push((
+                    key.row,
+                    "an API Key already exists for the given value".to_string(),
+                ));
+            }
+        }
+
+        // Which STORED usage plan each surviving row is to be metered by. Resolved here,
+        // against the plans this account really holds, BEFORE anything is written: a
+        // `usageplanIds` cell naming a plan that exists is carried over as the
+        // association `CreateUsagePlanKey` writes, and only an id that names no stored
+        // plan — or a plan already metering as many keys as it may — is reported as a row
+        // the import could not fully carry over.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ImportApiKeys"))
+        // Each entry is (which surviving row, which plan), so the association can be
+        // written once the row's key id has been minted below.
+        let mut associations: Vec<(usize, String)> = Vec::new();
+        // How many keys THIS import has already decided to add to each plan, so the
+        // plan's cap accounts for the rows of this same payload too.
+        let mut adding: BTreeMap<String, usize> = BTreeMap::new();
+        for (index, key) in creatable.iter().enumerate() {
+            // One cell may name a plan twice; a key is metered by a plan at most once.
+            for plan_id in key.usage_plan_ids.iter().collect::<BTreeSet<&String>>() {
+                let Some(plan) = store.usage_plans.get(plan_id) else {
+                    warnings.push((
+                        key.row,
+                        format!(
+                            "no usage plan {plan_id} exists, so the imported API Key was \
+                             not associated with it"
+                        ),
+                    ));
+                    continue;
+                };
+                let metered = plan.keys.len() + adding.get(plan_id).copied().unwrap_or_default();
+                if metered >= crate::state::MAX_USAGE_PLAN_KEYS_PER_PLAN {
+                    warnings.push((
+                        key.row,
+                        format!(
+                            "usage plan {plan_id} already meters {} API Keys, so the \
+                             imported API Key was not associated with it",
+                            crate::state::MAX_USAGE_PLAN_KEYS_PER_PLAN
+                        ),
+                    ));
+                    continue;
+                }
+                *adding.entry(plan_id.clone()).or_default() += 1;
+                associations.push((index, plan_id.clone()));
+            }
+        }
+
+        // One warning per row the import could not carry over, in row order whichever
+        // check earned it, and at most as many as this service reports for a
+        // caller-sized list: what the response carries stays bounded however many rows
+        // the payload declares. A cut list says so in a last entry, so a caller can tell
+        // a truncated report from a complete one.
+        warnings.sort_by_key(|(row, _)| *row);
+        let mut warnings: Vec<String> = warnings
+            .into_iter()
+            .map(|(row, message)| format!("row {row}: {message}"))
+            .collect();
+        if warnings.len() > crate::state::MAX_COLLECTION_ENTRIES {
+            // The cut keeps one entry fewer than the bound and spends the last on how
+            // many rows went unreported, so the list stays at the bound and a caller can
+            // tell a truncated report from a complete one.
+            let kept = crate::state::MAX_COLLECTION_ENTRIES.saturating_sub(1);
+            let omitted = warnings.len() - kept;
+            warnings.truncate(kept);
+            warnings.push(format!("{omitted} further row(s) warned"));
+        }
+
+        // `failOnWarnings` is "a query parameter to indicate whether to rollback ApiKey
+        // importation (true) or not (false) when error is encountered": every warning is
+        // known before anything is written, so the rollback is that no record changes at
+        // all.
+        if input.fail_on_warnings && !warnings.is_empty() {
+            return Err(bad_request(format!(
+                "Errors found during import: {}",
+                warnings.join("; ")
+            )));
+        }
+
+        // Bound the growth a caller drives, at API Gateway's published quota: an import
+        // that would carry the account past it imports nothing.
+        if store.api_keys.len() + creatable.len() > crate::state::MAX_API_KEYS {
+            return Err(ImportApiKeysErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    retry_after_seconds: None,
+                    message: Some(format!(
+                        "Maximum number of API keys exceeded: {}",
+                        crate::state::MAX_API_KEYS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // One stored record per row that survived, in the payload's own row order, so the
+        // ids answered are in that order too.
+        let mut ids: Vec<String> = Vec::with_capacity(creatable.len());
+        for key in creatable {
+            let id = store.mint_id();
+            let sequence = store.next_sequence();
+            store.api_keys.insert(
+                id.clone(),
+                ApiKeyEntry {
+                    id: id.clone(),
+                    value: key.value,
+                    name: key.name,
+                    description: key.description,
+                    // The API key file declares no marketplace customer id, so an
+                    // imported key carries none until an `UpdateApiKey` patch sets one.
+                    customer_id: None,
+                    enabled: key.enabled,
+                    // A key is created and last updated at the same instant; a successful
+                    // `UpdateApiKey` patch moves the second one.
+                    created_date: Some(now),
+                    last_updated_date: Some(now),
+                    // An import associates the key with no stage and gives it no label or
+                    // tag: the file format declares none of them.
+                    stage_keys: Vec::new(),
+                    labels: Vec::new(),
+                    tags: BTreeMap::new(),
+                    sequence,
+                },
+            );
+            ids.push(id);
+        }
+
+        // The associations resolved above, written to the plans they named: a usage plan
+        // key is the same record `CreateUsagePlanKey` writes, so a later
+        // `GetUsagePlanKey` reports an imported key exactly like an added one.
+        for (index, plan_id) in associations {
+            let Some(key_id) = ids.get(index).cloned() else {
+                continue;
+            };
+            let sequence = store.next_sequence();
+            if let Some(plan) = store.usage_plans.get_mut(&plan_id) {
+                plan.keys.insert(
+                    key_id.clone(),
+                    crate::state::UsagePlanKeyEntry {
+                        key_id,
+                        // The one type the model declares valid, which is what an import
+                        // adds a key as.
+                        key_type: crate::state::USAGE_PLAN_KEY_TYPE.to_string(),
+                        sequence,
+                    },
+                );
+            }
+        }
+
+        // Everything below is owned, so the store lock is released before the response is
+        // formatted: the critical section covers the state change only.
+        drop(store);
+        // The access record for a state-changing operation: who, what, and the outcome.
+        // Metadata only — an imported key's `value` is a secret and is never a field here.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            api_keys = ids.len(),
+            warnings = warnings.len(),
+            outcome = "imported",
+            "api keys imported",
+        );
+        Ok(ImportApiKeysOutput {
+            ids: Some(ids),
+            // What THIS import could not carry over; an import that warned about nothing
+            // reports no warnings, never a value some other call left behind.
+            warnings: (!warnings.is_empty()).then_some(warnings),
+        })
     }
 }
