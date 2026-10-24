@@ -39,6 +39,8 @@ mod flush_stage_cache;
 mod gateway_response;
 #[path = "all/gateway_response_collection.rs"]
 mod gateway_response_collection;
+#[path = "all/gateway_response_scope.rs"]
+mod gateway_response_scope;
 #[path = "all/integration_response.rs"]
 mod integration_response;
 #[path = "all/method_integration.rs"]
