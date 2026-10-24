@@ -201,9 +201,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries only request metadata; the workflow this call updates is the one
-        // its `WorkflowArn` names, and the ARN the response reports is the stored one.
-        let _ = ctx;
+        // The endpoint this request was signed for: a regional endpoint resolves only
+        // the workflows created through it. The ARN the response reports is the stored
+        // one, never the request's.
+        let region = crate::state::request_region(ctx.parts());
 
         // A member value that fails the constraint its model declares is refused
         // first, with the modelled `ValidationException` — `Message`,
@@ -223,16 +224,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.reap_deleted_workflows(now);
 
         // A reference that resolves to nothing is a lookup miss, and the entity THIS
-        // operation resolves is the workflow itself.
+        // operation resolves is the workflow itself. A workflow of ANOTHER region is
+        // not one this endpoint holds, so its ARN resolves to nothing here either.
         let (arn, version_count, encryption_configuration) = {
-            let workflow = store.workflows.get(&input.workflow_arn).ok_or_else(|| {
-                crate::state::lookup_miss(UpdateWorkflowErrorModeled::ResourceNotFoundException(
-                    crate::state::unresolved(
-                        crate::state::UnresolvedEntity::Workflow,
-                        &input.workflow_arn,
-                    ),
-                ))
-            })?;
+            let workflow = store
+                .workflow_in(&region, &input.workflow_arn)
+                .ok_or_else(|| {
+                    crate::state::lookup_miss(
+                        UpdateWorkflowErrorModeled::ResourceNotFoundException(
+                            crate::state::unresolved(
+                                crate::state::UnresolvedEntity::Workflow,
+                                &input.workflow_arn,
+                            ),
+                        ),
+                    )
+                })?;
             // A workflow whose teardown has started is going away with every version
             // it holds, so a new version cannot be appended to it. That is what the
             // modelled `ConflictException` is for: "the resource is in a state that
@@ -291,7 +297,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             trigger_mode: input.trigger_mode.clone(),
         };
 
-        let workflow = store.workflows.get_mut(&arn).ok_or_else(unavailable)?;
+        let workflow = store.workflow_in_mut(&region, &arn).ok_or_else(unavailable)?;
         // "Creates a new version with the updated configuration and disables scheduling on
         // all previous versions to ensure only one version is actively scheduled at a
         // time": the appended version becomes the workflow's only latest one, and every
@@ -312,7 +318,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Answer from the stored record, so the response can only ever be what was
         // persisted.
-        let stored = store.workflows.get(&arn).ok_or_else(unavailable)?;
+        let stored = store.workflow_in(&region, &arn).ok_or_else(unavailable)?;
         Ok(UpdateWorkflowOutput {
             workflow_arn: stored.arn.clone(),
             modified_at: Some(crate::state::timestamp(stored.modified_at)),

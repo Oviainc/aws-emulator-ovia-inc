@@ -272,9 +272,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.reap_deleted_workflows(now);
 
         // A repeated @idempotencyToken replays its first answer rather than minting a
-        // second workflow; the same token with a different request is a conflict.
+        // second workflow; the same token with a different request is a conflict. The
+        // token is remembered per region, because a token presented at one regional
+        // endpoint says nothing about what another endpoint created.
         if let Some(token) = input.client_token.as_deref() {
-            if let Some(recorded) = store.idempotency.get(&token_key(token)).cloned() {
+            if let Some(recorded) = store.idempotency.get(&token_key(&region, token)).cloned() {
                 if recorded.request_fingerprint() != fingerprint {
                     return Err(CreateWorkflowErrorModeled::ConflictException(
                         ConflictException {
@@ -289,22 +291,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into());
                 }
                 let workflow = store
-                    .workflows
-                    .get(recorded.workflow_arn())
+                    .workflow_in(&region, recorded.workflow_arn())
                     .ok_or_else(unavailable)?;
                 return Ok(response_for(workflow));
             }
         }
 
         // "You must use unique workflow names within your account" — a second create
-        // under a name already in the store is a conflict, not a second workflow. A
-        // workflow whose teardown has not finished still holds its name, so the
-        // conflict says which state the holder is in.
-        if let Some(existing) = store.workflow_names.get(&input.name) {
+        // under a name already in the store is a conflict, not a second workflow. The
+        // name is held only at the endpoint the holder was created through, so the same
+        // name in another region is a second, independent workflow. A workflow whose
+        // teardown has not finished still holds its name, so the conflict says which
+        // state the holder is in.
+        if let Some(existing) = store.workflow_arn_named(&region, &input.name) {
             let existing = existing.clone();
             let deleting = store
-                .workflows
-                .get(&existing)
+                .workflow_in(&region, &existing)
                 .is_some_and(crate::state::Workflow::is_deleting);
             let message = if deleting {
                 format!(
@@ -365,6 +367,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let workflow = crate::state::Workflow {
             arn: arn.clone(),
+            // The endpoint this workflow was created through, so every later lookup
+            // and listing resolves it only there.
+            region: region.clone(),
             name: input.name.clone(),
             // READY is documented as "workflow is ready to run": a created workflow is
             // returned ready, so it owes no later transition.
@@ -392,11 +397,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             deletion_due_at: None,
         };
 
-        store.workflow_names.insert(input.name.clone(), arn.clone());
+        store.claim_workflow_name(&region, &input.name, &arn);
         store.workflows.insert(arn.clone(), workflow);
         if let Some(token) = input.client_token.as_deref() {
             store.idempotency.record(
-                token_key(token),
+                token_key(&region, token),
                 crate::state::IdempotentResult::CreateWorkflow {
                     request_fingerprint: fingerprint,
                     workflow_arn: arn.clone(),
@@ -406,15 +411,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Read the response back out of the stored record, so the answer can only ever
         // be what was persisted.
-        let stored = store.workflows.get(&arn).ok_or_else(unavailable)?;
+        let stored = store.workflow_in(&region, &arn).ok_or_else(unavailable)?;
         Ok(response_for(stored))
     }
 }
 
-/// The idempotency-ledger key for a `ClientToken` of THIS operation, so one token
-/// used on two different operations records two entries.
-fn token_key(client_token: &str) -> String {
-    format!("CreateWorkflow:{client_token}")
+/// The idempotency-ledger key for a `ClientToken` of THIS operation at THIS region's
+/// endpoint, so one token used on two different operations — or at two different
+/// regional endpoints — records two entries.
+fn token_key(region: &str, client_token: &str) -> String {
+    format!("CreateWorkflow:{region}:{client_token}")
 }
 
 /// Check every `CreateWorkflow` input member whose modelled constraint this

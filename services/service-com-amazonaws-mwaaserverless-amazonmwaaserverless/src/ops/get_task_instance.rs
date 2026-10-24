@@ -211,9 +211,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries only request metadata; the task instance is identified by
-        // its input.
-        let _ = ctx;
+        // The endpoint this request was signed for: a regional endpoint resolves only
+        // the workflows created through it.
+        let region = crate::state::request_region(ctx.parts());
 
         // Every member whose declared constraint this operation's input struct
         // hands over (`skip_validation`) is checked here, so a bad value is
@@ -240,8 +240,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // span is gone with it.
         store.reap_deleted_workflows(SystemTime::now());
 
-        // The TASK INSTANCE is what this operation resolves, so an absent workflow,
-        // an absent run and a run holding no such instance are one failure to the
+        // The TASK INSTANCE is what this operation resolves, so an absent workflow
+        // (including one of ANOTHER region, which this endpoint does not serve), an
+        // absent run and a run holding no such instance are one failure to the
         // caller — the same convention `GetWorkflowRun` follows for its run.
         let unresolved_task_instance = || {
             crate::state::lookup_miss(GetTaskInstanceErrorModeled::ResourceNotFoundException(
@@ -252,8 +253,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         };
         let run = store
-            .workflows
-            .get(&input.workflow_arn)
+            .workflow_in(&region, &input.workflow_arn)
             .and_then(|workflow| workflow.runs.get(&input.run_id))
             .ok_or_else(unresolved_task_instance)?;
         let task = run
