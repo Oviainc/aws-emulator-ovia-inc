@@ -98,7 +98,7 @@ fn error_code(payload: &Value) -> String {
 }
 
 /// Assert that one request is refused with `expected_status` and `expected_code`.
-async fn refused(
+pub(crate) async fn refused(
     router: &MultiServiceRouter,
     operation: &str,
     body: &Value,

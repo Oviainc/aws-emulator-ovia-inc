@@ -32,7 +32,11 @@
 //! keyed by its own ARN: `GetHypervisor` resolves it out of that map and reports the
 //! record, `ListHypervisors` pages over that map in ARN order, and the state either one
 //! reports is derived from the record and the clock
-//! ([`StoredHypervisor::state_as_of`]) so a read never moves it.
+//! ([`StoredHypervisor::state_as_of`]) so a read never moves it. `UpdateHypervisor` is
+//! what changes its metadata in place
+//! ([`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::update_hypervisor`]),
+//! applying only the members the request carried, so every later read reports the record
+//! the last write left and no second copy of a hypervisor exists to drift from it.
 //!
 //! The third resource this store owns is the **virtual machine**
 //! ([`StoredVirtualMachine`]), keyed by its own ARN. A virtual machine is not minted by
@@ -758,6 +762,32 @@ pub struct HypervisorConfiguration {
     pub tags: BTreeMap<String, String>,
 }
 
+/// What an update asks a stored hypervisor to BECOME: the members `UpdateHypervisor`
+/// takes that a later read reports
+/// (`smithy_query(query="operation",operation="UpdateHypervisor")`).
+///
+/// Every member is optional on the wire and optional here, and `None` means "the request
+/// did not carry it": an update applies only what it states and leaves the rest of the
+/// record exactly as the previous write left it.
+///
+/// Its `Username` / `Password` are `@sensitive` credentials no response member carries,
+/// so — as in [`HypervisorConfiguration`] — they are deliberately absent here and never
+/// persisted.
+#[derive(Debug, Clone, Default)]
+pub struct HypervisorUpdate {
+    /// `Name`, or `None` to leave the stored name alone.
+    pub name: Option<String>,
+    /// `Host`, or `None` to leave the stored host alone.
+    pub host: Option<String>,
+    /// `LogGroupArn`, or `None` to leave the stored log group alone.
+    ///
+    /// The member's pattern is `^$|^arn:…:log-group:…:\*$`, so the EMPTY string is a
+    /// value the model accepts and the only way a caller can state "no log group": it
+    /// detaches whatever the record carried, which is why an empty value is not the same
+    /// as an absent one.
+    pub log_group_arn: Option<String>,
+}
+
 /// One page of a list operation: the records it returns and the token that resumes
 /// after them, present only while more records remain.
 ///
@@ -1109,6 +1139,64 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
         self.hypervisors
             .values()
             .find(|hypervisor| hypervisor.host == host)
+    }
+
+    /// Apply `update` to the hypervisor stored under `arn`, and hand back the record as it
+    /// is now STORED — read out of the map after the write, so what a caller gets is what
+    /// the store holds.
+    ///
+    /// Only the members `update` STATES are written: a member the request did not carry
+    /// leaves the stored one as it was, rather than clearing it, exactly as
+    /// [`Self::set_maintenance_start_time`] replaces only the resource its request states.
+    /// Nothing else on the record moves — an update is not an import and not a sync, so it
+    /// neither re-dates the record nor touches its state, tags, mappings or sync progress.
+    ///
+    /// Refused, with NOTHING written, when `arn` names no hypervisor this store holds
+    /// ([`HypervisorUpdateRefusal::NoSuchHypervisor`]) or when the new host is the host of
+    /// a DIFFERENT stored hypervisor ([`HypervisorUpdateRefusal::HostAlreadyImported`]): a
+    /// record stands for the machine reachable at its host, so the one-host-one-record
+    /// invariant [`Self::hypervisor_by_host`] rests on holds for every writer, not just
+    /// for an import. Setting a hypervisor's host to the host it already has is the same
+    /// record again and succeeds.
+    pub fn update_hypervisor(
+        &mut self,
+        arn: &str,
+        update: HypervisorUpdate,
+    ) -> Result<StoredHypervisor, HypervisorUpdateRefusal> {
+        let Some(stored) = self.hypervisors.get(arn) else {
+            return Err(HypervisorUpdateRefusal::NoSuchHypervisor);
+        };
+        // The key the store holds, so the refusal below compares records and not the
+        // string the request spelled.
+        let stored_arn = stored.arn.clone();
+        if let Some(host) = &update.host {
+            if let Some(other) = self.hypervisor_by_host(host) {
+                if other.arn != stored_arn {
+                    return Err(HypervisorUpdateRefusal::HostAlreadyImported(
+                        other.arn.clone(),
+                    ));
+                }
+            }
+        }
+        // Present: the same `&mut self` borrow resolved it above, so nothing could have
+        // removed it in between.
+        let Some(record) = self.hypervisors.get_mut(arn) else {
+            return Err(HypervisorUpdateRefusal::NoSuchHypervisor);
+        };
+        if let Some(name) = update.name {
+            record.name = name;
+        }
+        if let Some(host) = update.host {
+            record.host = host;
+        }
+        if let Some(log_group_arn) = update.log_group_arn {
+            // The empty string the member's pattern accepts means "no log group", so it is
+            // stored as the absent value a read reports nothing for.
+            record.log_group_arn = (!log_group_arn.is_empty()).then_some(log_group_arn);
+        }
+        // The record the store now holds, read back off the same borrow that wrote it:
+        // nothing between the write and here could have removed it.
+        Ok(record.clone())
     }
 
     /// Whether property mappings are SET for `arn`.
@@ -1544,6 +1632,22 @@ pub enum AssociationRefusal {
     NoSuchServer,
     /// The gateway is already associated with a DIFFERENT server, whose ARN this carries.
     AlreadyAssociated(String),
+}
+
+/// Why a hypervisor could not be updated.
+///
+/// Returned by
+/// [`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::update_hypervisor`], which
+/// writes nothing on either arm. As with [`AssociationRefusal`], the store names the
+/// CONDITION and the handler maps it to the modelled error its own operation declares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HypervisorUpdateRefusal {
+    /// The `HypervisorArn` names no hypervisor this store holds — never imported, or
+    /// already deleted.
+    NoSuchHypervisor,
+    /// The requested host is already the host of a DIFFERENT stored hypervisor, whose ARN
+    /// this carries.
+    HostAlreadyImported(String),
 }
 
 /// How this service refuses a well-formed resource ARN that names no resource it holds.

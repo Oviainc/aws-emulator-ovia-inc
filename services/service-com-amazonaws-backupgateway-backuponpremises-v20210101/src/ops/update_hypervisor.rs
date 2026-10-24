@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateHypervisor
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateHypervisor`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateHypervisor::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates the metadata of the hypervisor an ARN names, in place in [`crate::state`],
+//! applying only the members the request carries. This is the ONLY file to touch for
+//! this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -98,12 +92,16 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-backupgateway-backuponp
 // here — hence the `UpdateHypervisorError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.backupgateway#UpdateHypervisor")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.backupgateway#UpdateHypervisor",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum UpdateHypervisorErrorModeled {
     AccessDeniedException(AccessDeniedException),
     ConflictException(ConflictException),
     ResourceNotFoundException(ResourceNotFoundException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -157,18 +155,80 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateHypervisor` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateHypervisorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Request metadata only; the store is reached through `self.engine`.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateHypervisorErrorModeled::InternalServerException(InternalServerException {
+                error_code: None,
+                message: Some("Backup gateway state is unavailable on this engine.".to_string()),
+            })
+        })?;
+
+        // Every modelled constraint on this input — `HypervisorArn`'s length and pattern,
+        // `Host`'s and `Name`'s, the `@sensitive` `Username` / `Password`, and
+        // `LogGroupArn`'s (which accepts the empty string) — is refused by the boundary
+        // validator before `handle` runs, so reaching here means the request satisfies
+        // every one of them. What remains are facts of the STORE.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateHypervisor"))
+        // `Username` and `Password` are `@sensitive` credentials no response member
+        // carries, so they are not persisted — exactly as an import does not persist them:
+        // a credential a store does not hold cannot leak out of one.
+        let update = crate::state::HypervisorUpdate {
+            name: input.name.clone(),
+            host: input.host.clone(),
+            log_group_arn: input.log_group_arn.clone(),
+        };
+
+        // One guard spans the host lookup and the write, so two concurrent updates onto
+        // one host cannot both pass a check only one of them should.
+        let updated = state.lock().update_hypervisor(&input.hypervisor_arn, update);
+
+        let updated = match updated {
+            Ok(updated) => updated,
+            Err(crate::state::HypervisorUpdateRefusal::NoSuchHypervisor) => {
+                // This operation resolves exactly one resource type, so an ARN it cannot
+                // resolve is a missing HYPERVISOR whatever else the ARN spells — and this
+                // service answers that with the modelled `ResourceNotFoundException` at
+                // HTTP 400 carrying `ErrorCode` `HypervisorNotFound`
+                // (`crate::state::MissingResource`), the one place the status and the code
+                // are chosen together.
+                let missing = crate::state::MissingResource::Hypervisor;
+                let error = UpdateHypervisorErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        error_code: missing.error_code().map(str::to_string),
+                        message: Some(missing.message(&input.hypervisor_arn)),
+                    },
+                );
+                return Err(match missing.status_override() {
+                    Some(status) => {
+                        crate::scaffolded::Scaffolded::modeled_with_status(error, status)
+                    }
+                    None => error.into(),
+                });
+            }
+            Err(crate::state::HypervisorUpdateRefusal::HostAlreadyImported(_)) => {
+                // A hypervisor record stands for the machine reachable at its host, so no
+                // write may give two records one host: moving a hypervisor onto a host
+                // another one already holds is the same modelled `ConflictException`
+                // (HTTP 409) an import of that host takes, refused BEFORE anything is
+                // written.
+                return Err(UpdateHypervisorErrorModeled::ConflictException(
+                    ConflictException {
+                        error_code: crate::state::HYPERVISOR_ALREADY_EXISTS.to_string(),
+                        message: Some(
+                            crate::state::HYPERVISOR_ALREADY_EXISTS_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+        };
+
+        // The ARN comes off the record the store now holds, so a success says which record
+        // was really written rather than echoing the request.
+        Ok(UpdateHypervisorOutput {
+            hypervisor_arn: Some(updated.arn),
+        })
     }
 }

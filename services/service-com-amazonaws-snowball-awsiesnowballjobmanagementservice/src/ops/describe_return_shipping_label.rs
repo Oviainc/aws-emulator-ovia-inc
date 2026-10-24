@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeReturnShippingLabel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeReturnShippingLabel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeReturnShippingLabel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the current return shipping label of a job this service persisted: the status
+//! of the task that creates it and, once that task has finished, the label's download URI
+//! and the instant it expires. The job must carry a device that can still be returned, and
+//! a job no label has been created for has none to report.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +146,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeReturnShippingLabel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeReturnShippingLabelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeReturnShippingLabel"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STATE_UNAVAILABLE,
+            ));
+        };
+
+        // The label file's URI addresses a bucket in the Region the request was signed
+        // for: the credential scope is the only Region a request carries.
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // Nothing here writes: the status a caller reads is derived from the instants the
+        // creating call recorded, so two callers asking at the same instant are told the
+        // same thing and asking moves nothing.
+        let store = state.lock();
+
+        let Some(job) = store.jobs.get(&input.job_id) else {
+            return Err(
+                DescribeReturnShippingLabelErrorModeled::InvalidResourceException(
+                    InvalidResourceException {
+                        message: Some(format!(
+                            "The job ID {} can't be found. Check the information you provided in \
+                             your last request, and try again.",
+                            input.job_id
+                        )),
+                        resource_type: Some("job".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The main job of an export order "aren't associated with any Snowballs"
+        // (`JobListEntry$IsMaster`), so it has no device to return and no label of its own.
+        if job.is_master() {
+            return Err(
+                DescribeReturnShippingLabelErrorModeled::InvalidResourceException(
+                    InvalidResourceException {
+                        message: Some(format!(
+                            "The job {} is the main job of an export order and is associated with \
+                             no Snowball, so it has no return shipping label. Describe the label \
+                             of one of its job parts instead.",
+                            input.job_id
+                        )),
+                        resource_type: Some("job".to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The same window `CreateReturnShippingLabel` creates a label in: a job whose
+        // device will never ship, or whose device is already back at Amazon Web Services,
+        // has no return shipment to report on.
+        if !job.job_state.has_returnable_device() {
+            return Err(
+                DescribeReturnShippingLabelErrorModeled::InvalidJobStateException(
+                    InvalidJobStateException {
+                        message: Some(format!(
+                            "The job {} is in state {} and has no device to return, so it has no \
+                             return shipping label.",
+                            input.job_id,
+                            job.job_state.as_wire()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let Some(label) = store.return_shipping_label(&input.job_id) else {
+            return Err(
+                DescribeReturnShippingLabelErrorModeled::InvalidResourceException(
+                    InvalidResourceException {
+                        message: Some(format!(
+                            "No return shipping label has been created for job {}. Call \
+                             CreateReturnShippingLabel first.",
+                            input.job_id
+                        )),
+                        resource_type: Some("return shipping label".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The URI and the expiry describe a label that EXISTS: while the creating task is
+        // still running there is no file to download and no window to report, so both are
+        // absent rather than empty or guessed.
+        let status = label.status(now);
+        let created = status == crate::state::ShippingLabelStatus::Succeeded;
+
+        Ok(DescribeReturnShippingLabelOutput {
+            status: Some(status.as_wire().to_string()),
+            expiration_date: created
+                .then(|| ::aws_smithy_types::DateTime::from(label.expires_at)),
+            return_shipping_label_uri: created.then(|| label.label_uri(&region)),
+        })
     }
 }

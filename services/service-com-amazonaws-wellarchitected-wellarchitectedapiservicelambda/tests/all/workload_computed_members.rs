@@ -24,6 +24,21 @@ const RISKS: [&str; 5] = ["UNANSWERED", "HIGH", "MEDIUM", "NONE", "NOT_APPLICABL
 /// out of the code under test.
 const FRAMEWORK_LENS_QUESTIONS: i64 = 11 + 11 + 13 + 5 + 11 + 6;
 
+/// The framework lens's published per-pillar question numbering, by `PillarId`.
+const FRAMEWORK_PILLAR_QUESTIONS: [(&str, usize); 6] = [
+    ("operationalExcellence", 11),
+    ("security", 11),
+    ("reliability", 13),
+    ("performance", 5),
+    ("costOptimization", 11),
+    ("sustainability", 6),
+];
+
+/// A lens alias AWS publishes that this emulator's AWS-official lens catalog carries no
+/// content for, so it asks no questions here and adds nothing to a roll-up. The catalog
+/// itself — every lens it DOES carry — is pinned by `super::official_lens_catalog`.
+const UNCARRIED_LENS: &str = "mergersandacquisitions";
+
 /// The pillar order a workload is reviewed in when it names none, by `PillarId`
 /// (`smithy_query(query="shape", shape="PillarId")`).
 fn framework_pillar_order() -> Value {
@@ -82,12 +97,12 @@ async fn risk_roll_up_counts_the_questions_of_the_attached_lenses() {
             ]),
             FRAMEWORK_LENS_QUESTIONS,
         ),
-        // A lens whose definition this emulator does not ship asks no questions here,
-        // so it adds nothing to the roll-up.
-        ("unshipped-lens-only", json!(["serverless"]), 0),
+        // A lens whose content this emulator's catalog does not carry asks no questions
+        // here, so it adds nothing to the roll-up.
+        ("uncarried-lens-only", json!([UNCARRIED_LENS]), 0),
         (
-            "framework-lens-and-unshipped-lenses",
-            json!(["wellarchitected", "serverless", "softwareasaservice"]),
+            "framework-lens-and-uncarried-lens",
+            json!(["wellarchitected", UNCARRIED_LENS]),
             FRAMEWORK_LENS_QUESTIONS,
         ),
     ];
@@ -136,14 +151,12 @@ async fn risk_roll_up_counts_the_questions_of_the_attached_lenses() {
 
 /// The catalog the roll-up and the default pillar order are derived from: the AWS
 /// Well-Architected Framework lens's pillars. Checked here on entries the issue did not
-/// cite — the sustainability pillar's own count, and a lens alias the emulator ships no
-/// definition for.
+/// cite — the sustainability pillar's own count, and a lens alias the emulator's catalog
+/// carries no content for.
 #[tokio::test]
 async fn the_framework_lens_catalog_matches_its_published_question_numbering() {
-    let total: usize = state::FRAMEWORK_LENS_PILLARS
-        .iter()
-        .map(|(_, _, count)| *count)
-        .sum();
+    let pillars = state::lens_pillars("wellarchitected");
+    let total: usize = pillars.iter().map(|(_, _, count)| *count).sum();
     assert_eq!(
         i64::try_from(total).unwrap_or(-1),
         FRAMEWORK_LENS_QUESTIONS,
@@ -155,15 +168,16 @@ async fn the_framework_lens_catalog_matches_its_published_question_numbering() {
         "the default pillar order must be the catalog's pillar order, got {:?}",
         state::default_pillar_priorities()
     );
-    assert_eq!(
-        state::FRAMEWORK_LENS_PILLARS
-            .iter()
-            .find(|(pillar, _, _)| *pillar == "sustainability")
-            .map(|(_, _, count)| *count),
-        Some(6),
-        "the sustainability pillar asks SUS 1-6, catalog says {:?}",
-        state::FRAMEWORK_LENS_PILLARS
-    );
+    for (pillar, expected) in FRAMEWORK_PILLAR_QUESTIONS {
+        assert_eq!(
+            pillars
+                .iter()
+                .find(|(pillar_id, _, _)| *pillar_id == pillar)
+                .map(|(_, _, count)| *count),
+            Some(expected),
+            "the {pillar} pillar asks {expected} questions, catalog says {pillars:?}"
+        );
+    }
 
     for (case, lens, expected) in [
         ("alias", "wellarchitected", total),
@@ -177,7 +191,7 @@ async fn the_framework_lens_catalog_matches_its_published_question_numbering() {
             "arn:aws:wellarchitected:us-east-1::lens/wellarchitected/2023-10-03",
             total,
         ),
-        ("unshipped-alias", "serverless", 0),
+        ("uncarried-alias", UNCARRIED_LENS, 0),
         (
             "unshipped-custom-arn",
             "arn:aws:wellarchitected:us-west-2:000000000000:lens/0123456789abcdef0123456789abcdef",

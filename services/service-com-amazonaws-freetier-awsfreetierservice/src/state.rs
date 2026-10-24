@@ -213,15 +213,34 @@ impl AccountPlan {
         }
     }
 
-    /// Move the plan onto `plan_type`. The plan becomes `ACTIVE` on the type it
-    /// now holds, and a paid plan drops the expiration date a free plan carries
-    /// because it does not expire.
-    pub fn upgrade_to(&mut self, plan_type: &str) {
+    /// Whether the account's free-plan window is still open — the plan it holds
+    /// is the free plan and that plan's expiration instant has not passed yet.
+    ///
+    /// The free plan is a one-off, time-boxed window
+    /// ("the timestamp for when the current account plan expires",
+    /// `GetAccountPlanStateResponse$accountPlanExpirationDate`), so an account
+    /// whose window is closed — because it left the free plan, or because the
+    /// window elapsed — cannot be moved onto it again. Read the status after
+    /// [`Self::settle`], which is what makes an elapsed window show here.
+    pub fn free_window_open(&self) -> bool {
+        self.plan_type == PLAN_TYPE_FREE && self.plan_status != PLAN_STATUS_EXPIRED
+    }
+
+    /// Move the plan onto `plan_type` as of `now`. The plan becomes `ACTIVE` on
+    /// the type it now holds, and a paid plan drops the expiration date a free
+    /// plan carries because it does not expire.
+    ///
+    /// The status this leaves stored is the status the record yields at `now`
+    /// ([`Self::settle`]), so what the writing operation reports is what the
+    /// next read of the same record reports: a stored plan whose expiry is
+    /// already past is never left claiming to be `ACTIVE`.
+    pub fn upgrade_to(&mut self, plan_type: &str, now: DateTime) {
         self.plan_type = plan_type.to_string();
         self.plan_status = PLAN_STATUS_ACTIVE.to_string();
         if plan_type == PLAN_TYPE_PAID {
             self.expiration_date = None;
         }
+        self.settle(now);
     }
 }
 

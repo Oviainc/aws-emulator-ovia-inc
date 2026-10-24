@@ -4,9 +4,14 @@
 //! auto-adjust figures it derives from the cost it tracks (never taken from a request),
 //! and the `BudgetLimit` a utilization or coverage budget defaults to.
 //!
-//! Every test states a RULE and asserts it over a table; the requests the issue recorded
-//! are three of the rows. The harness (`router`, `call`, `account`, `carries`, …) is the
-//! one `tests/all/budget_lifecycle.rs` already builds.
+//! Both write paths are covered: `CreateBudget`, an `UpdateBudget` that resends the
+//! budget unchanged, and an `UpdateBudget` that REWRITES the budget's caller-owned parts
+//! while supplying the service-owned ones — "you can change every part of a budget except
+//! for the `budgetName` and the `calculatedSpend`" (`UpdateBudget`).
+//!
+//! Every test states a RULE and asserts it over a table; the requests the issues recorded
+//! are rows of those tables. The harness (`router`, `call`, `account`, `carries`, …) is
+//! the one `tests/all/budget_lifecycle.rs` already builds.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -19,7 +24,7 @@ use service_com_amazonaws_budgets_awsbudgetservicegateway::state::{
     PERCENTAGE_LIMIT_AMOUNT, PERCENTAGE_LIMIT_BUDGET_TYPES, PERCENTAGE_LIMIT_UNIT,
 };
 
-use super::budget_lifecycle::{account, call, carries, is_error, router};
+use super::budget_lifecycle::{account, call, carries, is_error, router, same};
 
 /// The `BudgetType` members `Budget$BudgetLimit` requires a limit of ("`BudgetLimit` is
 /// required for cost or usage budgets"), which is therefore the complement of the
@@ -32,8 +37,9 @@ use super::budget_lifecycle::{account, call, carries, is_error, router};
 const LIMIT_REQUIRED_BUDGET_TYPES: [&str; 2] = ["COST", "USAGE"];
 
 /// Drive one write operation (`CreateBudget` with `Budget`, `UpdateBudget` with
-/// `NewBudget`) for `account_id` and return the `Budget` a following `DescribeBudget`
-/// reports. The write must be accepted.
+/// `NewBudget`) for `account_id` and return the `Budget` the read paths report. The
+/// write must be accepted, and BOTH read paths must report the same budget — the issue
+/// behind this suite is observable through `DescribeBudget` and `DescribeBudgets` alike.
 async fn write_and_read(
     router: &MultiServiceRouter,
     case: &str,
@@ -64,7 +70,26 @@ async fn write_and_read(
         status, 200,
         "case {case:?}: expected DescribeBudget to answer 200, got {status} {body}"
     );
-    body["Budget"].clone()
+    let read = body["Budget"].clone();
+
+    let (status, body) = call(router, "DescribeBudgets", &json!({"AccountId": account_id})).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected DescribeBudgets to answer 200, got {status} {body}"
+    );
+    let listed = body["Budgets"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|listed| listed["BudgetName"] == json!(name))
+        .unwrap_or_else(|| panic!("case {case:?}: {name} is not listed after {operation}: {body}"));
+    assert!(
+        same(&read, &listed),
+        "case {case:?}: the two read paths must report the same budget after {operation}, \
+         got {read} from DescribeBudget and {listed} from DescribeBudgets"
+    );
+    read
 }
 
 /// The value at `path` (a trail of member names) in `budget`, or `Value::Null`.
@@ -283,6 +308,302 @@ async fn an_update_discards_them_too() {
             "case {:?}: expected the update to keep the caller's {}, got {updated}",
             row.case,
             row.kept
+        );
+    }
+}
+
+/// One row of the MODIFYING-update table: a budget created carrying none of the
+/// service-derived members, and the `NewBudget` an `UpdateBudget` then sends — which
+/// changes caller-owned parts of the budget AND supplies the service-derived members.
+struct Modified {
+    case: &'static str,
+    /// The `Budget` the row is created with.
+    created: Value,
+    /// The `NewBudget` the update sends: the same `BudgetName`, changed caller-owned
+    /// parts, plus the service-derived members a caller cannot set.
+    new_budget: Value,
+    /// The caller-owned members the update must land, none of which the created budget
+    /// already carried.
+    changed: Value,
+    /// The member paths whose caller-sent values the update must discard.
+    dropped: Vec<Vec<&'static str>>,
+    /// Caller-owned member paths the update's `NewBudget` omits, which must therefore be
+    /// gone from the read: dropping the service-derived members does not turn the update
+    /// into a merge of the old budget with the new one.
+    absent_after: Vec<Vec<&'static str>>,
+}
+
+/// The modifying-update table. Rows differ along WHAT the update changes (the limit's
+/// amount, its unit, the granularity, the budget type, the filters, the kind of limit)
+/// and along WHICH service-derived member the same request carries, so the rule is
+/// asserted over updates that really rewrite the budget rather than resend it.
+fn modified_rows() -> Vec<Modified> {
+    vec![
+        Modified {
+            // The request the issue recorded (step 2), with the limit changed too so the
+            // update is a real modification and not a resend.
+            case: "cost budget raising its limit while supplying an actual spend",
+            created: json!({
+                "BudgetName": "spend-demo",
+                "TimeUnit": "MONTHLY",
+                "BudgetType": "COST",
+                "BudgetLimit": {"Amount": "100", "Unit": "USD"}
+            }),
+            new_budget: json!({
+                "BudgetName": "spend-demo",
+                "TimeUnit": "MONTHLY",
+                "BudgetType": "COST",
+                "BudgetLimit": {"Amount": "250", "Unit": "USD"},
+                "CalculatedSpend": {"ActualSpend": {"Amount": "999999", "Unit": "USD"}}
+            }),
+            changed: json!({"BudgetLimit": {"Amount": "250", "Unit": "USD"}}),
+            dropped: vec![vec!["CalculatedSpend"]],
+            absent_after: vec![],
+        },
+        Modified {
+            case: "usage budget changing granularity and limit, supplying both spends",
+            created: json!({
+                "BudgetName": "usage-demo",
+                "TimeUnit": "DAILY",
+                "BudgetType": "USAGE",
+                "BudgetLimit": {"Amount": "3.5", "Unit": "GB"}
+            }),
+            new_budget: json!({
+                "BudgetName": "usage-demo",
+                "TimeUnit": "MONTHLY",
+                "BudgetType": "USAGE",
+                "BudgetLimit": {"Amount": "7", "Unit": "GB"},
+                "CalculatedSpend": {
+                    "ActualSpend": {"Amount": "4", "Unit": "GB"},
+                    "ForecastedSpend": {"Amount": "6.5", "Unit": "GB"}
+                }
+            }),
+            changed: json!({
+                "TimeUnit": "MONTHLY",
+                "BudgetLimit": {"Amount": "7", "Unit": "GB"}
+            }),
+            dropped: vec![vec!["CalculatedSpend"]],
+            absent_after: vec![],
+        },
+        Modified {
+            // A fixed limit replaced by a planned one: the read derives the `BudgetLimit`
+            // in force from `PlannedBudgetLimits`, so the caller's own fixed limit is gone
+            // and the derived one is reported instead.
+            case: "cost budget swapping its fixed limit for a planned one, with a spend",
+            created: json!({
+                "BudgetName": "planned-demo",
+                "TimeUnit": "MONTHLY",
+                "BudgetType": "COST",
+                "BudgetLimit": {"Amount": "100", "Unit": "USD"}
+            }),
+            new_budget: json!({
+                "BudgetName": "planned-demo",
+                "TimeUnit": "MONTHLY",
+                "BudgetType": "COST",
+                "PlannedBudgetLimits": {"1704067200": {"Amount": "10", "Unit": "USD"}},
+                "CalculatedSpend": {"ActualSpend": {"Amount": "5", "Unit": "USD"}}
+            }),
+            changed: json!({
+                "PlannedBudgetLimits": {"1704067200": {"Amount": "10", "Unit": "USD"}},
+                "BudgetLimit": {"Amount": "10", "Unit": "USD"}
+            }),
+            dropped: vec![vec!["CalculatedSpend"]],
+            absent_after: vec![],
+        },
+        Modified {
+            case: "cost budget becoming auto-adjusting, supplying every derived member",
+            created: json!({
+                "BudgetName": "auto-adjust-demo",
+                "TimeUnit": "MONTHLY",
+                "BudgetType": "COST",
+                "BudgetLimit": {"Amount": "100", "Unit": "USD"}
+            }),
+            new_budget: json!({
+                "BudgetName": "auto-adjust-demo",
+                "TimeUnit": "MONTHLY",
+                "BudgetType": "COST",
+                "AutoAdjustData": {
+                    "AutoAdjustType": "HISTORICAL",
+                    "HistoricalOptions": {
+                        "BudgetAdjustmentPeriod": 6,
+                        "LookBackAvailablePeriods": 6
+                    },
+                    "LastAutoAdjustTime": 1_704_067_200
+                },
+                "CalculatedSpend": {"ActualSpend": {"Amount": "12", "Unit": "USD"}}
+            }),
+            changed: json!({
+                "AutoAdjustData": {
+                    "AutoAdjustType": "HISTORICAL",
+                    "HistoricalOptions": {"BudgetAdjustmentPeriod": 6}
+                }
+            }),
+            dropped: vec![
+                vec!["CalculatedSpend"],
+                vec!["AutoAdjustData", "LastAutoAdjustTime"],
+                vec!["AutoAdjustData", "HistoricalOptions", "LookBackAvailablePeriods"],
+            ],
+            // The fixed limit the created budget carried is not merged into the
+            // auto-adjusting budget the update describes.
+            absent_after: vec![vec!["BudgetLimit"]],
+        },
+        Modified {
+            case: "auto-adjusting budget switching from historical to forecast adjustment",
+            created: json!({
+                "BudgetName": "forecast-demo",
+                "TimeUnit": "DAILY",
+                "BudgetType": "USAGE",
+                "AutoAdjustData": {
+                    "AutoAdjustType": "HISTORICAL",
+                    "HistoricalOptions": {"BudgetAdjustmentPeriod": 30}
+                }
+            }),
+            new_budget: json!({
+                "BudgetName": "forecast-demo",
+                "TimeUnit": "DAILY",
+                "BudgetType": "USAGE",
+                "AutoAdjustData": {
+                    "AutoAdjustType": "FORECAST",
+                    "LastAutoAdjustTime": 1_767_225_600
+                }
+            }),
+            changed: json!({"AutoAdjustData": {"AutoAdjustType": "FORECAST"}}),
+            dropped: vec![vec!["AutoAdjustData", "LastAutoAdjustTime"]],
+            // `HistoricalOptions` are "only valid for a HISTORICAL AutoAdjustType", so a
+            // forecast-adjusting budget reports none.
+            absent_after: vec![vec!["AutoAdjustData", "HistoricalOptions"]],
+        },
+        Modified {
+            case: "coverage budget changing its type and granularity, with a spend in percent",
+            created: json!({
+                "BudgetName": "coverage-demo",
+                "TimeUnit": "ANNUALLY",
+                "BudgetType": "RI_COVERAGE"
+            }),
+            new_budget: json!({
+                "BudgetName": "coverage-demo",
+                "TimeUnit": "MONTHLY",
+                "BudgetType": "SAVINGS_PLANS_COVERAGE",
+                "CalculatedSpend": {
+                    "ActualSpend": {"Amount": "80", "Unit": "PERCENTAGE"},
+                    "ForecastedSpend": {"Amount": "90", "Unit": "PERCENTAGE"}
+                }
+            }),
+            changed: json!({
+                "TimeUnit": "MONTHLY",
+                "BudgetType": "SAVINGS_PLANS_COVERAGE"
+            }),
+            dropped: vec![vec!["CalculatedSpend"]],
+            absent_after: vec![],
+        },
+        Modified {
+            case: "cost budget dropping its cost filters and changing its limit, with a spend",
+            created: json!({
+                "BudgetName": "filters-demo",
+                "TimeUnit": "QUARTERLY",
+                "BudgetType": "COST",
+                "BudgetLimit": {"Amount": "100", "Unit": "USD"},
+                "CostFilters": {"Service": ["Amazon Elastic Compute Cloud - Compute"]}
+            }),
+            new_budget: json!({
+                "BudgetName": "filters-demo",
+                "TimeUnit": "QUARTERLY",
+                "BudgetType": "COST",
+                "BudgetLimit": {"Amount": "500", "Unit": "USD"},
+                "CalculatedSpend": {"ActualSpend": {"Amount": "0", "Unit": "USD"}}
+            }),
+            changed: json!({"BudgetLimit": {"Amount": "500", "Unit": "USD"}}),
+            dropped: vec![vec!["CalculatedSpend"]],
+            absent_after: vec![vec!["CostFilters"]],
+        },
+    ]
+}
+
+/// Remove `path` from `budget`, so the same `NewBudget` can be resent without the
+/// service-derived members it carried.
+fn without(budget: &Value, path: &[&str]) -> Value {
+    let mut stripped = budget.clone();
+    let mut here = &mut stripped;
+    let (last, parents) = path.split_last().expect("a member path is never empty");
+    for segment in parents {
+        match here.get_mut(segment) {
+            Some(next) => here = next,
+            None => return stripped,
+        }
+    }
+    if let Some(object) = here.as_object_mut() {
+        object.remove(*last);
+    }
+    stripped
+}
+
+/// `budget` without the `LastUpdatedTime` every write stamps, so two reads taken at
+/// different instants are compared on everything else.
+fn without_write_instant(budget: &Value) -> Value {
+    without(budget, &["LastUpdatedTime"])
+}
+
+/// RULE: a member whose value the service derives from the cost and usage it tracks is
+/// not caller-settable on the UPDATE path either — "you can change every part of a budget
+/// except for the `budgetName` and the `calculatedSpend`" (`UpdateBudget`), and "you
+/// can't set your own `LookBackAvailablePeriods`" — so an update applies every change the
+/// caller IS allowed to make while discarding whatever the same request carried for the
+/// derived members, and the result is the same budget the update would have stored had it
+/// carried none of them.
+#[tokio::test]
+async fn a_modifying_update_applies_the_change_and_still_discards_the_derived_members() {
+    let router = router();
+    for (index, row) in modified_rows().into_iter().enumerate() {
+        let account_id = account(740_000_000 + index as u64);
+        let created =
+            write_and_read(&router, row.case, "CreateBudget", &account_id, &row.created).await;
+        // The row's change is a real change: nothing asserted below is already true of
+        // the budget before the update runs.
+        assert!(
+            !carries(&row.changed, &created),
+            "case {:?}: the created budget already carries {}, so the update changes \
+             nothing: {created}",
+            row.case,
+            row.changed
+        );
+
+        let updated = write_and_read(
+            &router,
+            row.case,
+            "UpdateBudget",
+            &account_id,
+            &row.new_budget,
+        )
+        .await;
+        for path in &row.dropped {
+            assert_absent(row.case, &updated, path);
+        }
+        for path in &row.absent_after {
+            assert_absent(row.case, &updated, path);
+        }
+        assert!(
+            carries(&row.changed, &updated),
+            "case {:?}: expected the update to apply {}, got {updated}",
+            row.case,
+            row.changed
+        );
+
+        // The derived members the request carried changed NOTHING: the same update sent
+        // again without them reports the same budget, down to every other member.
+        let mut clean = row.new_budget.clone();
+        for path in &row.dropped {
+            clean = without(&clean, path);
+        }
+        let resent = write_and_read(&router, row.case, "UpdateBudget", &account_id, &clean).await;
+        let (expected, actual) = (
+            without_write_instant(&updated),
+            without_write_instant(&resent),
+        );
+        assert!(
+            same(&expected, &actual),
+            "case {:?}: an update carrying the derived members must store what the same \
+             update without them stores, expected {expected}, got {actual}",
+            row.case
         );
     }
 }

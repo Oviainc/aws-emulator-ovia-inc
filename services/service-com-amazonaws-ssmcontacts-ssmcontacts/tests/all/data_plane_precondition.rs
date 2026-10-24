@@ -2,7 +2,7 @@
 
 //! The replication-set-scoped data plane, end to end over the wire.
 //!
-//! One rule drives the first three suites, asserted over a TABLE of all ten operations
+//! One rule drives the first three suites, asserted over a TABLE of every gated operation
 //! rather than one call each:
 //!
 //! > An SSM Contacts operation whose subject is scoped to the account's Incident Manager
@@ -14,11 +14,13 @@
 //! The contact registry's own writes (`CreateContact`, `CreateContactChannel`,
 //! `UpdateContact`, `DeleteContact`, `DeleteContactChannel`) are gated by the SAME account
 //! precondition — `tests/all/replication_set_precondition.rs` is the suite about them — so
-//! this suite's `Emulator` is onboarded before it creates the resources the ten gated
-//! operations name. The contact registry's READS (`ListContacts`, `GetContact`) are the
-//! positive control: they answer whatever the account's state is, which is what makes a
-//! 400 from the ten gated operations a statement about the gate rather than about the
-//! service being down.
+//! this suite's `Emulator` is onboarded before it creates the resources the gated
+//! operations name. The account-wide listing `ListContacts` is the positive control: it
+//! resolves no resource ARN, so it answers whatever the account's state is, which is what
+//! makes a 400 from the gated operations a statement about the gate rather than about the
+//! service being down. `tests/all/arn_read_precondition.rs` is the suite about the reads
+//! that DO take a resource ARN from the request (`GetContact`, `GetContactChannel`,
+//! `ListContactChannels`), which this table carries as rows too.
 //!
 //! The remaining suites assert what each of those operations DOES once the gate is open,
 //! each over a table spanning what its rule generalises over: the activation code that was
@@ -216,7 +218,7 @@ async fn activation_status(emulator: &Emulator, channel_arn: &str, case: &str) -
 }
 
 // ---------------------------------------------------------------------------
-// The ten gated operations, as one table
+// The gated operations, as one table
 // ---------------------------------------------------------------------------
 
 /// One gated operation: how to build its request, and what an ONBOARDED account gets when
@@ -292,6 +294,24 @@ const GATED_OPERATIONS: &[GatedOperation] = &[
         body: |targets| json!({"ResourceARN": targets.contact, "TagKeys": ["team"]}),
         absent_status: 404,
     },
+    // The ARN-addressed reads: they resolve a replication-set-scoped ARN out of the
+    // request, so they are gated exactly like the calls above rather than like the
+    // account-wide listing. `tests/all/arn_read_precondition.rs` spans their request shapes.
+    GatedOperation {
+        operation: "GetContact",
+        body: |targets| json!({"ContactId": targets.contact}),
+        absent_status: 404,
+    },
+    GatedOperation {
+        operation: "GetContactChannel",
+        body: |targets| json!({"ContactChannelId": targets.channel}),
+        absent_status: 404,
+    },
+    GatedOperation {
+        operation: "ListContactChannels",
+        body: |targets| json!({"ContactId": targets.contact}),
+        absent_status: 404,
+    },
 ];
 
 /// Everything a refused data-plane call must leave alone, read straight from the store.
@@ -339,7 +359,7 @@ fn snapshot(emulator: &Emulator, targets: &Targets) -> Snapshot {
 }
 
 // ---------------------------------------------------------------------------
-// Rule: the account gate, for every one of the ten operations
+// Rule: the account gate, for every one of the gated operations
 // ---------------------------------------------------------------------------
 
 #[tokio::test]

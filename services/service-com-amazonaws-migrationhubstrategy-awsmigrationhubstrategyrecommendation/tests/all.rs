@@ -23,6 +23,12 @@ mod assessment_error_paths;
 #[path = "all/enum_membership.rs"]
 mod enum_membership;
 
+#[path = "all/enum_membership_other_operations.rs"]
+mod enum_membership_other_operations;
+
+#[path = "all/enum_support.rs"]
+mod enum_support;
+
 #[path = "all/import_and_assess.rs"]
 mod import_and_assess;
 

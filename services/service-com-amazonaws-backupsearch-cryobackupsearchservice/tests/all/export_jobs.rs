@@ -29,7 +29,7 @@ use service_com_amazonaws_backupsearch_cryobackupsearchservice::state;
 
 use crate::search_jobs::{
     call, emulator_with_engine, recovery_point, seed_recovery_points, Answer,
-    PAST_THE_DUE_INSTANT, WITHIN_THE_DUE_INSTANT,
+    PAST_THE_CREATING_INSTANT, PAST_THE_DUE_INSTANT, WITHIN_THE_DUE_INSTANT,
 };
 
 /// A `RoleArn` the service can be passed: a role in the account this emulator attributes
@@ -48,9 +48,9 @@ fn passable_role(partition: &str, name: &str) -> String {
 /// one a recording happened to use.
 #[derive(Debug, Clone, Copy)]
 enum Settled {
-    /// Let the scan finish: `RUNNING` -> `COMPLETED`.
+    /// Let the scan be created and finish: `CREATING` -> `RUNNING` -> `COMPLETED`.
     Completed,
-    /// Cancel it: `RUNNING` -> `STOPPING` -> `STOPPED`.
+    /// Cancel it: `STOPPING` -> `STOPPED`.
     Stopped,
 }
 
@@ -473,13 +473,14 @@ async fn starting_an_export_for_a_search_job_that_does_not_exist_is_not_found_an
 
 #[tokio::test]
 async fn an_export_is_refused_while_the_search_job_has_not_settled() {
-    // Every non-terminal status a search job can be observed in, and the one terminal
-    // status export does not permit.
+    // Every non-terminal status a search job can be observed in, with how long after the
+    // start call that status is the one the export is judged against.
     let cases = [
-        ("still scanning", state::RUNNING, false),
-        ("stop in flight", state::STOPPING, true),
+        ("being created", state::CREATING, false, WITHIN_THE_DUE_INSTANT),
+        ("still scanning", state::RUNNING, false, PAST_THE_CREATING_INSTANT),
+        ("stop in flight", state::STOPPING, true, WITHIN_THE_DUE_INSTANT),
     ];
-    for (case, expected_status, cancel) in cases {
+    for (case, expected_status, cancel, dwell) in cases {
         let (emulator, engine) = emulator_with_engine();
         // One recovery point in scope, so the scan has something to get through and
         // settles to a status an export may be started from.
@@ -513,7 +514,7 @@ async fn an_export_is_refused_while_the_search_job_has_not_settled() {
         }
         // Inside the span the clock owes, so the transient status is what the export is
         // judged against.
-        tokio::time::sleep(WITHIN_THE_DUE_INSTANT).await;
+        tokio::time::sleep(dwell).await;
 
         let refused = call(
             &emulator,

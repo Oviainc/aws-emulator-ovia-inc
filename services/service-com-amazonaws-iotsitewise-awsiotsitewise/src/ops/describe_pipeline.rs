@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribePipeline
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribePipeline`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribePipeline::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -169,20 +160,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribePipeline` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribePipelineErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribePipeline"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribePipelineError::Modeled(DescribePipelineErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: "the IoT SiteWise store is unavailable".to_string(),
+                },
+            ))
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        let key = crate::state::pipeline_key(&input.workspace_name, &input.pipeline_name);
+        // A read, so nothing here writes: the status is DERIVED from the instant the
+        // transition the create or the update owes falls due.
+        let store = state.lock();
+        let record = store
+            .pipelines
+            .get(&key)
+            .ok_or_else(|| not_found(&input.pipeline_name))?;
+
+        // "The version number of the pipeline to retrieve. If not specified, returns
+        // the latest version." A version no write ever produced names nothing this
+        // service holds.
+        let version = match input.pipeline_version.as_deref() {
+            Some(requested) => record
+                .version(requested)
+                .ok_or_else(|| not_found_version(&input.pipeline_name, requested))?,
+            None => &record.current,
+        };
+
+        Ok(DescribePipelineOutput {
+            pipeline_name: record.name.clone(),
+            workspace_name: record.workspace_name.clone(),
+            pipeline_arn: record.arn.clone(),
+            description: version.description.clone(),
+            environment_variables: version.environment_variables.clone(),
+            computations: version.computations.clone(),
+            version: version.version.to_string(),
+            status: record.status(now),
+            created_at: crate::state::to_date_time(record.created_at),
+            // When an earlier version is asked for, this is when THAT version was
+            // written: the pipeline's last update as of the version being read.
+            updated_at: crate::state::to_date_time(version.recorded_at),
+        })
     }
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the pipeline the request addressed.
+fn not_found(pipeline_name: &str) -> DescribePipelineError {
+    DescribePipelineError::Modeled(DescribePipelineErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: crate::state::not_found_message(
+                crate::state::RESOURCE_PIPELINE,
+                pipeline_name,
+            ),
+        },
+    ))
+}
+
+/// HTTP 404 `ResourceNotFoundException` for a pipeline that exists at some other
+/// version than the one the request named.
+fn not_found_version(pipeline_name: &str, requested: &str) -> DescribePipelineError {
+    DescribePipelineError::Modeled(DescribePipelineErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: format!(
+                "{} with ID {pipeline_name} has no version {requested}",
+                crate::state::RESOURCE_PIPELINE
+            ),
+        },
+    ))
 }

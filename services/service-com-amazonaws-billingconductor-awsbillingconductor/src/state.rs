@@ -280,9 +280,10 @@ pub type ValidationRefusal = (&'static str, &'static str, String);
 ///
 /// `Ok` carries the `(ModifierPercentage, Tiering)` pair to store; `Err` carries
 /// the `(reason, member, message)` of the modelled `ValidationException` the
-/// calling operation refuses the request with. `CreatePricingRule` states the
-/// create-time half of the same rule in its own handler (it has no stored record
-/// to merge with); this is the merging form `UpdatePricingRule` applies.
+/// calling operation refuses the request with. BOTH paths that set a rule's rate
+/// decide it here, so one rule has one behaviour: `UpdatePricingRule` passes the
+/// stored record merged with the request, and `CreatePricingRule` — which has no
+/// stored record behind it — passes the request's own members as the whole rate.
 pub fn reconcile_pricing_rule_rate(
     rule_type: &str,
     modifier_percentage: Option<f64>,

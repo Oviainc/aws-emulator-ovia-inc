@@ -271,11 +271,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                  Settings.ChannelIdentification to true. Correct your request and try again.",
             ));
         }
-        if speaker_labels && input.settings.max_speaker_labels.is_none() {
-            return Err(bad_request(
-                "Settings.MaxSpeakerLabels is required when Settings.ShowSpeakerLabels is \
-                 true. Correct your request and try again.",
-            ));
+        if let Some(message) = crate::state::co_required_setting_error(
+            "ShowSpeakerLabels",
+            speaker_labels,
+            "MaxSpeakerLabels",
+            input.settings.max_speaker_labels.is_some(),
+        ) {
+            return Err(bad_request(&message));
         }
         if channel_identification != input.channel_definitions.is_some() {
             return Err(bad_request(
