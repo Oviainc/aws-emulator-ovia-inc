@@ -31,6 +31,8 @@ mod pending_aggregation;
 mod permission_writes;
 #[path = "all/policy_surface.rs"]
 mod policy_surface;
+#[path = "all/principal_arn_validation.rs"]
+mod principal_arn_validation;
 #[path = "all/profile_times.rs"]
 mod profile_times;
 #[path = "all/profiling_group_lifecycle.rs"]
