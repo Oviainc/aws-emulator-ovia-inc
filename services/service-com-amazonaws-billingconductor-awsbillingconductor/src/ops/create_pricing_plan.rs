@@ -227,7 +227,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn: arn.clone(),
             name: input.name.clone(),
             description: input.description,
-            pricing_rule_arns: input.pricing_rule_arns.unwrap_or_default(),
+            // Each rule the create names is associated FROM the billing period this
+            // call is made in: a read scoped to an earlier period reports no
+            // association, because there was none then.
+            pricing_rule_associations: input
+                .pricing_rule_arns
+                .unwrap_or_default()
+                .iter()
+                .map(|arn| crate::state::PricingRuleAssociationRecord::started_now(arn))
+                .collect(),
             tags: input.tags.unwrap_or_default().into_iter().collect(),
             creation_time_millis: now,
             last_modified_time_millis: now,

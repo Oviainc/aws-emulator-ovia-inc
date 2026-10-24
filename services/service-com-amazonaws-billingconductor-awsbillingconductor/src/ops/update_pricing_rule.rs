@@ -243,7 +243,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .pricing_rule_names
                 .insert(updated.name.clone(), rule_arn.clone());
         }
-        let associated = state.associated_pricing_plan_count(&rule_arn);
+        // An association is in force from the billing period it was made in onward, so
+        // the count an update reports is the one for the period this call is made in.
+        let associated = state
+            .associated_pricing_plan_count(&rule_arn, &crate::state::current_billing_period());
         let output = render(&updated, associated);
         state.pricing_rules.insert(rule_arn.clone(), updated);
 

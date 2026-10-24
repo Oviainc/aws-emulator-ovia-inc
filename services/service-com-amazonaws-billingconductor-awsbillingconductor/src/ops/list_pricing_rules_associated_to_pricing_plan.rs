@@ -2,10 +2,10 @@
 
 //! @op ListPricingRulesAssociatedToPricingPlan
 //!
-//! Reports the pricing rules associated with ONE pricing plan, read out of
-//! [`crate::state`]: the plan's association set as `CreatePricingPlan` persisted
-//! it, normalised to full rule ARNs, deduplicated, ordered by ARN and paginated.
-//! The operation is `@readonly` and writes nothing.
+//! Reports the pricing rules associated with ONE pricing plan FOR ONE BILLING
+//! PERIOD, read out of [`crate::state`]: the plan's associations that are in force
+//! in the requested period, normalised to full rule ARNs, deduplicated, ordered by
+//! ARN and paginated. The operation is `@readonly` and writes nothing.
 //!
 //! The order the answers are decided in:
 //!
@@ -15,7 +15,10 @@
 //!    hold and is answered the same 404;
 //! 2. an AWS-managed plan (`BasicPricingPlan` / `Passthrough`) exists without the
 //!    caller having created it and carries no rule of the caller's, so it reports
-//!    an empty association set.
+//!    an empty association set;
+//! 3. an association is in force from the billing period it was made in onward, so a
+//!    read for an earlier period does not report it; a request that names no period
+//!    asks about the current one.
 //!
 //! ## Shape of an operation
 //!
@@ -185,7 +188,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and both name one plan.
         let pricing_plan_arn = crate::state::normalize_pricing_plan_arn(&input.pricing_plan_arn);
 
-        let Some(rule_arns) = state.associated_pricing_rule_arns(&pricing_plan_arn) else {
+        // "The billing period for which the pricing rule associations are to be
+        // listed": the read is scoped to ONE period, and an association is in force
+        // only from the period it was made in onward, so a period before that reports
+        // it not at all. A request that names no period asks about the current one.
+        let billing_period = input
+            .billing_period
+            .clone()
+            .unwrap_or_else(crate::state::current_billing_period);
+
+        let Some(rule_arns) = state.associated_pricing_rule_arns(&pricing_plan_arn, &billing_period)
+        else {
             return Err(
                 ListPricingRulesAssociatedToPricingPlanErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
@@ -208,11 +221,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(ListPricingRulesAssociatedToPricingPlanOutput {
             // "The billing period for which the pricing rule associations are
-            // listed." This emulator keeps no per-billing-period history, so every
-            // period reports the plan's current associations and the answer names the
-            // period the request asked about; a request that named none leaves it
-            // absent rather than inventing one — the same rule `list_pricing_rules`
-            // applies to this member.
+            // listed": the answer names the period the request asked about; a request
+            // that named none leaves it absent rather than inventing one — the same
+            // rule `list_pricing_rules` applies to this member.
             billing_period: input.billing_period,
             pricing_plan_arn: Some(pricing_plan_arn),
             // `PricingRuleArns` is modelled `@length(min: 1)`, so a plan with no

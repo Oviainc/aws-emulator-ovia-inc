@@ -6,10 +6,10 @@
 //!
 //! RULE: the operation REPORTS, for the pricing rule the request names (in either
 //! spelling the modelled `PricingRuleArn` pattern allows), exactly the set of pricing
-//! plans whose stored associations name that rule — each as its FULL plan ARN,
-//! deduplicated, in ARN order, bounded by the request's `MaxResults` with a
-//! `NextToken` naming the rest — while a rule this account does not hold is refused
-//! with the modelled 404. It is the inverse index of
+//! plans whose association with that rule is in force in the `BillingPeriod` asked
+//! about — each as its FULL plan ARN, deduplicated, in ARN order, bounded by the
+//! request's `MaxResults` with a `NextToken` naming the rest — while a rule this
+//! account does not hold is refused with the modelled 404. It is the inverse index of
 //! `ListPricingRulesAssociatedToPricingPlan` over one set of associations, so the two
 //! agree. Nothing is written: a later caller sees exactly what an earlier one did.
 //!
@@ -483,6 +483,21 @@ async fn the_reported_period_is_the_one_the_request_named_and_otherwise_absent()
         .create_plan("period-plan", std::slice::from_ref(&rule))
         .await;
 
+    // The association this test made starts in the billing period the create ran in,
+    // so a period before that reports it not at all and a period from it onward
+    // reports it — whatever month the clock says.
+    let started_in =
+        service_com_amazonaws_billingconductor_awsbillingconductor::state::current_billing_period();
+    let period_key = |value: &str| -> (u32, u32) {
+        let (year, month) = value
+            .split_once('-')
+            .expect("a test period is spelled YYYY-MM");
+        (
+            year.parse().expect("a test period has a numeric year"),
+            month.parse().expect("a test period has a numeric month"),
+        )
+    };
+
     // Rows differ along the period asked for: months at each end of the modelled
     // `BillingPeriod` pattern, a past year and a future one, and the one-digit month
     // form the pattern also allows (`0?[1-9]`).
@@ -503,10 +518,16 @@ async fn the_reported_period_is_the_one_the_request_named_and_otherwise_absent()
             "case {period:?}: the reported period must satisfy the modelled YYYY-MM form, \
              got {body:?}"
         );
+        let expected: Vec<String> = if period_key(period) >= period_key(&started_in) {
+            vec![plan.clone()]
+        } else {
+            vec![]
+        };
         assert_eq!(
             reported(&body),
-            vec![plan.clone()],
-            "case {period:?}: the associations must not depend on the period, got {body:?}"
+            expected,
+            "case {period:?}: an association that started in {started_in} must be reported \
+             from that period onward and not before; expected {expected:?}, got {body:?}"
         );
     }
 

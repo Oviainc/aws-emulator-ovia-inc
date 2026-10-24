@@ -247,8 +247,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reader of it uses, so the count cannot drift from the rules it counts — a plan
         // that is associated with no rule counts 0, which is what this plan holds rather
         // than the model's unenforced `@range(min: 1)` floor.
+        // An association is in force from the billing period it was made in onward, so
+        // the count an update reports is the one for the period this call is made in.
         let size = state
-            .associated_pricing_rule_arns(&plan_arn)
+            .associated_pricing_rule_arns(&plan_arn, &crate::state::current_billing_period())
             .map(|arns| i64::try_from(arns.len()).unwrap_or(i64::MAX))
             .unwrap_or_default();
         let output = render(&updated, size);

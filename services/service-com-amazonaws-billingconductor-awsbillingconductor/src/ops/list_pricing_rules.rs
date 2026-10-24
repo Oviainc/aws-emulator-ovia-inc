@@ -202,6 +202,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .collect()
             });
 
+        // `AssociatedPricingPlanCount` counts the plans that associate the rule, and
+        // an association is in force only from the billing period it was made in
+        // onward, so the count is taken for the period the read is scoped to. A
+        // request that names no period asks about the current one.
+        let billing_period = input
+            .billing_period
+            .clone()
+            .unwrap_or_else(crate::state::current_billing_period);
+
         // `pricing_rules` is ordered by ARN, and an ARN carries the monotonic id this
         // service mints, so the sequence is creation order and a `NextToken` names the
         // same cut point on the next call.
@@ -212,7 +221,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|(arn, rule)| {
                 (
                     arn.clone(),
-                    element(rule, state.associated_pricing_plan_count(arn)),
+                    element(
+                        rule,
+                        state.associated_pricing_plan_count(arn, &billing_period),
+                    ),
                 )
             })
             .collect();
@@ -222,10 +234,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(ListPricingRulesOutput {
             // "The billing period for which the described pricing rules are
-            // applicable." This emulator keeps no per-billing-period history of a
-            // rule, so every period reports the rules as they stand now and the answer
-            // names the period the request asked about; a request that named none
-            // leaves it absent rather than inventing one.
+            // applicable." The answer names the period the request asked about; a
+            // request that named none leaves it absent rather than inventing one.
             billing_period: input.billing_period,
             pricing_rules: Some(pricing_rules),
             next_token,
