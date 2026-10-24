@@ -373,6 +373,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A monitor sends extended metrics nowhere until a
             // `PutRumMetricsDestination` call names a destination.
             metric_destinations: ::std::collections::BTreeMap::new(),
+            // And it defines no extended or custom metric until a
+            // `BatchCreateRumMetricDefinitions` call creates one under a destination.
+            metric_definitions: ::std::collections::BTreeMap::new(),
             // A monitor is created with no resource policy: `PutResourcePolicy` is the
             // only call that attaches one, and the one that stores revision 1 of it.
             resource_policy: None,
