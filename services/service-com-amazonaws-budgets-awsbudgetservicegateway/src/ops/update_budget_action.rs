@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateBudgetAction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateBudgetAction`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateBudgetAction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates the members a caller supplied on one stored budget action, leaving the
+//! members it did not name as they were, and records the `UPDATE_ACTION` event in the
+//! action's history. Reports the action as it was before the call (`OldAction`) and as
+//! it is after it (`NewAction`).
 //!
 //! ## Shape of an operation
 //!
@@ -177,18 +173,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateBudgetAction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateBudgetActionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateBudgetAction"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateBudgetActionErrorModeled::InternalErrorException(InternalErrorException {
+                message: Some(
+                    "budgets is mounted on an engine that holds no state for it".to_string(),
+                ),
+            })
+        })?;
+
+        // The modelled `BudgetName` `@pattern` the boundary validator cannot compile —
+        // refused as the request-validation failure it is (HTTP 400
+        // `ValidationException`), naming the member path and the constraint.
+        if let Some(message) =
+            crate::state::budget_name_violation(&["BudgetName"], &input.budget_name)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let held = store
+            .budgets
+            .get_mut(&(input.account_id.clone(), input.budget_name.clone()))
+            .and_then(|stored| crate::state::find_action_mut(stored, &input.action_id, now))
+            .ok_or_else(|| {
+                UpdateBudgetActionErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(format!(
+                        "Unable to update budget action: {} - the budget action doesn't exist.",
+                        input.action_id
+                    )),
+                })
+            })?;
+
+        let old_action = held.action.clone();
+        // `ActionType` is not an input of this operation, so the action keeps the type it
+        // was created with — and "the type of action ... determines the format for
+        // definition" (`Action$ActionType`), so a replacement `Definition` is checked
+        // against THAT type.
+        if let Some(definition) = &input.definition {
+            crate::state::validate_action_definition(&old_action.action_type, definition).map_err(
+                |message| {
+                    UpdateBudgetActionErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(message),
+                        },
+                    )
+                },
+            )?;
+        }
+
+        // Every member this operation takes is optional: one the caller named replaces
+        // the stored value, one it left out keeps it. `ActionId`, `BudgetName` and the
+        // service-owned `Status` are not updatable at all.
+        let action = &mut held.action;
+        if let Some(notification_type) = input.notification_type {
+            action.notification_type = notification_type;
+        }
+        if let Some(action_threshold) = input.action_threshold {
+            action.action_threshold = action_threshold;
+        }
+        if let Some(definition) = input.definition {
+            action.definition = definition;
+        }
+        if let Some(execution_role_arn) = input.execution_role_arn {
+            action.execution_role_arn = execution_role_arn;
+        }
+        if let Some(approval_model) = input.approval_model {
+            action.approval_model = approval_model;
+        }
+        if let Some(subscribers) = input.subscribers {
+            action.subscribers = subscribers;
+        }
+        let new_action = held.action.clone();
+        crate::state::record_action_event(
+            held,
+            crate::state::EVENT_TYPE_UPDATE_ACTION,
+            "The budget action was updated.",
+            now,
+        );
+
+        Ok(UpdateBudgetActionOutput {
+            account_id: input.account_id,
+            budget_name: input.budget_name,
+            old_action,
+            new_action,
+        })
     }
 }

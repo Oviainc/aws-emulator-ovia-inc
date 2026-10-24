@@ -14,11 +14,12 @@
 //!
 //! The rule under test: Lightsail's domain API is served by the N. Virginia
 //! (`us-east-1`) endpoint ALONE, so EVERY domain operation — the creates, the
-//! read and the edits alike — refuses a request whose credential scope names any
-//! other Region with the modelled `InvalidInputException` (HTTP 400) carrying the
-//! restriction the model documents, and changes nothing in the store; a request
-//! made in `us-east-1`, or one carrying no credential scope at all (served in the
-//! service's default Region, which IS `us-east-1`), is served.
+//! read, the edits and the deletes alike — refuses a request whose credential
+//! scope names any other Region with the modelled `InvalidInputException` (HTTP
+//! 400) carrying the restriction the model documents, and changes nothing in the
+//! store; a request made in `us-east-1`, or one carrying no credential scope at
+//! all (served in the service's default Region, which IS `us-east-1`), is
+//! served.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_lightsail_lightsail_20161128::ops::types::REGION_NAME_VALUES;
@@ -107,11 +108,14 @@ struct Row {
     body: fn(&Fixture) -> Value,
 }
 
-/// Every implemented domain operation. `GetDomains` and `DeleteDomain` are not
-/// here because they are still scaffold stubs answering 501 — their own issues
-/// own them. The distribution operations the same documentation covers are
-/// pinned where they live: `CreateDistribution` and `GetDistributions` in
-/// `distribution_cdn.rs`, and the rest are stubs under their own issues.
+/// Every implemented domain operation. `GetDomains` is not here because it is
+/// still a scaffold stub answering 501 — its own issue owns it. The distribution
+/// operations the same documentation covers are pinned where they live:
+/// `CreateDistribution` and `GetDistributions` in `distribution_cdn.rs`, and the
+/// rest are stubs under their own issues.
+///
+/// The zone delete comes LAST, so the rows before it still find the fixture zone
+/// in the serving case below.
 const ROWS: &[Row] = &[
     Row {
         case: "creating a zone",
@@ -166,6 +170,11 @@ const ROWS: &[Row] = &[
                 },
             })
         },
+    },
+    Row {
+        case: "deleting a zone",
+        operation: "DeleteDomain",
+        body: |fixture| json!({"domainName": fixture.zone}),
     },
 ];
 
@@ -403,6 +412,26 @@ async fn the_domain_apis_are_served_in_the_domain_region() {
             Some(0),
             "case {case}: expected the deleted entry to be gone, got {:?}",
             domain["domainEntries"]
+        );
+
+        let (status, body) = emulator
+            .call_in(region, "DeleteDomain", json!({"domainName": zone}))
+            .await;
+        assert_eq!(
+            status, 200,
+            "case {case}: DeleteDomain must be served, got {status} {body:?}"
+        );
+        let (status, body) = emulator
+            .call_in(region, "GetDomain", json!({"domainName": zone}))
+            .await;
+        assert_eq!(
+            status, 400,
+            "case {case}: expected the deleted zone to be unreadable, got {status} {body:?}"
+        );
+        assert_eq!(
+            body["code"].as_str(),
+            Some("DoesNotExist"),
+            "case {case}: expected code DoesNotExist for the deleted zone, got {body:?}"
         );
     }
 }
