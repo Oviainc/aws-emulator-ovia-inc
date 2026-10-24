@@ -2,7 +2,10 @@
 
 //! @op CreateFilter
 //! IMPLEMENTED: saves a finding filter on the detector and answers with the name it
-//! was saved under, so a later `GetFilter` reports exactly what this call stored.
+//! was saved under, so a later `GetFilter` reports exactly what this call stored. A
+//! filter name outside the documented alphabet, and a `FindingCriteria` criterion
+//! keyed by anything that is not a finding attribute, are refused with the
+//! `BadRequestException` envelope and persist no filter.
 //! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -186,6 +189,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // The second such rule: a `FindingCriteria.Criterion` key must NAME a
+        // finding attribute. The model types the criterion as a map keyed by a
+        // plain string, so the boundary validator accepts any key at all, and a
+        // filter saved under a key that names no attribute would select nothing —
+        // the findings it was built to suppress or route go unsuppressed and
+        // unrouted, with nothing in the response to say why. The attribute
+        // CATALOGUE is the one `ListFindings` and `GetFindings` evaluate against
+        // (`crate::state::validate_finding_criteria`), so there is ONE answer on
+        // this service to "is this a finding attribute": a criterion a saved
+        // filter carries is one a findings read can evaluate.
+        //
+        // Validated before the store is touched, so a refused request leaves no
+        // filter behind.
+        crate::state::validate_finding_criteria(Some(&input.finding_criteria)).map_err(|path| {
+            bad_request(format!(
+                "findingCriteria.criterion: '{path}' is not a finding attribute this service can filter on. Supported attributes are {}.",
+                crate::state::FINDING_ATTRIBUTES.join(", ")
+            ))
+        })?;
+
         let region = crate::state::request_region(ctx);
         let mut state = state.lock();
         if state.detector_in(&region, &input.detector_id).is_none() {
@@ -256,11 +279,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `Rank` is optional and GuardDuty invents none: a filter created
             // without one reports none.
             rank: input.rank,
-            // Stored as sent. GuardDuty's filter criterion names a far wider set of
-            // finding fields than the subset this emulator evaluates for
-            // `ListFindings`, and a saved filter is only ever read back here, so the
-            // criteria are persisted and reported rather than narrowed to what the
-            // finding matcher can evaluate.
+            // Stored as sent, once every criterion key has been resolved against
+            // the finding-attribute catalogue above: a saved filter carries only
+            // criteria a findings read can evaluate, so `GetFilter` reports back
+            // exactly what the create accepted.
             finding_criteria: input.finding_criteria.clone(),
             tags: input
                 .tags

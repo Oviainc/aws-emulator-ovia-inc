@@ -265,6 +265,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A new detector administers nobody: `CreateMembers` is what records a
             // member account against it.
             members: std::collections::BTreeMap::new(),
+            // And nobody administers it: an invitation is delivered to this
+            // account by another account's `InviteMembers`, and accepting one is
+            // what establishes the administrator relationship.
+            received_invitations: std::collections::BTreeMap::new(),
+            administrator: None,
         };
         // The deprecated `DataSources` view is applied first so an explicit
         // `Features` entry for the same switch wins.

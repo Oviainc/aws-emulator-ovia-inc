@@ -11,8 +11,10 @@
 //! call:
 //!
 //! 1. Setting the archive state is a write over the `findingIds` the request NAMES: a
-//!    named finding the detector holds takes the requested state, every other finding
-//!    keeps the state it had, and an id the detector does not hold moves nothing.
+//!    named finding the detector holds takes the requested state and every other
+//!    finding keeps the state it had. Every named id is resolved against the detector
+//!    FIRST, so a batch naming an id it does not hold is refused and moves nothing —
+//!    see the `negative_class_rejections` suite, which owns that rule.
 //! 2. The LAST call to land decides the state, so a repeated call is a no-op and
 //!    archive/unarchive compose in any order.
 //! 3. A finding's `updatedAt` moves when the call changes its archive state and stays
@@ -45,10 +47,6 @@ const SAMPLE_TYPES: [&str; 5] = [
     "PenTest:IAMUser/PentooLinux",
     "Policy:Kubernetes/ExposedDashboard",
 ];
-
-/// A value of the modelled `FindingId` form (`len 1..300`,
-/// `smithy_query(shape="FindingId")`) that no detector holds.
-const ABSENT_FINDING_ID: &str = "ffffffffffffffffffffffffffffffff";
 
 /// The Region whose endpoint does not serve the detector these tests create.
 const OTHER_REGION: &str = "us-west-2";
@@ -186,27 +184,25 @@ async fn ids_with_archived(router: &Router, detector_id: &str, archived: bool) -
 
 /// `findingIds` is a LIST (`len 0..50`, `smithy_query(operation="ArchiveFindings")`), so
 /// the call is a set operation over the ids it names. The rows differ along the size and
-/// the content of that set: none, one, a proper subset, all of them, the same id twice,
-/// and a request mixing in ids the detector does not hold.
+/// the content of that set: none, one, a proper subset, all of them, and the same id
+/// twice. A set containing an id the detector does NOT hold is refused rather than
+/// partially applied, which the `negative_class_rejections` suite asserts.
 #[tokio::test]
 async fn archiving_moves_exactly_the_named_findings() {
-    let cases: [(&str, &[usize], &[&str]); 7] = [
-        ("no id named", &[], &[]),
-        ("one id", &[0], &[]),
-        ("a proper subset", &[0, 2], &[]),
-        ("every finding", &[0, 1, 2, 3, 4], &[]),
-        ("the same id twice", &[1, 1], &[]),
-        ("one held id beside an absent one", &[3], &[ABSENT_FINDING_ID]),
-        ("only ids the detector does not hold", &[], &[ABSENT_FINDING_ID, "not-a-finding-id"]),
+    let cases: [(&str, &[usize]); 5] = [
+        ("no id named", &[]),
+        ("one id", &[0]),
+        ("a proper subset", &[0, 2]),
+        ("every finding", &[0, 1, 2, 3, 4]),
+        ("the same id twice", &[1, 1]),
     ];
 
     for case in cases {
-        let (label, selected, absent) = case;
+        let (label, selected) = case;
         let router = new_router();
         let (detector_id, ids) = detector_with_findings(&router).await;
 
-        let mut named: Vec<String> = selected.iter().map(|index| ids[*index].clone()).collect();
-        named.extend(absent.iter().map(|id| (*id).to_string()));
+        let named: Vec<String> = selected.iter().map(|index| ids[*index].clone()).collect();
 
         let (status, body) = set_archived(&router, &detector_id, &named, true).await;
         assert_eq!(

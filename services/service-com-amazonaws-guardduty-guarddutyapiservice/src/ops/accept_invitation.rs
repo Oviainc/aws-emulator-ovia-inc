@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AcceptInvitation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AcceptInvitation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AcceptInvitation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: resolves the `(MasterId, InvitationId)` pair against the invitations
+//! the member detector's account has pending and, when one matches, records the
+//! administrator relationship a later `GetMasterAccount` reports. A pair that matches
+//! no pending invitation is refused with the `BadRequestException` envelope and leaves
+//! master-account state exactly where it was, as does an unknown detector id.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -138,18 +135,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AcceptInvitation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AcceptInvitationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AcceptInvitation"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(AcceptInvitationErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx);
+
+        // `MasterId` is an account id ("the account ID of the GuardDuty
+        // administrator account whose invitation you're accepting",
+        // `smithy_query(operation="AcceptInvitation")`) but targets a plain
+        // `String`, so the boundary validator accepts any value: a value that
+        // cannot be an account id at all is a parameter failure, refused before
+        // anything is looked up.
+        if !crate::state::is_account_id(&input.master_id) {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::invalid_parameter_message(crate::state::MASTER_ID_MEMBER),
+            ));
+        }
+
+        let mut state = state.lock();
+        // A MUTATION, so the clock is read here: the instant is what the accepted
+        // relationship moves the detector's `UpdatedAt` to.
+        let now = state.tick_millis();
+        let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
+            // Classified from the REQUEST, the way every other operation on this
+            // service classifies a `DetectorId` it cannot resolve.
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::detector_id_rejection(&input.detector_id),
+            ));
+        };
+
+        // The whole operation: an invitation pending for this account under
+        // exactly this `(MasterId, InvitationId)` pair is accepted, and anything
+        // else is refused. `AcceptInvitation` models no not-found shape — only
+        // `BadRequestException` (400) and `InternalServerErrorException` (500),
+        // `smithy_query(operation="AcceptInvitation")` — so the absence case is
+        // the 400, never a hollow 200 that would let a caller believe an
+        // administrator relationship now exists.
+        if !detector.accept_invitation(&input.master_id, &input.invitation_id, now) {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::invitation_not_pending_message(),
+            ));
+        }
+
+        // `AcceptInvitationResponse` declares no members
+        // (`smithy_query(operation="AcceptInvitation")`): success is the modelled
+        // 200 and an empty body.
+        Ok(AcceptInvitationOutput {})
     }
 }

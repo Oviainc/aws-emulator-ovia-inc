@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCustomDetectionRuleOrgConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCustomDetectionRuleOrgConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCustomDetectionRuleOrgConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: records the organization-level configuration of a PUBLISHED custom
+//! detection rule for `(RuleId, Mode)`, which `GetCustomDetectionRuleOrgConfiguration`
+//! then reports. A `RuleId` the catalogue does not publish is refused with the modelled
+//! `ResourceNotFoundException`, a second create for a pair already configured with the
+//! modelled `ConflictException`, and an account list that is not an account id — or
+//! both `IncludeAccountIds` and `ExcludeAccountIds`, which are mutually exclusive —
+//! with the `BadRequestException` envelope. A replayed `ClientToken` is a no-op.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +148,145 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCustomDetectionRuleOrgConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCustomDetectionRuleOrgConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCustomDetectionRuleOrgConfiguration"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateCustomDetectionRuleOrgConfigurationErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx);
+
+        // "Mutually exclusive with ExcludeAccountIds"
+        // (`smithy_query(query="doc",shape="DetectionRuleOrgConfiguration",member="IncludeAccountIds")`):
+        // a request that scopes the configuration both ways describes two
+        // different scopes at once, which the model cannot express and this
+        // refuses. An EMPTY list is not a scope, so it does not conflict.
+        let include = input.include_account_ids.clone().unwrap_or_default();
+        let exclude = input.exclude_account_ids.clone().unwrap_or_default();
+        if !include.is_empty() && !exclude.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::ORG_CONFIGURATION_ACCOUNT_SCOPE_MESSAGE,
+            ));
+        }
+        // `DetectionRuleAccountIds` constrains the LIST length only, so an entry
+        // that is not an account id at all reaches the handler: a parameter
+        // failure, refused before anything is written.
+        if include
+            .iter()
+            .chain(exclude.iter())
+            .any(|account_id| !crate::state::is_account_id(account_id))
+        {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::invalid_parameter_message(crate::state::ACCOUNT_ID_MEMBER),
+            ));
+        }
+
+        let token = input
+            .client_token
+            .as_deref()
+            .filter(|token| !token.is_empty())
+            .map(str::to_string);
+
+        let mut state = state.lock();
+
+        // `ClientToken` is `@idempotencyToken`: a replayed create answers with the
+        // success the first call did rather than the conflict below, and mutates
+        // nothing — creating is not updating.
+        if let Some(token) = token.as_deref() {
+            if state
+                .detection_rule_org_configuration_for_client_token(&region, token)
+                .is_some()
+            {
+                return Ok(CreateCustomDetectionRuleOrgConfigurationOutput {});
+            }
+        }
+
+        // An organization configuration can only ever be for a rule GuardDuty
+        // publishes, so an id the catalogue does not carry is the modelled 404.
+        if state.custom_detection_rules.rule(&input.rule_id).is_none() {
+            return Err(not_found(
+                crate::state::custom_detection_rule_not_found_message(),
+            ));
+        }
+
+        if state
+            .detection_rule_org_configuration(&region, &input.rule_id, &input.mode)
+            .is_some()
+        {
+            return Err(
+                CreateCustomDetectionRuleOrgConfigurationErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(
+                            crate::state::detection_rule_org_configuration_conflict_message(),
+                        ),
+                        r#type: Some(CONFLICT_EXCEPTION.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The Region is request-chosen, so the number of PARTITIONS needs its own
+        // ceiling.
+        if state.detection_rule_regions_exhausted(&region) {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::DETECTION_RULE_REGION_LIMIT_MESSAGE,
+            ));
+        }
+
+        let now = state.tick_millis();
+        let record = crate::state::DetectionRuleOrgConfigurationRecord {
+            region: region.clone(),
+            rule_id: input.rule_id.clone(),
+            mode: input.mode.clone(),
+            include_account_ids: include,
+            exclude_account_ids: exclude,
+            // The configuration is accepted and then rolled out across the
+            // organization, so it starts in the transitional `PROCESSING` status
+            // and the clock owes it `ACTIVE`
+            // (`crate::state::ORG_CONFIGURATION_TRANSITION_MILLIS`). The due
+            // instant is STORED and never slept for.
+            status_due_millis: Some(
+                now.saturating_add(crate::state::ORG_CONFIGURATION_TRANSITION_MILLIS),
+            ),
+            client_token: token,
+            created_at_millis: now,
+            updated_at_millis: now,
+        };
+        state.custom_detection_rule_org_configurations.insert(
+            (region, input.rule_id.clone(), input.mode.clone()),
+            record,
+        );
+
+        // `CreateCustomDetectionRuleOrgConfigurationResponse` declares no members
+        // (`smithy_query(operation="CreateCustomDetectionRuleOrgConfiguration")`):
+        // the configuration is read back with
+        // `GetCustomDetectionRuleOrgConfiguration`.
+        Ok(CreateCustomDetectionRuleOrgConfigurationOutput {})
     }
+}
+
+/// The error CLASS a create naming a rule the catalogue does not publish is named
+/// by on the wire — the modelled 404
+/// (`smithy_query(operation="CreateCustomDetectionRuleOrgConfiguration")`).
+const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
+
+/// The error CLASS a second create for an already-configured `(RuleId, Mode)` pair
+/// is named by — the modelled 409.
+const CONFLICT_EXCEPTION: &str = "ConflictException";
+
+/// Refuse with the modelled 404, carrying `message`.
+fn not_found(message: String) -> CreateCustomDetectionRuleOrgConfigurationError {
+    CreateCustomDetectionRuleOrgConfigurationErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: Some(message),
+            // "The error type"
+            // (`smithy_query(shape="ResourceNotFoundException")`): the class, the
+            // same value the body's `__type` carries.
+            r#type: Some(RESOURCE_NOT_FOUND_EXCEPTION.to_string()),
+        },
+    )
+    .into()
 }
