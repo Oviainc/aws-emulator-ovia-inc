@@ -1123,7 +1123,7 @@ async fn the_store_bounds_how_many_tags_one_data_store_carries() {
 #[tokio::test]
 async fn an_unimplemented_operation_still_answers_501() {
     let service = HealthLake::new();
-    let (id, arn) = service
+    let (id, _arn) = service
         .create(&json!({ "DatastoreTypeVersion": "R4" }))
         .await;
 
@@ -1132,14 +1132,9 @@ async fn an_unimplemented_operation_still_answers_501() {
     // written it yet", never an empty success. (`UpdateFHIRDatastore` is NOT in
     // this list any more — it is implemented; see
     // `control_plane_error_semantics`. Neither is `ListFHIRExportJobs` — see
-    // `fhir_export_job_listing`.)
-    let cases = [
-        ("ListFHIRImportJobs", json!({ "DatastoreId": &id })),
-        (
-            "UntagResource",
-            json!({ "ResourceARN": &arn, "TagKeys": ["env"] }),
-        ),
-    ];
+    // `fhir_export_job_listing`, nor `UntagResource` — see
+    // `resource_untagging`.)
+    let cases = [("ListFHIRImportJobs", json!({ "DatastoreId": &id }))];
     for (operation, request) in cases {
         let (status, payload) = service.call(operation, &request).await;
         assert_eq!(

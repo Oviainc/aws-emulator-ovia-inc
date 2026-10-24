@@ -36,13 +36,13 @@ pub const ACCOUNT: &str = "000000000000";
 /// The only `SubscriptionProviderSource` the model declares (`one of: RedHat`).
 pub const RED_HAT: &str = "RedHat";
 /// `SubscriptionProviderStatus` of a provider whose token the service holds and
-/// accepted, named from the crate so a suite cannot hold a second copy of the value.
+/// accepted — the status a registration reaches once it is usable — named from the crate
+/// so a suite cannot hold a second copy of the value.
 pub const ACTIVE: &str = PROVIDER_STATUS_ACTIVE;
 /// `SubscriptionProviderStatus` a fresh registration reports, while the validation of its
 /// access token has not landed.
 pub const PENDING: &str = PROVIDER_STATUS_PENDING;
-/// `SubscriptionProviderStatus` a registration whose access token could not be validated
-/// settles into.
+/// `SubscriptionProviderStatus` of a registration whose access token the service rejected.
 pub const INVALID: &str = PROVIDER_STATUS_INVALID;
 
 /// Wait out the span the clock owes a fresh registration before its terminal
@@ -265,6 +265,36 @@ pub fn percent_encode(value: &str) -> String {
     encoded
 }
 
+/// Whether `value` is an ISO-8601 UTC instant at whole-second precision
+/// (`YYYY-MM-DDTHH:MM:SSZ`), the form this service renders a timestamp member in.
+///
+/// Checked by the suites rather than taken on trust, because the members carrying an
+/// instant here are plain `String`s in the model: the format is part of what a client
+/// parses.
+pub fn is_iso8601_utc(value: &str) -> bool {
+    let digits =
+        |part: &str, len: usize| part.len() == len && part.bytes().all(|b| b.is_ascii_digit());
+    let Some((date, time)) = value.split_once('T') else {
+        return false;
+    };
+    let Some(time) = time.strip_suffix('Z') else {
+        return false;
+    };
+    let date: Vec<&str> = date.split('-').collect();
+    let time: Vec<&str> = time.split(':').collect();
+    match (date.as_slice(), time.as_slice()) {
+        ([year, month, day], [hour, minute, second]) => {
+            digits(year, 4)
+                && digits(month, 2)
+                && digits(day, 2)
+                && digits(hour, 2)
+                && digits(minute, 2)
+                && digits(second, 2)
+        }
+        _ => false,
+    }
+}
+
 /// An ARN of this service's one resource kind, for `id`.
 pub fn provider_arn_for(id: &str) -> String {
     format!("arn:aws:{SIGNING_NAME}:{REGION}:{ACCOUNT}:subscription-provider/{id}")
@@ -273,13 +303,13 @@ pub fn provider_arn_for(id: &str) -> String {
 /// Seed one registration DIRECTLY into the store, in a TERMINAL `ACTIVE` status, and
 /// answer its ARN.
 ///
-/// `RegisterSubscriptionProvider` creates registrations over the wire (and
-/// `tests/all/subscription_provider_registration.rs` is what exercises that path), but it
-/// can never leave one `ACTIVE`: validating a provider access token needs trust material
-/// this emulator does not hold, so a registration it created settles `INVALID`. A suite
-/// whose rule is about the read/list/tag/deregister side of an ACCEPTED registration
-/// therefore places the record itself, through the same seam the handlers use
-/// (`engine.state::<…>()`), not a second copy of the store.
+/// `RegisterSubscriptionProvider` creates registrations over the wire and they become
+/// `ACTIVE` on the clock (which is what
+/// `tests/all/subscription_provider_registration.rs` exercises). A suite whose rule is
+/// about the read/list/tag/deregister side of an ALREADY usable registration places the
+/// record itself instead, through the same seam the handlers use (`engine.state::<…>()`,
+/// not a second copy of the store), so it does not have to wait out that span once per
+/// row.
 pub fn seed_provider(
     h: &Harness,
     id: &str,
@@ -301,6 +331,7 @@ pub fn seed_provider(
             tags.iter()
                 .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
                 .collect::<HashMap<String, String>>(),
+            std::time::SystemTime::now(),
         ),
     );
     state.provider_order.push(arn.clone());

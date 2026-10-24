@@ -167,25 +167,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// when it does not run forwards — a rule about the PAIR of members, so it is enforced
     /// here rather than by a per-member constraint.
     ///
-    /// No finding is reported. The model names the auditors that produce them — `slo` (SLO
-    /// violations and breached thresholds), `operation_metric` (anomalies in Application
-    /// Signals RED metrics), `service_quota` (utilization against quotas), `trace` — and
-    /// every one of them analyses telemetry: the request, error and latency metrics and
-    /// the traces an instrumented application sends Application Signals. This emulator
-    /// receives none of that telemetry and runs no auditor over it, so there is no finding
-    /// to report; reporting one would claim an analysis that never ran. `AuditFindings` is
-    /// therefore empty for every target and every window, as it is on the real service for
-    /// a window whose targets it observed nothing in.
+    /// The findings are RESOLVED AGAINST THE STORE, target by target: each `AuditTarget`
+    /// names an entity, and what is reported for it is the analysis of the records this
+    /// emulator holds for that entity over the window
+    /// ([`crate::state::ComAmazonawsApplicationsignalsApplicationsignalsState::audited_findings`],
+    /// which is where the projection lives so this read cannot disagree with the topology
+    /// reads about the same entity). A target the store holds nothing for contributes no
+    /// finding, so a target naming a stored objective and one naming an objective that was
+    /// never created do not answer alike.
+    ///
+    /// Of the auditors the model names, only `slo` — SLO violations and breached
+    /// thresholds — has an input this emulator holds; the others analyse telemetry (RED
+    /// metrics, traces, EMF logs, change events) an instrumented application sends
+    /// Application Signals, which this emulator never receives, so they produce no result
+    /// and `Auditors` naming only those reports nothing. `DetailLevel` selects how much
+    /// context each finding carries.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = (ctx, &self.engine);
+        let _ = ctx;
         if let Some(message) = crate::state::time_range_refusal(&input.start_time, &input.end_time)
         {
             return Err(refused(message));
         }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListAuditFindingsErrorModeled::ThrottlingException(
+                ThrottlingException {
+                    message: crate::state::STATE_UNAVAILABLE.to_string(),
+                },
+            )
+            .into());
+        };
 
         // `MaxResults` declares no `@default`, so an absent one means the default the
         // member documents. A value outside the modelled `range 1..10` is already refused
@@ -195,11 +210,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or(crate::state::DEFAULT_AUDIT_FINDING_PAGE)
             .max(0) as usize;
 
+        // The extra per-finding context is what `DetailLevel` asks for, so it is attached
+        // only when the caller asks for the DETAILED level; the modelled enum admits one
+        // other value, and an absent member asks for no extra context.
+        let detailed = input.detail_level.as_deref() == Some(crate::state::DETAIL_LEVEL_DETAILED);
+
+        let findings = state.lock().audited_findings(
+            &input.audit_targets,
+            input.auditors.as_deref(),
+            detailed,
+            &input.start_time,
+            &input.end_time,
+        );
+
         // Paged through the same cursor the other lists of this service use, so a
         // `NextToken` this service did not issue is refused rather than read as a page
         // boundary.
         let (audit_findings, next_token) = crate::state::page_of(
-            Vec::new(),
+            findings,
             crate::state::AUDIT_FINDINGS_TOKEN_TAG,
             input.next_token.as_deref(),
             page_size,

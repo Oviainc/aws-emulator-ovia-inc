@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateHsmConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateHsmConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateHsmConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Inserts a new HSM configuration into this service's store and reports it
+//! back: the identifier as given, the description, the HSM's IP address and the
+//! partition the cluster's encryption keys live in, plus the tags the request
+//! carried. A second create under the same identifier is refused with
+//! `HsmConfigurationAlreadyExistsFault`.
+//!
+//! The two secret-bearing request members — the HSM's public certificate file
+//! and the partition password — are kept on the stored record (see
+//! [`crate::state::StoredHsmConfiguration`]) and never on the modelled
+//! `HsmConfiguration`, which has no member for either, so neither can reach the
+//! wire.
 //!
 //! ## Shape of an operation
 //!
@@ -103,13 +106,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `CreateHsmConfigurationError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#CreateHsmConfiguration")]
+// `DependentServiceUnavailableFault` is widened in: the model does not list it for
+// this operation, but the service declares the shape, and it is the only modelled
+// way to say "the control-plane store could not be reached".
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#CreateHsmConfiguration",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum CreateHsmConfigurationErrorModeled {
     HsmConfigurationAlreadyExistsFault(HsmConfigurationAlreadyExistsFault),
     HsmConfigurationQuotaExceededFault(HsmConfigurationQuotaExceededFault),
     InvalidTagFault(InvalidTagFault),
     TagLimitExceededFault(TagLimitExceededFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -161,20 +171,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateHsmConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateHsmConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateHsmConfiguration"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                CreateHsmConfigurationErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The request's own tag list is capped BEFORE the store is locked and
+        // before any per-element work: "a resource can have up to 50 tags", so a
+        // request carrying more entries than one resource may hold is refused on
+        // its length alone.
+        let tags = input.tags.clone().unwrap_or_default();
+        if tags.len() > st::MAX_TAGS_PER_RESOURCE {
+            return Err(CreateHsmConfigurationErrorModeled::TagLimitExceededFault(
+                TagLimitExceededFault {
+                    message: Some(st::tag_quota_message(tags.len())),
+                },
+            )
+            .into());
+        }
+        if let Err(message) = st::check_tags(&tags) {
+            return Err(CreateHsmConfigurationErrorModeled::InvalidTagFault(
+                InvalidTagFault {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+
+        // Identity before capacity: a request that would create nothing keeps the
+        // more specific fault even when the store is at its bound. The message
+        // names the identifier the REQUEST carried, which is what makes the
+        // refusal say which configuration already holds the name.
+        if store
+            .hsm_configuration(&input.hsm_configuration_identifier)
+            .is_some()
+        {
+            return Err(
+                CreateHsmConfigurationErrorModeled::HsmConfigurationAlreadyExistsFault(
+                    HsmConfigurationAlreadyExistsFault {
+                        message: Some(format!(
+                            "Cannot create the HSM configuration because a configuration with the identifier {} already exists.",
+                            input.hsm_configuration_identifier
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        if store.hsm_configurations.len() >= st::HSM_CONFIGURATION_QUOTA {
+            return Err(
+                CreateHsmConfigurationErrorModeled::HsmConfigurationQuotaExceededFault(
+                    HsmConfigurationQuotaExceededFault {
+                        message: Some(format!(
+                            "The request would exceed the allowed number of HSM configurations ({}).",
+                            st::HSM_CONFIGURATION_QUOTA
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The record every later `DescribeHsmConfigurations` reports verbatim:
+        // the identifier, description, HSM address and partition name the request
+        // carried, and the tags it carried (an empty list when it carried none,
+        // which is what the configuration then has).
+        let configuration = HsmConfiguration {
+            hsm_configuration_identifier: Some(input.hsm_configuration_identifier.clone()),
+            description: Some(input.description.clone()),
+            hsm_ip_address: Some(input.hsm_ip_address.clone()),
+            hsm_partition_name: Some(input.hsm_partition_name.clone()),
+            tags: Some(tags),
+        };
+        store.hsm_configurations.push(st::StoredHsmConfiguration {
+            configuration: configuration.clone(),
+            // Kept verbatim and off the modelled record: the certificate file is
+            // what a cluster configured with this HSM connects to the HSM with,
+            // and the partition password is what unlocks the partition — the
+            // `HsmConfiguration` shape models no member for either.
+            hsm_server_public_certificate: input.hsm_server_public_certificate.clone(),
+            hsm_partition_password: input.hsm_partition_password.clone(),
+        });
+
+        Ok(CreateHsmConfigurationOutput {
+            hsm_configuration: Some(configuration),
+        })
     }
 }

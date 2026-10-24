@@ -17,6 +17,8 @@ mod error_taxonomy;
 mod harness;
 #[path = "all/linux_subscriptions.rs"]
 mod linux_subscriptions;
+#[path = "all/provider_status_transition.rs"]
+mod provider_status_transition;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]

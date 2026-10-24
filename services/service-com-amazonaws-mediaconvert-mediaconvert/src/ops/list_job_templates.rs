@@ -122,32 +122,6 @@ impl From<ListJobTemplatesErrorModeled> for ListJobTemplatesError {
     }
 }
 
-/// Which key the listing is ordered on, as `listBy` chooses it: "you can choose to list
-/// them alphabetically by NAME or chronologically by CREATION_DATE. If you don't specify,
-/// the service will list them by name."
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum SortKey {
-    /// Alphabetically by `Name`. Names are unique within the account, so this key alone
-    /// is a total order.
-    Name,
-    /// Chronologically by `CreatedAt`, with the name breaking ties.
-    CreationDate,
-}
-
-/// Where one template falls against another in the ordering `sort_key` names, reading the
-/// `(creation instant, name)` key the shared cursor
-/// ([`crate::state::encode_cursor`]) carries.
-fn compare(
-    sort_key: SortKey,
-    left: (u128, &str),
-    right: (u128, &str),
-) -> ::std::cmp::Ordering {
-    match sort_key {
-        SortKey::Name => left.1.cmp(right.1),
-        SortKey::CreationDate => left.0.cmp(&right.0).then_with(|| left.1.cmp(right.1)),
-    }
-}
-
 /// The `ListJobTemplates` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -211,11 +185,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         } else {
             crate::state::TYPE_CUSTOM
         };
-        let sort_key = if list_by == crate::state::LIST_BY_CREATION_DATE {
-            SortKey::CreationDate
-        } else {
-            SortKey::Name
-        };
+        // `JobTemplateListBy`: "If you don't specify, the service will list them by name."
+        let sort_key = crate::state::ListBySortKey::from_list_by(
+            Some(list_by),
+            crate::state::ListBySortKey::Name,
+        );
 
         // `category`: "specify a job template category to limit responses to only job
         // templates from that category" — so a template with no category matches no
@@ -229,9 +203,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 category.is_none_or(|want| record.category.as_deref() == Some(want))
             })
             .collect();
-        matching.sort_by(|left, right| {
-            compare(sort_key, left.ordering_key(), right.ordering_key())
-        });
+        matching
+            .sort_by(|left, right| sort_key.compare(left.ordering_key(), right.ordering_key()));
         // "Default varies by resource": a job template listing runs up the key it is
         // ordered on — alphabetically from the start of the alphabet, chronologically
         // from the oldest — unless the caller asks for DESCENDING.
@@ -264,7 +237,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 matching
                     .iter()
                     .position(|record| {
-                        let side = compare(sort_key, record.ordering_key(), anchor);
+                        let side = sort_key.compare(record.ordering_key(), anchor);
                         if ascending {
                             side == ::std::cmp::Ordering::Greater
                         } else {

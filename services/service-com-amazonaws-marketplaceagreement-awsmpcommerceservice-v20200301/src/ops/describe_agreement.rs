@@ -194,6 +194,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
-        Ok(agreement.to_description())
+        // The agreement's cost is the one its own quote priced, read from the
+        // stored request rather than priced a second time.
+        let estimated_charges = store.estimated_charges(agreement);
+        Ok(agreement.to_description(estimated_charges))
     }
 }

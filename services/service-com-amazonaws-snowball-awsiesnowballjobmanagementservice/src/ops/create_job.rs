@@ -357,7 +357,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // so carrying it is not an error, and the cluster is what the order agreed.
             // Only the members a cluster does not model are this request's to supply.
             let job_id = store.mint_job_id();
-            let mut node = cluster.node_job(job_id.clone(), ::std::time::SystemTime::now());
+            let unlock_code = store.mint_unlock_code();
+            let mut node = cluster.node_job(
+                job_id.clone(),
+                ::std::time::SystemTime::now(),
+                unlock_code,
+            );
             node.long_term_pricing_id = input.long_term_pricing_id;
             node.device_configuration = input.device_configuration;
             node.impact_level = input.impact_level;
@@ -456,6 +461,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Filled in below for an export order's main job; a plain job and a job part
             // have no parts of their own.
             job_part_ids: Vec::new(),
+            // The credential the job's device is unlocked with, minted with the job and
+            // read back by `GetJobUnlockCode`.
+            unlock_code: store.mint_unlock_code(),
         };
 
         // The order this create stores: one record for a plain job, and for an export the
@@ -471,6 +479,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let part_id = store.mint_job_id();
                 let mut part = main_job.clone();
                 part.job_id = part_id.clone();
+                // "each job part is associated with a Snowball" (`JobListEntry$IsMaster`):
+                // a part has a device of its own, so it has its own unlock code rather
+                // than the order's.
+                part.unlock_code = store.mint_unlock_code();
                 main_job.job_part_ids.push(part_id);
                 parts.push(part);
             }

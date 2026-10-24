@@ -817,6 +817,21 @@ pub const PARAMETER_GROUP_FAMILIES: [&str; 12] = [
 /// default cache parameter groups in your account.").
 pub const DEFAULT_PARAMETER_GROUP_PREFIX: &str = "default.";
 
+/// The name suffix of the CLUSTER-MODE-ON default parameter group of a family:
+/// `default.<family>.cluster.on`, the group `CreateReplicationGroup`'s own
+/// documentation names ("To create a Valkey or Redis OSS (cluster mode enabled)
+/// replication group, use CacheParameterGroupName=default.redis3.2.cluster.on").
+pub const CLUSTER_MODE_ON_SUFFIX: &str = ".cluster.on";
+
+/// The parameter whose value IS cluster mode, and the value that turns it on.
+///
+/// A family publishes it from the engine version that introduced cluster mode
+/// onward, which is what makes the parameter the one statement of which families
+/// have a cluster-mode-on default group — see [`family_publishes_cluster_mode`].
+pub const CLUSTER_ENABLED_PARAMETER: &str = "cluster-enabled";
+/// See [`CLUSTER_ENABLED_PARAMETER`].
+pub const CLUSTER_ENABLED_ON: &str = "yes";
+
 /// The published parameter group family `engine_version` of `engine` belongs
 /// to, or `None` when no published family covers that version.
 ///
@@ -855,32 +870,68 @@ pub fn default_parameter_group_name(engine: &str, engine_version: &str) -> Optio
         .map(|family| format!("{DEFAULT_PARAMETER_GROUP_PREFIX}{family}"))
 }
 
+/// True when `family` publishes the cluster-mode parameter, and so has a
+/// cluster-mode-on default group beside its plain one.
+///
+/// Read off the family's OWN parameter catalog rather than from a second list of
+/// family names: a family carries [`CLUSTER_ENABLED_PARAMETER`] exactly when its
+/// line covers the engine version that introduced cluster mode, so the groups
+/// this service holds and the parameters they report cannot disagree about which
+/// families can run cluster mode.
+pub fn family_publishes_cluster_mode(family: &str) -> bool {
+    family_default_parameters(family).is_some_and(|parameters| {
+        parameters
+            .values()
+            .any(|parameter| parameter.name == CLUSTER_ENABLED_PARAMETER)
+    })
+}
+
 /// The default parameter groups an account holds the moment ElastiCache becomes
-/// available in it: one per published family, which is why
+/// available in it: one per published family, plus the CLUSTER-MODE-ON default
+/// of every family that can run cluster mode — which is why
 /// `DescribeCacheParameterGroups` answers with groups before anything has been
 /// created. Seeded into
 /// [`ComAmazonawsElasticacheAmazonelasticachev9State::cache_parameter_groups`]
 /// when the store is created, so the groups a read reports and the
 /// [`default_parameter_group_name`] a `CreateCacheCluster` applies cannot
 /// disagree.
+///
+/// A family's two defaults differ by ONE value: the cluster-mode-on group holds
+/// [`CLUSTER_ENABLED_ON`] for [`CLUSTER_ENABLED_PARAMETER`] and takes the
+/// family's engine defaults for everything else, which is what makes it a
+/// customised copy of the plain default rather than a second catalog.
 pub fn default_parameter_groups() -> BTreeMap<String, CacheParameterGroupRecord> {
-    PARAMETER_GROUP_FAMILIES
-        .iter()
-        .map(|family| {
-            let record = CacheParameterGroupRecord {
-                name: format!("{DEFAULT_PARAMETER_GROUP_PREFIX}{family}"),
-                family: (*family).to_string(),
-                // The description AWS gives a family's own default group.
-                description: format!("Default parameter group for {family}"),
-                // Nothing tags a group the service itself provides.
+    let mut groups = BTreeMap::new();
+    for family in PARAMETER_GROUP_FAMILIES {
+        let plain = CacheParameterGroupRecord {
+            name: format!("{DEFAULT_PARAMETER_GROUP_PREFIX}{family}"),
+            family: family.to_string(),
+            // The description AWS gives a family's own default group.
+            description: format!("Default parameter group for {family}"),
+            // Nothing tags a group the service itself provides.
+            tags: Vec::new(),
+            // A family default starts out being exactly its family's engine
+            // defaults: nothing has set a value on it.
+            parameter_values: BTreeMap::new(),
+        };
+        if family_publishes_cluster_mode(family) {
+            let cluster_on = CacheParameterGroupRecord {
+                name: format!("{}{CLUSTER_MODE_ON_SUFFIX}", plain.name),
+                family: family.to_string(),
+                description: format!(
+                    "Customized default parameter group for {family} with cluster mode on"
+                ),
                 tags: Vec::new(),
-                // A family default starts out being exactly its family's engine
-                // defaults: nothing has set a value on it.
-                parameter_values: BTreeMap::new(),
+                parameter_values: BTreeMap::from([(
+                    CLUSTER_ENABLED_PARAMETER.to_string(),
+                    CLUSTER_ENABLED_ON.to_string(),
+                )]),
             };
-            (record.name.clone(), record)
-        })
-        .collect()
+            groups.insert(cluster_on.name.clone(), cluster_on);
+        }
+        groups.insert(plain.name.clone(), plain);
+    }
+    groups
 }
 
 /// One cache parameter group, as this emulator persists it: a family default
@@ -925,6 +976,15 @@ impl CacheParameterGroupRecord {
     /// [`Self::parameter_values`].
     pub fn set_value(&self, name: &str) -> Option<&str> {
         self.parameter_values.get(name).map(String::as_str)
+    }
+
+    /// True when this group turns cluster mode ON: the value it holds for
+    /// [`CLUSTER_ENABLED_PARAMETER`] is [`CLUSTER_ENABLED_ON`].
+    ///
+    /// Read off the group's own parameter value rather than off its NAME, so a
+    /// group's reported parameters and what naming it does cannot disagree.
+    pub fn cluster_mode_on(&self) -> bool {
+        self.set_value(CLUSTER_ENABLED_PARAMETER) == Some(CLUSTER_ENABLED_ON)
     }
 
     /// This record as the modelled `CacheParameterGroup`, read from `region`.
@@ -1941,11 +2001,13 @@ impl ParameterRecord {
     /// the customer's when the group holds a value for it, the service's
     /// otherwise; see [`CacheParameterGroupRecord::parameter_values`].
     ///
-    /// A parameter whose value is per cache node type is never the customer's:
-    /// its value is the node's own capacity, which is why every such row of the
-    /// published catalog is `IsModifiable: false` and so can hold no set value.
+    /// A parameter a customer cannot set is never the customer's, whatever value
+    /// the group holds for it: a parameter whose value is per cache node type
+    /// takes the node's own capacity, and one the engine fixes
+    /// (`IsModifiable: false`) can only carry a value the SERVICE put there —
+    /// the cluster-mode flag of a cluster-mode-on default group, say.
     pub fn source_in_group(&self, set_value: Option<&str>) -> &'static str {
-        if set_value.is_some() && !self.is_node_type_specific() {
+        if set_value.is_some() && !self.is_node_type_specific() && self.is_modifiable {
             PARAMETER_SOURCE_USER
         } else {
             PARAMETER_SOURCE_SYSTEM
@@ -2872,9 +2934,13 @@ fn offering_key(
 /// `FixedPrice` is "the fixed price charged for this offering" — the whole term
 /// for an all-upfront reservation, half of it for a partial-upfront one, nothing
 /// for a no-upfront one — and whatever is not paid up front is the hourly
-/// `RecurringCharges` entry. `UsagePrice`, "the hourly price charged for this
-/// offering", is 0 for all three: an upfront-type reservation's hourly charge is
-/// the recurring charge, not a usage price.
+/// `RecurringCharges` entry. EVERY offering publishes that entry, so
+/// `RecurringCharges` is always a `RecurringCharge` structure a client can read
+/// the frequency and the amount off: an all-upfront offering's amount is 0,
+/// because its whole term is already in the fixed price, which is the one
+/// combination that pairs with a non-zero `FixedPrice`. `UsagePrice`, "the
+/// hourly price charged for this offering", is 0 for all three: an upfront-type
+/// reservation's hourly charge is the recurring charge, not a usage price.
 fn stock_offering(
     product_description: &str,
     cache_node_type: &str,
@@ -2894,14 +2960,10 @@ fn stock_offering(
     } else {
         (0.0, effective_hourly)
     };
-    let recurring_charges = if recurring_hourly > 0.0 {
-        vec![RecurringCharge {
-            recurring_charge_amount: Some(round_to(recurring_hourly, 4)),
-            recurring_charge_frequency: Some(RECURRING_CHARGE_HOURLY.to_string()),
-        }]
-    } else {
-        Vec::new()
-    };
+    let recurring_charges = vec![RecurringCharge {
+        recurring_charge_amount: Some(round_to(recurring_hourly, 4)),
+        recurring_charge_frequency: Some(RECURRING_CHARGE_HOURLY.to_string()),
+    }];
     ReservedCacheNodesOffering {
         reserved_cache_nodes_offering_id: Some(offering_id(
             product_description,
@@ -4791,9 +4853,9 @@ const fn engine_version_row(
 /// several versions per line, at least one version per published family, and a
 /// newest version per engine, which is the one [`default_engine_version`] hands
 /// a cluster that names none.
-pub const CACHE_ENGINE_VERSIONS: [PublishedEngineVersion; 33] = [
-    engine_version_row("memcached", "1.4.5"),
-    // The version `EngineVersion`'s own documentation uses as its example.
+pub const CACHE_ENGINE_VERSIONS: [PublishedEngineVersion; 32] = [
+    // The oldest Memcached version ElastiCache still offers, and the version
+    // `EngineVersion`'s own documentation uses as its example.
     engine_version_row("memcached", "1.4.14"),
     engine_version_row("memcached", "1.4.24"),
     engine_version_row("memcached", "1.4.33"),
@@ -4832,15 +4894,18 @@ pub const CACHE_ENGINE_VERSIONS: [PublishedEngineVersion; 33] = [
 /// (`CacheEngineVersion$CacheEngineDescription`: "the description of the cache
 /// engine").
 ///
-/// The three names the model itself uses for the engines, from
-/// `CreateCacheCluster`'s own documentation: "All nodes in the cluster run the
-/// same protocol-compliant cache engine software, either Memcached, Valkey or
-/// Redis OSS."
+/// The catalog describes an engine by the engine's OWN published name, spelled
+/// the way that engine spells it rather than re-cased by this service:
+/// `memcached` writes its name in lower case, `Redis` and `Valkey` capitalise
+/// theirs. That spelling is also what
+/// `CacheEngineVersion$CacheEngineVersionDescription` is built from (see
+/// [`published_cache_engine_versions`]), so a client selecting an engine by
+/// matching either description string finds the entry under one name.
 pub fn engine_description(engine: &str) -> &'static str {
     match engine {
-        "memcached" => "Memcached",
-        "valkey" => "Valkey",
-        _ => "Redis OSS",
+        "memcached" => "memcached",
+        ENGINE_VALKEY => "Valkey",
+        _ => "Redis",
     }
 }
 
@@ -5383,6 +5448,11 @@ impl NodeSnapshotRecord {
 /// The published cache-engine-version catalog, keyed by
 /// [`engine_version_key`].
 ///
+/// An entry's two descriptions come from two different names: the ENGINE's own
+/// product name describes the engine ([`engine_description`]), and the engine's
+/// API name — the `Engine` value itself — is what the version description is
+/// built from, `<engine> version <version>`.
+///
 /// A `BTreeMap` is what gives `DescribeCacheEngineVersions` the stable total
 /// order its `Marker` indexes into, and the per-engine order its `DefaultOnly`
 /// reads the newest version off.
@@ -5390,7 +5460,6 @@ pub fn published_cache_engine_versions() -> BTreeMap<String, CacheEngineVersionR
     CACHE_ENGINE_VERSIONS
         .iter()
         .map(|row| {
-            let description = engine_description(row.engine);
             (
                 engine_version_key(row.engine, row.engine_version),
                 CacheEngineVersionRecord {
@@ -5401,10 +5470,10 @@ pub fn published_cache_engine_versions() -> BTreeMap<String, CacheEngineVersionR
                         row.engine_version,
                     )
                     .map(str::to_string),
-                    cache_engine_description: description.to_string(),
+                    cache_engine_description: engine_description(row.engine).to_string(),
                     cache_engine_version_description: format!(
-                        "{description} version {}",
-                        row.engine_version
+                        "{} version {}",
+                        row.engine, row.engine_version
                     ),
                 },
             )
@@ -5711,6 +5780,14 @@ pub const DAY: Duration = Duration::from_secs(24 * 60 * 60);
 /// earlier one the clock has already carried past its end date) however long
 /// after this build the emulator runs.
 struct PublishedUpdate {
+    /// The tail of this row's `ServiceUpdateName`, FIXED by the catalog: an
+    /// update's identity is part of what the service publishes, so it is the
+    /// same string on every store this build brings up and is never derived
+    /// from the clock — a client that discovered a name, or that was written
+    /// against one, can still name it in `BatchApplyUpdateAction` /
+    /// `BatchStopUpdateAction` a day later. See [`published_service_updates`]
+    /// for the whole name.
+    slug: &'static str,
     /// One of `ServiceUpdateSeverity`'s values (`critical | important | medium |
     /// low`).
     severity: &'static str,
@@ -5731,6 +5808,7 @@ struct PublishedUpdate {
 /// fallen out of.
 const PUBLISHED_UPDATES: [PublishedUpdate; 2] = [
     PublishedUpdate {
+        slug: "security-update-001",
         severity: "critical",
         released_days_before: 180,
         apply_by_days_after_release: 30,
@@ -5738,6 +5816,7 @@ const PUBLISHED_UPDATES: [PublishedUpdate; 2] = [
         auto_update_after_recommended_apply_by_date: true,
     },
     PublishedUpdate {
+        slug: "security-update-002",
         severity: "important",
         released_days_before: 7,
         apply_by_days_after_release: 30,
@@ -5855,48 +5934,31 @@ pub struct SnapshotCopy {
     pub now: SystemTime,
 }
 
-/// The `YYYYMMDD` an update released at `at` is named after.
-///
-/// Built from the RFC-3339 rendering of the instant, so the service's one
-/// timestamp implementation is also what dates a name.
-fn release_date_label(at: SystemTime) -> String {
-    ::aws_smithy_types::DateTime::from(at)
-        .fmt(::aws_smithy_types::date_time::Format::DateTime)
-        .map(|rendered| {
-            rendered
-                .chars()
-                .take_while(|c| *c != 'T')
-                .filter(|c| c.is_ascii_digit())
-                .collect()
-        })
-        // Unreachable for an instant this century; an unrenderable date is
-        // simply not part of a name.
-        .unwrap_or_default()
-}
-
 /// The service-update catalog as of `anchor`, keyed by `ServiceUpdateName`.
 ///
-/// One update per engine per row of [`PUBLISHED_UPDATES`], named the way AWS
-/// names an ElastiCache service update — `elasticache-<YYYYMMDD>-<NNN>`, the
-/// release date and a sequence number within that date. A `BTreeMap` is what
-/// gives `DescribeServiceUpdates` the stable total order its `Marker` indexes
-/// into.
+/// One update per engine per row of [`PUBLISHED_UPDATES`], named
+/// `elasticache-<engine>-<slug>`: the service, the engine the update applies to
+/// and the row's own [`PublishedUpdate::slug`]. The name is FIXED by the
+/// catalog, so a store built at any instant publishes the same set of names and
+/// a name a client holds stays resolvable; only the DATES hang off `anchor`,
+/// which is what keeps the window shape a real account sees. A `BTreeMap` is
+/// what gives `DescribeServiceUpdates` the stable total order its `Marker`
+/// indexes into.
 pub fn published_service_updates(anchor: SystemTime) -> BTreeMap<String, ServiceUpdateRecord> {
     let mut catalog = BTreeMap::new();
     for row in &PUBLISHED_UPDATES {
         let release_date = anchor
             .checked_sub(DAY * u32::try_from(row.released_days_before).unwrap_or(u32::MAX))
             .unwrap_or(anchor);
-        let label = release_date_label(release_date);
-        for (index, engine) in ENGINES.iter().enumerate() {
-            let name = format!("elasticache-{label}-{:03}", index + 1);
+        for engine in ENGINES {
+            let name = format!("{ARN_NAMESPACE}-{engine}-{}", row.slug);
             let engine_version = default_engine_version(engine);
             let severity = row.severity;
             catalog.insert(
                 name.clone(),
                 ServiceUpdateRecord {
                     service_update_name: name,
-                    engine: (*engine).to_string(),
+                    engine: engine.to_string(),
                     engine_version: engine_version.to_string(),
                     severity: severity.to_string(),
                     update_type: SERVICE_UPDATE_TYPE.to_string(),

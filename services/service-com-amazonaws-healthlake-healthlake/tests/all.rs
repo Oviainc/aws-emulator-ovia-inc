@@ -39,6 +39,8 @@ mod fhir_update_interaction;
 mod list_tags_for_resource;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
+#[path = "all/resource_untagging.rs"]
+mod resource_untagging;
 #[path = "all/restore_fhir_datastore.rs"]
 mod restore_fhir_datastore;
 #[path = "all/state_roundtrip.rs"]

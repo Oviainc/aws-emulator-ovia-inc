@@ -239,3 +239,5 @@ mod pi_resource_features;
 mod cloudformation_provisions_cloudwatch_metric_streams;
 #[path = "all/cloudformation_provisions_event_rules_and_ssm_parameters.rs"]
 mod cloudformation_provisions_event_rules_and_ssm_parameters;
+#[path = "all/cloudformation_provisions_sfn_activities.rs"]
+mod cloudformation_provisions_sfn_activities;

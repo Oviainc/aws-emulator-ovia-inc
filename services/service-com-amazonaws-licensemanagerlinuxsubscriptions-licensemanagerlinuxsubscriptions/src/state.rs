@@ -15,8 +15,14 @@ use crate::ops::types::{
     Filter, LinuxSubscriptionsDiscoverySettings, RegisteredSubscriptionProvider, OPERATOR_VALUES,
 };
 
-/// `SubscriptionProviderStatus` for a provider whose access token License Manager holds
-/// and accepted (`SubscriptionProviderStatus`: ACTIVE | INVALID | PENDING).
+/// `SubscriptionProviderStatus` of a registration that is USABLE: License Manager holds
+/// the provider access token and retrieves subscription data with it
+/// (`SubscriptionProviderStatus`: ACTIVE | INVALID | PENDING).
+///
+/// This is the terminal status a registration the account asked for reaches, and the one a
+/// client script or the console polls for before it expects third-party subscription data
+/// — which is why a registration carrying it also reports a
+/// [`SubscriptionProviderRecord::last_successful_data_retrieval_time`].
 pub const PROVIDER_STATUS_ACTIVE: &str = "ACTIVE";
 
 /// `SubscriptionProviderStatus` of a registration whose access token License Manager has
@@ -25,10 +31,15 @@ pub const PROVIDER_STATUS_ACTIVE: &str = "ACTIVE";
 /// behind it (`GetRegisteredSubscriptionProvider` is what reports where it got to).
 pub const PROVIDER_STATUS_PENDING: &str = "PENDING";
 
-/// `SubscriptionProviderStatus` of a registration whose access token could not be
-/// established as genuine. Terminal: the registration stays in the store reporting it,
-/// together with the [`SubscriptionProviderRecord::status_message`] that says why, which
-/// is the only way a client can tell a refused token from a token still being checked.
+/// `SubscriptionProviderStatus` of a registration whose access token the service rejected.
+/// Terminal: the registration stays in the store reporting it, together with the
+/// [`SubscriptionProviderRecord::status_message`] the service has about the token, which is
+/// the only way a client can tell a refused token from one still being checked.
+///
+/// Nothing in the registration path reaches it: a registration is refused at the request
+/// boundary or it is taken, and a taken one becomes usable
+/// ([`SubscriptionProviderRecord::settle`]). It stays named here because it is a value of
+/// the modelled enum a client may branch on.
 pub const PROVIDER_STATUS_INVALID: &str = "INVALID";
 
 /// How long a fresh registration stays [`PROVIDER_STATUS_PENDING`] before the clock owes
@@ -42,21 +53,6 @@ pub const PROVIDER_STATUS_INVALID: &str = "INVALID";
 /// ([`SubscriptionProviderRecord::settles_at`]) and materialized by whichever later call
 /// runs after it falls due ([`SubscriptionProviderRecord::settle`]) — nothing sleeps.
 pub const TOKEN_VALIDATION_DELAY: Duration = Duration::from_millis(500);
-
-/// The `SubscriptionProviderStatusMessage` of a registration whose token validation this
-/// emulator could not carry out.
-///
-/// Validating a Red Hat offline token means an outbound call to the provider with trust
-/// material this emulator does not hold, so no token reaches a verdict here — and work
-/// nothing performed must not be reported as having succeeded. The registration therefore
-/// settles into the modelled failure status [`PROVIDER_STATUS_INVALID`] with this reason,
-/// rather than into [`PROVIDER_STATUS_ACTIVE`], which would claim a validation nothing
-/// ran. Nothing of the request is interpolated into it: it states what did not happen,
-/// not a verdict on the caller's secret.
-pub const TOKEN_NOT_VALIDATED_MESSAGE: &str =
-    "The subscription provider access token was not validated: this emulator holds no \
-     subscription-provider trust material and makes no call to the provider, so no access \
-     token can be established as genuine";
 
 /// The `LinuxSubscriptionsDiscovery` value an account that never called
 /// `UpdateServiceSettings` reports (`LinuxSubscriptionsDiscovery`: Disabled | Enabled).
@@ -107,9 +103,11 @@ pub struct SubscriptionProviderRecord {
     pub status: String,
     /// Set only when the service has something to report about the token; never fabricated.
     pub status_message: Option<String>,
-    /// When License Manager last retrieved third-party subscription data for this
-    /// account. The emulator makes no outbound call to a third-party provider, so no
-    /// retrieval has ever succeeded and this stays absent rather than being invented.
+    /// When License Manager last retrieved subscription details from this registered
+    /// provider, ISO-8601 UTC ([`iso8601`]). Set when the registration became usable
+    /// ([`PROVIDER_STATUS_ACTIVE`]), which is the retrieval the status reports on, and
+    /// absent while the registration has not got there — never invented for a registration
+    /// that has not.
     pub last_successful_data_retrieval_time: Option<String>,
     /// The metadata tags the registration carried.
     pub tags: HashMap<String, String>,
@@ -143,22 +141,29 @@ impl SubscriptionProviderRecord {
         }
     }
 
-    /// A registration already in a terminal `status`, for a record this service's state
-    /// holds without a registration call having produced it.
+    /// A registration already in a terminal `status` as of `now`, for a record this
+    /// service's state holds without a registration call having produced it.
+    ///
+    /// A registration in [`PROVIDER_STATUS_ACTIVE`] is usable, so it carries the retrieval
+    /// time that status reports on, exactly as one that got there through
+    /// [`settle`](Self::settle) does: the member cannot depend on how the record was
+    /// placed.
     pub fn settled(
         arn: String,
         source: String,
         secret_arn: String,
         status: String,
         tags: HashMap<String, String>,
+        now: SystemTime,
     ) -> Self {
+        let active = status == PROVIDER_STATUS_ACTIVE;
         Self {
             arn,
             source,
             secret_arn,
             status,
             status_message: None,
-            last_successful_data_retrieval_time: None,
+            last_successful_data_retrieval_time: active.then(|| iso8601(now)),
             tags,
             settles_at: None,
         }
@@ -166,11 +171,19 @@ impl SubscriptionProviderRecord {
 
     /// Materialize the status transition the clock owes this registration by `now`.
     ///
-    /// The token validation that runs behind the registration call cannot be carried out
-    /// here (see [`TOKEN_NOT_VALIDATED_MESSAGE`]), so the status this settles into is the
-    /// modelled failure one with the reason that says so. The transition was owed at
-    /// `settles_at` whether or not anybody called, which is what lets a report materialize
-    /// it: no caller's read decides it.
+    /// A registration the account asked for and the service took becomes USABLE: the
+    /// validation running behind the registration call finishes and the registration
+    /// reports [`PROVIDER_STATUS_ACTIVE`], with nothing to report about the token (so no
+    /// `SubscriptionProviderStatusMessage`) and the subscription data retrieval that status
+    /// reports on recorded in
+    /// [`last_successful_data_retrieval_time`](Self::last_successful_data_retrieval_time).
+    /// A failure status belongs to a registration the service rejected, which is a
+    /// condition the request boundary answers before a record exists at all.
+    ///
+    /// The transition was owed at `settles_at` whether or not anybody called, which is what
+    /// lets a report materialize it: no caller's read decides it, and the values it writes
+    /// are derived from the DUE instant rather than from the reader's clock, so every later
+    /// read of the same registration answers the same thing.
     fn settle(&mut self, now: SystemTime) {
         let Some(due) = self.settles_at else {
             return;
@@ -179,8 +192,9 @@ impl SubscriptionProviderRecord {
             return;
         }
         self.settles_at = None;
-        self.status = PROVIDER_STATUS_INVALID.to_string();
-        self.status_message = Some(TOKEN_NOT_VALIDATED_MESSAGE.to_string());
+        self.status = PROVIDER_STATUS_ACTIVE.to_string();
+        self.status_message = None;
+        self.last_successful_data_retrieval_time = Some(iso8601(due));
     }
 }
 
@@ -520,6 +534,24 @@ const PROVIDER_ARN_SERVICE: &str = "license-manager-linux-subscriptions";
 /// order, so a list page and its cursor stay stable.
 pub fn provider_id(sequence: u64) -> String {
     format!("00000000-0000-4000-8000-{sequence:012x}")
+}
+
+/// Format `at` the way this service's one timestamp member carries an instant:
+/// ISO-8601 UTC at whole-second precision, e.g. `2026-10-24T03:43:12Z`.
+///
+/// `LastSuccessfulDataRetrievalTime` is a plain `String` in the model
+/// (`smithy_query(query="operation",operation="GetRegisteredSubscriptionProvider")`), so
+/// the value has to carry its own format; ISO-8601 UTC is what an AWS JSON timestamp
+/// rendered as a string is, and it is what both operations that report this member use,
+/// so a client parses one format wherever it reads it.
+pub fn iso8601(at: SystemTime) -> String {
+    let seconds = at
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|since_epoch| since_epoch.as_secs() as i64)
+        .unwrap_or_default();
+    ::aws_smithy_types::DateTime::from_secs(seconds)
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_string())
 }
 
 /// The `RegisteredSubscriptionProvider` the model describes, built entirely from the

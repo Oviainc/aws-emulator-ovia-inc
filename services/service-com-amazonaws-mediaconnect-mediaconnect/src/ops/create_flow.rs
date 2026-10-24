@@ -337,11 +337,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // `FlowTags` writes the same tag map TagResource writes, so a pair it carries is
-        // bounded by the same rule, named once in `crate::state`.
-        for (key, value) in input.flow_tags.iter().flatten() {
-            if let Some(reason) = crate::state::tag_pair_rejection(key, value) {
-                return Err(bad_request(reason));
+        // `FlowTags` writes the same tag map TagResource writes, so it is bounded by the
+        // same rules, read from the one place that states them.
+        if let Some(rejection) =
+            crate::state::tag_set_rejection("FlowTags", input.flow_tags.as_ref())
+        {
+            return Err(bad_request(rejection));
+        }
+
+        // Each sub-resource this request can create carries a tag member of its OWN
+        // (`SourceTags`, `OutputTags`, `EntitlementTags`), and each of those sub-resources
+        // has its own ARN — so each is a resource the tagging operations address, and each
+        // tag map is bounded by the same rules `FlowTags` is (see
+        // `crate::state::tag_set_rejection`). Checked before anything is stored, so a
+        // refused request creates no flow.
+        for (index, source) in requested_sources.iter().enumerate() {
+            if let Some(rejection) = crate::state::tag_set_rejection(
+                &format!("Sources[{index}]"),
+                source.source_tags.as_ref(),
+            ) {
+                return Err(bad_request(rejection));
+            }
+        }
+        for (index, output) in input.outputs.iter().flatten().enumerate() {
+            if let Some(rejection) = crate::state::tag_set_rejection(
+                &format!("Outputs[{index}]"),
+                output.output_tags.as_ref(),
+            ) {
+                return Err(bad_request(rejection));
+            }
+        }
+        for (index, entitlement) in input.entitlements.iter().flatten().enumerate() {
+            if let Some(rejection) = crate::state::tag_set_rejection(
+                &format!("Entitlements[{index}]"),
+                entitlement.entitlement_tags.as_ref(),
+            ) {
+                return Err(bad_request(rejection));
             }
         }
 

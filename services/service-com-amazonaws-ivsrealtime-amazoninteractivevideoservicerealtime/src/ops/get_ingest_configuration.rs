@@ -144,7 +144,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A pure read (`@readonly` in the model, and "Gets information about the
         // specified IngestConfiguration"): the configuration is reported exactly as it
         // is stored — the same ingest key and participant id `CreateIngestConfiguration`
-        // minted — and nothing is written, so a later caller sees what this one saw.
+        // minted, and the `state` its stage's publishers make true right now — and
+        // nothing is written, so a later caller sees what this one saw.
         let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::state::store_unavailable(
@@ -159,7 +160,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         Ok(GetIngestConfigurationOutput {
-            ingest_configuration: Some(record.to_ingest_configuration()),
+            ingest_configuration: Some(record.to_ingest_configuration(&store)),
         })
     }
 }

@@ -37,6 +37,10 @@ use crate::ops::types::{
     InstrumentationConfiguration, InstrumentationConfigurationWithoutServiceEnv,
     InstrumentationStatusEvent, Location, LocationIdentifier,
 };
+// The shapes the audit read projects, on their own `use` for the same reason.
+use crate::ops::types::{
+    AuditFinding, AuditTarget, AuditTargetEntity, AuditorResult, MetricGraph, ServiceEntity,
+};
 
 /// This service's SigV4 signing name, which is also its ARN namespace
 /// (`OPERATIONS.md`: `sigv4 signing name: application-signals`, `ARN namespace:
@@ -826,6 +830,11 @@ pub fn derive_metric_source_type(
 pub struct SloEntity {
     pub key_attributes: Option<HashMap<String, String>>,
     pub operation_name: Option<String>,
+    /// The kind of metric the indicator measures (`MetricType`,
+    /// `smithy_query(shape="ServiceLevelIndicatorMetric")`), which is how a read that
+    /// selects on the measured type — an audit target naming a service operation and its
+    /// metric type — narrows to the objectives that measure it.
+    pub metric_type: Option<String>,
     pub dependency_config: Option<DependencyConfig>,
     pub metric_source: Option<MetricSource>,
     pub composite_sli_config: Option<crate::ops::types::CompositeSliConfig>,
@@ -838,6 +847,7 @@ pub fn entity_of(slo: &ServiceLevelObjective) -> SloEntity {
         return SloEntity {
             key_attributes: metric.key_attributes.clone(),
             operation_name: metric.operation_name.clone(),
+            metric_type: metric.metric_type.clone(),
             dependency_config: metric.dependency_config.clone(),
             metric_source: metric.metric_source.clone(),
             composite_sli_config: metric.composite_sli_config.clone(),
@@ -848,6 +858,7 @@ pub fn entity_of(slo: &ServiceLevelObjective) -> SloEntity {
         return SloEntity {
             key_attributes: metric.key_attributes.clone(),
             operation_name: metric.operation_name.clone(),
+            metric_type: metric.metric_type.clone(),
             dependency_config: metric.dependency_config.clone(),
             metric_source: metric.metric_source.clone(),
             composite_sli_config: metric.composite_sli_config.clone(),
@@ -856,6 +867,7 @@ pub fn entity_of(slo: &ServiceLevelObjective) -> SloEntity {
     SloEntity {
         key_attributes: None,
         operation_name: None,
+        metric_type: None,
         dependency_config: None,
         metric_source: None,
         composite_sli_config: None,
@@ -973,6 +985,14 @@ pub fn attributes_contain(
 /// "`Type` designates the type of object this is"
 /// (`smithy_query(query="doc", shape="GetServiceInput", member="KeyAttributes")`).
 pub const TYPE_ATTRIBUTE: &str = "Type";
+
+/// The `Attributes` entry that NAMES the object: "`Name` specifies the name of the object"
+/// (`smithy_query(query="doc", shape="GetServiceInput", member="KeyAttributes")`).
+const NAME_ATTRIBUTE: &str = "Name";
+
+/// The `Attributes` entry that says where the object runs: "`Environment` specifies the
+/// location where this object is hosted" (same member doc as [`NAME_ATTRIBUTE`]).
+const ENVIRONMENT_ATTRIBUTE: &str = "Environment";
 
 /// The entity types `Type` designates, in sorted order.
 ///
@@ -1914,6 +1934,353 @@ fn passes_attribute_filter(
                 .iter()
                 .any(|accepted| accepted == value)
         })
+}
+
+// =============================================================================
+// The audit findings the stored SLOs are evidence of
+// =============================================================================
+
+/// The auditor this emulator holds the input of: the one that assesses the SERVICE LEVEL
+/// OBJECTIVES of the audited entity.
+///
+/// The name is the one the API configures that auditor by, and the only one of the
+/// configurable auditors whose input is a resource this service STORES
+/// (`smithy_query(query="doc", shape="ListAuditFindingsInput", member="Auditors")`: "`slo` -
+/// SloAuditor: Identifies SLO violations and detects breached thresholds during the
+/// Assessment phase"). Every other auditor that doc names reads telemetry — the request,
+/// error and latency metrics, the traces, the EMF logs and the change events an instrumented
+/// application sends Application Signals — which this emulator never receives, so each of
+/// them produces no result and an `Auditors` filter naming only those reports nothing.
+pub const SLO_AUDITOR: &str = "slo";
+
+/// The `Severity` of an auditor result that reports NO issue
+/// (`smithy_query(shape="Severity")` -> `["CRITICAL", "HIGH", "MEDIUM", "LOW", "NONE"]`).
+const SEVERITY_NONE: &str = "NONE";
+
+/// The `DetailLevel` that asks for the fullest per-finding context
+/// (`smithy_query(shape="DetailLevel")` -> `["BRIEF", "DETAILED"]`).
+pub const DETAIL_LEVEL_DETAILED: &str = "DETAILED";
+
+/// The budget status of an objective whose attainment has no evaluated datapoint
+/// (`smithy_query(shape="ServiceLevelObjectiveBudgetStatus")` -> `["OK", "WARNING",
+/// "BREACHED", "INSUFFICIENT_DATA"]`). It is what the SLO auditor's assessment rests on
+/// here: an objective whose attainment cannot be evaluated has no breached threshold to
+/// report, which is why the result it carries is a [`SEVERITY_NONE`] one.
+const BUDGET_STATUS_INSUFFICIENT_DATA: &str = "INSUFFICIENT_DATA";
+
+/// The `AuditorResult.Data` entries the SLO auditor reports: "additional data"
+/// (`smithy_query(shape="AuditorResult")`), each read off the assessed record, named after
+/// the member of that record it carries.
+const AUDITOR_DATA_SLO_NAME: &str = "SloName";
+/// [`AUDITOR_DATA_SLO_NAME`], for the assessed objective's ARN.
+const AUDITOR_DATA_SLO_ARN: &str = "SloArn";
+/// [`AUDITOR_DATA_SLO_NAME`], for the attainment goal it is assessed against.
+const AUDITOR_DATA_ATTAINMENT_GOAL: &str = "AttainmentGoal";
+/// [`AUDITOR_DATA_SLO_NAME`], for the budget status the assessment reached.
+const AUDITOR_DATA_BUDGET_STATUS: &str = "BudgetStatus";
+
+/// The kind of audit target a finding was produced for, as `AuditFinding.Type` reports it.
+///
+/// The tokens are the ones the target's own type member enumerates — "The type of entity
+/// being audited, such as `service`, `SLO`, `service_operation`, or `canary`"
+/// (`smithy_query(query="doc", shape="AuditTarget", member="Type")`) — each spelled exactly
+/// as that doc spells it, so a client comparing against the documented set matches. The kind
+/// is read off the modelled `AuditTargetEntity` UNION the request carried, not off the
+/// target's free-form `Type` string, so the finding states the kind of entity that was
+/// actually resolved.
+fn audit_target_kind(target: &AuditTargetEntity) -> &'static str {
+    match target {
+        AuditTargetEntity::Service(_) => "service",
+        AuditTargetEntity::Slo(_) => "SLO",
+        AuditTargetEntity::ServiceOperation(_) => "service_operation",
+        AuditTargetEntity::Canary(_) => "canary",
+    }
+}
+
+/// The key attributes a `ServiceEntity` names, or `None` when it names no entity of this
+/// store.
+///
+/// The shape's members ARE `Attributes` entries: `Type` "the type of the service entity",
+/// `Name` "the name of the service" and `Environment` the location it is hosted in
+/// (`smithy_query(shape="ServiceEntity")`), so a target's service entity becomes the same
+/// kind of identity map `GetService` and `ListServiceOperations` take, and an absent member
+/// simply names one fewer attribute ([`attributes_contain`] matches on a subset).
+///
+/// `None` for an entity that names NO attribute at all, since an empty map would match every
+/// stored identity rather than one, and `None` for an entity in another account: the member
+/// is "the Amazon Web Services account ID where the service is located. Provide this value
+/// only for cross-account access", and this store holds one account's records (see the store
+/// doc), so another account's entity is one it holds nothing for.
+fn audited_entity_attributes(entity: &ServiceEntity) -> Option<HashMap<String, String>> {
+    if entity
+        .aws_account_id
+        .as_deref()
+        .is_some_and(|account| account != ::engine::emulator_account_id())
+    {
+        return None;
+    }
+    let mut attributes = HashMap::new();
+    for (attribute, value) in [
+        (TYPE_ATTRIBUTE, entity.r#type.as_deref()),
+        (NAME_ATTRIBUTE, entity.name.as_deref()),
+        (ENVIRONMENT_ATTRIBUTE, entity.environment.as_deref()),
+    ] {
+        if let Some(value) = value {
+            attributes.insert(attribute.to_string(), value.to_string());
+        }
+    }
+    (!attributes.is_empty()).then_some(attributes)
+}
+
+/// The SLO auditor's result for one assessed objective.
+///
+/// The auditor "identifies SLO violations and detects breached thresholds" (see
+/// [`SLO_AUDITOR`]), and it is run here over the objectives the store holds. Its verdict is
+/// the one the stored state supports: the attainment of an objective has no evaluated
+/// datapoint in this emulator, so the assessment reaches
+/// [`BUDGET_STATUS_INSUFFICIENT_DATA`], no threshold is observed breached, and the result's
+/// severity — "the severity level of this audit finding, indicating the importance and
+/// potential impact of the issue" (`smithy_query(shape="AuditorResult")`) — is the modelled
+/// value for no issue, [`SEVERITY_NONE`]. Claiming any other severity would report a
+/// violation nothing measured.
+///
+/// Every value in `Data` is read off the assessed record, so two objectives' results differ
+/// exactly as their stored configuration does. The attainment goal is the one the objective
+/// is evaluated against, which is the stored goal with the defaults the member documents
+/// filled in ([`goal_with_defaults`]), so the result cannot disagree with what
+/// `GetServiceLevelObjective` reports for the same objective.
+fn slo_auditor_result(slo: &ServiceLevelObjective) -> AuditorResult {
+    let mut data = HashMap::from([
+        (AUDITOR_DATA_SLO_NAME.to_string(), slo.name.clone()),
+        (AUDITOR_DATA_SLO_ARN.to_string(), slo.arn.clone()),
+        (
+            AUDITOR_DATA_BUDGET_STATUS.to_string(),
+            BUDGET_STATUS_INSUFFICIENT_DATA.to_string(),
+        ),
+    ]);
+    if let Some(attainment_goal) = goal_with_defaults(Some(&slo.goal)).attainment_goal {
+        data.insert(
+            AUDITOR_DATA_ATTAINMENT_GOAL.to_string(),
+            attainment_goal.to_string(),
+        );
+    }
+    AuditorResult {
+        auditor: Some(SLO_AUDITOR.to_string()),
+        description: Some(format!(
+            "No attainment datapoint is recorded for service level objective {} in the \
+             requested period, so no breached threshold is reported.",
+            slo.name,
+        )),
+        data: Some(data),
+        severity: Some(SEVERITY_NONE.to_string()),
+    }
+}
+
+/// The metric graph a DETAILED finding carries for one assessed objective: "metric data
+/// queries and time range information that provides context for audit findings through
+/// relevant performance metrics" (`smithy_query(shape="MetricGraph")`).
+///
+/// The queries are the objective's OWN stored ones — the `MetricDataQueries` of a
+/// period-based indicator, or the total and monitored request-count queries of a
+/// request-based one — so the graph names the metrics the assessment is evaluated from
+/// rather than a catalogue this read made up, and the range is the window the request asked
+/// to be audited over.
+fn assessed_metric_graph(
+    slo: &ServiceLevelObjective,
+    window_start: &DateTime,
+    window_end: &DateTime,
+) -> MetricGraph {
+    let mut queries: Vec<MetricDataQuery> = Vec::new();
+    if let Some(sli) = slo.sli.as_ref() {
+        queries.extend(sli.sli_metric.metric_data_queries.iter().cloned());
+    }
+    if let Some(request_based_sli) = slo.request_based_sli.as_ref() {
+        let metric = &request_based_sli.request_based_sli_metric;
+        queries.extend(metric.total_request_count_metric.iter().cloned());
+        let monitored = match &metric.monitored_request_count_metric {
+            MonitoredRequestCountMetricDataQueries::GoodCountMetric(queries) => queries,
+            MonitoredRequestCountMetricDataQueries::BadCountMetric(queries) => queries,
+        };
+        queries.extend(monitored.iter().cloned());
+    }
+    MetricGraph {
+        // An absent fact is an absent member: an objective whose indicator holds no query
+        // contributes no query rather than an empty list.
+        metric_data_queries: (!queries.is_empty()).then_some(queries),
+        start_time: Some(*window_start),
+        end_time: Some(*window_end),
+    }
+}
+
+/// `finding` with only the results of the named auditors left, or `None` once nothing is
+/// left.
+///
+/// The filter is the one the member documents: "a list of auditor names to filter the
+/// findings by. Only findings generated by the specified auditors will be returned" (see
+/// [`SLO_AUDITOR`]) — so a finding none of whose results came from a named auditor was not
+/// generated by one of them and is not reported. An ABSENT list names no filter and keeps
+/// every finding; a list that is present but empty names no auditor, so it keeps none.
+fn retaining_auditors(
+    mut finding: AuditFinding,
+    auditors: Option<&[String]>,
+) -> Option<AuditFinding> {
+    let Some(auditors) = auditors else {
+        return Some(finding);
+    };
+    let results: Vec<AuditorResult> = finding
+        .auditor_results
+        .take()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|result| {
+            result
+                .auditor
+                .as_deref()
+                .is_some_and(|auditor| auditors.iter().any(|named| named == auditor))
+        })
+        .collect();
+    if results.is_empty() {
+        return None;
+    }
+    finding.auditor_results = Some(results);
+    Some(finding)
+}
+
+impl ComAmazonawsApplicationsignalsApplicationsignalsState {
+    /// The audit findings the request's targets resolve to over the window, filtered by the
+    /// auditors it named and carrying the per-finding context its detail level asked for.
+    ///
+    /// Every finding is an assessment of ONE stored service level objective: the audited
+    /// entity is the entity that objective monitors (`AuditFinding.KeyAttributes` is
+    /// `@required` with `length 1..4`, so an objective whose indicator identifies no entity
+    /// is reported for no target), and the result it carries is the SLO auditor's
+    /// ([`slo_auditor_result`]). Which objectives a target resolves to is [`Self::audited`];
+    /// a target this store holds nothing for — an objective that was never created, an
+    /// entity nothing monitors, a kind of resource this service does not hold — contributes
+    /// no finding, exactly as the topology reads report an entity they observed nothing for
+    /// as absent.
+    ///
+    /// An objective named by SEVERAL targets is assessed ONCE: the findings are the
+    /// assessments of a set of objectives, not one per target, and the kind reported for a
+    /// repeated one is that of the first target in the request that resolved to it. The
+    /// order is the objective name's — the order `slos` is keyed in — which is what makes a
+    /// page cursor over this projection a stable boundary.
+    pub fn audited_findings(
+        &self,
+        targets: &[AuditTarget],
+        auditors: Option<&[String]>,
+        detailed: bool,
+        window_start: &DateTime,
+        window_end: &DateTime,
+    ) -> Vec<AuditFinding> {
+        let mut assessed: BTreeMap<String, &'static str> = BTreeMap::new();
+        for target in targets {
+            let kind = audit_target_kind(&target.data);
+            for name in self.audited(&target.data, window_start, window_end) {
+                assessed.entry(name).or_insert(kind);
+            }
+        }
+        assessed
+            .into_iter()
+            .filter_map(|(name, kind)| {
+                let slo = self.slos.get(&name)?;
+                let entity = entity_of(slo);
+                let key_attributes = entity
+                    .key_attributes
+                    .filter(|attributes| !attributes.is_empty())?;
+                Some(AuditFinding {
+                    key_attributes,
+                    auditor_results: Some(vec![slo_auditor_result(slo)]),
+                    operation: entity.operation_name,
+                    // Only the SLO auditor produces a result here, and the context it
+                    // reports is the metric graph of the objective it assessed. A
+                    // `DependencyGraph` is the trace and critical-path auditors' artefact —
+                    // built from the distributed traces this emulator never receives — so
+                    // no finding here carries one.
+                    metric_graph: detailed
+                        .then(|| assessed_metric_graph(slo, window_start, window_end)),
+                    dependency_graph: None,
+                    r#type: Some(kind.to_string()),
+                })
+            })
+            .filter_map(|finding| retaining_auditors(finding, auditors))
+            .collect()
+    }
+
+    /// The names of the stored objectives one audit target resolves to over the window.
+    ///
+    /// Each kind of target names its entity the way the API identifies that kind:
+    ///
+    /// * an objective by name or ARN, resolved as every operation taking a
+    ///   `ServiceLevelObjectiveId` resolves one ([`Self::resolve`]). A target that states
+    ///   both must state them of ONE objective: two identities naming two records name no
+    ///   single objective, and an identity that resolves to nothing resolves the whole
+    ///   target to nothing.
+    /// * a service by its key attributes ([`audited_entity_attributes`]), resolving to the
+    ///   objectives that monitor it ([`Self::monitoring`] — the same subset match and the
+    ///   same window rule the topology reads apply).
+    /// * a service operation by its service AND its operation, since an operation is
+    ///   identified by the service it belongs to; its optional metric type narrows further
+    ///   to the objectives whose indicator measures that type.
+    /// * a canary names a Synthetics resource, which this service does not hold, so it
+    ///   resolves to nothing.
+    fn audited(
+        &self,
+        target: &AuditTargetEntity,
+        window_start: &DateTime,
+        window_end: &DateTime,
+    ) -> Vec<String> {
+        match target {
+            AuditTargetEntity::Slo(entity) => {
+                let mut resolved: Option<&ServiceLevelObjective> = None;
+                for id in [entity.slo_name.as_deref(), entity.slo_arn.as_deref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    let Some(slo) = self.resolve(id) else {
+                        return Vec::new();
+                    };
+                    if resolved.is_some_and(|already| already.name != slo.name) {
+                        return Vec::new();
+                    }
+                    resolved = Some(slo);
+                }
+                resolved
+                    .filter(|slo| monitored_in_window(slo, window_start, window_end))
+                    .map(|slo| vec![slo.name.clone()])
+                    .unwrap_or_default()
+            }
+            AuditTargetEntity::Service(entity) => {
+                let Some(attributes) = audited_entity_attributes(entity) else {
+                    return Vec::new();
+                };
+                self.monitoring(&attributes, window_start, window_end)
+                    .map(|slo| slo.name.clone())
+                    .collect()
+            }
+            AuditTargetEntity::ServiceOperation(entity) => {
+                let (Some(service), Some(operation)) =
+                    (entity.service.as_ref(), entity.operation.as_deref())
+                else {
+                    return Vec::new();
+                };
+                let Some(attributes) = audited_entity_attributes(service) else {
+                    return Vec::new();
+                };
+                self.monitoring(&attributes, window_start, window_end)
+                    .filter(|slo| {
+                        let assessed = entity_of(slo);
+                        assessed.operation_name.as_deref() == Some(operation)
+                            && entity.metric_type.as_deref().is_none_or(|metric_type| {
+                                assessed.metric_type.as_deref() == Some(metric_type)
+                            })
+                    })
+                    .map(|slo| slo.name.clone())
+                    .collect()
+            }
+            AuditTargetEntity::Canary(_) => Vec::new(),
+        }
+    }
 }
 
 // =============================================================================

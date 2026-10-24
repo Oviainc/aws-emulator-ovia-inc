@@ -26,20 +26,35 @@
 //! `BillingAdjustmentSummary`) is computed from these records, so the
 //! implemented operations share exactly one copy of each resource.
 //!
-//! ## What this emulator does NOT know
+//! ## Where the money comes from
 //!
 //! An agreement request names terms that live in an *agreement proposal* (an
 //! offer), which is a resource of a different AWS Marketplace API and is not in
-//! this service's model or state. So the emulator holds no rate card, and no
-//! money amount can be computed from a request: every amount member
-//! (`ChargeSummary$newAgreementValueAfterTax`, `ExpectedCharge$amount`,
-//! `ItemizedCharge$incrementalChargeAmount`, …) is optional in the model and is
-//! left absent rather than invented. The one amount the model DOES define
-//! without a rate card is `EstimatedCharges$agreementValue`, which documents
-//! "This is `0` if the accepted terms contain `UsageBasedPricingTerm` without
-//! `ConfigurableUpfrontPricingTerm` or `RecurringPaymentTerm`" — i.e. zero when
-//! nothing in the terms commits the acceptor to an amount, and that is the case
-//! this emulator reports.
+//! this service's model or state — so there is no per-proposal rate card to
+//! read here. What this emulator holds instead is a rate card of its OWN, as
+//! DATA: [`RATE_CARD`] publishes the per-unit price of each product dimension
+//! it carries, at each contract length, and [`TERM_PRICE_LIST`] the single
+//! price of each kind of term that carries one instead of a rate card. A quote
+//! prices the dimensions and terms those lists publish — quantity times the
+//! published rate — and reports NO amount for anything they do not, which
+//! `ExpectedCharge$amount` ("Only available when the charge amount is known")
+//! states. Nothing here derives a price: a rate card is data.
+//!
+//! Each amount is computed ONCE, by the quote
+//! ([`ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State::charge_summary`]),
+//! so the agreement that accepting the quote mints and the charges that
+//! agreement holds read that one copy rather than pricing again.
+//!
+//! Two charged kinds are never priced at quote time whatever the lists carry: a
+//! usage-based charge is "based on product usage", and a variable payment is an
+//! amount no seller has requested yet. The agreement value of terms that commit
+//! nothing at all is `EstimatedCharges$agreementValue`'s documented zero
+//! ([`ZERO_AGREEMENT_VALUE`]), and it is absent when a term commits an amount
+//! these lists do not price. `ChargeSummary`'s tax members and its
+//! `invoicingEntity` stay absent: AWS estimates tax from the acceptor's tax
+//! registration and address and invoices through the entity that address
+//! belongs to, none of which this service models, and the model returns those
+//! members "on a best-effort basis".
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -50,9 +65,10 @@ use sha2::{Digest, Sha256};
 use crate::ops::types::{
     AcceptedTerm, Acceptor, AgreementCancellationRequestSummary, AgreementEntitlement,
     AgreementViewSummary, BatchCreateBillingAdjustmentRequestEntry, BillingAdjustmentSummary,
-    ByolPricingTerm, Charge, ChargeSummary, ConfigurableUpfrontPricingTerm, ConflictException,
-    DescribeAgreementOutput, EndTimeBehavior, Entitlement, EstimatedCharges, ExpectedCharge,
-    Filter, FixedUpfrontPricingTerm, FreeTrialPricingTerm, GetAgreementPaymentRequestOutput,
+    ByolPricingTerm, Charge, ChargeSummary, ConfigurableUpfrontPricingTerm,
+    ConfigurableUpfrontPricingTermConfiguration, ConflictException, DescribeAgreementOutput,
+    EndTimeBehavior, Entitlement, EstimatedCharges, ExpectedCharge, Filter,
+    FixedUpfrontPricingTerm, FreeTrialPricingTerm, GetAgreementPaymentRequestOutput,
     GetBillingAdjustmentRequestOutput, InternalServerException, ItemizedCharge, LegalTerm,
     NetPaymentTerm, PaymentRequestSummary, PaymentScheduleTerm, ProposalSummary, Proposer,
     PurchaseOrder, RecurringPaymentTerm, RenewalTerm, RequestedTerm, RequestedTermConfiguration,
@@ -250,6 +266,269 @@ pub const SERVICE_CODE: &str = "aws-marketplace";
 /// terms set, which includes one carrying no pricing term at all (a legal term
 /// only): there too the total known amount the acceptor has to pay is zero.
 pub const ZERO_AGREEMENT_VALUE: &str = "0";
+
+// ---------------------------------------------------------------------------
+// Prices
+// ---------------------------------------------------------------------------
+
+/// The currency every price this service quotes is in, as `CurrencyCode` spells
+/// one (`@length(3, 3)`, `^[A-Z]+$`): "The three-letter currency code for all
+/// charges (e.g., USD)".
+///
+/// One code for every charge of an agreement is what that member states ("for
+/// ALL charges"), and the listing catalog this service serves ([`CATALOG`])
+/// prices in US dollars.
+pub const CURRENCY_CODE: &str = "USD";
+
+/// How many minor units one unit of [`CURRENCY_CODE`] divides into, which is
+/// the precision every amount this service reports carries.
+const MINOR_UNITS: u128 = 100;
+
+/// One published per-unit rate of the rate card this emulator carries: what one
+/// unit of a product dimension costs, per contract length.
+///
+/// `RateCardItem` is "the per unit rates for each individual product dimension":
+/// its `dimensionKey` is the "dimension for which the given entitlement
+/// applies… Dimensions represent categories of capacity in a product and are
+/// specified when the product is listed in AWS Marketplace", and its `price` is
+/// the "per unit price for the product dimension that's used for calculating the
+/// amount to be charged". Which rate card of a term applies is the acceptor's
+/// choice: `ConfigurableUpfrontRateCardItem$selector` "differentiates between
+/// the mutually exclusive rate cards in the same pricing term to be selected by
+/// the buyer", and the configuration's `selectorValue` "defines the length of
+/// time for which the particular pricing/dimension is being purchased" — so a
+/// rate is keyed by the dimension and the contract length together.
+#[derive(Debug, Clone, Copy)]
+pub struct PublishedRate {
+    /// The product dimension this row prices.
+    pub dimension_key: &'static str,
+    /// `(selectorValue, the price of one unit in minor units of
+    /// [`CURRENCY_CODE`])`.
+    pub per_selector: &'static [(&'static str, u64)],
+}
+
+/// The rate card this emulator quotes configured prepaid dimensions from.
+///
+/// SOURCE: this is the emulator's OWN catalog. A rate card belongs to the
+/// agreement proposal — the seller's offer — which is a resource of a different
+/// AWS Marketplace API and is in neither this service's model nor its state, and
+/// AWS publishes no list price for another seller's listing, so there is no
+/// price list to carry here and nothing to compute one from either. The rows
+/// below are therefore DATA this emulator ships, the way a price list is data:
+/// the dimension names are the ones AWS Marketplace contract pricing documents
+/// as examples of product dimensions (users, admins, hosts, nodes, data
+/// storage), and the selectors are the ISO-8601 contract lengths contract
+/// pricing is bought in (1, 12, 24 and 36 months), each priced per unit for the
+/// whole length.
+///
+/// It is deliberately a SLICE: a dimension these rows do not publish, or a
+/// contract length they do not publish for that dimension, is quoted with NO
+/// amount at all — `ExpectedCharge$amount` is "only available when the charge
+/// amount is known" — never with a made-up number.
+pub const RATE_CARD: &[PublishedRate] = &[
+    PublishedRate {
+        dimension_key: "Users",
+        per_selector: &[("P1M", 2_000), ("P12M", 21_600), ("P24M", 40_800), ("P36M", 57_600)],
+    },
+    PublishedRate {
+        dimension_key: "Admins",
+        per_selector: &[("P1M", 5_000), ("P12M", 54_000), ("P24M", 102_000), ("P36M", 144_000)],
+    },
+    PublishedRate {
+        dimension_key: "Hosts",
+        per_selector: &[("P1M", 1_200), ("P12M", 12_960), ("P24M", 24_480), ("P36M", 34_560)],
+    },
+    PublishedRate {
+        dimension_key: "Nodes",
+        per_selector: &[("P1M", 3_500), ("P12M", 37_800), ("P24M", 71_400), ("P36M", 100_800)],
+    },
+    PublishedRate {
+        dimension_key: "Storage",
+        per_selector: &[("P1M", 10), ("P12M", 108), ("P24M", 204), ("P36M", 288)],
+    },
+    PublishedRate {
+        dimension_key: "DataTransfer",
+        per_selector: &[("P1M", 5), ("P12M", 54), ("P24M", 102), ("P36M", 144)],
+    },
+];
+
+/// The price of a term that carries ONE price instead of a rate card, in minor
+/// units of [`CURRENCY_CODE`], keyed by the kind of term:
+/// `FixedUpfrontPricingTerm$price` is the "fixed amount to be charged to the
+/// customer when this term is accepted", `RecurringPaymentTerm$price` the
+/// "amount charged to the buyer every billing period", and a
+/// `PaymentScheduleTerm`'s is the total of the installments its "schedule"
+/// lists ("the sum of all invoice charges in the payment schedule",
+/// `EstimatedCharges$agreementValue`).
+///
+/// Data on the same footing as [`RATE_CARD`], and keyed by the kind rather than
+/// by a term id because the price of such a term is stated by the proposal's
+/// term document and a term id is the acceptor's own naming of it. A kind this
+/// list does not publish is quoted with no amount.
+pub const TERM_PRICE_LIST: &[(&str, u64)] = &[
+    ("FixedUpfrontPricingTerm", 120_000),
+    ("RecurringPaymentTerm", 10_000),
+    ("PaymentScheduleTerm", 360_000),
+];
+
+/// The published per-unit rate of `dimension_key` at `selector`, or `None` when
+/// [`RATE_CARD`] publishes none — the case no amount is reported for.
+fn published_unit_rate(dimension_key: &str, selector: &str) -> Option<u64> {
+    RATE_CARD
+        .iter()
+        .find(|rate| rate.dimension_key == dimension_key)?
+        .per_selector
+        .iter()
+        .find(|(published, _)| *published == selector)
+        .map(|(_, price)| *price)
+}
+
+/// The published price of a term of `kind` that carries one price rather than a
+/// rate card, or `None` when [`TERM_PRICE_LIST`] publishes none.
+fn published_term_price(kind: &str) -> Option<u64> {
+    TERM_PRICE_LIST
+        .iter()
+        .find(|(published, _)| *published == kind)
+        .map(|(_, price)| *price)
+}
+
+/// `minor` minor units, as every money member of this service spells an amount:
+/// the units, a decimal point, and the two minor digits.
+pub fn amount(minor: u128) -> String {
+    format!(
+        "{units}.{minor_digits:02}",
+        units = minor / MINOR_UNITS,
+        minor_digits = minor % MINOR_UNITS
+    )
+}
+
+/// The quantity a dimension value buys, in the arithmetic amounts are computed
+/// in. `ZeroValueInteger` is `@range(min: 0)`, so a negative value is one the
+/// boundary already refused and buys nothing.
+fn quantity(value: i32) -> u128 {
+    u128::try_from(value).unwrap_or(0)
+}
+
+/// What one priced dimension of a configured prepaid term costs.
+#[derive(Debug)]
+struct DimensionPrice {
+    /// "The dimension key as specified in the accepted term."
+    key: String,
+    /// "The requested quantity for this dimension."
+    new_quantity: i32,
+    /// "The existing quantity for this dimension from the source agreement."
+    old_quantity: i32,
+    /// `ItemizedCharge$incrementalChargeAmount`, "the total incremental charge
+    /// amount for this dimension": the units this request ADDS at the
+    /// dimension's published rate, and `None` for a dimension [`RATE_CARD`]
+    /// publishes no rate for.
+    incremental: Option<u128>,
+}
+
+/// What one charged term of a quote costs.
+#[derive(Debug, Default)]
+struct TermPrice {
+    /// What this request is charged for the term — `ExpectedCharge$amount`,
+    /// "the tax-exclusive amount of the charge" — which for an amendment covers
+    /// only the units the amendment adds. `None` for a charge the published
+    /// rates do not price.
+    charged: Option<u128>,
+    /// What the term commits over the agreement's lifecycle at the quantities
+    /// this request asks for, which is what `ChargeSummary$newAgreementValue`
+    /// totals. `None` for a term the published rates do not price.
+    committed: Option<u128>,
+    /// One entry per dimension the acceptor configured, in the order the
+    /// configuration lists them.
+    dimensions: Vec<DimensionPrice>,
+}
+
+/// What the term of kind `kind` costs, given the configuration the acceptor
+/// supplied and the quantities the agreement being amended already holds.
+///
+/// The kinds priced at all are the ones [`commits_amount`] names: a configured
+/// prepaid term at the published per-unit rate of every dimension it buys
+/// ([`published_unit_rate`]), and a fixed upfront, recurring or payment-schedule
+/// term at the one published price of its kind ([`published_term_price`]). Every
+/// other kind is unpriced at quote time whatever is published — a usage-based
+/// charge follows "product usage" and a variable payment is an amount no seller
+/// has requested yet — and so is anything the published rates do not carry.
+fn term_price(
+    kind: &str,
+    configuration: Option<&ConfigurableUpfrontPricingTermConfiguration>,
+    old_quantities: &HashMap<String, i32>,
+) -> TermPrice {
+    if !commits_amount(kind) {
+        return TermPrice::default();
+    }
+    match kind {
+        "ConfigurableUpfrontPricingTerm" => {
+            // The dimensions and the contract length are the acceptor's own
+            // choice, so a term carrying no configuration buys nothing there is
+            // a rate for.
+            let Some(configuration) = configuration else {
+                return TermPrice::default();
+            };
+            let mut dimensions = Vec::with_capacity(configuration.dimensions.len());
+            // The term's own totals, which stay unknown as soon as ONE of its
+            // dimensions is one the rate card does not price: a total missing a
+            // line item is not the amount of the charge.
+            let mut committed: Option<u128> = Some(0);
+            let mut charged: Option<u128> = Some(0);
+            for dimension in &configuration.dimensions {
+                let rate = published_unit_rate(
+                    &dimension.dimension_key,
+                    &configuration.selector_value,
+                )
+                .map(u128::from);
+                let old_quantity = old_quantities
+                    .get(&dimension.dimension_key)
+                    .copied()
+                    .unwrap_or_default();
+                let added =
+                    quantity(dimension.dimension_value).saturating_sub(quantity(old_quantity));
+                let incremental = rate.map(|rate| rate.saturating_mul(added));
+                committed = committed.zip(rate).map(|(total, rate)| {
+                    total.saturating_add(rate.saturating_mul(quantity(dimension.dimension_value)))
+                });
+                charged = charged
+                    .zip(incremental)
+                    .map(|(total, incremental)| total.saturating_add(incremental));
+                dimensions.push(DimensionPrice {
+                    key: dimension.dimension_key.clone(),
+                    new_quantity: dimension.dimension_value,
+                    old_quantity,
+                    incremental,
+                });
+            }
+            TermPrice {
+                charged,
+                committed,
+                dimensions,
+            }
+        }
+        _ => {
+            let price = published_term_price(kind).map(u128::from);
+            TermPrice {
+                charged: price,
+                committed: price,
+                dimensions: Vec::new(),
+            }
+        }
+    }
+}
+
+/// The configured prepaid configuration a requested term carries, if any: the
+/// one union member of `RequestedTermConfiguration` a rate card prices against.
+fn requested_upfront_configuration(
+    requested: &RequestedTerm,
+) -> Option<&ConfigurableUpfrontPricingTermConfiguration> {
+    match requested.configuration.as_ref() {
+        Some(RequestedTermConfiguration::configurableUpfrontPricingTermConfiguration(
+            configuration,
+        )) => Some(configuration),
+        _ => None,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Billing adjustment requests
@@ -913,25 +1192,6 @@ impl Agreement {
         })
     }
 
-    /// The agreement's estimated cost.
-    ///
-    /// Reported only where the model defines it without a rate card: zero when
-    /// no accepted term commits the acceptor to an amount (see
-    /// [`ZERO_AGREEMENT_VALUE`]). When a term does commit one, the amount is
-    /// priced by the proposal's rate card, which this emulator does not hold, so
-    /// the member is left absent rather than invented — and so is
-    /// `currencyCode`, which the same rate card names.
-    pub fn estimated_charges(&self) -> EstimatedCharges {
-        let committed = self
-            .accepted_terms
-            .iter()
-            .any(|term| commits_amount(accepted_term_kind(term)));
-        EstimatedCharges {
-            currency_code: None,
-            agreement_value: (!committed).then(|| ZERO_AGREEMENT_VALUE.to_string()),
-        }
-    }
-
     /// The provisioning state of one entitlement of this agreement at `now`:
     /// its `AgreementEntitlementStatus` and the `…StatusReasonCode` that says
     /// why it is in that state.
@@ -998,7 +1258,13 @@ impl Agreement {
     }
 
     /// The `DescribeAgreement` projection of this agreement.
-    pub fn to_description(&self) -> DescribeAgreementOutput {
+    ///
+    /// `estimated_charges` is the agreement's cost, which the quote it was
+    /// accepted from already priced
+    /// ([`ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State::estimated_charges`]):
+    /// it is passed in rather than recomputed here so the amounts the agreement
+    /// reports are the ones its own quote reported.
+    pub fn to_description(&self, estimated_charges: EstimatedCharges) -> DescribeAgreementOutput {
         DescribeAgreementOutput {
             agreement_id: Some(self.id.clone()),
             acceptor: Some(self.acceptor.clone()),
@@ -1007,7 +1273,7 @@ impl Agreement {
             end_time: self.end_time.map(::aws_smithy_types::DateTime::from),
             acceptance_time: Some(::aws_smithy_types::DateTime::from(self.acceptance_time)),
             agreement_type: Some(self.agreement_type.clone()),
-            estimated_charges: Some(self.estimated_charges()),
+            estimated_charges: Some(estimated_charges),
             proposal_summary: Some(self.proposal_summary.clone()),
             status: Some(self.status.clone()),
             initial_agreement_id: Some(self.initial_agreement_id.clone()),
@@ -2559,19 +2825,50 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
                         .iter()
                         .find(|order| order.charge_id == id)
                         .and_then(|order| order.purchase_order_reference.clone()),
-                    // The amount and the currency it is priced in come from the
-                    // proposal's rate card, which this emulator does not hold
-                    // (see the module docs), so both are read from the quote's
-                    // own charge rather than invented — and the quote carries
-                    // neither.
+                    // "The currency code for the charge amount" and "the amount
+                    // of the charge": both are read from the quote's own charge,
+                    // which priced it once (see the module docs), so a charge is
+                    // never re-priced into a second amount.
                     currency_code: request.charge_summary.currency_code.clone(),
                     amount: expected.amount.clone(),
-                    // "available only when the charge date is known", which is
-                    // exactly when the quote's expected charge carries one.
-                    time: expected.time,
+                    // "The date and time when the charge will be incurred. This
+                    // is available only when the charge date is known." A charge
+                    // timed `ON_ACCEPTANCE` is "charged immediately when the
+                    // agreement request is accepted", so this agreement's
+                    // acceptance is its date. One timed on a billing period or
+                    // on the proposal's payment schedule is dated by a billing
+                    // cycle or a schedule this service does not model, so its
+                    // date stays unknown.
+                    time: expected.time.or_else(|| {
+                        (expected.timing.as_deref() == Some(TIMING_ON_ACCEPTANCE)).then(|| {
+                            ::aws_smithy_types::DateTime::from(agreement.acceptance_time)
+                        })
+                    }),
                 })
             })
             .collect()
+    }
+
+    /// The agreement's estimated cost, as `DescribeAgreement` reports it.
+    ///
+    /// Read from the quote the agreement was accepted from, which priced the
+    /// terms being accepted once ([`Self::charge_summary`]):
+    /// `ChargeSummary$newAgreementValue` is "the total value of the agreement,
+    /// which includes any amendments", the same total
+    /// `EstimatedCharges$agreementValue` reports ("the total known amount
+    /// customer has to pay across the lifecycle of the agreement"). Reading it
+    /// rather than pricing the accepted terms a second time is what keeps the
+    /// quote, the agreement and the agreement's charges reporting one set of
+    /// amounts.
+    pub fn estimated_charges(&self, agreement: &Agreement) -> EstimatedCharges {
+        let summary = self
+            .agreement_requests
+            .get(&agreement.agreement_request_id)
+            .map(|request| &request.charge_summary);
+        EstimatedCharges {
+            currency_code: summary.and_then(|summary| summary.currency_code.clone()),
+            agreement_value: summary.and_then(|summary| summary.new_agreement_value.clone()),
+        }
     }
 
     /// Mint a charge id for an expected charge of a quote. `ExpectedCharge$id`
@@ -2584,13 +2881,14 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
     /// The charges `requested_terms` imply, as `CreateAgreementRequest` returns
     /// them.
     ///
-    /// Every member is computed from the request and the store: one expected
-    /// charge per requested term that is charged at all (with the timing its
-    /// kind implies), one itemized charge per dimension the acceptor configured
-    /// (with the quantity it asked for, and the quantity the source agreement
-    /// already holds for an amendment), and the agreement value where the model
-    /// defines it without a rate card. See the module docs for why no amount is
-    /// reported.
+    /// Every member is computed from the request, the store and the published
+    /// rates: one expected charge per requested term that is charged at all
+    /// (with the timing its kind implies, and the amount the published rates
+    /// price it at), one itemized charge per dimension the acceptor configured
+    /// (with the quantity it asked for, the quantity the source agreement
+    /// already holds for an amendment, and the incremental amount between them),
+    /// and an agreement value totalling what the requested terms commit. See the
+    /// module docs for where the prices come from and what is left unpriced.
     pub fn charge_summary(
         &mut self,
         requested_terms: &[RequestedTerm],
@@ -2607,11 +2905,33 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
 
         let mut expected_charges: Vec<ExpectedCharge> = Vec::new();
         let mut itemized_charges: Vec<ItemizedCharge> = Vec::new();
+        // The agreement value: the total of what the requested terms commit,
+        // whether any term commits an amount at all, and whether one of them
+        // commits an amount the published rates do not price — in which case the
+        // total is NOT known and the member is left absent rather than reported
+        // short.
+        let mut committed_total: u128 = 0;
+        let mut commits = false;
+        let mut unpriced = false;
         for requested in requested_terms {
             let kind = term_kind(requested);
             let Some(timing) = charge_timing(kind) else {
                 continue;
             };
+            let price = term_price(
+                kind,
+                requested_upfront_configuration(requested),
+                &old_quantities,
+            );
+            if commits_amount(kind) {
+                commits = true;
+                match price.committed {
+                    Some(committed) => {
+                        committed_total = committed_total.saturating_add(committed);
+                    }
+                    None => unpriced = true,
+                }
+            }
             let charge_id = self.mint_charge_id();
             expected_charges.push(ExpectedCharge {
                 id: Some(charge_id.clone()),
@@ -2619,42 +2939,41 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
                 // This is available only when the charge date is known" — a
                 // quote has not been accepted yet, so no charge date is.
                 time: None,
-                amount: None,
+                amount: price.charged.map(amount),
+                // The tax members stay absent whatever `taxConfiguration` asked
+                // for: see the module docs.
                 amount_after_tax: None,
                 timing: Some(timing.to_string()),
                 estimated_taxes: None,
             });
-            if let Some(RequestedTermConfiguration::configurableUpfrontPricingTermConfiguration(
-                configuration,
-            )) = requested.configuration.as_ref()
-            {
-                for dimension in &configuration.dimensions {
-                    itemized_charges.push(ItemizedCharge {
-                        dimension_key: Some(dimension.dimension_key.clone()),
-                        new_quantity: Some(dimension.dimension_value),
-                        old_quantity: Some(
-                            old_quantities
-                                .get(&dimension.dimension_key)
-                                .copied()
-                                .unwrap_or_default(),
-                        ),
-                        charge_reference: Some(charge_id.clone()),
-                        incremental_charge_amount: None,
-                    });
-                }
+            for dimension in price.dimensions {
+                itemized_charges.push(ItemizedCharge {
+                    dimension_key: Some(dimension.key),
+                    new_quantity: Some(dimension.new_quantity),
+                    old_quantity: Some(dimension.old_quantity),
+                    charge_reference: Some(charge_id.clone()),
+                    incremental_charge_amount: dimension.incremental.map(amount),
+                });
             }
         }
 
-        let committed = requested_terms
-            .iter()
-            .any(|requested| commits_amount(term_kind(requested)));
         ChargeSummary {
-            currency_code: None,
-            new_agreement_value: (!committed).then(|| ZERO_AGREEMENT_VALUE.to_string()),
+            currency_code: Some(CURRENCY_CODE.to_string()),
+            new_agreement_value: if !commits {
+                Some(ZERO_AGREEMENT_VALUE.to_string())
+            } else if unpriced {
+                None
+            } else {
+                Some(amount(committed_total))
+            },
             new_agreement_value_after_tax: None,
             expected_charges: (!expected_charges.is_empty()).then_some(expected_charges),
             estimated_taxes: None,
             itemized_charges: (!itemized_charges.is_empty()).then_some(itemized_charges),
+            // The entity that issues the acceptor's invoice follows the
+            // acceptor's address, which this service does not model, so the
+            // member stays absent — one of the tax and invoicing members
+            // `ChargeSummary` returns "on a best-effort basis".
             invoicing_entity: None,
         }
     }

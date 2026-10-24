@@ -796,6 +796,200 @@ async fn a_request_level_fault_refuses_the_whole_call_and_writes_nothing() {
     assert_eq!(error_code(&body), "InvalidParameterException", "got {body}");
 }
 
+/// The tags ECS reports for one of its resources, read through ECS's OWN reader.
+async fn ecs_tags(router: &MultiServiceRouter, resource_arn: &str) -> BTreeMap<String, String> {
+    let (status, body) = call(
+        router,
+        ECS,
+        "AmazonEC2ContainerServiceV20141113.ListTagsForResource",
+        serde_json::json!({ "resourceArn": resource_arn }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "ListTagsForResource({resource_arn}): expected 200, got {status} with {body}"
+    );
+    body["tags"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a ListTagsForResource body with no tags list: {body}"))
+        .iter()
+        .map(|tag| {
+            (
+                tag["key"].as_str().expect("Tag.key").to_string(),
+                tag["value"].as_str().expect("Tag.value").to_string(),
+            )
+        })
+        .collect()
+}
+
+/// A tag this API writes to a LIVE resource of an owning service is that
+/// resource's own tag, so the owning service's own reader reports it — here ECS,
+/// whose `ListTagsForResource` is the half of the partial-failure loop that says
+/// whether the write that succeeded really landed.
+///
+/// The rows span two ECS resource KINDS, each beside a well-formed but absent
+/// ARN of the same kind, so the per-resource failure the batch reports is proved
+/// not to have cost the live resource its tag.
+#[tokio::test]
+async fn ecs_reports_the_tags_this_api_writes_through_its_own_reader() {
+    let router = emulator();
+
+    // A cluster and a task-definition revision, each created through ECS with a
+    // tag of its own, so a tag this API never touched is beside the one it writes.
+    let (status, cluster) = call(
+        &router,
+        ECS,
+        "AmazonEC2ContainerServiceV20141113.CreateCluster",
+        serde_json::json!({
+            "clusterName": "propagation-cluster",
+            "tags": [{ "key": "Owner", "value": "ecs" }]
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "CreateCluster: body {cluster}");
+    let cluster_arn = cluster["cluster"]["clusterArn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("CreateCluster returned no clusterArn: {cluster}"))
+        .to_string();
+
+    let (status, definition) = call(
+        &router,
+        ECS,
+        "AmazonEC2ContainerServiceV20141113.RegisterTaskDefinition",
+        serde_json::json!({
+            "family": "propagation-family",
+            "containerDefinitions": [{
+                "name": "app",
+                "image": "public.ecr.aws/nginx/nginx:latest",
+                "memory": 128,
+            }],
+            "tags": [{ "key": "Owner", "value": "ecs" }]
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "RegisterTaskDefinition: body {definition}");
+    let definition_arn = definition["taskDefinition"]["taskDefinitionArn"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!("RegisterTaskDefinition returned no taskDefinitionArn: {definition}")
+        })
+        .to_string();
+
+    // A third kind, the capacity provider, which `TagResource$resourceArn` names too.
+    let (status, provider) = call(
+        &router,
+        ECS,
+        "AmazonEC2ContainerServiceV20141113.CreateCapacityProvider",
+        serde_json::json!({
+            "name": "propagation-pool",
+            "autoScalingGroupProvider": { "autoScalingGroupArn": "asg-propagation" },
+            "tags": [{ "key": "Owner", "value": "ecs" }]
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "CreateCapacityProvider: body {provider}");
+    let provider_arn = provider["capacityProvider"]["capacityProviderArn"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!("CreateCapacityProvider returned no capacityProviderArn: {provider}")
+        })
+        .to_string();
+
+    let rows: &[(&str, &str, &str)] = &[
+        (
+            "ecs cluster",
+            &cluster_arn,
+            "arn:aws:ecs:us-east-1:000000000000:cluster/propagation-ghost",
+        ),
+        (
+            "ecs task definition",
+            &definition_arn,
+            "arn:aws:ecs:us-east-1:000000000000:task-definition/propagation-ghost:1",
+        ),
+        (
+            "ecs capacity provider",
+            &provider_arn,
+            "arn:aws:ecs:us-east-1:000000000000:capacity-provider/propagation-ghost",
+        ),
+    ];
+
+    for (case, live, ghost) in rows {
+        let (status, body) = tagging(
+            &router,
+            "TagResources",
+            serde_json::json!({
+                "ResourceARNList": [live, ghost],
+                "Tags": { "Batch": "partial" }
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case}: expected a 200 with a partial failure, got {status} with {body}"
+        );
+        let failed: Vec<String> = body["FailedResourcesMap"]
+            .as_object()
+            .unwrap_or_else(|| panic!("case {case}: no FailedResourcesMap in {body}"))
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(
+            failed,
+            vec![(*ghost).to_string()],
+            "case {case}: expected exactly the absent ARN to fail, got {failed:?}"
+        );
+
+        // The half the loop turns on: ECS's own reader reports the tag the batch
+        // wrote, beside the tag ECS itself was created with.
+        let held = ecs_tags(&router, live).await;
+        assert_eq!(
+            held,
+            [
+                ("Batch".to_string(), "partial".to_string()),
+                ("Owner".to_string(), "ecs".to_string()),
+            ]
+            .into_iter()
+            .collect::<BTreeMap<_, _>>(),
+            "case {case}: expected ECS to report both tags for {live}, got {held:?}"
+        );
+
+        // And an untag through this API is gone from that same reader, while the
+        // resource's own tag stays.
+        let (status, body) = tagging(
+            &router,
+            "UntagResources",
+            serde_json::json!({ "ResourceARNList": [live], "TagKeys": ["Batch"] }),
+        )
+        .await;
+        assert_eq!(status, 200, "case {case}: UntagResources body {body}");
+        let held = ecs_tags(&router, live).await;
+        assert_eq!(
+            held,
+            [("Owner".to_string(), "ecs".to_string())]
+                .into_iter()
+                .collect::<BTreeMap<_, _>>(),
+            "case {case}: expected the untag to reach ECS's own tags of {live}, got {held:?}"
+        );
+    }
+
+    // Each kind is in this API's own index too, under its qualified resource
+    // type, since the index IS the owning service's records: a resource that
+    // carries a tag is reported, whichever ECS kind it is.
+    let indexed: &[(&str, &str)] = &[
+        ("ecs:cluster", &cluster_arn),
+        ("ecs:task-definition", &definition_arn),
+        ("ecs:capacity-provider", &provider_arn),
+    ];
+    for (filter, arn) in indexed {
+        let got = arns_of_type(&router, &[filter]).await;
+        assert_eq!(
+            got,
+            vec![(*arn).to_string()],
+            "case ResourceTypeFilters=[{filter}]: expected only {arn}, got {got:?}"
+        );
+    }
+}
+
 /// A page-size member outside its documented window is refused with the
 /// service's FIXED range text for that member: the same message for every value
 /// outside it, with the submitted value not echoed.

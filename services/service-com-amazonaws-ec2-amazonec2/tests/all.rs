@@ -205,6 +205,8 @@ mod transit_gateway_acceptance;
 mod transit_gateway_lifecycle;
 #[path = "all/transit_gateway_policy_table_associations.rs"]
 mod transit_gateway_policy_table_associations;
+#[path = "all/transit_gateway_rejection.rs"]
+mod transit_gateway_rejection;
 #[path = "all/transit_gateway_route_table_propagation.rs"]
 mod transit_gateway_route_table_propagation;
 // The Verified Access trust provider slice: create, then read it back.

@@ -149,39 +149,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this operation cannot use, which `InvalidArn` reports before any resource
         // resolution.
         let endpoint_region = crate::state::request_region(ctx.parts());
-        let target = match crate::state::read_taggable_arn(&input.resource_arn, &endpoint_region) {
-            Ok(target) => target,
-            Err(message) => {
-                return Err(UntagResourceErrorModeled::InvalidArn(InvalidArn {
-                    message: Some(message),
-                })
-                .into())
-            }
-        };
+        if let Err(message) = crate::state::read_taggable_arn(&input.resource_arn, &endpoint_region)
+        {
+            return Err(UntagResourceErrorModeled::InvalidArn(InvalidArn {
+                message: Some(message),
+            })
+            .into());
+        }
 
         let mut store = state.lock();
         // This write must see the store a report sees: a state machine whose removal
         // the clock already made due is gone, and is not untagged back into life.
         store.settle(crate::state::now());
 
-        // Only a state machine can be in the store: `CreateActivity` is still
-        // scaffolded, so no activity exists for an activity ARN to name, and the
-        // honest answer for one is that the resource could not be found.
+        // Either taggable resource type answers from the store — the ARN's own
+        // resource-type field is what decides which record is looked up — so an ARN
+        // the store holds no resource under is what the modelled `ResourceNotFound`
+        // reports.
         //
         // `tagKeys` is "the list of tags to remove from the resource": a key the
         // resource does not carry is nothing to remove rather than a failure, so a
         // request naming only keys it does not hold is an empty 200 that changes
         // nothing. The modelled errors are about the ARN and the resource, not about
         // the keys.
-        match target {
-            crate::state::TaggableResource::Activity(_) => Err(not_found(&input.resource_arn)),
-            crate::state::TaggableResource::StateMachine(_) => {
-                if store.remove_state_machine_tags(&input.resource_arn, &input.tag_keys) {
-                    Ok(UntagResourceOutput {})
-                } else {
-                    Err(not_found(&input.resource_arn))
-                }
-            }
+        if store.remove_tags(&input.resource_arn, &input.tag_keys) {
+            Ok(UntagResourceOutput {})
+        } else {
+            Err(not_found(&input.resource_arn))
         }
     }
 }

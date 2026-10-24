@@ -16,8 +16,8 @@ use crate::ops::types::{
     AssistantIntegrationConfiguration, AssistantSummary, ExternalBedrockKnowledgeBaseConfig,
     KnowledgeBaseAssociationData, KnowledgeBaseData, OrchestratorConfigurationEntry,
     RenderingConfiguration, RecommendationData, RecommendationTrigger,
-    ServerSideEncryptionConfiguration, SessionData, SourceConfiguration,
-    TagFilter, VectorIngestionConfiguration,
+    ServerSideEncryptionConfiguration, SessionData, SessionIntegrationConfiguration,
+    SourceConfiguration, TagFilter, VectorIngestionConfiguration,
 };
 
 /// The only `AssistantType` the model declares
@@ -134,6 +134,17 @@ pub const AI_AGENT_VISIBILITY_PUBLISHED: &str = "PUBLISHED";
 /// The terminal `Status` of an AI agent in service
 /// (`smithy_query(query="shape",shape="Status")`).
 pub const AI_AGENT_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// The version of a default `SYSTEM` AI agent the service provisions with an assistant,
+/// and so the version the assistant's binding to it names.
+///
+/// A published AI agent is versioned, and the first published version of one is 1: the
+/// modelled `Version` shape is `range 1..`
+/// (`smithy_query(query="shape",shape="Version")`), and nothing in this emulator
+/// publishes a second version of a default agent, so the version a binding reports stays
+/// the one the provisioning assigned. See [`qualified_ai_agent_id`] for why the binding
+/// reports it at all.
+pub const AI_AGENT_FIRST_VERSION: i64 = 1;
 
 /// The one AI agent type whose binding can be turned off, which is why its binding is
 /// the one that reports `enabled`: the model's `AIAgentConfigurationData$enabled` doc
@@ -321,6 +332,23 @@ pub fn session_arn(region: &str, assistant_id: &str, session_id: &str) -> String
         region,
         &format!("session/{assistant_id}/{session_id}"),
     )
+}
+
+/// The id a binding to an AI agent names that agent by: the agent's own `Uuid` followed
+/// by the `:<VERSION>` qualifier of the version of it that runs.
+///
+/// A binding targets `UuidWithQualifier`, whose pattern is a uuid plus an OPTIONAL
+/// qualifier (`^[a-f0-9]{8}-…-[a-f0-9]{12}(:[A-Z0-9_$]+){0,1}$`,
+/// `smithy_query(query="shape",shape="UuidWithQualifier")`), and an AI agent type's
+/// binding is documented as mapping the type "to AI Agent version"
+/// (`smithy_query(query="shape",shape="SessionData")`, member `aiAgentConfiguration`):
+/// what runs for the type is one VERSION of an agent, so the binding the service itself
+/// made names the version it bound rather than leaving a client unable to tell which one
+/// it got. An id a CALLER configured is stored and reported exactly as given — the
+/// caller already chose whether to pin a version — so this is used only where the
+/// SERVICE binds an agent of its own.
+pub fn qualified_ai_agent_id(ai_agent_id: &str, version_number: i64) -> String {
+    format!("{ai_agent_id}:{version_number}")
 }
 
 /// This service's ARN for an AI agent, which names its parent assistant too:
@@ -545,7 +573,16 @@ pub struct Session {
     pub description: Option<String>,
     pub tags: HashMap<String, String>,
     pub tag_filter: Option<TagFilter>,
+    /// The AI agent bound per `AIAgentType` for this session: the parent assistant's
+    /// bindings, overlaid per type by whatever the create configured for the session
+    /// itself. Stored on the session, so every read of it reports the same bindings.
     pub ai_agent_configuration: HashMap<String, AIAgentConfigurationData>,
+    /// The ARN of the SNS topic this session streams chat messages through: the topic the
+    /// parent assistant was provisioned with (see [`topic_integration_arn`]), which is
+    /// what a session of that assistant is integrated with.
+    pub topic_integration_arn: Option<String>,
+    /// This session's orchestrator configurations, as its create stored them.
+    pub orchestrator_configuration_list: Vec<OrchestratorConfigurationEntry>,
     /// The contact this session was opened for, as the caller gave it. Not a member of
     /// `SessionData`, so it is persisted but not reported.
     pub contact_arn: Option<String>,
@@ -567,13 +604,18 @@ impl Session {
             name: self.name.clone(),
             description: self.description.clone(),
             tags: tags_out(&self.tags),
-            // The emulator integrates a session with no external topic, so the
-            // integration configuration has nothing to report.
-            integration_configuration: None,
+            // Every configuration member of the stored record is reported, each out of
+            // what the record holds — the same rule the assistant is rendered by: the
+            // topic the session streams through, the AI agent bound per `AIAgentType`,
+            // and the orchestrator configurations, the last reported empty rather than
+            // omitted the way `tags` is.
+            integration_configuration: Some(SessionIntegrationConfiguration {
+                topic_integration_arn: self.topic_integration_arn.clone(),
+            }),
             tag_filter: self.tag_filter.clone(),
             ai_agent_configuration: map_out(&self.ai_agent_configuration),
             origin: Some(self.origin.clone()),
-            orchestrator_configuration_list: None,
+            orchestrator_configuration_list: Some(self.orchestrator_configuration_list.clone()),
         }
     }
 }
@@ -596,6 +638,9 @@ pub struct AiAgent {
     pub origin: String,
     pub visibility_status: String,
     pub status: String,
+    /// The version of this agent that is published, and so the version an assistant's or
+    /// session's binding to it names — see [`qualified_ai_agent_id`].
+    pub version_number: i64,
     pub created_at: SystemTime,
 }
 
@@ -1162,17 +1207,20 @@ impl ComAmazonawsQconnectWisdomserviceState {
                     origin: AI_AGENT_ORIGIN_SYSTEM.to_string(),
                     visibility_status: AI_AGENT_VISIBILITY_PUBLISHED.to_string(),
                     status: AI_AGENT_STATUS_ACTIVE.to_string(),
+                    version_number: AI_AGENT_FIRST_VERSION,
                     created_at,
                 },
             );
             bindings.insert(
                 agent_type.to_string(),
                 AIAgentConfigurationData {
-                    // The binding names the stored agent by its id — the model's own
-                    // wording for the member is "The ID of the AI Agent to be
-                    // configured" — so the id this assistant reports is the id of a
-                    // record this store holds.
-                    ai_agent_id,
+                    // The binding names the stored agent by its id AND the version of it
+                    // that runs — the model's own wording for the member is "The ID of
+                    // the AI Agent to be configured", and the map it lives in maps an AI
+                    // agent type "to AI Agent version" — so the id this assistant reports
+                    // is the id of a record this store holds, qualified by that record's
+                    // published version. See [`qualified_ai_agent_id`].
+                    ai_agent_id: qualified_ai_agent_id(&ai_agent_id, AI_AGENT_FIRST_VERSION),
                     // The model's own wording: "Indicates whether the AI Agent
                     // configured for this AI Agent type is enabled … Setting this value
                     // to false is currently supported only for the

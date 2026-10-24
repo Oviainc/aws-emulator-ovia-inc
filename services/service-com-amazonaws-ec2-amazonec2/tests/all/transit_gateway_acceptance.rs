@@ -38,15 +38,15 @@ use super::ec2_query::{call, element, elements, error_code, indexed};
 const REGION: &str = "us-east-1";
 
 /// The HTTP status EC2 answers `DryRunOperation` with.
-const DRY_RUN_STATUS: u16 = 412;
+pub(crate) const DRY_RUN_STATUS: u16 = 412;
 
 /// Long enough past [`TRANSITION_DELAY`] that a move the clock owes is certainly due.
-fn past_the_transition() -> Duration {
+pub(crate) fn past_the_transition() -> Duration {
     TRANSITION_DELAY + Duration::from_millis(250)
 }
 
 /// One call of `action` signed for the Region above.
-async fn invoke(
+pub(crate) async fn invoke(
     router: &MultiServiceRouter,
     action: &str,
     params: &[(String, String)],
@@ -55,7 +55,7 @@ async fn invoke(
 }
 
 /// One `TransitGatewayAttachmentId=` request member.
-fn attachment_param(attachment_id: &str) -> Vec<(String, String)> {
+pub(crate) fn attachment_param(attachment_id: &str) -> Vec<(String, String)> {
     vec![(
         "TransitGatewayAttachmentId".to_string(),
         attachment_id.to_string(),
@@ -63,7 +63,7 @@ fn attachment_param(attachment_id: &str) -> Vec<(String, String)> {
 }
 
 /// The state a stored attachment is in right now, read straight out of the store.
-fn stored_state(engine: &engine::InMemoryEngine, attachment_id: &str) -> String {
+pub(crate) fn stored_state(engine: &engine::InMemoryEngine, attachment_id: &str) -> String {
     engine
         .state::<Ec2State>()
         .lock()
@@ -95,7 +95,7 @@ struct Kind {
 }
 
 /// A VPC attachment waiting for the transit gateway owner.
-fn pending_vpc_attachment() -> TransitGatewayAttachmentView {
+pub(crate) fn pending_vpc_attachment() -> TransitGatewayAttachmentView {
     TransitGatewayAttachmentView::Vpc(TransitGatewayVpcAttachment {
         transit_gateway_id: Some("tgw-0123456789abcdef0".to_string()),
         vpc_id: Some("vpc-0123456789abcdef0".to_string()),
@@ -130,7 +130,7 @@ fn pending_peering_attachment() -> TransitGatewayAttachmentView {
 
 /// A Client VPN attachment waiting for the transit gateway owner. Its state enum is the
 /// HYPHENATED one, so `pending-acceptance` is the state it waits in.
-fn pending_client_vpn_attachment() -> TransitGatewayAttachmentView {
+pub(crate) fn pending_client_vpn_attachment() -> TransitGatewayAttachmentView {
     TransitGatewayAttachmentView::ClientVpn(TransitGatewayClientVpnAttachment {
         transit_gateway_id: Some("tgw-0123456789abcdef0".to_string()),
         client_vpn_endpoint_id: Some("cvpn-endpoint-0123456789abcdef0".to_string()),

@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateInfrastructureConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateInfrastructureConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateInfrastructureConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates the infrastructure configuration this service's state then holds, so a
+//! later `GetInfrastructureConfiguration` reports what this request stored.
+//!
+//! The rules it follows, each from the modelled documentation quoted beside it:
+//!
+//! * the ARN is derived from a NORMALIZED form of the name
+//!   (`crate::state::normalized_name`), and that normalized name must be unique in the
+//!   Region — a second create under it is `ResourceAlreadyExistsException`;
+//! * naming a `subnetId` without any `securityGroupIds` fails the request;
+//! * the four reserved `resourceTags` keys may not be assigned;
+//! * `clientToken` is an idempotency token: a retry carrying it answers with the
+//!   ORIGINAL response, and the same token carrying different creation parameters is
+//!   `IdempotentParameterMismatchException`;
+//! * `dryRun` validates the request and then answers `DryRunOperationException`,
+//!   having stored nothing;
+//! * `terminateInstanceOnFailure` and `terminateInstanceOnCompletion` each default to
+//!   true, and the stored configuration carries that default so every later read
+//!   reports it.
 //!
 //! ## Shape of an operation
 //!
@@ -251,18 +261,179 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateInfrastructureConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateInfrastructureConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateInfrastructureConfiguration"))
+        // Every modelled constraint on this input — `name`'s pattern, the string
+        // lengths, the tag-key pattern that already refuses the `aws:` namespace, the
+        // 1..30 / 1..50 map bounds — has been refused by the centralized walk before
+        // this body runs, so what is checked here is only what the model cannot say.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateInfrastructureConfigurationErrorModeled::ServiceException(ServiceException {
+                message: Some(crate::state::store_unavailable_message()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+
+        // `subnetId`'s own rule: "If you specify subnetId, you must also specify one
+        // or more security group IDs in securityGroupIds. Otherwise, the request
+        // fails." An empty list specifies none of them, so it fails the same way an
+        // absent member does.
+        if input.subnet_id.is_some()
+            && input
+                .security_group_ids
+                .as_ref()
+                .is_none_or(|ids| ids.is_empty())
+        {
+            return Err(
+                CreateInfrastructureConfigurationErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(crate::state::subnet_without_security_group_message()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The reserved metadata-tag keys `resourceTags` documents. Checked before
+        // anything is minted, so a refused create stores nothing.
+        if let Some(reserved) = input.resource_tags.as_ref().and_then(|tags| {
+            crate::state::RESERVED_RESOURCE_TAG_KEYS
+                .iter()
+                .find(|key| tags.contains_key(**key))
+        }) {
+            return Err(
+                CreateInfrastructureConfigurationErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(crate::state::reserved_resource_tag_key_message(reserved)),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let fingerprint = crate::state::create_request_fingerprint(&input);
+        let arn = crate::state::infrastructure_configuration_arn(&region, &input.name);
+
+        // The idempotency check, the name-uniqueness check and the insert happen under
+        // ONE lock, so concurrent creates are serialized: the first to take the lock
+        // stores the Region's configuration and every other one sees it.
+        let mut store = state.lock();
+
+        // "If you retry a request with the same client token, Image Builder returns
+        // the original response without running the operation again" — so a retry
+        // answers with the ORIGINAL response, down to its `requestId`. The same token
+        // carrying different creation parameters is the modelled mismatch instead.
+        if let Some(receipt) =
+            store.infrastructure_configuration_receipt(&region, &input.client_token)
+        {
+            if receipt.fingerprint != fingerprint {
+                return Err(
+                    CreateInfrastructureConfigurationErrorModeled::IdempotentParameterMismatchException(
+                        IdempotentParameterMismatchException {
+                            message: Some(crate::state::idempotent_parameter_mismatch_message()),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            return Ok(CreateInfrastructureConfigurationOutput {
+                request_id: Some(receipt.request_id.clone()),
+                client_token: Some(receipt.client_token.clone()),
+                infrastructure_configuration_arn: Some(receipt.arn.clone()),
+            });
+        }
+
+        // "Infrastructure configuration names must be unique to your account in each
+        // Amazon Web Services Region", compared in the normalized form the ARN carries
+        // — so a name differing from a stored one only in case, spaces or underscores
+        // is the SAME name and is refused.
+        if store.infrastructure_configurations.contains_key(&arn) {
+            return Err(
+                CreateInfrastructureConfigurationErrorModeled::ResourceAlreadyExistsException(
+                    ResourceAlreadyExistsException {
+                        message: Some(
+                            crate::state::infrastructure_configuration_exists_message(&input.name),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The store is finite: a create that would take it past this emulator's own
+        // cap is refused rather than growing it. Checked BEFORE the dry-run branch, so
+        // a dry run reports the same outcome the real create would have.
+        if store.infrastructure_configuration_store_is_full() {
+            return Err(
+                CreateInfrastructureConfigurationErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(crate::state::store_full_message()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // `dryRun`: "Validates the required permissions and request parameters without
+        // performing the operation. If validation succeeds, the operation returns a
+        // DryRunOperationException error response." Every validation above has passed
+        // by here, and nothing has been written — including the request's receipt, so
+        // a dry run leaves the token free for the real request.
+        if input.dry_run {
+            return Err(
+                CreateInfrastructureConfigurationErrorModeled::DryRunOperationException(
+                    DryRunOperationException {
+                        message: Some(crate::state::dry_run_message()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The instant the configuration was created. It is also its last write until
+        // an update replaces it, so `dateUpdated` reports the same instant.
+        let created_at = crate::state::iso8601(::std::time::SystemTime::now());
+        let request_id = crate::state::new_request_id();
+        let client_token = input.client_token.clone();
+
+        store.insert_infrastructure_configuration(
+            crate::state::InfrastructureConfigurationRecord {
+                arn: arn.clone(),
+                region: region.clone(),
+                name: input.name,
+                description: input.description,
+                instance_types: input.instance_types,
+                instance_profile_name: input.instance_profile_name,
+                security_group_ids: input.security_group_ids,
+                subnet_id: input.subnet_id,
+                logging: input.logging,
+                key_pair: input.key_pair,
+                // Each of these two documents the value the service applies when the
+                // request omits it, so the STORED configuration carries that value and
+                // every later read reports it rather than nothing.
+                terminate_instance_on_failure: input
+                    .terminate_instance_on_failure
+                    .unwrap_or(crate::state::DEFAULT_TERMINATE_INSTANCE_ON_FAILURE),
+                terminate_instance_on_completion: input
+                    .terminate_instance_on_completion
+                    .unwrap_or(crate::state::DEFAULT_TERMINATE_INSTANCE_ON_COMPLETION),
+                sns_topic_arn: input.sns_topic_arn,
+                resource_tags: input.resource_tags.map(crate::state::into_ordered_tags),
+                instance_metadata_options: input.instance_metadata_options,
+                tags: input.tags.map(crate::state::into_ordered_tags),
+                placement: input.placement,
+                parent_instance: input.parent_instance,
+                date_created: created_at.clone(),
+                date_updated: created_at,
+            },
+            &client_token,
+            fingerprint,
+            request_id.clone(),
+        );
+
+        Ok(CreateInfrastructureConfigurationOutput {
+            request_id: Some(request_id),
+            client_token: Some(client_token),
+            infrastructure_configuration_arn: Some(arn),
+        })
     }
 }

@@ -3,8 +3,9 @@
 //! @op ListTagsForResource
 //!
 //! REPORTS the tags the resource `ResourceArn` addresses carries in [`crate::state`] —
-//! what CreateFlow's `FlowTags`, TagResource and UntagResource left on it. A read: it
-//! changes nothing.
+//! what that resource's create request (CreateFlow's `FlowTags`, an output's `OutputTags`,
+//! a source's `SourceTags`, an entitlement's `EntitlementTags`), TagResource and
+//! UntagResource left on it. A read: it changes nothing.
 //!
 //! ## Shape of an operation
 //!

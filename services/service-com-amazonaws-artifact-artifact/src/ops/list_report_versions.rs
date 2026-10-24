@@ -7,7 +7,9 @@
 //! resumes at (`crate::state::report_versions_token`). This handler only READS.
 //!
 //! The emulator models no IAM, so the modelled `AccessDeniedException` is never raised
-//! here: a pass is not a statement about an AWS-side authorisation decision.
+//! here: a pass is not a statement about an AWS-side authorisation decision. A `reportId`
+//! the catalog does not hold is refused by the front door's 401 `UnauthorizedException`,
+//! because AWS Artifact authorises the report resource before looking it up.
 //!
 //! The report catalog IS the account's entitlement, though: AWS Artifact is served
 //! through a gateway that authorizes the report the request targets before the service

@@ -24,7 +24,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ssoadmin_permission_sets::{
-    call, error_code, router_over, seeded_instance_arn, with_store,
+    call, error_code, hold_deletion, router_over, seeded_instance_arn, with_store,
 };
 
 /// The provider the applications here are created under: the `custom` entry of the
@@ -169,14 +169,10 @@ async fn the_access_scopes_of_an_application_stop_existing_with_its_instance() {
     );
     // The deletion falls due a span after the call; a test moves the stored due instant
     // rather than sleeping for it.
-    with_store(&engine, |store| {
-        for instance in store.instances.values_mut() {
-            if instance.deleted_due.is_some() {
-                instance.deleted_due =
-                    Some(std::time::SystemTime::now() - std::time::Duration::from_secs(60));
-            }
-        }
-    });
+    hold_deletion(
+        &engine,
+        std::time::SystemTime::now() - std::time::Duration::from_secs(60),
+    );
 
     for (case, application_arn, scope, _) in &rows {
         let (status, body) = get_scope(&router, application_arn, scope).await;

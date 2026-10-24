@@ -11,12 +11,10 @@
 //! Validating the access token held in that secret is work that happens BEHIND this call:
 //! the registration answers `SubscriptionProviderStatus: PENDING` and the verdict lands on
 //! the resource afterwards (which is why `GetRegisteredSubscriptionProvider`, and not this
-//! operation, reports a `SubscriptionProviderStatusMessage`). This emulator holds no
-//! provider trust material and makes no outbound call, so that validation cannot be
-//! carried out: the registration settles into the modelled failure status `INVALID` with
-//! the reason that says so (`crate::state::TOKEN_NOT_VALIDATED_MESSAGE`) once
-//! `crate::state::TOKEN_VALIDATION_DELAY` has passed. It never settles `ACTIVE`, because
-//! nothing here accepted a token.
+//! operation, reports a `SubscriptionProviderStatusMessage`). A registration this call
+//! took then becomes usable: once `crate::state::TOKEN_VALIDATION_DELAY` has passed it
+//! reports `ACTIVE` with the subscription data retrieval that status reports on, which is
+//! the status a client polls for before it expects third-party subscription data.
 //!
 //! The operation is `@idempotent`: a repeat naming a (source, secret) pair this account
 //! already registered answers THAT registration rather than minting a second resource.
@@ -223,8 +221,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 // The registration path is implemented, so there is no blanket refusal constant here any
-// more: the reason this emulator cannot validate a provider access token is reported where
-// the model has a member for it — the `SubscriptionProviderStatusMessage` of the
-// registration that settled `INVALID` (`crate::state::TOKEN_NOT_VALIDATED_MESSAGE`) —
-// rather than as a refusal that erased the resource.
+// more: a registration this account may not take is refused with the taxonomy that belongs
+// to the condition (`crate::state::RegisterRefusal`), and one it may take is created and
+// becomes usable on the clock, rather than being answered with a refusal that erased the
+// resource.
 

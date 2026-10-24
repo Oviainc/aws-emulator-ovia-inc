@@ -167,20 +167,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The two log-group names are the only caller-supplied strings this operation
-        // stores, and they are bounded before anything is written. Each refusal is this
-        // service's own envelope, keyed by the member it is about.
+        // stores, and each has to NAME a log group CloudWatch Logs can hold, because this
+        // call subscribes the channel's access logs to it: a value outside that domain is
+        // refused before anything is written, so no stored channel reports a subscription
+        // to a group nothing could ever be written to. The refusal is this service's own
+        // envelope, keyed by the member it is about.
         let ingress_log_group_name = input
             .ingress_access_logs
             .and_then(|logs| logs.log_group_name);
         let egress_log_group_name = input.egress_access_logs.and_then(|logs| logs.log_group_name);
-        for (member, value) in [
-            ("ingressAccessLogs.logGroupName", &ingress_log_group_name),
-            ("egressAccessLogs.logGroupName", &egress_log_group_name),
-        ] {
-            if let Some(value) = value {
-                crate::state::bound_chars(member, value, crate::state::MAX_STRING_CHARS)?;
-            }
-        }
+        crate::state::check_access_log_group_names(
+            ingress_log_group_name.as_deref(),
+            egress_log_group_name.as_deref(),
+        )?;
 
         let record = state
             .channels

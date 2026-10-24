@@ -3,10 +3,11 @@
 //! @op UntagResource
 //!
 //! IMPLEMENTED. Removes the named tag keys from the automation rule the ARN
-//! names. A key outside the modelled `TagKey` form is refused with
-//! `InvalidParameterValueException` (400) before anything is removed, a
-//! `ruleRevision` other than the rule's current one is refused the same way, and
-//! an ARN no rule has is `ResourceNotFoundException` (404).
+//! names. A key outside the modelled `TagKey` form, or one in the reserved tag
+//! namespace, is refused with `InvalidParameterValueException` (400) before
+//! anything is removed (`state::tag_keys_violation`), a `ruleRevision` other
+//! than the rule's current one is refused the same way, and an ARN no rule has
+//! is `ResourceNotFoundException` (404).
 //!
 //! ## Shape of an operation
 //!
@@ -172,18 +173,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // `TagKeyList`'s member targets a plain `String`, so the boundary
-        // validator admitted keys the service's own `TagKey` shape would refuse.
-        // Checked here, BEFORE the store is touched, so a rejected request
-        // removes nothing.
-        if input
-            .tag_keys
-            .iter()
-            .any(|key| !crate::state::tag_key_is_valid(key))
+        // validator admitted keys the service's own `TagKey` shape would refuse,
+        // and no modelled constraint can express the reserved namespace either.
+        // Both are judged here, BEFORE the store is touched, so a rejected
+        // request removes nothing.
+        if let Some(message) =
+            crate::state::tag_keys_violation(input.tag_keys.iter().map(String::as_str))
         {
-            // The requirement is the modelled code and its 400 status; this is
-            // the fixed text the service states a tag-validation rejection
-            // with, and it echoes no caller-supplied key.
-            return Err(invalid_parameter("Tag validation failed".to_string()));
+            // The requirement is the modelled code and its 400 status; the
+            // message is the service's own and echoes no caller-supplied key.
+            return Err(invalid_parameter(message));
         }
 
         let mut probe = input.clone();

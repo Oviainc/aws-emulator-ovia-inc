@@ -37,6 +37,8 @@ mod error_payloads;
 mod recommended_action_summaries;
 #[path = "all/recommended_actions.rs"]
 mod recommended_actions;
+#[path = "all/reserved_tag_keys.rs"]
+mod reserved_tag_keys;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/resource_tags.rs"]

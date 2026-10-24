@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteIngestConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteIngestConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteIngestConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -89,11 +80,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-ivsrealtime-amazoninter
 // here — hence the `DeleteIngestConfigurationError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.ivsrealtime#DeleteIngestConfiguration")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.ivsrealtime#DeleteIngestConfiguration",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum DeleteIngestConfigurationErrorModeled {
     AccessDeniedException(AccessDeniedException),
     ConflictException(ConflictException),
+    // Widened in through `extra_errors`: the SERVICE models `InternalServerException`
+    // (HTTP 500) though `DeleteIngestConfiguration` does not list it, and it is the only
+    // honest answer if the shared engine cannot hand back this service's store.
+    InternalServerException(InternalServerException),
     PendingVerification(PendingVerification),
     ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
@@ -150,18 +148,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteIngestConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteIngestConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteIngestConfiguration"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::store_unavailable(
+                DeleteIngestConfigurationErrorModeled::InternalServerException,
+            )
+        })?;
+        let mut store = state.lock();
+
+        // A delete of a configuration this store does not hold is the modelled
+        // `ResourceNotFoundException` (HTTP 404), the same answer `DeleteStage` and
+        // `DeleteEncoderConfiguration` give — so a second delete of the same ARN is
+        // refused rather than silently accepted.
+        let configuration = store
+            .ingest_configurations
+            .get(&input.arn)
+            .ok_or_else(|| {
+                crate::state::resource_not_found(
+                    DeleteIngestConfigurationErrorModeled::ResourceNotFoundException,
+                    &input.arn,
+                )
+            })?
+            .clone();
+
+        // "An IngestConfiguration cannot be deleted if the publisher is actively
+        // streaming to a stage, unless force is set to true": the publishers are the
+        // ones the configuration's stage holds right now
+        // (`crate::state::ingest_configuration_publishers`, the same lookup the reported
+        // `state` follows), so the refusal and the `ACTIVE` a caller just read are one
+        // fact and not two.
+        let publishers = crate::state::ingest_configuration_publishers(&store, &configuration);
+        if !input.force {
+            if let Some(publisher) = publishers.first() {
+                return Err(crate::state::conflict(
+                    DeleteIngestConfigurationErrorModeled::ConflictException,
+                    crate::state::ingest_configuration_publishing_message(
+                        &input.arn,
+                        &publisher.participant_id,
+                        &configuration.stage_arn,
+                    ),
+                ));
+            }
+        }
+
+        // With `force`, "the participant is disconnected from the stage, followed by
+        // deletion of the IngestConfiguration": each publisher leaves the session it is
+        // in through the one place a participant leaves
+        // (`crate::state::leave_stage_session`), so it is reported `DISCONNECTED` and a
+        // session it emptied ends, exactly as a departure over the data plane would.
+        for publisher in &publishers {
+            crate::state::leave_stage_session(
+                &mut store,
+                &configuration.stage_arn,
+                &publisher.session_id,
+                &publisher.participant_id,
+            );
+        }
+
+        // The configuration "can no longer be used to broadcast": the record goes, and
+        // with it the ingest key and the participant ids it carried, so a later read of
+        // this ARN finds nothing and the identities it minted name no participant of its
+        // stage any more.
+        store.ingest_configurations.remove(&input.arn);
+        Ok(DeleteIngestConfigurationOutput {})
     }
 }

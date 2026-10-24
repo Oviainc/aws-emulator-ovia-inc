@@ -26,15 +26,28 @@
 //!    enum does not carry, an `AuthenticationMethod` union variant the model does not
 //!    declare — is refused `ValidationException` by the boundary, on both the put and
 //!    the get.
+//! 7. because the method lives ON the application record, the put resolves the
+//!    application at the INSTANT of the call: an application whose instance the clock has
+//!    already removed no longer exists, so the put is refused `ResourceNotFoundException`
+//!    and stores nothing, while an application whose instance is still being deleted does
+//!    exist and is served.
 //!
 //! Every call goes through `MultiServiceRouter::dispatch`, so the modelled constraints,
 //! the `awsJson1_1` envelope and the `X-Amz-Target` routing are exercised rather than
-//! bypassed. The harness is the one `ssoadmin_permission_sets.rs` owns.
+//! bypassed. The harness is the one `ssoadmin_permission_sets.rs` owns. Where a test has
+//! to be on the far side of a due instant it moves the STORED instant rather than
+//! sleeping — the transition itself is still applied by the service's own
+//! `materialize_due`, exactly as in production.
+
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::ssoadmin_permission_sets::{call, error_code, router, seeded_instance_arn};
+use crate::ssoadmin_permission_sets::{
+    call, error_code, hold_deletion, router, router_over, seeded_instance_arn,
+};
 
 /// The OAuth 2.0 application provider every application below is created under.
 ///
@@ -634,5 +647,162 @@ async fn requests_outside_the_modeled_constraints_are_refused() {
         error_code(&body),
         "ResourceNotFoundException",
         "expected ResourceNotFoundException for a method no put stored, got {body}"
+    );
+}
+
+/// The `ActorPolicy` the application created `index` places along a table carries, so a
+/// method read back under the wrong application is visible as the wrong document.
+fn policy_for(index: usize) -> Value {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Sid": format!("Application{index}"),
+            "Effect": "Allow",
+            "Action": format!("app{index}:Call"),
+            "Resource": "*",
+        }],
+    })
+}
+
+/// Rule 7: the method lives ON the application record, so the put resolves the
+/// application at the INSTANT of the call. An application whose instance is still being
+/// deleted exists, so the put is served and the get reports it; once the clock has made
+/// that removal due the application is gone with it, so the put and the get are both
+/// refused `ResourceNotFoundException` and nothing is stored under the ARN — and an
+/// application created afterwards inherits no method.
+#[tokio::test]
+async fn a_put_resolves_the_application_at_the_instant_of_the_call() {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let router = router_over(Arc::clone(&engine));
+    let instance_arn = seeded_instance_arn(&router).await;
+
+    // The rows differ along the position of the application in a set of several, so the
+    // rule is asserted over more than the one application a delete happens to visit
+    // first.
+    let names = ["held-one", "held-two", "held-three"];
+    let mut arns: Vec<String> = Vec::new();
+    for name in names {
+        arns.push(create_application(&router, &instance_arn, name).await);
+    }
+    for (index, arn) in arns.iter().enumerate() {
+        let (status, body) = put_iam_method(&router, arn, &policy_for(index)).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: the seed put must answer 200, got {status} {body}",
+            names[index]
+        );
+    }
+
+    let deleted_at = SystemTime::now();
+    let (status, body) = call(
+        &router,
+        "DeleteInstance",
+        &json!({"InstanceArn": instance_arn}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "DeleteInstance must answer 200, got {status} {body}"
+    );
+
+    // While the removal the delete owes is still pending, every application the instance
+    // holds still exists: the put of a REPLACEMENT method is served and the get reports
+    // exactly it.
+    hold_deletion(&engine, deleted_at + Duration::from_secs(3_600));
+    for (index, arn) in arns.iter().enumerate() {
+        let replacement = policy_for(index + 100);
+        let (status, body) = put_iam_method(&router, arn, &replacement).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: a put while the instance removal is pending must answer 200, got \
+             {status} {body}",
+            names[index]
+        );
+        let (status, read) = get_method(&router, arn, IAM).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: the get while the removal is pending must answer 200, got {status} \
+             {read}",
+            names[index]
+        );
+        assert_eq!(
+            read,
+            expected_iam_body(&replacement),
+            "case {:?}: the put must have replaced the stored method, got {read}",
+            names[index]
+        );
+    }
+
+    // Once the removal falls due the applications are gone, so neither half of the pair
+    // resolves their ARNs any more.
+    hold_deletion(&engine, deleted_at - Duration::from_secs(1));
+    for (index, arn) in arns.iter().enumerate() {
+        let (status, body) = put_iam_method(&router, arn, &policy_for(index)).await;
+        assert_eq!(
+            status, 400,
+            "case {:?}: a put on an application whose instance is gone must be refused 400, \
+             got {status} {body}",
+            names[index]
+        );
+        assert_eq!(
+            error_code(&body),
+            "ResourceNotFoundException",
+            "case {:?}: expected ResourceNotFoundException from the put, got {body}",
+            names[index]
+        );
+
+        let (status, body) = get_method(&router, arn, IAM).await;
+        assert_eq!(
+            status, 400,
+            "case {:?}: a get on an application whose instance is gone must be refused 400, \
+             got {status} {body}",
+            names[index]
+        );
+        assert_eq!(
+            error_code(&body),
+            "ResourceNotFoundException",
+            "case {:?}: expected ResourceNotFoundException from the get, got {body}",
+            names[index]
+        );
+    }
+
+    // The refusals were about the missing application record and nothing else: an
+    // application created under a new instance carries no method until a put stores one,
+    // and that put is served.
+    let (status, created) = call(&router, "CreateInstance", &json!({"Name": "AfterDelete"})).await;
+    assert_eq!(
+        status, 200,
+        "CreateInstance must answer 200 once the quota is free, got {status} {created}"
+    );
+    let new_instance_arn = created["InstanceArn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("CreateInstance returned no InstanceArn: {created}"))
+        .to_string();
+    let fresh = create_application(&router, &new_instance_arn, "held-one").await;
+    let (status, body) = get_method(&router, &fresh, IAM).await;
+    assert_eq!(
+        status, 400,
+        "a fresh application must inherit no method, got {status} {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "ResourceNotFoundException",
+        "expected ResourceNotFoundException on a fresh application, got {body}"
+    );
+    let stored = policy_for(7);
+    let (status, body) = put_iam_method(&router, &fresh, &stored).await;
+    assert_eq!(
+        status, 200,
+        "the put on the fresh application must answer 200, got {status} {body}"
+    );
+    let (status, read) = get_method(&router, &fresh, IAM).await;
+    assert_eq!(
+        status, 200,
+        "the get on the fresh application must answer 200, got {status} {read}"
+    );
+    assert_eq!(
+        read,
+        expected_iam_body(&stored),
+        "the fresh application must report the method its own put stored, got {read}"
     );
 }

@@ -242,13 +242,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(flow) = store.flows.get_mut(&input.flow_arn) else {
             return Err(not_found(&input.flow_arn));
         };
-        let Some(entitlement) = flow
+        let Some(stored) = flow
             .entitlements
             .iter_mut()
-            .find(|entitlement| entitlement.entitlement_arn == input.entitlement_arn)
+            .find(|entitlement| entitlement.entitlement.entitlement_arn == input.entitlement_arn)
         else {
             return Err(not_found(&input.entitlement_arn));
         };
+        let entitlement = &mut stored.entitlement;
 
         // What the encryption becomes is resolved BEFORE anything is written, because a
         // merge the required `Encryption$RoleArn` makes inexpressible refuses the request

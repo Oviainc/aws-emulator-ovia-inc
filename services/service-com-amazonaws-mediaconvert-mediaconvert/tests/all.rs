@@ -49,6 +49,8 @@ mod policy_lifecycle;
 mod preset_deletion;
 #[path = "all/preset_lifecycle.rs"]
 mod preset_lifecycle;
+#[path = "all/preset_listing.rs"]
+mod preset_listing;
 #[path = "all/preset_update.rs"]
 mod preset_update;
 #[path = "all/queue_deletion.rs"]
