@@ -19,6 +19,8 @@ mod get_service;
 mod grouping_configuration;
 #[path = "all/list_services.rs"]
 mod list_services;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/sli_metric_type.rs"]
 mod sli_metric_type;
 #[path = "all/slo_lifecycle.rs"]

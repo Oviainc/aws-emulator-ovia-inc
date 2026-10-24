@@ -98,6 +98,9 @@ mod multiplex_start;
 #[path = "all/multiplex_stop.rs"]
 mod multiplex_stop;
 
+#[path = "all/networks.rs"]
+mod networks;
+
 #[path = "all/rejection_messages.rs"]
 mod rejection_messages;
 

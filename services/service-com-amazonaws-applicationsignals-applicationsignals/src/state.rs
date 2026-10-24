@@ -22,7 +22,7 @@ use crate::ops::types::{
     RequestBasedServiceLevelIndicator, RequestBasedServiceLevelIndicatorConfig,
     RequestBasedServiceLevelIndicatorMetric, ResourceNotFoundException, RollingInterval,
     ServiceLevelIndicator, ServiceLevelIndicatorConfig, ServiceLevelIndicatorMetric,
-    ServiceLevelObjective, ServiceLevelObjectiveSummary,
+    ServiceLevelObjective, ServiceLevelObjectiveSummary, Tag,
 };
 // The shapes the time-ranged topology reads project, on their own `use` so this set and the
 // SLO lifecycle's above are edited on separate lines.
@@ -137,8 +137,9 @@ pub struct ComAmazonawsApplicationsignalsApplicationsignalsState {
     /// at [`MAX_SLOS`] entries by the create path, which is the only writer.
     pub slos: BTreeMap<String, ServiceLevelObjective>,
     /// Tags per resource ARN, the key the service's tagging operations address a resource
-    /// by (`TagResource`/`ListTagsForResource` take a `ResourceArn`). One entry per
-    /// accepted create, so [`MAX_SLOS`] bounds this map too.
+    /// by (`TagResource`/`UntagResource`/`ListTagsForResource` take a `ResourceArn`). One
+    /// entry per tagged resource, so [`MAX_SLOS`] bounds this map too; the entry is dropped
+    /// once the resource holds no tags (see [`Self::remove_tags`]).
     pub tags: BTreeMap<String, BTreeMap<String, String>>,
     /// This account's grouping configuration, or `None` while none is configured.
     ///
@@ -171,6 +172,57 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
             self.tags.remove(&slo.arn);
         }
         removed
+    }
+
+    /// The ARN this resource's tag set is stored under, for a tagging operation's
+    /// `ResourceArn`: the ARN of the STORED resource the request names, read off the record
+    /// rather than taken from the request. `None` when the ARN names no resource this
+    /// service holds, which is what the tagging operations answer
+    /// `ResourceNotFoundException` for.
+    ///
+    /// `ResourceArn` is an ARN (`AmazonResourceName`), so only the ARN form resolves: a
+    /// bare SLO name is not a resource ARN and names no resource here. Which ARNs name a
+    /// resource of this service and account is [`tagged_slo_name_in_arn`]'s rule.
+    pub fn tagged_resource_arn(&self, resource_arn: &str) -> Option<&str> {
+        let name = tagged_slo_name_in_arn(resource_arn)?;
+        self.slos.get(name).map(|slo| slo.arn.as_str())
+    }
+
+    /// The tags attached to the resource stored under `arn`, as the modelled `TagList`.
+    ///
+    /// Key order: the store is ordered by tag key, so two reads of one resource report the
+    /// tags in the same order. A resource with no tags has no entry in the map and reports
+    /// the empty list — holding no tags and holding an empty tag set are the same state.
+    pub fn tag_list(&self, arn: &str) -> Vec<Tag> {
+        self.tags
+            .get(arn)
+            .into_iter()
+            .flatten()
+            .map(|(key, value)| Tag {
+                key: key.clone(),
+                value: value.clone(),
+            })
+            .collect()
+    }
+
+    /// Detach `keys` from the tag set of the resource stored under `arn`, leaving every
+    /// other tag of that resource in place.
+    ///
+    /// A key the resource does not carry removes nothing: removal is per key, so the result
+    /// of a call is "none of these keys is attached any more" whether or not each one was
+    /// attached to begin with, and repeating a call changes nothing further. The resource's
+    /// entry is dropped once its last tag is gone, so an untagged resource is stored exactly
+    /// as one that was never tagged.
+    pub fn remove_tags<K: AsRef<str>>(&mut self, arn: &str, keys: &[K]) {
+        let Some(tags) = self.tags.get_mut(arn) else {
+            return;
+        };
+        for key in keys {
+            tags.remove(key.as_ref());
+        }
+        if tags.is_empty() {
+            self.tags.remove(arn);
+        }
     }
 
     /// Replace this account's grouping configuration with `definitions`, stamping
@@ -259,10 +311,47 @@ pub fn service_state<Eng: Send + Sync + 'static>(
 /// `ServiceLevelObjectiveArn`, so both forms name one record and every operation that
 /// takes an `Id` must resolve them identically.
 pub fn slo_name_of(id: &str) -> &str {
-    match id.split_once(":slo/") {
-        Some((prefix, name)) if prefix.starts_with("arn:") => name,
-        _ => id,
+    slo_name_in_arn(id).unwrap_or(id)
+}
+
+/// The SLO name an ARN names, or `None` when the string is not an SLO ARN at all.
+///
+/// The ARN form of the modelled `ServiceLevelObjectiveArn`: a well-formed resource ARN
+/// whose resource field is `<SLO_ARN_RESOURCE>/<name>`. This is [`slo_name_of`] WITHOUT its
+/// bare-name fallback, for a member the model types as an ARN rather than as a
+/// `ServiceLevelObjectiveId`.
+///
+/// Read through `service_common::arn` — the workspace's ONE resource-ARN parse — so the name
+/// comes out of the ARN's RESOURCE field, the last of the six, rather than out of the first
+/// `:slo/` the string happens to contain: no earlier field (a region read off the caller's
+/// credential scope, say) can be mistaken for the resource one, and this service agrees with
+/// every other about what an ARN is.
+pub fn slo_name_in_arn(arn: &str) -> Option<&str> {
+    ::service_common::arn::resource_id_of_type(arn, SLO_ARN_RESOURCE)
+}
+
+/// The SLO name a tagging operation's `ResourceArn` names, or `None` when the ARN names no
+/// SLO of this service and account.
+///
+/// Stricter than [`slo_name_in_arn`], because `ResourceArn` is a bare `AmazonResourceName`:
+/// the model puts no pattern on it, so nothing before the handler rejects an ARN of another
+/// service or another account, and an ARN that merely CARRIES an SLO-shaped resource field
+/// (`arn:aws:s3:::slo/x`) names no resource here. The VENDOR field must be this service's
+/// namespace (`SIGNING_NAME`, which the modelled `ServiceLevelObjectiveArn` pattern spells)
+/// — which is what `service_common::arn::parse_of` narrows a parse to — and the account
+/// field must be the account this store holds (`engine::emulator_account_id()`). A
+/// `ServiceLevelObjectiveId` needs neither check: its modelled pattern already fixes the
+/// namespace before a handler runs.
+///
+/// The REGION field is not compared, for the reason the store's own doc gives: this process
+/// holds one account's and one Region's records, and the region in a minted ARN is a
+/// rendering of the writer's SigV4 scope rather than part of an SLO's identity.
+pub fn tagged_slo_name_in_arn(resource_arn: &str) -> Option<&str> {
+    let arn = ::service_common::arn::parse_of(resource_arn, SIGNING_NAME)?;
+    if arn.account != ::engine::emulator_account_id() {
+        return None;
     }
+    slo_name_in_arn(resource_arn)
 }
 
 /// The ARN of the SLO called `name` in `region`, in the shape the modelled
@@ -278,10 +367,15 @@ pub fn slo_arn(region: &str, name: &str) -> String {
 ///
 /// This is how an error identifies an SLO that is not stored: there is no record to read an
 /// ARN off, so the ARN is derived from the identity the request named.
+///
+/// Which ids are already in ARN form is [`slo_name_in_arn`]'s rule — the one ARN reader in
+/// this module, so the ARN this renders and the name [`slo_name_of`] resolves cannot
+/// disagree about the same id.
 pub fn slo_arn_of(region: &str, id: &str) -> String {
-    match id.split_once(&format!(":{SLO_ARN_RESOURCE}/")) {
-        Some((prefix, _)) if prefix.starts_with("arn:") => id.to_string(),
-        _ => slo_arn(region, id),
+    if slo_name_in_arn(id).is_some() {
+        id.to_string()
+    } else {
+        slo_arn(region, id)
     }
 }
 
@@ -310,6 +404,22 @@ pub fn slo_not_found(region: &str, id: &str) -> ResourceNotFoundException {
         message: format!("{SLO_RESOURCE_TYPE} with arn '{arn}' does not exist."),
         resource_type: SLO_RESOURCE_TYPE.to_string(),
         resource_id: arn,
+    }
+}
+
+/// The modelled `ResourceNotFoundException` for a tagging operation's `ResourceArn` that
+/// names no resource this service holds.
+///
+/// `ResourceId` is the ARN the request named, reported verbatim: the member is already a
+/// full resource identifier, so there is nothing to mint from it and nothing of the
+/// caller's identity to re-derive — unlike [`slo_not_found`], which renders an ARN for a
+/// request that may have named a bare SLO name. `ResourceType` is the capitalised type name
+/// of the only resource this service's tagging operations address.
+pub fn tagged_resource_not_found(resource_arn: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: format!("{SLO_RESOURCE_TYPE} with arn '{resource_arn}' does not exist."),
+        resource_type: SLO_RESOURCE_TYPE.to_string(),
+        resource_id: resource_arn.to_string(),
     }
 }
 
