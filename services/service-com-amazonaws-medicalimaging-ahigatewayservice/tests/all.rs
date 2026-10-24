@@ -23,3 +23,5 @@ mod image_set_copy;
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_map_validation.rs"]
+mod tag_map_validation;

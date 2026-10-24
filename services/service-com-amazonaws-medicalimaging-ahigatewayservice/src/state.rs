@@ -379,10 +379,146 @@ pub const ARN_PARTITIONS: [&str; 5] = ["aws", "aws-us-gov", "aws-iso", "aws-iso-
 ///
 /// A memory bound, not an AWS quota: the tagging operations persist caller-supplied
 /// keys and values in process memory, so without a cap one caller could grow a
-/// resource's tag map without limit. Past the cap `TagResource` is refused with its
-/// own modelled `ValidationException` (HTTP 400). The value matches AWS's
-/// general per-resource tag limit of 50.
+/// resource's tag map without limit. Past the cap EVERY operation that installs tags
+/// — `CreateDatastore` as much as `TagResource` — is refused with its own modelled
+/// `ValidationException` (HTTP 400). The value matches AWS's general per-resource tag
+/// limit of 50.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The text this service refuses a request that would leave one resource holding more
+/// than [`MAX_TAGS_PER_RESOURCE`] tags with. `requested` is how many the resource would
+/// end up with — a count computed from the request, so the sentence says which side of
+/// the bound the caller landed on without echoing any key.
+///
+/// One sentence for both write paths: the create path and the tag path enforce one
+/// bound, so they state it with one text.
+pub fn too_many_tags_message(requested: usize) -> String {
+    format!(
+        "this emulator holds at most {MAX_TAGS_PER_RESOURCE} tags per resource; this \
+         request would leave {requested}"
+    )
+}
+
+// ---------------------------------------------------------------------------
+// What makes a TAG KEY legal
+//
+// Every rule about a tag KEY is applied here, by every handler that accepts one,
+// because the boundary validator applies NONE of them: the validating walk captures a
+// collection's ELEMENT constraints only ("Map keys are not captured" —
+// `vendor/smithy-macros/src/lib.rs`), so a `TagMap` key is never visited at all, and
+// `TagKey`'s `@pattern` opens with a negative lookahead the `regex` crate cannot
+// compile, which `pattern_matches`
+// (`vendor/smithy-schema-server/src/constraints.rs`) treats as matching. A tag VALUE
+// needs nothing here: it IS the map's element, so `TagValue`'s `@length` reaches it
+// through the `ElementConstraintsTrait` the boundary already runs.
+// ---------------------------------------------------------------------------
+
+/// The `@pattern` the model declares on `TagKey`, the key shape of `TagMap`
+/// (`smithy_query(query="shape",shape="TagMap,TagKey")`), copied verbatim: it is the
+/// text a refusal quotes, and the two halves applied below are
+/// [`TAG_KEY_RESERVED_PREFIX`] and the character class [`is_tag_key_character`] tests
+/// membership of.
+pub const TAG_KEY_PATTERN: &str = "^(?!aws:)[a-zA-Z+-=._:/]+$";
+
+/// The prefix [`TAG_KEY_PATTERN`]'s leading `(?!aws:)` refuses: the tag namespace AWS
+/// reserves for itself. A negative lookahead anchored at the start of an expression says
+/// exactly "the value does not start with this", so it is applied as a `starts_with` —
+/// and in the one case the model spells it with, not case-insensitively, because the
+/// pattern is what the service advertises.
+pub const TAG_KEY_RESERVED_PREFIX: &str = "aws:";
+
+/// `TagKey`'s `@length` minimum (len 1..128). Also what [`TAG_KEY_PATTERN`]'s `+`
+/// quantifier says: a key is a non-empty run of admitted characters.
+pub const TAG_KEY_MIN_LENGTH: usize = 1;
+
+/// `TagKey`'s `@length` maximum (len 1..128) — the one tag-key rule the pattern does not
+/// also state.
+pub const TAG_KEY_MAX_LENGTH: usize = 128;
+
+/// Whether `character` is one the class `[a-zA-Z+-=._:/]` of [`TAG_KEY_PATTERN`] admits.
+///
+/// That class admits the ASCII letters, `_`, and — because `+-=` inside a character
+/// class is the RANGE from `+` (0x2B) to `=` (0x3D) — every character in that range: the
+/// digits, `+`, `,`, `-`, `.`, `/`, `:`, `;`, `<` and `=`. The `.`, `:` and `/` the class
+/// also lists one by one are inside that range too, so the three terms below are the
+/// whole class. A character class is a MEMBERSHIP test rather than a pattern language, so
+/// it is written out: the check then costs one pass over the key with no regex engine on
+/// a path that reads request text.
+fn is_tag_key_character(character: char) -> bool {
+    character.is_ascii_alphabetic() || character == '_' || ('+'..='=').contains(&character)
+}
+
+/// Whether `key` satisfies [`TAG_KEY_PATTERN`]: it lies outside AWS's reserved namespace
+/// AND it is a non-empty run of characters the class admits — which is exactly what the
+/// pattern's lookahead, class and `+` quantifier say between the `^` and the `$`.
+pub fn tag_key_matches_pattern(key: &str) -> bool {
+    !key.starts_with(TAG_KEY_RESERVED_PREFIX)
+        && !key.is_empty()
+        && key.chars().all(is_tag_key_character)
+}
+
+/// The violation `key` commits as a `TagKey` at `path`, or `None` when it satisfies
+/// every constraint the model puts on one.
+///
+/// The bounds are checked before the pattern, in the order the boundary validator's own
+/// leaf walk runs them (`run_leaf_traits`), so a key that breaks both is reported the way
+/// the framework would have reported it. The caller words the result through
+/// [`one_validation_error`], so a refusal raised here reads like one the boundary stated.
+pub fn tag_key_violation(path: &str, key: &str) -> Option<Violation> {
+    let length = key.chars().count();
+    let kind = if length < TAG_KEY_MIN_LENGTH {
+        ViolationKind::MinLength(TAG_KEY_MIN_LENGTH as i64)
+    } else if length > TAG_KEY_MAX_LENGTH {
+        ViolationKind::MaxLength(TAG_KEY_MAX_LENGTH as i64)
+    } else if !tag_key_matches_pattern(key) {
+        ViolationKind::Pattern(TAG_KEY_PATTERN.to_string())
+    } else {
+        return None;
+    };
+    Some(Violation {
+        path: path.to_string(),
+        kind,
+        value: Some(echoed_value(key)),
+    })
+}
+
+/// The violation the keys of a supplied `TagMap` commit, or `None` when every key is
+/// legal. `member` is the map member's own path (`tags`), which is where the refusal is
+/// reported: a key is not a member of the map, so it has no path of its own to be
+/// reported at, and the key that failed is carried as the clause's echoed VALUE.
+///
+/// The keys are examined in sorted order so that a map with more than one illegal key is
+/// refused with the same clause every time — a `HashMap`'s iteration order is not
+/// stable, and a refusal that varies run to run is not a contract.
+pub fn tag_map_violation(member: &str, tags: &HashMap<String, String>) -> Option<Violation> {
+    let mut keys: Vec<&String> = tags.keys().collect();
+    keys.sort();
+    keys.into_iter()
+        .find_map(|key| tag_key_violation(member, key))
+}
+
+/// The rejected value as a MESSAGE carries it: itself when short, a
+/// character-boundary-safe prefix with an elision when not.
+///
+/// Mirrors the framework's own elision (`echoed` in
+/// `vendor/smithy-schema-server/src/constraints.rs`), which is private to that crate, cap
+/// and rendering included. A tag key is a value NO boundary check bounds first — the walk
+/// never visits a map key — so without this a caller could turn a one-megabyte key into a
+/// one-megabyte message. Rendering ONLY: every check above runs on the original key.
+fn echoed_value(value: &str) -> String {
+    /// The longest rejected value a clause carries, as the framework caps it.
+    const MAX_ECHOED_VALUE: usize = 256;
+
+    if value.len() <= MAX_ECHOED_VALUE {
+        return value.to_string();
+    }
+    // Truncate on a char boundary, never mid-UTF-8.
+    let mut end = MAX_ECHOED_VALUE;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}... [{} bytes]", &value[..end], value.len())
+}
 
 /// `DatastoreStatus`, exactly the values the model declares
 /// (`smithy_query(query="shape",shape="DatastoreStatus")`).

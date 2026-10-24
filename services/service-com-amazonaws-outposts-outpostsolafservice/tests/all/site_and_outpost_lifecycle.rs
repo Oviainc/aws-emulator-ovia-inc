@@ -214,6 +214,23 @@ impl Outposts {
         self.ok_in(region, "POST", "/outposts", Some(request)).await["Outpost"].clone()
     }
 
+    /// One site named `<name>-site` and one Outpost named `name` on it, as that
+    /// Outpost's `(OutpostId, OutpostArn)` — the two identifier forms every route
+    /// that takes an Outpost accepts.
+    ///
+    /// An Outpost belongs to a site, so the site comes first: the same order a real
+    /// workflow takes, and the one helper every suite that just needs "an Outpost"
+    /// reaches for.
+    pub(crate) async fn site_and_outpost(&self, name: &str) -> (String, String) {
+        let site = self
+            .create_site(&json!({ "Name": format!("{name}-site") }))
+            .await;
+        let outpost = self
+            .create_outpost(&json!({ "Name": name, "SiteId": text(&site, "SiteId") }))
+            .await;
+        (text(&outpost, "OutpostId"), text(&outpost, "OutpostArn"))
+    }
+
     /// `GetSite`, returning the `Site` it answered with.
     pub(crate) async fn get_site(&self, identifier: &str) -> Value {
         self.ok("GET", &format!("/sites/{}", segment(identifier)), None)

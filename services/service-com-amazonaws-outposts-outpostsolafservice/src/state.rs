@@ -90,6 +90,46 @@ pub const QUOTE_STATUS_CREATED: &str = "CREATED";
 /// [`ComAmazonawsOutpostsOutpostsolafserviceState::settle_quotes`].
 pub const QUOTE_STATUS_EXPIRED: &str = "EXPIRED";
 
+/// The `QuoteStatus` a quote holds once an order has been submitted from it — the
+/// model's "`ORDER_SUBMITTED` - An order has been submitted for the quote", which
+/// is also what makes the quote's `SubmittedOrderId` present.
+///
+/// No operation in this slice reaches it yet (`CreateOrder` is still a scaffold
+/// stub), but it is the one record this service's store can hold of an Outpost
+/// ORDER placed against an Outpost, which is what
+/// `StartOutpostDecommission` reads to decide whether an order still blocks a
+/// decommission.
+pub const QUOTE_STATUS_ORDER_SUBMITTED: &str = "ORDER_SUBMITTED";
+
+/// The `DecommissionRequestStatus` `StartOutpostDecommission` answers when a
+/// resource still associated with the Outpost stops the decommission from
+/// starting; the types of those resources travel beside it in
+/// `BlockingResourceTypes`.
+///
+/// The three values below are exactly the modelled `DecommissionRequestStatus`
+/// enum (see [`crate::ops::types::shared_types::DECOMMISSION_REQUEST_STATUS_VALUES`]).
+pub const DECOMMISSION_STATUS_BLOCKED: &str = "BLOCKED";
+
+/// The `DecommissionRequestStatus` of a decommission this call STARTED: nothing
+/// blocks it, the caller did not ask to validate only, and the request is now
+/// recorded on the Outpost ([`OutpostRecord::decommission_requested_at`]). See
+/// [`DECOMMISSION_STATUS_BLOCKED`].
+pub const DECOMMISSION_STATUS_REQUESTED: &str = "REQUESTED";
+
+/// The `DecommissionRequestStatus` of a call that found nothing blocking and yet
+/// started nothing — because the caller asked to validate the request only
+/// (`ValidateOnly`, "Validates the request without starting the decommission
+/// process"), or because the Outpost's decommission had already been requested, so
+/// there is nothing left to start. See [`DECOMMISSION_STATUS_BLOCKED`].
+pub const DECOMMISSION_STATUS_SKIPPED: &str = "SKIPPED";
+
+/// The `BlockingResourceType` an Outpost order still outstanding on an Outpost is
+/// reported as, from the modelled enum's values. See
+/// [`ComAmazonawsOutpostsOutpostsolafserviceState::blocking_resource_types`], which
+/// states which of those values this store can observe and why it reports none of
+/// the others.
+pub const BLOCKING_OUTPOST_ORDER_CANCELLABLE: &str = "OUTPOST_ORDER_CANCELLABLE";
+
 /// How long after `CreateQuote` the quote's `ExpirationDate` falls.
 ///
 /// AWS documents the member only as "The date the quote expires" and publishes no
@@ -156,6 +196,16 @@ pub struct OutpostRecord {
     /// first call made at or after it, which reports exactly the status the
     /// Outpost would hold had nobody called at all.
     pub active_at: Option<std::time::Instant>,
+    /// When `StartOutpostDecommission` started the decommission of this Outpost,
+    /// or `None` for an Outpost nobody has asked to decommission.
+    ///
+    /// A decommission is started once: it is what makes a later
+    /// `StartOutpostDecommission` on the same Outpost answer
+    /// [`DECOMMISSION_STATUS_SKIPPED`] rather than starting it again. The Outpost's
+    /// `LifeCycleStatus` is left alone — the model constrains that member without
+    /// declaring a value set and AWS publishes no decommissioning value, so the
+    /// emulator does not invent one.
+    pub decommission_requested_at: Option<std::time::SystemTime>,
     /// The priced subscription options a RENEWAL of this Outpost's contract can be
     /// bought under — what `GetRenewalPricing` reports for it, and the list a
     /// `CreateRenewal` picks a payment option and term out of.
@@ -471,6 +521,57 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
         self.capacity_tasks
             .values()
             .find(|task| task.order_id.as_deref() == Some(order_id) && task.is_active())
+    }
+
+    /// Every `BlockingResourceType` this store observes still associated with
+    /// `outpost_id`, deduplicated and in one stable order — what a `BLOCKED`
+    /// `StartOutpostDecommission` reports in `BlockingResourceTypes`.
+    ///
+    /// The modelled enum names seven kinds of resource (see
+    /// [`crate::ops::types::shared_types::BLOCKING_RESOURCE_TYPE_VALUES`]). Exactly
+    /// one of them is a resource THIS service's store can hold:
+    ///
+    /// * [`BLOCKING_OUTPOST_ORDER_CANCELLABLE`] — an Outpost order still outstanding
+    ///   on the Outpost. The store's one record of such an order is a quote of this
+    ///   Outpost that an order was submitted from: the modelled `QuoteStatus`
+    ///   [`QUOTE_STATUS_ORDER_SUBMITTED`], whose `SubmittedOrderId` names it. Nothing
+    ///   in this slice moves an order past submission, so an order the store knows
+    ///   about is one that can still be cancelled, and a decommission has to wait for
+    ///   it.
+    ///
+    /// The other six name resources that live nowhere in this store, so reporting one
+    /// would be asserting a resource this emulator has no record of:
+    ///
+    /// * `EC2_INSTANCE` — this emulator runs no instances on an Outpost (stated once
+    ///   beside [`CAPACITY_TASK_TERMINAL`], which is why no capacity task ever waits
+    ///   for an evacuation either). The instances a capacity task names in
+    ///   `InstancesToExclude` are the caller's own input, not a record of instances
+    ///   this service placed.
+    /// * `OUTPOST_RAM_SHARE`, `LGW_ROUTING_DOMAIN`, `LGW_ROUTE_TABLE`,
+    ///   `LGW_VIRTUAL_INTERFACE_GROUP` — resource shares and local gateway resources
+    ///   belong to other services' APIs; nothing in this service creates or holds
+    ///   one.
+    /// * `OUTPOST_ORDER_INTERVENTION_REQUIRED` — an order condition nothing in this
+    ///   slice produces: no order the store knows about ever fails or stalls, so the
+    ///   emulator never claims one needs intervention.
+    ///
+    /// Callers settle first (see [`Self::settle_quotes`]), so the quote statuses read
+    /// here are the ones the quotes hold at that instant.
+    pub fn blocking_resource_types(&self, outpost_id: &str) -> Vec<String> {
+        let mut blocking: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let order_outstanding = self.quotes.values().any(|record| {
+            let quote_outpost = record
+                .quote
+                .outpost_arn
+                .as_deref()
+                .and_then(resolve_outpost_id);
+            quote_outpost.as_deref() == Some(outpost_id)
+                && record.quote.quote_status.as_deref() == Some(QUOTE_STATUS_ORDER_SUBMITTED)
+        });
+        if order_outstanding {
+            blocking.insert(BLOCKING_OUTPOST_ORDER_CANCELLABLE.to_string());
+        }
+        blocking.into_iter().collect()
     }
 
     /// The tag map of the resource an Outposts resource ARN names, or `None` when
