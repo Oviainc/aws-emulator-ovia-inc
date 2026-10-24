@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListProvisionedConcurrencyConfigs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListProvisionedConcurrencyConfigs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListProvisionedConcurrencyConfigs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the provisioned concurrency configurations the function record
+//! [`crate::state`] holds — one per alias or published version a
+//! `PutProvisionedConcurrencyConfig` call added one to — so every listed entry is the
+//! same stored record `GetProvisionedConcurrencyConfig` reports, and a function nobody has
+//! configured lists nothing.
+//!
+//! The configurations are keyed by the qualifier they were added to, so that order is the
+//! order they are reported and paginated in: a page continues at the first qualifier
+//! ordered after the caller's `Marker`, and `NextMarker` is present only while entries
+//! remain.
+//!
+//! This is a REPORTING operation (`@readonly`): the only thing it writes is the
+//! transition the CLOCK already made due (see
+//! [`crate::state::ProvisionedConcurrencyRecord::materialize`]).
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +162,130 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListProvisionedConcurrencyConfigs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListProvisionedConcurrencyConfigsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListProvisionedConcurrencyConfigs"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListProvisionedConcurrencyConfigsErrorModeled::ServiceException(
+                ServiceException {
+                    r#type: None,
+                    message: Some("Lambda state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // "Specify a number to limit the number of configurations returned": the model
+        // declares `MaxItems` as `@range(min: 1, max: 50)`, so the boundary validator has
+        // already refused anything outside it; this handler keeps the same floor rather
+        // than letting a page size of zero reach the pagination arithmetic below. A caller
+        // that names no limit is answered with every configuration the function holds
+        // (`None` here, resolved against the entry count below).
+        let requested_page_size = input
+            .max_items
+            .and_then(|requested| usize::try_from(requested).ok())
+            .map(|requested| requested.max(1));
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+
+        // "The name or ARN of the Lambda function": the configurations listed are those
+        // of the one function the name resolves to, resolved exactly the way every other
+        // operation on this service resolves a `FunctionName`.
+        let record = match crate::state::resolve_function(
+            &mut store,
+            &input.function_name,
+            None,
+            &region,
+            now,
+        ) {
+            Ok((record, qualifier)) => {
+                // A configuration belongs to one alias or version, and this operation
+                // lists every configuration OF A FUNCTION — it takes no `Qualifier` to
+                // select one with — so a `FunctionName` qualifying a version or an alias
+                // names no function whose configurations to list.
+                if qualifier != crate::state::VERSION_LATEST {
+                    return Err(invalid_parameter(format!(
+                        "A provisioned concurrency configuration belongs to one alias or \
+                         version of a function, and the qualifier '{qualifier}' in \
+                         'functionName' names one of them rather than the function whose \
+                         configurations are listed"
+                    )));
+                }
+                record
+            }
+            Err(crate::state::ResolveFailure::Malformed(message)) => {
+                return Err(invalid_parameter(message))
+            }
+            Err(crate::state::ResolveFailure::NotFound(message)) => {
+                return Err(not_found(message))
+            }
+        };
+
+        // The store keys a function's configurations by the qualifier they were added to,
+        // so its own order is the order the entries are reported and paginated in. Each
+        // entry is built from the stored record, so a listed configuration reports exactly
+        // what `GetProvisionedConcurrencyConfig` reports for the same qualifier.
+        let entries: Vec<(String, ProvisionedConcurrencyConfigListItem)> = record
+            .provisioned_concurrency_configs
+            .iter()
+            .map(|(qualifier, config)| {
+                (
+                    qualifier.clone(),
+                    config.listed(record.versioned_arn(qualifier)),
+                )
+            })
+            .collect();
+
+        // The next page starts at the first configuration ordered after the one the
+        // marker names, so no configuration is ever reported twice.
+        let start = match input.marker.as_deref() {
+            Some(marker) => entries
+                .iter()
+                .position(|(qualifier, _)| qualifier.as_str() > marker)
+                .unwrap_or(entries.len()),
+            None => 0,
+        };
+        let page = match entries.get(start..) {
+            Some(remaining) => {
+                let page_size = requested_page_size.unwrap_or(remaining.len());
+                &remaining[..page_size.min(remaining.len())]
+            }
+            None => &[][..],
+        };
+        let truncated = start + page.len() < entries.len();
+
+        Ok(ListProvisionedConcurrencyConfigsOutput {
+            provisioned_concurrency_configs: Some(
+                page.iter().map(|(_, item)| item.clone()).collect(),
+            ),
+            // "The pagination token that's included if more results are available" — so it
+            // is absent on the last page, and it is the qualifier of the last entry THIS
+            // page reported, which is what the next page continues after.
+            next_marker: page
+                .last()
+                .filter(|_| truncated)
+                .map(|(qualifier, _)| qualifier.clone()),
+        })
     }
+}
+
+/// The modelled 400 this operation refuses a request it cannot satisfy with.
+fn invalid_parameter(message: String) -> ListProvisionedConcurrencyConfigsError {
+    ListProvisionedConcurrencyConfigsErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            r#type: None,
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// The modelled 404 for a function this emulator does not hold.
+fn not_found(message: String) -> ListProvisionedConcurrencyConfigsError {
+    ListProvisionedConcurrencyConfigsErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            r#type: None,
+            message: Some(message),
+        },
+    )
+    .into()
 }

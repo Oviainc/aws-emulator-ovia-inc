@@ -1241,6 +1241,35 @@ impl Secret {
         self.pending_rotation_version_id = Some(version_id);
         self.last_changed_date = at;
     }
+
+    /// Turn automatic rotation off and cancel a rotation that is still in
+    /// progress, reporting the version id that rotation staked `AWSPENDING` on
+    /// (`None` when no rotation was in progress).
+    ///
+    /// "Turns off automatic rotation, and if a rotation is currently in
+    /// progress, cancels the rotation" (`CancelRotateSecret`, this service's
+    /// Smithy model), so the schedule stops making rotations due. The rotation
+    /// configuration itself is KEPT: "To turn on automatic rotation again, call
+    /// RotateSecret", which rotates "with the values already stored in the
+    /// secret" when the call names none.
+    ///
+    /// The staging labels the cancelled rotation left are kept too: "If you
+    /// cancel a rotation in progress, it can leave the VersionStage labels in an
+    /// unexpected state. You might need to remove the staging label AWSPENDING
+    /// from the partially created version. ... Failing to clean up a cancelled
+    /// rotation can block you from starting future rotations." — the caller
+    /// cleans them up with `UpdateSecretVersionStage`, which is also why the id
+    /// is reported back here.
+    pub fn cancel_rotation(&mut self, at: SystemTime) -> Option<String> {
+        let cancelled = self
+            .rotation_in_progress()
+            .then(|| self.pending_version_id().map(str::to_string))
+            .flatten();
+        self.rotation_enabled = false;
+        self.next_rotation_date = None;
+        self.last_changed_date = at;
+        cancelled
+    }
 }
 
 /// The rotation configuration one `RotateSecret` call carries: a member it does

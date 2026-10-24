@@ -153,7 +153,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(StartImportFileTaskErrorModeled::InternalServerException(
                 InternalServerException {
@@ -190,49 +189,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::check_group_names(&group_id)
             .map_err(StartImportFileTaskErrorModeled::ValidationException)?;
 
-        let mut store = state.lock();
+        // The store is read and written inside this block, so the lock is released at
+        // its end: the status report write below is an in-process call into the
+        // emulator's own S3 service, and nothing awaits while the store is held.
+        let (id, report) = {
+            let mut store = state.lock();
 
-        // The store is bounded: past its quota an import is refused rather than adding
-        // another record. `ServiceQuotaExceededException` is this operation's modelled
-        // refusal for exactly that ("The AWS account has reached its quota of imports.").
-        if store.import_tasks.len() >= crate::state::IMPORT_TASK_QUOTA {
-            return Err(
-                StartImportFileTaskErrorModeled::ServiceQuotaExceededException(
-                    ServiceQuotaExceededException {
-                        message: format!(
-                            "this account already holds the maximum of {} import file tasks",
-                            crate::state::IMPORT_TASK_QUOTA
-                        ),
-                    },
+            // The store is bounded: past its quota an import is refused rather than
+            // adding another record. `ServiceQuotaExceededException` is this operation's
+            // modelled refusal for exactly that ("The AWS account has reached its quota
+            // of imports.").
+            if store.import_tasks.len() >= crate::state::IMPORT_TASK_QUOTA {
+                return Err(
+                    StartImportFileTaskErrorModeled::ServiceQuotaExceededException(
+                        ServiceQuotaExceededException {
+                            message: format!(
+                                "this account already holds the maximum of {} import file tasks",
+                                crate::state::IMPORT_TASK_QUOTA
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            let id = store.mint_import_file_task_id();
+            let task = crate::state::ImportFileTask {
+                id: id.clone(),
+                import_name: input.name,
+                input_s3_bucket: input.s3_bucket,
+                input_s3_key: input.s3key,
+                data_source_type: input.data_source_type,
+                group_id,
+                // Where the import results are uploaded, when the caller named a bucket
+                // for them. The key of the report object is filled in below, once that
+                // object has actually been written.
+                status_report_s3_bucket: input.s3bucket_for_report_data,
+                status_report_s3_key: None,
+                // The import is not done the instant the call returns; the clock owes it
+                // a terminal status once the completion span has passed.
+                status: crate::state::IMPORT_IN_PROGRESS.to_string(),
+                start_time: now,
+                completion_time: None,
+                // No records are counted until the task completes.
+                number_of_records_success: 0,
+                number_of_records_failed: 0,
+                completion_due: Some(now + crate::state::COMPLETION_SPAN),
+            };
+            // The import's status report: the object a caller follows
+            // `statusReportS3Bucket` and `statusReportS3Key` to in order to read the
+            // per-record outcomes (the companion of `numberOfRecordsFailed`). It is
+            // produced here, where the import runs, and both its key and its content are
+            // derived from the stored task.
+            //
+            // Producing it HERE rather than when the clock's completion is materialised
+            // is deliberate: the import itself is carried out by this call, and the two
+            // reads that materialise the completion are `@readonly`, so neither may make
+            // the in-process call that writes an object. The record the document reports
+            // is fixed by this call too — the counts are settled here and the completion
+            // only moves the status — so writing it now reports the same import the
+            // completed task reports. `statusReportS3Key` is still withheld until the
+            // task is complete, because the report a caller is pointed at is the report
+            // of a FINISHED import.
+            let report = task.status_report_s3_bucket.clone().map(|bucket| {
+                (
+                    bucket,
+                    crate::state::import_status_report_key(&task),
+                    crate::state::import_status_report_document(&task),
                 )
-                .into(),
-            );
-        }
-
-        let id = store.mint_import_file_task_id();
-        let task = crate::state::ImportFileTask {
-            id: id.clone(),
-            import_name: input.name,
-            input_s3_bucket: input.s3_bucket,
-            input_s3_key: input.s3key,
-            data_source_type: input.data_source_type,
-            group_id,
-            // Where the import results would be uploaded, when the caller named a
-            // bucket for them. The report object itself is never written, so there is
-            // no `statusReportS3Key` to report.
-            status_report_s3_bucket: input.s3bucket_for_report_data,
-            status_report_s3_key: None,
-            // The import is not done the instant the call returns; the clock owes it a
-            // terminal status once the completion span has passed.
-            status: crate::state::IMPORT_IN_PROGRESS.to_string(),
-            start_time: now,
-            completion_time: None,
-            // No records are counted until the task completes.
-            number_of_records_success: 0,
-            number_of_records_failed: 0,
-            completion_due: Some(now + crate::state::COMPLETION_SPAN),
+            });
+            store.import_tasks.insert(id.clone(), task);
+            (id, report)
         };
-        store.import_tasks.insert(id.clone(), task);
+
+        if let Some((bucket, key, document)) = report {
+            let region = crate::state::request_region(ctx.parts());
+            match crate::state::put_import_status_report(ctx, &region, &bucket, &key, document)
+                .await
+            {
+                // The object is there, so the task can name it: `statusReportS3Key` is
+                // reported from here on by both the single read and the list read.
+                Ok(()) => {
+                    let mut store = state.lock();
+                    if let Some(task) = store.import_tasks.get_mut(&id) {
+                        task.status_report_s3_key = Some(key);
+                    }
+                }
+                // Nothing was written, so the task names nothing: a reported key would
+                // send a caller to an object it cannot read.
+                Err(reason) => ::tracing::warn!(
+                    import_task_id = %id,
+                    %bucket,
+                    %key,
+                    %reason,
+                    "the import status report object could not be written",
+                ),
+            }
+        }
 
         Ok(StartImportFileTaskOutput { id: Some(id) })
     }

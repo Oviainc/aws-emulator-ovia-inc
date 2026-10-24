@@ -68,6 +68,16 @@
 //! [`ComAmazonawsLambdaAwsgirapiserviceState::reserved_concurrency_except`] and
 //! [`MIN_UNRESERVED_CONCURRENT_EXECUTIONS`]).
 //!
+//! The provisioned-concurrency slice hangs off the same record, one entry per qualifier:
+//! `PutProvisionedConcurrencyConfig` "Adds a provisioned concurrency configuration to a
+//! function's alias or version", so what it persists lives on
+//! [`FunctionRecord::provisioned_concurrency_configs`] keyed by the qualifier the call
+//! addressed, and every reader reports exactly that record. The allocation it asks for is
+//! owed by the CLOCK rather than by anybody calling — a configuration is stored
+//! [`PROVISIONED_CONCURRENCY_IN_PROGRESS`] with nothing allocated yet, and
+//! [`ProvisionedConcurrencyRecord::materialize`] brings it up to whatever the clock has
+//! already made due.
+//!
 //! `GetAccountSettings` reports on the same records at the account level:
 //! "Retrieves details about your account's limits and usage in an Amazon Web Services
 //! Region", so its usage is what the store holds and its unreserved concurrency is what
@@ -101,9 +111,10 @@ use crate::ops::types::{
     CreateFunctionOutput, DeadLetterConfig, DestinationConfig, DocumentDBEventSourceConfig,
     DurableConfig, Environment, EnvironmentResponse, EphemeralStorage,
     EventSourceMappingLoggingConfig, EventSourceMappingMetricsConfig, FileSystemConfig,
-    FilterCriteria, FunctionCodeLocation, GetLayerVersionOutput, ImageConfig, ImageConfigResponse,
-    InstanceRequirements, Layer, LayerVersionContentOutput, LayerVersionsListItem, LoggingConfig,
-    PropagateTags, ProvisionedPollerConfig, PutFunctionConcurrencyOutput, ResolvedS3Object,
+    FilterCriteria, FunctionCodeLocation, GetLayerVersionOutput, GetProvisionedConcurrencyConfigOutput,
+    ImageConfig, ImageConfigResponse, InstanceRequirements, Layer, LayerVersionContentOutput,
+    LayerVersionsListItem, LoggingConfig, PropagateTags, ProvisionedConcurrencyConfigListItem,
+    ProvisionedPollerConfig, PutFunctionConcurrencyOutput, ResolvedS3Object,
     RuntimeVersionConfig, ScalingConfig, SelfManagedEventSource, SelfManagedKafkaEventSourceConfig,
     SnapStartResponse, SourceAccessConfiguration, TenancyConfig, TracingConfigResponse, VpcConfig,
     VpcConfigResponse,
@@ -915,6 +926,159 @@ impl FunctionUrlConfigRecord {
     }
 }
 
+/// `ProvisionedConcurrencyStatusEnum` values an allocation moves through, from the
+/// model's enum (`IN_PROGRESS | READY | FAILED`). An allocation this store accepts is
+/// `IN_PROGRESS` until the clock makes it `READY`; `FAILED` is the status of an
+/// allocation Lambda could not make, and nothing here fails one.
+pub const PROVISIONED_CONCURRENCY_IN_PROGRESS: &str = "IN_PROGRESS";
+/// See [`PROVISIONED_CONCURRENCY_IN_PROGRESS`].
+pub const PROVISIONED_CONCURRENCY_READY: &str = "READY";
+
+/// How long after a `PutProvisionedConcurrencyConfig` the allocation it asked for
+/// becomes [`PROVISIONED_CONCURRENCY_READY`].
+///
+/// AWS documents no duration for it — only that the allocation is not immediate ("The
+/// status of the allocation process" is `IN_PROGRESS` while Lambda prepares the
+/// environments) — so the span is EMULATOR-CHOSEN, the same half second this slice uses
+/// for a function's own activation ([`ACTIVATION_DELAY`]). It is never zero, so a caller
+/// that reads the configuration straight after setting it sees the `IN_PROGRESS` status
+/// and the zero allocation that go with a warm-up still under way.
+pub const PROVISIONED_CONCURRENCY_ALLOCATION_DELAY: Duration = Duration::from_millis(500);
+
+/// The message a provisioned-concurrency operation refuses with when the qualifier a
+/// configuration would be ADDED to names the unpublished version.
+///
+/// A configuration "is added to a function's alias or version", and `$LATEST` is neither,
+/// so it is never a qualifier one can be added to, read from or removed from. Every one
+/// of those operations answers one fixed sentence for it — the sentence names nothing the
+/// request carried, so it is the wording of the rule rather than an echo of a call — and
+/// the one the write answers says the configuration cannot be applied there, while
+/// [`PROVISIONED_CONCURRENCY_QUALIFIER_MESSAGE`] is what the operations addressing an
+/// existing configuration answer.
+pub const PROVISIONED_CONCURRENCY_CANNOT_APPLY_TO_LATEST_MESSAGE: &str =
+    "Provisioned Concurrency Configs cannot be applied to unpublished function versions.";
+
+/// The message an operation addressing an EXISTING configuration refuses with when the
+/// qualifier names the unpublished version: the same rule as
+/// [`PROVISIONED_CONCURRENCY_CANNOT_APPLY_TO_LATEST_MESSAGE`], stated as the resource form
+/// the operation requires.
+pub const PROVISIONED_CONCURRENCY_QUALIFIER_MESSAGE: &str =
+    "The function resource provided must be an alias or a published version.";
+
+/// The message a provisioned-concurrency operation refuses with when the alias or version
+/// it resolved holds no configuration.
+///
+/// Lambda answers this one fixed sentence for a configuration that does not exist — the
+/// request already names which one it asked about — rather than the `Function not found:
+/// <arn>` form [`resolve_function`] builds when it is the FUNCTION, alias or version that
+/// is missing, so a caller can tell "no such version" from "that version has no
+/// provisioned concurrency".
+pub const PROVISIONED_CONCURRENCY_CONFIG_NOT_FOUND_MESSAGE: &str =
+    "No Provisioned Concurrency Config found for this function";
+
+/// One provisioned concurrency configuration: the concurrency a
+/// `PutProvisionedConcurrencyConfig` call asked Lambda to keep initialised for one alias
+/// or version of a function, and how far that allocation has got.
+///
+/// Held per qualifier on [`FunctionRecord::provisioned_concurrency_configs`], because
+/// `PutProvisionedConcurrencyConfig` "Adds a provisioned concurrency configuration to a
+/// function's alias or version" and `ProvisionedConcurrencyConfigListItem$FunctionArn`
+/// is "The Amazon Resource Name (ARN) of the alias or version" — so an alias and the
+/// version it invokes each hold their own configuration, keyed by the qualifier the call
+/// addressed.
+///
+/// The allocation itself is owed by the CLOCK rather than by anybody calling: the record
+/// stores the instant it becomes [`PROVISIONED_CONCURRENCY_READY`] and
+/// [`ProvisionedConcurrencyRecord::materialize`] brings the status up to whatever the
+/// clock has already made due. Nothing sleeps.
+#[derive(Debug, Clone)]
+pub struct ProvisionedConcurrencyRecord {
+    /// "The amount of provisioned concurrency requested", exactly as the call asked for
+    /// it.
+    pub requested: i32,
+    /// One of the model's `ProvisionedConcurrencyStatusEnum` values.
+    pub status: String,
+    /// When the move to [`PROVISIONED_CONCURRENCY_READY`] becomes due, while the
+    /// allocation is still being made.
+    pub ready_due: Option<SystemTime>,
+    /// "The date and time that a user last updated the configuration, in ISO 8601
+    /// format", stamped by the call that stored this record.
+    pub last_modified: String,
+}
+
+impl ProvisionedConcurrencyRecord {
+    /// Bring this record up to whatever the clock has already made due: an allocation
+    /// whose warm-up instant has passed is ready, and would have been ready at that same
+    /// instant even if nobody had called.
+    pub fn materialize(&mut self, now: SystemTime) {
+        if self.ready_due.is_some_and(|due| now >= due) {
+            self.status = PROVISIONED_CONCURRENCY_READY.to_string();
+            self.ready_due = None;
+        }
+    }
+
+    /// "The amount of provisioned concurrency allocated": all of what was requested once
+    /// the allocation is ready, and none of it while Lambda is still making it.
+    ///
+    /// Read it only after [`Self::materialize`], so an allocation the clock has already
+    /// completed is not reported as still empty.
+    #[must_use]
+    pub fn allocated(&self) -> i32 {
+        if self.status == PROVISIONED_CONCURRENCY_READY {
+            self.requested
+        } else {
+            0
+        }
+    }
+
+    /// What every reader of one configuration reports, built entirely out of what is
+    /// stored.
+    ///
+    /// The model declares ONE `ProvisionedConcurrencyConfig` response shape, generated
+    /// here as [`GetProvisionedConcurrencyConfigOutput`]; an operation whose output is
+    /// generated as its own struct over that shape carries these members across one for
+    /// one rather than rebuilding them from state a second time.
+    ///
+    /// `StatusReason` is "For failed allocations, the reason that provisioned concurrency
+    /// could not be allocated", and no allocation this slice accepts fails, so none is
+    /// reported.
+    #[must_use]
+    pub fn reported(&self) -> GetProvisionedConcurrencyConfigOutput {
+        let allocated = self.allocated();
+        GetProvisionedConcurrencyConfigOutput {
+            requested_provisioned_concurrent_executions: Some(self.requested),
+            allocated_provisioned_concurrent_executions: Some(allocated),
+            // "The amount of provisioned concurrency available": what is allocated is
+            // initialised and therefore available to serve an invocation.
+            available_provisioned_concurrent_executions: Some(allocated),
+            status: Some(self.status.clone()),
+            status_reason: None,
+            last_modified: Some(self.last_modified.clone()),
+        }
+    }
+
+    /// The `ProvisionedConcurrencyConfigListItem` a listing reports for this
+    /// configuration: the same members [`Self::reported`] answers, beside
+    /// `FunctionArn` — "The Amazon Resource Name (ARN) of the alias or version" the
+    /// configuration was added to, which the caller passes `function_arn`.
+    #[must_use]
+    pub fn listed(&self, function_arn: String) -> ProvisionedConcurrencyConfigListItem {
+        let reported = self.reported();
+        ProvisionedConcurrencyConfigListItem {
+            function_arn: Some(function_arn),
+            requested_provisioned_concurrent_executions: reported
+                .requested_provisioned_concurrent_executions,
+            available_provisioned_concurrent_executions: reported
+                .available_provisioned_concurrent_executions,
+            allocated_provisioned_concurrent_executions: reported
+                .allocated_provisioned_concurrent_executions,
+            status: reported.status,
+            status_reason: reported.status_reason,
+            last_modified: reported.last_modified,
+        }
+    }
+}
+
 /// The runtime management configuration of one function version: "the runtime update
 /// mode" and, in [`UPDATE_RUNTIME_ON_MANUAL`] mode only, the runtime version the
 /// version is pinned to.
@@ -1165,6 +1329,12 @@ pub struct FunctionRecord {
     /// [`RuntimeManagementConfigRecord::default`]; see
     /// [`Self::runtime_management_config`].
     pub runtime_management_configs: BTreeMap<String, RuntimeManagementConfigRecord>,
+    /// The provisioned concurrency configuration of each alias or published version that
+    /// has one, keyed by the qualifier the `PutProvisionedConcurrencyConfig` call
+    /// addressed. A configuration "is added to a function's alias or version", so an
+    /// alias and the version it invokes hold their own, and a qualifier nobody has
+    /// configured holds none at all.
+    pub provisioned_concurrency_configs: BTreeMap<String, ProvisionedConcurrencyRecord>,
 }
 
 impl FunctionRecord {
@@ -1206,6 +1376,11 @@ impl FunctionRecord {
                 invocation.outcome =
                     AsyncInvocationOutcome::Failed(ASYNC_NOT_EXECUTED_REASON.to_string());
             }
+        }
+        // And the same rule for every provisioned concurrency allocation under way: the
+        // warm-up the clock has already made due is finished, so the allocation is ready.
+        for config in self.provisioned_concurrency_configs.values_mut() {
+            config.materialize(now);
         }
     }
 
@@ -1587,6 +1762,23 @@ impl FunctionRecord {
             source_kms_key_arn: self.code.source_kms_key_arn.clone(),
             ..FunctionCodeLocation::default()
         }
+    }
+
+    /// The provisioned concurrency this function has allocated across its aliases and
+    /// versions, leaving out the one qualifier `exclude` names when it names one.
+    ///
+    /// `PutProvisionedConcurrencyConfig` REPLACES the configuration of the qualifier it
+    /// addresses, so a caller checking what a new allocation would commit asks for the
+    /// sum without that qualifier's current one.
+    #[must_use]
+    pub fn provisioned_concurrency_except(&self, exclude: Option<&str>) -> i32 {
+        self.provisioned_concurrency_configs
+            .iter()
+            .filter(|(qualifier, _)| {
+                exclude.is_none_or(|excluded| qualifier.as_str() != excluded)
+            })
+            .map(|(_, config)| config.requested)
+            .fold(0i32, i32::saturating_add)
     }
 
     /// The `Concurrency` `GetFunction` reports, present only once reserved concurrency
@@ -2623,6 +2815,32 @@ impl ComAmazonawsLambdaAwsgirapiserviceState {
             .iter()
             .filter(|(name, _)| exclude.is_none_or(|excluded| name.as_str() != excluded))
             .filter_map(|(_, function)| function.reserved_concurrent_executions)
+            .fold(0i32, i32::saturating_add)
+    }
+
+    /// The provisioned concurrency the stored functions have allocated out of the
+    /// account's UNRESERVED capacity, leaving out the one configuration `exclude` names
+    /// when it names one (a function name and a qualifier).
+    ///
+    /// A function that reserves concurrency allocates its provisioned concurrency out of
+    /// that reservation — `PutFunctionConcurrency` "reserves capacity for that
+    /// concurrency level", and the reservation is the whole of what the account commits
+    /// to that function — so only the functions reserving nothing commit anything here
+    /// beyond what [`Self::reserved_concurrency_except`] already counts.
+    #[must_use]
+    pub fn unreserved_provisioned_concurrency_except(
+        &self,
+        exclude: Option<(&str, &str)>,
+    ) -> i32 {
+        self.functions
+            .iter()
+            .filter(|(_, function)| function.reserved_concurrent_executions.is_none())
+            .map(|(name, function)| {
+                let excluded = exclude
+                    .filter(|(excluded_name, _)| *excluded_name == name.as_str())
+                    .map(|(_, qualifier)| qualifier);
+                function.provisioned_concurrency_except(excluded)
+            })
             .fold(0i32, i32::saturating_add)
     }
 

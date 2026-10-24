@@ -166,20 +166,22 @@ pub const ERROR_CODE_MALFORMED_TOKEN: &str = "MalformedToken";
 /// See [`ERROR_CODE_MISSING_INPUT`].
 pub const ERROR_CODE_INVALID_TOKEN: &str = "InvalidToken";
 
-/// The page `ListTaxRegistrations` builds when a request names no `maxResults`.
+/// The page a listing builds when a request names no `maxResults`, for an
+/// operation whose own documentation states no default.
 ///
-/// AWS documents no default page size for this operation, so this is the
-/// emulator's own: a request that names none still gets a bounded page and a
-/// cursor to continue from, so no single request can ask the emulator to
-/// serialise the whole store into one response.
+/// The bounds are per operation (see [`PageBounds`]): where the operation's
+/// documentation states them, they are the service's, and where it states none
+/// this is the emulator's own, so a request that names no page size still gets a
+/// bounded page and a cursor to continue from rather than the whole store in one
+/// response.
 pub const DEFAULT_PAGE_SIZE: usize = 100;
 
-/// The largest page `ListTaxRegistrations` builds, whatever `maxResults` asks
-/// for.
+/// The largest page a listing builds whose own documentation states no cap,
+/// whatever `maxResults` asks for.
 ///
-/// Equal to the ceiling of the model's own `maxResults` range (1..=1000), so it
-/// never truncates a page size the model admits; it pins that the SERVER, not
-/// the request, owns the upper bound on one response's size and on the work done
+/// Equal to the ceiling of the shared `MaxResults` range (1..=1000), so it never
+/// truncates a page size the model admits; it pins that the SERVER, not the
+/// request, owns the upper bound on one response's size and on the work done
 /// while the state lock is held.
 pub const MAX_PAGE_SIZE: usize = 1_000;
 
@@ -203,20 +205,68 @@ pub const MAX_STORED_REGISTRATIONS: usize = 1_000;
 /// nothing.
 pub const MAX_STORED_SUPPLEMENTAL_REGISTRATIONS: usize = 1_000;
 
-/// The page size a listing request selects: what it asked for, else
-/// [`DEFAULT_PAGE_SIZE`], never more than [`MAX_PAGE_SIZE`] and never zero.
+/// The page-size bounds of ONE listing operation: the page it builds when the
+/// request names no `maxResults`, and the largest page it builds whatever
+/// `maxResults` asks for.
 ///
-/// A `maxResults` outside the model's 1..=1000 range never reaches here: the
-/// boundary validator refuses it with a `ValidationException` before the handler
-/// runs, as `tests/all/tax_exemptions.rs` pins on each bound and one past it. The
-/// clamp is therefore the SERVER's ceiling on a page, not a coercion of a value a
-/// client could have sent.
-pub fn page_size(max_results: Option<i32>) -> usize {
-    max_results
-        .and_then(|max| usize::try_from(max).ok())
-        .unwrap_or(DEFAULT_PAGE_SIZE)
-        .clamp(1, MAX_PAGE_SIZE)
+/// Bounds belong to the operation, not to the service: the listings of one
+/// service need not share them, and the range of the `MaxResults` shape they
+/// share (1..=1000) is what the WIRE admits, not what any one of them serves in
+/// a single page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PageBounds {
+    /// The page size used when the request names no `maxResults`.
+    pub default_size: usize,
+    /// The largest page built, whatever `maxResults` asks for.
+    pub max_size: usize,
 }
+
+impl PageBounds {
+    /// Bounds with this default page size and this ceiling.
+    pub const fn new(default_size: usize, max_size: usize) -> Self {
+        Self {
+            default_size,
+            max_size,
+        }
+    }
+
+    /// The page size a request selects under these bounds: what it asked for,
+    /// else [`Self::default_size`], never more than [`Self::max_size`] and never
+    /// zero.
+    ///
+    /// A `maxResults` outside the model's 1..=1000 range never reaches here: the
+    /// boundary validator refuses it with a `ValidationException` before the
+    /// handler runs, as `tests/all/tax_exemptions.rs` pins on each bound and one
+    /// past it. The clamp is therefore the SERVER's ceiling on a page, which a
+    /// larger `maxResults` does not raise, not a coercion of a value a client
+    /// could not have sent.
+    pub fn page_size(self, max_results: Option<i32>) -> usize {
+        max_results
+            .and_then(|max| usize::try_from(max).ok())
+            .unwrap_or(self.default_size)
+            .clamp(1, self.max_size)
+    }
+}
+
+/// `ListTaxRegistrations`' page bounds, which its own documentation states: the
+/// operation "can be used to retrieve up to 100 accounts' tax registrations in
+/// one call (default 50)". So a request naming no `maxResults` is served 50
+/// entries and a cursor, and one naming more than 100 — up to the 1000 the
+/// shared `MaxResults` shape admits on the wire — is still served at most 100
+/// entries and a cursor.
+pub const TAX_REGISTRATIONS_PAGE_BOUNDS: PageBounds = PageBounds::new(50, 100);
+
+/// `ListTaxExemptions`' page bounds. Its documentation states neither a default
+/// nor a cap, so these are the emulator's own ([`DEFAULT_PAGE_SIZE`] /
+/// [`MAX_PAGE_SIZE`]).
+pub const TAX_EXEMPTIONS_PAGE_BOUNDS: PageBounds =
+    PageBounds::new(DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE);
+
+/// `ListSupplementalTaxRegistrations`' page bounds. Documented like
+/// [`TAX_EXEMPTIONS_PAGE_BOUNDS`]: the operation states neither a default nor a
+/// cap, so these are the emulator's own.
+pub const SUPPLEMENTAL_TAX_REGISTRATIONS_PAGE_BOUNDS: PageBounds =
+    PageBounds::new(DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE);
 
 /// Per-service state for com-amazonaws-taxsettings-taxsettings. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]

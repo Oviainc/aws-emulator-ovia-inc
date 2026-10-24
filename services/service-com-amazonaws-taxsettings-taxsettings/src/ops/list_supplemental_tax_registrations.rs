@@ -10,11 +10,12 @@
 //! after, so resuming means "the first key strictly greater than it" — well
 //! defined because the store is ordered.
 //!
-//! The page size is the SERVER's decision: `maxResults` when the request names
-//! one, [`crate::state::DEFAULT_PAGE_SIZE`] when it does not, capped at
-//! [`crate::state::MAX_PAGE_SIZE`] — the same rule `ListTaxRegistrations`
-//! follows, so no request can ask the emulator to serialise the whole store into
-//! one response.
+//! The page size is the SERVER's decision, under THIS operation's bounds
+//! ([`crate::state::SUPPLEMENTAL_TAX_REGISTRATIONS_PAGE_BOUNDS`]): `maxResults`
+//! when the request names one, that default when it does not, capped at that
+//! ceiling. This operation's documentation states no page bound (unlike
+//! `ListTaxRegistrations`), so the bounds are the emulator's own, and no request
+//! can ask it to serialise the whole store into one response.
 //!
 //! ## Shape of an operation
 //!
@@ -164,7 +165,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request's own 1..=1000 range is a modelled constraint the boundary
         // already refused outside, but a request that names NO page size must
         // still get a bounded page.
-        let page_size = crate::state::page_size(input.max_results);
+        let page_size =
+            crate::state::SUPPLEMENTAL_TAX_REGISTRATIONS_PAGE_BOUNDS.page_size(input.max_results);
         let resume_after = match input.next_token.as_deref() {
             Some(token) => Some(
                 crate::state::decode_supplemental_page_token(token)

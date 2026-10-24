@@ -38,6 +38,9 @@ mod import_and_assess;
 #[path = "all/import_file_task_listing.rs"]
 mod import_file_task_listing;
 
+#[path = "all/import_status_report.rs"]
+mod import_status_report;
+
 #[path = "all/portfolio_preferences.rs"]
 mod portfolio_preferences;
 

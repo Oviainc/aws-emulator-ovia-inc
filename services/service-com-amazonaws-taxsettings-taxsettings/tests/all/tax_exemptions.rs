@@ -57,8 +57,8 @@ use serde_json::{json, Value};
 use service_com_amazonaws_taxsettings_taxsettings::ops::types::{Authority, TaxExemptionType};
 use service_com_amazonaws_taxsettings_taxsettings::state::{
     tax_exemption_type_catalog, ComAmazonawsTaxsettingsTaxsettingsState, StoredTaxExemption,
-    DEFAULT_PAGE_SIZE, EXEMPTION_STATUS_EXPIRED, EXEMPTION_STATUS_NONE, EXEMPTION_STATUS_PENDING,
-    EXEMPTION_STATUS_VALID, MAX_PAGE_SIZE, MAX_STORED_EXEMPTIONS,
+    EXEMPTION_STATUS_EXPIRED, EXEMPTION_STATUS_NONE, EXEMPTION_STATUS_PENDING,
+    EXEMPTION_STATUS_VALID, MAX_STORED_EXEMPTIONS, TAX_EXEMPTIONS_PAGE_BOUNDS,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -1159,7 +1159,7 @@ async fn all_listed_accounts(router: &MultiServiceRouter) -> Vec<String> {
         // The largest page `maxResults` admits, so the biggest table row still
         // takes few pages (`smithy_query(query="operation",
         // operation="ListTaxExemptions")`: 1..=1000).
-        let mut body = json!({ "maxResults": MAX_PAGE_SIZE });
+        let mut body = json!({ "maxResults": TAX_EXEMPTIONS_PAGE_BOUNDS.max_size });
         if let Some(cursor) = &token {
             body["nextToken"] = json!(cursor);
         }
@@ -1355,7 +1355,7 @@ async fn a_submission_records_the_exemption_for_every_account_it_names() {
 
 /// Seed one exemption for each of `count` accounts, answering the account ids in
 /// store order.
-fn seed_many(engine: &Arc<engine::InMemoryEngine>, count: usize) -> Vec<String> {
+pub(crate) fn seed_many(engine: &Arc<engine::InMemoryEngine>, count: usize) -> Vec<String> {
     let accounts: Vec<String> = (1..=count).map(|index| format!("{index:012}")).collect();
     for account in &accounts {
         seed_exemptions(engine, account, vec![a_valid_exemption()]);
@@ -1396,7 +1396,9 @@ async fn the_listing_pages_over_every_account() {
                 "case {case:?}: expected 200, got {answer:?}"
             );
             let page = reported_accounts(&answer);
-            let limit = page_size.map_or(DEFAULT_PAGE_SIZE, |size| size.unsigned_abs() as usize);
+            let limit = page_size.map_or(TAX_EXEMPTIONS_PAGE_BOUNDS.default_size, |size| {
+                size.unsigned_abs() as usize
+            });
             assert!(
                 page.len() <= limit,
                 "case {case:?}: a page holds at most {limit} accounts, got {page:?}"
@@ -1429,14 +1431,14 @@ async fn the_listing_pages_over_every_account() {
 #[tokio::test]
 async fn a_request_naming_no_page_size_gets_the_servers_default() {
     let (router, engine) = emulator_with_engine();
-    let store_size = DEFAULT_PAGE_SIZE + 5;
+    let store_size = TAX_EXEMPTIONS_PAGE_BOUNDS.default_size + 5;
     let expected = seed_many(&engine, store_size);
 
     let first = call(&router, "ListTaxExemptions", &json!({})).await;
     let page = reported_accounts(&first);
     assert_eq!(
         page.len(),
-        DEFAULT_PAGE_SIZE,
+        TAX_EXEMPTIONS_PAGE_BOUNDS.default_size,
         "case \"no maxResults\": expected the server's default page, got {} accounts",
         page.len()
     );
@@ -1450,7 +1452,7 @@ async fn a_request_naming_no_page_size_gets_the_servers_default() {
     let rest = reported_accounts(&second);
     assert_eq!(
         rest.len(),
-        store_size - DEFAULT_PAGE_SIZE,
+        store_size - TAX_EXEMPTIONS_PAGE_BOUNDS.default_size,
         "case \"the cursor's page\": expected the remainder, got {rest:?}"
     );
     assert!(
