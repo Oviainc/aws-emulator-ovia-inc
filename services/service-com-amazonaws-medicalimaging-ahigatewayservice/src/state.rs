@@ -17,6 +17,14 @@
 //! (`GetDatastore`, `ListDatastores`, `GetDICOMImportJob`, `GetImageSet`) only ever
 //! writes a change the clock already owed at that instant — so a read never moves a
 //! status that was not already due.
+//!
+//! # Pixel data belongs to the image set
+//!
+//! An image set owns the image frames it holds ([`ImageFrame`]), keyed by image frame
+//! id, because `GetImageFrame` takes no version: every version of an image set reaches
+//! the same frames. A frame is readable only once something has DELIVERED it — the copy
+//! that completes carries its source's frames to its destination — so nothing is served
+//! that was never stored.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, SystemTime};
@@ -172,6 +180,11 @@ pub const IMAGE_SET_VERSION_CONFLICT_MESSAGE: &str =
 /// stated by rule rather than by which image set it was.
 pub const IMAGE_SET_NOT_ACTIVE_MESSAGE: &str =
     "The image set is not in the ACTIVE state, so it cannot take part in a copy.";
+
+/// The text this service answers a request naming an image frame an image set does not
+/// hold with — the resource KIND, by the same rule as [`IMAGE_SET_NOT_FOUND_MESSAGE`],
+/// with no identifier from the request in it.
+pub const IMAGE_FRAME_NOT_FOUND_MESSAGE: &str = "ImageFrame resource is not found.";
 
 /// The storage tier every image set this emulator holds reports.
 ///
@@ -488,6 +501,87 @@ impl ImportJob {
     }
 }
 
+/// The `contentType` `GetImageFrame` reports for pixel data whose stored transfer
+/// syntax the response documentation does not list — the documented default
+/// ("Default is `application/octet-stream`").
+pub const DEFAULT_IMAGE_FRAME_CONTENT_TYPE: &str = "application/octet-stream";
+
+/// The `contentType` `GetImageFrame` reports when the stored transfer syntax is
+/// MISSING, which the documentation gives the same answer as UID
+/// `1.2.840.10008.1.2.4.202`.
+pub const MISSING_TRANSFER_SYNTAX_CONTENT_TYPE: &str = "image/jph";
+
+/// Every stored DICOM transfer syntax UID the `GetImageFrame` response documents a
+/// `contentType` for, with the content type it documents for it.
+///
+/// Transcribed from the member's own documentation —
+/// `smithy_query(query="doc",shape="GetImageFrameResponse",member="contentType")` —
+/// including `video/H256` for HEVC/H.265, which is how AWS spells it there. A UID this
+/// table does not list falls back to [`DEFAULT_IMAGE_FRAME_CONTENT_TYPE`].
+pub const IMAGE_FRAME_CONTENT_TYPES: [(&str, &str); 22] = [
+    ("1.2.840.10008.1.2.1", "application/octet-stream"),
+    ("1.2.840.10008.1.2.4.50", "image/jpeg"),
+    ("1.2.840.10008.1.2.4.91", "image/j2c"),
+    // MPEG2.
+    ("1.2.840.10008.1.2.4.100", "video/mpeg"),
+    ("1.2.840.10008.1.2.4.100.1", "video/mpeg"),
+    ("1.2.840.10008.1.2.4.101", "video/mpeg"),
+    ("1.2.840.10008.1.2.4.101.1", "video/mpeg"),
+    // MPEG-4 AVC/H.264.
+    ("1.2.840.10008.1.2.4.102", "video/mp4"),
+    ("1.2.840.10008.1.2.4.102.1", "video/mp4"),
+    ("1.2.840.10008.1.2.4.103", "video/mp4"),
+    ("1.2.840.10008.1.2.4.103.1", "video/mp4"),
+    ("1.2.840.10008.1.2.4.104", "video/mp4"),
+    ("1.2.840.10008.1.2.4.104.1", "video/mp4"),
+    ("1.2.840.10008.1.2.4.105", "video/mp4"),
+    ("1.2.840.10008.1.2.4.105.1", "video/mp4"),
+    ("1.2.840.10008.1.2.4.106", "video/mp4"),
+    ("1.2.840.10008.1.2.4.106.1", "video/mp4"),
+    // HEVC/H.265.
+    ("1.2.840.10008.1.2.4.107", "video/H256"),
+    ("1.2.840.10008.1.2.4.108", "video/H256"),
+    // High-Throughput JPEG 2000.
+    ("1.2.840.10008.1.2.4.202", "image/jph"),
+    ("1.2.840.10008.1.2.4.203", "image/jphc"),
+    // JPEG XL.
+    ("1.2.840.10008.1.2.4.112", "image/jxl"),
+];
+
+/// The `contentType` `GetImageFrame` reports for pixel data STORED in
+/// `transfer_syntax_uid`: what [`IMAGE_FRAME_CONTENT_TYPES`] documents for it, the
+/// missing-transfer-syntax answer when the frame declares none, and the documented
+/// default for a UID the table does not list.
+pub fn image_frame_content_type(transfer_syntax_uid: Option<&str>) -> &'static str {
+    let Some(uid) = transfer_syntax_uid else {
+        return MISSING_TRANSFER_SYNTAX_CONTENT_TYPE;
+    };
+    IMAGE_FRAME_CONTENT_TYPES
+        .iter()
+        .find(|(documented, _)| *documented == uid)
+        .map_or(DEFAULT_IMAGE_FRAME_CONTENT_TYPE, |(_, content_type)| {
+            *content_type
+        })
+}
+
+/// One image frame — the pixel data of one frame of one image set, as it was stored.
+///
+/// Pixel data belongs to the image SET rather than to one of its versions:
+/// `GetImageFrame` takes no version, so every version of an image set reaches the same
+/// frames.
+#[derive(Debug, Clone)]
+pub struct ImageFrame {
+    /// `ImageFrameId` (`^[0-9a-z]{32}$`) — the identifier this frame is reached by.
+    pub image_frame_id: String,
+    /// The DICOM transfer syntax UID the pixel data is STORED in, `None` when the
+    /// instance it came from declared none. `GetImageFrame`'s `contentType` is computed
+    /// from it (see [`image_frame_content_type`]); the bytes themselves are never
+    /// transcoded.
+    pub transfer_syntax_uid: Option<String>,
+    /// The pixel data, byte for byte as it was stored.
+    pub pixel_data: Vec<u8>,
+}
+
 /// `ImageSetState`, exactly the values the model declares
 /// (`smithy_query(query="shape",shape="ImageSetState")`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -620,6 +714,12 @@ pub struct PendingImageSetTransition {
     pub due_at: SystemTime,
     pub image_set_state: ImageSetState,
     pub workflow_status: ImageSetWorkflowStatus,
+    /// The pixel data this transition DELIVERS when it lands, keyed by image frame id —
+    /// the frames a copy in flight is writing into its destination. `None` for a
+    /// transition that delivers none, such as the release of the copy's read-only lock
+    /// on its source. Nothing is readable through `GetImageFrame` before the transition
+    /// that delivers it falls due, because nothing holds it yet.
+    pub delivered_image_frames: Option<HashMap<String, ImageFrame>>,
 }
 
 /// One persisted image set, with every version of it the data store holds.
@@ -638,6 +738,10 @@ pub struct ImageSet {
     pub latest_version: ImageSetVersion,
     /// Every superseded version, oldest first.
     pub earlier_versions: Vec<ImageSetVersion>,
+    /// The pixel data this image set holds, keyed by `ImageFrameId` — what
+    /// `GetImageFrame` serves. Empty for an image set no frame has been delivered to
+    /// yet.
+    pub image_frames: HashMap<String, ImageFrame>,
     /// Whether this image set is in the primary DICOM hierarchy (`isPrimary`).
     pub is_primary: bool,
     pub created_at: SystemTime,
@@ -674,6 +778,9 @@ impl ImageSet {
                 message: None,
             },
             earlier_versions: Vec::new(),
+            // A freshly minted image set holds no pixel data: a frame is readable only
+            // once something has delivered it (the copy that completes, an import).
+            image_frames: HashMap::new(),
             is_primary,
             created_at: now,
             deleted_at: None,
@@ -694,6 +801,12 @@ impl ImageSet {
     pub fn version(&self, wire_version_id: &str) -> Option<&ImageSetVersion> {
         self.versions()
             .find(|version| version.wire_version_id() == wire_version_id)
+    }
+
+    /// The image frame `image_frame_id` names, or `None` when this image set holds no
+    /// pixel data under that identifier.
+    pub fn image_frame(&self, image_frame_id: &str) -> Option<&ImageFrame> {
+        self.image_frames.get(image_frame_id)
     }
 
     /// The latest version identifier, as the wire spells it.
@@ -739,6 +852,13 @@ impl ImageSet {
         self.latest_version.workflow_status = pending.workflow_status;
         // The due instant, not `now`: `updatedAt` must not move between reads.
         self.latest_version.updated_at = pending.due_at;
+        // The pixel data the transition owed lands with it, so a frame becomes readable
+        // exactly when the copy that delivers it completes. A frame already held under
+        // the same identifier is replaced by the delivered one: an image frame id names
+        // its pixel data, so the two cannot disagree.
+        if let Some(delivered) = pending.delivered_image_frames {
+            self.image_frames.extend(delivered);
+        }
         self.pending = None;
     }
 }

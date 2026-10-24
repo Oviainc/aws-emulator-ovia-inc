@@ -41,6 +41,11 @@ pub(crate) const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 pub(crate) struct Answer {
     pub(crate) status: u16,
     pub(crate) body: Value,
+    /// The RAW response body, for an operation whose `@httpPayload` is a blob rather
+    /// than JSON (`GetImageFrame`'s `imageFrameBlob`), where [`Answer::body`] is null.
+    pub(crate) body_bytes: Vec<u8>,
+    /// The `Content-Type` the answer carried, empty when it carried none.
+    pub(crate) content_type: String,
     /// The wire error code (`x-amzn-errortype`, else the body's `__type`), with any
     /// `namespace#` prefix stripped. Empty on a success.
     pub(crate) error_code: String,
@@ -100,6 +105,12 @@ impl Emulator {
             .expect("a well-formed test request");
         let response = self.router.dispatch(request).await;
         let status = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
         let header_code = response
             .headers()
             .get("x-amzn-errortype")
@@ -127,6 +138,8 @@ impl Emulator {
         Answer {
             status,
             body,
+            body_bytes: response.body().to_vec(),
+            content_type,
             error_code,
         }
     }
