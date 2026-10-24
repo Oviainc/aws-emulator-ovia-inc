@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateRouterOutput
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateRouterOutput`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateRouterOutput::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies the settings one request carries to the router output its `Arn` addresses, in
+//! this service's store, and answers with the STORED record read back out of it. A member
+//! the request omits leaves the stored value alone; the read side is BatchGetRouterOutput.
 //!
 //! ## Shape of an operation
 //!
@@ -102,6 +97,47 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// Refuse the request with the service's own client-input error, `BadRequestException`
+/// (HTTP 400): "thrown if the request contains a semantic error". `detail` states what was
+/// unacceptable; the message carries it inside this service's validation envelope
+/// ([`crate::state::validation_failed_message`]), which every refusal about a request's
+/// CONTENT carries.
+fn bad_request(detail: impl Into<String>) -> UpdateRouterOutputError {
+    UpdateRouterOutputErrorModeled::BadRequestException(BadRequestException {
+        message: crate::state::validation_failed_message(&detail.into()),
+    })
+    .into()
+}
+
+/// Refuse a WELL-FORMED request the addressed router output itself does not admit, with the
+/// same `BadRequestException` (HTTP 400) under the other envelope
+/// ([`crate::state::bad_request_message`]): the request is not malformed, the output simply
+/// cannot be changed that way.
+fn refused_by_output(detail: impl Into<String>) -> UpdateRouterOutputError {
+    UpdateRouterOutputErrorModeled::BadRequestException(BadRequestException {
+        message: crate::state::bad_request_message(&detail.into()),
+    })
+    .into()
+}
+
+/// Refuse the request with `NotFoundException` (HTTP 404): "one or more of the resources in
+/// the request does not exist in the system" — the router output `identifier` addressed, in
+/// this service's not-found envelope ([`crate::state::not_found_message`]).
+fn not_found(identifier: &str) -> UpdateRouterOutputError {
+    UpdateRouterOutputErrorModeled::NotFoundException(NotFoundException {
+        message: crate::state::not_found_message(identifier),
+    })
+    .into()
+}
+
+/// The server-side failure for a store this service cannot reach.
+fn store_unavailable(detail: &str) -> UpdateRouterOutputError {
+    UpdateRouterOutputErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: detail.to_string(),
+    })
+    .into()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -176,18 +212,160 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateRouterOutput` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateRouterOutputErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(store_unavailable(
+                "the mediaconnect router output store is unavailable",
+            ));
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The lookup materialises every state change the clock already made due before the
+        // output is read or written — including the completion of an earlier delete, which
+        // is what makes an output whose deletion has finished a not-found here rather than
+        // an updatable record.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateRouterOutput"))
+        // The ARN is resolved FIRST, before anything about the request's content is judged,
+        // so a request against an output this service does not hold answers the not-found
+        // the operation it addressed resolves to rather than a complaint about a member of a
+        // resource that does not exist.
+        let Some(output) = store.router_output_mut(&input.arn, now) else {
+            return Err(not_found(&input.arn));
+        };
+
+        // An output whose delete has been accepted is on its way out of the store
+        // (`StoredRouterOutput::is_deleting`), so there is nothing left to reconfigure: the
+        // request conflicts with the state the resource is already in, which is what
+        // `ConflictException` describes ("would cause a conflict with the current state of a
+        // service resource associated with the request", 409 and retryable).
+        if output.is_deleting() {
+            return Err(UpdateRouterOutputErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "Router output {} is in state {} and is being deleted, so it cannot \
+                         be updated.",
+                        output.arn, output.state
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // A replacement configuration is stored through the crate's one normalisation, the
+        // same one CreateRouterOutput stores through: a STANDARD output's `Protocol` is
+        // implied by the variant of its `ProtocolConfiguration`, so the stored value reports
+        // the protocol that configuration configures and a request naming a different one is
+        // refused rather than stored self-contradicting.
+        let requested_configuration = match input.configuration.clone() {
+            Some(configuration) => Some(
+                crate::state::normalized_router_output_configuration(configuration)
+                    .map_err(bad_request)?,
+            ),
+            None => None,
+        };
+
+        // "Changing the type of the configuration is not supported"
+        // (`UpdateRouterOutput$Configuration`): the type is the variant of the
+        // configuration union (`crate::state::router_output_type`), so a replacement of a
+        // different variant is refused — the output stays the kind of output it was created
+        // as.
+        if let Some(configuration) = requested_configuration.as_ref() {
+            let requested_type = crate::state::router_output_type(configuration);
+            if requested_type != output.output_type() {
+                return Err(refused_by_output(format!(
+                    "Router output {} is a {} output, so its Configuration cannot be \
+                     replaced with a {} one: changing the type of the configuration is not \
+                     supported.",
+                    output.arn,
+                    output.output_type(),
+                    requested_type
+                )));
+            }
+        }
+
+        // "You cannot update the fabric configuration while the output has an active route.
+        // You must unroute the output before updating the fabric configuration"
+        // (`UpdateRouterOutput$FabricConfiguration`) — a request the output's current
+        // relation to a router input refuses, which is what `ConflictException` describes
+        // ("would cause a conflict with the current state of a service resource associated
+        // with the request. Resolve the conflict before retrying this request", 409 and
+        // retryable). The status and the error code are the contract; the sentence states
+        // the documented precondition, and carries neither of this service's
+        // `BadRequestException` envelopes.
+        if input.fabric_configuration.is_some() && output.is_routed() {
+            return Err(UpdateRouterOutputErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "Router output {} has an active route from router input {}, so its \
+                         FabricConfiguration cannot be updated. Unroute the output first.",
+                        output.arn,
+                        output.routed_input_arn.as_deref().unwrap_or_default()
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // What the tier and the bitrate become once this request is applied: the requested
+        // value where it carries one, the stored value where it does not.
+        let tier = input.tier.clone().unwrap_or_else(|| output.tier.clone());
+        let maximum_bitrate = input.maximum_bitrate.unwrap_or(output.maximum_bitrate);
+        // The tier bounds the bitrate, so the pair is judged as the output ENDS UP with it —
+        // lowering the tier under a bitrate it no longer allows is refused as surely as
+        // raising the bitrate past it. A request that moves NEITHER is never refused for a
+        // stored pair it did not introduce.
+        if input.tier.is_some() || input.maximum_bitrate.is_some() {
+            if let Some(rejection) =
+                crate::state::router_output_bitrate_rejection(&tier, maximum_bitrate)
+            {
+                return Err(bad_request(rejection));
+            }
+        }
+
+        // Each member the request carries replaces its counterpart; one it omits leaves the
+        // stored value alone. Nothing above this line has written anything, so a refused
+        // request changes nothing at all.
+        if let Some(name) = input.name.clone() {
+            output.name = name;
+        }
+        if let Some(configuration) = requested_configuration {
+            output.configuration = configuration;
+        }
+        output.tier = tier;
+        output.maximum_bitrate = maximum_bitrate;
+        if let Some(routing_scope) = input.routing_scope.clone() {
+            output.routing_scope = routing_scope;
+        }
+        if let Some(maintenance_configuration) = input.maintenance_configuration.clone() {
+            output.maintenance_configuration = maintenance_configuration;
+        }
+        if let Some(fabric_configuration) = input.fabric_configuration.clone() {
+            output.fabric_configuration = fabric_configuration;
+        }
+        // The update changed the resource, so the record's `UpdatedAt` moves with it.
+        //
+        // DELIBERATELY unconditional: `UpdatedAt` records when this resource was last
+        // written, and an accepted update writes it. Every member of this request shape is
+        // optional, so there is no such thing here as a request the service may refuse for
+        // carrying nothing, and the model states no exemption for one: a 202 means the
+        // reconfiguration was accepted. The ONE thing not keyed to the request is what it
+        // asked to change, so a request that re-sets a member to the value it already held
+        // is not told apart from one that moves it.
+        output.updated_at = now;
+
+        // Reconfiguring is not instantaneous — this operation answers `202 Accepted` — so
+        // the output reports `UPDATING` and the clock owes it, one transition span later,
+        // the state it was heading for: the one it is settled in, or the one its own
+        // creation still owes it (`StoredRouterOutput::settling_state`). A caller that reads
+        // the output straight afterwards therefore still sees the update in flight.
+        let settling = output.settling_state();
+        output.begin_transition(crate::state::ROUTER_OUTPUT_STATE_UPDATING, &settling, now);
+
+        // The response is the STORED record, read back out of the store, never the request.
+        Ok(UpdateRouterOutputOutput {
+            router_output: output.to_router_output(),
+        })
     }
 }

@@ -202,26 +202,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // `Tier` "sets the maximum bitrate, in Mbps, for the router output", so a request
-        // asking for more than its tier allows is a semantic error. The per-tier ceiling
-        // lives in `crate::state` with the documentation it comes from.
-        let Some(ceiling) = crate::state::router_output_tier_bitrate_ceiling(&input.tier) else {
-            return Err(bad_request(format!(
-                "Tier {:?} is not a router output tier this service offers.",
-                input.tier
-            )));
-        };
-        if input.maximum_bitrate <= 0 {
-            return Err(bad_request(format!(
-                "MaximumBitrate is a number of bits per second and must be positive; this \
-                 request asks for {}.",
-                input.maximum_bitrate
-            )));
-        }
-        if input.maximum_bitrate > ceiling {
-            return Err(bad_request(format!(
-                "MaximumBitrate {} bps exceeds the {} bps the {} tier allows.",
-                input.maximum_bitrate, ceiling, input.tier
-            )));
+        // asking for more than its tier allows is a semantic error. The rule and the
+        // per-tier ceiling live in `crate::state` with the documentation they come from, so
+        // UpdateRouterOutput judges the same pair the same way.
+        if let Some(rejection) =
+            crate::state::router_output_bitrate_rejection(&input.tier, input.maximum_bitrate)
+        {
+            return Err(bad_request(rejection));
         }
 
         // "The Amazon Web Services Region for the router output. Defaults to the current
@@ -258,37 +245,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A STANDARD output's `Protocol` is implied by the variant of its
         // `ProtocolConfiguration`, so the stored configuration reports the protocol that
         // configuration configures, and a request naming a different one is refused rather
-        // than stored self-contradicting.
-        let configuration = match input.configuration.clone() {
-            RouterOutputConfiguration::Standard(standard) => {
-                let configured = crate::state::router_output_protocol(
-                    &standard.protocol_configuration,
-                );
-                if let Some(named) = standard
-                    .protocol
-                    .as_deref()
-                    .filter(|protocol| !protocol.is_empty())
-                {
-                    if named != configured {
-                        return Err(bad_request(format!(
-                            "Configuration sets a {configured} protocol configuration, but \
-                             Protocol names {named}."
-                        )));
-                    }
-                }
-                RouterOutputConfiguration::Standard(StandardRouterOutputConfiguration {
-                    protocol: Some(configured.to_string()),
-                    ..standard
-                })
-            }
-            // The two configurations that deliver into another AWS resource carry no
-            // protocol member to reconcile. Neither variant's target is RESOLVED here: a
-            // MediaLive input belongs to another service, and the model gives this create no
-            // `NotFoundException` to answer with for a router network interface this account
-            // does not hold — so referential checks belong with the operations that own
-            // those resources.
-            other => other,
-        };
+        // than stored self-contradicting — through the crate's one normalisation, which
+        // UpdateRouterOutput stores a replacement configuration through as well.
+        //
+        // No variant's target is RESOLVED here: a MediaLive input belongs to another
+        // service, and the model gives this create no `NotFoundException` to answer with for
+        // a router network interface this account does not hold — so referential checks
+        // belong with the operations that own those resources.
+        let configuration =
+            crate::state::normalized_router_output_configuration(input.configuration.clone())
+                .map_err(bad_request)?;
 
         // `Tags` writes the same kind of tag map TagResource writes, so a pair it carries is
         // bounded by the same rule, named once in `crate::state`.
