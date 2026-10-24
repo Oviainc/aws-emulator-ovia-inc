@@ -21,6 +21,8 @@ mod benefit_allocations;
 mod benefit_application_lifecycle;
 #[path = "all/client_token_idempotency.rs"]
 mod client_token_idempotency;
+#[path = "all/disassociate_benefit_application_resource.rs"]
+mod disassociate_benefit_application_resource;
 #[path = "all/entitlement_denial.rs"]
 mod entitlement_denial;
 #[path = "all/get_benefit.rs"]
