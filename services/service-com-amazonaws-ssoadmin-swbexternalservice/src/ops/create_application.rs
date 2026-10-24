@@ -388,6 +388,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             name: input.name,
             description: input.description,
             status,
+            // `CreateApplication` takes no assignment configuration, so the application
+            // starts on the modelled default of `AssignmentRequired` until a
+            // `PutApplicationAssignmentConfiguration` sets one.
+            assignment_required: crate::state::APPLICATION_ASSIGNMENT_REQUIRED_DEFAULT,
             portal_options,
             created_date: ::aws_smithy_types::DateTime::from(now),
             // "CreatedFrom" — the Region this create ran in, which is the only Region
