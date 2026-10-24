@@ -196,13 +196,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
         let now_millis = crate::state::now_millis();
         let page_size = crate::state::page_size(input.max_results);
-        let resume_from = match input.next_token.as_deref() {
-            Some(token) => Some(
-                crate::state::decode_page_token(token, crate::state::ALLOCATION_ID_PREFIX)
-                    .ok_or_else(invalid_next_token)?,
-            ),
-            None => None,
-        };
 
         let mut store = state.lock();
         if !store.catalogs.contains_key(&input.catalog) {
@@ -264,6 +257,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
             });
 
+        // A `NextToken` only resumes this listing when it is a cursor this service issued
+        // for THIS catalog's allocations and the allocation it names is still stored — see
+        // [`crate::state::resume_from`]; anything else is a client-fabricated or stale
+        // cursor, which is a validation failure rather than a position in the collection.
+        let resume_from = crate::state::resume_from(
+            input.next_token.as_deref(),
+            crate::state::ALLOCATION_ID_PREFIX,
+            &input.catalog,
+            &catalog.allocations,
+        )
+        .map_err(|_| invalid_next_token())?;
+
         // The allocations are keyed by id in a `BTreeMap`, so this walk is in one stable
         // order and the token is simply the id to resume at — the range starts directly at
         // that key rather than rescanning from the front. One extra matching record is
@@ -294,7 +299,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let next_token = page
             .get(page_size)
-            .map(|allocation| crate::state::encode_page_token(&allocation.id));
+            .map(|allocation| {
+                crate::state::encode_page_token(&input.catalog, &allocation.id)
+            });
         page.truncate(page_size);
 
         Ok(ListBenefitAllocationsOutput {

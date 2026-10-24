@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisableKeyRotation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisableKeyRotation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisableKeyRotation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -198,18 +189,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisableKeyRotation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisableKeyRotationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisableKeyRotation"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DisableKeyRotationErrorModeled::KMSInternalException(
+                KMSInternalException {
+                    message: Some("the KMS state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx);
+        let mut state = state.lock();
+        let key = match state.resolve_mut(&region, &input.key_id) {
+            crate::state::KeyRefMut::Found(key) => key,
+            crate::state::KeyRefMut::MalformedArn => {
+                return Err(DisableKeyRotationErrorModeled::InvalidArnException(
+                    InvalidArnException {
+                        message: Some(crate::state::invalid_arn_message(&input.key_id)),
+                    },
+                )
+                .into());
+            }
+            crate::state::KeyRefMut::NotFound => {
+                return Err(DisableKeyRotationErrorModeled::NotFoundException(
+                    NotFoundException {
+                        message: Some(crate::state::key_not_found_message(&region, &input.key_id)),
+                    },
+                )
+                .into());
+            }
+        };
+
+        // The keys whose automatic rotation a caller may turn OFF are exactly those it
+        // may turn on, so both operations read the same gate.
+        crate::state::check_rotation_configurable(key).map_err(refuse)?;
+
+        // "Disables automatic rotation of the key material": the schedule goes, and
+        // the key material and the rotations the key has already had stay. Disabling
+        // rotation on a key that has no schedule reaches the same end state, which is
+        // what the request asks for.
+        key.unschedule_rotation();
+
+        Ok(DisableKeyRotationOutput)
     }
+}
+
+/// Lift the shared refusal of a key whose automatic rotation cannot be configured
+/// into this operation's modelled error channel. Which error reports which refusal
+/// is the same for `EnableKeyRotation` and `DisableKeyRotation`, because the two
+/// model the same errors and accept the same keys.
+fn refuse(refusal: crate::state::RotationConfigRefusal) -> DisableKeyRotationError {
+    match refusal {
+        crate::state::RotationConfigRefusal::Unsupported => {
+            DisableKeyRotationErrorModeled::UnsupportedOperationException(
+                UnsupportedOperationException {
+                    message: crate::state::unsupported_rotation_message(),
+                },
+            )
+        }
+        crate::state::RotationConfigRefusal::Disabled(message) => {
+            DisableKeyRotationErrorModeled::DisabledException(DisabledException {
+                message: Some(message),
+            })
+        }
+        crate::state::RotationConfigRefusal::InvalidState(message) => {
+            DisableKeyRotationErrorModeled::KMSInvalidStateException(KMSInvalidStateException {
+                message: Some(message),
+            })
+        }
+    }
+    .into()
 }

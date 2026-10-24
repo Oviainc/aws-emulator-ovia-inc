@@ -157,7 +157,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListBlockingInstancesForCapacityTaskErrorModeled::InternalServerException(
                 InternalServerException {
@@ -165,6 +164,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
         })?;
+        // The region this request is addressed to: an Outpost is part of its own
+        // region's inventory and of no other's, so that is where the parent is
+        // resolved — and with it the task nested under it.
+        let region = crate::state::request_region(ctx.parts());
         // `OutpostIdentifier` accepts the bare id or the full Outpost ARN; both name
         // the same stored Outpost.
         let outpost_id =
@@ -203,7 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // so the parent is resolved first: an Outpost the store does not hold cannot be
         // asked about the instances running on it. The refusal is the identifier echo of
         // the value AS SUPPLIED — not of the bare id an ARN resolved to.
-        let record = store.outposts.get(&outpost_id).ok_or_else(|| {
+        let record = store.outpost(&region, &outpost_id).ok_or_else(|| {
             ListBlockingInstancesForCapacityTaskErrorModeled::NotFoundException(
                 NotFoundException {
                     message: Some(crate::state::identifier_not_found(

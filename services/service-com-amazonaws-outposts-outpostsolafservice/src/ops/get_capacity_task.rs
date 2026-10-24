@@ -176,12 +176,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetCapacityTaskErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the Outposts store is unavailable".to_string()),
             })
         })?;
+        // The region this request is addressed to: an Outpost is part of its own
+        // region's inventory and of no other's, so that is where the parent is
+        // resolved — and with it the tasks nested under it.
+        let region = crate::state::request_region(ctx.parts());
         // `OutpostIdentifier` accepts the bare id or the full Outpost ARN; both name
         // the same stored Outpost.
         let outpost_id =
@@ -200,7 +203,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`/outposts/{OutpostIdentifier}/capacity/{CapacityTaskId}`), so the parent
         // is resolved first: an Outpost the store does not hold cannot be asked
         // about its tasks at all.
-        if !store.outposts.contains_key(&outpost_id) {
+        if store.outpost(&region, &outpost_id).is_none() {
             return Err(GetCapacityTaskErrorModeled::NotFoundException(
                 NotFoundException {
                     // The identifier echo, of the value AS SUPPLIED — not of

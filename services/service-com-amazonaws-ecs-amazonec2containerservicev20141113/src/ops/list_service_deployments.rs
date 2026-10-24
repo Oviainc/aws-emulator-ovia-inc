@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListServiceDeployments
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListServiceDeployments`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListServiceDeployments::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the SERVICE DEPLOYMENTS stored for ONE service, newest first.
+//!
+//! Every entry comes from the `service_deployments` map in [`crate::state`] — the records
+//! `CreateService` and an `UpdateService` that starts a new deployment wrote — narrowed by
+//! each filter the request sets and paged at `maxResults`. Nothing here mints or mutates
+//! anything: this is a reporting operation (`@readonly` in the model), and the only write
+//! on its path is
+//! [`crate::state::ComAmazonawsEcsAmazonec2containerservicev20141113State::advance_clock`],
+//! which materialises the transitions the CLOCK already owed (a rollout reaching its steady
+//! state, a task reaching `RUNNING`) and would have been owed even if nobody had called.
 //!
 //! ## Shape of an operation
 //!
@@ -190,20 +192,168 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListServiceDeployments` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListServiceDeploymentsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListServiceDeployments"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListServiceDeploymentsErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        // "This value can be between 1 and 100."
+        if let Some(max_results) = input.max_results {
+            if !(1..=crate::state::MAX_LIST_PAGE_SIZE).contains(&max_results) {
+                return Err(
+                    ListServiceDeploymentsErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(format!(
+                                "maxResults must be between 1 and {}; got {max_results}",
+                                crate::state::MAX_LIST_PAGE_SIZE
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // "The ARN or name of the service", and "The cluster that hosts the service. This
+        // can either be the cluster name or ARN. ... If you don't specify a cluster,
+        // default is used." A service ARN carries the cluster that hosts it, so an ARN
+        // names the cluster too; naming two different clusters in one request names no
+        // service at all — the same refusal `UpdateService` gives that pairing.
+        let (arn_cluster, service_name) =
+            crate::state::cluster_and_service_from_reference(&input.service);
+        let cluster_name = match (&arn_cluster, input.cluster.as_deref()) {
+            (Some(from_arn), Some(requested))
+                if *from_arn != crate::state::cluster_name_from_reference(Some(requested)) =>
+            {
+                return Err(
+                    ListServiceDeploymentsErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(format!(
+                                "the service ARN names cluster {from_arn:?} but cluster \
+                                 {requested:?} was requested"
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            (Some(from_arn), _) => from_arn.clone(),
+            (None, requested) => crate::state::cluster_name_from_reference(requested),
+        };
+
+        let mut guard = state.lock();
+        guard.advance_clock(::std::time::SystemTime::now());
+
+        if !guard.has_active_cluster(&cluster_name) {
+            return Err(ListServiceDeploymentsErrorModeled::ClusterNotFoundException(
+                ClusterNotFoundException {
+                    message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+        // "The specified service wasn't found": the deployments listed are ONE service's
+        // history, so a request that names no stored service names no history either.
+        let Some(service) = guard
+            .services
+            .get(&(cluster_name.clone(), service_name.clone()))
+        else {
+            return Err(ListServiceDeploymentsErrorModeled::ServiceNotFoundException(
+                ServiceNotFoundException {
+                    message: Some(crate::state::SERVICE_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+        let service_arn = service.arn.clone();
+
+        // "An optional filter you can use to narrow the results by the service creation
+        // date", as a `before`/`after` window on each deployment's own `createdAt`. A
+        // bound the request omits bounds nothing.
+        let created_before = input
+            .created_at
+            .as_ref()
+            .and_then(|window| window.before)
+            .map(crate::state::timestamp_key);
+        let created_after = input
+            .created_at
+            .as_ref()
+            .and_then(|window| window.after)
+            .map(crate::state::timestamp_key);
+
+        let mut matching: Vec<&crate::state::ServiceDeploymentRecord> = guard
+            .service_deployments
+            .values()
+            .filter(|deployment| deployment.service_arn == service_arn)
+            // "An optional filter you can use to narrow the results. If you do not
+            // specify a status, then all status values are included in the result." A
+            // status list the request STATES is the set it asks for, so an empty one asks
+            // for no status and selects nothing; only an absent filter widens.
+            .filter(|deployment| {
+                input
+                    .status
+                    .as_ref()
+                    .is_none_or(|wanted| wanted.contains(&deployment.status))
+            })
+            // "Include service deployments in the result that were created before this
+            // time" / "... after this time" — the instant itself is on neither side of
+            // its own bound, so a bound never selects the deployment it was read off.
+            .filter(|deployment| {
+                let created = crate::state::timestamp_key(deployment.created_at);
+                created_before.is_none_or(|before| created < before)
+                    && created_after.is_none_or(|after| created > after)
+            })
+            .collect();
+        // The history reads NEWEST first: the deployment a caller wants after listing is
+        // the one that is running or just ran, and `ServiceDeploymentBrief$createdAt` is
+        // what dates it ([`crate::state::ServiceDeploymentRecord::order_key`] breaks a tie
+        // on the ARN's own monotonic id).
+        matching.sort_by(|left, right| right.order_key().cmp(&left.order_key()));
+
+        // "If this parameter isn't used, then ListServiceDeployments returns up to 20
+        // results and a nextToken value if applicable."
+        let page_size = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(crate::state::DEFAULT_LIST_SERVICE_DEPLOYMENTS_PAGE_SIZE);
+        // The token this operation mints is the ARN of the deployment the next page starts
+        // at — "an opaque identifier that is only used to retrieve the next items in a
+        // list" — so a page is unaffected by deployments started before it. A value that
+        // names no deployment of this service names no page: a `ClientException`, the
+        // error for a request "specifying an identifier that isn't valid", rather than
+        // some insertion point in the sequence.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let Some(resume) = matching
+                    .iter()
+                    .find(|deployment| deployment.arn == token)
+                    .map(|deployment| deployment.order_key())
+                else {
+                    return Err(ListServiceDeploymentsErrorModeled::ClientException(
+                        ClientException {
+                            message: Some(crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string()),
+                        },
+                    )
+                    .into());
+                };
+                matching.partition_point(|deployment| deployment.order_key() > resume)
+            }
+        };
+        let end = start.saturating_add(page_size).min(matching.len());
+        let service_deployments = matching[start..end]
+            .iter()
+            .map(|deployment| deployment.brief())
+            .collect();
+        // "This value is null when there are no more results to return."
+        let next_token = matching.get(end).map(|deployment| deployment.arn.clone());
+
+        Ok(ListServiceDeploymentsOutput {
+            service_deployments: Some(service_deployments),
+            next_token,
+        })
     }
 }

@@ -133,15 +133,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        // The order a caller is told about is the stored one, the same for every
-        // caller, so nothing here reads the request's metadata.
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetOrderErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the Outposts store is unavailable".to_string()),
             })
         })?;
+        // The region this request is addressed to: an order is part of its own
+        // region's inventory and of no other's, so that is where the id is resolved.
+        // What the order itself reports is the same for every caller of that region.
+        let region = crate::state::request_region(ctx.parts());
 
         let mut store = state.lock();
         // Report the status the order holds NOW: an order submitted a moment ago is
@@ -155,8 +157,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // directly. One the store holds none for is the not-found error this
         // operation models, worded as the identifier echo of the value as supplied.
         let order = store
-            .orders
-            .get(&input.order_id)
+            .order(&region, &input.order_id)
             .map(|record| record.order.clone())
             .ok_or_else(|| {
                 GetOrderErrorModeled::NotFoundException(NotFoundException {

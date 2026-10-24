@@ -327,9 +327,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(UpdateRouteErrorModeled::ConflictException(ConflictException {
                 message: Some(format!(
-                    "Route with key {} already exists for this API.",
+                    "Route with key {} already exists for this API",
                     updated.route_key
                 )),
+            })
+            .into());
+        }
+
+        // And the same route-key compatibility rule the create applies, over the keys of
+        // the api's OTHER routes: the route being updated cannot conflict with itself.
+        if let Err(message) = crate::state::validate_route_key_variables(
+            &updated.route_key,
+            api.routes
+                .iter()
+                .filter(|(route_id, _)| *route_id != &input.route_id)
+                .map(|(_, route)| route.route_key.as_str()),
+        ) {
+            return Err(UpdateRouteErrorModeled::ConflictException(ConflictException {
+                message: Some(message),
             })
             .into());
         }
@@ -339,6 +354,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and one that names none cannot.
         if let Err(message) = crate::state::validate_route_authorization(
             &updated.authorization_type,
+            updated.authorizer_id.as_deref(),
+        ) {
+            return Err(bad_request(&message));
+        }
+
+        // And the merged record's references: a patch cannot move a route onto an
+        // integration or an authorizer its api does not hold, exactly as the create
+        // cannot. Checked before anything is written.
+        if let Some(message) = api.unresolved_route_reference(
+            updated.target.as_deref(),
             updated.authorizer_id.as_deref(),
         ) {
             return Err(bad_request(&message));
