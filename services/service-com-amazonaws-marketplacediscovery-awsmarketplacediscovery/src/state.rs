@@ -597,10 +597,13 @@ impl ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState {
     /// values over it and reports the same size — so the two can never disagree about how
     /// many listings a query matches.
     ///
-    /// `searchText` matches a listing whose name or short description contains it, compared
-    /// case-insensitively, and an absent or empty `searchText` matches every listing;
-    /// `filters` then narrow the result per [`matches_every_search_filter`]. `Err` is that
-    /// function's refusal message.
+    /// `searchText` is a KEYWORD query: a listing matches when at least one of the query's
+    /// terms ([`search_terms`]) occurs, case-insensitively, in the text that listing presents
+    /// ([`Self::search_haystack`]) — so the words of a query need not appear verbatim, next to
+    /// each other or in one member for the listing to be a match. A `searchText` carrying no
+    /// term at all (absent, blank, punctuation only) selects every listing. `filters` then
+    /// narrow the result per [`matches_every_search_filter`]. `Err` is that function's refusal
+    /// message.
     pub fn search_matches(
         &self,
         preferred: &'static str,
@@ -611,11 +614,14 @@ impl ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState {
         // refused for what it says rather than for whether a listing happened to reach the
         // predicate below.
         validate_search_filters(filters)?;
-        let needle = search_text.trim().to_lowercase();
+        let terms = search_terms(search_text);
         let mut matches: Vec<&Listing> = Vec::new();
         for listing in self.listings.values() {
-            if !needle.is_empty() && !search_haystack(listing, preferred).contains(&needle) {
-                continue;
+            if !terms.is_empty() {
+                let haystack = self.search_haystack(listing, preferred);
+                if !terms.iter().any(|term| haystack.contains(term)) {
+                    continue;
+                }
             }
             if !matches_every_search_filter(self, listing, filters)? {
                 continue;
@@ -623,6 +629,55 @@ impl ComAmazonawsMarketplacediscoveryAwsmarketplacediscoveryState {
             matches.push(listing);
         }
         Ok(matches)
+    }
+
+    /// The text one `searchText` term is matched against: everything the listing PRESENTS —
+    /// its name and short description, the publisher it is sold by, the categories it is
+    /// classified under, the fulfillment options, pricing models and pricing units it is sold
+    /// through, and the products it associates with their manufacturers — lowercased.
+    ///
+    /// It is read off the listing's own [`Self::listing_summary`], so the text a keyword can
+    /// match is exactly the text the client is shown for that listing and the two cannot
+    /// drift. IDENTIFIERS are deliberately not part of it: an id is what `filters` select a
+    /// listing by, while `searchText` is the keyword query over its content.
+    pub fn search_haystack(&self, listing: &Listing, preferred: &'static str) -> String {
+        let summary = self.listing_summary(listing, preferred);
+        let mut parts: Vec<String> = vec![
+            summary.listing_name,
+            summary.short_description,
+            summary.publisher.display_name,
+        ];
+        parts.extend(
+            summary
+                .categories
+                .into_iter()
+                .map(|category| category.display_name),
+        );
+        parts.extend(
+            summary
+                .fulfillment_option_summaries
+                .into_iter()
+                .map(|option| option.display_name),
+        );
+        parts.extend(
+            summary
+                .pricing_models
+                .into_iter()
+                .map(|model| model.display_name),
+        );
+        parts.extend(
+            summary
+                .pricing_units
+                .into_iter()
+                .map(|unit| unit.display_name),
+        );
+        for entity in summary.associated_entities {
+            if let Some(product) = entity.product {
+                parts.push(product.product_name);
+                parts.push(product.manufacturer.display_name);
+            }
+        }
+        parts.join(" ").to_lowercase()
     }
 
     /// The listing summary `SearchListings` returns for `listing`, in `preferred` locale.
@@ -1312,12 +1367,27 @@ fn control_characters_escaped(pattern: &str) -> String {
 // Searching the catalog: what `SearchListings` and `SearchFacets` share.
 // ---------------------------------------------------------------------------
 
-/// The text a `searchText` is matched against: a listing's name and its short description,
-/// in the locale its content is returned in, lowercased.
-pub fn search_haystack(listing: &Listing, preferred: &'static str) -> String {
-    let locale = listing.text.content_locale(preferred);
-    let text = listing.text.text(locale);
-    format!("{} {}", text.name, text.short_description).to_lowercase()
+/// The terms a `searchText` is matched by: its whitespace-separated words, each lowercased
+/// and stripped of the punctuation around it, de-duplicated and in the order the request
+/// wrote them.
+///
+/// `SearchListings` is "search by keyword … sort results by relevance"
+/// (`smithy_query(query="doc",shape="SearchListings")`), so its `searchText` is a query of
+/// KEYWORDS rather than one literal string to be found: a two-word query matches a listing
+/// whose content carries those words apart, and ranks one carrying both above one carrying
+/// either. Splitting on whitespace only is what keeps a hyphenated or dotted identifier-like
+/// word one term rather than silently widening it to its parts.
+pub fn search_terms(search_text: &str) -> Vec<String> {
+    let mut terms: Vec<String> = Vec::new();
+    for word in search_text.split_whitespace() {
+        let term = word
+            .trim_matches(|character: char| !character.is_alphanumeric())
+            .to_lowercase();
+        if !term.is_empty() && !terms.contains(&term) {
+            terms.push(term);
+        }
+    }
+    terms
 }
 
 /// Refuse a `filters` list the model's `SearchFilterType` enum cannot reject on its own: an

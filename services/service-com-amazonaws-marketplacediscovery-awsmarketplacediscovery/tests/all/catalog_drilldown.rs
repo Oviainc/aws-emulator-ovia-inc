@@ -110,19 +110,75 @@ fn average_rating(summary: &Value) -> f64 {
     }
 }
 
-/// The emulator's relevance ordering: a hit in the name outranks a hit in the description.
-fn relevance(summary: &Value, needle: &str) -> u32 {
-    if needle.is_empty() {
-        return 0;
+/// The keywords a `searchText` is matched by, as `state::search_terms` resolves them: the
+/// whitespace-separated words, lowercased, stripped of surrounding punctuation and
+/// de-duplicated.
+pub(crate) fn search_terms(search_text: &str) -> Vec<String> {
+    let mut terms: Vec<String> = Vec::new();
+    for word in search_text.split_whitespace() {
+        let term = word
+            .trim_matches(|character: char| !character.is_alphanumeric())
+            .to_lowercase();
+        if !term.is_empty() && !terms.contains(&term) {
+            terms.push(term);
+        }
     }
-    let needle = needle.to_lowercase();
+    terms
+}
+
+/// The text a `searchText` keyword is matched against, read off the listing SUMMARY the
+/// client is shown: its name and short description, its publisher, the categories it is
+/// classified under, the fulfillment options, pricing models and pricing units it is sold
+/// through, and the products it associates with their manufacturers — lowercased, and
+/// carrying no identifier.
+pub(crate) fn summary_haystack(summary: &Value) -> String {
+    let mut parts = vec![
+        text(summary, "listingName"),
+        text(summary, "shortDescription"),
+        summary
+            .get("publisher")
+            .map(|publisher| text(publisher, "displayName"))
+            .unwrap_or_default(),
+    ];
+    for (member, display) in [
+        ("categories", "displayName"),
+        ("fulfillmentOptionSummaries", "displayName"),
+        ("pricingModels", "displayName"),
+        ("pricingUnits", "displayName"),
+    ] {
+        parts.extend(array(summary, member).iter().map(|row| text(row, display)));
+    }
+    for entity in array(summary, "associatedEntities") {
+        if let Some(product) = entity.get("product") {
+            parts.push(text(product, "productName"));
+            parts.push(
+                product
+                    .get("manufacturer")
+                    .map(|manufacturer| text(manufacturer, "displayName"))
+                    .unwrap_or_default(),
+            );
+        }
+    }
+    parts.join(" ").to_lowercase()
+}
+
+/// Whether a listing summary matches a `searchText`: at least one of the query's keywords
+/// occurs in what the listing presents, and a query carrying no keyword matches everything.
+pub(crate) fn matches_search_text(summary: &Value, search_text: &str) -> bool {
+    let terms = search_terms(search_text);
+    let haystack = summary_haystack(summary);
+    terms.is_empty() || terms.iter().any(|term| haystack.contains(term))
+}
+
+/// The emulator's relevance ordering: every keyword the listing carries scores, and a
+/// keyword in the name outranks one anywhere else in what the listing presents.
+pub(crate) fn relevance(summary: &Value, needle: &str) -> u32 {
     let name = text(summary, "listingName").to_lowercase();
-    let haystack = format!(
-        "{} {}",
-        name,
-        text(summary, "shortDescription").to_lowercase()
-    );
-    u32::from(name.contains(&needle)) * 2 + u32::from(haystack.contains(&needle))
+    let haystack = summary_haystack(summary);
+    search_terms(needle)
+        .iter()
+        .map(|term| u32::from(name.contains(term)) * 2 + u32::from(haystack.contains(term)))
+        .sum()
 }
 
 /// Every listing in the catalog, as search summaries.
@@ -377,33 +433,29 @@ async fn the_drill_down_chain_agrees_on_ids_and_names() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn search_text_matches_name_or_short_description_case_insensitively() {
+async fn search_text_matches_any_of_its_keywords_case_insensitively() {
     let router = router();
     let catalog = whole_catalog(&router).await;
 
-    // Rows differ in case, in length, in how many listings they select, and in whether
-    // the term appears in the name or only in the description.
+    // Rows differ in case, in how many keywords they carry, in whether those keywords sit
+    // in one listing or in different ones, in the punctuation around them and in how many
+    // listings they select.
     for term in [
         "analytics",
         "ANALYTICS",
         "Analytics Suite",
+        "analytics firewall",
         "firewall",
         "data",
         "a",
+        "  data   analytics  ",
+        "analytics, firewall!",
         "zzz-not-in-the-catalog",
+        "zzz-not-in-the-catalog firewall",
     ] {
-        let needle = term.to_lowercase();
         let mut expected: Vec<String> = catalog
             .iter()
-            .filter(|summary| {
-                format!(
-                    "{} {}",
-                    text(summary, "listingName"),
-                    text(summary, "shortDescription")
-                )
-                .to_lowercase()
-                .contains(&needle)
-            })
+            .filter(|summary| matches_search_text(summary, term))
             .map(|summary| text(summary, "listingId"))
             .collect();
         expected.sort();

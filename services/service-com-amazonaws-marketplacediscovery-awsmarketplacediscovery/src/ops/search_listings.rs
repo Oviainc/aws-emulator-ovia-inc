@@ -167,7 +167,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(SearchListingsError::validation)?;
 
         let search_text = input.search_text.as_deref().unwrap_or("").trim().to_string();
-        let needle = search_text.to_lowercase();
+        // The query's keywords, resolved ONCE: the match set and the relevance ordering are
+        // two readings of the same terms, so neither can disagree with the other about what
+        // the query asked for.
+        let terms = crate::state::search_terms(&search_text);
         let filters = input.filters.clone().unwrap_or_default();
 
         // Narrow first, so `totalResults` counts MATCHES rather than the page. The match set
@@ -182,7 +185,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         crate::state::average_customer_rating(listing.review_summary.as_ref())
                     }
                     // RELEVANCE, the model's default.
-                    _ => relevance(listing, locale, &needle),
+                    _ => relevance(
+                        listing,
+                        locale,
+                        &terms,
+                        &state.search_haystack(listing, locale),
+                    ),
                 };
                 (score, listing)
             })
@@ -228,25 +236,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// How well a listing matches `needle`: a hit in the name outranks a hit in the
-/// description, and a query with no `searchText` ranks every listing alike.
+/// How well a listing matches the query's keywords: EVERY term it carries scores, a term in
+/// the listing's name outranks one anywhere else in what the listing presents, and a query
+/// with no term ranks every listing alike.
 ///
-/// `sortBy=RELEVANCE` has no documented scoring function, so this is the emulator's own
-/// ordering; what the model pins is that RELEVANCE is an ordering over the matches, and
-/// that `sortOrder` reverses it.
-fn relevance(listing: &crate::state::Listing, locale: &'static str, needle: &str) -> f64 {
-    if needle.is_empty() {
+/// So a listing carrying both words of a two-word query outranks one carrying only one of
+/// them, which is what makes `sortBy=RELEVANCE` an ordering over the keywords rather than a
+/// coin flip between listings that merely all match.
+///
+/// `sortBy=RELEVANCE` has no documented scoring function, so the weights are the emulator's
+/// own; what the model pins is that RELEVANCE is an ordering over the matches, and that
+/// `sortOrder` reverses it.
+fn relevance(
+    listing: &crate::state::Listing,
+    locale: &'static str,
+    terms: &[String],
+    haystack: &str,
+) -> f64 {
+    if terms.is_empty() {
         return 0.0;
     }
     let content_locale = listing.text.content_locale(locale);
     let name = listing.text.text(content_locale).name.to_lowercase();
-    let haystack = crate::state::search_haystack(listing, locale);
     let mut score = 0.0;
-    if name.contains(needle) {
-        score += 2.0;
-    }
-    if haystack.contains(needle) {
-        score += 1.0;
+    for term in terms {
+        if name.contains(term) {
+            score += 2.0;
+        }
+        if haystack.contains(term) {
+            score += 1.0;
+        }
     }
     score
 }
