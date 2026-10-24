@@ -320,8 +320,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .stage_arn
                 .unwrap_or_else(|| crate::state::NO_ASSOCIATED_STAGE_ARN.to_string()),
             participant_id: primary.participant_id,
-            // Nobody is publishing to a configuration that has just been created.
-            state: crate::state::NO_PUBLISHER_INGEST_CONFIGURATION_STATE.to_string(),
             user_id: input.user_id,
             redundant_ingest: input.redundant_ingest,
             redundant_ingest_credentials,
@@ -333,8 +331,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `insecureIngest` is not persisted: no shape in this model reports it (the
         // modelled `IngestConfiguration` has no such member), so the only thing the
         // request's value decides is whether the cleartext protocol is admitted, which
-        // is settled above.
-        let ingest_configuration = record.to_ingest_configuration();
+        // is settled above. The reported `state` is not persisted either: it is read off
+        // the configuration's stage, where nobody can be publishing with an ARN this
+        // request has only just minted.
+        let ingest_configuration = record.to_ingest_configuration(&store);
         store.ingest_configurations.insert(arn, record);
 
         Ok(CreateIngestConfigurationOutput {

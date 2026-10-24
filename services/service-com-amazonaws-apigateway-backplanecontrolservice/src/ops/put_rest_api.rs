@@ -4,9 +4,15 @@
 //! IMPLEMENTED: parses the OpenAPI/Swagger definition carried in the `body` payload and
 //! materialises it into the stored API — every path of the definition becomes a
 //! `Resource` (with the ancestors a nested path implies), every operation on a path
-//! becomes a `Method` on that resource, and the document's `info` updates the API's own
-//! name, description and version. `merge` adds the definition to what the API already
+//! becomes a `Method` on that resource (carrying the declared parameters, responses and
+//! API Gateway integration of the operation), and the document's `info` updates the API's
+//! own name, description and version. `merge` adds the definition to what the API already
 //! has; `overwrite` replaces the API's definition, keeping only its root resource.
+//!
+//! The definition READER lives here and is shared with `ImportRestApi`, the other
+//! operation that takes an API definition in its `body`: the two differ in what they
+//! materialise the definition INTO (this one an existing API, that one a new one), not in
+//! how the document is read, so a document imported either way becomes the same records.
 //!
 //! ## Shape of an operation
 //!
@@ -253,12 +259,80 @@ pub fn put_mode(mode: Option<&str>) -> Result<PutModeKind, String> {
     }
 }
 
-/// One path of an imported definition: the path as the document writes it, and the HTTP
-/// verbs the document puts on it, in document order.
+/// One path of an imported definition: the path as the document writes it, and the
+/// `Method`s the operations the document puts on it become, in document order.
 #[derive(Debug, Clone)]
 pub struct ImportedPath {
     pub path: String,
-    pub methods: Vec<String>,
+    pub methods: Vec<MethodEntry>,
+}
+
+/// The refusal for a body that is not a readable API definition.
+///
+/// API Gateway answers a body it cannot read as an OpenAPI/Swagger document with ONE
+/// sentence that names no detail of what is wrong with it, whichever way the document is
+/// unreadable — unparsable, not an object, or declaring no OpenAPI version. The
+/// emulator's own resource guards below keep their own wording instead, because they are
+/// this emulator's bounds rather than anything the service publishes, and a caller has to
+/// be able to tell the two apart.
+pub const INVALID_DEFINITION: &str = "Invalid OpenAPI input.";
+
+/// The pseudo parameter an API definition writes where an integration's ARN needs the
+/// Region the API is imported into.
+const REGION_PSEUDO_PARAMETER: &str = "${AWS::Region}";
+
+/// The pseudo parameter for the account the API is imported into; see
+/// [`REGION_PSEUDO_PARAMETER`].
+const ACCOUNT_PSEUDO_PARAMETER: &str = "${AWS::AccountId}";
+
+/// The pseudo parameter for the partition the API is imported into; see
+/// [`REGION_PSEUDO_PARAMETER`].
+const PARTITION_PSEUDO_PARAMETER: &str = "${AWS::Partition}";
+
+/// The partition this emulator's ARNs are written in, as `crate::state::service_arn`
+/// writes it.
+const ARN_PARTITION: &str = "aws";
+
+/// The AWS scope an import resolves a definition's pseudo parameters against.
+///
+/// A definition writes [`REGION_PSEUDO_PARAMETER`], [`ACCOUNT_PSEUDO_PARAMETER`] and
+/// [`PARTITION_PSEUDO_PARAMETER`] where an integration's ARN needs the values of the
+/// account and Region the API is imported INTO, and the import resolves them as it reads
+/// the document — so the stored integration names this account's resources rather than
+/// carrying the parameter through, and an import of the same document into another scope
+/// resolves them again to that scope's values.
+#[derive(Debug, Clone)]
+pub struct ImportScope {
+    region: String,
+    account_id: String,
+    partition: String,
+}
+
+impl ImportScope {
+    /// The scope of the request being served: the Region its credential scope names, the
+    /// account this emulator serves, and its partition.
+    pub fn of(parts: &::http::request::Parts) -> Self {
+        Self {
+            region: crate::state::request_region(parts),
+            account_id: ::engine::emulator_account_id().to_string(),
+            partition: ARN_PARTITION.to_string(),
+        }
+    }
+
+    /// `value` with every pseudo parameter this scope resolves replaced by its value.
+    fn resolved(&self, value: &str) -> String {
+        let mut resolved = value.to_string();
+        for (parameter, value) in [
+            (REGION_PSEUDO_PARAMETER, self.region.as_str()),
+            (ACCOUNT_PSEUDO_PARAMETER, self.account_id.as_str()),
+            (PARTITION_PSEUDO_PARAMETER, self.partition.as_str()),
+        ] {
+            if resolved.contains(parameter) {
+                resolved = resolved.replace(parameter, value);
+            }
+        }
+        resolved
+    }
 }
 
 /// What an import reads out of an OpenAPI/Swagger definition.
@@ -273,6 +347,13 @@ pub struct ImportedDefinition {
     pub description: Option<String>,
     /// `info.version`.
     pub version: Option<String>,
+    /// The base path the document declares its paths under — Swagger 2.0's `basePath`,
+    /// or the path of the first `servers` entry's URL in OpenAPI 3 — absent when the
+    /// document declares none. Which of the paths an import creates is the caller's
+    /// choice on the operation that offers one: `ImportRestApi`'s `basepath` parameter.
+    /// `PutRestApi` models no such parameter, so it imports the paths as the document
+    /// writes them.
+    pub base_path: Option<String>,
     /// [`BINARY_MEDIA_TYPES_EXTENSION`], absent when the document declares none.
     pub binary_media_types: Option<Vec<String>>,
     /// The document's paths, in document order.
@@ -624,12 +705,14 @@ fn parse_yaml(text: &str) -> Result<Node, String> {
     let mut builder = DefinitionBuilder::default();
     ::yaml_rust2::parser::Parser::new_from_str(text)
         .load(&mut builder, true)
-        .map_err(|error| format!("Unable to parse API definition: {error}"))?;
+        // A document the parser could not read is not an API definition, and is refused
+        // as that rather than with the parser's own position.
+        .map_err(|_| INVALID_DEFINITION.to_string())?;
     if let Some(refusal) = builder.refused {
         return Err(format!("Unable to parse API definition: {refusal}"));
     }
     if !builder.open.is_empty() {
-        return Err("Unable to parse API definition: the document is incomplete".to_string());
+        return Err(INVALID_DEFINITION.to_string());
     }
     Ok(builder.root.unwrap_or_default())
 }
@@ -637,7 +720,7 @@ fn parse_yaml(text: &str) -> Result<Node, String> {
 /// The full path of a resource for `path` as the definition writes it: the segments
 /// joined again, so a trailing or doubled separator names the same resource as the path
 /// without it, and a path of only separators is the API's root.
-fn normalized_path(path: &str) -> String {
+pub fn normalized_path(path: &str) -> String {
     let mut normalized = ROOT_RESOURCE_PATH.to_string();
     for segment in path.split('/').filter(|segment| !segment.is_empty()) {
         normalized = child_path(&normalized, segment);
@@ -655,40 +738,92 @@ fn normalized_path(path: &str) -> String {
 ///
 /// `Err` carries the message for a body that is not such a document: the caller has to
 /// fix the definition from this text alone.
-pub fn parse_definition(body: &[u8]) -> Result<ImportedDefinition, String> {
+pub fn parse_definition(body: &[u8], scope: &ImportScope) -> Result<ImportedDefinition, String> {
     if body.len() > MAX_DEFINITION_BYTES {
         return Err(format!(
             "body may be at most {MAX_DEFINITION_BYTES} bytes, got {}",
             body.len()
         ));
     }
-    let text = std::str::from_utf8(body).map_err(|_| {
-        "body must be a UTF-8 encoded OpenAPI definition in JSON or YAML".to_string()
-    })?;
+    let text = std::str::from_utf8(body).map_err(|_| INVALID_DEFINITION.to_string())?;
     let document = match ::serde_json::from_str::<Node>(text) {
-        Ok(document) => document,
+        Ok(document) => {
+            // The YAML reader counts nodes AS it builds them
+            // ([`DefinitionBuilder::place`]); `serde_json` has its own recursion limit but
+            // no node ceiling, so the same bound is applied to the tree it built. Both
+            // spellings of a definition are therefore read under one node bound, which is
+            // what bounds every walk over the parsed document below.
+            bound_definition_nodes(&document)?;
+            document
+        }
         // Not JSON — or JSON past `serde_json`'s recursion limit, which the YAML reader's
         // own depth bound refuses in turn.
         Err(_) => parse_yaml(text)?,
     };
-    read_definition(&document)
+    read_definition(&document, scope)
+}
+
+/// Refuse a parsed definition carrying more nodes than [`MAX_DEFINITION_NODES`].
+///
+/// Counts with the bound as a budget, so a document past it is refused after that many
+/// nodes rather than after however many it carries.
+fn bound_definition_nodes(document: &Node) -> Result<(), String> {
+    fn count(node: &Node, budget: &mut usize) -> bool {
+        if *budget == 0 {
+            return false;
+        }
+        *budget -= 1;
+        match node {
+            Node::Mapping(entries) => entries.iter().all(|(_, value)| count(value, budget)),
+            Node::Sequence(items) => items.iter().all(|item| count(item, budget)),
+            _ => true,
+        }
+    }
+    let mut budget = MAX_DEFINITION_NODES;
+    if count(document, &mut budget) {
+        Ok(())
+    } else {
+        Err("the definition carries more nodes than this emulator reads".to_string())
+    }
+}
+
+/// The base path a definition declares its paths under, as [`ImportedDefinition`]'s
+/// `base_path`.
+///
+/// Swagger 2.0 declares it as the document's own `basePath`; OpenAPI 3 replaced that
+/// member with `servers`, whose first entry's URL carries the same path (and may be a
+/// relative URL, which is only that path). The URL's scheme and authority are not a
+/// path, so they are dropped, and a path that is only separators is no base path at all.
+fn declared_base_path(document: &Node) -> Option<String> {
+    let declared = document.string_member("basePath").or_else(|| {
+        let url = document
+            .member("servers")
+            .and_then(Node::items)
+            .and_then(<[Node]>::first)
+            .and_then(|server| server.string_member("url"))?;
+        // A server URL is absolute (`https://host/v1`) or relative (`/v1`); only the
+        // path part of either is a base path.
+        Some(match url.split_once("://") {
+            Some((_, authority_and_path)) => authority_and_path
+                .find('/')
+                .map(|start| authority_and_path[start..].to_string())
+                .unwrap_or_default(),
+            None => url,
+        })
+    })?;
+    let normalized = normalized_path(&declared);
+    (normalized != ROOT_RESOURCE_PATH).then_some(normalized)
 }
 
 /// What an import takes out of a parsed definition document.
-fn read_definition(document: &Node) -> Result<ImportedDefinition, String> {
+fn read_definition(document: &Node, scope: &ImportScope) -> Result<ImportedDefinition, String> {
     if document.entries().is_none() {
-        return Err(
-            "Unable to parse API definition: the definition must be a JSON or YAML object"
-                .to_string(),
-        );
+        return Err(INVALID_DEFINITION.to_string());
     }
     // Every OpenAPI document declares its version — `openapi` from 3.0 on, `swagger`
     // before it — so a body carrying neither is not an API definition at all.
     if document.member("openapi").is_none() && document.member("swagger").is_none() {
-        return Err(
-            "Unable to parse API definition: no 'openapi' or 'swagger' version is declared"
-                .to_string(),
-        );
+        return Err(INVALID_DEFINITION.to_string());
     }
 
     let info = document.member("info");
@@ -696,6 +831,7 @@ fn read_definition(document: &Node) -> Result<ImportedDefinition, String> {
         title: info.and_then(|info| info.string_member("title")),
         description: info.and_then(|info| info.string_member("description")),
         version: info.and_then(|info| info.string_member("version")),
+        base_path: declared_base_path(document),
         binary_media_types: document
             .member(BINARY_MEDIA_TYPES_EXTENSION)
             .and_then(Node::items)
@@ -709,6 +845,38 @@ fn read_definition(document: &Node) -> Result<ImportedDefinition, String> {
         warnings: Vec::new(),
     };
 
+    // The references the document does not resolve. A `$ref` names the schema a part of
+    // the document stands for, and one whose target the document does not declare — or
+    // whose target is outside the document altogether — names nothing an import could
+    // carry over, so it is reported rather than silently dropped.
+    for reference in unresolved_references(document) {
+        warn(
+            &mut definition.warnings,
+            format!("Unable to resolve reference '{reference}'. Ignoring."),
+        );
+    }
+
+    // The security schemes the document declares. API Gateway carries one over as an
+    // `Authorizer` only for the scheme types its authorizers cover, and reports a type it
+    // cannot. `securityDefinitions` is Swagger 2.0's spelling of the set, replaced by
+    // `components.securitySchemes` from OpenAPI 3 on.
+    for (name, scheme) in declared_security_schemes(document) {
+        let kind = scheme.string_member("type").unwrap_or_default();
+        if !IMPORTABLE_SECURITY_SCHEME_TYPES.contains(&kind.as_str()) {
+            warn(
+                &mut definition.warnings,
+                format!("Unsupported security definition type '{kind}' for '{name}'. Ignoring."),
+            );
+        }
+    }
+
+    // The security requirement the document declares across its API, which every
+    // operation that declares none of its own is imported under.
+    let document_security = document
+        .member("security")
+        .and_then(Node::items)
+        .is_some_and(|requirements| !requirements.is_empty());
+
     // `paths` is optional from OpenAPI 3.1 on, and a document without it describes an
     // API with no resources rather than a malformed definition.
     let Some(paths) = document.member("paths") else {
@@ -717,9 +885,9 @@ fn read_definition(document: &Node) -> Result<ImportedDefinition, String> {
     if matches!(paths, Node::Null) {
         return Ok(definition);
     }
-    let paths = paths.entries().ok_or_else(|| {
-        "Unable to parse API definition: 'paths' must be an object of paths".to_string()
-    })?;
+    let paths = paths
+        .entries()
+        .ok_or_else(|| INVALID_DEFINITION.to_string())?;
     for (path, item) in paths {
         if !path.starts_with('/') {
             return Err(format!(
@@ -727,22 +895,27 @@ fn read_definition(document: &Node) -> Result<ImportedDefinition, String> {
             ));
         }
         let mut methods = Vec::new();
-        for (operation, _) in item.entries().unwrap_or_default() {
+        for (operation, declared) in item.entries().unwrap_or_default() {
             let operation = operation.to_ascii_lowercase();
             if let Some((_, verb)) = OPERATION_KEYS
                 .iter()
                 .find(|(candidate, _)| *candidate == operation.as_str())
             {
-                methods.push((*verb).to_string());
-            } else if UNSUPPORTED_OPERATION_KEYS.contains(&operation.as_str())
-                // One warning per unsupported operation, up to the number of entries
-                // this emulator reports for a caller-sized list: what the response
-                // carries stays bounded however many paths the document declares.
-                && definition.warnings.len() < crate::state::MAX_COLLECTION_ENTRIES
-            {
-                definition.warnings.push(format!(
-                    "Unsupported method '{operation}' for path '{path}': the method was not imported"
+                methods.push(imported_method(
+                    verb,
+                    declared,
+                    path,
+                    document_security,
+                    scope,
+                    &mut definition.warnings,
                 ));
+            } else if UNSUPPORTED_OPERATION_KEYS.contains(&operation.as_str()) {
+                warn(
+                    &mut definition.warnings,
+                    format!(
+                        "Unsupported method '{operation}' for path '{path}': the method was not imported"
+                    ),
+                );
             }
             // Any other key of a path item (`summary`, `parameters`, a vendor extension)
             // describes the path rather than a method, so it imports nothing and warns
@@ -756,33 +929,633 @@ fn read_definition(document: &Node) -> Result<ImportedDefinition, String> {
     Ok(definition)
 }
 
+/// Report what an import could not carry over, up to the entries this emulator reports
+/// for a caller-sized list: what the response carries stays bounded however much the
+/// document declares.
+fn warn(warnings: &mut Vec<String>, message: String) {
+    if warnings.len() < crate::state::MAX_COLLECTION_ENTRIES {
+        warnings.push(message);
+    }
+}
+
+/// The security scheme types API Gateway's own authorizers cover, so a scheme of one of
+/// these types is a scheme an import can carry over: the `apiKey` scheme an API key or a
+/// custom authorizer is declared as, and the `oauth2` scheme a user-pool authorizer is.
+/// Any other type (HTTP basic or bearer authentication, say) has no `Authorizer` to
+/// become.
+const IMPORTABLE_SECURITY_SCHEME_TYPES: &[&str] = &["apiKey", "oauth2"];
+
+/// The document key API Gateway's OpenAPI extensions use for an operation's integration.
+const INTEGRATION_EXTENSION: &str = "x-amazon-apigateway-integration";
+
+/// The extension key that names an operation's integration, which API Gateway reads an
+/// authorizer's configuration out of; a method that specifies security and carries
+/// neither an imported authorizer nor this extension keeps no authorization.
+const AUTHORIZER_EXTENSION: &str = "x-amazon-apigateway-auth";
+
+/// The key [`INTEGRATION_EXTENSION`]'s `responses` map uses for the integration response
+/// that matches everything the other entries' selection patterns do not.
+const INTEGRATION_RESPONSE_DEFAULT_KEY: &str = "default";
+
+/// Where a declared parameter of an operation lands in a method's request parameters: the
+/// OpenAPI parameter locations API Gateway maps onto a `method.request.<section>.<name>`
+/// mapping expression. A `body` parameter is the request payload rather than a mapping,
+/// so it is not one of these.
+const REQUEST_PARAMETER_SECTIONS: &[(&str, &str)] = &[
+    ("path", "path"),
+    ("query", "querystring"),
+    ("header", "header"),
+];
+
 /// The `Method` an imported operation becomes.
 ///
-/// An imported operation carries only its verb into state: the integration, the method
-/// responses and the request models an OpenAPI operation can describe are written by
-/// `PutIntegration` / `PutMethodResponse` / `CreateModel`, and nothing else of the
-/// operation object has a `Method` member to land in.
-fn imported_method(verb: &str) -> MethodEntry {
-    MethodEntry {
+/// Everything of an OpenAPI operation object that a `Method` has a member for is carried
+/// over: its `operationId`, the `parameters` it declares as request parameters, the
+/// `responses` it declares as method responses, and API Gateway's own integration
+/// extension as the method's integration. What the import cannot carry over is reported
+/// in `warnings`.
+pub fn imported_method(
+    verb: &str,
+    operation: &Node,
+    path: &str,
+    document_security: bool,
+    scope: &ImportScope,
+    warnings: &mut Vec<String>,
+) -> MethodEntry {
+    let mut method = MethodEntry {
         http_method: verb.to_string(),
         authorization_type: IMPORTED_AUTHORIZATION_TYPE.to_string(),
         authorizer_id: None,
         api_key_required: false,
-        operation_name: None,
-        request_parameters: BTreeMap::new(),
+        operation_name: operation.string_member("operationId"),
+        request_parameters: imported_request_parameters(operation),
+        // A request model names a `Model` resource, which nothing in this emulator
+        // creates yet, so an operation's request body has no model to be stored under.
         request_models: BTreeMap::new(),
         request_validator_id: None,
         authorization_scopes: Vec::new(),
-        method_responses: BTreeMap::new(),
+        method_responses: imported_method_responses(operation),
         integration: None,
+    };
+
+    // An operation that specifies security needs the authorizer its security scheme named
+    // to have been created for the method to keep that authorization. This import creates
+    // no authorizer, so the method is imported open and what it specified is reported.
+    //
+    // A security requirement is the DOCUMENT's unless the operation declares one of its
+    // own: an OpenAPI document's `security` applies across the API, and an operation
+    // overrides it — with an EMPTY list where it means no security at all.
+    let specifies_security = match operation.member("security") {
+        Some(Node::Sequence(requirements)) => !requirements.is_empty(),
+        _ => document_security,
+    };
+    if specifies_security && operation.member(AUTHORIZER_EXTENSION).is_none() {
+        warn(
+            warnings,
+            format!(
+                "Method '{verb}' on resource '{path}' specified security, but no custom \
+                 authorizers were created and the extension {AUTHORIZER_EXTENSION} was not \
+                 provided. Ignoring."
+            ),
+        );
     }
+
+    method.integration = imported_integration(&method, operation, path, scope, warnings);
+    method
+}
+
+/// The request parameters an operation's declared `parameters` become: API Gateway names
+/// a method request parameter by the mapping expression
+/// `method.request.<section>.<name>`, whose section is the parameter's own location (see
+/// [`REQUEST_PARAMETER_SECTIONS`]). A path parameter is required by construction; any
+/// other is required only where the document says so.
+fn imported_request_parameters(operation: &Node) -> BTreeMap<String, bool> {
+    let mut parameters = BTreeMap::new();
+    for parameter in operation
+        .member("parameters")
+        .and_then(Node::items)
+        .unwrap_or_default()
+    {
+        let Some(name) = parameter.string_member("name") else {
+            continue;
+        };
+        let Some(location) = parameter.string_member("in") else {
+            continue;
+        };
+        let Some((_, section)) = REQUEST_PARAMETER_SECTIONS
+            .iter()
+            .find(|(declared, _)| *declared == location.as_str())
+        else {
+            continue;
+        };
+        let required = location == "path"
+            || parameter
+                .member("required")
+                .and_then(Node::text)
+                .is_some_and(|required| required == "true");
+        parameters.insert(format!("method.request.{section}.{name}"), required);
+    }
+    parameters
+}
+
+/// The method responses an operation's `responses` become, keyed by status code.
+///
+/// A response's declared headers become the response parameters the method may map onto,
+/// named by the `method.response.header.<name>` mapping expression. A key that is not a
+/// status code (`default`, a vendor extension) describes no method response: a
+/// `MethodResponse` is addressed BY its status code, so there is nothing for such an
+/// entry to be stored under.
+fn imported_method_responses(operation: &Node) -> BTreeMap<String, GetMethodResponseOutput> {
+    let mut responses = BTreeMap::new();
+    for (code, response) in operation
+        .member("responses")
+        .and_then(Node::entries)
+        .unwrap_or_default()
+    {
+        if !is_status_code(code) {
+            continue;
+        }
+        let headers: ::std::collections::HashMap<String, bool> = response
+            .member("headers")
+            .and_then(Node::entries)
+            .unwrap_or_default()
+            .iter()
+            .map(|(name, _)| (format!("method.response.header.{name}"), false))
+            .collect();
+        responses.insert(
+            code.clone(),
+            GetMethodResponseOutput {
+                status_code: Some(code.clone()),
+                response_parameters: crate::state::non_empty_map(Some(headers)),
+                // A response model names a `Model` resource, which nothing in this
+                // emulator creates yet.
+                response_models: None,
+            },
+        );
+    }
+    responses
+}
+
+/// Whether `code` is an HTTP status code, as a `MethodResponse`'s `statusCode` is
+/// constrained to be (`^[1-5]\d\d$`).
+fn is_status_code(code: &str) -> bool {
+    code.len() == 3
+        && code.starts_with(['1', '2', '3', '4', '5'])
+        && code.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// The `Integration` an operation's [`INTEGRATION_EXTENSION`] becomes, with every pseudo
+/// parameter of its ARNs resolved against `scope`.
+///
+/// The record is checked by the SAME rules `PutIntegration` applies
+/// ([`super::put_integration::validate_integration`]), so an integration this emulator
+/// refuses on that path cannot reach the store through an import either: one the
+/// definition declares wrongly is reported and the method is imported without it, which
+/// is what the rest of the definition being imported means for it.
+fn imported_integration(
+    method: &MethodEntry,
+    operation: &Node,
+    path: &str,
+    scope: &ImportScope,
+    warnings: &mut Vec<String>,
+) -> Option<GetIntegrationOutput> {
+    use super::put_integration::{
+        validate_integration, DEFAULT_CONNECTION_TYPE, DEFAULT_PASSTHROUGH_BEHAVIOR,
+        DEFAULT_TIMEOUT_IN_MILLIS,
+    };
+
+    let declared = operation.member(INTEGRATION_EXTENSION)?;
+    let integration = GetIntegrationOutput {
+        // The extension writes the enumerated values in either case (`aws_proxy`,
+        // `AWS_PROXY`), and the stored record carries the modelled spelling.
+        r#type: declared
+            .string_member("type")
+            .map(|kind| kind.to_ascii_uppercase()),
+        http_method: declared
+            .string_member("httpMethod")
+            .map(|verb| verb.to_ascii_uppercase()),
+        uri: declared
+            .string_member("uri")
+            .map(|uri| scope.resolved(uri.trim())),
+        connection_type: Some(
+            declared
+                .string_member("connectionType")
+                .map(|kind| kind.to_ascii_uppercase())
+                .unwrap_or_else(|| DEFAULT_CONNECTION_TYPE.to_string()),
+        ),
+        connection_id: declared.string_member("connectionId"),
+        credentials: declared
+            .string_member("credentials")
+            .map(|credentials| scope.resolved(credentials.trim())),
+        request_parameters: crate::state::non_empty_map(Some(string_map(
+            declared,
+            "requestParameters",
+            scope,
+        ))),
+        request_templates: crate::state::non_empty_map(Some(string_map(
+            declared,
+            "requestTemplates",
+            scope,
+        ))),
+        passthrough_behavior: Some(
+            declared
+                .string_member("passthroughBehavior")
+                .map(|behavior| behavior.to_ascii_uppercase())
+                .unwrap_or_else(|| DEFAULT_PASSTHROUGH_BEHAVIOR.to_string()),
+        ),
+        content_handling: declared.string_member("contentHandling"),
+        timeout_in_millis: declared
+            .member("timeoutInMillis")
+            .and_then(Node::text)
+            .and_then(|millis| millis.parse().ok())
+            .unwrap_or(DEFAULT_TIMEOUT_IN_MILLIS),
+        // Left to the materialisation, which is where the resource this method hangs off
+        // is known: "By default, API Gateway uses the resource ID as the cacheNamespace".
+        cache_namespace: None,
+        cache_key_parameters: Some(string_list(declared, "cacheKeyParameters")),
+        integration_responses: imported_integration_responses(declared, scope),
+        tls_config: declared.member("tlsConfig").map(|tls| TlsConfig {
+            insecure_skip_verification: tls
+                .member("insecureSkipVerification")
+                .and_then(Node::text)
+                .is_some_and(|value| value == "true"),
+        }),
+        response_transfer_mode: declared.string_member("responseTransferMode"),
+        integration_target: declared.string_member("integrationTarget"),
+    };
+    if let Err(reason) = validate_integration(&integration, method) {
+        warn(
+            warnings,
+            format!(
+                "Unable to import the integration of method '{}' on resource '{path}': \
+                 {reason}. Ignoring.",
+                method.http_method
+            ),
+        );
+        return None;
+    }
+    Some(integration)
+}
+
+/// The integration responses an integration extension's `responses` become, keyed by
+/// status code.
+///
+/// The extension keys each entry by the SELECTION PATTERN the integration response
+/// matches, with [`INTEGRATION_RESPONSE_DEFAULT_KEY`] naming the one that matches
+/// everything the others do not — which is the `selectionPattern` member of the record,
+/// while the record itself is addressed by the `statusCode` it declares. An entry that
+/// declares no status code names no integration response.
+fn imported_integration_responses(
+    declared: &Node,
+    scope: &ImportScope,
+) -> Option<::std::collections::HashMap<String, GetIntegrationResponseOutput>> {
+    let mut responses: ::std::collections::HashMap<String, GetIntegrationResponseOutput> =
+        ::std::collections::HashMap::new();
+    for (pattern, response) in declared
+        .member("responses")
+        .and_then(Node::entries)
+        .unwrap_or_default()
+    {
+        let Some(status_code) = response.string_member("statusCode") else {
+            continue;
+        };
+        responses.insert(
+            status_code.clone(),
+            GetIntegrationResponseOutput {
+                status_code: Some(status_code),
+                selection_pattern: (pattern != INTEGRATION_RESPONSE_DEFAULT_KEY)
+                    .then(|| pattern.clone()),
+                response_parameters: crate::state::non_empty_map(Some(string_map(
+                    response,
+                    "responseParameters",
+                    scope,
+                ))),
+                response_templates: crate::state::non_empty_map(Some(string_map(
+                    response,
+                    "responseTemplates",
+                    scope,
+                ))),
+                content_handling: response.string_member("contentHandling"),
+            },
+        );
+    }
+    (!responses.is_empty()).then_some(responses)
+}
+
+/// A mapping member of `node` as a map of strings, skipping an entry whose value is not a
+/// scalar: the modelled member it lands in carries strings. Every value is resolved
+/// against `scope`, because a definition writes a pseudo parameter wherever it needs this
+/// account's own values — a mapping template that forwards the Region as much as an
+/// integration ARN.
+fn string_map(
+    node: &Node,
+    key: &str,
+    scope: &ImportScope,
+) -> ::std::collections::HashMap<String, String> {
+    node.member(key)
+        .and_then(Node::entries)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .text()
+                .map(|text| (name.clone(), scope.resolved(text)))
+        })
+        .collect()
+}
+
+/// A sequence member of `node` as a list of strings; see [`string_map`].
+fn string_list(node: &Node, key: &str) -> Vec<String> {
+    node.member(key)
+        .and_then(Node::items)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|value| value.text().map(str::to_string))
+        .collect()
+}
+
+/// The security schemes a definition declares, in document order: Swagger 2.0's
+/// `securityDefinitions`, or OpenAPI 3's `components.securitySchemes`.
+fn declared_security_schemes(document: &Node) -> Vec<(String, &Node)> {
+    document
+        .member("securityDefinitions")
+        .or_else(|| {
+            document
+                .member("components")
+                .and_then(|components| components.member("securitySchemes"))
+        })
+        .and_then(Node::entries)
+        .unwrap_or_default()
+        .iter()
+        .map(|(name, scheme)| (name.clone(), scheme))
+        .collect()
+}
+
+/// The most references one definition's walk RESOLVES against the document.
+///
+/// Resolving a reference looks through the document the reference points into, so this is
+/// what bounds the PRODUCT of the two caller-chosen factors — how many references a body
+/// carries and how much document each resolution looks through — rather than each factor
+/// on its own. A reference the document repeats is resolved once
+/// ([`ReferenceWalk::resolved`]), and the walk stops as soon as it has as many unresolved
+/// references as a response can report, so what remains is a constant number of
+/// resolutions per request. Chosen: far past the distinct references a definition of
+/// [`crate::state::MAX_RESOURCES_PER_API`] paths carries, and small enough that the walk
+/// costs a constant multiple of one document's size.
+const MAX_DEFINITION_REFERENCES: usize = 256;
+
+/// The document member a `$ref` names a reference with.
+const REFERENCE_KEY: &str = "$ref";
+
+/// The prefix of a reference INTO the document carrying it; every other form names
+/// something outside the document.
+const LOCAL_REFERENCE_PREFIX: &str = "#/";
+
+/// The references `document` does not resolve, in document order and each reported once.
+///
+/// A reference stands for the part of the document it points at, so a reference whose
+/// target the document does not declare stands for nothing — and one that points OUTSIDE
+/// the document (another file, a URL) names something an import has no access to at all.
+/// Either way the part of the document that carries it cannot be imported, which is what
+/// an import reports as a warning.
+///
+/// Bounded by [`MAX_DEFINITION_REFERENCES`] and by the number of warnings a response can
+/// carry; see [`ReferenceWalk`].
+fn unresolved_references(document: &Node) -> Vec<String> {
+    let mut walk = ReferenceWalk {
+        document,
+        resolved: BTreeMap::new(),
+        unresolved: Vec::new(),
+        budget: MAX_DEFINITION_REFERENCES,
+    };
+    walk.visit(document);
+    walk.unresolved
+}
+
+/// [`unresolved_references`]' walk over a parsed definition.
+///
+/// Every step is bounded: a reference is resolved at most once (`resolved` answers a
+/// repeat), at most [`MAX_DEFINITION_REFERENCES`] resolutions happen per document, and the
+/// walk ends as soon as it holds as many unresolved references as an import can report —
+/// finding more than a response can carry is work no caller sees.
+struct ReferenceWalk<'a> {
+    /// The whole document, which every reference is resolved against.
+    document: &'a Node,
+    /// Whether each reference already resolved does resolve, so a document that repeats
+    /// one costs a single resolution and the lookup is not a scan of what came before.
+    resolved: BTreeMap<String, bool>,
+    /// The references that did not resolve, in document order.
+    unresolved: Vec<String>,
+    /// How many more references may be resolved.
+    budget: usize,
+}
+
+impl ReferenceWalk<'_> {
+    /// Whether the walk has done all the work a response can report.
+    fn exhausted(&self) -> bool {
+        self.budget == 0 || self.unresolved.len() >= crate::state::MAX_COLLECTION_ENTRIES
+    }
+
+    /// Resolve every reference `node` carries, and then those of the nodes under it.
+    fn visit(&mut self, node: &Node) {
+        if self.exhausted() {
+            return;
+        }
+        match node {
+            Node::Mapping(entries) => {
+                for (key, value) in entries {
+                    if key == REFERENCE_KEY {
+                        if let Some(reference) = value.text() {
+                            self.inspect(reference);
+                        }
+                    }
+                    self.visit(value);
+                    if self.exhausted() {
+                        return;
+                    }
+                }
+            }
+            Node::Sequence(items) => {
+                for item in items {
+                    self.visit(item);
+                    if self.exhausted() {
+                        return;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Resolve one reference, unless this walk has already resolved it.
+    fn inspect(&mut self, reference: &str) {
+        if self.resolved.contains_key(reference) {
+            return;
+        }
+        self.budget = self.budget.saturating_sub(1);
+        let resolved = resolves(self.document, reference);
+        self.resolved.insert(reference.to_string(), resolved);
+        if !resolved {
+            self.unresolved.push(reference.to_string());
+        }
+    }
+}
+
+/// Whether `reference` names a part of `document`: a local reference
+/// ([`LOCAL_REFERENCE_PREFIX`]) whose every path segment is a member of what the segment
+/// before it names. The segments are JSON Pointer tokens, so `~1` spells a separator
+/// inside one and `~0` spells the escape itself.
+fn resolves(document: &Node, reference: &str) -> bool {
+    let Some(path) = reference.strip_prefix(LOCAL_REFERENCE_PREFIX) else {
+        // The whole document (`#`) resolves to itself; anything else names a target
+        // outside this document.
+        return reference == "#";
+    };
+    let mut target = document;
+    for token in path.split('/') {
+        let member = token.replace("~1", "/").replace("~0", "~");
+        match target.member(&member) {
+            Some(next) => target = next,
+            None => return false,
+        }
+    }
+    true
+}
+
+/// One resource an import has to create: the full path it materialises, its own last
+/// segment, and the full path of the resource it hangs off.
+#[derive(Debug, Clone)]
+pub struct PlannedResource {
+    pub path: String,
+    pub path_part: String,
+    pub parent_path: String,
+}
+
+/// The ids and creation ranks a materialisation was handed did not line up with the plan
+/// it was handed, or a planned resource's parent was not in the API.
+///
+/// Neither can happen for a plan built by [`plan_resources`] against the same API, so
+/// each caller answers this as the server-side failure it would be rather than leaving a
+/// partly imported API reported as a success.
+#[derive(Debug)]
+pub struct Inconsistent;
+
+/// The resources `definition`'s paths ask for beyond the full paths `known` already
+/// names, in document order, each ancestor before the path that needs it:
+/// `/pets/{petId}` plans `/pets` first, exactly as `CreateResource` would have to. Every
+/// planned path is added to `known`, so a path two entries share is planned once.
+///
+/// The per-API resource quota is enforced AS the plan grows, not after it: a definition
+/// asking for more resources than an API may hold is refused at the entry that breaks
+/// the quota, so neither the plan nor the set it is built from can grow past the quota
+/// however long the document's paths are. `Err` carries that refusal's message, which is
+/// a `LimitExceededException` on either operation that imports a definition.
+pub fn plan_resources(
+    known: &mut BTreeSet<String>,
+    definition: &ImportedDefinition,
+) -> Result<Vec<PlannedResource>, String> {
+    let mut planned: Vec<PlannedResource> = Vec::new();
+    for imported in &definition.paths {
+        let mut parent = ROOT_RESOURCE_PATH.to_string();
+        for segment in imported.path.split('/').filter(|part| !part.is_empty()) {
+            let path = child_path(&parent, segment);
+            if known.insert(path.clone()) {
+                if known.len() > crate::state::MAX_RESOURCES_PER_API {
+                    return Err(format!(
+                        "Maximum number of resources exceeded for this API: {}",
+                        crate::state::MAX_RESOURCES_PER_API
+                    ));
+                }
+                planned.push(PlannedResource {
+                    path: path.clone(),
+                    path_part: segment.to_string(),
+                    parent_path: parent.clone(),
+                });
+            }
+            parent = path;
+        }
+    }
+    Ok(planned)
+}
+
+/// Materialise `definition`'s resource tree into `api`: insert every resource `planned`
+/// names under the id and creation rank reserved for it, then put every operation the
+/// definition declares on a path as a `Method` on that path's resource.
+///
+/// The imported definition wins over what a path already carried, which is what an
+/// import means for a path the definition declares. `ids` and `sequences` are reserved
+/// from the store before it is mutated — one per planned resource, in the plan's order —
+/// so the imported resources are listed in the order the definition declares them.
+///
+/// Shared by the two operations that import a definition, so the tree `ImportRestApi`
+/// builds for a document and the tree `PutRestApi` builds for the same document are the
+/// same tree.
+pub fn materialise_definition(
+    api: &mut RestApiEntry,
+    definition: &ImportedDefinition,
+    planned: &[PlannedResource],
+    ids: &[String],
+    sequences: &[u64],
+) -> Result<(), Inconsistent> {
+    let mut by_path: BTreeMap<String, String> = api
+        .resources
+        .values()
+        .map(|resource| (resource.path.clone(), resource.id.clone()))
+        .collect();
+    for (index, resource) in planned.iter().enumerate() {
+        let id = ids.get(index).ok_or(Inconsistent)?.clone();
+        let sequence = *sequences.get(index).ok_or(Inconsistent)?;
+        // A path is planned only after every one of its ancestors, so the parent is in
+        // the API or in what this loop has already inserted.
+        let parent_id = by_path
+            .get(&resource.parent_path)
+            .cloned()
+            .ok_or(Inconsistent)?;
+        api.resources.insert(
+            id.clone(),
+            ResourceEntry {
+                id: id.clone(),
+                parent_id: Some(parent_id),
+                path_part: Some(resource.path_part.clone()),
+                path: resource.path.clone(),
+                methods: BTreeMap::new(),
+                sequence,
+            },
+        );
+        by_path.insert(resource.path.clone(), id);
+    }
+    for imported in &definition.paths {
+        // The path's own resource: planned above when it did not exist, and in `by_path`
+        // either way (see the loop above).
+        let resource_id = by_path
+            .get(&normalized_path(&imported.path))
+            .cloned()
+            .ok_or(Inconsistent)?;
+        let resource = api
+            .resources
+            .get_mut(&resource_id)
+            .ok_or(Inconsistent)?;
+        for method in &imported.methods {
+            let mut method = method.clone();
+            if let Some(integration) = &mut method.integration {
+                // The one member of an imported integration that depends on where the
+                // method landed: "By default, API Gateway uses the resource ID as the
+                // cacheNamespace", which is the default `PutIntegration` applies too.
+                if integration.cache_namespace.is_none() {
+                    integration.cache_namespace = Some(resource_id.clone());
+                }
+            }
+            resource.methods.insert(method.http_method.clone(), method);
+        }
+    }
+    Ok(())
 }
 
 /// Refuse a definition whose paths would grow the store past a bound.
 ///
 /// Called BEFORE the store lock is taken, so an over-sized definition never reaches the
 /// records. Each bound is this emulator's resource guard from `crate::state`.
-fn bound_definition(definition: &ImportedDefinition) -> Result<(), String> {
+pub fn bound_definition(definition: &ImportedDefinition) -> Result<(), String> {
     use crate::state::{
         bound_chars, bound_entries, MAX_COLLECTION_ENTRIES, MAX_PATH_CHARS, MAX_PATH_PART_CHARS,
         MAX_STRING_CHARS,
@@ -943,7 +1716,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The definition is parsed and bounded BEFORE the store lock is taken, so a
         // malformed or over-sized body never reaches the records at all.
         let mode = put_mode(input.mode.as_deref()).map_err(bad_request)?;
-        let definition = parse_definition(&input.body).map_err(bad_request)?;
+        let definition =
+            parse_definition(&input.body, &ImportScope::of(ctx.parts())).map_err(bad_request)?;
         bound_definition(&definition).map_err(bad_request)?;
 
         // `parameters` is `@httpQueryParams`, so it carries this request's query string
@@ -991,38 +1765,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (api.root_resource_id.clone(), kept)
         };
 
-        // The resources the definition asks for that do not exist yet, in document
-        // order, each ancestor before the path that needs it: `/pets/{petId}` creates
-        // `/pets` first, exactly as `CreateResource` would have to.
-        //
-        // The per-API resource quota is enforced AS the plan grows, not after it: a
-        // definition asking for more resources than an API may hold is refused at the
-        // entry that breaks the quota, so neither the plan nor the set it is built from
-        // can grow past the quota however long the document's paths are.
-        let mut known = kept_paths.clone();
-        let mut planned: Vec<(String, String, String)> = Vec::new();
-        for imported in &definition.paths {
-            let mut parent = ROOT_RESOURCE_PATH.to_string();
-            for segment in imported.path.split('/').filter(|part| !part.is_empty()) {
-                let path = child_path(&parent, segment);
-                if known.insert(path.clone()) {
-                    if known.len() > crate::state::MAX_RESOURCES_PER_API {
-                        return Err(PutRestApiErrorModeled::LimitExceededException(
-                            LimitExceededException {
-                                retry_after_seconds: None,
-                                message: Some(format!(
-                                    "Maximum number of resources exceeded for this API: {}",
-                                    crate::state::MAX_RESOURCES_PER_API
-                                )),
-                            },
-                        )
-                        .into());
-                    }
-                    planned.push((path.clone(), segment.to_string(), parent.clone()));
-                }
-                parent = path;
-            }
-        }
+        // The resources the definition asks for that this API does not hold yet, planned
+        // under the per-API resource quota before any record is touched.
+        let mut known = kept_paths;
+        let planned = plan_resources(&mut known, &definition).map_err(|message| {
+            PutRestApiErrorModeled::LimitExceededException(LimitExceededException {
+                retry_after_seconds: None,
+                message: Some(message),
+            })
+        })?;
 
         // One id and one creation rank per resource the import creates, so the imported
         // resources are listed in the order the definition declares them.
@@ -1048,57 +1799,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        let mut by_path: BTreeMap<String, String> = api
-            .resources
-            .values()
-            .map(|resource| (resource.path.clone(), resource.id.clone()))
-            .collect();
-        for (index, (path, path_part, parent_path)) in planned.into_iter().enumerate() {
-            // One id and one rank were reserved per planned resource, and a path is
-            // planned only after every one of its ancestors, so neither lookup can miss.
-            // An inconsistency here would leave a partly imported API reported as a
-            // success, so it is answered as the server-side failure it would be rather
-            // than skipped.
-            let id = ids
-                .get(index)
-                .cloned()
-                .ok_or_else(crate::state::state_unavailable)?;
-            let sequence = sequences
-                .get(index)
-                .copied()
-                .ok_or_else(crate::state::state_unavailable)?;
-            let parent_id = by_path
-                .get(&parent_path)
-                .cloned()
-                .ok_or_else(crate::state::state_unavailable)?;
-            api.resources.insert(
-                id.clone(),
-                ResourceEntry {
-                    id: id.clone(),
-                    parent_id: Some(parent_id),
-                    path_part: Some(path_part),
-                    path: path.clone(),
-                    methods: BTreeMap::new(),
-                    sequence,
-                },
-            );
-            by_path.insert(path, id);
-        }
-
-        // Every operation the definition puts on a path becomes a method on that path's
-        // resource. The imported definition wins over what a path already carried: that
-        // is what both modes mean for a path the definition declares.
-        for imported in &definition.paths {
-            // The path's own resource: planned above when it did not exist, and in
-            // `by_path` either way, so this cannot miss (see the loop above).
-            let resource = by_path
-                .get(&normalized_path(&imported.path))
-                .and_then(|id| api.resources.get_mut(id))
-                .ok_or_else(crate::state::state_unavailable)?;
-            for verb in &imported.methods {
-                resource.methods.insert(verb.clone(), imported_method(verb));
-            }
-        }
+        // The planned resources, and then every operation the definition puts on a path
+        // as a method on that path's resource. One id and one rank was reserved per
+        // planned resource, so the materialisation cannot be short of either.
+        materialise_definition(api, &definition, &planned, &ids, &sequences)
+            .map_err(|_| crate::state::state_unavailable())?;
 
         // The definition also describes the API itself: the `info` object is where an
         // OpenAPI document carries the API's name, description and version, and an

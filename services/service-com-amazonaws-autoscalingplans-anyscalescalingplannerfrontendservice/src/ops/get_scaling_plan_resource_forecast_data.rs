@@ -13,18 +13,27 @@
 //!    single valid value), the resource coordinates (forecasts are issued for an Auto
 //!    Scaling group's desired capacity and nothing else) and the `ForecastDataType` enum —
 //!    so a bad request is refused whether or not the named plan exists;
-//! 2. the clock-owed plan transitions are settled and the data points are reported.
+//! 2. the clock-owed plan transitions are settled and the data points are computed from
+//!    the stored plan.
 //!
-//! Step 2 reports no data point, and that is the faithful answer rather than a shortcut:
-//! a data point of this forecast is a value "calculated using historical data points
-//! from a specified CloudWatch load metric" (this operation's own documentation, below).
-//! This emulator ingests no CloudWatch metric data at all, so no load metric has a
-//! history in it and there is nothing for any resource's predicted value to be
-//! calculated FROM — which is why the stored plan cannot change this answer and is not
-//! consulted for it. `Datapoints` is a required member whose list may legitimately be
-//! empty — which is also what AWS answers for a plan whose forecast has not been
-//! computed yet — whereas predicted values invented here would report a computation that
-//! never ran.
+//! A forecast belongs to ONE scalable resource, so step 2 looks the named plan up and
+//! takes the scaling instruction that names the requested resource: that instruction's
+//! capacity band, its target tracking configurations and its predictive-scaling settings
+//! decide every value, and each `ForecastDataType` reports the quantity the model defines
+//! for it (see [`ResourceForecast`]). A plan this service does not hold, a stored plan
+//! holding no instruction for the requested resource, and an instruction that configures
+//! no predictive scaling alike have no forecast, and report the empty `Datapoints` list —
+//! which is how this service reports every such miss, since the operation models no
+//! not-found error at all.
+//!
+//! AWS predicts each hour's load from the CloudWatch history of the instruction's load
+//! metric. This emulator ingests no metric data, so it has no history to predict FROM and
+//! the baseline load it forecasts around is read off the stored instruction instead. What
+//! the model itself defines holds exactly: the hourly granularity, the relation between
+//! the load forecast and the capacity forecast, and how the two scheduled-action
+//! capacities follow from the capacity forecast and the instruction. Every value is a
+//! deterministic function of stored state, so a second read of the same window never
+//! contradicts the first.
 //!
 //! ## Shape of an operation
 //!
@@ -208,25 +217,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // due (a plan whose creation or deletion came due) rather than a stale one.
         state.settle_due(now);
 
-        // The forecast carries no data point, and that is the whole of this answer.
+        // The forecast is computed from the stored plan: the scaling instruction that
+        // names the requested resource is what a forecast for it is issued from.
         //
-        // A data point here is a "predicted value … calculated using historical data
-        // points from a specified CloudWatch load metric" (this operation's own
-        // documentation). This emulator ingests no CloudWatch metric data, so no load
-        // metric — including the one a scaling instruction of a stored plan names —
-        // has a history in it for a predicted value to be calculated FROM. There is
-        // therefore nothing for the stored plan to contribute: the forecast over the
-        // requested window is empty for a resource this service covers and for one it
-        // does not alike, so the plan is deliberately NOT looked up to decide it.
-        // `Datapoints` is a required member whose list may legitimately be empty —
-        // which is also what AWS answers while a plan's forecast has not been computed
-        // yet — and this operation models NO not-found error
+        // Where there is no such instruction there is no forecast, and the empty
+        // `Datapoints` list reports it: this operation models NO not-found error
         // (`smithy_query(query="operation",operation="GetScalingPlanResourceForecastData")`
-        // binds only `InternalServiceException` and `ValidationException`), so a plan
-        // this service does not hold is reported the same way, exactly as
-        // `DescribeScalingPlanResources` reports a miss as an empty page. Synthesising
-        // values here would report a computation that never ran.
-        let datapoints: Vec<Datapoint> = Vec::new();
+        // binds only `InternalServiceException` and `ValidationException`), exactly as
+        // `DescribeScalingPlanResources` reports a miss as an empty page.
+        let datapoints = state
+            .plan(&input.scaling_plan_name, input.scaling_plan_version)
+            .and_then(|plan| instruction_for(plan, &input))
+            .map(|instruction| {
+                forecast(
+                    instruction,
+                    &input.forecast_data_type,
+                    input.start_time,
+                    input.end_time,
+                    now,
+                )
+            })
+            .unwrap_or_default();
 
         Ok(GetScalingPlanResourceForecastDataOutput { datapoints })
     }
@@ -364,6 +375,370 @@ fn validate_forecast_resource(
         return Err(crate::state::UNSUPPORTED_RESOURCE.to_string());
     }
     crate::state::validate_resource_id(&input.resource_id, &input.scalable_dimension)
+}
+
+// ---------------------------------------------------------------------------
+// The forecast itself: every value below is computed from the stored scaling
+// instruction that names the requested resource, and from the request's window.
+// ---------------------------------------------------------------------------
+
+/// The granularity of forecast data, in seconds.
+///
+/// One data point per hour: AWS Auto Scaling "sums up all the metric data points that
+/// occurred within each hour to match the granularity period that is used in the
+/// forecast (60 minutes)"
+/// (`smithy_query(query="doc",shape="CustomizedLoadMetricSpecification")`).
+pub const FORECAST_INTERVAL_SECONDS: i64 = 3_600;
+
+/// How far ahead of the current date and time forecast data exists, in days.
+///
+/// `GetScalingPlanResourceForecastDataRequest$EndTime`: "AWS Auto Scaling only issues
+/// forecasts for periods of two days in advance." A window may legitimately ask for more
+/// — the same member "can accept a date and time that is more than two days in the
+/// future" — so the hours past this horizon simply carry no data point instead of the
+/// request being refused.
+pub const FORECAST_HORIZON_DAYS: i64 = 2;
+
+/// Hours in a day, for the daily cycle and for turning day counts into hour counts.
+const HOURS_PER_DAY: i64 = 24;
+
+/// The `ForecastDataType` reporting the load metric forecast.
+const DATA_TYPE_LOAD_FORECAST: &str = "LoadForecast";
+/// The `ForecastDataType` reporting the capacity forecast.
+const DATA_TYPE_CAPACITY_FORECAST: &str = "CapacityForecast";
+/// The `ForecastDataType` reporting "the minimum capacity for each scheduled scaling
+/// action".
+const DATA_TYPE_SCHEDULED_ACTION_MIN_CAPACITY: &str = "ScheduledActionMinCapacity";
+/// The `ForecastDataType` reporting "the maximum capacity for each scheduled scaling
+/// action".
+const DATA_TYPE_SCHEDULED_ACTION_MAX_CAPACITY: &str = "ScheduledActionMaxCapacity";
+
+/// The `PredictiveScalingMaxCapacityBehavior` that lets capacity rise to the forecast
+/// capacity: "AWS Auto Scaling may scale resource capacity higher than the maximum
+/// capacity to equal but not exceed forecast capacity."
+const BEHAVIOR_TO_FORECAST_CAPACITY: &str = "SetMaxCapacityToForecastCapacity";
+
+/// The `PredictiveScalingMode` under which no scheduled scaling action is created: with
+/// it, "AWS Auto Scaling forecasts capacity but does not create any scheduled scaling
+/// actions based on the capacity forecast"
+/// (`smithy_query(query="doc",shape="ScalingInstruction",member="PredictiveScalingMode")`).
+const MODE_FORECAST_ONLY: &str = "ForecastOnly";
+
+/// How far the forecast load of one hour sits above and below the resource's baseline
+/// load, as a fraction of it, and the hour of day the cycle peaks at.
+///
+/// CHOSEN, not documented. AWS predicts each hour from the CloudWatch history of the
+/// instruction's load metric; this emulator ingests no metric data, so it has no history
+/// to predict FROM. What it does hold is the scaling instruction, so the forecast is a
+/// function of that instruction alone: a daily cycle of this amplitude around the
+/// baseline load the instruction describes. The cycle is what makes a forecast a curve
+/// over time rather than one number, and it is deterministic — the same hour of the same
+/// instruction always carries the same value, so a second read never contradicts the
+/// first.
+const DIURNAL_AMPLITUDE: f64 = 0.5;
+
+/// The hour of day, in UTC, at which that cycle peaks; it troughs twelve hours later.
+const PEAK_HOUR_UTC: f64 = 12.0;
+
+/// How close to a whole unit a capacity has to be to count as already whole, relative to
+/// its own magnitude, before it is rounded up — floating-point slack, not a rule.
+const WHOLE_UNIT_TOLERANCE: f64 = 1e-9;
+
+/// The hour of day, in UTC, of an instant given as whole seconds since the epoch.
+fn hour_of_day(at_secs: i64) -> i64 {
+    at_secs
+        .div_euclid(FORECAST_INTERVAL_SECONDS)
+        .rem_euclid(HOURS_PER_DAY)
+}
+
+/// The multiple of the baseline load the forecast carries at `hour` of the day.
+fn diurnal_factor(hour: i64) -> f64 {
+    let phase = (hour as f64 - PEAK_HOUR_UTC) / HOURS_PER_DAY as f64 * ::std::f64::consts::TAU;
+    1.0 + DIURNAL_AMPLITUDE * phase.cos()
+}
+
+/// `value` rounded UP to a whole unit of capacity.
+///
+/// Capacity is counted in whole units — `ResourceCapacity` is an integer in the model, and
+/// the dimension forecast here is an Auto Scaling group's desired capacity — so a
+/// fractional requirement is met by the next whole unit. A value already whole to within
+/// floating-point slack stays where it is instead of being pushed a unit higher.
+fn whole_units(value: f64) -> f64 {
+    let nearest = value.round();
+    if (value - nearest).abs() <= WHOLE_UNIT_TOLERANCE * nearest.abs().max(1.0) {
+        nearest
+    } else {
+        value.ceil()
+    }
+}
+
+/// A wall-clock instant as whole seconds since the epoch.
+fn clock_secs(at: ::std::time::SystemTime) -> i64 {
+    i64::try_from(clock_nanos(at).div_euclid(1_000_000_000)).unwrap_or(i64::MAX)
+}
+
+/// The first whole second at or after a modelled `TimestampType`, so a start inside a
+/// second does not pull in a data point that sits before it.
+fn ceil_secs(at: ::aws_smithy_types::DateTime) -> i64 {
+    if at.subsec_nanos() > 0 {
+        at.secs().saturating_add(1)
+    } else {
+        at.secs()
+    }
+}
+
+/// The instants a forecast carries a data point at, over the requested window.
+///
+/// Forecast data exists at [`FORECAST_INTERVAL_SECONDS`] granularity, so the points sit on
+/// the interval boundaries inside the half-open window `[StartTime, EndTime)` — the start
+/// is "inclusive" and the end "exclusive" — intersected with the span over which the
+/// service has forecast data at all: no further back than [`MAX_FORECAST_HISTORY_DAYS`]
+/// ("Data points are available for up to 56 days") and no further ahead than
+/// [`FORECAST_HORIZON_DAYS`].
+fn forecast_instants(
+    start_time: ::aws_smithy_types::DateTime,
+    end_time: ::aws_smithy_types::DateTime,
+    now: ::std::time::SystemTime,
+) -> Vec<i64> {
+    let now_secs = clock_secs(now);
+    let earliest = now_secs.saturating_sub(MAX_FORECAST_HISTORY_DAYS * SECONDS_PER_DAY);
+    let latest = now_secs.saturating_add(FORECAST_HORIZON_DAYS * SECONDS_PER_DAY);
+    let first = ceil_secs(start_time).max(earliest);
+    // A point at exactly `EndTime` is outside the window; one at the last whole second
+    // before an `EndTime` inside a second is inside it.
+    let end = end_time.secs();
+
+    let mut at = first.div_euclid(FORECAST_INTERVAL_SECONDS) * FORECAST_INTERVAL_SECONDS;
+    if at < first {
+        at = at.saturating_add(FORECAST_INTERVAL_SECONDS);
+    }
+    let mut instants = Vec::new();
+    while at < end && at <= latest {
+        instants.push(at);
+        at = at.saturating_add(FORECAST_INTERVAL_SECONDS);
+    }
+    instants
+}
+
+/// The stored scaling instruction a forecast for the requested resource is issued from.
+///
+/// "Each scaling instruction applies to one resource"
+/// (`smithy_query(query="doc",shape="ScalingInstruction")`), identified by the same
+/// `(ServiceNamespace, ResourceId, ScalableDimension)` triple this request carries — so
+/// the forecast of a resource is the forecast of the instruction naming it, and a plan
+/// holding no instruction for it has no forecast to report.
+fn instruction_for<'a>(
+    plan: &'a crate::state::ScalingPlanRecord,
+    input: &GetScalingPlanResourceForecastDataInput,
+) -> Option<&'a ScalingInstruction> {
+    plan.scaling_instructions.iter().find(|instruction| {
+        instruction.service_namespace == input.service_namespace
+            && instruction.resource_id == input.resource_id
+            && instruction.scalable_dimension == input.scalable_dimension
+    })
+}
+
+/// Which of the four modelled `ForecastDataType`s a request asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForecastKind {
+    /// "LoadForecast: The load metric forecast."
+    Load,
+    /// "CapacityForecast: The capacity forecast."
+    Capacity,
+    /// "ScheduledActionMinCapacity: The minimum capacity for each scheduled scaling
+    /// action."
+    ScheduledActionMinCapacity,
+    /// "ScheduledActionMaxCapacity: The maximum capacity for each scheduled scaling
+    /// action."
+    ScheduledActionMaxCapacity,
+}
+
+impl ForecastKind {
+    /// The kind a modelled `ForecastDataType` value names. `None` for a value outside the
+    /// enum, which the handler refuses before reaching here.
+    fn of(data_type: &str) -> Option<Self> {
+        match data_type {
+            DATA_TYPE_LOAD_FORECAST => Some(Self::Load),
+            DATA_TYPE_CAPACITY_FORECAST => Some(Self::Capacity),
+            DATA_TYPE_SCHEDULED_ACTION_MIN_CAPACITY => Some(Self::ScheduledActionMinCapacity),
+            DATA_TYPE_SCHEDULED_ACTION_MAX_CAPACITY => Some(Self::ScheduledActionMaxCapacity),
+            _ => None,
+        }
+    }
+
+    /// Whether this kind describes a scheduled scaling action, and so exists only where
+    /// the instruction creates scheduled scaling actions.
+    fn is_scheduled_action(self) -> bool {
+        matches!(
+            self,
+            Self::ScheduledActionMinCapacity | Self::ScheduledActionMaxCapacity
+        )
+    }
+}
+
+/// The forecast of one scaling instruction: everything the four forecast data types are
+/// computed from, read off the stored instruction.
+///
+/// The quantities relate exactly as the model defines them:
+///
+/// * the LOAD forecast is the instruction's load metric predicted for an hour — the
+///   aggregate load on the resource, which is what a load metric measures
+///   (`ASGTotalCPUUtilization` and the other `LoadMetricType` values are totals, while a
+///   `ScalingMetricType` tracked against a target value is the per-unit average);
+/// * the CAPACITY forecast is therefore the capacity that holds every target tracking
+///   configuration of the instruction at its target under that load, which is the load
+///   divided by the smallest target value of the instruction, in whole units;
+/// * `ScheduledActionMinCapacity` is "calculated as the larger of two values: the
+///   capacity forecast or the minimum capacity in the scaling instruction";
+/// * `ScheduledActionMaxCapacity` uses "the calculation … determined by the predictive
+///   scaling maximum capacity behavior setting in the scaling instruction".
+#[derive(Debug, Clone)]
+struct ResourceForecast {
+    /// `MinCapacity` — the floor the instruction sets on the resource.
+    min_capacity: f64,
+    /// `MaxCapacity` — the ceiling it sets.
+    max_capacity: f64,
+    /// The load one unit of capacity carries while every target tracking configuration of
+    /// the instruction holds its metric at its target: the SMALLEST target value, because
+    /// the capacity has to satisfy all of them at once.
+    load_per_unit: f64,
+    /// `PredictiveScalingMaxCapacityBehavior`, absent where the instruction leaves it to
+    /// its documented default (`SetForecastCapacityToMaxCapacity`).
+    max_capacity_behavior: Option<String>,
+    /// `PredictiveScalingMaxCapacityBuffer` as a fraction of the forecast capacity: "The
+    /// value is specified as a percentage relative to the forecast capacity."
+    max_capacity_buffer: f64,
+    /// Whether the instruction creates scheduled scaling actions from the capacity
+    /// forecast — true unless its `PredictiveScalingMode` is `ForecastOnly`.
+    creates_scheduled_actions: bool,
+}
+
+impl ResourceForecast {
+    /// The forecast of `instruction`, or `None` where the instruction configures no
+    /// predictive scaling.
+    ///
+    /// A load metric specification is what "configur[es] predictive scaling"
+    /// (`ScalingInstruction$PredefinedLoadMetricSpecification`: "This parameter or a
+    /// CustomizedLoadMetricSpecification is required when configuring predictive scaling,
+    /// and cannot be used otherwise"), so an instruction carrying neither has no forecast
+    /// at all — only the dynamic target tracking scaling the rest of it describes.
+    fn of(instruction: &ScalingInstruction) -> Option<Self> {
+        let configures_predictive_scaling = instruction
+            .predefined_load_metric_specification
+            .is_some()
+            || instruction.customized_load_metric_specification.is_some();
+        if !configures_predictive_scaling {
+            return None;
+        }
+        let load_per_unit = instruction
+            .target_tracking_configurations
+            .iter()
+            .map(|configuration| configuration.target_value)
+            .filter(|target| *target > 0.0)
+            .fold(f64::INFINITY, f64::min);
+        if !load_per_unit.is_finite() {
+            return None;
+        }
+        Some(Self {
+            min_capacity: f64::from(instruction.min_capacity),
+            max_capacity: f64::from(instruction.max_capacity),
+            load_per_unit,
+            max_capacity_behavior: instruction.predictive_scaling_max_capacity_behavior.clone(),
+            max_capacity_buffer: instruction
+                .predictive_scaling_max_capacity_buffer
+                .map_or(0.0, f64::from)
+                / 100.0,
+            creates_scheduled_actions: instruction.predictive_scaling_mode.as_deref()
+                != Some(MODE_FORECAST_ONLY),
+        })
+    }
+
+    /// The capacity the forecast cycles around: the middle of the band the instruction
+    /// declares, so the load it forecasts is one the instruction's own `MinCapacity` and
+    /// `MaxCapacity` bracket.
+    fn baseline_capacity(&self) -> f64 {
+        (self.min_capacity + self.max_capacity) / 2.0
+    }
+
+    /// The load metric forecast for `hour` of the day.
+    fn load(&self, hour: i64) -> f64 {
+        self.baseline_capacity() * self.load_per_unit * diurnal_factor(hour)
+    }
+
+    /// The capacity forecast for `hour`: the whole units that hold every target tracking
+    /// configuration at its target under the forecast load.
+    fn capacity(&self, hour: i64) -> f64 {
+        whole_units(self.load(hour) / self.load_per_unit)
+    }
+
+    /// "The minimum capacity for each scheduled scaling action … calculated as the larger
+    /// of two values: the capacity forecast or the minimum capacity in the scaling
+    /// instruction."
+    fn scheduled_action_min_capacity(&self, hour: i64) -> f64 {
+        self.capacity(hour).max(self.min_capacity)
+    }
+
+    /// The maximum capacity for each scheduled scaling action, by the instruction's
+    /// `PredictiveScalingMaxCapacityBehavior`:
+    ///
+    /// * `SetMaxCapacityToForecastCapacity` — capacity may go "higher than the maximum
+    ///   capacity to equal but not exceed forecast capacity";
+    /// * `SetMaxCapacityAboveForecastCapacity` — "higher than the maximum capacity by a
+    ///   specified buffer value", the buffer being a percentage of the forecast capacity
+    ///   ("if the buffer is 10 … if the forecast capacity is 50, and the maximum capacity
+    ///   is 40, then the effective maximum capacity is 55");
+    /// * `SetForecastCapacityToMaxCapacity`, the documented default — "the maximum
+    ///   capacity is enforced as a hard limit".
+    fn scheduled_action_max_capacity(&self, hour: i64) -> f64 {
+        match self.max_capacity_behavior.as_deref() {
+            Some(BEHAVIOR_TO_FORECAST_CAPACITY) => self.max_capacity.max(self.capacity(hour)),
+            Some(crate::state::BEHAVIOR_ABOVE_FORECAST_CAPACITY) => self
+                .max_capacity
+                .max(whole_units(self.capacity(hour) * (1.0 + self.max_capacity_buffer))),
+            _ => self.max_capacity,
+        }
+    }
+
+    /// The value one data point of `kind` carries at `hour`.
+    fn value_at(&self, kind: ForecastKind, hour: i64) -> f64 {
+        match kind {
+            ForecastKind::Load => self.load(hour),
+            ForecastKind::Capacity => self.capacity(hour),
+            ForecastKind::ScheduledActionMinCapacity => self.scheduled_action_min_capacity(hour),
+            ForecastKind::ScheduledActionMaxCapacity => self.scheduled_action_max_capacity(hour),
+        }
+    }
+}
+
+/// The data points of one forecast kind over the requested window, computed from the
+/// stored instruction.
+///
+/// Empty where the instruction configures no predictive scaling, and — for the two
+/// scheduled-action kinds — where it creates no scheduled scaling action to have a
+/// capacity.
+fn forecast(
+    instruction: &ScalingInstruction,
+    data_type: &str,
+    start_time: ::aws_smithy_types::DateTime,
+    end_time: ::aws_smithy_types::DateTime,
+    now: ::std::time::SystemTime,
+) -> Vec<Datapoint> {
+    let Some(kind) = ForecastKind::of(data_type) else {
+        return Vec::new();
+    };
+    let Some(forecast) = ResourceForecast::of(instruction) else {
+        return Vec::new();
+    };
+    if kind.is_scheduled_action() && !forecast.creates_scheduled_actions {
+        return Vec::new();
+    }
+    forecast_instants(start_time, end_time, now)
+        .into_iter()
+        .map(|at| Datapoint {
+            timestamp: Some(::aws_smithy_types::DateTime::from_secs(at)),
+            value: Some(forecast.value_at(kind, hour_of_day(at))),
+        })
+        .collect()
 }
 
 /// This operation's own modelled `ValidationException` (HTTP 400), naming what the
