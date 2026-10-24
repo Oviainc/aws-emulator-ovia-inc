@@ -31,7 +31,7 @@ use crate::identity_provider_subscriptions::{
 };
 
 /// The only value `ServerType` accepts (Smithy: `ServerType` enum, values `[RDS_SAL]`).
-const SERVER_TYPE: &str = "RDS_SAL";
+pub(crate) const SERVER_TYPE: &str = "RDS_SAL";
 
 /// Assert `reply` is the modelled `ValidationException` (HTTP 400).
 fn refused_as_validation(reply: &Reply, case: &str) {
@@ -46,13 +46,13 @@ fn refused_as_validation(reply: &Reply, case: &str) {
     );
 }
 
-async fn create_endpoint(h: &Harness, body: &Value) -> Reply {
+pub(crate) async fn create_endpoint(h: &Harness, body: &Value) -> Reply {
     // `CreateLicenseServerEndpoint` is bound to POST
     // /license-server/CreateLicenseServerEndpoint (smithy_query: http.uri).
     call(h, "/license-server/CreateLicenseServerEndpoint", body).await
 }
 
-async fn list_endpoints(h: &Harness, body: &Value) -> Reply {
+pub(crate) async fn list_endpoints(h: &Harness, body: &Value) -> Reply {
     // `ListLicenseServerEndpoints` is bound to POST
     // /license-server/ListLicenseServerEndpoints (smithy_query: http.uri).
     call(h, "/license-server/ListLicenseServerEndpoints", body).await
@@ -62,8 +62,8 @@ async fn list_endpoints(h: &Harness, body: &Value) -> Reply {
 /// generalise over: the directory-id form the provider was registered with, the
 /// product, the Secrets Manager secret id form, and whether tags are supplied.
 #[derive(Debug, Clone, Copy)]
-struct Endpoint {
-    case: &'static str,
+pub(crate) struct Endpoint {
+    pub(crate) case: &'static str,
     /// `DirectoryId` matches `^(d|sd)-[0-9a-f]{10}$`.
     directory_id: &'static str,
     /// From `RegisterIdentityProvider`'s `Product` documentation: VISUAL_STUDIO_ENTERPRISE
@@ -71,10 +71,10 @@ struct Endpoint {
     /// REMOTE_DESKTOP_SERVICES.
     product: &'static str,
     secret_id: &'static str,
-    tagged: bool,
+    pub(crate) tagged: bool,
 }
 
-const ENDPOINTS: &[Endpoint] = &[
+pub(crate) const ENDPOINTS: &[Endpoint] = &[
     Endpoint {
         case: "aws-managed directory, remote desktop services, secret name",
         directory_id: "d-0123456789",
@@ -117,7 +117,7 @@ impl Endpoint {
         })
     }
 
-    fn request(&self, identity_provider_arn: &str) -> Value {
+    pub(crate) fn request(&self, identity_provider_arn: &str) -> Value {
         let mut body = json!({
             "IdentityProviderArn": identity_provider_arn,
             "LicenseServerSettings": {
@@ -139,12 +139,12 @@ impl Endpoint {
 }
 
 /// The `arn:` prefix every resource of `kind` minted for this request must carry.
-fn arn_prefix(kind: &str) -> String {
+pub(crate) fn arn_prefix(kind: &str) -> String {
     format!("arn:aws:{SIGNING_NAME}:{REGION}:{ACCOUNT}:{kind}/")
 }
 
 /// The endpoints a list reply reports, as their ARNs in reply order.
-fn listed_arns(body: &Value, case: &str) -> Vec<String> {
+pub(crate) fn listed_arns(body: &Value, case: &str) -> Vec<String> {
     body.get("LicenseServerEndpoints")
         .and_then(Value::as_array)
         .unwrap_or_else(|| panic!("case {case:?}: LicenseServerEndpoints is missing from {body:?}"))
@@ -155,7 +155,7 @@ fn listed_arns(body: &Value, case: &str) -> Vec<String> {
 
 /// Register every row's identity provider and create its endpoint, answering the
 /// `(case, IdentityProviderArn, LicenseServerEndpointArn)` triples in creation order.
-async fn seed(h: &Harness) -> Vec<(&'static str, String, String)> {
+pub(crate) async fn seed(h: &Harness) -> Vec<(&'static str, String, String)> {
     let mut created = Vec::new();
     for row in ENDPOINTS {
         let registered = register(h, &row.registration()).await;
