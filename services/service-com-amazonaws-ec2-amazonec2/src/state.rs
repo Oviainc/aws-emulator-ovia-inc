@@ -647,6 +647,16 @@
 //! to `included` apply to the instance", and no two operations can disagree about one
 //! instance's status.
 //!
+//! ## Scheduled event notification tag keys are a fact of a REGION
+//!
+//! [`ComAmazonawsEc2Amazonec2State::instance_event_tag_registrations`] holds, per Region, the tag
+//! keys registered to appear in scheduled event notifications
+//! ([`InstanceEventTagRegistration`]) — the registration
+//! `DescribeInstanceEventNotificationAttributes` reports "for resources in the current
+//! Region" and `RegisterInstanceEventNotificationAttributes` writes. It is keyed by the
+//! Region of the request ([`request_region`]) rather than by a resource id, because no
+//! resource owns it, and a Region with no entry has nothing registered.
+//!
 //! ## VM import tasks
 //!
 //! [`ComAmazonawsEc2Amazonec2State::import_image_tasks`] holds the import image tasks
@@ -1810,6 +1820,16 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// module docs. Ordered by endpoint id, which is the order
     /// `DescribeVpcEndpointConnections` reports and pages over.
     pub vpc_endpoint_connections: BTreeMap<String, VpcEndpointConnection>,
+    /// The tag keys registered to appear in scheduled event notifications, by Region.
+    ///
+    /// `DescribeInstanceEventNotificationAttributes` reports "the tag keys that are
+    /// registered to appear in scheduled event notifications for resources in the current
+    /// Region", so the registration is a fact of a REGION and not of any one resource:
+    /// it is keyed by the Region of the request that wrote it ([`request_region`]). A
+    /// Region with no entry has nothing registered, which is exactly the empty
+    /// registration [`InstanceEventTagRegistration::default`] describes, so a describe
+    /// never has to invent one.
+    pub instance_event_tag_registrations: BTreeMap<String, InstanceEventTagRegistration>,
     /// Every route server endpoint the account holds, by `RouteServerEndpointId`, as the
     /// modelled [`RouteServerEndpoint`] shape itself, keyed and ordered like
     /// [`Self::route_servers`].
@@ -2090,6 +2110,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             dedicated_hosts: BTreeMap::new(),
             dedicated_host_client_tokens: HashMap::new(),
             vpc_endpoint_connections: BTreeMap::new(),
+            instance_event_tag_registrations: BTreeMap::new(),
             route_server_endpoints: BTreeMap::new(),
             route_server_endpoint_available_at: BTreeMap::new(),
             route_server_endpoint_client_tokens: HashMap::new(),
@@ -3267,6 +3288,20 @@ impl ComAmazonawsEc2Amazonec2State {
     /// Would storing `bytes` more caller-chosen bytes cross [`MAX_STORED_BYTES`]?
     pub fn would_exceed_stored_bytes(&self, bytes: usize) -> bool {
         self.stored_bytes.saturating_add(bytes) > MAX_STORED_BYTES
+    }
+
+    /// Would REPLACING a stored record — charging `charge` for the new one and giving back
+    /// the `refund` the old one was charged — cross [`MAX_STORED_BYTES`]?
+    ///
+    /// The NET change is what the budget has to be asked about on a replacement path: a
+    /// replacement stores no further record, so a record-count ceiling cannot bound it, and
+    /// `charge` is caller-chosen text, so replacing a small record with a large one grows
+    /// the store by the difference. Asking [`Self::would_exceed_stored_bytes`] about
+    /// `charge` alone would refuse replacements the budget has room for, and skipping the
+    /// question entirely would let repeated replacements grow this process's memory past
+    /// the only bound it has.
+    pub fn would_exceed_stored_bytes_after_refund(&self, charge: usize, refund: usize) -> bool {
+        self.stored_bytes.saturating_sub(refund).saturating_add(charge) > MAX_STORED_BYTES
     }
 
     /// Account for `bytes` more caller-chosen bytes, written onto records that are
@@ -10680,10 +10715,12 @@ impl ComAmazonawsEc2Amazonec2State {
     /// API can address — every BYOIP operation is addressed by `Cidr` — so there is no key
     /// to file it under and it is not stored.
     ///
-    /// `false`, with NOTHING written, when there is no key to file it under, or when the
-    /// range is a new one and the store is at [`MAX_STORED_RECORDS_PER_STORE`] or the bytes
-    /// it would hold would cross [`MAX_STORED_BYTES`]. Both ceilings are asked before the
-    /// first write, so a refused provision leaves the store exactly as it was.
+    /// `false`, with NOTHING written, when there is no key to file it under, when the
+    /// range is a new one and the store is at [`MAX_STORED_RECORDS_PER_STORE`], or when the
+    /// bytes it would hold would cross [`MAX_STORED_BYTES`] — on EVERY path, replacement
+    /// included, where the question is about the net change
+    /// ([`Self::would_exceed_stored_bytes_after_refund`]). Both ceilings are asked before
+    /// the first write, so a refused provision leaves the store exactly as it was.
     pub fn insert_byoip_cidr(&mut self, record: ByoipCidrRecord) -> bool {
         let Some(cidr) = record
             .byoip_cidr
@@ -10694,14 +10731,19 @@ impl ComAmazonawsEc2Amazonec2State {
             return false;
         };
         let charge = byoip_cidr_payload_bytes(&record);
-        // A range the store does not already hold is a NEW record, so it is the one that
-        // has to fit inside both ceilings. Replacing a range held under the same key stores
-        // no further record and gives back what the record it replaces was charged, so the
-        // byte budget stays the sum of what the store actually holds.
+        // A range the store does not already hold is a NEW record, so it is the only one
+        // the record-count ceiling can be about: replacing a range held under the same key
+        // stores no further record and gives back what the record it replaces was charged.
         let refund = self.byoip_cidrs.get(&cidr).map(byoip_cidr_payload_bytes);
-        if refund.is_none()
-            && (!self.has_byoip_cidr_capacity() || self.would_exceed_stored_bytes(charge))
-        {
+        if refund.is_none() && !self.has_byoip_cidr_capacity() {
+            return false;
+        }
+        // The BYTE budget, by contrast, binds every path: the charge is dominated by
+        // caller-chosen text (the description, the status message, the ASN associations), so
+        // re-provisioning one range with a larger record grows the store by the difference,
+        // and without this gate repeated replacements would make resident memory a function
+        // of the request body rather than of the budget.
+        if self.would_exceed_stored_bytes_after_refund(charge, refund.unwrap_or(0)) {
             return false;
         }
         if let Some(refund) = refund {
@@ -15542,6 +15584,175 @@ impl ComAmazonawsEc2Amazonec2State {
 pub const VPC_ENDPOINT_CONNECTION_RECORD_BYTES: usize = 512;
 
 // =============================================================================
+// The tag keys registered for scheduled event notifications
+// =============================================================================
+
+/// How many Regions this emulator holds a scheduled event notification registration for
+/// before a register signed for a further one is refused.
+///
+/// CHOSEN, and defined as the crate's one ceiling for a store nothing reclaims
+/// ([`MAX_STORED_RECORDS_PER_STORE`]), the way the other per-Region store
+/// ([`MAX_ALLOWED_IMAGES_SETTINGS_REGIONS`]) defines itself: the Region an entry is keyed
+/// by is read off the REQUEST's own SigV4 credential scope, so a caller can name a Region
+/// the store has never seen on every call, and nothing here reclaims an entry. A ceiling on
+/// the entry count is what the byte budget cannot give on its own, because a registration in
+/// the include-all mode holds no tag key. It is well above the number of Regions AWS has, so
+/// no caller signing for real Regions can meet it.
+pub const MAX_EVENT_NOTIFICATION_REGIONS: usize = MAX_STORED_RECORDS_PER_STORE;
+
+/// The tag keys registered to appear in scheduled event notifications for the resources of
+/// ONE Region.
+///
+/// `IncludeAllTagsOfInstance` is the MODE the registration is in — "true indicates that all
+/// tag keys in the current Region are registered"
+/// (`InstanceTagNotificationAttribute$IncludeAllTagsOfInstance`) — and the key set holds the
+/// individually registered keys the other mode reports ("The registered tag keys",
+/// `InstanceTagNotificationAttribute$InstanceTagKeys`). Storing the two together, rather
+/// than as independent members, is what keeps the store out of a combination the model has
+/// no reading for: either every tag key of the Region is registered, or exactly the keys in
+/// the set are.
+///
+/// The set is a [`BTreeSet`], so a key a request names twice is registered once and the
+/// order it is reported in is stable across reads.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InstanceEventTagRegistration {
+    /// Whether every tag key of the Region is registered.
+    pub include_all_tags_of_instance: bool,
+    /// The individually registered tag keys — empty while
+    /// [`Self::include_all_tags_of_instance`] holds, since "all tag keys in the current
+    /// Region are registered" leaves no key to name.
+    pub instance_tag_keys: BTreeSet<String>,
+}
+
+impl InstanceEventTagRegistration {
+    /// This registration as the modelled
+    /// [`crate::ops::types::InstanceTagNotificationAttribute`] every
+    /// operation that reports one answers with, so a register, a deregister and a describe
+    /// cannot report one Region's registration differently.
+    pub fn view(&self) -> crate::ops::types::InstanceTagNotificationAttribute {
+        crate::ops::types::InstanceTagNotificationAttribute {
+            include_all_tags_of_instance: Some(self.include_all_tags_of_instance),
+            instance_tag_keys: Some(self.instance_tag_keys.iter().cloned().collect()),
+        }
+    }
+
+    /// The registration with every tag key of the Region registered: "Indicates whether to
+    /// register all tag keys in the current Region. Specify `true` to register all tag keys"
+    /// (`RegisterInstanceTagAttributeRequest$IncludeAllTagsOfInstance`).
+    ///
+    /// An associated function, not a method, because the registration it answers with does
+    /// NOT depend on the one it replaces: the individually registered keys are dropped
+    /// because they are subsumed — the reported attribute has no key left to name once all
+    /// of them are registered — which is also what makes the registration idempotent.
+    pub fn registering_all() -> Self {
+        Self {
+            include_all_tags_of_instance: true,
+            instance_tag_keys: BTreeSet::new(),
+        }
+    }
+
+    /// This registration with `keys` registered individually: "The tag keys to register"
+    /// (`RegisterInstanceTagAttributeRequest$InstanceTagKeys`) are UNIONED into the keys
+    /// already registered, so registering one key does not deregister another.
+    ///
+    /// Naming keys is the other mode of the attribute, so it also leaves the include-all
+    /// mode off: the registration then reports exactly the keys it holds.
+    pub fn registering(&self, keys: &[String]) -> Self {
+        let mut registered = self.instance_tag_keys.clone();
+        registered.extend(keys.iter().cloned());
+        Self {
+            include_all_tags_of_instance: false,
+            instance_tag_keys: registered,
+        }
+    }
+
+    /// The caller-chosen bytes this registration holds: the registered keys themselves.
+    /// The mode is one bit the service stores, so it is fixed-size.
+    ///
+    /// The bytes of the REGION it is keyed by are charged too, by
+    /// [`instance_event_registration_payload_bytes`] — this method is only the key set's
+    /// share, and the include-all mode holds no key at all, so it must not be the whole
+    /// charge of a stored entry.
+    pub fn payload_bytes(&self) -> usize {
+        self.instance_tag_keys.iter().map(String::len).sum()
+    }
+}
+
+/// The caller-chosen bytes one STORED registration holds: the Region name it is keyed by
+/// and the keys registered for it.
+///
+/// The ONE definition of that charge, the way [`vpc_endpoint_connection_payload_bytes`] is
+/// for a connection: a writer charges exactly it, and replacing or removing a registration
+/// gives back exactly what the old one held. The Region is part of it because the key comes
+/// from the request's own SigV4 credential scope, so an entry in the include-all mode — whose
+/// key set is empty — must still cost the bytes it occupies.
+pub fn instance_event_registration_payload_bytes(
+    region: &str,
+    registration: &InstanceEventTagRegistration,
+) -> usize {
+    region.len().saturating_add(registration.payload_bytes())
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// What `region` has registered right now, or the empty registration for a Region
+    /// nothing has registered in.
+    ///
+    /// A pure read: a Region that is only described gains no entry, so describing twice
+    /// cannot change what a later caller sees.
+    pub fn instance_event_tag_registration(&self, region: &str) -> InstanceEventTagRegistration {
+        self.instance_event_tag_registrations
+            .get(region)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// The caller-chosen bytes `region`'s stored registration holds right now, or 0 for a
+    /// Region with no entry — what [`Self::set_instance_event_tag_registration`] gives back
+    /// when it replaces that entry, so a writer can work out what its write ADDS.
+    pub fn instance_event_registration_bytes(&self, region: &str) -> usize {
+        self.instance_event_tag_registrations
+            .get(region)
+            .map_or(0, |registration| {
+                instance_event_registration_payload_bytes(region, registration)
+            })
+    }
+
+    /// Whether a registration for `region` fits inside the store's ceiling
+    /// ([`MAX_EVENT_NOTIFICATION_REGIONS`]) — always true for a Region that already has an
+    /// entry, since replacing one adds no entry.
+    ///
+    /// The same contract as [`Self::has_vpc_capacity`]: a writer asks first and refuses when
+    /// it answers `false`, so the number of entries this map can hold never depends on how
+    /// many Regions a caller signs requests for.
+    pub fn has_instance_event_region_capacity(&self, region: &str) -> bool {
+        self.instance_event_tag_registrations.contains_key(region)
+            || self.instance_event_tag_registrations.len() < MAX_EVENT_NOTIFICATION_REGIONS
+    }
+
+    /// Replace `region`'s registration, re-charging the store's byte budget: what the old
+    /// entry held is given back and what the new one holds is charged
+    /// ([`instance_event_registration_payload_bytes`]), so the budget tracks exactly the
+    /// Region names and keys that are stored.
+    ///
+    /// A writer must have asked [`Self::has_instance_event_region_capacity`] first: this
+    /// method is the single write path, and it is not where a request is refused.
+    pub fn set_instance_event_tag_registration(
+        &mut self,
+        region: &str,
+        registration: InstanceEventTagRegistration,
+    ) {
+        let released = self.instance_event_registration_bytes(region);
+        self.release_stored_bytes(released);
+        self.add_stored_bytes(instance_event_registration_payload_bytes(
+            region,
+            &registration,
+        ));
+        self.instance_event_tag_registrations
+            .insert(region.to_string(), registration);
+    }
+}
+
+// =============================================================================
 // Amazon S3 storage locations a request names
 // =============================================================================
 
@@ -20144,8 +20355,10 @@ impl ComAmazonawsEc2Amazonec2State {
     /// the same contract as [`Self::insert_byoip_cidr`].
     ///
     /// `None`, with NOTHING written, when the view carries no prefix to file it under, when
-    /// `association_id` names no association, or when a NEW registration would cross one of
-    /// the store's ceilings.
+    /// `association_id` names no association, when a NEW registration would cross the
+    /// store's record ceiling, or when the bytes the registration would hold would cross
+    /// [`MAX_STORED_BYTES`] — on EVERY path, replacement included, where the question is
+    /// about the net change ([`Self::would_exceed_stored_bytes_after_refund`]).
     pub fn insert_ipam_routing_policy_registration(
         &mut self,
         association_id: &str,
@@ -20160,16 +20373,21 @@ impl ComAmazonawsEc2Amazonec2State {
         let charge = ipam_routing_policy_registration_payload_bytes(&record.view);
         let association = self.ipam_internet_registry_associations.get(association_id)?;
         // A prefix the association does not already hold a registration for is a NEW record,
-        // so it is the one that has to fit inside both ceilings; replacing one stores no
-        // further record and gives back what the record it replaces was charged.
+        // so it is the only one the record COUNT ceiling can be about; replacing one stores
+        // no further record and gives back what the record it replaces was charged.
         let refund = association
             .registrations
             .get(&cidr)
             .map(|held| ipam_routing_policy_registration_payload_bytes(&held.view));
-        if refund.is_none()
-            && (association.registrations.len() >= MAX_STORED_RECORDS_PER_STORE
-                || self.would_exceed_stored_bytes(charge))
-        {
+        let registrations_held = association.registrations.len();
+        if refund.is_none() && registrations_held >= MAX_STORED_RECORDS_PER_STORE {
+            return None;
+        }
+        // The BYTE budget, by contrast, binds every path, about the NET change: the charge
+        // is dominated by caller-chosen text, so re-registering one prefix with a larger
+        // record grows the store by the difference, and without this gate repeated
+        // replacements would grow this process's memory past the only bound it has.
+        if self.would_exceed_stored_bytes_after_refund(charge, refund.unwrap_or(0)) {
             return None;
         }
         if let Some(refund) = refund {

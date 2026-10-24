@@ -769,3 +769,114 @@ async fn a_range_with_an_address_still_allocated_from_it_fails_its_release() {
         stored_cidrs(&engine)
     );
 }
+
+/// A range carrying a `Description` of `description_bytes` characters — the member a
+/// provision's charge against the store's byte budget is dominated by.
+fn range_with_description(cidr: &str, description_bytes: usize) -> ByoipCidrRecord {
+    let mut record = ByoipCidrRecord::in_state(cidr, BYOIP_CIDR_STATE_PROVISIONED);
+    record.byoip_cidr.description = Some("d".repeat(description_bytes));
+    record
+}
+
+/// The byte budget (`ec2::state::MAX_STORED_BYTES`) is asked about EVERY write, and about
+/// the NET change when a write replaces a range the store already holds: re-provisioning one
+/// range stores no further record, so the record ceiling cannot bound it, and the charge is
+/// dominated by caller-chosen text.
+///
+/// The rows are the steps of one sequence, differing in the direction of the net change — a
+/// first write, a replacement that holds less than the record it replaces, a replacement
+/// that would cross the budget, and a further small range that still fits — and each one
+/// states whether it must be stored. A refused write must leave the store exactly as it was.
+#[test]
+fn a_replacement_is_charged_the_net_change_against_the_byte_budget() {
+    let (_router, engine) = emulator();
+    let store = engine.state::<Ec2State>();
+    let half = ec2::state::MAX_STORED_BYTES / 2;
+    // (case, the range, the description's size in characters, whether it must be stored)
+    let steps: [(&str, &str, usize, bool); 4] = [
+        (
+            "a first range holding about half the budget",
+            "198.51.100.0/24",
+            half,
+            true,
+        ),
+        (
+            "a replacement holding less than the range it replaces",
+            "198.51.100.0/24",
+            half - 1024,
+            true,
+        ),
+        (
+            "a replacement that would take the store past the budget",
+            "198.51.100.0/24",
+            ec2::state::MAX_STORED_BYTES,
+            false,
+        ),
+        (
+            "a further small range, which the budget still has room for",
+            "203.0.113.0/24",
+            1024,
+            true,
+        ),
+    ];
+
+    for (case, cidr, description_bytes, stored_expected) in steps {
+        let (bytes_before, held_before) = {
+            let guard = store.lock();
+            (
+                guard.stored_bytes(),
+                guard
+                    .byoip_cidrs
+                    .get(cidr)
+                    .and_then(|record| record.byoip_cidr.description.clone()),
+            )
+        };
+        let stored = store
+            .lock()
+            .insert_byoip_cidr(range_with_description(cidr, description_bytes));
+        assert_eq!(
+            stored, stored_expected,
+            "case {case:?}: expected a {description_bytes}-character description to be \
+             stored={stored_expected}, got {stored}"
+        );
+
+        let (bytes_after, held_after) = {
+            let guard = store.lock();
+            (
+                guard.stored_bytes(),
+                guard
+                    .byoip_cidrs
+                    .get(cidr)
+                    .and_then(|record| record.byoip_cidr.description.clone()),
+            )
+        };
+        assert!(
+            bytes_after <= ec2::state::MAX_STORED_BYTES,
+            "case {case:?}: expected at most {} stored bytes, got {bytes_after}",
+            ec2::state::MAX_STORED_BYTES
+        );
+        if stored_expected {
+            assert_eq!(
+                held_after.as_deref().map(str::len),
+                Some(description_bytes),
+                "case {case:?}: expected the stored range to carry the new description, \
+                 got {:?} characters",
+                held_after.as_deref().map(str::len)
+            );
+        } else {
+            assert_eq!(
+                bytes_after, bytes_before,
+                "case {case:?}: a refused write must charge nothing, got {bytes_after} \
+                 after {bytes_before}"
+            );
+            assert_eq!(
+                held_after.as_deref().map(str::len),
+                held_before.as_deref().map(str::len),
+                "case {case:?}: a refused write must leave the stored range as it was, \
+                 got {:?} after {:?}",
+                held_after.as_deref().map(str::len),
+                held_before.as_deref().map(str::len)
+            );
+        }
+    }
+}

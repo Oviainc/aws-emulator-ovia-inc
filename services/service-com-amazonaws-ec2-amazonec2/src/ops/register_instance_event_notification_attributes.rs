@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RegisterInstanceEventNotificationAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RegisterInstanceEventNotificationAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RegisterInstanceEventNotificationAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Registers tag keys to appear in scheduled event notifications for the resources of the
+//! Region the request was signed for, in this service's state
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::instance_event_tag_registrations`]), which
+//! `DescribeInstanceEventNotificationAttributes` reports back.
 //!
 //! ## Shape of an operation
 //!
@@ -136,18 +132,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RegisterInstanceEventNotificationAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RegisterInstanceEventNotificationAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RegisterInstanceEventNotificationAttributes"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            dry_run_operation, instance_event_registration_payload_bytes, request_region,
+            require_service_state, validate_tag_size, InstanceEventTagRegistration,
+            MAX_EVENT_NOTIFICATION_REGIONS, MAX_STORED_BYTES,
+        };
+
+        let attribute = &input.instance_tag_attribute;
+        let requested_keys = attribute.instance_tag_keys.as_deref().unwrap_or_default();
+        let include_all = attribute.include_all_tags_of_instance == Some(true);
+
+        // "You can either specify individual tag keys or register all tag keys in the
+        // current Region. You must specify either IncludeAllTagsOfInstance or
+        // InstanceTagKeys in the request" (`RegisterInstanceTagAttributeRequest`): the two
+        // are alternatives, so naming both has no single reading and naming neither asks
+        // for nothing at all.
+        if include_all && !requested_keys.is_empty() {
+            return Err(Scaffolded::invalid_parameter_combination(
+                "The request must specify either IncludeAllTagsOfInstance or \
+                 InstanceTagKeys, not both",
+            ));
+        }
+        if !include_all && requested_keys.is_empty() {
+            return Err(Scaffolded::missing_parameter(
+                "The request must specify either IncludeAllTagsOfInstance or \
+                 InstanceTagKeys",
+            ));
+        }
+        // A registered key is a TAG key, so it is bounded the way every other tag key this
+        // service accepts is: the model declares no `@length` on `InstanceTagKeySet`'s
+        // member, so the handler is the only place the bound can exist, and without one a
+        // single request could store caller-chosen megabytes per Region.
+        for key in requested_keys {
+            if key.is_empty() {
+                return Err(Scaffolded::invalid_parameter_value(
+                    "A tag key cannot be empty",
+                ));
+            }
+            validate_tag_size(key, "")?;
+        }
+
+        // The registration is a fact of the Region the request was signed for: the
+        // describe reports the keys registered "for resources in the current Region".
+        let region = request_region(ctx.parts());
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+        let current = store.instance_event_tag_registration(&region);
+        let registered = if include_all {
+            InstanceEventTagRegistration::registering_all()
+        } else {
+            current.registering(requested_keys)
+        };
+
+        // This write REPLACES the Region's entry, so the budget is asked about the net
+        // change — what the new entry holds (the Region name it is keyed by plus its keys)
+        // less what the entry it replaces held — through the store's one helper for that
+        // question. A key already registered adds nothing, since the set keeps one copy.
+        let charge = instance_event_registration_payload_bytes(&region, &registered);
+        let refund = store.instance_event_registration_bytes(&region);
+        if store.would_exceed_stored_bytes_after_refund(charge, refund) {
+            return Err(Scaffolded::tag_limit_exceeded(format!(
+                "This emulator holds {} of at most {MAX_STORED_BYTES} bytes of \
+                 caller-supplied instance data, so it cannot store this registration's \
+                 {charge} bytes",
+                store.stored_bytes()
+            )));
+        }
+        // The Region comes from the request's own credential scope, and a registration in
+        // the include-all mode holds no tag key at all, so the byte budget alone does not
+        // bound how many entries this store can gain: the entry COUNT has its own ceiling.
+        if !store.has_instance_event_region_capacity(&region) {
+            return Err(Scaffolded::tag_limit_exceeded(format!(
+                "This emulator holds scheduled event notification tag keys for at most \
+                 {MAX_EVENT_NOTIFICATION_REGIONS} Regions, so it cannot register any for \
+                 '{region}'"
+            )));
+        }
+
+        // A `DryRun` request that would have succeeded stops HERE, having written nothing:
+        // "If you have the required permissions, the error response is DryRunOperation"
+        // (`DryRun`). Everything above only reads state.
+        if input.dry_run == Some(true) {
+            return Err(dry_run_operation());
+        }
+
+        store.set_instance_event_tag_registration(&region, registered.clone());
+
+        // "The resulting set of tag keys"
+        // (`RegisterInstanceEventNotificationAttributesResult$InstanceTagAttribute`) — the
+        // registration as it now stands, which is exactly what a describe reports.
+        Ok(RegisterInstanceEventNotificationAttributesOutput {
+            instance_tag_attribute: Some(registered.view()),
+        })
     }
 }
