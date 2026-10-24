@@ -70,10 +70,11 @@
 //! that record ([`CacheParameterGroupRecord::parameter_values`]), because a
 //! group reports its family's engine defaults with exactly those values laid
 //! over them — which is what `DescribeCacheParameters` answers with.
-//! `ModifyCacheParameterGroup` and `ResetCacheParameterGroup`, the two
-//! operations that WRITE that map, are still scaffolded 501s and own their own
-//! gap issues; keeping the map on the group record is what will let them write
-//! the copy the reader already reads instead of a second one beside it.
+//! `ModifyCacheParameterGroup` is the operation that WRITES that map;
+//! `ResetCacheParameterGroup`, which removes an entry from it, is still a
+//! scaffolded 501 and owns its own gap issue. Keeping the map on the group
+//! record is what lets the writer write the copy the reader already reads
+//! instead of a second one beside it.
 //!
 //! Beside the cache resources sits the RBAC user: `CreateUser` mints one and
 //! `DescribeUsers` reports it, over the one [`UserRecord`] map below, which also
@@ -718,12 +719,20 @@ pub fn snapshot_source_filter(value: &str) -> Result<&'static str, String> {
 /// supported.
 pub const UNSNAPSHOTTABLE_NODE_TYPE: &str = "cache.t1.micro";
 
-/// The `ParameterApplyStatus` / `CacheNode$ParameterGroupStatus` of a cluster
-/// whose nodes all run the parameter group's current values — the only state
-/// this slice can be in, because every operation that would CHANGE a
-/// parameter's value (`ModifyCacheParameterGroup`, `ResetCacheParameterGroup`)
-/// is still a scaffolded 501, so no parameter value can ever be pending.
+/// The `ParameterApplyStatus` / `CacheNode$ParameterGroupStatus` of a cache
+/// node that runs the current values of the parameter group its cluster is
+/// associated with.
 pub const PARAMETER_APPLY_STATUS: &str = "in-sync";
+
+/// The `ParameterApplyStatus` / `CacheNode$ParameterGroupStatus` of a cache
+/// node whose group has had a parameter the engine applies only at a restart
+/// changed on it: the value is SET on the group, and the node keeps running the
+/// one it was started with until it is rebooted.
+///
+/// `Parameter$ChangeType` is what says which parameters those are
+/// ([`CHANGE_TYPE_REQUIRES_REBOOT`]), and `RebootCacheCluster` — which "applies
+/// any modified cache parameter groups to the cluster" — is what ends it.
+pub const PARAMETER_APPLY_STATUS_PENDING_REBOOT: &str = "pending-reboot";
 
 /// The `SecurityGroupMembership$Status` of a VPC security group a cluster was
 /// created with. The emulator models no EC2 security-group lifecycle, so a
@@ -964,9 +973,9 @@ pub struct CacheParameterGroupRecord {
     /// name in this map is the customer's value ([`PARAMETER_SOURCE_USER`]),
     /// one that is not is the service's ([`PARAMETER_SOURCE_SYSTEM`]).
     /// `ModifyCacheParameterGroup` sets an entry and
-    /// `ResetCacheParameterGroup` removes one; both are still scaffolded 501s
-    /// with their own issues, so a group answers its family's defaults until
-    /// one of them lands.
+    /// `ResetCacheParameterGroup` removes one; the latter is still a scaffolded
+    /// 501 with its own issue, so a value a group has been given stays set
+    /// until it lands.
     pub parameter_values: BTreeMap<String, String>,
 }
 
@@ -1978,8 +1987,7 @@ impl ParameterRecord {
     /// list's position is what puts the whole catalog in the single total order a
     /// `Marker` resumes from.
     pub fn page_key(&self) -> String {
-        let list = if self.is_node_type_specific() { 2 } else { 1 };
-        format!("{list}:{}", self.name)
+        parameter_page_key(&self.name, self.is_node_type_specific())
     }
 
     /// This record as the modelled `Parameter`.
@@ -2050,6 +2058,130 @@ impl ParameterRecord {
         }
     }
 }
+
+/// The key the parameter `name` is held and paged under, given which of
+/// `EngineDefaults`' two lists reports it; see [`ParameterRecord::page_key`].
+///
+/// A free function because a lookup BY NAME has to build the same key without
+/// holding the record it is looking for
+/// ([`ComAmazonawsElasticacheAmazonelasticachev9State::family_parameter`]), and
+/// two spellings of one key would let a write land where no read finds it.
+fn parameter_page_key(name: &str, node_type_specific: bool) -> String {
+    let list = if node_type_specific { 2 } else { 1 };
+    format!("{list}:{name}")
+}
+
+/// `Parameter$DataType`'s spellings in the catalogs this service publishes: the
+/// engine's own types, which are what decide whether a value a request asks to
+/// set is a number at all and how it is compared against a published range.
+pub const PARAMETER_DATA_TYPE_INTEGER: &str = "integer";
+/// See [`PARAMETER_DATA_TYPE_INTEGER`].
+pub const PARAMETER_DATA_TYPE_FLOAT: &str = "float";
+/// See [`PARAMETER_DATA_TYPE_INTEGER`].
+pub const PARAMETER_DATA_TYPE_BOOLEAN: &str = "boolean";
+/// See [`PARAMETER_DATA_TYPE_INTEGER`].
+pub const PARAMETER_DATA_TYPE_STRING: &str = "string";
+
+/// `value` as the number a parameter of `data_type` takes, or `None` when it is
+/// not one.
+///
+/// An `integer` (and a `boolean`, which the engines write as `0` / `1`) takes
+/// only a whole number, so `1.5` is not one of its values; a `float` takes any
+/// finite decimal number. A `string` parameter has no numeric reading at all.
+/// The number is used only to COMPARE the value against a published range — the
+/// text a request sent is what gets stored, so a value's own precision is never
+/// re-rendered from this.
+fn parameter_number(data_type: &str, value: &str) -> Option<f64> {
+    let finite = value.parse::<f64>().ok().filter(|number| number.is_finite());
+    match data_type {
+        // The engines write a boolean as the flag `0` or `1`, and nothing else
+        // is a value of that type, whether or not the row also publishes the
+        // pair as its allowed values.
+        PARAMETER_DATA_TYPE_BOOLEAN => finite.filter(|number| *number == 0.0 || *number == 1.0),
+        PARAMETER_DATA_TYPE_INTEGER if value.parse::<i64>().is_err() => None,
+        PARAMETER_DATA_TYPE_INTEGER | PARAMETER_DATA_TYPE_FLOAT => finite,
+        _ => None,
+    }
+}
+
+/// The bounds of `term` when it is a numeric RANGE of a published
+/// `Parameter$AllowedValues` list — `<lo>-<hi>`, or `<lo>-` where the engine
+/// bounds only the bottom — and `None` when it is a literal value.
+///
+/// A term is a range exactly when what precedes the `-` is a number, which is
+/// what tells `1-75` apart from a literal that happens to carry a hyphen
+/// (`volatile-lru`); see [`ParameterRow`]'s allowed-values column. A bound is
+/// therefore never negative — every published bound is a count, a size or a
+/// percentage — and a term written with one would read as a literal.
+fn allowed_value_range(term: &str) -> Option<(f64, Option<f64>)> {
+    let (low, high) = term.split_once('-')?;
+    let low: f64 = low.parse().ok()?;
+    if high.is_empty() {
+        return Some((low, None));
+    }
+    Some((low, Some(high.parse().ok()?)))
+}
+
+/// Whether the engine takes `value` for the parameter `parameter` describes, or
+/// the reason it does not.
+///
+/// The published catalog row IS the rule: a parameter the engine or the node
+/// type fixes (`Parameter$IsModifiable: false`, and every node-type-specific
+/// one) takes no customer value at all; a numeric parameter takes only a value
+/// of its `Parameter$DataType`; and a parameter that publishes
+/// `Parameter$AllowedValues` takes only a value that list covers — one of its
+/// literal values, or a number inside one of its ranges. A parameter that
+/// publishes no allowed values is constrained to no published set, so only its
+/// data type is checked.
+///
+/// The refusal says which of those the value fell outside: the data type it is
+/// not a value of, or the published set it is not in.
+///
+/// The one place a value a request asks to SET is held against the catalog, so
+/// every operation that writes a parameter value applies the same rule.
+pub fn check_parameter_value(parameter: &ParameterRecord, value: &str) -> Result<(), String> {
+    if !parameter.is_modifiable || parameter.is_node_type_specific() {
+        return Err(format!("Parameter {} is not modifiable.", parameter.name));
+    }
+    let number = parameter_number(&parameter.data_type, value);
+    // A value that is not one of the parameter's own DATA TYPE is refused for
+    // that, naming the type it is not a value of and the value that is not one:
+    // it is outside every published set the engine could name, so the set is
+    // not what the client got it wrong about.
+    if parameter.data_type != PARAMETER_DATA_TYPE_STRING && number.is_none() {
+        return Err(format!("invalid {} value: {value}", parameter.data_type));
+    }
+    let Some(allowed) = parameter.allowed_values.as_deref() else {
+        // Constrained to no published set: the value is held only to the
+        // parameter's own data type, which it already satisfies.
+        return Ok(());
+    };
+    for term in allowed.split(',') {
+        let covered = match allowed_value_range(term) {
+            Some((low, high)) => number
+                .is_some_and(|number| number >= low && high.is_none_or(|high| number <= high)),
+            None => term == value,
+        };
+        if covered {
+            return Ok(());
+        }
+    }
+    // The refusal names the published set the value is outside of, which is the
+    // parameter's own `Parameter$AllowedValues` as a read reports it: the client
+    // that asked for the value learns which values it may ask for instead.
+    Err(format!("{INVALID_PARAMETER_VALUE}, allowed values are:{allowed}"))
+}
+
+/// How ElastiCache opens the refusal of a value a parameter does not take; see
+/// [`check_parameter_value`], which is where the published set the value is
+/// outside of is appended to it.
+const INVALID_PARAMETER_VALUE: &str = "invalid parameter value";
+
+/// How many parameters one request may change: "A maximum of 20 parameters may
+/// be modified per request"
+/// (`ModifyCacheParameterGroup$ParameterNameValues`), which
+/// `ResetCacheParameterGroup` names the same bound for.
+pub const MAX_PARAMETERS_PER_REQUEST: usize = 20;
 
 /// Every engine default parameter of `family`, keyed by
 /// [`ParameterRecord::page_key`], or `None` when no published family carries
@@ -3440,6 +3572,13 @@ pub struct CacheNodeRecord {
     pub endpoint_address: String,
     pub endpoint_port: i32,
     pub availability_zone: Option<String>,
+    /// `CacheNode$ParameterGroupStatus`: [`PARAMETER_APPLY_STATUS`] while this
+    /// node runs the current values of its cluster's parameter group,
+    /// [`PARAMETER_APPLY_STATUS_PENDING_REBOOT`] once a parameter the engine
+    /// applies only at a restart has been changed on that group. Held per NODE
+    /// because a reboot of some of a cluster's nodes applies the group to those
+    /// nodes alone, and the cluster's own status is read off its nodes (see
+    /// [`CacheClusterRecord::parameter_apply_status`]).
     pub parameter_group_status: String,
 }
 
@@ -3807,6 +3946,30 @@ impl CacheClusterRecord {
         self.status != STATUS_CREATING && self.status != STATUS_DELETING
     }
 
+    /// What `CacheParameterGroupStatus$ParameterApplyStatus` reports for this
+    /// cluster's association with its parameter group: the group's values are
+    /// applied to the cluster only once every node runs them, so a cluster with
+    /// any node still owed a reboot is pending one; see
+    /// [`CacheNodeRecord::parameter_group_status`].
+    pub fn parameter_apply_status(&self) -> &'static str {
+        if self.cache_node_ids_to_reboot().is_empty() {
+            PARAMETER_APPLY_STATUS
+        } else {
+            PARAMETER_APPLY_STATUS_PENDING_REBOOT
+        }
+    }
+
+    /// The nodes `CacheParameterGroupStatus$CacheNodeIdsToReboot` names: "a
+    /// list of the cache node IDs which need to be rebooted for parameter
+    /// changes to be applied", in the cluster's own node order.
+    pub fn cache_node_ids_to_reboot(&self) -> Vec<String> {
+        self.nodes
+            .iter()
+            .filter(|node| node.parameter_group_status == PARAMETER_APPLY_STATUS_PENDING_REBOOT)
+            .map(|node| node.cache_node_id.clone())
+            .collect()
+    }
+
     /// This record as the modelled `CacheCluster`.
     ///
     /// `CacheNodes` is populated only when the caller asked for it
@@ -3850,10 +4013,14 @@ impl CacheClusterRecord {
             cache_security_groups: None,
             cache_parameter_group: Some(CacheParameterGroupStatus {
                 cache_parameter_group_name: Some(self.cache_parameter_group_name.clone()),
-                parameter_apply_status: Some(PARAMETER_APPLY_STATUS.to_string()),
-                // No parameter change can be pending, so no node needs a reboot
-                // for one.
-                cache_node_ids_to_reboot: None,
+                parameter_apply_status: Some(self.parameter_apply_status().to_string()),
+                // "A list of the cache node IDs which need to be rebooted for
+                // parameter changes to be applied": nothing to name while the
+                // nodes already run the group's current values.
+                cache_node_ids_to_reboot: {
+                    let ids = self.cache_node_ids_to_reboot();
+                    (!ids.is_empty()).then_some(ids)
+                },
             }),
             cache_subnet_group_name: self.cache_subnet_group_name.clone(),
             cache_nodes: (include_nodes && self.reports_node_detail())
@@ -7387,12 +7554,57 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
         self.cache_parameter_groups.get(&name.to_ascii_lowercase())
     }
 
+    /// The parameter group `name` names, for a handler that CHANGES it —
+    /// resolved exactly the way [`Self::parameter_group`] resolves it, so a
+    /// write cannot land on a record a read does not report.
+    pub fn parameter_group_mut(&mut self, name: &str) -> Option<&mut CacheParameterGroupRecord> {
+        self.cache_parameter_groups
+            .get_mut(&name.to_ascii_lowercase())
+    }
+
     /// The engine default parameters of the family `family` names, or `None`
     /// when this service publishes no such family — the one lookup a handler
     /// resolving a `CacheParameterGroupFamily` goes through, so no two of them
     /// can disagree about which families exist.
     pub fn engine_defaults(&self, family: &str) -> Option<&BTreeMap<String, ParameterRecord>> {
         self.engine_default_parameters.get(family)
+    }
+
+    /// The engine default parameter of `family` that `name` names, or `None`
+    /// when the family publishes no parameter of that name — the one lookup a
+    /// handler resolving a `Parameter$ParameterName` against a group's family
+    /// goes through, so a parameter a request may set and one a read reports
+    /// cannot disagree.
+    ///
+    /// The catalog is keyed by [`ParameterRecord::page_key`], so the name is
+    /// resolved through that key (under either of `EngineDefaults`' two lists)
+    /// rather than by scanning the catalog.
+    pub fn family_parameter(&self, family: &str, name: &str) -> Option<&ParameterRecord> {
+        let parameters = self.engine_defaults(family)?;
+        [false, true]
+            .into_iter()
+            .find_map(|specific| parameters.get(&parameter_page_key(name, specific)))
+    }
+
+    /// Record, on every cluster the parameter group `group` is associated with,
+    /// that a parameter the engine applies only at a restart has been changed
+    /// on it: its nodes keep running the values they were started with until
+    /// `RebootCacheCluster` applies the group to them, which is what
+    /// `CacheParameterGroupStatus$ParameterApplyStatus` reports (see
+    /// [`PARAMETER_APPLY_STATUS_PENDING_REBOOT`]).
+    ///
+    /// A cluster is associated with the group by name, resolved the way every
+    /// other `CacheParameterGroupName` is ([`Self::parameter_group`]), so a
+    /// cluster created naming the group in another case is covered too.
+    pub fn defer_parameter_change_to_reboot(&mut self, group: &str) {
+        for cluster in self.cache_clusters.values_mut() {
+            if !cluster.cache_parameter_group_name.eq_ignore_ascii_case(group) {
+                continue;
+            }
+            for node in &mut cluster.nodes {
+                node.parameter_group_status = PARAMETER_APPLY_STATUS_PENDING_REBOOT.to_string();
+            }
+        }
     }
 
     /// Mint the DNS label a new cluster's endpoints carry: six lowercase

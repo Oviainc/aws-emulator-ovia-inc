@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyCacheParameterGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyCacheParameterGroup`'s real behaviour. Implement it here — this is
+//! IMPLEMENTED: this operation answers from this service's state. The SCAFFOLDED
+//! marker line is gone, which is what records it as no longer a stub
+//! (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`); the paragraphs below
+//! are the scaffold's notes on how an operation of this service is wired. This is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyCacheParameterGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -116,6 +112,19 @@ impl From<ModifyCacheParameterGroupErrorModeled> for ModifyCacheParameterGroupEr
     }
 }
 
+/// `message` as this operation's modelled `InvalidParameterValueException`
+/// ("The value for a parameter is invalid", HTTP 400) — the refusal for a value
+/// a member of this request may not take, so every place that reaches it words
+/// it the same way.
+fn invalid_parameter_value(message: String) -> ModifyCacheParameterGroupError {
+    ModifyCacheParameterGroupErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
 /// The `ModifyCacheParameterGroup` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -150,20 +159,187 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyCacheParameterGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyCacheParameterGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyCacheParameterGroup"))
+        // "Modifies the parameters of a cache parameter group": the values the
+        // named group holds for the parameters this request names are SET on the
+        // stored group, which is the one copy `DescribeCacheParameters` lays over
+        // the family's engine defaults.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // "You must supply at least one parameter name and value; subsequent
+        // arguments are optional. A maximum of 20 parameters may be modified per
+        // request." `ParameterNameValueList` carries no modelled `@length`, so
+        // both ends of that documented window are refused here.
+        let requested = input.parameter_name_values;
+        if requested.is_empty() {
+            return Err(invalid_parameter_value(
+                "Invalid value for ParameterNameValues: at least one parameter name and value \
+                 must be supplied."
+                    .to_string(),
+            ));
+        }
+        if requested.len() > crate::state::MAX_PARAMETERS_PER_REQUEST {
+            return Err(invalid_parameter_value(format!(
+                "Invalid value for ParameterNameValues: {} parameters were supplied; a maximum of \
+                 {} parameters may be modified per request.",
+                requested.len(),
+                crate::state::MAX_PARAMETERS_PER_REQUEST
+            )));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        // One store lock spans the whole call: every named parameter is held
+        // against the group's family BEFORE any of them is written, so a request
+        // carrying one value the engine does not take changes nothing at all.
+        let mut store = state.lock();
+
+        // "The requested cache parameter group name does not refer to an
+        // existing cache parameter group" is the modelled 404, resolved through
+        // the one lookup every handler naming a `CacheParameterGroupName`
+        // shares.
+        let requested_name = input.cache_parameter_group_name;
+        let Some(group) = store.parameter_group(&requested_name) else {
+            return Err(
+                ModifyCacheParameterGroupErrorModeled::CacheParameterGroupNotFoundFault(
+                    CacheParameterGroupNotFoundFault {
+                        message: Some(format!(
+                            "CacheParameterGroup {requested_name} not found."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        // The name is "stored as a lowercase string", so the stored group's own
+        // name is what is written and answered rather than the spelling the
+        // request used.
+        let name = group.name.clone();
+        let family = group.family.clone();
+        // What the group holds for a parameter TODAY, so a pair that asks for
+        // the value already in effect is recognised as changing nothing.
+        let held = group.parameter_values.clone();
+        // A family's own default group is the service's, not the customer's: its
+        // values ARE the engine defaults, so no parameter of it may be set.
+        if name.starts_with(crate::state::DEFAULT_PARAMETER_GROUP_PREFIX) {
+            return Err(invalid_parameter_value(format!(
+                "Invalid value {name} for CacheParameterGroupName: a cache parameter group \
+                 family's default group cannot be modified."
+            )));
+        }
+
+        // A parameter of a group is a parameter of its FAMILY: the name has to
+        // be one the family publishes, and the value one the published catalog
+        // row takes (see `crate::state::check_parameter_value`). The accepted
+        // values are collected first and applied below, so the whole request is
+        // all-or-nothing.
+        let mut updates: ::std::collections::BTreeMap<String, String> =
+            ::std::collections::BTreeMap::new();
+        // Whether any value this request CHANGES belongs to a parameter the
+        // engine applies only at a restart (`Parameter$ChangeType`), which is
+        // what the clusters using the group are then owed a reboot for.
+        let mut deferred_to_reboot = false;
+        for pair in requested {
+            // Both members of `ParameterNameValue` are optional, so a pair that
+            // names no parameter, or names one with no value, reaches this
+            // handler; neither asks for a change this operation can make.
+            let parameter_name = pair.parameter_name.unwrap_or_default();
+            if parameter_name.is_empty() {
+                return Err(invalid_parameter_value(
+                    "Invalid value for ParameterNameValues: every parameter name and value pair \
+                     must name a parameter."
+                        .to_string(),
+                ));
+            }
+            let Some(value) = pair.parameter_value else {
+                return Err(invalid_parameter_value(format!(
+                    "Invalid value for ParameterNameValues: no value was supplied for parameter \
+                     {parameter_name}."
+                )));
+            };
+            let Some(parameter) = store.family_parameter(&family, &parameter_name) else {
+                return Err(invalid_parameter_value(format!(
+                    "Invalid value {parameter_name} for ParameterName: cache parameter group \
+                     family {family} publishes no such parameter."
+                )));
+            };
+            if let Err(message) = crate::state::check_parameter_value(parameter, &value) {
+                return Err(invalid_parameter_value(message));
+            }
+            // A parameter whose value is already the one asked for is not
+            // changed by this request, so it defers nothing: what the group has
+            // in effect for it is the value set on the group, or the engine's
+            // own default while none is.
+            let in_effect = held
+                .get(&parameter_name)
+                .map(String::as_str)
+                .or(parameter.value.as_deref());
+            if in_effect != Some(value.as_str())
+                && parameter.change_type == crate::state::CHANGE_TYPE_REQUIRES_REBOOT
+            {
+                deferred_to_reboot = true;
+            }
+            // The same parameter named twice with two different values asks for
+            // two changes that cannot both hold, which is what
+            // `InvalidParameterCombinationException` ("Two or more incompatible
+            // parameters were specified") refuses; naming it twice with the same
+            // value asks for one change and is accepted.
+            if let Some(previous) = updates.insert(parameter_name.clone(), value.clone()) {
+                if previous != value {
+                    return Err(
+                        ModifyCacheParameterGroupErrorModeled::InvalidParameterCombinationException(
+                            InvalidParameterCombinationException {
+                                message: Some(format!(
+                                    "Parameter {parameter_name} was supplied twice, with the \
+                                     incompatible values {previous} and {value}."
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            }
+        }
+
+        // The value stored is the TEXT the request sent, never a re-rendering of
+        // it: a numeric parameter keeps exactly the digits it was given, so a
+        // later read reports the value that was set rather than one formatted
+        // from a parsed number. The group is resolved for the write through the
+        // same lookup that found it above, under the one lock, so it is still
+        // the record that was validated against.
+        let Some(group) = store.parameter_group_mut(&name) else {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "the cache parameter group {name} is no longer held by this account"
+            )));
+        };
+        let changed = updates.len();
+        group.parameter_values.extend(updates);
+        // Changing a cache parameter group is one of the events this service
+        // records, under the same `cache-parameter-group` source the create
+        // records; see `crate::state::EventRecord`.
+        store.record_event(
+            crate::state::SOURCE_TYPE_CACHE_PARAMETER_GROUP,
+            &name,
+            format!("Updated {changed} parameter(s) of cache parameter group"),
+            now,
+        );
+        // A value the engine picks up only when a node restarts leaves every
+        // cluster associated with this group running the value it was started
+        // with until it is rebooted, which is what
+        // `CacheParameterGroupStatus$ParameterApplyStatus` reports. A value the
+        // engine applies at once leaves the clusters in sync.
+        if deferred_to_reboot {
+            store.defer_parameter_change_to_reboot(&name);
+        }
+
+        // `CacheParameterGroupNameMessage` carries the group's name alone, which
+        // is the stored one.
+        Ok(ModifyCacheParameterGroupOutput {
+            cache_parameter_group_name: Some(name),
+        })
     }
 }

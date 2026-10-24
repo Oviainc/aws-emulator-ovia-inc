@@ -212,17 +212,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // rebooting; the rest keep running. The clock owes the cluster
         // `available` again after the transition span, which is what moves every
         // node back to `available` too (see `CacheClusterRecord::settle`).
+        //
+        // "This operation applies any modified cache parameter groups to the
+        // cluster": a node that is restarted comes up on its group's current
+        // values, so the reboot is what ends a parameter change that was waiting
+        // for one (`crate::state::PARAMETER_APPLY_STATUS_PENDING_REBOOT`) — for
+        // the nodes the request named, and only those.
         for node in &mut cluster.nodes {
             if ids_to_reboot.contains(&node.cache_node_id) {
                 node.status = crate::state::NODE_STATUS_REBOOTING.to_string();
+                node.parameter_group_status = crate::state::PARAMETER_APPLY_STATUS.to_string();
             }
         }
         cluster.begin_transition(crate::state::STATUS_REBOOTING_NODES, now);
 
-        // "This operation applies any modified cache parameter groups to the
-        // cluster": every parameter-group operation is a scaffolded 501, so no
-        // parameter value can ever be pending here and the association is
-        // already reported `in-sync` (`crate::state::PARAMETER_APPLY_STATUS`).
         // The cluster event the reboot's completion creates belongs to
         // `DescribeEvents`, which records it from the clock-owed transition.
         Ok(RebootCacheClusterOutput {

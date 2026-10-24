@@ -132,3 +132,7 @@ mod catalog_publication;
 // Appended for the same reason: the `CreateGlobalReplicationGroup` suite.
 #[path = "all/global_replication_group_create.rs"]
 mod global_replication_group_create;
+
+// Appended for the same reason: the `ModifyCacheParameterGroup` suite.
+#[path = "all/modify_cache_parameter_group.rs"]
+mod modify_cache_parameter_group;

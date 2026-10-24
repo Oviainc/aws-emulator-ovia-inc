@@ -22,10 +22,11 @@
 //! name is one row of many.
 //!
 //! The values set on a group are seeded straight into the store through
-//! [`Emulator::with_state`]: `ModifyCacheParameterGroup` and
-//! `ResetCacheParameterGroup`, the two operations that WRITE them, are still
-//! scaffolded 501s with their own issues, and the harness exists for exactly
-//! this — asserting over the wire that a reader answers FROM stored state.
+//! [`Emulator::with_state`] rather than through `ModifyCacheParameterGroup`:
+//! what this suite is about is the READER, so a row fixes the stored value
+//! directly, including values no write would accept, and the suite that covers
+//! the writer asserts the two agree. The scanners below are `pub(crate)`
+//! because that suite reads a parameter out of an answer exactly the same way.
 
 use std::collections::BTreeSet;
 
@@ -95,7 +96,7 @@ pub(crate) fn reported(reply: &Reply) -> Vec<Reported> {
 }
 
 /// Every reported parameter name, in document order.
-fn names(reply: &Reply) -> Vec<String> {
+pub(crate) fn names(reply: &Reply) -> Vec<String> {
     reported(reply)
         .into_iter()
         .map(|parameter| parameter.name)
@@ -116,7 +117,7 @@ pub(crate) fn one(reply: &Reply, case: &str, name: &str) -> Reported {
 }
 
 /// Ask for the parameters of `group`, with whatever else `extra` names.
-async fn describe(emulator: &Emulator, group: &str, extra: &[(&str, &str)]) -> Reply {
+pub(crate) async fn describe(emulator: &Emulator, group: &str, extra: &[(&str, &str)]) -> Reply {
     let mut pairs = params(&[("CacheParameterGroupName", group)]);
     pairs.extend(params(extra));
     emulator.call("DescribeCacheParameters", &pairs).await
@@ -136,14 +137,14 @@ pub(crate) async fn describe_ok(emulator: &Emulator, group: &str, extra: &[(&str
 /// Create a custom parameter group of `family` named `name`, asserting the
 /// create was accepted — every custom-group row reads the created group back
 /// through `DescribeCacheParameters`.
-async fn create_group(emulator: &Emulator, name: &str, family: &str) {
+pub(crate) async fn create_group(emulator: &Emulator, name: &str, family: &str) {
     let reply = emulator
         .call(
             "CreateCacheParameterGroup",
             &params(&[
                 ("CacheParameterGroupName", name),
                 ("CacheParameterGroupFamily", family),
-                ("Description", "created by the DescribeCacheParameters suite"),
+                ("Description", "created by this crate's parameter-group suites"),
             ]),
         )
         .await;
@@ -154,8 +155,9 @@ async fn create_group(emulator: &Emulator, name: &str, family: &str) {
     );
 }
 
-/// Set `value` on `group` for the parameter `name`, the way
-/// `ModifyCacheParameterGroup` will once it is implemented.
+/// Set `value` on `group` for the parameter `name` by writing the store
+/// directly, which is how this suite fixes what the READER has to answer with —
+/// including a value `ModifyCacheParameterGroup` would refuse.
 fn set_value(emulator: &Emulator, group: &str, name: &str, value: &str) {
     emulator.with_state(|store| {
         let record = store

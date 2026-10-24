@@ -138,7 +138,7 @@ const ERROR_CASES: &[ErrorCase] = &[
     },
     ErrorCase {
         case: "a scaffolded operation, which answers the 501 channel",
-        action: "ModifyCacheParameterGroup",
+        action: "ResetCacheParameterGroup",
         params: &[
             ("CacheParameterGroupName", "default.redis7"),
             ("ParameterNameValues.ParameterNameValue.1.ParameterName", "maxmemory-policy"),
