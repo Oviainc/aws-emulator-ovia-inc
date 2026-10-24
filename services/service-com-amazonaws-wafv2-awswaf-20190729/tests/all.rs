@@ -19,6 +19,8 @@ mod ip_set_mutations;
 mod managed_rule_groups;
 #[path = "all/parameter_validation.rs"]
 mod parameter_validation;
+#[path = "all/regex_pattern_set_lifecycle.rs"]
+mod regex_pattern_set_lifecycle;
 #[path = "all/response_members.rs"]
 mod response_members;
 #[path = "all/rule_group_lifecycle.rs"]

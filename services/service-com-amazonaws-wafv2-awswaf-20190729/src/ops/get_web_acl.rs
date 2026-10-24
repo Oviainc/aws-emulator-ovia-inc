@@ -202,6 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 // An ARN that resolves to something else is not a web ACL ARN.
                 Some(crate::state::ResourceRef::IpSet { .. })
+                | Some(crate::state::ResourceRef::RegexPatternSet { .. })
                 | Some(crate::state::ResourceRef::RuleGroup { .. })
                 | None => None,
             }
