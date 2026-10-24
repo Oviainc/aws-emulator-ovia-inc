@@ -150,39 +150,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The stored key is the name exactly as `CreateJobTemplate` persisted it, so the
         // label is read as sent rather than normalised.
-        let name = input.name.as_str();
+        let name = input.name;
         let mut state = state.lock();
 
-        // "Permanently delete a job template you have created." The delete is IDEMPOTENT
-        // on the name, as `DeleteQueue`'s is: a template that is not there leaves the
-        // store in exactly the state the request asked for, so the repeat is the same
-        // empty 202 rather than a failure a teardown path that runs twice must
-        // special-case — while `GetJobTemplate` on that name is still the modelled 404.
-        //
-        // INFERRED, not observed: the recorded corpus shows the idempotent repeat for
-        // `DeleteQueue` (the same `DELETE /<collection>/{Name}` with success code 202 and
-        // an empty output), and no recording of `DeleteJobTemplate` on an absent name is
-        // available. This operation follows the same rule rather than keeping a
-        // one-operation exception to it.
-        //
-        // A built-in template is not the caller's to delete — "System or built-in job
-        // templates can't be modified or deleted by the user" — so it is the modelled
-        // 403. One lookup, through the map entry, decides all three and removes the
-        // record.
-        use ::std::collections::btree_map::Entry;
-        match state.job_templates.entry(name.to_string()) {
-            Entry::Vacant(_) => Ok(DeleteJobTemplateOutput {}),
-            Entry::Occupied(entry)
-                if entry.get().template_type == crate::state::TYPE_SYSTEM =>
-            {
+        // The store owns the removal and the refusal that goes with it, so the decision
+        // and the state it is read from cannot disagree — the same rule `DeleteQueue` and
+        // `DeletePreset` go through.
+        match state.delete_job_template(&name) {
+            // "Permanently delete a job template you have created." The delete is
+            // IDEMPOTENT on the name, as `DeleteQueue`'s is: a template that is not there
+            // leaves the store in exactly the state the request asked for, so the repeat
+            // is the same empty 202 rather than a failure a teardown path that runs twice
+            // must special-case — while `GetJobTemplate` on that name is still the
+            // modelled 404.
+            //
+            // INFERRED, not observed: the recorded corpus shows the idempotent repeat for
+            // `DeleteQueue` (the same `DELETE /<collection>/{Name}` with success code 202
+            // and an empty output), and no recording of `DeleteJobTemplate` on an absent
+            // name is available. This operation follows the same rule rather than keeping
+            // a one-operation exception to it.
+            crate::state::DeleteNamedOutcome::Deleted
+            | crate::state::DeleteNamedOutcome::AlreadyAbsent => Ok(DeleteJobTemplateOutput {}),
+            // A built-in template is not the caller's to delete — "System or built-in job
+            // templates can't be modified or deleted by the user" — so it is the modelled
+            // 403, naming the request member that pointed at it.
+            crate::state::DeleteNamedOutcome::SystemResource => {
                 Err(DeleteJobTemplateErrorModeled::ForbiddenException(ForbiddenException {
                     message: Some(crate::state::system_resource_delete_message("name")),
                 })
                 .into())
-            }
-            Entry::Occupied(entry) => {
-                entry.remove();
-                Ok(DeleteJobTemplateOutput {})
             }
         }
     }

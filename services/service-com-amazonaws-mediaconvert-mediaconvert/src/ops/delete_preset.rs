@@ -4,10 +4,12 @@
 //!
 //! "Permanently delete a preset you have created." The removal is immediate: the named
 //! preset is dropped from the store, so every later read of that name — `GetPreset`
-//! above all — is the modelled `NotFoundException`. A name the store does not hold is
-//! that same 404, and a built-in (`SYSTEM`) preset is not one the caller created, so
-//! deleting it is the modelled `ForbiddenException`, exactly as `DeleteQueue` and
-//! `DeleteJobTemplate` refuse a built-in queue or template.
+//! above all — is the modelled `NotFoundException`. The delete itself is IDEMPOTENT on
+//! the name, as `DeleteQueue`'s and `DeleteJobTemplate`'s are: a name the store does not
+//! hold is already in the state the request asks for, so it answers the same empty 202.
+//! A built-in (`SYSTEM`) preset is not one the caller created, so deleting it is the
+//! modelled `ForbiddenException`, exactly as `DeleteQueue` and `DeleteJobTemplate` refuse
+//! a built-in queue or template.
 //!
 //! ## Shape of an operation
 //!
@@ -160,33 +162,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The stored key is the name exactly as `CreatePreset` persisted it, so the label
         // is read as sent rather than normalised — as `GetPreset` reads it.
-        let name = input.name.as_str();
+        let name = input.name;
         let mut state = state.lock();
 
-        // One lookup, through the map entry, decides both refusals and removes the
-        // record: a name the store does not hold is the modelled 404, so a delete never
-        // reports removing nothing, and a built-in preset is not the caller's to delete —
-        // `Preset$Type` says a preset "can be of two types: system or custom" and a
-        // system one is not one "you have created" — so it is the modelled 403. That
-        // second branch answers for the built-in presets the store is seeded with, which
-        // no `CreatePreset` minted, exactly as `DeleteQueue` and `DeleteJobTemplate`
-        // answer for the built-in queue and the built-in job templates.
-        use ::std::collections::btree_map::Entry;
-        match state.presets.entry(name.to_string()) {
-            Entry::Vacant(_) => Err(DeletePresetErrorModeled::NotFoundException(NotFoundException {
-                // The refusal names the request member the lookup read, `Name`.
-                message: Some(crate::state::not_found_message("name")),
-            })
-            .into()),
-            Entry::Occupied(entry) if entry.get().preset_type == crate::state::TYPE_SYSTEM => {
+        // The store owns the removal and the refusal that goes with it, so the decision
+        // and the state it is read from cannot disagree — the same rule `DeleteQueue` and
+        // `DeleteJobTemplate` go through.
+        match state.delete_preset(&name) {
+            // The delete is IDEMPOTENT on the name: a preset that was already gone leaves
+            // the store in exactly the state the request asked for, so the repeat is the
+            // same empty 202 the first delete answered rather than a failure a teardown
+            // path that runs twice would have to special-case. `GetPreset` on that name is
+            // unchanged — a READ of a preset that is not there is still the modelled 404.
+            crate::state::DeleteNamedOutcome::Deleted
+            | crate::state::DeleteNamedOutcome::AlreadyAbsent => Ok(DeletePresetOutput {}),
+            // A built-in preset is not one "you have created" — `Preset$Type` says a
+            // preset "can be of two types: system or custom" — so deleting it is refused
+            // with the modelled 403, naming the request member that pointed at it, exactly
+            // as `DeleteQueue` and `DeleteJobTemplate` refuse a built-in queue or
+            // template.
+            crate::state::DeleteNamedOutcome::SystemResource => {
                 Err(DeletePresetErrorModeled::ForbiddenException(ForbiddenException {
                     message: Some(crate::state::system_resource_delete_message("name")),
                 })
                 .into())
-            }
-            Entry::Occupied(entry) => {
-                entry.remove();
-                Ok(DeletePresetOutput {})
             }
         }
     }
