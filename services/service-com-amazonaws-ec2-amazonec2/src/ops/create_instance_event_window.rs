@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateInstanceEventWindow
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateInstanceEventWindow`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateInstanceEventWindow::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints one event window from the request and stores it, so every later reader —
+//! `DescribeInstanceEventWindows` first of all — reports the same window: the id is minted
+//! by the store, the `State` is the `creating` a fresh window is in, and the schedule is
+//! whichever of `CronExpression` and `TimeRanges` the request named, validated against the
+//! constraints the model states for it
+//! ([`crate::state::validate_event_window_cron_expression`] /
+//! [`crate::state::validate_event_window_time_ranges`], shared with the modify of a
+//! window).
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +155,161 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateInstanceEventWindow` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateInstanceEventWindowErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateInstanceEventWindow"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            instance_event_window_limit_exceeded, instance_event_window_payload_bytes,
+            require_service_state, tags_from_specifications,
+            validate_event_window_cron_expression, validate_event_window_time_ranges,
+            InstanceEventWindowSpec, MAX_INSTANCE_EVENT_WINDOWS, MAX_STORED_BYTES,
+            RESOURCE_TYPE_INSTANCE_EVENT_WINDOW, TRANSITION_DELAY,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it — an event
+        // window carries no ARN and no Availability Zone, so nothing about it is derived
+        // from the Region the call was signed for. The store is reached through the engine
+        // held on `self`.
+        let _ = ctx;
+
+        // "You can define either a set of time ranges or a cron expression when creating
+        // the event window, but not both" (`CreateInstanceEventWindow`) — and a window has
+        // to say when it opens, so neither is as wrong as both. An empty `TimeRanges` list
+        // names no time range at all, so it counts as unspecified.
+        let requested_ranges = input.time_ranges.as_deref().unwrap_or_default();
+        let schedule = match (input.cron_expression.as_deref(), requested_ranges.is_empty()) {
+            (Some(_), false) => {
+                return Err(Scaffolded::invalid_parameter_combination(
+                    "Either cronExpression or timeRanges may be specified, not both",
+                ));
+            }
+            (None, true) => {
+                return Err(Scaffolded::missing_parameter(
+                    "Either cronExpression or timeRanges must be specified",
+                ));
+            }
+            (Some(cron_expression), true) => {
+                validate_event_window_cron_expression(cron_expression)?;
+                Schedule::Cron(cron_expression.to_string())
+            }
+            (None, false) => {
+                Schedule::TimeRanges(validate_event_window_time_ranges(requested_ranges)?)
+            }
+        };
+
+        // "The tags to apply to the event window"
+        // (`CreateInstanceEventWindowRequest$TagSpecifications`): the window is the only
+        // resource this call creates, so a specification naming any other resource type is
+        // refused rather than accepted and discarded.
+        let tags = tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            RESOURCE_TYPE_INSTANCE_EVENT_WINDOW,
+            Self::NAME,
+        )?;
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // "You can create up to 200 event windows per Amazon Web Services Region"
+        // (`CreateInstanceEventWindow`).
+        if !store.has_instance_event_window_capacity() {
+            return Err(instance_event_window_limit_exceeded(format!(
+                "The account holds {} event windows, which is as many as it may create \
+                 ({MAX_INSTANCE_EVENT_WINDOWS})",
+                store.instance_event_windows.len()
+            )));
+        }
+        // A COUNT ceiling admits megabytes on its own, because a window holds a name, a
+        // cron expression, tags and a list of time ranges the caller chose the size of, so
+        // the bytes this create would retain for the process's lifetime are asked for too —
+        // counted by the ONE definition of that charge, over the SAME members the insert
+        // charges, so the probe cannot see less than the insert stores.
+        let payload_bytes = instance_event_window_payload_bytes(&InstanceEventWindow {
+            name: input.name.clone(),
+            cron_expression: schedule.cron_expression(),
+            time_ranges: schedule.time_ranges(),
+            tags: Some(tags.clone()),
+            ..InstanceEventWindow::default()
+        });
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(instance_event_window_limit_exceeded(format!(
+                "This emulator holds {} of at most {MAX_STORED_BYTES} bytes of \
+                 caller-supplied data, so it cannot store {payload_bytes} more",
+                store.stored_bytes()
+            )));
+        }
+
+        // DryRun sits AFTER every parameter has been validated and BEFORE the first write:
+        // the flag asks whether the request WOULD have worked, so one that would have been
+        // refused is refused with that reason instead, and one that would have succeeded
+        // leaves state untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        let now = ::std::time::Instant::now();
+        // The store asks the count ceiling itself and answers `None` rather than growing
+        // past it, so the refusal above cannot be bypassed by a path that forgets it.
+        let instance_event_window_id = store
+            .insert_instance_event_window(InstanceEventWindowSpec {
+                name: input.name.clone(),
+                cron_expression: schedule.cron_expression(),
+                time_ranges: schedule.time_ranges(),
+                tags,
+                // A window AWS hands back is `creating` and reaches `active` without
+                // anybody asking: the same clock-owed span an instance's `pending` ->
+                // `running` move takes in this crate.
+                active_at: now + TRANSITION_DELAY,
+            })
+            .ok_or_else(|| {
+                instance_event_window_limit_exceeded(format!(
+                    "The account holds {MAX_INSTANCE_EVENT_WINDOWS} event windows, \
+                     which is as many as it may create"
+                ))
+            })?;
+
+        // Read the response back OUT of the store, so the caller sees what a later
+        // DescribeInstanceEventWindows will see rather than the request object.
+        store
+            .instance_event_windows
+            .get(&instance_event_window_id)
+            .map(|record| CreateInstanceEventWindowOutput {
+                instance_event_window: Some(record.view_at(now)),
+            })
+            .ok_or_else(|| {
+                Scaffolded::internal_error(format!(
+                    "the newly created event window '{instance_event_window_id}' \
+                     could not be read back"
+                ))
+            })
+    }
+}
+
+/// When an event window opens: "you can define either a set of time ranges or a cron
+/// expression when creating the event window, but not both" (`CreateInstanceEventWindow`),
+/// so a validated request carries exactly one of them and the stored window reports only
+/// the one it was given.
+enum Schedule {
+    /// The cron expression the window opens on.
+    Cron(String),
+    /// The time ranges the window opens in, as the model shapes a stored one.
+    TimeRanges(Vec<InstanceEventWindowTimeRange>),
+}
+
+impl Schedule {
+    /// The `CronExpression` the stored window carries: `None` for a window defined by time
+    /// ranges, which has no cron expression to report.
+    fn cron_expression(&self) -> Option<String> {
+        match self {
+            Self::Cron(expression) => Some(expression.clone()),
+            Self::TimeRanges(_) => None,
+        }
+    }
+
+    /// The `TimeRanges` the stored window carries: `None` for a window defined by a cron
+    /// expression, which has no time range to report.
+    fn time_ranges(&self) -> Option<Vec<InstanceEventWindowTimeRange>> {
+        match self {
+            Self::Cron(_) => None,
+            Self::TimeRanges(ranges) => Some(ranges.clone()),
+        }
     }
 }

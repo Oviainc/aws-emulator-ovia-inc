@@ -439,11 +439,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// The hours in one day, the smaller of the two increments a Capacity Block's duration is
-/// sold in.
-const HOURS_PER_DAY: i32 = 24;
+/// sold in. The calendar fact itself is the crate's one
+/// [`crate::state::HOURS_PER_DAY`]; this is only that number in the width this module's
+/// durations are typed in.
+const HOURS_PER_DAY: i32 = crate::state::HOURS_PER_DAY as i32;
 
-/// The hours in one week, the larger increment.
-const HOURS_PER_WEEK: i32 = 7 * HOURS_PER_DAY;
+/// The hours in one week, the larger increment — likewise
+/// [`crate::state::HOURS_PER_WEEK`] in this module's width.
+const HOURS_PER_WEEK: i32 = crate::state::HOURS_PER_WEEK as i32;
 
 /// The longest reservation sold in whole-day increments, in days: "You must specify the
 /// duration in 1-day increments up 14 days"

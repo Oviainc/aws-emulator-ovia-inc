@@ -823,6 +823,14 @@ pub use traffic_mirror_filters::*;
 /// model does.
 pub type ReservationView = RunInstancesOutput;
 
+/// The instance event windows this store holds, and the rules a window's schedule must
+/// satisfy — one resource's state, records and validators in their own child module, from
+/// which this module re-exports them, so a caller still reaches them as
+/// `crate::state::…` wherever they are written.
+pub mod instance_event_windows;
+
+pub use instance_event_windows::*;
+
 /// The one region whose Amazon-provided private DNS suffix is `ec2.internal`
 /// rather than `<region>.compute.internal`.
 pub const EC2_INTERNAL_REGION: &str = "us-east-1";
@@ -1787,6 +1795,10 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// A `CreateVolume` `ClientToken` and the volume id it minted, so a repeat of the
     /// same request answers with that volume instead of creating a second one.
     pub volume_client_tokens: HashMap<String, String>,
+    /// Every instance event window the account holds, by `InstanceEventWindowId` — see the
+    /// module docs. Ordered by id, which is the order `DescribeInstanceEventWindows`
+    /// reports and pages over.
+    pub instance_event_windows: BTreeMap<String, InstanceEventWindowRecord>,
     /// The most recent modification of each EBS volume that has one, by `VolumeId` — see
     /// the module docs. Ordered by that id, which is the order
     /// `DescribeVolumesModifications` reports and pages over.
@@ -2219,6 +2231,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             id_counter: 0,
             volumes: BTreeMap::new(),
             volume_client_tokens: HashMap::new(),
+            instance_event_windows: BTreeMap::new(),
             volume_modifications: BTreeMap::new(),
             secondary_networks: BTreeMap::new(),
             secondary_network_client_tokens: HashMap::new(),
