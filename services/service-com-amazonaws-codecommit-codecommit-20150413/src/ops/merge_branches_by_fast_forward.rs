@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op MergeBranchesByFastForward
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `MergeBranchesByFastForward`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`MergeBranchesByFastForward::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: advances ONE stored reference — the `targetBranch`, or the branch the
+//! destination specifier itself names — from the destination tip to the source tip,
+//! which is all a fast-forward is. No commit is written, so the merge is admitted
+//! exactly where the two tips are related by ancestry, which is where one of them IS
+//! their merge base: where the destination tip is the base, its history is a prefix of
+//! the source's and the reference advances to the source; where the SOURCE tip is the
+//! base, its history is already part of the destination's, so there is nothing to
+//! advance and the destination tip stands as the merge. Where neither tip is the
+//! other's ancestor, each history holds commits the other does not and honouring both
+//! needs a merge commit, which this strategy cannot make: the call is refused with the
+//! modelled `ManualMergeRequiredException` and nothing is written.
+//!
+//! The ancestry question is [`crate::state::merge::fast_forward`], built on the merge
+//! base every merge question in this service shares with `GetMergeOptions`, so the two
+//! cannot disagree about what the base is. It is charged to one per-request budget and
+//! runs off the async worker, exactly as that operation's evaluation is, because it
+//! holds the store guard it walks the history through for its whole span.
 //!
 //! ## Shape of an operation
 //!
@@ -195,18 +204,249 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `MergeBranchesByFastForward` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(MergeBranchesByFastForwardErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("MergeBranchesByFastForward"))
+        let _ = ctx;
+
+        // Both specifiers are required, so the boundary already refused an absent
+        // one; a blank one names no commit either.
+        let source_specifier = input.source_commit_specifier.trim();
+        let destination_specifier = input.destination_commit_specifier.trim();
+        if source_specifier.is_empty() || destination_specifier.is_empty() {
+            return Err(
+                MergeBranchesByFastForwardErrorModeled::CommitRequiredException(
+                    CommitRequiredException {
+                        message: Some("a commit was not specified".to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // `targetBranch` carries only a modelled length, so a value that cannot be
+        // a git reference name at all reaches the handler; it is refused with the
+        // code every operation in this crate words such a name with.
+        let requested_target = input.target_branch.as_deref();
+        if let Some(target) = requested_target {
+            if !crate::state::is_valid_branch_name(target) {
+                return Err(
+                    MergeBranchesByFastForwardErrorModeled::InvalidBranchNameException(
+                        InvalidBranchNameException {
+                            message: Some(format!("the reference name {target} is not valid")),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            // An unreachable store is an internal mounting fault, not a modelled
+            // CodeCommit failure; every handler in this crate refuses it this way.
+            crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+        })?;
+        let mut store = state.lock();
+        let repository = store.repositories.get(&input.repository_name).ok_or_else(|| {
+            MergeBranchesByFastForwardErrorModeled::RepositoryDoesNotExistException(
+                RepositoryDoesNotExistException {
+                    message: Some(crate::state::repository_does_not_exist_message(
+                        &input.repository_name,
+                    )),
+                },
+            )
+        })?;
+
+        let commit_does_not_exist = |specifier: &str| {
+            MergeBranchesByFastForwardErrorModeled::CommitDoesNotExistException(
+                CommitDoesNotExistException {
+                    message: Some(format!(
+                        "the commit {specifier} does not exist in the repository {}",
+                        input.repository_name
+                    )),
+                },
+            )
+        };
+        let source = repository
+            .resolve_commit(source_specifier)
+            .ok_or_else(|| commit_does_not_exist(source_specifier))?;
+        let destination = repository
+            .resolve_commit(destination_specifier)
+            .ok_or_else(|| commit_does_not_exist(destination_specifier))?;
+        let source_commit_id = source.commit_id.clone();
+        let source_tree_id = source.tree_id.clone();
+        let destination_commit_id = destination.commit_id.clone();
+        let destination_tree_id = destination.tree_id.clone();
+
+        // The reference this merge is applied to: "the branch where the merge is
+        // applied" when the caller names one, and otherwise the branch the
+        // destination specifier itself names. A specifier that names a commit
+        // without naming a branch (a commit id, a tag reference) leaves no
+        // reference to advance, and a fast-forward is nothing but that advance, so
+        // the request names no valid target at all.
+        let target = match requested_target {
+            Some(target) => target.to_string(),
+            None => repository
+                .resolve_branch(destination_specifier)
+                .ok_or_else(|| {
+                    MergeBranchesByFastForwardErrorModeled::InvalidTargetBranchException(
+                        InvalidTargetBranchException {
+                            message: Some(format!(
+                                "{destination_specifier} names no branch of the repository {}, so the merge has no target branch to be applied to",
+                                input.repository_name
+                            )),
+                        },
+                    )
+                })?
+                .to_string(),
+        };
+        // A name the repository holds only in its TAG namespace (`refs/tags/<name>`,
+        // which a git push writes) is a tag name rather than a branch name, which
+        // the model has its own error for; every other name it does not hold as a
+        // branch is simply no branch of it. Nothing is created here: a fast-forward
+        // moves an existing reference.
+        let target_tip = match repository.branches.get(&target) {
+            Some(branch) => branch.commit_id.clone(),
+            None if repository.git_tags.contains_key(&target) => {
+                return Err(
+                    MergeBranchesByFastForwardErrorModeled::BranchNameIsTagNameException(
+                        BranchNameIsTagNameException {
+                            message: Some(format!(
+                                "the name {target} is a tag name in the repository {}, not a branch name",
+                                input.repository_name
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            None => {
+                return Err(
+                    MergeBranchesByFastForwardErrorModeled::BranchDoesNotExistException(
+                        BranchDoesNotExistException {
+                            message: Some(crate::state::BRANCH_DOES_NOT_EXIST_MESSAGE.to_string()),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        };
+        // The merge is evaluated against the destination tip, so the reference it
+        // advances has to still be AT that commit: a target branch that points
+        // somewhere else has moved since, and advancing it would discard whatever
+        // moved it.
+        if target_tip != destination_commit_id {
+            return Err(
+                MergeBranchesByFastForwardErrorModeled::ConcurrentReferenceUpdateException(
+                    ConcurrentReferenceUpdateException {
+                        message: Some(format!(
+                            "the merge cannot be completed because the branch {target} is no longer at the commit {destination_commit_id} the merge was evaluated against"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let relation = crate::service::off_the_async_worker(|| {
+            // One budget for this request's whole evaluation, as every merge
+            // question in this service is charged: the commits the history walk
+            // visits and the time it may spend are charged to it, so resolving the
+            // merge base of two long histories is bounded.
+            let mut budget = crate::state::merge::MergeBudget::for_one_request();
+            crate::state::merge::fast_forward(
+                repository,
+                &source_commit_id,
+                &destination_commit_id,
+                &mut budget,
+            )
+        })
+        .map_err(|problem| {
+            // Every way the walk can stop short is the same answer to the caller:
+            // the two tips are too far apart for this service to tell whether they
+            // merge — no common ancestor at all, or more history than one request
+            // walks.
+            let detail = match problem {
+                crate::state::merge::MergeProblem::NoMergeBase => {
+                    "they share no commit".to_string()
+                }
+                crate::state::merge::MergeProblem::ItemsToCompare
+                | crate::state::merge::MergeProblem::ContentToLoad => format!(
+                    "their histories exceed the {} commits this emulator walks at once",
+                    crate::state::merge::MAX_COMMITS_WALKED_PER_REQUEST
+                ),
+                crate::state::merge::MergeProblem::Deadline => format!(
+                    "walking their histories took longer than the {} seconds this emulator spends comparing two commits",
+                    crate::state::merge::MAX_MERGE_SECONDS
+                ),
+            };
+            MergeBranchesByFastForwardErrorModeled::TipsDivergenceExceededException(
+                TipsDivergenceExceededException {
+                    message: Some(format!(
+                        "the divergence between {source_specifier} and {destination_specifier} is too great to determine whether there might be any merge conflicts: {detail}"
+                    )),
+                },
+            )
+        })?;
+        // Which of the two tips the merge leaves in the target branch, and whether
+        // the reference has to move to get there.
+        let (merged_commit_id, merged_tree_id) = match relation {
+            // The destination's history is a prefix of the source's: the reference
+            // advances, and the source tip is what the target branch then holds.
+            crate::state::merge::FastForward::Advances => {
+                (source_commit_id.clone(), source_tree_id)
+            }
+            // The source is already part of the destination's history, so there is
+            // nothing to advance and the destination tip stands as the merge.
+            crate::state::merge::FastForward::AlreadyMerged => {
+                (destination_commit_id.clone(), destination_tree_id)
+            }
+            crate::state::merge::FastForward::Diverged => {
+                // Each history holds commits the other does not, so honouring both
+                // sides needs a merge commit, which no reference move can make.
+                // The sentence is built from what this request asked about: the two
+                // specifiers it named and why they cannot be fast-forwarded, which
+                // says more for a branch merge than the modelled shape's own
+                // pull-request wording.
+                return Err(
+                    MergeBranchesByFastForwardErrorModeled::ManualMergeRequiredException(
+                        ManualMergeRequiredException {
+                            message: Some(format!(
+                                "the merge of {source_specifier} into {destination_specifier} cannot be performed by fast-forward because neither commit is an ancestor of the other. You must manually merge the branches and resolve any conflicts."
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        };
+
+        // Advance the reference. A target already at the merged commit has nothing
+        // left to do — the source is already merged, the same request repeated, or a
+        // source that IS the destination — so the store is left untouched rather
+        // than restamped.
+        if target_tip != merged_commit_id {
+            let repository = store
+                .repositories
+                .get_mut(&input.repository_name)
+                .ok_or_else(|| {
+                    crate::scaffolded::Scaffolded::validation("the repository store is unavailable")
+                })?;
+            repository.branches.insert(
+                target.clone(),
+                crate::state::Branch {
+                    name: target,
+                    commit_id: merged_commit_id.clone(),
+                },
+            );
+            // Moving a reference modifies the repository, so `lastModifiedDate`
+            // moves with it, exactly as it does for a write through `PutFile` or a
+            // reference added by `CreateBranch`.
+            repository.last_modified_date = std::time::SystemTime::now();
+        }
+
+        // A fast-forward writes no commit: the merge IS one of the two tips, and the
+        // tree it reports is that commit's tree.
+        Ok(MergeBranchesByFastForwardOutput {
+            commit_id: Some(merged_commit_id),
+            tree_id: Some(merged_tree_id),
+        })
     }
 }

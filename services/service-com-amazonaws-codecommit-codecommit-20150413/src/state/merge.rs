@@ -358,6 +358,49 @@ pub fn merge_base(
         .ok_or(MergeProblem::NoMergeBase)
 }
 
+/// How two tips are related by ancestry — the one question a fast-forward asks.
+///
+/// A fast-forward merge moves a reference rather than merging content, so what
+/// decides it is which of the two tips the merge base IS, and nothing about the
+/// paths either side changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FastForward {
+    /// The destination tip is the merge base, so the destination's history is a
+    /// prefix of the source's and the reference can simply advance to the source.
+    /// The same condition [`MergeEvaluation::is_fast_forward`] reports.
+    Advances,
+    /// The source tip is the merge base, so its history is already part of the
+    /// destination's: there is nothing left to advance, and the destination tip
+    /// stands as the merged commit.
+    AlreadyMerged,
+    /// Neither tip is the other's ancestor: each history holds commits the other
+    /// does not, so honouring both needs a merge commit, which no reference move
+    /// can make.
+    Diverged,
+}
+
+/// How the two tips are related by ancestry in this repository, resolving the
+/// merge base alone.
+///
+/// Every commit the history walk visits is charged to `budget`, exactly as a
+/// path-comparing evaluation charges its own work. Two tips that are the SAME
+/// commit are [`FastForward::Advances`], where advancing has nothing to do.
+pub fn fast_forward(
+    repository: &Repository,
+    source_commit_id: &str,
+    destination_commit_id: &str,
+    budget: &mut MergeBudget,
+) -> Result<FastForward, MergeProblem> {
+    let base = merge_base(repository, source_commit_id, destination_commit_id, budget)?;
+    if base == destination_commit_id {
+        return Ok(FastForward::Advances);
+    }
+    if base == source_commit_id {
+        return Ok(FastForward::AlreadyMerged);
+    }
+    Ok(FastForward::Diverged)
+}
+
 /// Evaluate a merge of `source` into `destination` in this repository at the
 /// given conflict detail level and resolution strategy, charging the work to
 /// `budget`.
