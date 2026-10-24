@@ -523,12 +523,22 @@ pub struct Workspace {
     pub update_date_time: SystemTime,
     /// The entities created in this workspace, keyed by `entityId`.
     pub entities: BTreeMap<String, Entity>,
-    /// The component types created in this workspace, keyed by
-    /// `componentTypeId`. Owned by the workspace for the same reason entities
-    /// are: a component type is addressed as
+    /// The component types this workspace holds, keyed by `componentTypeId`.
+    /// Owned by the workspace for the same reason entities are: a component
+    /// type is addressed as
     /// `/workspaces/{workspaceId}/component-types/{componentTypeId}`, so it
     /// cannot outlive the workspace that contains it, and two operations must
     /// not read two copies of one component type.
+    ///
+    /// Holds BOTH the component types a caller created here and the service's
+    /// own built-in ones, which every workspace is provisioned with when it is
+    /// created ([`built_in_component_types`]) — they are addressed through the
+    /// same path and read through the same operations, so they live in the same
+    /// map rather than in a second one beside it. The two are told apart by the
+    /// reserved namespace their ids lie in
+    /// ([`built_in_component_type_id`]): see
+    /// [`created_component_types`](Workspace::created_component_types) for the
+    /// caller's own.
     pub component_types: BTreeMap<String, ComponentType>,
     /// The scenes created in this workspace, keyed by `sceneId`. Owned by the
     /// workspace for the same reason entities and component types are: a scene
@@ -567,6 +577,23 @@ impl Workspace {
         self.sync_jobs.keys().cloned().collect()
     }
 
+    /// The component types a CALLER created in this workspace: the stored ones
+    /// whose ids lie outside the service's reserved namespace, which is exactly
+    /// what `CreateComponentType` wrote.
+    ///
+    /// The built-ins every workspace is provisioned with are the SERVICE's own
+    /// ([`built_in_component_types`]), not the caller's contents, so a caller
+    /// that created none has an empty workspace however many built-ins it
+    /// holds: this is what the per-workspace component-type ceiling counts
+    /// against and what a `DeleteWorkspace` that requires an emptied workspace
+    /// asks about. ONE definition of "the caller's component types", so a
+    /// quota, a delete guard and any later reader cannot disagree.
+    pub fn created_component_types(&self) -> impl Iterator<Item = &ComponentType> {
+        self.component_types
+            .values()
+            .filter(|component_type| !built_in_component_type_id(&component_type.component_type_id))
+    }
+
     /// Whether any stored entity names `entity_id` as its parent.
     ///
     /// Derived on every read rather than kept as a flag beside the entity, so a
@@ -602,8 +629,8 @@ impl Workspace {
     ///
     /// A `RELATIONSHIP` property definition's `targetComponentTypeId` is NOT
     /// counted: it is a declared target no writer in this service requires to
-    /// resolve (a create stores it without checking, and it may name one of the
-    /// service's built-in types, of which this emulator holds no registry), so
+    /// resolve (a create stores it without checking, and it may name a built-in
+    /// type of the real service this emulator does not model), so
     /// counting it would refuse deletes the real service allows.
     ///
     /// Derived on every call rather than kept as a count beside the component
@@ -654,11 +681,15 @@ impl Workspace {
     /// type the reference names.
     ///
     /// A reference resolves when this workspace stores a component type under
-    /// the id (a component type is addressed inside its workspace, so a
-    /// reference never reaches across one), or when the id is one of the
-    /// service's own built-in types — see
-    /// [`BUILT_IN_COMPONENT_TYPE_ID_PREFIX`], of which this emulator holds no
-    /// registry.
+    /// the id — which includes the built-ins the workspace was provisioned with
+    /// ([`built_in_component_types`]), since a component type is addressed
+    /// inside its workspace and a reference never reaches across one — or when
+    /// the id lies in the service's reserved namespace
+    /// ([`BUILT_IN_COMPONENT_TYPE_ID_PREFIX`]) without being one of the
+    /// built-ins this emulator models: the real service ships more of them than
+    /// are modelled here, and refusing such an id would reject inheritance the
+    /// real service accepts, which is the opposite error from the dangling
+    /// reference this rule exists to catch.
     pub fn resolves_component_type(&self, component_type_id: &str) -> bool {
         self.component_types.contains_key(component_type_id)
             || built_in_component_type_id(component_type_id)
@@ -667,8 +698,9 @@ impl Workspace {
     /// The transitive `extendsFrom` closure of `seeds`, in ONE walk: the stored
     /// component types it reaches (breadth-first, nearest first, each at most
     /// once), every id it reached whether stored or not, and whether any of
-    /// those ids is NOT stored in this workspace — one of the service's
-    /// built-in types, whose own definitions this emulator does not hold.
+    /// those ids is NOT stored in this workspace — a built-in type of the real
+    /// service that this emulator does not model, whose own definitions it
+    /// therefore does not hold.
     ///
     /// The single walk over `extendsFrom` every reader of inherited structure
     /// shares, so an inheritance chain is resolved ONE way:
@@ -708,9 +740,9 @@ impl Workspace {
 
     /// Every component type `extends_from` reaches — the ids it names plus,
     /// transitively, the ids those stored component types themselves extend —
-    /// and whether any of them is NOT stored in this workspace, i.e. is one of
-    /// the service's built-in types, whose own definitions this emulator does
-    /// not hold.
+    /// and whether any of them is NOT stored in this workspace, i.e. is a
+    /// built-in type of the real service this emulator does not model, whose
+    /// own definitions it therefore does not hold.
     pub fn ancestor_component_type_ids(&self, extends_from: &[String]) -> (BTreeSet<String>, bool) {
         let (_, reached, holds_unstored) =
             self.component_type_closure(extends_from.iter().cloned());
@@ -784,8 +816,8 @@ impl Workspace {
     /// chain rather than a single map. The walk is
     /// [`component_type_closure`](Self::component_type_closure)'s, seeded with
     /// the component type itself; a parent this workspace does not hold (a
-    /// built-in type, of which this emulator holds no registry) contributes
-    /// nothing rather than failing the walk.
+    /// built-in type of the real service this emulator does not model)
+    /// contributes nothing rather than failing the walk.
     pub fn component_type_chain(&self, component_type_id: &str) -> Vec<&ComponentType> {
         let (chain, _, _) = self.component_type_closure([component_type_id.to_string()]);
         chain
@@ -1257,6 +1289,18 @@ pub struct ComponentType {
     /// member's own documentation. Stored resolved: a create that names none
     /// leaves it `false`.
     pub is_singleton: bool,
+    /// "Whether the component type is abstract" — a base type an entity holds
+    /// no component of, which exists to be extended.
+    ///
+    /// STORED rather than derived at each reader, so the value
+    /// `GetComponentType` reports and the set a `ListComponentTypes`
+    /// `isAbstract` filter selects cannot drift apart. `isAbstract` is not a
+    /// member of `CreateComponentTypeRequest` and not derivable from one that
+    /// is — the API offers no way to declare a component type abstract — so
+    /// every component type a caller creates is concrete, and the abstract ones
+    /// are the service's own built-ins, which the workspace is provisioned with
+    /// rather than asked for ([`built_in_component_types`]).
+    pub is_abstract: bool,
     /// The parent component types this one extends, in the order the create
     /// gave them.
     pub extends_from: Vec<String>,
@@ -1327,24 +1371,6 @@ impl ComponentType {
         self.functions.contains_key(SCHEMA_INITIALIZER_FUNCTION) && self.state == STATE_ACTIVE
     }
 
-    /// Whether the component type is ABSTRACT — a base type an entity cannot
-    /// hold a component of.
-    ///
-    /// False for every component type this service stores, and derived HERE
-    /// rather than at each reader so the value `GetComponentType` reports and
-    /// the set a `ListComponentTypes` `isAbstract` filter selects cannot drift
-    /// apart. `isAbstract` is not a member of `CreateComponentTypeRequest` and
-    /// not derivable from one that is: the API offers no way to declare a
-    /// component type abstract, and the service's own abstract base types are
-    /// built in, of which this emulator holds no registry. Every component type
-    /// it stores was created through this API, so every one of them is concrete.
-    ///
-    /// Takes `&self` though today's answer does not depend on the record: a
-    /// writer that ever persists abstractness has exactly one place to make
-    /// every reader of it agree.
-    pub fn is_abstract(&self) -> bool {
-        false
-    }
 }
 
 /// Whether a `MetadataTransferJobState` is TERMINAL — a state the job has
@@ -1414,18 +1440,244 @@ pub fn property_definition_needs_data_type(
 /// IoT TwinMaker publishes the component types it ships under the reserved
 /// `com.amazon.` namespace — `com.amazon.iottwinmaker.alarm.basic`,
 /// `com.amazon.iotsitewise.connector` and the rest of the user guide's
-/// "built-in component types" — while a caller's own ids live outside it. This
-/// emulator holds no registry of those types (nothing creates them and
-/// `ListComponentTypes` does not report them), so an id inside the namespace is
-/// treated as RESOLVING to a built-in instead of being refused: refusing it
+/// "built-in component types" — while a caller's own ids live outside it. The
+/// namespace is therefore the SERVICE's: the component types in it are
+/// provisioned with every workspace ([`built_in_component_types`]) and no
+/// caller creates, changes or deletes one. An id inside it that this emulator
+/// does not model still RESOLVES as a reference rather than being refused: the
+/// real service ships more built-ins than are modelled here, and refusing one
 /// would reject inheritance the real service accepts, which is the opposite
-/// error from the dangling reference this rule exists to catch.
+/// error from the dangling reference that rule exists to catch.
 pub const BUILT_IN_COMPONENT_TYPE_ID_PREFIX: &str = "com.amazon.";
 
 /// Whether `component_type_id` names one of the service's built-in component
 /// types. See [`BUILT_IN_COMPONENT_TYPE_ID_PREFIX`].
 pub fn built_in_component_type_id(component_type_id: &str) -> bool {
     component_type_id.starts_with(BUILT_IN_COMPONENT_TYPE_ID_PREFIX)
+}
+
+/// The `Type` values ([`crate::ops::types::TYPE_VALUES`]) the built-in
+/// catalogue's property definitions carry.
+const TYPE_STRING: &str = "STRING";
+/// See [`TYPE_STRING`].
+const TYPE_MAP: &str = "MAP";
+
+/// One entry of the built-in catalogue: a component type IoT TwinMaker SHIPS,
+/// as this emulator models it. See [`built_in_component_types`].
+struct BuiltInComponentType {
+    /// Its published `componentTypeId`, inside
+    /// [`BUILT_IN_COMPONENT_TYPE_ID_PREFIX`].
+    component_type_id: &'static str,
+    /// Whether it is abstract — see [`ComponentType::is_abstract`].
+    is_abstract: bool,
+    /// The property definitions it declares itself, which a component type
+    /// extending it inherits.
+    property_definitions: &'static [BuiltInProperty],
+}
+
+/// One property definition of a built-in component type.
+struct BuiltInProperty {
+    /// The property's name, as the service publishes it.
+    name: &'static str,
+    /// Its `dataType`'s `type`: a [`crate::ops::types::TYPE_VALUES`] value.
+    data_type: &'static str,
+    /// The `nestedType`'s `type` for a container `data_type`, `None` for a
+    /// scalar one.
+    nested_type: Option<&'static str>,
+    /// Whether the property "ID comes from an external data store"
+    /// (`isExternalId`): what names the resource of the linked service the
+    /// built-in connects a component to.
+    is_external_id: bool,
+    /// Whether the property "consists of time series data" (`isTimeSeries`).
+    is_time_series: bool,
+}
+
+impl BuiltInProperty {
+    /// This declaration as the modelled `PropertyDefinitionRequest` a stored
+    /// component type carries, so a built-in's definitions are stored and read
+    /// back exactly like a created one's.
+    fn definition(&self) -> crate::ops::types::PropertyDefinitionRequest {
+        crate::ops::types::PropertyDefinitionRequest {
+            data_type: Some(crate::ops::types::DataType {
+                r#type: self.data_type.to_string(),
+                nested_type: self.nested_type.map(|nested| {
+                    Box::new(crate::ops::types::DataType {
+                        r#type: nested.to_string(),
+                        ..Default::default()
+                    })
+                }),
+                ..Default::default()
+            }),
+            is_external_id: Some(self.is_external_id),
+            is_time_series: Some(self.is_time_series),
+            ..Default::default()
+        }
+    }
+}
+
+/// The built-in component types this emulator models, from the AWS IoT
+/// TwinMaker user guide's "built-in component types": the IoT SiteWise
+/// connector a workspace's own types extend to read an asset's property values,
+/// the basic alarm type the service's alarm pattern extends, and the document
+/// type an entity carries document links in.
+///
+/// The service ships these; nothing creates them through the API, which is why
+/// [`built_in_component_types`] provisions a workspace with them and
+/// `CreateComponentType` refuses the namespace they live in. The set is the one
+/// the user guide publishes and this emulator models — an id inside the
+/// reserved namespace that is NOT here still resolves as a reference (see
+/// [`BUILT_IN_COMPONENT_TYPE_ID_PREFIX`]) rather than being refused.
+const BUILT_IN_COMPONENT_TYPES: &[BuiltInComponentType] = &[
+    // The IoT SiteWise connector. ABSTRACT: a workspace's own component type
+    // extends it and the entity's component then names the SiteWise asset and
+    // asset model the component reads its values from, so the connector itself
+    // is never instantiated. Its two properties are those external ids.
+    BuiltInComponentType {
+        component_type_id: "com.amazon.iotsitewise.connector",
+        is_abstract: true,
+        property_definitions: &[
+            BuiltInProperty {
+                name: "sitewiseAssetModelId",
+                data_type: TYPE_STRING,
+                nested_type: None,
+                is_external_id: true,
+                is_time_series: false,
+            },
+            BuiltInProperty {
+                name: "sitewiseAssetId",
+                data_type: TYPE_STRING,
+                nested_type: None,
+                is_external_id: true,
+                is_time_series: false,
+            },
+        ],
+    },
+    // The basic alarm. ABSTRACT: it is the parent the service's documented
+    // alarm pattern declares in `extendsFrom`, so a workspace's own alarm type
+    // inherits the alarm key that names the alarm in the system that raises it
+    // and the alarm status that system reports over time.
+    BuiltInComponentType {
+        component_type_id: "com.amazon.iottwinmaker.alarm.basic",
+        is_abstract: true,
+        property_definitions: &[
+            BuiltInProperty {
+                name: "alarm_key",
+                data_type: TYPE_STRING,
+                nested_type: None,
+                is_external_id: true,
+                is_time_series: false,
+            },
+            BuiltInProperty {
+                name: "alarm_status",
+                data_type: TYPE_STRING,
+                nested_type: None,
+                is_external_id: false,
+                is_time_series: true,
+            },
+        ],
+    },
+    // The document type. CONCRETE: an entity holds a component of it directly,
+    // whose one property maps each document's name to its location.
+    BuiltInComponentType {
+        component_type_id: "com.amazon.iottwinmaker.documents",
+        is_abstract: false,
+        property_definitions: &[BuiltInProperty {
+            name: "documents",
+            data_type: TYPE_MAP,
+            nested_type: Some(TYPE_STRING),
+            is_external_id: false,
+            is_time_series: false,
+        }],
+    },
+];
+
+/// The built-in component types a workspace created in `region` under
+/// `workspace_id` at `at` is PROVISIONED with, keyed by `componentTypeId` — the
+/// value `CreateWorkspace` stores in [`Workspace::component_types`].
+///
+/// The service's own component types are not created through this API: they
+/// exist in a workspace from the instant it does, which is why a workspace is
+/// seeded with them rather than a reader synthesising them. Each is stored as
+/// an ordinary [`ComponentType`] record — same ARN minting, same reported
+/// members — so `GetComponentType`, `ListComponentTypes` and every walk of an
+/// inheritance chain reach a built-in exactly as they reach a created one, and
+/// a component type that extends one really has a parent whose definitions can
+/// be read.
+///
+/// Each record is ACTIVE from that same instant, with no transition owed: a
+/// provisioned component type has no create in flight for the clock to settle
+/// ([`ComponentType::settle`] is a no-op on it). It carries no tags and no
+/// friendly name or description — this emulator does not invent the service's
+/// prose — and its ARN is deliberately NOT put in
+/// [`ComAmazonawsIottwinmakerAwsiottwinmakerState::arn_index`], for the same
+/// reason a metadata transfer job's is not: that index resolves an id-or-ARN
+/// input and finds a TAGGABLE resource's tag map, and a built-in is the
+/// service's own resource, which carries no caller's tags.
+pub fn built_in_component_types(
+    region: &str,
+    workspace_id: &str,
+    at: SystemTime,
+) -> BTreeMap<String, ComponentType> {
+    BUILT_IN_COMPONENT_TYPES
+        .iter()
+        .map(|built_in| {
+            (
+                built_in.component_type_id.to_string(),
+                ComponentType {
+                    component_type_id: built_in.component_type_id.to_string(),
+                    arn: component_type_arn(region, workspace_id, built_in.component_type_id),
+                    workspace_id: workspace_id.to_string(),
+                    component_type_name: None,
+                    description: None,
+                    is_singleton: false,
+                    is_abstract: built_in.is_abstract,
+                    extends_from: Vec::new(),
+                    property_definitions: built_in
+                        .property_definitions
+                        .iter()
+                        .map(|property| (property.name.to_string(), property.definition()))
+                        .collect(),
+                    functions: BTreeMap::new(),
+                    property_groups: BTreeMap::new(),
+                    composite_component_types: BTreeMap::new(),
+                    tags: BTreeMap::new(),
+                    creation_date_time: at,
+                    update_date_time: at,
+                    state: STATE_ACTIVE.to_string(),
+                    settles_at: at,
+                },
+            )
+        })
+        .collect()
+}
+
+/// Why a `componentTypeId` a caller asked to create cannot be minted, as the
+/// message a `ValidationException` carries: it lies in the namespace the
+/// service reserves for the component types it ships.
+///
+/// Built from the request — it names the id and the namespace — so a caller is
+/// told what to change. See [`BUILT_IN_COMPONENT_TYPE_ID_PREFIX`].
+pub fn reserved_component_type_namespace_message(component_type_id: &str) -> String {
+    format!(
+        "componentTypeId {component_type_id} lies in the \
+         {BUILT_IN_COMPONENT_TYPE_ID_PREFIX} namespace, which is reserved for the service's \
+         built-in component types"
+    )
+}
+
+/// Why a write addressed to a stored built-in component type cannot be
+/// performed, as the message a `ValidationException` carries: the component
+/// type is the service's own, provisioned with the workspace, so no caller's
+/// update or delete applies to it. Built from the request, naming what was
+/// addressed and where.
+pub fn built_in_component_type_not_writable_message(
+    workspace_id: &str,
+    component_type_id: &str,
+) -> String {
+    format!(
+        "ComponentType {component_type_id} in workspace {workspace_id} is a built-in component \
+         type of the service and cannot be changed or deleted."
+    )
 }
 
 /// Why `extends_from` cannot be stored as the inheritance of
@@ -1508,7 +1760,8 @@ pub fn composite_component_types_violation(
 /// groups and the names are both read off `record` as the write leaves it, so a
 /// group may name a property the same request defines and no caller can check
 /// one component type's groups against another's definitions. Where the chain
-/// reaches a built-in type, this emulator does not hold its definitions, so a
+/// reaches a built-in type this emulator does not model, it does not hold its
+/// definitions, so a
 /// name it does not otherwise account for cannot be called undefined and the
 /// group stands. Shared by every writer of a component type's `propertyGroups`.
 pub fn property_groups_violation(workspace: &Workspace, record: &ComponentType) -> Option<String> {
@@ -1692,8 +1945,8 @@ pub struct ResolvedComponentPath {
 /// component types. A path of a single segment names a top-level component and
 /// no composite component, so it does not resolve; and resolution walks only
 /// the component type's OWN `compositeComponentTypes`, because this service
-/// resolves no inheritance (every `isInherited` it reports is `false`) and holds
-/// no registry of the built-in component types a real workspace carries — so a
+/// resolves no inheritance (every `isInherited` it reports is `false`) and does
+/// not model every built-in component type a real workspace carries — so a
 /// path through a component type this workspace does not hold cannot be
 /// resolved, and is refused rather than guessed at.
 pub fn resolve_composite_component_path(

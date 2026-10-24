@@ -42,8 +42,9 @@ const WORKSPACE: &str = "updateCtRefsWorkspace";
 /// Two of the component types IoT TwinMaker SHIPS, from the user guide's
 /// "built-in component types": they are published under the service's reserved
 /// `com.amazon.` namespace (`state::BUILT_IN_COMPONENT_TYPE_ID_PREFIX`) and
-/// neither is created in the workspace below, so a reference to one resolves
-/// against the service rather than against the store.
+/// neither is created by the cases below — the workspace is PROVISIONED with
+/// them when it is created, so a reference to one resolves against what the
+/// service seeded rather than against anything a caller wrote.
 const BUILT_IN_ALARM: &str = "com.amazon.iottwinmaker.alarm.basic";
 /// See [`BUILT_IN_ALARM`].
 const BUILT_IN_CONNECTOR: &str = "com.amazon.iotsitewise.connector";
@@ -578,9 +579,9 @@ async fn an_update_accepts_declared_references_the_service_holds() {
             )],
         ),
         (
-            // The chain reaches a BUILT-IN type, whose own definitions this
-            // emulator does not hold, so a name it cannot account for is not
-            // one it can call undefined.
+            // The chain reaches a BUILT-IN type, which the workspace was
+            // provisioned with, so the group's name resolves against the
+            // definitions that built-in declares.
             "propertyGroups.underABuiltInParent",
             json!({"extendsFrom": [BUILT_IN_ALARM]}),
             json!({"propertyGroups": {"alarms": {"propertyNames": ["alarm_status"]}}}),
