@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListManagedPoliciesInPermissionSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListManagedPoliciesInPermissionSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListManagedPoliciesInPermissionSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the AWS managed policies attached to one permission set, from the
+//! attachments stored on that permission set's record — one page per call, in ARN order,
+//! resuming after the cursor the previous page handed back.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +159,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListManagedPoliciesInPermissionSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListManagedPoliciesInPermissionSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListManagedPoliciesInPermissionSet"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListManagedPoliciesInPermissionSetErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the SSO Admin state store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // The cursor is scoped to THIS enumeration: the operation and the permission set
+        // whose attachments it walks. A token issued for another enumeration decodes to
+        // nothing and is refused rather than silently resuming somewhere else.
+        let scope = crate::state::cursor_managed_policies(
+            &input.instance_arn,
+            &input.permission_set_arn,
+        );
+        let after = crate::state::cursor_after(&scope, input.next_token.as_deref()).map_err(
+            |message| {
+                ListManagedPoliciesInPermissionSetErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(message.to_string()),
+                        // The model's `ValidationExceptionReason` enum carries only KMS
+                        // key states, none of which this refusal is.
+                        reason: None,
+                    },
+                )
+            },
+        )?;
+
+        let ordered: Vec<(String, AttachedManagedPolicy)> = {
+            let region = crate::state::request_region(ctx.parts());
+            let mut store = state.lock();
+            // A READ, except for what the CLOCK already owes the instances themselves,
+            // and the account's ambient instance if nothing has enabled one yet.
+            store.on_request(&region, ::std::time::SystemTime::now());
+
+            // The ACCOUNT-INSTANCE restriction, asked BEFORE any resource lookup:
+            // permission sets are a feature of an organization instance, so on an account
+            // instance no permission set can ever exist and the refusal does not depend on
+            // whether this one does. An ARN this account holds no instance for is NOT this
+            // refusal — it falls through to the 404 below.
+            if store.permission_set_surface_withdrawn(&input.instance_arn) {
+                return Err(
+                    ListManagedPoliciesInPermissionSetErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(
+                                crate::state::ACCOUNT_INSTANCE_UNSUPPORTED_MESSAGE.to_string(),
+                            ),
+                            reason: None,
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            if store.instance(&input.instance_arn).is_none() {
+                return Err(
+                    ListManagedPoliciesInPermissionSetErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(format!(
+                                "No instance found with the ARN {}",
+                                input.instance_arn
+                            )),
+                            reason: None,
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            // Absent, or belonging to another instance, or already deleted — all the same
+            // answer: there is no such permission set to list the policies of. An EMPTY
+            // page is what a permission set that exists and carries no attachment
+            // answers, so the two are never confused.
+            let record = store
+                .permission_set(&input.instance_arn, &input.permission_set_arn)
+                .ok_or_else(|| {
+                    ListManagedPoliciesInPermissionSetErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(format!(
+                                "No permission set found with the ARN {}",
+                                input.permission_set_arn
+                            )),
+                            reason: None,
+                        },
+                    )
+                })?;
+            // Exactly the attachments this permission set currently holds, in the ARN
+            // order that is both the page order and the cursor order.
+            record.attached_managed_policies()
+        };
+
+        let (attached_managed_policies, next_token) =
+            crate::state::page(&scope, ordered, after.as_deref(), input.max_results);
+        Ok(ListManagedPoliciesInPermissionSetOutput {
+            attached_managed_policies: Some(attached_managed_policies),
+            next_token,
+        })
     }
 }

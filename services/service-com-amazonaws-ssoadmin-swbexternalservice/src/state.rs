@@ -21,7 +21,8 @@ use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
     AccessControlAttribute, AccountAssignment, AccountAssignmentOperationStatus,
-    ApplicationProvider, AuthenticationMethod, CustomerManagedPolicyReference, DisplayData,
+    ApplicationProvider, AttachedManagedPolicy, AuthenticationMethod,
+    CustomerManagedPolicyReference, DisplayData,
     EncryptionConfigurationDetails, InstanceAccessControlAttributeConfiguration, InstanceMetadata,
     PermissionSet, PermissionsBoundary, PortalOptions, RegionMetadata, ResourceServerConfig,
     ResourceServerScopeDetails, Tag, TrustedTokenIssuerConfiguration,
@@ -1126,7 +1127,52 @@ pub struct PermissionSetRecord {
     pub permissions_boundary: Option<PermissionsBoundaryRecord>,
 }
 
+/// The name of the AWS managed policy `managed_policy_arn` names, as
+/// `AttachedManagedPolicy$Name` ("The name of the Amazon Web Services managed policy")
+/// reports it.
+///
+/// DERIVED from the ARN rather than stored beside it: `ManagedPolicyArn`'s pattern
+/// (`^arn:aws(-[a-z]{1,5}){0,3}:iam::aws:policy((/[A-Za-z0-9\.,\+@=_-]+)*)/([A-Za-z0-9\.,\+=@_-]+)$`)
+/// makes the final `/`-separated segment the policy's name and everything before it the
+/// path, so the name of an attached policy is a function of the ARN the caller attached
+/// and the two can never disagree. An ARN with no `/` at all cannot match that pattern,
+/// so the whole string is the only name such a value could have.
+pub fn managed_policy_name(managed_policy_arn: &str) -> String {
+    match managed_policy_arn.rsplit_once('/') {
+        Some((_, name)) if !name.is_empty() => name.to_string(),
+        _ => managed_policy_arn.to_string(),
+    }
+}
+
+/// One attached AWS managed policy as the modeled `AttachedManagedPolicy` shape — what
+/// `ListManagedPoliciesInPermissionSet` enumerates.
+pub fn attached_managed_policy(managed_policy_arn: &str) -> AttachedManagedPolicy {
+    AttachedManagedPolicy {
+        name: Some(managed_policy_name(managed_policy_arn)),
+        arn: Some(managed_policy_arn.to_string()),
+    }
+}
+
 impl PermissionSetRecord {
+    /// The AWS managed policies attached to this permission set, in ARN order, as the
+    /// `(page key, item)` pairs [`page`] enumerates.
+    ///
+    /// The ARN is both the page key and the identity of an attachment — a permission set
+    /// holds a given managed policy at most once — so the enumeration order is stable
+    /// across calls however the attachments were made, and a pagination cursor resumes
+    /// after a KEY rather than after a position a later attach would shift.
+    pub fn attached_managed_policies(&self) -> Vec<(String, AttachedManagedPolicy)> {
+        let mut arns: Vec<String> = self.managed_policies.clone();
+        arns.sort();
+        arns.dedup();
+        arns.into_iter()
+            .map(|arn| {
+                let policy = attached_managed_policy(&arn);
+                (arn, policy)
+            })
+            .collect()
+    }
+
     /// This record as the modeled `PermissionSet` shape — what both
     /// `CreatePermissionSet` and `DescribePermissionSet` return, so a describe answers
     /// byte-identically to the create that stored it.
@@ -2344,6 +2390,13 @@ pub const CURSOR_APPLICATION_PROVIDERS: &str = "applicationProviders";
 /// whose permission sets it walks.
 pub fn cursor_permission_sets(instance_arn: &str) -> String {
     format!("permissionSets|{instance_arn}")
+}
+
+/// Cursor scope of a `ListManagedPoliciesInPermissionSet` enumeration: the operation and
+/// the permission set whose attached AWS managed policies it walks, qualified by the
+/// instance that permission set belongs to (the same pair the read resolves against).
+pub fn cursor_managed_policies(instance_arn: &str, permission_set_arn: &str) -> String {
+    format!("managedPolicies|{instance_arn}|{permission_set_arn}")
 }
 
 /// Cursor scope of a `ListAccountAssignments` enumeration: the operation and the whole
