@@ -1850,6 +1850,42 @@ pub fn is_ground_station_name(name: &str) -> bool {
         })
 }
 
+/// Whether `name` is spellable as an `AntennaName`: length 4..256 over the character set
+/// `[ a-zA-Z0-9-._:=]` (`smithy_query(query="shape", shape="AntennaName")`) — the same
+/// character set a `GroundStationName` takes, over a longer span.
+pub fn is_antenna_name(name: &str) -> bool {
+    (4..=256).contains(&name.len())
+        && name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b' ' | b'-' | b'.' | b'_' | b':' | b'=')
+        })
+}
+
+/// Most antennas one ground station can report: the modelled maximum length of
+/// `AntennaList` (`smithy_query(query="shape", shape="AntennaList")` — len 0..100), which
+/// is the list `ListAntennas` answers from.
+pub const MAX_ANTENNAS_PER_GROUND_STATION: usize = 100;
+
+/// A ground station serving this account, and the antennas at it.
+///
+/// Nothing in THIS API builds one: the model declares no operation that creates a ground
+/// station or an antenna — the listings only report them (`smithy_query(query="digest")`)
+/// — because AWS builds and operates the antennas itself and an account reaches whichever
+/// ones it has been granted. So a ground station record is written when this service's
+/// store is created, from the operator setting, and the API reports it.
+#[derive(Debug, Clone)]
+pub struct GroundStation {
+    /// Its `GroundStationName`: both the `groundStationId` an operation addresses it by
+    /// and the `groundStationName` a listing reports, which are ONE name in this API —
+    /// the two members target the same shape (`smithy_query(query="shape",
+    /// shape="GroundStationData")`).
+    pub ground_station_name: String,
+    /// The antennas at it, each an `AntennaName`, held in name order and bounded by
+    /// [`MAX_ANTENNAS_PER_GROUND_STATION`]. A ground station whose antennas this account
+    /// has not been told about has none here, which is a ground station with nothing to
+    /// list rather than an unknown one.
+    pub antennas: Vec<String>,
+}
+
 /// The status an ephemeris carries while the service is still validating the data it was
 /// created with.
 ///
@@ -2107,6 +2143,18 @@ pub struct ComAmazonawsGroundstationGroundstationState {
     /// exactly as a new AWS account does, and `ListSatellites` answers an empty list until
     /// an onboarding lands here.
     pub satellites: HashMap<String, Satellite>,
+    /// The ground stations this account is served by, keyed by their `GroundStationName`,
+    /// and the antennas at each — what `ListAntennas` reports.
+    ///
+    /// EMPTY unless [`GROUND_STATIONS_ENV`] describes one, and that is this account's real
+    /// reach rather than a gap in the emulator: AWS builds and operates the antennas and
+    /// grants an account access to them outside this API, and the model carries no
+    /// operation that builds a ground station or an antenna and no response member that
+    /// reports one other than the listings themselves (`smithy_query(query="digest")`). So
+    /// an account starts knowing only the ground stations its satellite onboardings name
+    /// ([`Self::knows_ground_station`]), and none of them lists an antenna until an
+    /// inventory lands here.
+    pub ground_stations: HashMap<String, GroundStation>,
 }
 
 /// The reserved-minutes pricing plan an account holds: which calendar months it covers
@@ -2275,6 +2323,69 @@ pub fn parse_satellites(setting: &str) -> HashMap<String, Satellite> {
     satellites
 }
 
+/// The environment variable an operator uses to describe the ground stations THIS
+/// emulated account is served by and the antennas at each, since the API models no
+/// operation that builds one: a comma-separated list of entries, each either a bare
+/// `GroundStationName` (a ground station whose antennas this account has not been told
+/// about) or `<ground station>=<antenna>+<antenna>…` naming the antennas at it
+/// (`Ohio 1=Antenna 1+Antenna 2,Oregon 1`). Read once when this service's store is
+/// created. Unset means no inventory, in which case the only ground stations this account
+/// knows are the ones its satellite onboardings name, and none of them lists an antenna.
+pub const GROUND_STATIONS_ENV: &str = "GROUNDSTATION_GROUND_STATIONS";
+
+/// The ground stations `setting` describes, keyed by the `GroundStationName` each is
+/// addressed by.
+///
+/// `,` separates entries and `+` separates one entry's antennas because neither is
+/// spellable in a `GroundStationName` or an `AntennaName`, so no name can be split in
+/// two; the first `=` of an entry separates the ground station from its antennas, which
+/// may contain further `=`.
+///
+/// An entry whose ground station is not spellable as a `GroundStationName` is skipped, as
+/// is one repeating a ground station already described (one ground station is one entry)
+/// and any antenna not spellable as an `AntennaName` or repeating one already at that
+/// ground station, so a typo describes nothing instead of something unintended. The
+/// inventory is bounded by [`MAX_RECORDS_PER_STORE`] and each ground station's antennas by
+/// [`MAX_ANTENNAS_PER_GROUND_STATION`].
+pub fn parse_ground_stations(setting: &str) -> HashMap<String, GroundStation> {
+    let mut inventory: HashMap<String, GroundStation> = HashMap::new();
+    for entry in setting.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() || inventory.len() >= MAX_RECORDS_PER_STORE {
+            continue;
+        }
+        let (name, antennas) = match entry.split_once('=') {
+            None => (entry, ""),
+            Some((name, antennas)) => (name.trim(), antennas),
+        };
+        if !is_ground_station_name(name) || inventory.contains_key(name) {
+            continue;
+        }
+        let mut at_station: Vec<String> = Vec::new();
+        for antenna in antennas.split('+').map(str::trim) {
+            if !is_antenna_name(antenna)
+                || at_station.iter().any(|held| held == antenna)
+                || at_station.len() >= MAX_ANTENNAS_PER_GROUND_STATION
+            {
+                continue;
+            }
+            at_station.push(antenna.to_string());
+        }
+        // Held in NAME order, so the order a listing reports them in is a property of the
+        // store rather than of each read. The bound above keeps the first names the
+        // setting named; the sort only arranges what it kept.
+        at_station.sort();
+        inventory.insert(
+            name.to_string(),
+            GroundStation {
+                ground_station_name: name.to_string(),
+                antennas: at_station,
+            },
+        );
+    }
+    inventory
+}
+
 /// The value `variable` holds, parsed by `parse`, or nothing when it is not set.
 fn from_env<T: Default>(variable: &str, parse: impl Fn(&str) -> T) -> T {
     ::std::env::var(variable)
@@ -2284,8 +2395,9 @@ fn from_env<T: Default>(variable: &str, parse: impl Fn(&str) -> T) -> T {
 
 impl Default for ComAmazonawsGroundstationGroundstationState {
     /// An account with no resources, the uplink approval [`APPROVED_UPLINK_BANDS_ENV`]
-    /// grants it, the reserved minutes [`RESERVED_MINUTES_ENV`] commits and the satellites
-    /// [`SATELLITES_ENV`] onboards (none of them, unless they are set).
+    /// grants it, the reserved minutes [`RESERVED_MINUTES_ENV`] commits, the satellites
+    /// [`SATELLITES_ENV`] onboards and the ground stations [`GROUND_STATIONS_ENV`]
+    /// describes (none of them, unless they are set).
     fn default() -> Self {
         Self {
             configs: HashMap::new(),
@@ -2301,6 +2413,7 @@ impl Default for ComAmazonawsGroundstationGroundstationState {
             ),
             reserved_minutes: from_env(RESERVED_MINUTES_ENV, parse_reserved_minutes),
             satellites: from_env(SATELLITES_ENV, parse_satellites),
+            ground_stations: from_env(GROUND_STATIONS_ENV, parse_ground_stations),
         }
     }
 }
@@ -2319,6 +2432,31 @@ impl ComAmazonawsGroundstationGroundstationState {
         config_data: &ConfigTypeData,
     ) -> Result<(), InvalidParameterException> {
         validate_config_data(config_data, &self.approved_uplink_bands_mhz)
+    }
+
+    /// Whether this account knows a ground station called `name`: its own inventory
+    /// describes one ([`GROUND_STATIONS_ENV`]), or a satellite it is on-boarded to is
+    /// on-boarded to that station — the two places a ground station this account reaches
+    /// is recorded. A name neither records is a ground station this account cannot address.
+    pub fn knows_ground_station(&self, name: &str) -> bool {
+        self.ground_stations.contains_key(name)
+            || self.satellites.values().any(|satellite| {
+                satellite
+                    .ground_stations
+                    .iter()
+                    .any(|station| station == name)
+            })
+    }
+
+    /// The antennas at the ground station `name`, each an `AntennaName`, in the order the
+    /// inventory holds them — by name, which [`parse_ground_stations`] is what arranges —
+    /// so a page boundary is stable whatever order the setting named them in; empty when
+    /// that ground station has none and when this account knows no station by that name.
+    pub fn antennas_at(&self, name: &str) -> Vec<String> {
+        self.ground_stations
+            .get(name)
+            .map(|station| station.antennas.clone())
+            .unwrap_or_default()
     }
 
     /// The config `arn` names, if it names one.

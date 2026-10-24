@@ -367,6 +367,23 @@ impl ComAmazonawsPcaconnectorscepPcaconnectorscepState {
             .is_some_and(|connector| connector.challenges.remove(challenge_arn).is_some())
     }
 
+    /// The tags of the connector or challenge `resource_arn` names, or `None` when this
+    /// service holds no resource under that ARN.
+    ///
+    /// Which of the two kinds an ARN names follows from its shape ([`resource_type_of`]), and
+    /// the tags come off that record — both kinds carry their own map — so a tag listing is
+    /// computed from the resource itself and disappears with it.
+    pub fn tags_of(&self, resource_arn: &str) -> Option<&BTreeMap<String, String>> {
+        if connector_arn_of_challenge(resource_arn).is_some() {
+            self.challenge(resource_arn)
+                .map(|challenge| &challenge.tags)
+        } else {
+            self.connectors
+                .get(resource_arn)
+                .map(|connector| &connector.tags)
+        }
+    }
+
     /// The record a still-live `ClientToken` of `CreateConnector` is bound to.
     pub fn connector_for_token(&self, client_token: Option<&str>) -> Option<IdempotencyRecord> {
         client_token
@@ -379,6 +396,20 @@ impl ComAmazonawsPcaconnectorscepPcaconnectorscepState {
         client_token
             .and_then(|token| self.challenge_tokens.get(token))
             .cloned()
+    }
+}
+
+/// Which of this service's two resource kinds an ARN names, as the `ResourceType` member of
+/// its errors spells it ("either `Connector` or `Challenge`").
+///
+/// Decided by the ARN's own shape: a challenge ARN is its connector's ARN plus the challenge
+/// segment ([`connector_arn_of_challenge`]), so anything without that segment names a
+/// connector.
+pub fn resource_type_of(resource_arn: &str) -> &'static str {
+    if connector_arn_of_challenge(resource_arn).is_some() {
+        RESOURCE_TYPE_CHALLENGE
+    } else {
+        RESOURCE_TYPE_CONNECTOR
     }
 }
 
