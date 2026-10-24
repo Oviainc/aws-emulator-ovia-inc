@@ -60,6 +60,14 @@ fn at_epoch_secs(secs: u64) -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_secs(secs)
 }
 
+/// Epoch seconds now, which brackets a server-assigned instant.
+fn epoch_seconds_now() -> f64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("the clock is after the epoch")
+        .as_secs_f64()
+}
+
 /// The resources the gated operations name when the target EXISTS, and the never-created
 /// ARNs they name when it does not.
 struct Targets {
@@ -824,20 +832,24 @@ async fn a_created_rotation_reads_back_exactly_as_it_was_created() {
     let emulator = Emulator::new();
     let team = rotation_team(&emulator).await;
 
-    let mut created: Vec<(&RotationRow, String)> = Vec::new();
+    // Each row's create is bracketed by the clock, so a rotation created without a
+    // `StartTime` can be asserted to report the start time the create assigned it.
+    let mut created: Vec<(&RotationRow, String, f64, f64)> = Vec::new();
     for row in ROTATION_ROWS {
         let request = create_rotation_request(row, &team);
+        let before = epoch_seconds_now();
         let arn = create_rotation(&emulator, request.clone(), row.case).await;
+        let after = epoch_seconds_now();
         assert!(
             arn.starts_with(&format!("arn:aws:ssm-contacts:{REGION}:{ACCOUNT}:rotation/")),
             "case {:?}: expected a rotation ARN in the request's region, got {arn:?}",
             row.case
         );
-        created.push((row, arn));
+        created.push((row, arn, before, after));
     }
 
     // Each rotation reads back through `ListRotations` with exactly what its create named.
-    for (row, arn) in &created {
+    for (row, arn, before, after) in &created {
         let case = row.case;
         let reported = all_rotations(&emulator, json!({"RotationNamePrefix": row.name}), case).await;
         assert_eq!(
@@ -873,10 +885,35 @@ async fn a_created_rotation_reads_back_exactly_as_it_was_created() {
             parse(row.recurrence),
             "case {case:?}: expected the created Recurrence, got {rotation:?}"
         );
+        // A rotation always holds an effective start time: the one the create named, or
+        // the instant the create stored it when the request named none. The summary
+        // reports that stored value, and so does `GetRotation` for the same rotation.
+        let listed_start = rotation["StartTime"].as_f64().unwrap_or_else(|| {
+            panic!("case {case:?}: expected the summary to carry a StartTime, got {rotation:?}")
+        });
+        match row.start_time_secs {
+            Some(secs) => assert!(
+                (listed_start - secs as f64).abs() < f64::EPSILON,
+                "case {case:?}: expected the created StartTime {secs}, got {listed_start}"
+            ),
+            None => assert!(
+                listed_start >= *before && listed_start <= *after,
+                "case {case:?}: expected a StartTime assigned inside [{before}, {after}], \
+                 got {listed_start}"
+            ),
+        }
+        let (status, read) = emulator
+            .call("GetRotation", json!({"RotationId": arn}))
+            .await;
         assert_eq!(
-            rotation["StartTime"].as_f64(),
-            row.start_time_secs.map(|secs| secs as f64),
-            "case {case:?}: expected the created StartTime, got {rotation:?}"
+            status, 200,
+            "case {case:?}: expected GetRotation to answer 200, got {status} {read:?}"
+        );
+        assert_eq!(
+            read["StartTime"].as_f64(),
+            Some(listed_start),
+            "case {case:?}: expected GetRotation to report the listed StartTime \
+             {listed_start}, got {read:?}"
         );
         // The tags the create carried are reached through `ListTagsForResource`, not
         // through the rotation summary.
@@ -896,7 +933,7 @@ async fn a_created_rotation_reads_back_exactly_as_it_was_created() {
 
     // And the unfiltered listing reports every one of them, in ARN order, whatever the page
     // size — including the sizes that split the result.
-    let mut expected: Vec<String> = created.iter().map(|(_, arn)| arn.clone()).collect();
+    let mut expected: Vec<String> = created.iter().map(|(_, arn, _, _)| arn.clone()).collect();
     expected.sort();
     for max_results in [None, Some(1), Some(2), Some(3), Some(1024)] {
         let case = format!("the whole listing at MaxResults={max_results:?}");

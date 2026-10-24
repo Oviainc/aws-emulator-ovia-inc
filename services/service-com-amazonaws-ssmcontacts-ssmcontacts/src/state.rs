@@ -105,8 +105,13 @@ pub struct RotationRecord {
     /// The contacts on the rotation team, in the order the create listed them — "the order
     /// in which you list the contacts is their shift order in the rotation schedule".
     pub contact_ids: Vec<String>,
-    /// When the rotation becomes active, when the create named a time.
-    pub start_time: Option<::aws_smithy_types::DateTime>,
+    /// When the rotation becomes active: the effective start time the service assigned at
+    /// creation.
+    ///
+    /// Every rotation holds one — `GetRotation$StartTime` is modelled required — so a
+    /// create that named no `StartTime` has the instant it was stored assigned here, once,
+    /// and every reader reports that one persisted value.
+    pub start_time: ::aws_smithy_types::DateTime,
     pub time_zone_id: String,
     /// The recurrence exactly as created.
     pub recurrence: RecurrenceSettings,
@@ -937,7 +942,10 @@ pub fn rotation_summary(record: &RotationRecord) -> Rotation {
         rotation_arn: record.arn.clone(),
         name: record.name.clone(),
         contact_ids: Some(record.contact_ids.clone()),
-        start_time: record.start_time,
+        // The summary member is optional, but the rotation's start time is not: it was
+        // assigned at creation, so it is always reported — and it is the same value
+        // `GetRotation` reports for the same rotation.
+        start_time: Some(record.start_time),
         time_zone_id: Some(record.time_zone_id.clone()),
         recurrence: Some(record.recurrence.clone()),
     }
