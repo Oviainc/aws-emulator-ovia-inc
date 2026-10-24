@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteStoredQuery
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteStoredQuery`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteStoredQuery::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the stored query [`crate::state`] holds under the requested `QueryName`, so
+//! `GetStoredQuery` and `ListStoredQueries` no longer report it and its ARN resolves to
+//! no tag set. A name this account holds no query under is refused with the modelled
+//! `ResourceNotFoundException`, worded by the one helper every stored-query read uses.
 //!
 //! ## Shape of an operation
 //!
@@ -143,18 +138,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteStoredQuery` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteStoredQueryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // A stored query is keyed by name alone, so this operation needs nothing from
+        // the request metadata `ctx` carries.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        // `QueryName` is a required member whose 1..64 length and `^[a-zA-Z0-9-_]+$`
+        // pattern the request walk has already checked, so the only way this can fail is
+        // a query nobody saved.
+        let name = input.query_name;
+
+        // "Deletes the stored query for a single Amazon Web Services account and a single
+        // Amazon Web Services Region." The query's tags live ON its entry (the store's
+        // one ARN-to-tags path), so dropping the entry drops the query and its tags
+        // together, and frees its slot under this Region's stored-query quota.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteStoredQuery"))
+        // This operation MODELS a not-found error, so a name holding no query is refused
+        // rather than answered as a no-op — worded by the one helper every stored-query
+        // read uses, so the wording cannot drift between them.
+        if state.lock().stored_queries.remove(&name).is_none() {
+            return Err(DeleteStoredQueryErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::no_such_stored_query_message(&name)),
+                },
+            )
+            .into());
+        }
+
+        Ok(DeleteStoredQueryOutput {})
     }
 }
