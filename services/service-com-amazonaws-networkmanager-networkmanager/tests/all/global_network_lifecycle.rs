@@ -702,6 +702,10 @@ async fn a_next_token_this_service_did_not_mint_is_refused() {
                 "GetSites",
                 format!("/global-networks/{network}/sites?nextToken={token}"),
             ),
+            (
+                "GetConnections",
+                format!("/global-networks/{network}/connections?nextToken={token}"),
+            ),
         ] {
             let (status, body) = emulator.get(&uri).await;
             assert_eq!(

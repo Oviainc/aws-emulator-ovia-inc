@@ -76,7 +76,7 @@ async fn create_connection(emulator: &Emulator, network: &str, body: Value) -> (
 }
 
 /// `CreateConnection` that must succeed, answering the whole minted `Connection`.
-async fn create_connection_ok(emulator: &Emulator, network: &str, body: Value) -> Value {
+pub(crate) async fn create_connection_ok(emulator: &Emulator, network: &str, body: Value) -> Value {
     let (status, created) = create_connection(emulator, network, body.clone()).await;
     assert_eq!(
         status, 200,
@@ -86,7 +86,7 @@ async fn create_connection_ok(emulator: &Emulator, network: &str, body: Value) -
 }
 
 /// The `ConnectionId` of a `Connection`.
-fn id_of(connection: &Value) -> String {
+pub(crate) fn id_of(connection: &Value) -> String {
     connection["ConnectionId"]
         .as_str()
         .unwrap_or_else(|| panic!("expected a ConnectionId in {connection}"))
@@ -109,7 +109,11 @@ async fn update_connection(
 }
 
 /// `GetConnections` for `query` (appended to the connections URI), with the status.
-async fn get_connections(emulator: &Emulator, network: &str, query: &str) -> (u16, Value) {
+pub(crate) async fn get_connections(
+    emulator: &Emulator,
+    network: &str,
+    query: &str,
+) -> (u16, Value) {
     let uri = if query.is_empty() {
         format!("/global-networks/{network}/connections")
     } else {
@@ -119,7 +123,7 @@ async fn get_connections(emulator: &Emulator, network: &str, query: &str) -> (u1
 }
 
 /// The `ConnectionId`s one `GetConnections` answer carries, in the order returned.
-fn ids_in(body: &Value) -> Vec<String> {
+pub(crate) fn ids_in(body: &Value) -> Vec<String> {
     body["Connections"]
         .as_array()
         .unwrap_or_else(|| panic!("expected a Connections array in {body}"))
