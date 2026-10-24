@@ -17,6 +17,8 @@ mod account_information_wire_fidelity;
 mod account_settings;
 #[path = "all/contact_information.rs"]
 mod contact_information;
+#[path = "all/enum_input_validation.rs"]
+mod enum_input_validation;
 #[path = "all/pattern_validation_messages.rs"]
 mod pattern_validation_messages;
 #[path = "all/primary_email_update.rs"]
