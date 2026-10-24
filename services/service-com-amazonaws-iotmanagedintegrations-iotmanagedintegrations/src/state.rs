@@ -508,6 +508,12 @@ pub const DESTINATION_RESOURCE_TYPE: &str = "Destination";
 /// ([`resource_not_found_message`]).
 pub const DESTINATION_RESOURCE_NAME: &str = "Destination";
 
+/// The destination resource as a MUTATION's and a CONFLICT's reason names it: the subject
+/// of the sentence those paths state ([`cannot_be_found_message`],
+/// [`already_exists_message`]), as [`CONNECTOR_DESTINATION_RESOURCE_SUBJECT`] is for a
+/// connector destination.
+pub const DESTINATION_RESOURCE_SUBJECT: &str = "Destination";
+
 /// The most destinations one store holds. A create past it is refused rather than grown
 /// into, so a caller cannot make this emulator's memory grow without end. A bound CHOSEN
 /// for the emulator, like [`MAX_MANAGED_THINGS`], not a published AWS quota.
@@ -1222,6 +1228,12 @@ impl ComAmazonawsIotmanagedintegrationsIotmanagedintegrationsState {
     /// created in another region is not visible here, as for every regional resource.
     pub fn destination_in(&self, region: &str, name: &str) -> Option<&Destination> {
         self.destinations.get(&RegionalName::new(region, name))
+    }
+
+    /// [`Self::destination_in`] for a mutation, so the write side resolves a destination
+    /// by exactly the rule the read side resolves it by.
+    pub fn destination_in_mut(&mut self, region: &str, name: &str) -> Option<&mut Destination> {
+        self.destinations.get_mut(&RegionalName::new(region, name))
     }
 
     /// The notification configuration `region`'s endpoint holds for `event_type`, if any.
@@ -2149,6 +2161,63 @@ pub fn destination_not_found_on_read(name: &str) -> ResourceNotFoundException {
         message: Some(resource_not_found_message(DESTINATION_RESOURCE_NAME)),
         ..resource_not_found(DESTINATION_RESOURCE_TYPE, name)
     }
+}
+
+/// The modelled `ResourceNotFoundException` a MUTATION answers for a destination the
+/// caller's region holds none of under the `Name` a request named: the sentence every
+/// mutation of a NAME-addressed resource of this service states
+/// ([`cannot_be_found_message`]) plus the `ResourceId` and `ResourceType` members every 404
+/// of this service reports the same way.
+pub fn destination_not_found_on_mutation(name: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(cannot_be_found_message(DESTINATION_RESOURCE_SUBJECT)),
+        ..resource_not_found(DESTINATION_RESOURCE_TYPE, name)
+    }
+}
+
+/// How a CREATE states that the resource it was to mint is already there: the resource as
+/// the sentence's subject, and that it exists.
+///
+/// The sentence is the service's own, not a value of one request — a second
+/// `CreateDestination` for a name the region already holds one under is recorded as
+/// `Destination already exists`, naming no identifier — so every create that refuses a
+/// duplicate of a NAME-addressed resource states it through here, the way
+/// [`cannot_be_found_message`] serves every mutation's 404.
+pub fn already_exists_message(resource_subject: &str) -> String {
+    format!("{resource_subject} already exists")
+}
+
+/// The region segment of `arn`, when `arn` has the shape of an AWS ARN and names one.
+///
+/// Generic over the service: unlike [`parse_resource_arn`], which resolves an ARN THIS
+/// service minted, this reads the region out of an ARN naming a resource of ANOTHER
+/// service — the delivery target a destination points at.
+pub fn arn_region(arn: &str) -> Option<&str> {
+    // `arn:<partition>:<service>:<region>:<account>:<resource>`, and the resource segment
+    // may itself carry `:`.
+    let mut fields = arn.splitn(6, ':');
+    if fields.next()? != "arn" {
+        return None;
+    }
+    let _partition = fields.next()?;
+    let _service = fields.next()?;
+    let region = fields.next()?;
+    (!region.is_empty()).then_some(region)
+}
+
+/// How a destination call states that the delivery target its `DeliveryDestinationArn`
+/// names lives in another region than the one the call was made in.
+///
+/// A destination delivers to a target of the SAME region as the service call, so the
+/// region the ARN carries is part of the request's validity rather than a value to store.
+pub const DELIVERY_DESTINATION_REGION_MISMATCH_MESSAGE: &str =
+    "Service region doesn't match region in DeliveryDestinationArn";
+
+/// Whether `arn` names a delivery target of a region OTHER than `region`, which is what
+/// [`DELIVERY_DESTINATION_REGION_MISMATCH_MESSAGE`] refuses. An ARN whose region cannot be
+/// read is not refused here: its form is the modelled `@pattern`'s to judge.
+pub fn delivery_destination_is_cross_region(region: &str, arn: &str) -> bool {
+    arn_region(arn).is_some_and(|arn_region| arn_region != region)
 }
 
 /// The modelled `ResourceNotFoundException` a READ answers for an event type the caller's

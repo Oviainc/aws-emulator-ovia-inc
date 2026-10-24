@@ -245,11 +245,6 @@ async fn every_filter_selects_on_the_stored_request() {
             expected: every.clone(),
         },
         Listing {
-            case: "another catalog selects nothing".to_string(),
-            request: json!({"catalog": "SomeOtherCatalog"}),
-            expected: vec![],
-        },
-        Listing {
             case: "agreementType selects the type the agreements carry".to_string(),
             request: json!({"agreementType": AGREEMENT_TYPE}),
             expected: every.clone(),
@@ -305,8 +300,8 @@ async fn every_filter_selects_on_the_stored_request() {
             expected: early.clone(),
         },
         Listing {
-            case: "agreementId and a mismatching catalog select nothing".to_string(),
-            request: json!({"agreementId": first, "catalog": "SomeOtherCatalog"}),
+            case: "agreementId and a mismatching agreementType select nothing".to_string(),
+            request: json!({"agreementId": first, "agreementType": "VendorInsightsAgreement"}),
             expected: vec![],
         },
         Listing {

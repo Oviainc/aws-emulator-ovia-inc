@@ -198,7 +198,14 @@ async fn create_and_settle(
     let (status, body) = cloudformation(
         router,
         "CreateStack",
-        &[("StackName", stack_name), ("TemplateBody", template)],
+        &[
+            ("StackName", stack_name),
+            ("TemplateBody", template),
+            // Each row's template declares the IAM role the metric stream writes as, so the
+            // request acknowledges the template's IAM resources; `CAPABILITY_NAMED_IAM`
+            // covers the named form too.
+            ("Capabilities.member.1", "CAPABILITY_NAMED_IAM"),
+        ],
     )
     .await;
     assert_eq!(
@@ -662,6 +669,9 @@ async fn an_update_applies_the_declared_change_to_the_stream_cloudwatch_holds() 
             &[
                 ("StackName", stack_name),
                 ("TemplateBody", &template(declaration(properties.clone()))),
+                // The template still declares the stream's IAM role, and the
+                // acknowledgement is the one each request carries.
+                ("Capabilities.member.1", "CAPABILITY_NAMED_IAM"),
             ],
         )
         .await;

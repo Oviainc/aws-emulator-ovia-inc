@@ -24,8 +24,9 @@
 
 use std::time::{Duration, Instant, SystemTime};
 
-use serde_json::json;
+use serde_json::{json, Value};
 
+use service_com_amazonaws_medicalimaging_ahigatewayservice::ops::types::JOB_STATUS_VALUES;
 use service_com_amazonaws_medicalimaging_ahigatewayservice::state::{
     service_state, DATASTORE_ACTIVATION_DELAY, DATASTORE_NOT_ACTIVE_MESSAGE,
     DATASTORE_STILL_CREATING_MESSAGE,
@@ -34,6 +35,7 @@ use service_com_amazonaws_medicalimaging_ahigatewayservice::state::{
 use crate::datastore_lifecycle::{Emulator, SETTLE_MULTIPLE};
 use crate::image_set_copy::{copy_image_set, information, seed_image_set};
 use crate::image_set_deletion::delete_image_set;
+use crate::import_job_listing::{list_jobs, summaries};
 
 /// How far out a held transition's due instant is pushed, so the data store stays in the
 /// status it has already reached for the whole of a case. Long enough that no scheduling
@@ -174,13 +176,25 @@ fn hold_transition(emulator: &Emulator, case: &str, datastore_id: &str) {
 }
 
 /// The body `StartDICOMImportJob` takes, with a token unique to the case.
-fn import_job_body(case: &str) -> serde_json::Value {
+fn import_job_body(case: &str) -> Value {
     json!({
         "clientToken": case_token("guard-job", case),
         "dataAccessRoleArn": "arn:aws:iam::000000000000:role/ImportRole",
         "inputS3Uri": "s3://imaging-in/",
         "outputS3Uri": "s3://imaging-out/",
     })
+}
+
+/// How many import jobs a data store reports over the wire
+/// (`GET /listDICOMImportJobs/datastore/{datastoreId}`), read through the sibling
+/// listing suite's own helpers so there is one `jobSummaries` walk in this crate.
+async fn job_count(emulator: &Emulator, case: &str, datastore_id: &str) -> usize {
+    let listing = list_jobs(emulator, datastore_id, "").await;
+    assert_eq!(
+        listing.status, 200,
+        "case {case:?}: expected HTTP 200 from ListDICOMImportJobs, got {listing:?}"
+    );
+    summaries(&listing).len()
 }
 
 /// RULE (above): only a settled `ACTIVE` data store serves work on itself or its
@@ -438,6 +452,266 @@ async fn a_delete_racing_the_creation_is_refused_and_the_creation_still_lands() 
             deleted.string(&["datastoreStatus"]),
             "DELETING",
             "case attempts={attempts}: expected DELETING, got {deleted:?}"
+        );
+    }
+}
+
+/// One row of the "a refused import creates nothing" table: which status is in flight,
+/// crossed with which optional members the refused request carries.
+#[derive(Debug)]
+struct RefusedImportRow {
+    case: &'static str,
+    phase: Phase,
+    job_name: Option<&'static str>,
+    input_owner_account_id: Option<&'static str>,
+    import_configuration: bool,
+}
+
+/// The request one [`RefusedImportRow`] sends, built from the operation's required
+/// members plus the optional ones the row names
+/// (`smithy_query(query="operation",operation="StartDICOMImportJob")`).
+fn refused_import_request(row: &RefusedImportRow) -> Value {
+    let mut request = import_job_body(row.case);
+    if let Some(name) = row.job_name {
+        request["jobName"] = json!(name);
+    }
+    if let Some(account) = row.input_owner_account_id {
+        request["inputOwnerAccountId"] = json!(account);
+    }
+    if row.import_configuration {
+        request["importConfiguration"] = json!({
+            "dicomJsonMetadataImportConfiguration": {
+                "dicomMetadataMappings": [{
+                    "studyInstanceUID": "1.2.840.113619.2.1.1",
+                    "metadataFilePath": "metadata/study.json"
+                }]
+            }
+        });
+    }
+    request
+}
+
+/// RULE (above), on what the refusal LEAVES BEHIND: an import refused for the data
+/// store's status creates no job at all — the answer carries no `jobId` and the store's
+/// job listing is as empty afterwards as before — and it is refused for the STORE, so no
+/// member of the request can buy admission.
+///
+/// Rows span both axes the rule generalises over: which status is in flight (`CREATING`,
+/// `DELETING`) crossed with which optional members the request carries (none, a
+/// `jobName`, a source account id, the `importConfiguration` union).
+#[tokio::test]
+async fn an_import_refused_for_the_datastore_status_creates_no_job() {
+    let rows = vec![
+        RefusedImportRow {
+            case: "creating, required members only",
+            phase: Phase::Creating,
+            job_name: None,
+            input_owner_account_id: None,
+            import_configuration: false,
+        },
+        RefusedImportRow {
+            case: "creating, named job with a source account",
+            phase: Phase::Creating,
+            job_name: Some("nightly.import#1"),
+            input_owner_account_id: Some("000000000001"),
+            import_configuration: false,
+        },
+        RefusedImportRow {
+            case: "creating, with an import configuration",
+            phase: Phase::Creating,
+            job_name: Some("metadata-enhance"),
+            input_owner_account_id: None,
+            import_configuration: true,
+        },
+        RefusedImportRow {
+            case: "deleting, required members only",
+            phase: Phase::Deleting,
+            job_name: None,
+            input_owner_account_id: None,
+            import_configuration: false,
+        },
+        RefusedImportRow {
+            case: "deleting, named job with an import configuration",
+            phase: Phase::Deleting,
+            job_name: Some("late.import"),
+            input_owner_account_id: Some("000000000001"),
+            import_configuration: true,
+        },
+    ];
+
+    for row in &rows {
+        let case = row.case;
+        // One emulator per row, so no row inherits another's stores or jobs.
+        let emulator = Emulator::new();
+        let datastore_id = datastore_in_phase(&emulator, case, row.phase).await;
+        let before = job_count(&emulator, case, &datastore_id).await;
+        assert_eq!(
+            before, 0,
+            "case {case:?}: expected a store holding no import jobs before the call, got {before}"
+        );
+
+        let refused = emulator
+            .start_import_job(&datastore_id, refused_import_request(row))
+            .await;
+        assert_eq!(
+            refused.status, 409,
+            "case {case:?}: expected HTTP 409, got {refused:?}"
+        );
+        assert_eq!(
+            refused.error_code, "ConflictException",
+            "case {case:?}: expected ConflictException, got {refused:?}"
+        );
+        assert_eq!(
+            refused.string(&["message"]),
+            DATASTORE_NOT_ACTIVE_MESSAGE,
+            "case {case:?}: expected the not-ACTIVE sentence, got {refused:?}"
+        );
+        assert!(
+            refused.field(&["jobId"]).is_null(),
+            "case {case:?}: a refusal must mint no jobId, got {refused:?}"
+        );
+
+        // Nothing was persisted: the store holds exactly as many jobs as it did before,
+        // so no later read can report a job against a store that never served it.
+        let after = job_count(&emulator, case, &datastore_id).await;
+        assert_eq!(
+            after, before,
+            "case {case:?}: expected the refusal to persist no job (held {before} before), got {after}"
+        );
+    }
+}
+
+/// RULE (above), through the REAL clock and the issue's own sequence: an import that
+/// races the activation the create promised is refused, and the refusal costs the caller
+/// nothing — the creation still lands, and the SAME `clientToken` then submits exactly
+/// one job, which reads back through `GetDICOMImportJob`.
+///
+/// Rows span how many imports race the one creation, which is the loop a client retrying
+/// a submit would run; the idempotency token is the same across a row's attempts, so a
+/// refusal that had consumed it would show up as a second job or a missing one.
+#[tokio::test]
+async fn an_import_racing_the_activation_is_refused_and_its_token_survives() {
+    for attempts in [1_usize, 2, 3] {
+        let case = format!("attempts={attempts}");
+        let emulator = Emulator::new();
+        let started = Instant::now();
+        let created = emulator
+            .create_datastore(json!({
+                "datastoreName": "race.import.store",
+                "clientToken": format!("race-import-store-{attempts}"),
+            }))
+            .await;
+        assert_eq!(
+            created.status, 200,
+            "case {case:?}: expected HTTP 200 from CreateDatastore, got {created:?}"
+        );
+        assert_eq!(
+            created.string(&["datastoreStatus"]),
+            "CREATING",
+            "case {case:?}: expected CREATING from CreateDatastore, got {created:?}"
+        );
+        let datastore_id = created.string(&["datastoreId"]);
+        let request = json!({
+            "clientToken": format!("race-import-token-{attempts}"),
+            "dataAccessRoleArn": "arn:aws:iam::000000000000:role/ImportRole",
+            "inputS3Uri": "s3://imaging-in/studies/",
+            "outputS3Uri": "s3://imaging-out/results/",
+        });
+
+        // Whether any racing attempt was already admitted, i.e. the clock settled the
+        // store before the attempt landed. The post-settle assertions below then read
+        // the idempotent repeat of a job that has been running for a while, rather than
+        // a fresh submit, so they must not insist on `SUBMITTED`.
+        let mut admitted_in_the_race = false;
+        for attempt in 0..attempts {
+            let answer = emulator
+                .start_import_job(&datastore_id, request.clone())
+                .await;
+            let elapsed = started.elapsed();
+            // A disjunction so no row is silently skipped, and BOTH arms pin an answer:
+            // inside the activation span the import must be the conflict; past it the
+            // clock has settled the store, so the only other admissible answer is the
+            // submitted job itself — never, say, a 500.
+            let refused = answer.status == 409 && answer.error_code == "ConflictException";
+            let admitted = elapsed >= DATASTORE_ACTIVATION_DELAY
+                && answer.status == 200
+                && answer.string(&["jobStatus"]) == "SUBMITTED";
+            assert!(
+                refused || admitted,
+                "case {case:?}, attempt {attempt}: expected 409 ConflictException {elapsed:?} into the activation span (the span is {DATASTORE_ACTIVATION_DELAY:?}), or SUBMITTED past it, got {answer:?}"
+            );
+            admitted_in_the_race |= admitted;
+        }
+
+        // The creation the imports raced still falls due.
+        tokio::time::sleep(SETTLE_MULTIPLE * DATASTORE_ACTIVATION_DELAY).await;
+        let settled = emulator.get_datastore(&datastore_id).await;
+        assert_eq!(
+            settled.string(&["datastoreProperties", "datastoreStatus"]),
+            "ACTIVE",
+            "case {case:?}: expected ACTIVE after the activation span, got {settled:?}"
+        );
+
+        // And now the SAME token is admitted: the refusal consumed neither the token nor
+        // a job slot.
+        let submitted = emulator
+            .start_import_job(&datastore_id, request.clone())
+            .await;
+        assert_eq!(
+            submitted.status, 200,
+            "case {case:?}: expected HTTP 200 once the store is ACTIVE, got {submitted:?}"
+        );
+        let reported_status = submitted.string(&["jobStatus"]);
+        if admitted_in_the_race {
+            // The token already named a job, so this is the idempotent repeat reporting
+            // that job's CURRENT status — whichever modelled value the clock has carried
+            // it to (`smithy_query(query="shape",shape="JobStatus")`).
+            assert!(
+                JOB_STATUS_VALUES.contains(&reported_status.as_str()),
+                "case {case:?}: expected a modelled JobStatus from the idempotent repeat, got {submitted:?}"
+            );
+        } else {
+            assert_eq!(
+                reported_status, "SUBMITTED",
+                "case {case:?}: expected SUBMITTED, got {submitted:?}"
+            );
+        }
+        let job_id = submitted.string(&["jobId"]);
+
+        // The ledger entry the admitted submit wrote is LIVE, not dangling: repeating the
+        // same token names the same job rather than minting a second one.
+        let repeated = emulator.start_import_job(&datastore_id, request).await;
+        assert_eq!(
+            repeated.status, 200,
+            "case {case:?}: expected HTTP 200 repeating the token, got {repeated:?}"
+        );
+        assert_eq!(
+            repeated.string(&["jobId"]),
+            job_id,
+            "case {case:?}: expected the repeat to name {job_id:?}, got {repeated:?}"
+        );
+
+        // Exactly one job exists: the refused attempts left nothing behind, and the one
+        // that was admitted reads back.
+        let held = job_count(&emulator, &case, &datastore_id).await;
+        assert_eq!(
+            held, 1,
+            "case {case:?}: expected the store to hold exactly the one admitted job, got {held}"
+        );
+        let read = emulator.get_import_job(&datastore_id, &job_id).await;
+        assert_eq!(
+            read.status, 200,
+            "case {case:?}: expected the admitted job to read back, got {read:?}"
+        );
+        assert_eq!(
+            read.string(&["jobProperties", "jobId"]),
+            job_id,
+            "case {case:?}: expected GetDICOMImportJob to report {job_id:?}, got {read:?}"
+        );
+        assert_eq!(
+            read.string(&["jobProperties", "datastoreId"]),
+            datastore_id,
+            "case {case:?}: expected the job to name its data store, got {read:?}"
         );
     }
 }

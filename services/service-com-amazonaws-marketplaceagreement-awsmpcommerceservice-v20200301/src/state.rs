@@ -731,6 +731,21 @@ pub const PAYMENT_REQUEST_STATUS_CANCELLED: &str = "CANCELLED";
 /// [`validation_exception`] and the modelled `INVALID_PARTY_TYPE` reason.
 pub const PARTY_TYPE_VALUES: &[&str] = &[PARTY_TYPE_PROPOSER, PARTY_TYPE_ACCEPTOR];
 
+/// The other `agreementType` the model documents beside [`AGREEMENT_TYPE`]: "The
+/// type of agreement. Values are `PurchaseAgreement` or
+/// `VendorInsightsAgreement`" (`smithy_query(query="doc",
+/// shape="DescribeAgreementOutput", member="agreementType")`). No operation of
+/// this crate mints one, so it is a value an `agreementType` selector admits and
+/// selects nothing with.
+pub const AGREEMENT_TYPE_VENDOR_INSIGHTS: &str = "VendorInsightsAgreement";
+
+/// Every value an `agreementType` admits, from the two the model documents.
+///
+/// `AgreementType` is modelled a plain string (`@length(1, 64)`, `^[A-Za-z]+$`)
+/// rather than an enum, so the boundary validator cannot refuse a word outside
+/// the documented pair — the handler does, with [`selector_value_refusal`].
+pub const AGREEMENT_TYPE_VALUES: &[&str] = &[AGREEMENT_TYPE, AGREEMENT_TYPE_VENDOR_INSIGHTS];
+
 /// The `AgreementCancellationRequestStatus` a cancellation request is created
 /// in: "The cancellation request is created in PENDING_APPROVAL status, at which
 /// point the buyer can review it"
@@ -2348,6 +2363,36 @@ pub fn validation_exception(reason: &str, path: impl Into<String>) -> Validation
     }
 }
 
+/// Refuse a selector whose value lies outside the fixed set this service
+/// publishes for that member, BEFORE anything is selected.
+///
+/// A selector of this service is RESOLVED, not merely matched: `catalog` names a
+/// catalog AWS Marketplace exposes — it exposes exactly one, [`CATALOG`] — and
+/// `agreementType` one of the types the model documents
+/// ([`AGREEMENT_TYPE_VALUES`]). A value outside either set names nothing this
+/// service could ever hold, so it is not a filter that happens to select
+/// nothing: it is a value the member does not admit, and the modelled refusal is
+/// the `INVALID_CATALOG` / `INVALID_AGREEMENT_TYPE` reason a client branches on.
+/// Both shapes are pattern-constrained strings rather than enums, so nothing
+/// before a handler refuses them.
+///
+/// Neither check reads the store, so the answer is the same whatever the store
+/// holds, including nothing at all. A value INSIDE the set is left to the
+/// listing to match, so an `agreementType` no stored agreement carries still
+/// reports an empty page.
+pub fn selector_value_refusal(
+    agreement_type: Option<&str>,
+    catalog: Option<&str>,
+) -> Option<ValidationException> {
+    if catalog.is_some_and(|catalog| catalog != CATALOG) {
+        return Some(validation_exception("INVALID_CATALOG", "catalog"));
+    }
+    if agreement_type.is_some_and(|kind| !AGREEMENT_TYPE_VALUES.contains(&kind)) {
+        return Some(validation_exception("INVALID_AGREEMENT_TYPE", "agreementType"));
+    }
+    None
+}
+
 /// The `ValidationException` for constraint violations the boundary validator
 /// found in the request, BEFORE any handler ran.
 ///
@@ -2729,6 +2774,28 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
                 provisioned_at,
             })
             .collect()
+    }
+
+    /// Refuse an `agreementId` selector that names no agreement this store
+    /// holds.
+    ///
+    /// The same resolution [`selector_value_refusal`] applies to the members
+    /// whose value set is fixed, applied to the one that names a RESOURCE: an id
+    /// no agreement of this account carries is not a filter that selects
+    /// nothing, so a caller can tell "this agreement has no such records" from
+    /// "this agreement does not exist". The listing operations model no
+    /// `ResourceNotFoundException`, so the refusal is their modelled
+    /// `ValidationException` carrying the `INVALID_AGREEMENT_ID` reason.
+    pub fn unknown_agreement_refusal(
+        &self,
+        agreement_id: Option<&str>,
+    ) -> Option<ValidationException> {
+        match agreement_id {
+            Some(id) if !self.agreements.contains_key(id) => {
+                Some(validation_exception("INVALID_AGREEMENT_ID", "agreementId"))
+            }
+            _ => None,
+        }
     }
 
     /// The payment request `token` already sent, if any.

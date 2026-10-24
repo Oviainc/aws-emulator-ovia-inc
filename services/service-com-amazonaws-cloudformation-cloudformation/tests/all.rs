@@ -39,6 +39,8 @@ mod error_envelope;
 mod extension_registry;
 #[path = "all/generated_physical_names.rs"]
 mod generated_physical_names;
+#[path = "all/iam_capability_gate.rs"]
+mod iam_capability_gate;
 #[path = "all/list_stack_resources.rs"]
 mod list_stack_resources;
 #[path = "all/nested_resource_outputs.rs"]

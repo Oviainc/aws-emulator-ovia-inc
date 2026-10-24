@@ -1057,6 +1057,41 @@ pub const SNAPSHOT_TYPE_MANUAL: &str = "manual";
 /// member="SnapshotType")` — "Valid Values: automated | manual".
 pub const SNAPSHOT_TYPE_AUTOMATED: &str = "automated";
 
+/// How many snapshot identifiers ONE batch snapshot operation accepts before it
+/// refuses the whole call with its own modelled limit fault.
+///
+/// Source: `smithy_query(query="shape",
+/// shape="BatchModifyClusterSnapshotsLimitExceededFault")` — "The maximum number
+/// for snapshot identifiers has been reached. The limit is 100."
+pub const BATCH_SNAPSHOT_IDENTIFIER_LIMIT: usize = 100;
+
+/// The `SnapshotErrorMessage$FailureCode` a batch snapshot operation reports for
+/// an entry naming no snapshot this store holds.
+///
+/// `SnapshotErrorMessage$FailureCode` is "the failure code for the error"
+/// (`smithy_query(query="shape", shape="SnapshotErrorMessage")`), and a batch
+/// operation reports per entry the same condition the one-snapshot operation
+/// raises as a fault — so the code is that fault's own wire code,
+/// `smithy_query(query="shape", shape="ClusterSnapshotNotFoundFault")` →
+/// `awsQueryError` code `ClusterSnapshotNotFound`.
+pub const SNAPSHOT_FAILURE_NOT_FOUND: &str = "ClusterSnapshotNotFound";
+
+/// The `SnapshotErrorMessage$FailureCode` for an entry naming a snapshot whose
+/// state carries nothing the call can act on.
+///
+/// The same reasoning as [`SNAPSHOT_FAILURE_NOT_FOUND`]:
+/// `smithy_query(query="shape", shape="InvalidClusterSnapshotStateFault")` →
+/// `awsQueryError` code `InvalidClusterSnapshotState`.
+pub const SNAPSHOT_FAILURE_INVALID_STATE: &str = "InvalidClusterSnapshotState";
+
+/// The `SnapshotErrorMessage$FailureCode` for an entry whose snapshot would fall
+/// outside the requested retention window.
+///
+/// The same reasoning as [`SNAPSHOT_FAILURE_NOT_FOUND`]:
+/// `smithy_query(query="shape", shape="InvalidRetentionPeriodFault")` →
+/// `awsQueryError` code `InvalidRetentionPeriodFault`.
+pub const SNAPSHOT_FAILURE_INVALID_RETENTION_PERIOD: &str = "InvalidRetentionPeriodFault";
+
 /// How many clusters the store holds before `CreateCluster` refuses with the
 /// modelled `ClusterQuotaExceededFault`.
 ///

@@ -100,6 +100,19 @@ pub const MAX_CHALLENGES_PER_CONNECTOR: usize = 1_000;
 /// create call cost unbounded memory.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
+/// How long a tag key may be. `Tags` carries no `@length` on its key, so the bound is the
+/// AWS-wide tagging one: a key is 1 to 128 characters.
+pub const MAX_TAG_KEY_LENGTH: usize = 128;
+
+/// How long a tag value may be: 0 to 256 characters, the AWS-wide bound. An EMPTY value is
+/// a tag a caller may set, which is why only the key has a lower bound.
+pub const MAX_TAG_VALUE_LENGTH: usize = 256;
+
+/// The tag-key namespace Amazon Web Services keeps for the tags it sets itself, which a
+/// caller may therefore not write. Matched without regard to case, so no spelling of it
+/// gets a caller-set tag into the namespace.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
 /// `ServiceCode` carried by this service's `ServiceQuotaExceededException`: the originating
 /// service, which is this service's own endpoint prefix.
 pub const SERVICE_CODE: &str = ARN_SERVICE;
@@ -411,6 +424,94 @@ pub fn resource_type_of(resource_arn: &str) -> &'static str {
     } else {
         RESOURCE_TYPE_CONNECTOR
     }
+}
+
+/// Whether `character` is one a tag key or a tag value may carry.
+///
+/// AWS's tag alphabet is letters, numbers, spaces and the characters `_ . : / = + - @`, and
+/// it is not restricted to ASCII: "letters" and "numbers" of any script are allowed, which
+/// is what [`char::is_alphanumeric`] answers. "Spaces" are the Unicode separators — a tab or
+/// a newline is a control character rather than a space, and [`char::is_whitespace`] answers
+/// for those too, so they are excluded here.
+fn is_tag_character(character: char) -> bool {
+    character.is_alphanumeric()
+        || (character.is_whitespace() && !character.is_control())
+        || matches!(character, '_' | '.' | ':' | '/' | '=' | '+' | '-' | '@')
+}
+
+/// Why this one tag may not be stored, as the sentence to refuse the request with, or `None`
+/// when the pair is one a caller may set.
+///
+/// The key is checked before the value, and each half's length before its characters, so the
+/// text a message quotes back is always within the bound the quote came from.
+pub fn tag_entry_rejection(key: &str, value: &str) -> Option<String> {
+    let key_length = key.chars().count();
+    if key_length == 0 {
+        return Some(format!(
+            "Tags carries an empty tag key; a tag key is 1 to {MAX_TAG_KEY_LENGTH} characters"
+        ));
+    }
+    if key_length > MAX_TAG_KEY_LENGTH {
+        return Some(format!(
+            "Tags carries a tag key of {key_length} characters; a tag key is 1 to \
+             {MAX_TAG_KEY_LENGTH} characters"
+        ));
+    }
+    if let Some(character) = key.chars().find(|character| !is_tag_character(*character)) {
+        return Some(format!(
+            "the key of tag `{key}` carries {character:?}; a tag key may use only letters, \
+             numbers, spaces and the characters _ . : / = + - @"
+        ));
+    }
+    if key
+        .get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
+    {
+        return Some(format!(
+            "tag key `{key}` uses the `{RESERVED_TAG_KEY_PREFIX}` prefix, which is reserved \
+             for the tags Amazon Web Services sets itself"
+        ));
+    }
+    let value_length = value.chars().count();
+    if value_length > MAX_TAG_VALUE_LENGTH {
+        return Some(format!(
+            "the value of tag `{key}` is {value_length} characters; a tag value is at most \
+             {MAX_TAG_VALUE_LENGTH} characters"
+        ));
+    }
+    if let Some(character) = value.chars().find(|character| !is_tag_character(*character)) {
+        return Some(format!(
+            "the value of tag `{key}` carries {character:?}; a tag value may use only letters, \
+             numbers, spaces and the characters _ . : / = + - @"
+        ));
+    }
+    None
+}
+
+/// Why the `Tags` of a request may not be stored, or `None` when every entry is one a caller
+/// may set.
+///
+/// `Tags` carries no modelled `@length` or `@pattern` on the map or on either half of an
+/// entry, so nothing is refused at the request boundary and every tagging rule this service
+/// holds a caller to lives here: the per-resource count ([`MAX_TAGS_PER_RESOURCE`]) and then
+/// each entry ([`tag_entry_rejection`]).
+///
+/// The count is answered first, so an oversized map is refused for being oversized rather
+/// than for whichever of its entries happened to be looked at; the entries are then walked
+/// in key order, so the same map is always refused with the same sentence however the
+/// request's own map iterates.
+pub fn tags_rejection<'a>(tags: impl IntoIterator<Item = (&'a str, &'a str)>) -> Option<String> {
+    let mut entries: Vec<(&str, &str)> = tags.into_iter().collect();
+    if entries.len() > MAX_TAGS_PER_RESOURCE {
+        return Some(format!(
+            "Tags carries {} entries; a resource may have at most {MAX_TAGS_PER_RESOURCE}",
+            entries.len()
+        ));
+    }
+    entries.sort_unstable();
+    entries
+        .into_iter()
+        .find_map(|(key, value)| tag_entry_rejection(key, value))
 }
 
 /// The region this request was signed for, read from its SigV4 credential scope.

@@ -32,7 +32,8 @@
 //!
 //! An application's SAP HANA databases are DERIVED from that same record rather than
 //! held beside it: the emulator discovers nothing on the registered instances, so the
-//! databases an application has are the ones its registration named
+//! databases an application has are the ones its registration named — by `DatabaseArn`
+//! or by a credential's `DatabaseName`
 //! ([`StoredApplication::databases`], projected onto the wire `DatabaseSummary` by
 //! [`ApplicationDatabase::summary`]) — which is what `ListDatabases` reports, so a
 //! database cannot outlive the registration it came from.
@@ -131,6 +132,11 @@ pub const DATABASE_TYPE_SYSTEM: &str = "SYSTEM";
 
 /// `DatabaseType` of a tenant database of a HANA system.
 pub const DATABASE_TYPE_TENANT: &str = "TENANT";
+
+/// The longest `DatabaseId` the model admits
+/// (`smithy_query(query="shape", shape="DatabaseSummary")`: `DatabaseId` length 1..300),
+/// which is what [`database_id_from_name`] cuts a derived id to.
+pub const MAX_DATABASE_ID_LENGTH: usize = 300;
 
 /// How long after the call that starts it a status change the clock owes falls due.
 ///
@@ -258,6 +264,8 @@ pub struct StoredApplication {
     /// The EC2 instances the registration named.
     pub instances: Vec<String>,
     pub credentials: Vec<ApplicationCredential>,
+    /// The ARN of the SAP HANA database the registration named, when it named one: one
+    /// of the databases of this application ([`StoredApplication::databases`]).
     pub database_arn: Option<String>,
     /// The change the clock owes this application, if one is outstanding.
     pub pending: Option<PendingTransition>,
@@ -334,15 +342,23 @@ impl StoredApplication {
     /// The SAP HANA databases of this application, in `DatabaseId` order.
     ///
     /// The emulator discovers nothing on the registered instances, so the databases an
-    /// application has are the ones its registration named: every
-    /// `ApplicationCredential` names, in `DatabaseName`, the SAP HANA database its
-    /// secret reaches, so there is one database per distinct name and an application
-    /// registered with no credentials has none. Two credentials naming the same database
-    /// are one database, since a database is identified by its name
-    /// ([`database_id_from_name`]).
+    /// application has are the ones its registration named — and a registration names a
+    /// database in EITHER of two places, so the set is the union of both:
     ///
-    /// `region` is the Region the application is registered in, which is the Region its
-    /// databases' ARNs carry.
+    /// * `DatabaseArn` names the application's SAP HANA database by ARN, whose last
+    ///   segment is the database's own name ([`database_name_from_arn`]); the ARN the
+    ///   registration gave it is that database's ARN, so it is the ARN reported for it
+    ///   rather than one minted here.
+    /// * every `ApplicationCredential` names, in `DatabaseName`, the SAP HANA database
+    ///   its secret reaches; a database no ARN named is a sub-resource of this
+    ///   application, so its ARN is minted from the two ids ([`database_arn`]).
+    ///
+    /// A database is identified by its name ([`database_id_from_name`]), so two of those
+    /// mentions naming the same database are ONE database — and an application whose
+    /// registration named none, by ARN or by credential, has none.
+    ///
+    /// `region` is the Region the application is registered in, which is the Region the
+    /// ARNs minted here carry.
     pub fn databases(&self, region: &str) -> Vec<ApplicationDatabase> {
         // The component a HANA database belongs to is the application's HANA component,
         // identified the way this service identifies every component: by the System ID
@@ -355,6 +371,27 @@ impl StoredApplication {
         // Keyed by `DatabaseId`, which both deduplicates and puts the databases in id
         // order, so a page taken over them is stable between calls.
         let mut databases: BTreeMap<String, ApplicationDatabase> = BTreeMap::new();
+        // The database the registration named by ARN goes in FIRST, so that when a
+        // credential names that same database the ARN the registration gave it is the
+        // one reported for it.
+        let named_by_arn = self
+            .database_arn
+            .as_deref()
+            .and_then(|arn| database_name_from_arn(arn).map(|name| (arn, name)));
+        if let Some((arn, database_name)) = named_by_arn {
+            let database_id = database_id_from_name(database_name);
+            databases.insert(
+                database_id.clone(),
+                ApplicationDatabase {
+                    application_id: self.id.clone(),
+                    component_id: component_id.clone(),
+                    arn: arn.to_string(),
+                    database_id,
+                    database_name: database_name.to_string(),
+                    database_type: database_type_for(database_name).to_string(),
+                },
+            );
+        }
         for credential in &self.credentials {
             let database_id = database_id_from_name(&credential.database_name);
             databases
@@ -387,10 +424,14 @@ pub struct ApplicationDatabase {
     pub component_id: Option<String>,
     /// The `DatabaseId`, derived from the name by [`database_id_from_name`].
     pub database_id: String,
-    /// The `DatabaseName` the registration's credential named.
+    /// The `DatabaseName` the registration named this database by: a credential's
+    /// `DatabaseName`, or the name the registration's `DatabaseArn` ends with.
     pub database_name: String,
     /// A `DatabaseType` value; see [`database_type_for`].
     pub database_type: String,
+    /// The ARN of the database: the one the registration's `DatabaseArn` gave it when it
+    /// named this database by ARN, and otherwise the sub-resource ARN minted from the
+    /// application and database ids ([`database_arn`]).
     pub arn: String,
 }
 
@@ -1123,9 +1164,11 @@ pub fn database_arn(region: &str, application_id: &str, database_id: &str) -> St
 ///
 /// A database is identified by its name, so its id is a function of that name: every
 /// character the model's `DatabaseId` pattern (`[\w\d]+$`) does not admit is replaced by
-/// `_`, which that pattern does admit. So a name of any form yields an id of the
-/// modelled form, the same name always yields the same id, and the id is no longer than
-/// the name (`DatabaseName` is at most 100 characters, `DatabaseId` at most 300).
+/// `_`, which that pattern does admit, and the result is cut to the modelled
+/// `DatabaseId` length bound (1..300). So a name of any form yields an id of the
+/// modelled form and the same name always yields the same id. A `DatabaseName` is at
+/// most 100 characters, so only a name taken off a longer ARN segment
+/// ([`database_name_from_arn`]) can reach that cut.
 pub fn database_id_from_name(database_name: &str) -> String {
     database_name
         .chars()
@@ -1136,7 +1179,21 @@ pub fn database_id_from_name(database_name: &str) -> String {
                 '_'
             }
         })
+        .take(MAX_DATABASE_ID_LENGTH)
         .collect()
+}
+
+/// The name the SAP HANA database ARN `database_arn` names its database by: the last
+/// non-empty segment of the ARN, the `:`- and `/`-separated part that carries the name
+/// of the resource an ARN names (a database ARN minted by [`database_arn`] ends with the
+/// `DatabaseId`).
+///
+/// `None` when nothing past the ARN's separators is non-empty, so the ARN names no
+/// database this service can identify and no database is derived from it.
+pub fn database_name_from_arn(database_arn: &str) -> Option<&str> {
+    database_arn
+        .split([':', '/'])
+        .rfind(|segment| !segment.is_empty())
 }
 
 /// The `DatabaseType` of the SAP HANA database named `database_name`.

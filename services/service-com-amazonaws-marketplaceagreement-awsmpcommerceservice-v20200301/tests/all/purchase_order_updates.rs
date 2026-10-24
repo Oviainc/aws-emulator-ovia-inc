@@ -598,18 +598,13 @@ async fn the_charge_report_is_computed_from_the_agreement_that_holds_the_charge(
             expected: first_charges.len() + second_charges.len(),
         },
         Selected {
-            case: "a catalog no agreement is created in",
-            request: json!({"catalog": "AWSMarketplace.test"}),
-            expected: 0,
-        },
-        Selected {
             case: "one agreement and the type it carries",
             request: json!({"agreementId": first, "agreementType": AGREEMENT_TYPE}),
             expected: first_charges.len(),
         },
         Selected {
-            case: "one agreement and a catalog it is not in",
-            request: json!({"agreementId": first, "catalog": "AWSMarketplace.test"}),
+            case: "one agreement and an agreement type it does not carry",
+            request: json!({"agreementId": first, "agreementType": "VendorInsightsAgreement"}),
             expected: 0,
         },
     ];

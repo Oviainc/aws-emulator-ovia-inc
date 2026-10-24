@@ -48,7 +48,7 @@ fn unheld_datastore_id() -> String {
 
 /// `GET /listDICOMImportJobs/datastore/{datastoreId}` with the query string `query`
 /// (`smithy_query(query="operation",operation="ListDICOMImportJobs")`).
-async fn list_jobs(emulator: &Emulator, datastore_id: &str, query: &str) -> Answer {
+pub(crate) async fn list_jobs(emulator: &Emulator, datastore_id: &str, query: &str) -> Answer {
     let uri = if query.is_empty() {
         format!("/listDICOMImportJobs/datastore/{datastore_id}")
     } else {
@@ -58,7 +58,7 @@ async fn list_jobs(emulator: &Emulator, datastore_id: &str, query: &str) -> Answ
 }
 
 /// The `jobSummaries` of one answer, as JSON objects.
-fn summaries(answer: &Answer) -> Vec<Value> {
+pub(crate) fn summaries(answer: &Answer) -> Vec<Value> {
     answer
         .field(&["jobSummaries"])
         .as_array()

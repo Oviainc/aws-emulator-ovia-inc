@@ -17,6 +17,8 @@ mod commitment_bounds;
 mod offering_catalog;
 #[path = "all/offering_product_type_coverage.rs"]
 mod offering_product_type_coverage;
+#[path = "all/offering_rate_catalog.rs"]
+mod offering_rate_catalog;
 #[path = "all/queued_plan_wire_rules.rs"]
 mod queued_plan_wire_rules;
 #[path = "all/queued_purchase_deletion.rs"]

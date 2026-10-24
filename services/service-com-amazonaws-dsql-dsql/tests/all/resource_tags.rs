@@ -71,7 +71,7 @@ async fn list_tags(dsql: &Dsql, arn: &str) -> Answer {
 /// request carrying no `tagKeys` pair carries no value for a `@required`
 /// `@httpQuery` member, which is what tells this route from the other operations
 /// bound to the same path, so it names no operation at all.
-async fn untag(dsql: &Dsql, arn: &str, keys: &[String]) -> Answer {
+pub async fn untag(dsql: &Dsql, arn: &str, keys: &[String]) -> Answer {
     assert!(
         !keys.is_empty(),
         "UntagResource is addressed with at least one tagKeys pair"

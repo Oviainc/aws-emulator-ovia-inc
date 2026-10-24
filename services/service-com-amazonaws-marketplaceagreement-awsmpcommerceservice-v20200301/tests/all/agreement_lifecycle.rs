@@ -1405,14 +1405,25 @@ async fn a_search_selects_stored_agreements_by_the_documented_filters() {
         );
     }
 
-    // A catalog no agreement was created in selects nothing.
+    // AWS Marketplace exposes exactly one catalog, so a `catalog` naming
+    // another one is not a selector that matches nothing: it is refused, which
+    // `selector_resolution.rs` pins over every operation carrying the member.
     let other_catalog = search(&router, json!({"catalog": "SomeOtherCatalog"})).await;
     assert_eq!(
-        other_catalog.body["agreementViewSummaries"]
-            .as_array()
-            .map(Vec::len),
-        Some(0),
-        "an agreement is created in the AWSMarketplace catalog only, got {:?}",
+        other_catalog.status, 400,
+        "an agreement is created in the AWSMarketplace catalog only, got {} with {:?}",
+        other_catalog.status, other_catalog.body
+    );
+    assert_eq!(
+        other_catalog.error_code(),
+        "ValidationException",
+        "a catalog AWS Marketplace does not expose is a ValidationException, got {:?}",
+        other_catalog.body
+    );
+    assert_eq!(
+        other_catalog.reason(),
+        "INVALID_CATALOG",
+        "the refusal carries the reason naming the member, got {:?}",
         other_catalog.body
     );
 

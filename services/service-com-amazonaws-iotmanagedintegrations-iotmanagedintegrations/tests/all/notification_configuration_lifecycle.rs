@@ -148,12 +148,20 @@ async fn call_in(
 
 /// The create request body of a destination called `name`, carrying only the four required
 /// members. The ARNs satisfy the modelled `DeliveryDestinationArn` pattern
-/// (`^arn:aws:[0-9a-zA-Z]+:[0-9a-zA-Z-]+:[0-9]+:[0-9a-zA-Z]+/[0-9a-zA-Z._-]+$`).
+/// (`^arn:aws:[0-9a-zA-Z]+:[0-9a-zA-Z-]+:[0-9]+:[0-9a-zA-Z]+/[0-9a-zA-Z._-]+$`), and the
+/// delivery target lives in the SAME region as the call, which is what a destination
+/// requires of it.
 fn destination_request(name: &str) -> Value {
+    destination_request_in(REGION, name)
+}
+
+/// [`destination_request`] whose delivery target lives in `region`, so a destination can
+/// be created through another region's endpoint.
+fn destination_request_in(region: &str, name: &str) -> Value {
     json!({
         "Name": name,
         "DeliveryDestinationArn":
-            "arn:aws:kinesis:us-east-1:123456789012:stream/notifications",
+            format!("arn:aws:kinesis:{region}:123456789012:stream/notifications"),
         "DeliveryDestinationType": DELIVERY_DESTINATION_TYPE_VALUES[0],
         "RoleArn": "arn:aws:iam::123456789012:role/managed-integrations",
     })
@@ -391,7 +399,7 @@ async fn a_create_naming_a_destination_that_does_not_exist_is_refused() {
     let elsewhere = create_destination_in(
         &router,
         "eu-central-1",
-        destination_request("elsewhere.stream"),
+        destination_request_in("eu-central-1", "elsewhere.stream"),
     )
     .await;
     assert_eq!(

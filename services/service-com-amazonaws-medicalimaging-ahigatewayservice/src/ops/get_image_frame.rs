@@ -15,12 +15,17 @@
 //! gets `image/jph`, and any other UID the documented default,
 //! `application/octet-stream`.
 //!
-//! A REPORTING operation (`@readonly` in the model), so it writes nothing of its own.
-//! Like every handler it calls
+//! Serving the pixel data is itself an ACCESS of the image set, and the one piece of
+//! state this handler writes is that access: the image set's `lastAccessedAt`
+//! ([`crate::state::ImageSet::record_access`]) is what the service reports for "when the
+//! image set was last accessed", so a call that hands a caller the content the image set
+//! holds is exactly the event that member names. Nothing else is written: no status is
+//! moved, no version minted, no pixel data changed. Like every handler it calls
 //! [`crate::state::ComAmazonawsMedicalimagingAhigatewayserviceState::advance_clock`]
 //! first, which materialises only what the CLOCK already owed at that instant — the
 //! completion of a copy, which is what delivers pixel data to the destination image
-//! set it was writing.
+//! set it was writing. A call that serves NO pixel data (an absent data store, image
+//! set or frame) records no access: there was none.
 //!
 //! ---
 //!
@@ -198,12 +203,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
             })?;
 
-        Ok(GetImageFrameOutput {
+        let output = GetImageFrameOutput {
             image_frame_blob: frame.pixel_data.clone(),
             content_type: Some(
                 crate::state::image_frame_content_type(frame.transfer_syntax_uid.as_deref())
                     .to_string(),
             ),
-        })
+        };
+
+        // The pixel data WAS served, so the image set holding it was accessed at this
+        // instant: that is the event `lastAccessedAt` reports, and it is recorded on the
+        // image SET because content belongs to the image set rather than to one version
+        // of it. Reached again mutably only now, past every refusal, so a call that
+        // served nothing recorded nothing.
+        if let Some(image_set) = store
+            .datastores
+            .get_mut(&input.datastore_id)
+            .and_then(|datastore| datastore.image_sets.get_mut(&input.image_set_id))
+        {
+            image_set.record_access(now);
+        }
+
+        Ok(output)
     }
 }

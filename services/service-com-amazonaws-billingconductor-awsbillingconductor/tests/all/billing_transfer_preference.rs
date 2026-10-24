@@ -30,7 +30,10 @@
 //!   `ConflictExceptionReason` enumerates, and the plan is still there afterwards;
 //! * `ClientToken` is `@idempotencyToken`, so a retry "completes successfully without
 //!   performing any further actions": it answers with the preference the first call
-//!   recorded and moves nothing.
+//!   recorded and moves nothing. That replay is scoped to the billing transfer the
+//!   recorded call addressed, because the preference is per transfer: the same token
+//!   carried against ANOTHER transfer is a different request, applied there, and leaves
+//!   the first transfer's preference and instant alone.
 //!
 //! Every table's rows differ along what the rule generalises over: the form of the
 //! transfer ARN (direction `inbound`/`outbound`, the shortest and the longest
@@ -849,6 +852,107 @@ async fn a_retried_client_token_performs_no_further_action() {
             &transfer,
             retry["Enabled"].as_bool().unwrap_or_default(),
             applied_plan.as_deref(),
+        );
+    }
+}
+
+/// RULE: the preference is per BILLING TRANSFER, so a `ClientToken`'s replay is scoped to
+/// the transfer the call it recorded addressed — the same token carried against another
+/// transfer is a different request, recorded for THAT transfer, and the first transfer's
+/// preference and `LastModifiedTime` are untouched by it.
+#[tokio::test]
+async fn a_client_token_replays_only_for_the_transfer_it_recorded() {
+    let em = Emulator::new();
+    let first_plan = em.create_plan("setup", "SharedTokenPlanOne").await;
+    let second_plan = em.create_plan("setup", "SharedTokenPlanTwo").await;
+
+    // The rows differ in the form of the `ClientToken` (the modelled `^[a-zA-Z0-9-]+$` at
+    // its length minimum of 1, a hyphenated token, and one at the length maximum of 64)
+    // and in the form of the two preferences the shared token carries: disabled, enabled
+    // naming a plan by full ARN, enabled naming one by its bare id, and enabled naming a
+    // plan Amazon Web Services owns.
+    let rows: Vec<(&str, String, Value, Value)> = vec![
+        (
+            "a one-character token: disabled here, enabled by full ARN there",
+            "b".to_string(),
+            json!({ "Enabled": false }),
+            json!({ "Enabled": true, "PricingPlanArn": &first_plan }),
+        ),
+        (
+            "a hyphenated token: enabled by bare id here, by another plan's ARN there",
+            "shared-token-0002".to_string(),
+            json!({ "Enabled": true, "PricingPlanArn": bare_id(&first_plan) }),
+            json!({ "Enabled": true, "PricingPlanArn": &second_plan }),
+        ),
+        (
+            "a 64-character token: an AWS-managed plan here, disabled there",
+            "S".repeat(64),
+            json!({ "Enabled": true, "PricingPlanArn": AWS_MANAGED_PLAN_IDS[1] }),
+            json!({ "Enabled": false }),
+        ),
+    ];
+
+    for (index, (case, token, here, there)) in rows.iter().enumerate() {
+        // Two transfers of this organization that differ in direction and in the length of
+        // the transfer id, both inside the modelled pattern.
+        let first = transfer_arn(&format!("tokenscope{index}"), "inbound", "aabbccdd");
+        let second = transfer_arn(
+            &format!("tokenscope{index}"),
+            "outbound",
+            "0123456789abcdef0123456789abcdef",
+        );
+
+        let here_plan = expected_plan(here);
+        let there_plan = expected_plan(there);
+        let here_enabled = here["Enabled"].as_bool().unwrap_or_default();
+        let there_enabled = there["Enabled"].as_bool().unwrap_or_default();
+
+        let recorded_here = em.set(case, &first, here, Some(token.as_str())).await;
+        let stamped_here =
+            assert_reports(case, &recorded_here, &first, here_enabled, here_plan.as_deref());
+
+        // The SAME token against the other transfer: a different request, so it is
+        // applied rather than answered with the first transfer's preference.
+        let recorded_there = em.set(case, &second, there, Some(token.as_str())).await;
+        assert_reports(
+            case,
+            &recorded_there,
+            &second,
+            there_enabled,
+            there_plan.as_deref(),
+        );
+        let read_there = em.read_back(case, &second).await;
+        assert_reports(
+            case,
+            &read_there,
+            &second,
+            there_enabled,
+            there_plan.as_deref(),
+        );
+
+        // And the first transfer still holds exactly what its own call recorded.
+        let read_here = em.read_back(case, &first).await;
+        let read_stamp =
+            assert_reports(case, &read_here, &first, here_enabled, here_plan.as_deref());
+        assert_eq!(
+            read_stamp, stamped_here,
+            "case {case:?}: the other transfer's write must not move this one's \
+             LastModifiedTime, got {read_here:?}"
+        );
+
+        // A retry on the transfer the token now records IS a retry: it answers what that
+        // call recorded, even asked for the other preference, and moves nothing.
+        let replayed = em.set(case, &second, here, Some(token.as_str())).await;
+        assert_eq!(
+            replayed, recorded_there,
+            "case {case:?}: a retry on the recorded transfer must answer what it recorded, \
+             got {replayed:?} after {recorded_there:?}"
+        );
+        let after = em.read_back(case, &second).await;
+        assert_eq!(
+            after, read_there,
+            "case {case:?}: a retry must leave the recorded preference alone, got {after:?} \
+             after {read_there:?}"
         );
     }
 }
