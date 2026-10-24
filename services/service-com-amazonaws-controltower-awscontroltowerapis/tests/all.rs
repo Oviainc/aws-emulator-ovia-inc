@@ -33,6 +33,8 @@ mod landing_zone_update;
 mod landing_zone_validation;
 #[path = "all/list_baselines.rs"]
 mod list_baselines;
+#[path = "all/list_tags_for_resource.rs"]
+mod list_tags_for_resource;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]

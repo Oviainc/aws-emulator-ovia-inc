@@ -28,21 +28,25 @@ use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
 };
 
 use crate::harness::{
-    call, call_in_region, emulator_with_engine, error_code, instance_arn, opt_in, ACCOUNT,
+    call, call_in_region, emulator_with_engine, error_code, instance_arn, opt_in,
 };
 
-/// The second account these fixtures use, so an `accountIds` selection has something to
-/// select away.
+/// Another account entirely, which this service cannot be asked about: `accountIds` is how
+/// an organization's MANAGEMENT account names a member account, and this emulator presents
+/// one standalone account and records no organization. Used below for the values that must
+/// be REFUSED, and for the catalog row that must be reported to nobody.
 const MEMBER_ACCOUNT: &str = "210987654321";
 
 /// The region the harness signs for, and so the regional endpoint every call below
 /// addresses unless it names another.
 const REGION: &str = "us-east-1";
 
-/// The account the emulator's own findings catalog is seeded for, and the ARN of the one
-/// database it holds: this service presents exactly one account of its own
-/// (`engine::emulator_account_id`).
-const SEEDED_ACCOUNT: &str = "000000000000";
+/// The ONE account this service answers for, taken from the engine rather than written out
+/// here: it owns every analysed database this service can report, including the one its own
+/// catalog is seeded with.
+fn own_account() -> &'static str {
+    ::engine::emulator_account_id()
+}
 
 /// The `lastRefreshTimestamp` the recorded rows carry, in epoch seconds — the form awsJson1_0
 /// renders a timestamp in.
@@ -109,10 +113,10 @@ fn storage(storage_type: &str, allocated: i32, iops: i32) -> DBStorageConfigurat
     }
 }
 
-/// The analysis output every fixture below reads: five analysed databases spanning both
-/// accounts, every `RDSInstanceFinding` plus the one finding only `RDSStorageFinding`
-/// declares, recommendations that save / grow / change nothing, and a row whose database
-/// configuration the analysis did not record.
+/// The analysis output every fixture below reads: five analysed databases of the account
+/// this service answers for, covering every `RDSInstanceFinding` plus the one finding only
+/// `RDSStorageFinding` declares, recommendations that save / grow / change nothing, and a
+/// row whose database configuration the analysis did not record.
 fn corpus() -> Vec<AnalysedResource> {
     vec![
         // Over-provisioned: the recommendation is a smaller DB instance class, so it saves.
@@ -120,7 +124,7 @@ fn corpus() -> Vec<AnalysedResource> {
         // vocabulary (`MemoryOverprovisioned` is a `FindingReasonCode`), so the partition
         // rule has something to drop.
         analysed_database(
-            ACCOUNT,
+            own_account(),
             "db:orders-writer",
             "Overprovisioned",
             &["CPUOverprovisioned", "MemoryOverprovisioned"],
@@ -154,7 +158,7 @@ fn corpus() -> Vec<AnalysedResource> {
         // Under-provisioned: the recommendation is LARGER, so the configuration changes but
         // nothing is saved.
         analysed_database(
-            ACCOUNT,
+            own_account(),
             "db:reports-primary",
             "Underprovisioned",
             &["MemoryUnderprovisioned"],
@@ -172,7 +176,7 @@ fn corpus() -> Vec<AnalysedResource> {
         // Optimized: nothing to change, so there is no recommendation option at all — and
         // the analysis recorded no database configuration for this row.
         analysed_database(
-            ACCOUNT,
+            own_account(),
             "db:audit-archive",
             "Optimized",
             &[],
@@ -184,7 +188,7 @@ fn corpus() -> Vec<AnalysedResource> {
         // The one finding only `RDSStorageFinding` declares: it is the STORAGE that is not
         // optimized, so the finding and the option belong to the storage members.
         analysed_database(
-            ACCOUNT,
+            own_account(),
             "cluster:ledger-cluster",
             "NotOptimized",
             &[
@@ -205,9 +209,9 @@ fn corpus() -> Vec<AnalysedResource> {
                 ..RdsDatabaseDetail::default()
             }),
         ),
-        // Another account's database, so an `accountIds` selection has something to drop.
+        // A fifth database of the same account, recorded with no reason code at all.
         analysed_database(
-            MEMBER_ACCOUNT,
+            own_account(),
             "db:billing-primary",
             "Overprovisioned",
             &[],
@@ -321,7 +325,7 @@ fn assert_members(case: &str, reported: &Value, expected: &Value) {
 async fn the_seeded_analysed_database_is_reported_from_its_catalog_row() {
     let (router, engine) = emulator_with_engine();
     opt_in(&router).await;
-    let seeded = db_arn(SEEDED_ACCOUNT, "orders-primary");
+    let seeded = db_arn(own_account(), "orders-primary");
     let before = catalog_size(&engine);
 
     let body = get_rds(&router, "the whole catalog", json!({})).await;
@@ -337,7 +341,7 @@ async fn the_seeded_analysed_database_is_reported_from_its_catalog_row() {
         // Stored: Overprovisioned, Medium risk, 300.00/month against a recommended 225.00.
         &json!({
             "resourceArn": seeded,
-            "accountId": SEEDED_ACCOUNT,
+            "accountId": own_account(),
             "engine": "postgres",
             "engineVersion": "15.4",
             "currentDBInstanceClass": "db.r6g.2xlarge",
@@ -560,15 +564,16 @@ async fn reason_codes_are_reported_on_the_member_that_can_carry_them() {
     }
 }
 
-/// The selection rule: a request reports the analysed databases of the resources it names, of
-/// the account it names, whose recommendation satisfies every filter it carries — and a
-/// member it omits selects nothing away. Each row differs along one of those dimensions.
+/// The selection rule: a request reports the analysed databases of the resources it names,
+/// owned by the one account this service answers for, whose recommendation satisfies every
+/// filter it carries — and a member it omits selects nothing away. Each row differs along one
+/// of those dimensions.
 #[tokio::test]
 async fn the_read_selects_by_resource_account_and_filter() {
     let (router, _engine, corpus) = emulator_with_corpus().await;
     let [writer, reports, archive, ledger, billing] =
         [0, 1, 2, 3, 4].map(|index| corpus[index].arn_in(REGION));
-    let seeded = db_arn(SEEDED_ACCOUNT, "orders-primary");
+    let seeded = db_arn(own_account(), "orders-primary");
 
     // (case, request, the ARNs expected in the order expected)
     let rows: Vec<(&str, Value, Vec<String>)> = vec![
@@ -595,18 +600,27 @@ async fn the_read_selects_by_resource_account_and_filter() {
             vec![writer.clone(), archive.clone(), billing.clone()],
         ),
         (
-            "one account",
-            json!({"accountIds": [MEMBER_ACCOUNT]}),
-            vec![billing.clone()],
-        ),
-        (
-            "the other account",
-            json!({"accountIds": [ACCOUNT]}),
+            "the caller's own account, named explicitly, selects nothing away",
+            json!({"accountIds": [own_account()]}),
             vec![
+                seeded.clone(),
                 writer.clone(),
                 reports.clone(),
                 archive.clone(),
                 ledger.clone(),
+                billing.clone(),
+            ],
+        ),
+        (
+            "an empty accountIds list names no account and so selects nothing away",
+            json!({"accountIds": []}),
+            vec![
+                seeded.clone(),
+                writer.clone(),
+                reports.clone(),
+                archive.clone(),
+                ledger.clone(),
+                billing.clone(),
             ],
         ),
         (
@@ -702,14 +716,20 @@ async fn the_read_selects_by_resource_account_and_filter() {
             ],
         ),
         (
-            "an account and a resource ARN are ANDed",
-            json!({"accountIds": [ACCOUNT], "resourceArns": [writer.clone(), billing.clone()]}),
-            vec![writer.clone()],
+            "the caller's own account and two resource ARNs are ANDed",
+            json!({
+                "accountIds": [own_account()],
+                "resourceArns": [writer.clone(), billing.clone()],
+            }),
+            vec![writer.clone(), billing.clone()],
         ),
         (
-            "a database of another account",
-            json!({"accountIds": [ACCOUNT], "resourceArns": [billing.clone()]}),
-            Vec::new(),
+            "an account and a filter are ANDed",
+            json!({
+                "accountIds": [own_account()],
+                "filters": [{"name": "StorageFinding", "values": ["NotOptimized"]}],
+            }),
+            vec![ledger.clone()],
         ),
     ];
 
@@ -720,6 +740,150 @@ async fn the_read_selects_by_resource_account_and_filter() {
             wanted,
             "case {case:?}: expected {wanted:?}, got {body}"
         );
+    }
+}
+
+/// `accountIds` is the mechanism by which an organization's MANAGEMENT account names a
+/// MEMBER account, and this emulator presents one standalone account with no organization:
+/// a well-formed 12-digit id naming any other account asks for recommendations this service
+/// cannot report, so it is refused with `InvalidParameterValueException` (400) rather than
+/// used as a key to select catalog rows with. An analysed database another account owns is
+/// therefore reported to nobody — not to a read that names no account, not to one that names
+/// the caller's own, not to one whose filter its finding would match, and not to one that
+/// names its very ARN, which is answered as a resource this service holds no recommendation
+/// for.
+#[tokio::test]
+async fn another_account_is_refused_and_its_analysed_database_is_reported_to_nobody() {
+    let (router, engine, corpus) = emulator_with_corpus().await;
+
+    // What the catalog holds for the account this service answers for: the database the
+    // emulator seeds plus the recorded corpus, in catalog order.
+    let mut own_databases = vec![db_arn(own_account(), "orders-primary")];
+    own_databases.extend(corpus.iter().map(|resource| resource.arn_in(REGION)));
+
+    // One more analysed database, owned by an account this service cannot be asked about —
+    // the state the catalog is in whenever an analysis recorded a member account's resource.
+    let foreign = analysed_database(
+        MEMBER_ACCOUNT,
+        "db:members-primary",
+        "Overprovisioned",
+        &["CPUOverprovisioned"],
+        "Low",
+        80.0,
+        40.0,
+        Some(RdsDatabaseDetail {
+            engine: Some("mysql".to_string()),
+            current_db_instance_class: Some("db.m6g.xlarge".to_string()),
+            recommended_db_instance_class: Some("db.m6g.large".to_string()),
+            ..RdsDatabaseDetail::default()
+        }),
+    );
+    record(&engine, std::slice::from_ref(&foreign));
+    let foreign_arn = foreign.arn_in(REGION);
+
+    // Every read that could reach that row reports it to nobody, and each still reports the
+    // caller's own databases. The last row also pins what a read that names that database's
+    // very ARN answers: nothing reported, and the row reported as a resource this service
+    // holds no recommendation for — exactly as an ARN nothing analysed is.
+    let no_recommendation = json!([{
+        "identifier": foreign_arn.clone(),
+        "code": NO_RECOMMENDATION_CODE,
+        "message": "Compute Optimizer has no Amazon Aurora or RDS database \
+                    recommendation for the resource this identifier names.",
+    }]);
+    let reads: Vec<(&str, Value, Vec<String>, Value)> = vec![
+        ("no selection", json!({}), own_databases.clone(), json!([])),
+        (
+            "the caller's own account",
+            json!({"accountIds": [own_account()]}),
+            own_databases.clone(),
+            json!([]),
+        ),
+        (
+            "an empty account list",
+            json!({"accountIds": []}),
+            own_databases.clone(),
+            json!([]),
+        ),
+        (
+            "the filter the foreign row's own finding would match",
+            json!({"filters": [{"name": "InstanceFinding", "values": ["Overprovisioned"]}]}),
+            vec![
+                own_databases[0].clone(),
+                own_databases[1].clone(),
+                own_databases[5].clone(),
+            ],
+            json!([]),
+        ),
+        (
+            "the foreign database's own ARN",
+            json!({"resourceArns": [foreign_arn.clone()]}),
+            Vec::new(),
+            no_recommendation,
+        ),
+    ];
+    for (case, request, wanted, wanted_errors) in reads {
+        let body = get_rds(&router, case, request).await;
+        assert_eq!(
+            reported_arns(&body),
+            wanted,
+            "case {case:?}: expected {wanted:?} and never {foreign_arn}, got {body}"
+        );
+        assert_eq!(
+            body["errors"], wanted_errors,
+            "case {case:?}: expected errors {wanted_errors}, got {body}"
+        );
+    }
+
+    // Well-formed ids that are not the caller's: the account the row above belongs to, the
+    // documentation's own example account, an id one digit from the caller's own, and the
+    // extremes of the 12-digit range. Each is refused whatever else the request carries.
+    // (The wording of the refusal is pinned for every reader in `cross_account_requests`.)
+    let other_accounts = [
+        MEMBER_ACCOUNT,
+        "111122223333",
+        "123456789012",
+        "000000000001",
+        "999999999999",
+    ];
+    for account_id in other_accounts {
+        for (case, request) in [
+            ("alone", json!({"accountIds": [account_id]})),
+            (
+                "with that account's own database named",
+                json!({"accountIds": [account_id], "resourceArns": [foreign_arn.clone()]}),
+            ),
+            (
+                "with a database of the caller's own account named",
+                json!({
+                    "accountIds": [account_id],
+                    "resourceArns": [own_databases[0].clone()],
+                }),
+            ),
+            (
+                "with a filter",
+                json!({
+                    "accountIds": [account_id],
+                    "filters": [{"name": "Idle", "values": ["False"]}],
+                }),
+            ),
+            (
+                "with a page size",
+                json!({"accountIds": [account_id], "maxResults": 1}),
+            ),
+        ] {
+            let (status, body) =
+                call(&router, "GetRDSDatabaseRecommendations", request.clone()).await;
+            assert_eq!(
+                status, 400,
+                "case {account_id}/{case:?}: {request} must be refused, got {status}: {body}"
+            );
+            assert_eq!(
+                error_code(&body),
+                "InvalidParameterValueException",
+                "case {account_id}/{case:?}: expected InvalidParameterValueException, got {body}"
+            );
+        }
     }
 }
 
@@ -738,7 +902,7 @@ async fn idle_is_true_exactly_where_an_idle_recommendation_is_held() {
             IdleRecommendation {
                 resource_arn: Some(idle_database.clone()),
                 resource_type: Some("RDSDBInstance".to_string()),
-                account_id: Some(ACCOUNT.to_string()),
+                account_id: Some(own_account().to_string()),
                 finding: Some("Idle".to_string()),
                 ..IdleRecommendation::default()
             },
@@ -795,7 +959,7 @@ async fn the_look_back_preference_in_force_sets_the_reported_days() {
             "an account-scoped preference beats the account default",
             Some(json!({
                 "resourceType": "RdsDBInstance",
-                "scope": {"name": "AccountId", "value": ACCOUNT},
+                "scope": {"name": "AccountId", "value": own_account()},
                 "lookBackPeriod": "DAYS_93",
             })),
             "DAYS_93",
@@ -936,8 +1100,12 @@ async fn a_token_from_another_selection_is_refused() {
     // (case, the request the token is replayed in)
     let rows: Vec<(&str, Value)> = vec![
         (
-            "a different account selection",
-            json!({"maxResults": 1, "accountIds": [ACCOUNT], "nextToken": token.clone()}),
+            "a different resource selection",
+            json!({
+                "maxResults": 1,
+                "resourceArns": [db_arn(own_account(), "orders-primary")],
+                "nextToken": token.clone(),
+            }),
         ),
         (
             "a different filter selection",
@@ -998,7 +1166,7 @@ async fn a_request_outside_the_model_is_refused() {
     let rows: Vec<(&str, Value, &str)> = vec![
         (
             "two account ids: only one is allowed per request",
-            json!({"accountIds": [ACCOUNT, MEMBER_ACCOUNT]}),
+            json!({"accountIds": [own_account(), MEMBER_ACCOUNT]}),
             "InvalidParameterValueException",
         ),
         (
@@ -1090,11 +1258,11 @@ async fn a_requested_resource_with_no_database_recommendation_is_reported_in_err
     let rows: Vec<(&str, String)> = vec![
         (
             "a DB instance nothing analysed",
-            db_arn(ACCOUNT, "no-such-database"),
+            db_arn(own_account(), "no-such-database"),
         ),
         (
             "a DB cluster nothing analysed",
-            cluster_arn(ACCOUNT, "no-such-cluster"),
+            cluster_arn(own_account(), "no-such-cluster"),
         ),
         (
             "an analysed resource that is not a database",
@@ -1102,7 +1270,7 @@ async fn a_requested_resource_with_no_database_recommendation_is_reported_in_err
         ),
         (
             "a resource of another service entirely",
-            arn("dynamodb", ACCOUNT, "table/orders"),
+            arn("dynamodb", own_account(), "table/orders"),
         ),
     ];
 
@@ -1182,7 +1350,7 @@ async fn the_reported_arn_names_the_region_the_endpoint_serves() {
             vec![reported[0].clone()],
             "region {region:?}: expected the named database, got {selected}"
         );
-        let elsewhere = arn("rds", SEEDED_ACCOUNT, "db:orders-primary")
+        let elsewhere = arn("rds", own_account(), "db:orders-primary")
             .replace(&format!(":{REGION}:"), ":ap-south-1:");
         let (status, body) = call_in_region(
             &router,
