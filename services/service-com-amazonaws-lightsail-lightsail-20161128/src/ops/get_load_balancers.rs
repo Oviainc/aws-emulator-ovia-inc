@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetLoadBalancers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetLoadBalancers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Answers one page of the load balancer records this service's store holds in
+//! the Region the request is made in, in the store's own name order.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetLoadBalancers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +161,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetLoadBalancers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetLoadBalancersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetLoadBalancers"))
+        // A load balancer is a REGIONAL resource, so "all load balancers in an
+        // account" is the records of the Region this request is signed for —
+        // the same Region `GetLoadBalancer` addresses one record by name in.
+        let region = crate::state::request_region(ctx.parts());
+
+        // `pageToken` is the name the previous page stopped before, so a page is
+        // this Region's stored load balancers from that name onward in the
+        // store's own total order. Using the name rather than an index means a
+        // load balancer deleted between two pages cannot make the walk skip or
+        // repeat another one.
+        let page_token = input.page_token.unwrap_or_default();
+
+        crate::state::with_state(&*self.engine, |store| {
+            let mut load_balancers = Vec::new();
+            let mut next_page_token = None;
+            // The store keys load balancers by `(region, name)`, so a range from
+            // this Region and the page token walks exactly this Region's load
+            // balancers in name order and leaves it behind at the first key of
+            // the next one.
+            let page_start = (region.clone(), page_token);
+            for ((balancer_region, name), balancer) in store.load_balancers.range(page_start..) {
+                if balancer_region != &region {
+                    break;
+                }
+                if load_balancers.len() == crate::state::LOAD_BALANCER_PAGE_SIZE {
+                    // More remain, so the caller is told where to resume; the
+                    // token is absent once this page is the last one.
+                    next_page_token = Some(name.clone());
+                    break;
+                }
+                load_balancers.push(balancer.view());
+            }
+            GetLoadBalancersOutput {
+                // A Region with no load balancers reports an empty list, not an
+                // absent one: the caller asked what it has, and the answer is
+                // "nothing".
+                load_balancers: Some(load_balancers),
+                next_page_token,
+            }
+        })
+        .ok_or_else(unavailable)
     }
 }
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> GetLoadBalancersError {
+    GetLoadBalancersErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail load balancer store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
+}
+

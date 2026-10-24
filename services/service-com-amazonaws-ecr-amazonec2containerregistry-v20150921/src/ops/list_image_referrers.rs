@@ -154,9 +154,10 @@ fn fault_error(fault: crate::state::Fault) -> ListImageReferrersErrorModeled {
 /// asks for no page size gets a page of 20 rather than this service's general default.
 const DEFAULT_REFERRER_PAGE_SIZE: i32 = 20;
 
-/// The artifact status every stored manifest has, and the one a request that names no
-/// `artifactStatus` filter asks for: "If not specified, only artifacts with ACTIVE status
-/// are returned." (`ListImageReferrersFilter$artifactStatus`).
+/// The artifact status a request that names no `artifactStatus` filter asks for: "If not
+/// specified, only artifacts with ACTIVE status are returned."
+/// (`ListImageReferrersFilter$artifactStatus`). The status an artifact HAS is its stored
+/// one — `UpdateImageStorageClass` moves it — so this is only the default filter.
 const DEFAULT_ARTIFACT_STATUS_FILTER: &str = "ACTIVE";
 
 /// The `ArtifactStatusFilter` value that matches an artifact of any status — the one
@@ -222,15 +223,15 @@ fn referrer_of(image: &crate::state::ImageRecord, subject_digest: &str) -> Optio
             .clone()
             .unwrap_or_else(|| OCI_IMAGE_MANIFEST_MEDIA_TYPE.to_string()),
         artifact_type,
-        size: image.size_in_bytes,
+        size: image.manifest_size(),
         annotations: if annotations.is_empty() {
             None
         } else {
             Some(annotations)
         },
-        // Every manifest this registry stores is in standard storage, so every artifact
-        // it reports is ACTIVE; moving one to archive is `UpdateImageStorageClass`.
-        artifact_status: Some(crate::state::ACTIVE_IMAGE_STATUS.to_string()),
+        // The artifact's status is the stored manifest's own storage-class status:
+        // archiving one artifact in a repository leaves its neighbours ACTIVE.
+        artifact_status: Some(image.status.clone()),
     })
 }
 
@@ -288,38 +289,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let artifact_status = filter
             .artifact_status
             .unwrap_or_else(|| DEFAULT_ARTIFACT_STATUS_FILTER.to_string());
-        let status_matches = artifact_status == ANY_ARTIFACT_STATUS_FILTER
-            || artifact_status == crate::state::ACTIVE_IMAGE_STATUS;
         let artifact_types = filter.artifact_types.unwrap_or_default();
 
-        let store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
         // The subject is addressed inside one repository, so the repository has to exist
         // before anything can refer to anything: an unknown one is refused with
         // `RepositoryNotFoundException`. A subject digest this repository does not hold is
         // NOT a refusal — this operation models no image-not-found error, and nothing
         // refers to an image that is not there, which is an empty list.
         let repo = store
-            .repository(&input.repository_name)
+            .repository_mut(&input.repository_name)
             .map_err(fault_error)?;
+        // A restore the clock has already made due is written down before the artifacts
+        // are reported, so this read reports the status each one was already in.
+        repo.settle_image_storage_classes(now);
+        let repo = &*repo;
 
-        let candidates: Vec<(String, ImageReferrer)> = if status_matches {
-            repo.images
-                .values()
-                .filter_map(|image| referrer_of(image, &input.subject_id.image_digest))
-                .filter(|referrer| {
-                    artifact_types.is_empty()
-                        || referrer
-                            .artifact_type
-                            .as_ref()
-                            .is_some_and(|artifact_type| artifact_types.contains(artifact_type))
-                })
-                .map(|referrer| (referrer.digest.clone(), referrer))
-                .collect()
-        } else {
-            // Nothing stored here is archived or activating, so no stored artifact
-            // matches a filter asking for one.
-            Vec::new()
-        };
+        let candidates: Vec<(String, ImageReferrer)> = repo
+            .images
+            .values()
+            // The status filter is applied per artifact, against the stored status of the
+            // manifest that refers to the subject.
+            .filter(|image| {
+                artifact_status == ANY_ARTIFACT_STATUS_FILTER || artifact_status == image.status
+            })
+            .filter_map(|image| referrer_of(image, &input.subject_id.image_digest))
+            .filter(|referrer| {
+                artifact_types.is_empty()
+                    || referrer
+                        .artifact_type
+                        .as_ref()
+                        .is_some_and(|artifact_type| artifact_types.contains(artifact_type))
+            })
+            .map(|referrer| (referrer.digest.clone(), referrer))
+            .collect();
 
         let (referrers, next_token) = crate::state::paginate(
             candidates,

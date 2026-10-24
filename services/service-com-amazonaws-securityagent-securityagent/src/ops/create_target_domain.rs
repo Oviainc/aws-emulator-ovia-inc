@@ -71,6 +71,18 @@
 //!   verification status.
 //! * `verifiedAt` (Timestamp) — The date and time the target domain was verified, in UTC
 //!   format.
+//!
+//! ## Recorded, not modelled
+//!
+//! The recorded 200 carries a `status` member beside the modelled `verificationStatus`,
+//! holding the same `TargetDomainStatus` value, and `createdAt`/`verifiedAt` are
+//! `@timestampFormat("date-time")` members, so they go out as RFC 3339 strings. The
+//! challenge itself is recorded behaviour too: `verificationDetails.dnsTxt.dnsRecordName`
+//! is the `_aws_securityagent-challenge` label under the registered domain,
+//! `verificationDetails.httpRoute.routePath` is one fixed token-free relative path, and
+//! `verificationStatusReason` is one constant sentence per verification method. The
+//! derivations live on `TargetDomainRecord` in `src/state.rs`, the wire form on
+//! `CreateTargetDomainOutput` in `src/ops/types/create_target_domain_types.rs`.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -245,9 +257,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             domain_name: projected.domain_name,
             // `TargetDomain` makes the status optional while this output requires it;
             // a stored record always carries one, so the projection always fills it.
-            verification_status: projected.verification_status.expect(
-                "a stored target domain always carries a status, so its projection does too",
-            ),
+            verification_status: projected
+                .verification_status
+                .clone()
+                .expect(
+                    "a stored target domain always carries a status, so its projection does too",
+                ),
             verification_status_reason: projected.verification_status_reason,
             verification_details: projected.verification_details,
             created_at: projected.created_at,
@@ -255,6 +270,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // nothing inside this emulator can observe the owner publishing the
             // challenge, so this stays absent until a verification call finds it.
             verified_at: projected.verified_at,
+            // The recorded `status`: the same stored status the modelled
+            // `verificationStatus` above carries, so the two cannot disagree.
+            status: projected.status.expect(
+                "a stored target domain always carries a status, so its projection does too",
+            ),
         })
     }
 }

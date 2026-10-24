@@ -102,6 +102,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The `ImageStatusFilter` value that matches an image of any status — the one value of
+/// that enum (`IMAGE_STATUS_FILTER_VALUES`) that `ImageStatus` itself does not carry, and
+/// what a request naming no image status asks for.
+const ANY_IMAGE_STATUS_FILTER: &str = "ANY";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -217,18 +222,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A value outside `TagStatus` / `ImageStatusFilter` was already refused at the
         // boundary, so what arrives here is one of the modelled values.
         let tag_status = filter.tag_status.unwrap_or_else(|| "ANY".to_string());
-        // Every image in standard storage is ACTIVE, and that is what a request naming
-        // no image status asks for.
+        // The model's `DescribeImagesFilter$imageStatus` doc says "If not specified, only
+        // images with ACTIVE status are returned", but the recorded AWS responses show an
+        // archived image reported to a read that named no `imageStatus` at all — so an
+        // absent filter filters on nothing, exactly as an absent `tagStatus` does, and a
+        // status NAMED in the filter selects on each image's own stored status.
         let image_status = filter
             .image_status
-            .unwrap_or_else(|| crate::state::ACTIVE_IMAGE_STATUS.to_string());
-        let status_matches =
-            image_status == "ANY" || image_status == crate::state::ACTIVE_IMAGE_STATUS;
+            .unwrap_or_else(|| ANY_IMAGE_STATUS_FILTER.to_string());
 
-        let store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
         let repo = store
-            .repository(&input.repository_name)
+            .repository_mut(&input.repository_name)
             .map_err(fault_error)?;
+        // A restore the clock has already made due is written down before the images are
+        // reported, so this read reports the status the image was already in.
+        repo.settle_image_storage_classes(now);
+        let repo = &*repo;
 
         // Each requested identifier must name a stored image; the whole call is refused
         // when one does not. The resolution lives on `Repo`, so every operation that
@@ -239,27 +250,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             wanted.insert(repo.resolve_image(id).map_err(fault_error)?.digest.clone());
         }
 
-        let candidates: Vec<(String, ImageDetail)> = if status_matches {
-            repo.images
-                .values()
-                .filter(|image| wanted.is_empty() || wanted.contains(&image.digest))
-                .filter(|image| match tag_status.as_str() {
-                    "TAGGED" => !image.tags.is_empty(),
-                    "UNTAGGED" => image.tags.is_empty(),
-                    _ => true,
-                })
-                .map(|image| {
-                    (
-                        image.digest.clone(),
-                        image.to_detail(&repo.registry_id, &repo.name),
-                    )
-                })
-                .collect()
-        } else {
-            // Nothing stored here is archived or activating, so no stored image
-            // matches a filter asking for one.
-            Vec::new()
-        };
+        let candidates: Vec<(String, ImageDetail)> = repo
+            .images
+            .values()
+            .filter(|image| wanted.is_empty() || wanted.contains(&image.digest))
+            // The status is the image's own, so a repository holding an archived image
+            // beside active ones reports each under the filter that asks for it.
+            .filter(|image| image_status == ANY_IMAGE_STATUS_FILTER || image_status == image.status)
+            .filter(|image| match tag_status.as_str() {
+                "TAGGED" => !image.tags.is_empty(),
+                "UNTAGGED" => image.tags.is_empty(),
+                _ => true,
+            })
+            .map(|image| {
+                (
+                    image.digest.clone(),
+                    image.to_detail(&repo.registry_id, &repo.name),
+                )
+            })
+            .collect();
 
         let (image_details, next_token) =
             crate::state::paginate(candidates, input.next_token.as_ref(), input.max_results)

@@ -229,6 +229,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     image_id: Some(stored.identifier(id.image_tag.as_deref())),
                     image_manifest: Some(stored.manifest.clone()),
                     image_manifest_media_type: stored.manifest_media_type.clone(),
+                    // The byte length of the manifest this entry carries: a client that
+                    // streams or verifies the document reads the advertised size rather
+                    // than trusting an unbounded read.
+                    image_manifest_size: Some(stored.manifest_size()),
                 }),
                 Err(failure) => failures.push(ImageFailure {
                     // The identifier is echoed exactly as requested: it is what lets a

@@ -49,6 +49,8 @@ mod origin_access_control_lifecycle;
 mod origin_access_identity_lifecycle;
 #[path = "all/origin_request_policy_lifecycle.rs"]
 mod origin_request_policy_lifecycle;
+#[path = "all/public_key_lifecycle.rs"]
+mod public_key_lifecycle;
 #[path = "all/response_headers_policy_lifecycle.rs"]
 mod response_headers_policy_lifecycle;
 #[path = "all/state_roundtrip.rs"]

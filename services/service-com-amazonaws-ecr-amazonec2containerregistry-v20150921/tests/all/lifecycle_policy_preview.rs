@@ -1303,15 +1303,7 @@ async fn an_image_is_expired_only_once_it_is_older_than_the_count_in_days() {
         for (case, age, expired) in ages {
             let manifest = format!("{{\"schemaVersion\":2,\"case\":\"{case}\"}}");
             let digest = manifest_digest(&manifest);
-            let image = state::ImageRecord {
-                digest: digest.clone(),
-                tags: BTreeSet::new(),
-                manifest,
-                manifest_media_type: None,
-                artifact_media_type: None,
-                size_in_bytes: 42,
-                pushed_at: now - age,
-            };
+            let image = state::ImageRecord::pushed(digest.clone(), manifest, None, now - age);
             let images = BTreeMap::from([(digest.clone(), image)]);
             let acted = state::evaluate_lifecycle_policy(&rules, &images, now);
             assert_eq!(

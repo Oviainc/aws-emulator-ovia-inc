@@ -76,6 +76,15 @@
 //!   associated with the agent space.
 //! * `updatedAt` (Timestamp) — The date and time the agent space was last updated, in UTC
 //!   format.
+//!
+//! ## Recorded, not modelled
+//!
+//! The recorded 200 carries three identity members beside the modelled ones — `id` (the
+//! same value as `agentSpaceId`), `ownerId` (the owning account) and `arn` — plus
+//! `targetDomains`, the association echoed RESOLVED: the stored record of each target
+//! domain the request named. `createdAt`/`updatedAt` are `@timestampFormat("date-time")`
+//! members, so they go out as RFC 3339 strings. The wire form, and the evidence for it,
+//! live on `CreateAgentSpaceOutput` in `src/ops/types/create_agent_space_types.rs`.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -161,13 +170,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateAgentSpaceErrorModeled::InternalServerException(InternalServerException {
                 message: "the agent space store is unavailable".to_string(),
             })
         })?;
-
         // `name` is required but carries no `@length` in the model, so the boundary
         // validator lets a blank one through. A resource whose name is only whitespace
         // has no name, so it is refused here with the service's own client-input error
@@ -187,6 +194,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // `targetDomainIds` carries no `@length` in the model, so the boundary validator
+        // lets a list of any size through; every associated id is stored and expanded
+        // into the full target domain record on this response and on every later read of
+        // the agent space, so a list past the association limit is refused here with the
+        // service's own client-input error naming the member rather than stored.
+        if let Some(ids) = input.target_domain_ids.as_ref() {
+            if ids.len() > crate::state::MAX_AGENT_SPACE_TARGET_DOMAINS {
+                let limit = crate::state::MAX_AGENT_SPACE_TARGET_DOMAINS;
+                let violation = format!("member must have at most {limit} items");
+                return Err(CreateAgentSpaceErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "1 validation error detected: value for 'targetDomainIds' failed \
+                             to satisfy constraint: {violation}"
+                        ),
+                        field_list: Some(vec![ValidationExceptionField {
+                            path: "targetDomainIds".to_string(),
+                            message: violation,
+                        }]),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The region the agent space's ARN names comes from the request's own
+        // credential scope, so it is read before the store is locked.
+        let region = crate::state::request_region(ctx.parts());
         let mut state = state.lock();
 
         // Every agent space is a stored record, so the number of them a caller can
@@ -208,10 +243,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A fresh identity per call: the id is the service's to choose, so two calls
         // are two distinct agent spaces whatever they were called with. `createdAt` and
-        // `updatedAt` are the same instant on a record nothing has updated yet.
+        // `updatedAt` are the same instant on a record nothing has updated yet, and the
+        // ARN is minted from the id and the request's region.
         let agent_space_id = state.mint_agent_space_id();
         let now = ::std::time::SystemTime::now();
         let record = crate::state::AgentSpaceRecord {
+            arn: crate::state::agent_space_arn(&region, &agent_space_id),
             agent_space_id,
             name: input.name,
             description: input.description,
@@ -226,18 +263,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             updated_at: now,
         };
 
-        // The response is projected from the record that was just persisted, so what
-        // the caller is told is exactly what a later read of the store reports.
+        // The response is projected from the record that was just persisted, through the
+        // SAME projection `BatchGetAgentSpaces` answers from — so what the caller is told
+        // is exactly what a later read of the store reports, member for member, down to
+        // the target domains the association resolves to.
+        let projected = record.modelled(&state.target_domains);
         let output = CreateAgentSpaceOutput {
-            agent_space_id: record.agent_space_id.clone(),
-            name: record.name.clone(),
-            description: record.description.clone(),
-            aws_resources: record.aws_resources.clone(),
-            target_domain_ids: record.target_domain_ids.clone(),
-            code_review_settings: record.code_review_settings.clone(),
-            kms_key_id: record.kms_key_id.clone(),
-            created_at: Some(crate::state::timestamp(record.created_at)),
-            updated_at: Some(crate::state::timestamp(record.updated_at)),
+            agent_space_id: projected.agent_space_id,
+            name: projected.name,
+            description: projected.description,
+            aws_resources: projected.aws_resources,
+            target_domain_ids: projected.target_domain_ids,
+            code_review_settings: projected.code_review_settings,
+            kms_key_id: projected.kms_key_id,
+            created_at: projected.created_at,
+            updated_at: projected.updated_at,
+            id: projected.id,
+            owner_id: projected.owner_id,
+            arn: projected.arn,
+            target_domains: projected.target_domains,
         };
         state
             .agent_spaces

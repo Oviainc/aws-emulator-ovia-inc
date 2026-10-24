@@ -14,7 +14,7 @@ use std::fmt::Write as _;
 use std::hash::BuildHasher;
 use std::time::SystemTime;
 
-use crate::ops::types::{Connection, Tag};
+use crate::ops::types::{Connection, Tag, VpcConfiguration};
 
 /// This service's ARN namespace (`awsService.arnNamespace` in the Smithy model), used
 /// for every ARN the service mints.
@@ -28,6 +28,43 @@ pub const ARN_NAMESPACE: &str = "codestar-connections";
 /// connection to `AVAILABLE` is a console action, not something the clock owes, so a
 /// connection this emulator mints stays `PENDING` until something updates it.
 pub const CONNECTION_STATUS_PENDING: &str = "PENDING";
+
+/// The statuses a host carries.
+///
+/// From the model's `Host$Status` doc ("The status of the host, such as PENDING,
+/// AVAILABLE, VPC_CONFIG_DELETING, VPC_CONFIG_INITIALIZING, and
+/// VPC_CONFIG_FAILED_INITIALIZATION", `smithy_query(query="shape", shape="Host")`).
+/// `HostStatus` is modeled as a free-form string (`len 1..64`) rather than an enum, so
+/// these are the values the doc names rather than a closed set the wire enforces.
+pub const HOST_STATUS_PENDING: &str = "PENDING";
+/// See [`HOST_STATUS_PENDING`].
+pub const HOST_STATUS_AVAILABLE: &str = "AVAILABLE";
+/// See [`HOST_STATUS_PENDING`].
+pub const HOST_STATUS_VPC_CONFIG_DELETING: &str = "VPC_CONFIG_DELETING";
+/// See [`HOST_STATUS_PENDING`].
+pub const HOST_STATUS_VPC_CONFIG_INITIALIZING: &str = "VPC_CONFIG_INITIALIZING";
+/// See [`HOST_STATUS_PENDING`].
+pub const HOST_STATUS_VPC_CONFIG_FAILED_INITIALIZATION: &str = "VPC_CONFIG_FAILED_INITIALIZATION";
+
+/// Every status [`HOST_STATUS_PENDING`]'s doc names, in the order it names them.
+pub const HOST_STATUS_VALUES: &[&str] = &[
+    HOST_STATUS_PENDING,
+    HOST_STATUS_AVAILABLE,
+    HOST_STATUS_VPC_CONFIG_DELETING,
+    HOST_STATUS_VPC_CONFIG_INITIALIZING,
+    HOST_STATUS_VPC_CONFIG_FAILED_INITIALIZATION,
+];
+
+/// The statuses a host cannot be deleted from.
+///
+/// `DeleteHost`'s own doc states the rule: "A host cannot be deleted if it is in the
+/// VPC_CONFIG_INITIALIZING or VPC_CONFIG_DELETING state." Both are transitional VPC
+/// provisioning states, so the refusal is the "the host is there but is not usable
+/// right now" signal (`ResourceUnavailableException`) rather than an absence.
+pub const HOST_STATUS_DELETE_BLOCKED: &[&str] = &[
+    HOST_STATUS_VPC_CONFIG_INITIALIZING,
+    HOST_STATUS_VPC_CONFIG_DELETING,
+];
 
 /// Region used when a request carries no SigV4 credential scope to read one from.
 pub const DEFAULT_REGION: &str = "us-east-1";
@@ -102,11 +139,50 @@ impl StoredConnection {
     }
 }
 
+/// A host as this service persists it.
+///
+/// One record per `HostArn`, holding every member of the modeled `Host` shape the API
+/// can observe, so an operation that reports or deletes a host works off this one row
+/// rather than recomputing one. `DeleteHost` reads [`StoredHost::status`] (the delete
+/// is refused while the host's VPC configuration is in flight) and removes the whole
+/// record; the fields it does not read are what makes the record a HOST, and are what
+/// `CreateHost` / `GetHost` / `ListHosts` / `UpdateHost` write and report (each still
+/// a scaffold with its own open issue).
+#[derive(Debug, Clone)]
+pub struct StoredHost {
+    /// `Name` as supplied at create.
+    pub name: String,
+    /// The ARN this host is keyed by.
+    pub host_arn: String,
+    /// One of `PROVIDER_TYPE_VALUES`; `CreateHost` models it required.
+    pub provider_type: String,
+    /// The endpoint of the infrastructure the host represents.
+    pub provider_endpoint: String,
+    /// The VPC configuration provisioned for the host, when one was supplied.
+    pub vpc_configuration: Option<VpcConfiguration>,
+    /// The host's `HostStatus` — one of `HOST_STATUS_VALUES`.
+    pub status: String,
+    /// The status description, when the service has one to report.
+    pub status_message: Option<String>,
+}
+
+impl StoredHost {
+    /// Whether this host's status forbids deleting it — see
+    /// [`HOST_STATUS_DELETE_BLOCKED`].
+    pub fn delete_blocked_by_status(&self) -> bool {
+        HOST_STATUS_DELETE_BLOCKED.contains(&self.status.as_str())
+    }
+}
+
 /// Per-service state for com-amazonaws-codestarconnections-codestar-connections-20191201. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCodestarconnectionsCodestarConnections20191201State {
     /// Every connection in this emulator, keyed by its ARN.
     pub connections: BTreeMap<String, StoredConnection>,
+    /// Every host in this emulator, keyed by its ARN. A connection may name one
+    /// through `StoredConnection::host_arn`, which is the association `DeleteHost`
+    /// refuses to break.
+    pub hosts: BTreeMap<String, StoredHost>,
     /// Tags by resource ARN, shared by `TagResource` / `UntagResource` /
     /// `ListTagsForResource` and populated from `CreateConnection.Tags`.
     pub tags: BTreeMap<String, BTreeMap<String, String>>,
@@ -130,6 +206,20 @@ impl ComAmazonawsCodestarconnectionsCodestarConnections20191201State {
         let mut connections: Vec<&StoredConnection> = self.connections.values().collect();
         connections.sort_unstable_by_key(|connection| connection.sequence);
         connections
+    }
+
+    /// How many connections are currently associated with `host_arn`.
+    ///
+    /// `DeleteHost`'s doc states the precondition this answers: "Before you delete a
+    /// host, all connections associated to the host must be deleted." The association
+    /// lives on the CONNECTION (`StoredConnection::host_arn`, set at create), so it is
+    /// read out of the connection store rather than held a second time on the host, and
+    /// counted in place: the caller needs how many still hold the host, not which.
+    pub fn connections_attached_to_host_count(&self, host_arn: &str) -> usize {
+        self.connections
+            .values()
+            .filter(|connection| connection.host_arn.as_deref() == Some(host_arn))
+            .count()
     }
 
     /// How many distinct keys `resource_arn` would hold after merging `tags`.

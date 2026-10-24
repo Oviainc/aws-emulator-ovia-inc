@@ -19,7 +19,16 @@ pub struct CreateTargetDomainInput {
     pub tags: Option<std::collections::HashMap<String, String>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.securityagent#CreateTargetDomainOutput")]
+/// `CreateTargetDomainOutput`, with its schema and serializer written out instead of
+/// derived — the same two reasons as [`TargetDomain`], which is the shape every read of
+/// the record answers (`super::wire_shape` holds the machinery):
+///
+/// 1. `createdAt` and `verifiedAt` carry `@timestampFormat("date-time")`
+///    (`smithy_query(query="operation", operation="CreateTargetDomain",
+///    model_path="services/service-com-amazonaws-securityagent-securityagent/smithy-model/com-amazonaws-securityagent-securityagent.json")`),
+///    which the derive drops.
+/// 2. The recorded 200 carries a `status` member beside the modelled
+///    `verificationStatus`, holding the same value.
 #[derive(Debug, Clone, Default)]
 pub struct CreateTargetDomainOutput {
     pub target_domain_id: String,
@@ -29,5 +38,40 @@ pub struct CreateTargetDomainOutput {
     pub verification_details: Option<VerificationDetails>,
     pub created_at: Option<::aws_smithy_types::DateTime>,
     pub verified_at: Option<::aws_smithy_types::DateTime>,
+    /// Recorded, not modelled: the domain's status, the same value the modelled
+    /// `verificationStatus` carries.
+    pub status: String,
 }
+
+sa_schema_and_codec!(
+    CreateTargetDomainOutput,
+    CREATE_TARGET_DOMAIN_OUTPUT_SCHEMA,
+    "com.amazonaws.securityagent#CreateTargetDomainOutput",
+    "com.amazonaws.securityagent",
+    "CreateTargetDomainOutput",
+    modelled: [
+        (M_TARGET_DOMAIN_ID, target_domain_id, "targetDomainId", 0, req, string),
+        (M_DOMAIN_NAME, domain_name, "domainName", 1, req, string),
+        (M_VERIFICATION_STATUS, verification_status, "verificationStatus", 2, req, string),
+        (
+            M_VERIFICATION_STATUS_REASON,
+            verification_status_reason,
+            "verificationStatusReason",
+            3,
+            opt,
+            string
+        ),
+        (
+            M_VERIFICATION_DETAILS,
+            verification_details,
+            "verificationDetails",
+            4,
+            opt,
+            struct_of(VerificationDetails)
+        ),
+        (M_CREATED_AT, created_at, "createdAt", 5, opt, date_time),
+        (M_VERIFIED_AT, verified_at, "verifiedAt", 6, opt, date_time),
+    ],
+    recorded: [(M_STATUS, status, "status", 7, req, string)],
+);
 

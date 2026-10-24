@@ -14,6 +14,13 @@
 //! here named after an operation would make that operation's own module name
 //! ambiguous inside `ops` (`E0659`).
 
+// Not a type module: the schema/serializer macros a structure needs when its wire form
+// is not what the derive produces (a `@timestampFormat("date-time")` member, or a member
+// the recorded wire carries and the model does not). Declared with `#[macro_use]` AHEAD
+// of the type modules, which is what puts the macros in their textual scope.
+#[macro_use]
+mod wire_shape;
+
 pub mod add_artifact_types;
 pub mod batch_create_security_requirements_types;
 pub mod batch_delete_code_reviews_types;
