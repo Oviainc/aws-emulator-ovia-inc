@@ -23,7 +23,7 @@ use std::collections::BTreeMap;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::collection_lifecycle::{at, call, emulator, text};
+use crate::collection_lifecycle::{at, call, emulator, text, CLIENT_ERROR};
 
 /// A minimal IdP metadata document, as the `security_configs` suite uses it: `samlMetadata`
 /// is `@length(min: 1, max: 51200)` with no structural constraint in the model.
@@ -407,14 +407,15 @@ async fn a_refused_call_leaves_every_counter_where_it_was() {
     );
 
     // A counter counts STORED records, so a call that is refused raises nothing: the rows
-    // span a duplicate pair (409) and a request outside a modelled or documented bound
-    // (400), over three of the counted resources.
+    // span a duplicate pair (`ConflictException`) and a request outside a modelled or
+    // documented bound (`ValidationException`), over three of the counted resources. Both
+    // answer this service's single client-error status.
     let refusals: [(&str, &str, Value, u16); 4] = [
         (
             "a duplicate retention policy",
             "CreateLifecyclePolicy",
             json!({ "type": "retention", "name": "retain-kept", "policy": LIFECYCLE_POLICY_DOCUMENT }),
-            409,
+            CLIENT_ERROR,
         ),
         (
             "a retention window below the documented 24h minimum",
@@ -430,7 +431,7 @@ async fn a_refused_call_leaves_every_counter_where_it_was() {
             "a duplicate encryption policy",
             "CreateSecurityPolicy",
             json!({ "type": "encryption", "name": "enc-kept", "policy": SECURITY_POLICY_DOCUMENT }),
-            409,
+            CLIENT_ERROR,
         ),
         (
             "a data access policy whose document is not JSON",

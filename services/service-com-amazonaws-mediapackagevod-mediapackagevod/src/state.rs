@@ -2,11 +2,21 @@
 
 //! Engine state for the com-amazonaws-mediapackagevod-mediapackagevod service.
 //!
-//! Three resource maps, each keyed by the resource's own `Id` (the identifier the
-//! REST routes address it by), plus ONE tag map keyed by resource ARN. Tags live
-//! only in `tags_by_arn`: a resource record carries its ARN, so every operation —
-//! the creates here and the later `TagResource` / `ListTagsForResource` slice —
-//! reads and writes the one copy rather than two that can drift.
+//! Three resource maps, each keyed by a [`ResourceKey`] — the AWS Region the
+//! resource was created in, then the resource's own `Id` (the identifier the REST
+//! routes address it by) — plus ONE tag map keyed by resource ARN. Tags live only
+//! in `tags_by_arn`: a resource record carries its ARN, and an ARN carries its
+//! Region, so every operation — the creates here and the later `TagResource` /
+//! `ListTagsForResource` slice — reads and writes the one copy rather than two that
+//! can drift.
+//!
+//! MediaPackage VOD is a REGIONAL control plane (`aws.api#service` gives it the
+//! `mediapackage-vod` endpoint prefix, arn namespace and SigV4 signing name), so
+//! the Region a request is served in is part of the identity of every resource it
+//! touches: the same `Id` in two Regions is two independent resources, and a
+//! request served in one Region resolves, lists, mutates and deletes only the
+//! records created in it. Every accessor on this struct therefore takes the
+//! request's Region ([`request_region`]) beside the `Id`.
 //!
 //! `ApproximateAssetCount` and `EgressEndpoints` are never stored: they are
 //! derived from these maps on every read ([`Self::asset_count`],
@@ -135,12 +145,46 @@ pub const MIN_PAGE_SIZE: usize = 1;
 /// `MaxResults` gets: the maximum of that same `range` trait.
 pub const MAX_PAGE_SIZE: usize = 1000;
 
+/// How every resource map in this state is keyed: the AWS Region the resource was
+/// created in, then the caller-chosen `Id` the REST routes address it by.
+///
+/// The Region comes FIRST so one Region's records are a contiguous range of the
+/// `BTreeMap`, read in `Id` order ([`region_slice`]) \u2014 which is what lets a listing
+/// page one Region's resources in one stable order. Two Regions holding the same
+/// `Id` are two distinct keys, so the same `Id` can be created independently in
+/// each, exactly as a regional AWS control plane allows.
+pub type ResourceKey = (String, String);
+
+/// The key `id` is stored under when the request that created it was served in
+/// `region`.
+pub fn resource_key(region: &str, id: &str) -> ResourceKey {
+    (region.to_string(), id.to_string())
+}
+
+/// The records of ONE Region, in `Id` order.
+///
+/// A `BTreeMap` keyed by [`ResourceKey`] orders by Region first, so a Region's
+/// records are the contiguous range that starts at its smallest possible key; the
+/// scan stops at the first key naming another Region.
+fn region_slice<'map, V>(
+    map: &'map BTreeMap<ResourceKey, V>,
+    region: &str,
+) -> impl Iterator<Item = &'map V> {
+    let region = region.to_string();
+    map.range(resource_key(&region, "")..)
+        .take_while(move |((stored_region, _), _)| *stored_region == region)
+        .map(|(_, record)| record)
+}
+
 /// A stored PackagingGroup. `ApproximateAssetCount` is NOT a field: it is counted
 /// from [`ComAmazonawsMediapackagevodMediapackagevodState::assets`] on each read.
 #[derive(Debug, Clone)]
 pub struct PackagingGroupRecord {
     /// The caller-chosen `Id` this group is addressed by.
     pub id: String,
+    /// The Region this group was created in — the one its ARN and its egress domain
+    /// name carry, and the only one it resolves in. See [`ResourceKey`].
+    pub region: String,
     /// `arn:aws:mediapackage-vod:<region>:<account>:packaging-groups/<Id>`.
     pub arn: String,
     /// The egress domain name assets in this group are played back from.
@@ -159,6 +203,8 @@ pub struct PackagingGroupRecord {
 pub struct PackagingConfigurationRecord {
     /// The caller-chosen `Id` this configuration is addressed by.
     pub id: String,
+    /// The Region this configuration was created in; see [`ResourceKey`].
+    pub region: String,
     /// `arn:aws:mediapackage-vod:<region>:<account>:packaging-configurations/<Id>`.
     pub arn: String,
     /// ISO-8601 instant this configuration was created.
@@ -185,6 +231,8 @@ pub struct PackagingConfigurationRecord {
 pub struct AssetRecord {
     /// The caller-chosen `Id` this asset is addressed by.
     pub id: String,
+    /// The Region this asset was ingested in; see [`ResourceKey`].
+    pub region: String,
     /// `arn:aws:mediapackage-vod:<region>:<account>:assets/<Id>`.
     pub arn: String,
     /// ISO-8601 instant this asset was submitted for ingest.
@@ -206,12 +254,13 @@ pub struct AssetRecord {
 /// Per-service state for com-amazonaws-mediapackagevod-mediapackagevod. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsMediapackagevodMediapackagevodState {
-    /// PackagingGroups by `Id`.
-    pub packaging_groups: BTreeMap<String, PackagingGroupRecord>,
-    /// PackagingConfigurations by `Id`.
-    pub packaging_configurations: BTreeMap<String, PackagingConfigurationRecord>,
-    /// Assets by `Id`. A `BTreeMap` so `ListAssets` pages in one stable order.
-    pub assets: BTreeMap<String, AssetRecord>,
+    /// PackagingGroups by (Region, `Id`).
+    pub packaging_groups: BTreeMap<ResourceKey, PackagingGroupRecord>,
+    /// PackagingConfigurations by (Region, `Id`).
+    pub packaging_configurations: BTreeMap<ResourceKey, PackagingConfigurationRecord>,
+    /// Assets by (Region, `Id`). A `BTreeMap` so `ListAssets` pages one Region's
+    /// assets in one stable `Id` order.
+    pub assets: BTreeMap<ResourceKey, AssetRecord>,
     /// Every resource's tags, keyed by that resource's ARN — the single tag store.
     ///
     /// It holds at most one entry per stored resource (a create inserts one, a
@@ -220,6 +269,111 @@ pub struct ComAmazonawsMediapackagevodMediapackagevodState {
 }
 
 impl ComAmazonawsMediapackagevodMediapackagevodState {
+    /// The PackagingGroup `id` names IN `region`, for a reporting operation. `None`
+    /// for an `Id` only another Region holds: that group does not exist here.
+    pub fn packaging_group(&self, region: &str, id: &str) -> Option<&PackagingGroupRecord> {
+        self.packaging_groups.get(&resource_key(region, id))
+    }
+
+    /// The PackagingGroup `id` names in `region`, for an operation the spec says
+    /// mutates it (`UpdatePackagingGroup`, `ConfigureLogs`).
+    pub fn packaging_group_mut(
+        &mut self,
+        region: &str,
+        id: &str,
+    ) -> Option<&mut PackagingGroupRecord> {
+        self.packaging_groups.get_mut(&resource_key(region, id))
+    }
+
+    /// Whether `region` holds a PackagingGroup under `id`.
+    pub fn has_packaging_group(&self, region: &str, id: &str) -> bool {
+        self.packaging_groups.contains_key(&resource_key(region, id))
+    }
+
+    /// Store `record` as the PackagingGroup `id` of `region`.
+    pub fn insert_packaging_group(&mut self, record: PackagingGroupRecord) {
+        let key = resource_key(&record.region, &record.id);
+        self.packaging_groups.insert(key, record);
+    }
+
+    /// Remove the PackagingGroup `id` names in `region`, returning what was stored.
+    pub fn remove_packaging_group(
+        &mut self,
+        region: &str,
+        id: &str,
+    ) -> Option<PackagingGroupRecord> {
+        self.packaging_groups.remove(&resource_key(region, id))
+    }
+
+    /// Every PackagingGroup stored in `region`, in `Id` order.
+    pub fn packaging_groups_in(&self, region: &str) -> impl Iterator<Item = &PackagingGroupRecord> {
+        region_slice(&self.packaging_groups, region)
+    }
+
+    /// The PackagingConfiguration `id` names in `region`.
+    pub fn packaging_configuration(
+        &self,
+        region: &str,
+        id: &str,
+    ) -> Option<&PackagingConfigurationRecord> {
+        self.packaging_configurations.get(&resource_key(region, id))
+    }
+
+    /// Whether `region` holds a PackagingConfiguration under `id`.
+    pub fn has_packaging_configuration(&self, region: &str, id: &str) -> bool {
+        self.packaging_configurations
+            .contains_key(&resource_key(region, id))
+    }
+
+    /// Store `record` as the PackagingConfiguration `id` of `region`.
+    pub fn insert_packaging_configuration(&mut self, record: PackagingConfigurationRecord) {
+        let key = resource_key(&record.region, &record.id);
+        self.packaging_configurations.insert(key, record);
+    }
+
+    /// Remove the PackagingConfiguration `id` names in `region`.
+    pub fn remove_packaging_configuration(
+        &mut self,
+        region: &str,
+        id: &str,
+    ) -> Option<PackagingConfigurationRecord> {
+        self.packaging_configurations.remove(&resource_key(region, id))
+    }
+
+    /// Every PackagingConfiguration stored in `region`, in `Id` order.
+    pub fn packaging_configurations_in(
+        &self,
+        region: &str,
+    ) -> impl Iterator<Item = &PackagingConfigurationRecord> {
+        region_slice(&self.packaging_configurations, region)
+    }
+
+    /// The Asset `id` names in `region`.
+    pub fn asset(&self, region: &str, id: &str) -> Option<&AssetRecord> {
+        self.assets.get(&resource_key(region, id))
+    }
+
+    /// Whether `region` holds an Asset under `id`.
+    pub fn has_asset(&self, region: &str, id: &str) -> bool {
+        self.assets.contains_key(&resource_key(region, id))
+    }
+
+    /// Store `record` as the Asset `id` of `region`.
+    pub fn insert_asset(&mut self, record: AssetRecord) {
+        let key = resource_key(&record.region, &record.id);
+        self.assets.insert(key, record);
+    }
+
+    /// Remove the Asset `id` names in `region`.
+    pub fn remove_asset(&mut self, region: &str, id: &str) -> Option<AssetRecord> {
+        self.assets.remove(&resource_key(region, id))
+    }
+
+    /// Every Asset stored in `region`, in `Id` order.
+    pub fn assets_in(&self, region: &str) -> impl Iterator<Item = &AssetRecord> {
+        region_slice(&self.assets, region)
+    }
+
     /// Replace the tags stored for `arn`. An absent `Tags` member and an empty map
     /// are the same request: the resource carries no tags.
     pub fn set_tags(&mut self, arn: &str, tags: Option<&HashMap<String, String>>) {
@@ -249,23 +403,23 @@ impl ComAmazonawsMediapackagevodMediapackagevodState {
             .unwrap_or_default()
     }
 
-    /// How many assets are currently stored in `group_id` — `ApproximateAssetCount`,
-    /// counted rather than stored.
-    pub fn asset_count(&self, group_id: &str) -> i32 {
+    /// How many assets are currently stored in `group_id` IN `region` —
+    /// `ApproximateAssetCount`, counted rather than stored. An asset of the same
+    /// group `Id` in another Region belongs to another group, so it is not counted.
+    pub fn asset_count(&self, region: &str, group_id: &str) -> i32 {
         let count = self
-            .assets
-            .values()
+            .assets_in(region)
             .filter(|asset| asset.packaging_group_id == group_id)
             .count();
         i32::try_from(count).unwrap_or(i32::MAX)
     }
 
-    /// How many packaging configurations are currently stored in `group_id`, which
-    /// is also the length of the `EgressEndpoints` list every asset in that group
-    /// derives. Bounded by [`MAX_PACKAGING_CONFIGURATIONS_PER_GROUP`].
-    pub fn configuration_count(&self, group_id: &str) -> usize {
-        self.packaging_configurations
-            .values()
+    /// How many packaging configurations are currently stored in `group_id` in
+    /// `region`, which is also the length of the `EgressEndpoints` list every asset
+    /// in that group derives. Bounded by
+    /// [`MAX_PACKAGING_CONFIGURATIONS_PER_GROUP`].
+    pub fn configuration_count(&self, region: &str, group_id: &str) -> usize {
+        self.packaging_configurations_in(region)
             .filter(|cfg| cfg.packaging_group_id == group_id)
             .count()
     }
@@ -274,15 +428,15 @@ impl ComAmazonawsMediapackagevodMediapackagevodState {
     /// group, in configuration-`Id` order.
     ///
     /// Derived, never stored: a configuration added after the asset shows up here on
-    /// the next read, which is how the real service behaves. `now` is the reading
-    /// instant, so the packaging status the clock owes is materialised without
-    /// writing anything.
+    /// the next read, which is how the real service behaves. Only the group and the
+    /// configurations of the asset's OWN Region take part, since those are the only
+    /// ones that exist where the asset does. `now` is the reading instant, so the
+    /// packaging status the clock owes is materialised without writing anything.
     pub fn egress_endpoints(&self, asset: &AssetRecord, now: Instant) -> Vec<EgressEndpoint> {
-        let Some(group) = self.packaging_groups.get(&asset.packaging_group_id) else {
+        let Some(group) = self.packaging_group(&asset.region, &asset.packaging_group_id) else {
             return Vec::new();
         };
-        self.packaging_configurations
-            .values()
+        self.packaging_configurations_in(&asset.region)
             .filter(|cfg| cfg.packaging_group_id == asset.packaging_group_id)
             .map(|cfg| EgressEndpoint {
                 packaging_configuration_id: Some(cfg.id.clone()),

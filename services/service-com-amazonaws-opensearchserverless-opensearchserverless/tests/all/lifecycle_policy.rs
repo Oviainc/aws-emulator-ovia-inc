@@ -26,7 +26,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
-use crate::collection_lifecycle::{at, call, emulator, is_policy_version, text};
+use crate::collection_lifecycle::{at, call, emulator, is_policy_version, text, CLIENT_ERROR};
 
 /// The values `LifecyclePolicyType` accepts on the wire
 /// (`smithy_query(query="shape", shape="LifecyclePolicyType")` -> `values`): the single
@@ -428,8 +428,8 @@ async fn create_lifecycle_policy_refuses_a_duplicate_pair_and_an_invalid_input()
     .await;
     assert_eq!(
         (status, code.as_str()),
-        (409, "ConflictException"),
-        "case CreateLifecyclePolicy(duplicate pair): expected 409 ConflictException, got {status} {code} with {answer}"
+        (CLIENT_ERROR, "ConflictException"),
+        "case CreateLifecyclePolicy(duplicate pair): expected {CLIENT_ERROR} ConflictException, got {status} {code} with {answer}"
     );
 
     // ... and it leaves the stored policy exactly as it was.
@@ -696,8 +696,8 @@ async fn a_replayed_client_token_answers_the_lifecycle_policy_it_first_created()
     .await;
     assert_eq!(
         (status, code.as_str()),
-        (409, "ConflictException"),
-        "case CreateLifecyclePolicy(a fresh token for a stored pair): expected 409 ConflictException, got {status} {code} with {answer}"
+        (CLIENT_ERROR, "ConflictException"),
+        "case CreateLifecyclePolicy(a fresh token for a stored pair): expected {CLIENT_ERROR} ConflictException, got {status} {code} with {answer}"
     );
 
     // The token index is keyed by operation as well, so the same token spent on another
@@ -755,7 +755,7 @@ async fn create_lifecycle_policy_refuses_the_request_past_the_account_cap() {
     .await;
     assert_eq!(
         (status, code.as_str()),
-        (402, "ServiceQuotaExceededException"),
-        "case CreateLifecyclePolicy(one past the {MAX_LIFECYCLE_POLICIES}-policy cap): expected 402 ServiceQuotaExceededException, got {status} {code} with {answer}"
+        (CLIENT_ERROR, "ServiceQuotaExceededException"),
+        "case CreateLifecyclePolicy(one past the {MAX_LIFECYCLE_POLICIES}-policy cap): expected {CLIENT_ERROR} ServiceQuotaExceededException, got {status} {code} with {answer}"
     );
 }

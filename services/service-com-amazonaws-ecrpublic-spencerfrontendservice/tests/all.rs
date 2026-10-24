@@ -31,6 +31,8 @@ mod layer_upload_completion;
 mod layer_upload_convergence;
 #[path = "all/layer_upload_sessions.rs"]
 mod layer_upload_sessions;
+#[path = "all/pagination_token_refusal.rs"]
+mod pagination_token_refusal;
 #[path = "all/region_gate.rs"]
 mod region_gate;
 #[path = "all/registry_catalog_data.rs"]

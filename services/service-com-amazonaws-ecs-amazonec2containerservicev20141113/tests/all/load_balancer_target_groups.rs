@@ -49,7 +49,11 @@ const VPC: &str = "vpc-0abc1234ecs0lb";
 /// A router carrying the ECS service AND the Elastic Load Balancing v2 service over ONE
 /// shared engine — the two stores this rule reads across, mounted the way the production
 /// router mounts them.
-fn emulator() -> MultiServiceRouter {
+///
+/// `pub(crate)` because every suite in this one test binary whose service binds a target
+/// group needs BOTH stores: a binding naming a group ELBv2 does not hold is refused, so a
+/// suite that fabricates an ARN would be asserting a refusal it did not mean.
+pub(crate) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
@@ -120,9 +124,37 @@ async fn elb_call(
     (status, body)
 }
 
-/// Create one target group of `target_type` through the ELBv2 API and return its ARN, as
-/// that service minted it.
-async fn create_target_group(
+/// Create one target group of `target_type` through the ELBv2 API, give it a load balancer
+/// that forwards to it, and return its ARN, as that service minted it.
+///
+/// The listener is part of the fixture because a target group no load balancer forwards to
+/// cannot be bound to a service AT ALL — `CreateService` refuses it, whatever its target
+/// type — so a group a row means to be USABLE has to have one. That refusal is pinned by
+/// [`create_unattached_target_group`]'s callers.
+///
+/// A `lambda` or `alb` target group gets no listener: no row binds one to a service
+/// successfully (ECS registers neither a Lambda function nor a load balancer as a task
+/// target), so the target-type refusal is what those rows are about.
+///
+/// `pub(crate)`: shared with the other suites in this binary that bind a service to a
+/// target group.
+pub(crate) async fn create_target_group(
+    router: &MultiServiceRouter,
+    name: &str,
+    target_type: &str,
+    case: &str,
+) -> String {
+    let arn = create_unattached_target_group(router, name, target_type, case).await;
+    if target_type == "instance" || target_type == "ip" {
+        attach_load_balancer(router, name, &arn, case).await;
+    }
+    arn
+}
+
+/// Create one target group of `target_type` through the ELBv2 API and return its ARN,
+/// with NO load balancer forwarding to it — which `DescribeTargetGroups` is asserted to
+/// confirm, since it is the premise of the orphan-target-group refusal.
+pub(crate) async fn create_unattached_target_group(
     router: &MultiServiceRouter,
     name: &str,
     target_type: &str,
@@ -142,7 +174,7 @@ async fn create_target_group(
     let arn = first_text(&body, "TargetGroupArn")
         .unwrap_or_else(|| panic!("case {case:?}: no TargetGroupArn in {body}"));
     // The read back through the ELBv2 model confirms the stored target type the ECS check
-    // will read — the row's own premise.
+    // will read — the row's own premise — and that nothing forwards to the group yet.
     let (status, described) =
         elb_call(router, "DescribeTargetGroups", &[("Names.member.1", name)]).await;
     assert_eq!(
@@ -154,7 +186,75 @@ async fn create_target_group(
         Some(target_type),
         "case {case:?}: expected the stored target type {target_type}, got {described}"
     );
+    assert!(
+        first_text(&described, "LoadBalancerArns")
+            .unwrap_or_default()
+            .is_empty(),
+        "case {case:?}: a group with no listener forwarding to it has no load balancer, \
+         got {described}"
+    );
     arn
+}
+
+/// Create a load balancer and a listener that forwards to `target_group`, so the group is
+/// one a service may bind to, and assert ELBv2 then reports the association.
+pub(crate) async fn attach_load_balancer(
+    router: &MultiServiceRouter,
+    name: &str,
+    target_group: &str,
+    case: &str,
+) {
+    let load_balancer_name = format!("{name}-alb");
+    let (status, body) = elb_call(
+        router,
+        "CreateLoadBalancer",
+        &[
+            ("Name", &load_balancer_name),
+            ("Subnets.member.1", "subnet-0abc1234ecs0lb0"),
+            ("Subnets.member.2", "subnet-0abc1234ecs0lb1"),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: CreateLoadBalancer must succeed, got {status} with {body}"
+    );
+    let load_balancer = first_text(&body, "LoadBalancerArn")
+        .unwrap_or_else(|| panic!("case {case:?}: no LoadBalancerArn in {body}"));
+    let (status, body) = elb_call(
+        router,
+        "CreateListener",
+        &[
+            ("LoadBalancerArn", &load_balancer),
+            ("Protocol", "HTTP"),
+            ("Port", "80"),
+            ("DefaultActions.member.1.Type", "forward"),
+            ("DefaultActions.member.1.TargetGroupArn", target_group),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: CreateListener must succeed, got {status} with {body}"
+    );
+    let (status, described) = elb_call(
+        router,
+        "DescribeTargetGroups",
+        &[("TargetGroupArns.member.1", target_group)],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: DescribeTargetGroups must read the group back, got {status} with \
+         {described}"
+    );
+    assert!(
+        first_text(&described, "LoadBalancerArns")
+            .unwrap_or_default()
+            .contains(&load_balancer),
+        "case {case:?}: ELBv2 must report the association the listener made, got \
+         {described}"
+    );
 }
 
 /// Register one revision of `family` in `network_mode` and return its ARN. A revision in

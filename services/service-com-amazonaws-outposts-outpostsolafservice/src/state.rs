@@ -17,7 +17,8 @@ use sha2::{Digest, Sha256};
 use smithy_server_runtime::{Violation, ViolationKind};
 
 use crate::ops::types::{
-    Address, CapacityTaskFailure, InstanceTypeCapacity, InstancesToExclude, Outpost, Quote, Site,
+    Address, CapacityTaskFailure, InstanceTypeCapacity, InstancesToExclude, Outpost,
+    PrivateConnectivityConfig, Quote, Site,
 };
 
 /// The region every minted ARN falls back to when the request carries no SigV4
@@ -51,6 +52,16 @@ pub const LIFE_CYCLE_STATUS_ACTIVE: &str = "ACTIVE";
 /// still observes the pending status the create reported. It is never zero —
 /// a transition the clock owes is owed at an instant, not on the next read.
 pub const OUTPOST_PROVISIONING: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The `PrivateConnectivityStatus` an Outpost's private connectivity carries once
+/// it has been configured.
+///
+/// The modelled `PrivateConnectivityStatus` enum declares exactly two values,
+/// `ENABLED` and `DISABLED` (see
+/// [`crate::ops::types::shared_types::PRIVATE_CONNECTIVITY_STATUS_VALUES`]), and neither is a
+/// provisioning value — so a configuration that exists is already in a terminal
+/// status and the clock owes no transition on it.
+pub const PRIVATE_CONNECTIVITY_ENABLED: &str = "ENABLED";
 
 /// The `QuoteStatus` a freshly created quote carries.
 ///
@@ -97,14 +108,23 @@ pub struct SiteRecord {
     pub shipping_address: Option<Address>,
 }
 
-/// A persisted Outpost: the modelled [`Outpost`] plus its creation order and the
-/// instant its lifecycle transition falls due.
+/// A persisted Outpost: the modelled [`Outpost`] plus its creation order, the
+/// instant its lifecycle transition falls due, and the private connectivity
+/// configuration created for it.
 #[derive(Debug, Clone)]
 pub struct OutpostRecord {
     /// See [`SiteRecord::sequence`].
     pub sequence: u64,
     /// The Outpost as `CreateOutpost` / `GetOutpost` / `ListOutposts` return it.
     pub outpost: Outpost,
+    /// The private connectivity configuration of this Outpost, or `None` for an
+    /// Outpost nobody has created one for.
+    ///
+    /// Private connectivity is an attribute of ONE Outpost — the modelled routes
+    /// are `/outposts/{OutpostId}/privateConnectivity` — so it is kept on the
+    /// Outpost's own record: the create writes it here, the read answers it from
+    /// here, and deleting the Outpost takes it with the Outpost.
+    pub private_connectivity: Option<PrivateConnectivityConfig>,
     /// When this Outpost's `PENDING` -> `ACTIVE` transition falls due, or `None`
     /// once it has been materialised and the status is terminal. Stored as an
     /// instant so nothing ever sleeps for it: the transition is applied by the

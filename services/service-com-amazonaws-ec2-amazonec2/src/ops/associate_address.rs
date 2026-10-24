@@ -232,17 +232,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 require_known_instance(&store, instance_id)?;
                 instance_id.to_string()
             }
-            // This emulator holds NO network interfaces: nothing in it mints one —
-            // `CreateNetworkInterface` and `DescribeNetworkInterfaces` are both still
-            // scaffolds and the state struct carries no store for them — so a well-formed
-            // interface id can only be one the account holds no interface for, which is
-            // refused rather than read as an interface this call could attach an address
-            // to. A malformed id is refused first, the way the service orders the two.
+            // A malformed id is refused first, the way the service orders the two, and then
+            // an id the store holds no interface for. Associating an address with an
+            // INTERFACE rather than with an instance is work this slice has not done — the
+            // association has to be reported on the interface itself, which
+            // `DescribeNetworkInterfaces` is still a scaffold for — so an interface the
+            // store DOES hold is answered with the 501 rather than with an association
+            // nothing would report.
             (None, Some(network_interface_id)) => {
                 if !network_interface_id_is_well_formed(network_interface_id) {
                     return Err(invalid_network_interface_id_malformed(network_interface_id));
                 }
-                return Err(invalid_network_interface_id_not_found(network_interface_id));
+                if !store.network_interfaces.contains_key(network_interface_id) {
+                    return Err(invalid_network_interface_id_not_found(network_interface_id));
+                }
+                return Err(Scaffolded::not_implemented(
+                    "AssociateAddress with a networkInterfaceId",
+                ));
             }
             (None, None) => {
                 return Err(Scaffolded::missing_parameter(

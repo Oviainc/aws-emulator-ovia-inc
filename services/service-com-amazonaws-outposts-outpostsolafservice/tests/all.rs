@@ -17,6 +17,8 @@ mod capacity_task_lifecycle;
 mod error_classification;
 #[path = "all/error_message_rules.rs"]
 mod error_message_rules;
+#[path = "all/private_connectivity.rs"]
+mod private_connectivity;
 #[path = "all/quote_lifecycle.rs"]
 mod quote_lifecycle;
 #[path = "all/site_and_outpost_lifecycle.rs"]

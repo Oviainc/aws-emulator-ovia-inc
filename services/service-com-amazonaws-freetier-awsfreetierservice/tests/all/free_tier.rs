@@ -12,7 +12,7 @@
 //! computed from what the service itself reports, so a test asserts the rule
 //! and not the catalog's contents.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use serde_json::{json, Value};
@@ -27,7 +27,8 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The model's `ActivityStatus` value set (`shared_types::ACTIVITY_STATUS_VALUES`,
 /// generated from the Smithy enum).
 use service_com_amazonaws_freetier_awsfreetierservice::ops::types::{
-    ACTIVITY_STATUS_VALUES, CURRENCY_CODE_VALUES, DIMENSION_VALUES, MATCH_OPTION_VALUES,
+    ACTIVITY_STATUS_VALUES, CURRENCY_CODE_VALUES, DIMENSION_VALUES, LANGUAGE_CODE_VALUES,
+    MATCH_OPTION_VALUES,
 };
 
 /// A router with only this service mounted, over one shared engine — the same
@@ -760,6 +761,162 @@ async fn activity_readers_check_the_language_code() {
         )
         .await;
     }
+}
+
+/// The title the LIST reports for every activity in `language_code`, keyed by
+/// activity id. `None` asks for no language at all.
+async fn listed_titles(
+    router: &MultiServiceRouter,
+    language_code: Option<&str>,
+) -> BTreeMap<String, String> {
+    let mut body = json!({"maxResults": 1000});
+    if let Some(code) = language_code {
+        body["languageCode"] = json!(code);
+    }
+    let payload = ok(router, "ListAccountActivities", &body).await;
+    payload["activities"]
+        .as_array()
+        .expect("activities is a list")
+        .iter()
+        .map(|activity| (text(activity, "activityId"), text(activity, "title")))
+        .collect()
+}
+
+/// The detail view of `activity_id` in `language_code`.
+async fn detail_in(
+    router: &MultiServiceRouter,
+    activity_id: &str,
+    language_code: Option<&str>,
+) -> Value {
+    let mut body = json!({"activityId": activity_id});
+    if let Some(code) = language_code {
+        body["languageCode"] = json!(code);
+    }
+    ok(router, "GetAccountActivity", &body).await
+}
+
+/// `languageCode` selects the language the activity text is reported in:
+/// `ListAccountActivities$languageCode` is "the language code used to return
+/// translated titles" and `GetAccountActivity$languageCode` the same for the
+/// title and the description, so the text a reader reports is a function of the
+/// stored row AND the requested code, with a request that names no code
+/// answered in the service's base language.
+///
+/// The table spans the model's WHOLE `LanguageCode` value set
+/// (`shared_types::LANGUAGE_CODE_VALUES`, generated from the Smithy enum) plus
+/// the no-code row, and every activity in the catalog — not the one code and
+/// one row the gap was found on.
+#[tokio::test]
+async fn activity_text_is_reported_in_the_requested_language() {
+    let router = router();
+    let ids: Vec<String> = catalog(&router).await.into_iter().map(|(id, _)| id).collect();
+    assert!(
+        !ids.is_empty(),
+        "case catalog: the account has an activity catalog to read in each language"
+    );
+
+    // The language a request that names none is answered in, and the baseline
+    // every other row is compared against.
+    let english = listed_titles(&router, Some("en-US")).await;
+    let unspecified = listed_titles(&router, None).await;
+    assert_eq!(
+        unspecified, english,
+        "case no languageCode: a request that names no code must be answered in the service's \
+         base language, got {unspecified:?} against {english:?}"
+    );
+
+    let mut per_language: BTreeMap<&str, BTreeMap<String, String>> = BTreeMap::new();
+    for code in LANGUAGE_CODE_VALUES {
+        let titles = listed_titles(&router, Some(code)).await;
+
+        // Every activity is reported in every modelled language, with a title
+        // the modelled `GenericString` constraints allow (len 0..1024).
+        let listed: BTreeSet<&String> = titles.keys().collect();
+        let expected: BTreeSet<&String> = ids.iter().collect();
+        assert_eq!(
+            listed, expected,
+            "case {code}: the list must report the whole catalog whatever the language, got \
+             {listed:?}"
+        );
+        for (id, title) in &titles {
+            assert!(
+                !title.is_empty() && title.chars().count() <= 1024,
+                "case {code}/{id}: the title must be non-empty and at most 1024 characters, \
+                 got {title:?}"
+            );
+        }
+
+        // Asking twice in one language reports the same text: a read reports
+        // stored text and never rewrites it.
+        let again = listed_titles(&router, Some(code)).await;
+        assert_eq!(
+            again, titles,
+            "case {code}: the text reported must depend only on the row and the code, got \
+             {again:?} then {titles:?}"
+        );
+
+        for id in &ids {
+            let detail = detail_in(&router, id, Some(code)).await;
+
+            // The two readers read the SAME localized row, so the detail view
+            // repeats the summary's title in the language asked for.
+            assert_eq!(
+                text(&detail, "title"),
+                titles[id],
+                "case {code}/{id}: the detail view must repeat the summary's title in the \
+                 requested language, got {detail}"
+            );
+
+            let description = text(&detail, "description");
+            let english_description = text(&detail_in(&router, id, Some("en-US")).await, "description");
+            assert!(
+                !description.is_empty() && description.chars().count() <= 1024,
+                "case {code}/{id}: the description must be non-empty and at most 1024 \
+                 characters, got {description:?}"
+            );
+
+            // A code for a language other than the base one reports DIFFERENT
+            // text — the dropped effect this test exists to pin. `en-GB` is a
+            // variant of the base language, so it resolves to the base text.
+            if !code.starts_with("en-") {
+                assert_ne!(
+                    titles[id], english[id],
+                    "case {code}/{id}: a non-English language code must report a translated \
+                     title, got {:?} for both",
+                    titles[id]
+                );
+                assert_ne!(
+                    description, english_description,
+                    "case {code}/{id}: a non-English language code must report a translated \
+                     description, got {description:?} for both"
+                );
+            } else {
+                assert_eq!(
+                    titles[id], english[id],
+                    "case {code}/{id}: a variant of the base language reports the base text, \
+                     got {:?} against {:?}",
+                    titles[id], english[id]
+                );
+            }
+        }
+
+        per_language.insert(code, titles);
+    }
+
+    // The codes do not all collapse onto one rendering: every language but the
+    // `en-GB` variant of the base language reports its own text.
+    let renderings: BTreeSet<Vec<(String, String)>> = per_language
+        .values()
+        .map(|titles| titles.iter().map(|(id, title)| (id.clone(), title.clone())).collect())
+        .collect();
+    assert!(
+        renderings.len() >= LANGUAGE_CODE_VALUES.len() - 1,
+        "case distinct renderings: expected at least {} distinct title sets over {} codes, got \
+         {}",
+        LANGUAGE_CODE_VALUES.len() - 1,
+        LANGUAGE_CODE_VALUES.len(),
+        renderings.len()
+    );
 }
 
 // ---------------------------------------------------------------------------

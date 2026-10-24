@@ -388,6 +388,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         });
         let scheduler_owned = controller.r#type == crate::state::DEPLOYMENT_CONTROLLER_ECS;
+        let load_balancers = input.load_balancers.clone().unwrap_or_default();
+
+        // The list is caller-supplied and every entry costs a lookup in another service's
+        // store, so it is bounded HERE, before any per-entry work and before either store
+        // is locked, at the ECS service quota for target groups per service. The refusal
+        // is a `ClientException` ("specifying an identifier that isn't valid" and the
+        // other client-side refusals) to match this crate's other caller-supplied-list
+        // bound, `MAX_CONTAINER_DEFINITIONS` in `register_task_definition`.
+        if load_balancers.len() > crate::state::MAX_LOAD_BALANCERS {
+            return Err(CreateServiceErrorModeled::ClientException(ClientException {
+                message: Some(format!(
+                    "loadBalancers must name at most {} load balancers; got {}",
+                    crate::state::MAX_LOAD_BALANCERS,
+                    load_balancers.len()
+                )),
+            })
+            .into());
+        }
+
+        // A CODE_DEPLOY-controlled service is deployed by shifting traffic between two
+        // target groups, so it has to be BEHIND a load balancer: the same request under
+        // the ECS controller is legal, which is why this is keyed on the controller and
+        // not on the bindings alone.
+        if controller.r#type == crate::state::DEPLOYMENT_CONTROLLER_CODE_DEPLOY
+            && load_balancers.is_empty()
+        {
+            return Err(CreateServiceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(
+                        crate::state::CODE_DEPLOY_LOAD_BALANCER_REQUIRED_MESSAGE.to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
 
         // "If a capacityProviderStrategy is specified, the launchType parameter must be
         // omitted."
@@ -472,25 +507,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Balancing v2 service's store, not in this request. Read BEFORE this service's
         // store is locked, so the cross-service read holds no guard of ours (see
         // `crate::state::target_group_target_types`).
-        let requested_load_balancers = input.load_balancers.clone().unwrap_or_default();
-        // The list is caller-supplied and every entry costs a lookup in another service's
-        // store, so it is bounded HERE, before any per-entry work and before either store
-        // is locked, at the ECS service quota for target groups per service. The refusal
-        // is a `ClientException` ("specifying an identifier that isn't valid" and the
-        // other client-side refusals) to match this crate's other caller-supplied-list
-        // bound, `MAX_CONTAINER_DEFINITIONS` in `register_task_definition`.
-        if requested_load_balancers.len() > crate::state::MAX_LOAD_BALANCERS {
-            return Err(CreateServiceErrorModeled::ClientException(ClientException {
-                message: Some(format!(
-                    "loadBalancers must name at most {} load balancers; got {}",
-                    crate::state::MAX_LOAD_BALANCERS,
-                    requested_load_balancers.len()
-                )),
-            })
-            .into());
-        }
-        let target_group_arns =
-            crate::state::requested_target_group_arns(&requested_load_balancers);
+        let target_group_arns = crate::state::requested_target_group_arns(&load_balancers);
         let target_types =
             crate::state::target_group_target_types(&*self.engine, &target_group_arns)
                 .ok_or_else(|| {
@@ -500,6 +517,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         ),
                     })
                 })?;
+        // A service registers its tasks as TARGETS of the groups it binds to, and only a
+        // listener on a load balancer can send traffic to a group — so which of them a
+        // load balancer forwards to is read from the same store, in the same place, and
+        // for the same reason: before this service's store is locked.
+        let unattached = crate::state::unattached_target_groups(&*self.engine, &target_group_arns)
+            .ok_or_else(|| {
+                CreateServiceErrorModeled::ServerException(ServerException {
+                    message: Some("the Elastic Load Balancing store is unavailable".to_string()),
+                })
+            })?;
 
         let mut guard = state.lock();
         guard.advance_clock(now);
@@ -548,6 +575,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
+        // The rules below are cross-field: each is keyed on the REGISTERED task
+        // definition this service runs, which is state an earlier call wrote, so none of
+        // them can be expressed in the model and all of them have to be checked here —
+        // before the service is stored, since AWS creates nothing when it refuses.
+        if let Some(definition) = definition.as_ref() {
+            // An `awsvpc` task gets its own elastic network interface, so the service has
+            // to say which subnets and security groups it takes.
+            if let Some(message) = crate::state::network_configuration_violation(
+                &definition.network_mode,
+                input.network_configuration.as_ref(),
+            ) {
+                return Err(CreateServiceErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+            // ECS Exec signs its session with the TASK's role, so a service that enables
+            // it needs the revision to declare one.
+            if let Some(message) = crate::state::execute_command_violation(
+                input.enable_execute_command,
+                Some(definition),
+                crate::state::EXECUTE_COMMAND_SERVICE_SUBJECT,
+            ) {
+                return Err(CreateServiceErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+        }
+
         // A revision is placed with a launch type only where it was validated against
         // it (`TaskDefinition$compatibilities`), so a service that asks for one the
         // stored revision does not support is refused before anything is stored.
@@ -567,10 +628,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // mode by the container instance that runs it
         // (`crate::state::load_balancer_refusal`).
         if let Some(message) = crate::state::load_balancer_refusal(
-            &requested_load_balancers,
+            &load_balancers,
             definition.as_ref().map(|found| found.network_mode.as_str()),
             &target_types,
         ) {
+            return Err(CreateServiceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // A load-balancer binding attaches ONE container port of the task to a target
+        // group, so the container and the port it names have to be ones the revision
+        // declares. Checked AFTER the target group's own type: a binding onto a group that
+        // cannot carry this revision's tasks at all is reported as that, whatever else the
+        // binding names.
+        if let Some(message) =
+            crate::state::load_balancer_binding_violation(definition.as_ref(), &load_balancers)
+        {
+            return Err(CreateServiceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // And a group that exists and can carry the tasks still has to be one a load
+        // balancer forwards to, or the tasks it registers can never be reached.
+        if let Some(message) =
+            crate::state::orphan_target_group_refusal(&target_group_arns, &unattached)
+        {
             return Err(CreateServiceErrorModeled::InvalidParameterException(
                 InvalidParameterException {
                     message: Some(message),
@@ -659,7 +749,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "If your account has already created the Amazon ECS service-linked role,
             // that role is used for your service unless you specify a role here."
             role_arn: crate::state::service_role_arn(input.role.as_deref(), scheduler_owned),
-            load_balancers: requested_load_balancers,
+            load_balancers: load_balancers.clone(),
             service_registries: input.service_registries.clone().unwrap_or_default(),
             deployment_configuration: crate::state::deployment_configuration(
                 input.deployment_configuration.clone(),

@@ -321,7 +321,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             modified_at: now,
             duration: None,
             error_message: None,
-            task_instances: Vec::new(),
+            // No task instance exists until something executes the workflow
+            // definition, and this emulator has no Apache Airflow engine to do it
+            // (`crate::state::NO_AIRFLOW_ENGINE`), so a started run holds none.
+            task_instances: BTreeMap::new(),
             // The instant the run's exit from `QUEUED` falls due. Recorded, never
             // waited on, so a caller reading the run straight back still sees `QUEUED`.
             settles_at: now + crate::state::RUN_SETTLE_AFTER,

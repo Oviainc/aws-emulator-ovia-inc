@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteIntegration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteIntegration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: removes the integration the request names, together with the OpenSearch
+//! Service resources reported from it — or refuses a name no integration is stored under.
+//! This is the ONLY file to touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`DeleteIntegration::handle`] with real behaviour and
@@ -145,17 +145,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteIntegration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteIntegrationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteIntegration"))
+        // request metadata, which this operation needs none of: an integration is
+        // identified by its name alone.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteIntegrationError::from(
+                DeleteIntegrationErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let mut store = state.lock();
+
+        // An integration is identified by its name alone, and this delete removes it in
+        // whatever status it is in: a provisioning integration is deleted as readily as an
+        // active one, so the status the clock owes it is not read here.
+        if !store.integrations.contains_key(&input.integration_name) {
+            return Err(DeleteIntegrationErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::resource_not_found_message("integration")),
+                },
+            )
+            .into());
+        }
+
+        // The dashboards `force` is about are vended logs dashboards, which no operation of
+        // this service creates, lists or deletes: the account holds none for "If your
+        // integration has active vended logs dashboards, you must specify true for the force
+        // parameter" to be true of, so that condition never holds here and the delete is
+        // accepted whether or not the request forces it. Nothing is invented from the
+        // integration's status to stand in for a dashboard this emulator does not model.
+        let _ = input.force;
+
+        // The integration's OpenSearch Service resources are reported FROM its record, so
+        // removing the record is what removes them: nothing of the integration survives
+        // this call, and a later `GetIntegration` or `ListIntegrations` reports none.
+        store.integrations.remove(&input.integration_name);
+
+        Ok(DeleteIntegrationOutput {})
     }
 }

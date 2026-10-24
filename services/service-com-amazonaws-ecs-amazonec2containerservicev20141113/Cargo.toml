@@ -8,12 +8,13 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
-# The Elastic Load Balancing v2 service, for ONE read: the `TargetType` of a target group
-# a `loadBalancers` entry names, which decides whether that target group can carry the
-# tasks of the service's task definition (`crate::state::target_group_target_types`). The
-# target group lives in that service's own store in the shared engine, so this is a
-# cross-service READ of it rather than a copy of a value the request carried. No cycle:
-# that crate does not depend on this one.
+# The Elastic Load Balancing v2 service, for TWO reads of a target group a `loadBalancers`
+# entry names: its `TargetType`, which decides whether that group can carry the tasks of the
+# service's task definition (`crate::state::target_group_target_types`), and whether any load
+# balancer forwards to it, which decides whether those tasks can be reached at all
+# (`crate::state::unattached_target_groups`). The target group lives in that service's own
+# store in the shared engine, so these are cross-service READS of it rather than a copy of a
+# value the request carried. No cycle: that crate does not depend on this one.
 service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10 = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }

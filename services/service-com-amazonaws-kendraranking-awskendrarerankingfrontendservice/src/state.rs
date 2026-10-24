@@ -208,6 +208,28 @@ impl PendingStatus {
     }
 }
 
+/// The `RescoreCapacityUnits` count of a plan that was given no ADDITIONAL capacity
+/// units: zero.
+///
+/// "You are given a single capacity unit by default. If you want to use the default
+/// capacity, you don't set additional capacity units."
+/// (`CreateRescoreExecutionPlanRequest$CapacityUnits`) — so a create or update that
+/// carries no `CapacityUnits` member is asking for zero EXTRA units, which is a
+/// capacity configuration the plan has. A reader reports it as such: "A capacity of
+/// zero indicates that the rescore execution plan is using the default capacity."
+/// (`DescribeRescoreExecutionPlanResponse$CapacityUnits`). It is also the bottom of
+/// `CapacityUnitsConfiguration$RescoreCapacityUnits`'s published `@range` (min 0).
+pub const DEFAULT_RESCORE_CAPACITY_UNITS: i32 = 0;
+
+/// The capacity configuration of a plan given no additional capacity units — the ONE
+/// place [`DEFAULT_RESCORE_CAPACITY_UNITS`] is turned into the modelled structure, so
+/// create and update default it identically.
+pub fn default_capacity_units() -> CapacityUnitsConfiguration {
+    CapacityUnitsConfiguration {
+        rescore_capacity_units: DEFAULT_RESCORE_CAPACITY_UNITS,
+    }
+}
+
 /// The signing name / ARN namespace of this service, as the model's
 /// `aws.api#service` trait states it (see `OPERATIONS.md`).
 pub const ARN_NAMESPACE: &str = "kendra-ranking";
@@ -226,7 +248,13 @@ pub struct RescoreExecutionPlan {
     pub arn: String,
     pub name: String,
     pub description: Option<String>,
-    pub capacity_units: Option<CapacityUnitsConfiguration>,
+    /// This plan's capacity configuration. NOT optional: every plan has one, and a
+    /// plan that was never given additional capacity units has it set to
+    /// [`DEFAULT_RESCORE_CAPACITY_UNITS`] — "A capacity of zero indicates that the
+    /// rescore execution plan is using the default capacity."
+    /// (`DescribeRescoreExecutionPlanResponse$CapacityUnits` in the model), so the
+    /// default-capacity case is a value a reader reports rather than an absence.
+    pub capacity_units: CapacityUnitsConfiguration,
     /// Creation instant, Unix epoch milliseconds (the model types `CreatedAt` as a
     /// timestamp; milliseconds keep the stored value independent of the wire form).
     pub created_at_millis: i64,

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAgreementEntitlements
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAgreementEntitlements`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAgreementEntitlements::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports a page of the entitlements accepting the stored agreement provisioned, each
+//! with the licence it granted and the provisioning state the agreement and the clock
+//! put it in. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +147,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAgreementEntitlements` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAgreementEntitlementsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAgreementEntitlements"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetAgreementEntitlementsErrorModeled::InternalServerException(
+                    crate::state::store_unavailable(),
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+
+        // A pure report: it reads the entitlements the acceptance stored and
+        // writes nothing. Each entitlement's `status` and `statusReasonCode`
+        // are computed from the agreement and `now`, so the provisioning the
+        // clock has already made due is reported without a write — and two
+        // reads of a settled entitlement answer the same thing.
+        let store = state.lock();
+        let Some(agreement) = store.agreements.get(&input.agreement_id) else {
+            // The lookup found nothing: the modelled not-found body, at the
+            // status this service answers it with (`state::NOT_FOUND_STATUS`).
+            return Err(crate::state::not_found(
+                GetAgreementEntitlementsErrorModeled::ResourceNotFoundException(
+                    crate::state::agreement_not_found(&input.agreement_id),
+                ),
+            ));
+        };
+        let entitlements = agreement.to_entitlements(now);
+
+        // The token resumes THIS agreement's entitlements: the scope names the
+        // operation as well as the agreement, so a token minted for the same
+        // agreement's terms cannot resume this list.
+        let scope = crate::state::query_scope(&[Self::NAME, &input.agreement_id]);
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => match crate::state::page_offset(&scope, token) {
+                Some(offset) => offset,
+                None => {
+                    return Err(
+                        GetAgreementEntitlementsErrorModeled::ValidationException(
+                            crate::state::validation_exception("INVALID_NEXT_TOKEN", "nextToken"),
+                        )
+                        .into(),
+                    );
+                }
+            },
+        };
+
+        let Some((agreement_entitlements, next_token)) = crate::state::paginate(
+            &entitlements,
+            &scope,
+            offset,
+            crate::state::page_size(input.max_results),
+        ) else {
+            // The offset is past the end of this agreement's entitlements,
+            // which no token this operation minted ever named.
+            return Err(
+                GetAgreementEntitlementsErrorModeled::ValidationException(
+                    crate::state::validation_exception("INVALID_NEXT_TOKEN", "nextToken"),
+                )
+                .into(),
+            );
+        };
+
+        Ok(GetAgreementEntitlementsOutput {
+            agreement_entitlements: Some(agreement_entitlements),
+            next_token,
+        })
     }
 }

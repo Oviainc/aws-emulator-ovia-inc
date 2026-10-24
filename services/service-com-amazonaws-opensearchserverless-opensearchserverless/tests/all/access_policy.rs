@@ -24,7 +24,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 
-use crate::collection_lifecycle::{at, call, emulator, is_policy_version, text};
+use crate::collection_lifecycle::{at, call, emulator, is_policy_version, text, CLIENT_ERROR};
 
 /// The values `AccessPolicyType` accepts on the wire
 /// (`smithy_query(query="shape", shape="AccessPolicyType")` -> `values`): the single value
@@ -221,7 +221,8 @@ async fn the_access_policy_create_and_read_are_served_from_state() {
             );
         }
 
-        // And a pair that was never created is the 404 the model declares for the read.
+        // And a pair that was never created is the `ResourceNotFoundException` the model
+        // declares for the read.
         let (status, code, answer) = call(
             &router,
             "GetAccessPolicy",
@@ -230,8 +231,8 @@ async fn the_access_policy_create_and_read_are_served_from_state() {
         .await;
         assert_eq!(
             (status, code.as_str()),
-            (404, "ResourceNotFoundException"),
-            "case GetAccessPolicy({kind}/never-created): expected 404 ResourceNotFoundException, got {status} {code} with {answer}"
+            (CLIENT_ERROR, "ResourceNotFoundException"),
+            "case GetAccessPolicy({kind}/never-created): expected {CLIENT_ERROR} ResourceNotFoundException, got {status} {code} with {answer}"
         );
     }
 }
@@ -262,8 +263,8 @@ async fn create_access_policy_refuses_a_duplicate_pair_and_an_invalid_input() {
     .await;
     assert_eq!(
         (status, code.as_str()),
-        (409, "ConflictException"),
-        "case CreateAccessPolicy(duplicate pair): expected 409 ConflictException, got {status} {code} with {answer}"
+        (CLIENT_ERROR, "ConflictException"),
+        "case CreateAccessPolicy(duplicate pair): expected {CLIENT_ERROR} ConflictException, got {status} {code} with {answer}"
     );
 
     // ... and it leaves the stored policy exactly as it was.
@@ -350,7 +351,7 @@ async fn create_access_policy_refuses_a_duplicate_pair_and_an_invalid_input() {
     .await;
     assert_eq!(
         (status, code.as_str()),
-        (404, "ResourceNotFoundException"),
+        (CLIENT_ERROR, "ResourceNotFoundException"),
         "case GetAccessPolicy(bad-policy): a refused create must persist nothing, got {status} {code} with {answer}"
     );
 
@@ -432,8 +433,8 @@ async fn a_replayed_client_token_answers_the_access_policy_it_first_created() {
     .await;
     assert_eq!(
         (status, code.as_str()),
-        (409, "ConflictException"),
-        "case CreateAccessPolicy(a fresh token for a stored pair): expected 409 ConflictException, got {status} {code} with {answer}"
+        (CLIENT_ERROR, "ConflictException"),
+        "case CreateAccessPolicy(a fresh token for a stored pair): expected {CLIENT_ERROR} ConflictException, got {status} {code} with {answer}"
     );
 
     // The token index is keyed by operation as well, so the same token spent on another
@@ -486,8 +487,8 @@ async fn create_access_policy_refuses_the_request_past_the_account_quota() {
     .await;
     assert_eq!(
         (status, code.as_str()),
-        (402, "ServiceQuotaExceededException"),
-        "case CreateAccessPolicy(one past the {MAX_ACCESS_POLICIES}-policy quota): expected 402 ServiceQuotaExceededException, got {status} {code} with {answer}"
+        (CLIENT_ERROR, "ServiceQuotaExceededException"),
+        "case CreateAccessPolicy(one past the {MAX_ACCESS_POLICIES}-policy quota): expected {CLIENT_ERROR} ServiceQuotaExceededException, got {status} {code} with {answer}"
     );
     assert_eq!(
         text(&answer, "resourceType"),
@@ -570,7 +571,7 @@ async fn create_access_policy_bounds_the_nesting_of_the_policy_document() {
         .await;
         assert_eq!(
             (status, code.as_str()),
-            (404, "ResourceNotFoundException"),
+            (CLIENT_ERROR, "ResourceNotFoundException"),
             "case GetAccessPolicy(nested-{depth}): a refused document persists nothing, got {status} {code} with {answer}"
         );
     }
@@ -720,14 +721,14 @@ async fn every_access_policy_call_emits_one_structured_audit_record() {
             "the pair was already taken",
             "CreateAccessPolicy",
             json!({ "type": "data", "name": "audited-policy", "policy": r#"{"Rules":[]}"# }),
-            409,
+            CLIENT_ERROR,
             "already-exists",
         ),
         (
             "the document is not JSON",
             "CreateAccessPolicy",
             json!({ "type": "data", "name": "audited-refused", "policy": "not json at all" }),
-            400,
+            CLIENT_ERROR,
             "validation-refused",
         ),
         (
@@ -741,7 +742,7 @@ async fn every_access_policy_call_emits_one_structured_audit_record() {
             "the pair names no policy",
             "GetAccessPolicy",
             json!({ "type": "data", "name": "audited-missing" }),
-            404,
+            CLIENT_ERROR,
             "not-found",
         ),
         (
@@ -802,14 +803,14 @@ async fn every_access_policy_call_emits_one_structured_audit_record() {
             "the version is not the stored one",
             "UpdateAccessPolicy",
             json!({ "type": "data", "name": "audited-written", "policyVersion": version, "description": "do-not-log-this-either" }),
-            409,
+            CLIENT_ERROR,
             "version-mismatch",
         ),
         (
             "the write names no policy",
             "UpdateAccessPolicy",
             json!({ "type": "data", "name": "audited-absent", "policyVersion": version }),
-            404,
+            CLIENT_ERROR,
             "not-found",
         ),
         (
@@ -823,7 +824,7 @@ async fn every_access_policy_call_emits_one_structured_audit_record() {
             "the delete names no policy",
             "DeleteAccessPolicy",
             json!({ "type": "data", "name": "audited-written" }),
-            404,
+            CLIENT_ERROR,
             "not-found",
         ),
     ];

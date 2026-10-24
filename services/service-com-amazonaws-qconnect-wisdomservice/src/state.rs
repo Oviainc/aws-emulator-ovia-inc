@@ -7,7 +7,7 @@
 //! handler answers with is derived from the records kept here, so what one request
 //! writes is what the next request reads.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::SystemTime;
 
 use crate::ops::types::{
@@ -178,6 +178,63 @@ pub const MAX_ASSOCIATIONS_PER_ASSISTANT: usize = 100;
 /// The `AssociationType` of an association with a knowledge base this account holds
 /// (`smithy_query(query="shape",shape="AssociationType")`).
 pub const ASSOCIATION_TYPE_KNOWLEDGE_BASE: &str = "KNOWLEDGE_BASE";
+
+/// The only `KnowledgeBaseType` a content upload may be started against.
+///
+/// `StartContentUpload`'s own documentation states the rule — "You can only upload
+/// content to a knowledge base of type CUSTOM" — so a start against a knowledge base
+/// of any other modelled type is refused instead of being handed a URL that could not
+/// be used.
+pub const KNOWLEDGE_BASE_TYPE_CUSTOM: &str = "CUSTOM";
+
+/// How long an upload URL stays valid when the caller names no
+/// `presignedUrlTimeToLive`.
+///
+/// CHOSEN, not documented: the model bounds that member at `range 1..60` minutes
+/// (`smithy_query(query="operation",operation="StartContentUpload")`) and states no
+/// default, so this emulator picks one inside those bounds. A caller that cares names
+/// its own value, which is used as given.
+pub const DEFAULT_PRESIGNED_URL_TIME_TO_LIVE_MINUTES: u64 = 30;
+
+/// The most content uploads this store holds at once.
+///
+/// An upload is reclaimed when its URL expires or when its knowledge base is deleted,
+/// so the store drains by itself; the ceiling bounds how much a caller that keeps
+/// starting uploads can hold at any one instant. It is a resource guard this emulator
+/// owns, NOT an AWS-published quota, and a start past it is refused with the modelled
+/// `ValidationException` (the operation models no quota error).
+pub const MAX_CONTENT_UPLOADS: usize = 1_000;
+
+/// The most bytes one upload's `PUT` may carry.
+///
+/// The bytes live in this process's heap until the upload expires, so the body is
+/// bounded the way the number of uploads is. It is a resource guard this emulator owns,
+/// NOT an AWS-published quota, and a larger body is refused by the upload plane rather
+/// than stored.
+pub const MAX_CONTENT_UPLOAD_BYTES: usize = 8 * 1024 * 1024;
+
+/// The header an upload's `PUT` carries the `contentType` the upload was started for
+/// under: an upload URL is minted for ONE media type, exactly as an S3 presigned `PUT`
+/// signed over a content type is.
+pub const CONTENT_TYPE_HEADER: &str = "content-type";
+
+/// The header naming the server-side encryption an encrypted knowledge base's upload
+/// must be written with, and its value: a knowledge base that carries a
+/// `serverSideEncryptionConfiguration` is written under that KMS key, so the upload
+/// must say so.
+pub const SERVER_SIDE_ENCRYPTION_HEADER: &str = "x-amz-server-side-encryption";
+pub const SERVER_SIDE_ENCRYPTION_AWS_KMS: &str = "aws:kms";
+
+/// The header naming the customer-managed KMS key an encrypted knowledge base's upload
+/// is written under, carried only when the knowledge base names one.
+pub const SERVER_SIDE_ENCRYPTION_KEY_ID_HEADER: &str =
+    "x-amz-server-side-encryption-aws-kms-key-id";
+
+/// The endpoint prefix this service publishes
+/// (`smithy_query(query="service_info")`: endpoint templates
+/// `https://wisdom.{Region}.{dnsSuffix}`), used to word an upload URL for a request
+/// that addressed no endpoint host of its own.
+pub const ENDPOINT_PREFIX: &str = "wisdom";
 
 /// The `AssociationType` of an association with a Bedrock knowledge base outside this
 /// service (`smithy_query(query="shape",shape="AssociationType")`).
@@ -828,6 +885,138 @@ pub fn input_target_key(association: &AssistantAssociationInputData) -> String {
     }
 }
 
+/// One content upload `StartContentUpload` opened: the slot the URL it handed out
+/// writes into.
+///
+/// The record is what makes that URL a locator for something this emulator holds: the
+/// upload plane (`crate::service`) serves a `PUT` to it out of this record, and
+/// `CreateContent`/`UpdateContent` name the same `uploadId` to finalize the asset. The
+/// published headers are STORED rather than recomputed, so the headers the start call
+/// told the caller to include are exactly the ones the `PUT` is held to.
+#[derive(Debug, Clone)]
+pub struct ContentUpload {
+    pub upload_id: String,
+    /// The `knowledgeBaseId` the upload was started under — the resolved id, never the
+    /// label form the request used, so an upload resolves the same way by id or by ARN.
+    pub knowledge_base_id: String,
+    /// `ContentType` on the wire: the one media type this upload accepts.
+    pub content_type: String,
+    /// The URL handed to the caller, kept so the record and the locator cannot drift.
+    pub url: String,
+    /// When the URL stops being usable. A `PUT` at or after it is refused and the
+    /// record is reclaimed.
+    pub url_expiry: SystemTime,
+    /// The headers the start call published, which the `PUT` must carry. A `BTreeMap`,
+    /// so the map a response renders does not depend on hash order.
+    pub headers_to_include: BTreeMap<String, String>,
+    pub started_at: SystemTime,
+    /// The bytes a `PUT` to the URL stored, `None` until one does.
+    pub body: Option<Vec<u8>>,
+    /// When those bytes arrived.
+    pub received_at: Option<SystemTime>,
+}
+
+impl ContentUpload {
+    /// Whether this upload's URL is no longer usable at `now`.
+    pub fn has_expired(&self, now: SystemTime) -> bool {
+        now >= self.url_expiry
+    }
+
+    /// Whether a request carries every header this upload was started with, each with
+    /// the published value. `sent` reads one header off the request by name (HTTP header
+    /// names are case-insensitive, and the published names are already lowercase).
+    ///
+    /// This is what `headersToInclude` MEANS: the upload is written only by a request
+    /// that includes them, so a caller that echoes the start call's map is accepted and
+    /// one that drops a header is refused.
+    pub fn headers_satisfied<F>(&self, sent: F) -> bool
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        self.headers_to_include
+            .iter()
+            .all(|(name, value)| sent(name).as_deref() == Some(value.as_str()))
+    }
+}
+
+/// What a request to a published upload URL names: the knowledge-base label and the
+/// upload id, as [`content_upload_path`] words them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentUploadTarget {
+    pub knowledge_base_label: String,
+    pub upload_id: String,
+}
+
+/// The path the upload plane serves one upload under.
+///
+/// It sits under the knowledge base the upload belongs to — the same `/knowledgeBases`
+/// space the modelled routes use — and names no modelled operation (the model's own
+/// upload route is `POST /knowledgeBases/{knowledgeBaseId}/upload`), which is what lets
+/// the service serve it from its routing-error seam.
+pub fn content_upload_path(knowledge_base_id: &str, upload_id: &str) -> String {
+    format!("/knowledgeBases/{knowledge_base_id}/uploads/{upload_id}")
+}
+
+/// The upload a request path names, or `None` when the path is not one this service
+/// publishes.
+pub fn parse_content_upload_path(path: &str) -> Option<ContentUploadTarget> {
+    let rest = path.strip_prefix("/knowledgeBases/")?;
+    let mut segments = rest.split('/');
+    let (Some(knowledge_base_label), Some("uploads"), Some(upload_id), None) = (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) else {
+        return None;
+    };
+    if knowledge_base_label.is_empty() || upload_id.is_empty() {
+        return None;
+    }
+    Some(ContentUploadTarget {
+        knowledge_base_label: knowledge_base_label.to_string(),
+        upload_id: upload_id.to_string(),
+    })
+}
+
+/// The URL an upload is written to: the endpoint the caller reached, plus the upload's
+/// own path.
+///
+/// NO SigV4 signature is attached — this emulator does not sign URLs, and a fabricated
+/// signature would claim a computation nothing performed. The upload id is the receipt
+/// that names the slot, and it is minted, unguessable and expiring.
+pub fn content_upload_url(host: &str, knowledge_base_id: &str, upload_id: &str) -> String {
+    format!(
+        "https://{host}{}",
+        content_upload_path(knowledge_base_id, upload_id)
+    )
+}
+
+/// The endpoint host a request addressed, so a URL this service hands out is reachable
+/// at the endpoint the caller is already talking to; [`ENDPOINT_PREFIX`]'s published
+/// host for a request that named none.
+///
+/// The header is only taken when it LOOKS like a host — letters, digits, `-`, `.` and a
+/// `:port` — so a caller cannot get an arbitrary string of its own into the URL this
+/// service reports.
+pub fn request_endpoint_host(headers: &::http::HeaderMap, region: &str) -> String {
+    headers
+        .get("host")
+        .and_then(|host| host.to_str().ok())
+        .filter(|host| is_host_shaped(host))
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("{ENDPOINT_PREFIX}.{region}.amazonaws.com"))
+}
+
+/// Whether `host` is a non-empty `host[:port]` of the characters a hostname carries.
+fn is_host_shaped(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 255
+        && host
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b':'))
+}
+
 /// Per-service state for com-amazonaws-qconnect-wisdomservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsQconnectWisdomserviceState {
@@ -853,6 +1042,11 @@ pub struct ComAmazonawsQconnectWisdomserviceState {
     /// The id mint's sequence: every mint takes the next number, so no two minted ids
     /// can be the same candidate.
     next_id_seq: u64,
+    /// Every content upload `StartContentUpload` opened, keyed by its `uploadId`, at
+    /// most [`MAX_CONTENT_UPLOADS`] of them and each holding at most
+    /// [`MAX_CONTENT_UPLOAD_BYTES`] bytes. An entry is reclaimed once its URL expires
+    /// or its knowledge base is deleted.
+    pub content_uploads: HashMap<String, ContentUpload>,
 }
 
 impl ComAmazonawsQconnectWisdomserviceState {
@@ -870,6 +1064,51 @@ impl ComAmazonawsQconnectWisdomserviceState {
         (0..MINT_ATTEMPTS as u64)
             .map(|attempt| mint_candidate(seq, attempt))
             .find(|candidate| !self.assistants.contains_key(candidate))
+    }
+
+    /// An `uploadId` no stored upload holds, or `None` when [`MINT_ATTEMPTS`] candidates
+    /// of this sequence number's block were all taken.
+    ///
+    /// The model constrains `UploadId` by length alone (`len 1..1200`, no pattern), so a
+    /// minted id of the same form satisfies it, and it is unguessable — which is what
+    /// makes the id itself the receipt the upload URL carries.
+    pub fn mint_content_upload_id(&mut self) -> Option<String> {
+        let seq = self.next_seq();
+        (0..MINT_ATTEMPTS as u64)
+            .map(|attempt| mint_candidate(seq, attempt))
+            .find(|candidate| !self.content_uploads.contains_key(candidate))
+    }
+
+    /// The upload an `uploadId` names, whatever its state.
+    pub fn content_upload(&self, upload_id: &str) -> Option<&ContentUpload> {
+        self.content_uploads.get(upload_id)
+    }
+
+    /// The upload an `uploadId` names, for the plane that writes its bytes.
+    pub fn content_upload_mut(&mut self, upload_id: &str) -> Option<&mut ContentUpload> {
+        self.content_uploads.get_mut(upload_id)
+    }
+
+    /// Forget every upload whose URL has expired by `now`.
+    ///
+    /// This materialises what the CLOCK already made due — an expired URL cannot be used
+    /// by anyone, so the slot was owed back at the instant it expired, whether or not
+    /// anybody called — and it is what keeps the store draining rather than growing to
+    /// [`MAX_CONTENT_UPLOADS`] and staying there.
+    pub fn reclaim_expired_content_uploads(&mut self, now: SystemTime) {
+        self.content_uploads
+            .retain(|_, upload| !upload.has_expired(now));
+    }
+
+    /// Persist an opened upload. `false` — nothing stored — when the store already holds
+    /// [`MAX_CONTENT_UPLOADS`], so the bound holds however the caller reaches this.
+    pub fn insert_content_upload(&mut self, upload: ContentUpload) -> bool {
+        if self.content_uploads.len() >= MAX_CONTENT_UPLOADS {
+            return false;
+        }
+        self.content_uploads
+            .insert(upload.upload_id.clone(), upload);
+        true
     }
 
     /// The default AI agents an assistant comes with, and the bindings that name them:
@@ -981,6 +1220,11 @@ impl ComAmazonawsQconnectWisdomserviceState {
         for token in gone {
             self.idempotency.remove(&token);
         }
+        // An upload URL is a locator INSIDE the knowledge base it was started under, so
+        // a knowledge base that is gone takes its open uploads with it: following such a
+        // URL afterwards names nothing, and the bytes it held are reclaimed.
+        self.content_uploads
+            .retain(|_, upload| upload.knowledge_base_id != knowledge_base.knowledge_base_id);
         Some(knowledge_base)
     }
 

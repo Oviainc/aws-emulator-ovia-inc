@@ -1109,9 +1109,26 @@ pub fn decode_page_token(token: Option<&str>) -> Result<Option<String>, String> 
         .map_err(|_| invalid_token_message())
 }
 
-/// What to tell a caller that presented a token this service did not mint.
+/// The parameter name ECR Public states for the pagination token when it refuses one.
+///
+/// The WIRE member is lower-camel `nextToken` (`smithy_query(query="operation",
+/// operation="DescribeImageTags")` — input member `nextToken` -> `NextToken`), but the
+/// member path this service quotes in an `InvalidParameterException` is its own
+/// PascalCase parameter name for the token, which is the shape name `NextToken`. The
+/// same service states `PolicyText` the same way (`set_repository_policy.rs`), so the
+/// path a refusal quotes is the parameter name the service publishes and not a
+/// mechanical copy of the JSON key.
+pub const NEXT_TOKEN_PARAMETER: &str = "NextToken";
+
+/// What to tell a caller that presented a token this service did not mint: the service's
+/// `Invalid parameter at '<member>' failed to satisfy constraint: '<rule>'` template over
+/// the token parameter ([`NEXT_TOKEN_PARAMETER`]) and the VERDICT on the token supplied —
+/// the cursor is not one this service issued — rather than a prerequisite on how the
+/// caller should have come by it. The rejected token itself is never quoted back, like
+/// every other clause this service renders.
 pub fn invalid_token_message() -> String {
-    "Invalid parameter at 'nextToken' failed to satisfy constraint: 'Member must be a \
-     token returned by a previous call'"
-        .to_string()
+    format!(
+        "Invalid parameter at '{NEXT_TOKEN_PARAMETER}' failed to satisfy constraint: \
+         'Invalid next token provided'"
+    )
 }

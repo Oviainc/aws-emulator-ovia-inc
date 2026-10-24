@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListMonitoredResources
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListMonitoredResources`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListMonitoredResources::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the resources this account has under DevOps Guru analysis, one
+//! `MonitoredResourceIdentifier` per coverage entry the store holds
+//! ([`crate::state::ResourceCoverage::monitored_resources`]) — the same population
+//! `DescribeAccountHealth` counts as `AnalyzedResourceCount` — selected by the
+//! request's `Filters` and paged at its `MaxResults`. A report: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +155,174 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListMonitoredResources` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListMonitoredResourcesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListMonitoredResources"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListMonitoredResourcesError::Modeled(
+                ListMonitoredResourcesErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the DevOps Guru resource collection store is unavailable"
+                            .to_string(),
+                        retry_after_seconds: 0,
+                    },
+                ),
+            )
+        })?;
+
+        let selection = Selection::of(input.filters.as_ref())?;
+        // `MaxResults` is modelled 1..50, so a request can only narrow the page; one
+        // that names none pages at this service's own size, as its other paginated
+        // reads do.
+        let page_size = input
+            .max_results
+            .map_or(crate::state::PAGE_SIZE, |requested| {
+                (requested as usize).clamp(1, crate::state::PAGE_SIZE)
+            });
+
+        let guard = state.lock();
+        // Select, then page: a token names an offset into the resources THIS selection
+        // matches, so it is scoped to the selection and does not resolve against
+        // another's.
+        let selected: Vec<MonitoredResourceIdentifier> = guard
+            .resource_collection
+            .monitored_resources()
+            .into_iter()
+            .filter(|identifier| selection.matches(identifier))
+            .collect();
+
+        let (page, next_token) = crate::state::page_sized(
+            &selected,
+            &selection.page_scope(),
+            input.next_token.as_deref(),
+            page_size,
+        )
+        .ok_or_else(|| -> ListMonitoredResourcesError {
+            ListMonitoredResourcesErrorModeled::ValidationException(ValidationException {
+                message:
+                    "NextToken does not name a page of the monitored resources these filters select"
+                        .to_string(),
+                reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+                fields: Some(vec![ValidationExceptionField {
+                    name: "NextToken".to_string(),
+                    message:
+                        "must be a token returned by an earlier ListMonitoredResources for the same Filters"
+                            .to_string(),
+                }]),
+            })
+            .into()
+        })?;
+
+        // An account that has declared no coverage monitors nothing, which is an empty
+        // list rather than an error; `MonitoredResourceIdentifiers` is required, so it
+        // is always rendered.
+        Ok(ListMonitoredResourcesOutput {
+            monitored_resource_identifiers: page,
+            next_token,
+        })
     }
+}
+
+/// What a request's `Filters` select out of the monitored resources the store holds.
+///
+/// `Filters` is optional and its two members are both required when it is present, so
+/// a request either restricts along both dimensions or along neither.
+#[derive(Debug, Default)]
+struct Selection {
+    /// `Filters.ResourcePermission`: report only the resources whose permission status
+    /// is this one. `None` when the request carries no `Filters`, which restricts
+    /// nothing.
+    permission: Option<String>,
+    /// `Filters.ResourceTypeFilters`, deduplicated into a stable order: report only the
+    /// resources whose `Type` one of these names. An empty set names no type and so
+    /// restricts nothing, exactly as an absent `Filters` does.
+    types: ::std::collections::BTreeSet<String>,
+}
+
+impl Selection {
+    /// What `filters` selects, or the `ValidationException` that refuses it.
+    fn of(
+        filters: Option<&ListMonitoredResourcesFilters>,
+    ) -> Result<Self, ListMonitoredResourcesError> {
+        let Some(filters) = filters else {
+            return Ok(Self::default());
+        };
+        // Both members are modelled enums, so the boundary validator refuses anything
+        // else before this handler runs; checking here keeps such a value a 400 rather
+        // than a silently empty answer if it ever reaches this far.
+        if !RESOURCE_PERMISSION_VALUES.contains(&filters.resource_permission.as_str()) {
+            return Err(not_one_of(
+                "Filters.ResourcePermission",
+                &filters.resource_permission,
+                RESOURCE_PERMISSION_VALUES,
+            ));
+        }
+        if let Some(unknown) = filters
+            .resource_type_filters
+            .iter()
+            .find(|named| !RESOURCE_TYPE_FILTER_VALUES.contains(&named.as_str()))
+        {
+            return Err(not_one_of(
+                "Filters.ResourceTypeFilters",
+                unknown,
+                RESOURCE_TYPE_FILTER_VALUES,
+            ));
+        }
+        Ok(Self {
+            permission: Some(filters.resource_permission.clone()),
+            types: filters.resource_type_filters.iter().cloned().collect(),
+        })
+    }
+
+    /// Whether this selection reports `identifier`.
+    fn matches(&self, identifier: &MonitoredResourceIdentifier) -> bool {
+        let permitted = self
+            .permission
+            .as_deref()
+            .is_none_or(|wanted| identifier.resource_permission.as_deref() == Some(wanted));
+        // `ResourceTypeFilter`'s values (`RESOURCE_TYPE_FILTER_VALUES`) each name a kind
+        // of Amazon Web Services resource that DevOps Guru's own discovery finds INSIDE
+        // an analysis boundary — `LOG_GROUPS`, `LAMBDA_FUNCTION`, … — and this emulator
+        // runs no such discovery: the resources it records are the boundary entries
+        // THEMSELVES, typed `crate::state::MONITORED_STACK_RESOURCE_TYPE` and
+        // `crate::state::MONITORED_TAG_RESOURCE_TYPE`, which that enum does not name.
+        // So a request that names a type selects none of them; the mapping from a filter
+        // value to a DISCOVERED resource's type belongs with the discovery that would
+        // store one.
+        let typed = self.types.is_empty()
+            || identifier
+                .r#type
+                .as_deref()
+                .is_some_and(|stored| self.types.contains(stored));
+        permitted && typed
+    }
+
+    /// The scope a page token of this selection is bound to: a cursor into one selection
+    /// must not seek into another's.
+    fn page_scope(&self) -> String {
+        let permission = self.permission.as_deref().unwrap_or("-");
+        let types = if self.types.is_empty() {
+            "-".to_string()
+        } else {
+            self.types
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<&str>>()
+                .join(",")
+        };
+        format!("ListMonitoredResources/{permission}/{types}")
+    }
+}
+
+/// The `ValidationException` refusing `value` for `member`, for which the model admits
+/// only one of `allowed`.
+fn not_one_of(member: &str, value: &str, allowed: &[&str]) -> ListMonitoredResourcesError {
+    let allowed = allowed.join(" | ");
+    ListMonitoredResourcesErrorModeled::ValidationException(ValidationException {
+        message: format!("{member} must be one of {allowed}, got '{value}'"),
+        reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+        fields: Some(vec![ValidationExceptionField {
+            name: member.to_string(),
+            message: format!("must be one of {allowed}"),
+        }]),
+    })
+    .into()
 }

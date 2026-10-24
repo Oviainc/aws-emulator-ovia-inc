@@ -37,6 +37,23 @@
 //! * The activation of a new identity source ([`IDENTITY_SOURCE_ACTIVATION_DELAY`]). A
 //!   source is `CREATING` until it comes due and `ACTIVE` afterwards, which is what
 //!   `IdentitySourceStatus`' non-terminal `CREATING` token stands for.
+//! * The activation of a new session ([`SESSION_ACTIVATION_DELAY`]) and, after it, that
+//!   session's expiration ([`SESSION_EXPIRATION`]): a session is `CREATING` until its
+//!   activation comes due, `PENDING` while it waits on its approvers, and `FAILED` with
+//!   status code `EXPIRED` once its expiration has passed with no answer.
+//!
+//! # Sessions
+//!
+//! A session is an approval request put to ONE team's approvers.
+//! `StartApprovalTeamBaseline` is the only operation of this model that starts one, so a
+//! baseline session ([`SessionKind`]) is the only kind this store records, and
+//! `GetSession` reports it out of that one record
+//! ([`ComAmazonawsMpaAwsfluffycoreserviceState::session`]). No operation of this model
+//! records an approver's vote, so a session waits in `PENDING` until its expiration comes
+//! due and no response is ever reported as anything but `NO_RESPONSE`. A team's
+//! outstanding baseline session is also what `GetApprovalTeam` reports for each approver
+//! ([`ComAmazonawsMpaAwsfluffycoreserviceState::pending_baseline_session_arn`]), so the
+//! two reads cannot disagree.
 //!
 //! # Identity sources
 //!
@@ -123,6 +140,45 @@ pub const INVITATION_RESPONSE_DELAY: Duration = Duration::from_millis(500);
 /// fixes for a clock-owed transition, so a caller that lists the source immediately
 /// still observes the transient `CREATING` status the model declares.
 pub const IDENTITY_SOURCE_ACTIVATION_DELAY: Duration = Duration::from_millis(500);
+
+/// How long after a session is started the emulator reports it as `PENDING` (and
+/// therefore how long it stays `CREATING`).
+///
+/// CHOSEN, not documented: AWS publishes no duration for a session to be set up. It sits
+/// inside the 250–750 ms window this project fixes for a clock-owed transition, so a
+/// caller that reads the session back immediately still observes the transient
+/// `CREATING` status the model declares.
+pub const SESSION_ACTIVATION_DELAY: Duration = Duration::from_millis(500);
+
+/// How long a session waits for its approvers before it expires, measured from the
+/// instant it was initiated.
+///
+/// CHOSEN, not documented: this model carries no session timeout and no request member
+/// names one, so this is NOT a claim about the real service's deadline — it is the span
+/// `ExpirationTime` reports and the instant at which the clock owes the session's
+/// `FAILED` / `EXPIRED` outcome. It is deliberately NOT in the 250–750 ms band the
+/// project fixes for a provisioning transition: this span is a DEADLINE for a human
+/// answer, not a resource settling, and a sub-second one would expire every session
+/// before any approver could see it.
+pub const SESSION_EXPIRATION: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Largest number of sessions the store will hold.
+///
+/// A ceiling, not a fidelity claim, and the same bound (and the same reason) as
+/// [`MAX_APPROVAL_TEAMS`]: nothing authenticates a caller of this emulator, so without
+/// one a client looping on `StartApprovalTeamBaseline` grows this process's heap and the
+/// per-request [`ComAmazonawsMpaAwsfluffycoreserviceState::materialize_due`] walk without
+/// bound. `StartApprovalTeamBaseline` declares no quota error, so it reports the ceiling
+/// with the `ValidationException` (400) it does declare.
+pub const MAX_SESSIONS: usize = 1_000;
+
+/// Service principal of this service, as a session reports the service the approved
+/// action belongs to (`RequesterServicePrincipal`, `length(1..100)`).
+///
+/// Built from this service's own endpoint prefix (`smithy_query(query="service_info")`:
+/// `arnNamespace`/`sigv4Name` `mpa`, endpoint `mpa.{Region}.…`), in the
+/// `<prefix>.amazonaws.com` form every AWS service principal takes.
+pub const SERVICE_PRINCIPAL: &str = "mpa.amazonaws.com";
 
 /// Days between the delete request and the team's removal when
 /// `StartActiveApprovalTeamDeletion` omits `PendingWindowDays`.
@@ -503,6 +559,255 @@ impl IdentitySource {
     }
 }
 
+/// Status of an approval session, in the tokens `SessionStatus` declares
+/// (`smithy_query(query="shape",shape="SessionStatus")`: `CREATING | PENDING | APPROVED |
+/// CANCELLED | FAILED`).
+///
+/// `CREATING` is the non-terminal status a freshly started session is reported in and
+/// `PENDING` the one it waits for its approvers in
+/// ([`ComAmazonawsMpaAwsfluffycoreserviceState::materialize_due`] owes that transition).
+/// `FAILED` is what a session that was never answered reaches when its expiration comes
+/// due. `APPROVED` and `CANCELLED` are the other two terminal statuses the model
+/// declares — no operation of this model records an approver's vote, and `CancelSession`
+/// is still scaffolded — so nothing constructs them today; they are carried here so the
+/// enum is the model's whole token catalog rather than the subset one operation reaches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionStatus {
+    Creating,
+    Pending,
+    Approved,
+    Cancelled,
+    Failed,
+}
+
+impl SessionStatus {
+    /// The wire token, as `SessionStatus` spells it.
+    #[must_use]
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Creating => "CREATING",
+            Self::Pending => "PENDING",
+            Self::Approved => "APPROVED",
+            Self::Cancelled => "CANCELLED",
+            Self::Failed => "FAILED",
+        }
+    }
+
+    /// Whether a session in this status is still waiting on its approvers, and so is
+    /// neither completed nor cancelled.
+    #[must_use]
+    pub fn is_outstanding(self) -> bool {
+        matches!(self, Self::Creating | Self::Pending)
+    }
+}
+
+/// Status code of an approval session, in the tokens `SessionStatusCode` declares
+/// (`REJECTED | EXPIRED | CONFIGURATION_CHANGED | ALL_APPROVERS_IN_SESSION`).
+///
+/// `EXPIRED` is the one a session this service records reaches on its own: it is what the
+/// clock owes a session nobody answered before [`Session::expiration_time`]. The model
+/// documents no prose for any of the four, so the rest are carried as the model's token
+/// catalog and constructed by nothing until an operation records the condition each
+/// stands for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionStatusCode {
+    Rejected,
+    Expired,
+    ConfigurationChanged,
+    AllApproversInSession,
+}
+
+impl SessionStatusCode {
+    /// The wire token, as `SessionStatusCode` spells it.
+    #[must_use]
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Rejected => "REJECTED",
+            Self::Expired => "EXPIRED",
+            Self::ConfigurationChanged => "CONFIGURATION_CHANGED",
+            Self::AllApproversInSession => "ALL_APPROVERS_IN_SESSION",
+        }
+    }
+}
+
+/// Status of the protected operation a session guards, in the tokens
+/// `SessionExecutionStatus` declares (`PENDING | EXECUTED | FAILED`).
+///
+/// `PENDING` is the only one this emulator records: it RUNS no protected operation, so
+/// nothing is ever executed and no execution ever fails. `EXECUTED` and `FAILED` are
+/// carried as the model's token catalog; reporting either for work nothing performed
+/// would be a status for a run that never happened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionExecutionStatus {
+    Pending,
+    Executed,
+    Failed,
+}
+
+impl SessionExecutionStatus {
+    /// The wire token, as `SessionExecutionStatus` spells it.
+    #[must_use]
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Pending => "PENDING",
+            Self::Executed => "EXECUTED",
+            Self::Failed => "FAILED",
+        }
+    }
+}
+
+/// One approver's answer in a session, in the tokens `SessionResponse` declares
+/// (`APPROVED | REJECTED | NO_RESPONSE`).
+///
+/// `NO_RESPONSE` is where every approver starts and stays: no operation in this model
+/// records a vote, so nothing in this emulator may claim an approver answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionResponse {
+    Approved,
+    Rejected,
+    NoResponse,
+}
+
+impl SessionResponse {
+    /// The wire token, as `SessionResponse` spells it.
+    #[must_use]
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Approved => "APPROVED",
+            Self::Rejected => "REJECTED",
+            Self::NoResponse => "NO_RESPONSE",
+        }
+    }
+}
+
+/// How the protected operation completes once a session is approved, in the tokens
+/// `ActionCompletionStrategy` declares — today the single `AUTO_COMPLETION_UPON_APPROVAL`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionCompletionStrategy {
+    AutoCompletionUponApproval,
+}
+
+impl ActionCompletionStrategy {
+    /// The wire token, as `ActionCompletionStrategy` spells it.
+    #[must_use]
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::AutoCompletionUponApproval => "AUTO_COMPLETION_UPON_APPROVAL",
+        }
+    }
+}
+
+/// An extra requirement a session places on its approvers, in the tokens
+/// `AdditionalSecurityRequirement` declares — today the single
+/// `APPROVER_VERIFICATION_REQUIRED`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdditionalSecurityRequirement {
+    ApproverVerificationRequired,
+}
+
+impl AdditionalSecurityRequirement {
+    /// The wire token, as `AdditionalSecurityRequirement` spells it.
+    #[must_use]
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::ApproverVerificationRequired => "APPROVER_VERIFICATION_REQUIRED",
+        }
+    }
+}
+
+/// What a session was started FOR, which is what fixes the action it reports.
+///
+/// `StartApprovalTeamBaseline` is the one operation of this model that starts a session,
+/// so a baseline session is the only kind this store records; a session a protected
+/// operation of another service starts is not reachable from this API at all. The kind
+/// is what [`SessionKind::action_name`] reports as `ActionName` and what tells a team's
+/// outstanding BASELINE session from any other session of the same team
+/// ([`ComAmazonawsMpaAwsfluffycoreserviceState::pending_baseline_session_arn`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionKind {
+    Baseline,
+}
+
+impl SessionKind {
+    /// The action this kind of session approves, as `ActionName` reports it: the MPA
+    /// operation that starts it.
+    #[must_use]
+    pub fn action_name(self) -> &'static str {
+        match self {
+            Self::Baseline => "StartApprovalTeamBaseline",
+        }
+    }
+}
+
+/// One approver taking part in a session, and their answer so far.
+#[derive(Debug, Clone)]
+pub struct SessionApprover {
+    /// The `ApproverId` of the team member in the session — the same participant id
+    /// [`Approver::approver_id`] carries, so a session names the team's own approvers.
+    pub approver_id: String,
+    pub identity_id: String,
+    pub identity_source_arn: String,
+    pub response: SessionResponse,
+    pub response_time: Option<SystemTime>,
+}
+
+/// A stored approval session: everything `GetSession` reports.
+#[derive(Debug, Clone)]
+pub struct Session {
+    pub arn: String,
+    pub kind: SessionKind,
+    /// The team whose approvers the session asks, and the name that team carries.
+    pub approval_team_arn: String,
+    pub approval_team_name: String,
+    /// The team's approval strategy as it stood when the session started, so the
+    /// threshold a session is judged against does not move under it.
+    pub approval_strategy: StoredApprovalStrategy,
+    pub approvers: Vec<SessionApprover>,
+    /// The resource the approved action acts on.
+    pub protected_resource_arn: String,
+    pub status: SessionStatus,
+    pub status_code: Option<SessionStatusCode>,
+    pub status_message: Option<String>,
+    pub execution_status: SessionExecutionStatus,
+    pub action_completion_strategy: ActionCompletionStrategy,
+    pub additional_security_requirements: Vec<AdditionalSecurityRequirement>,
+    /// Service principal of the service the approved action belongs to.
+    pub requester_service_principal: String,
+    pub requester_principal_arn: String,
+    pub requester_account_id: String,
+    /// Region the request that started the session originated in, which need not be the
+    /// region the team's (and the session's) own ARN carries.
+    pub requester_region: String,
+    pub requester_comment: Option<String>,
+    pub description: Option<String>,
+    pub metadata: BTreeMap<String, String>,
+    pub initiation_time: SystemTime,
+    pub expiration_time: SystemTime,
+    /// Instant the session reached a terminal status, `None` while it is outstanding.
+    pub completion_time: Option<SystemTime>,
+    /// Instant at which this session's activation (`CREATING` -> `PENDING`) becomes due.
+    /// `None` once it has been materialised.
+    pub activation_due: Option<SystemTime>,
+    /// Initiation order, the stable ordering a session listing pages over.
+    pub seq: u64,
+}
+
+impl Session {
+    /// Total number of approvers in the session, as `NumberOfApprovers` reports it.
+    #[must_use]
+    pub fn number_of_approvers(&self) -> i32 {
+        i32::try_from(self.approvers.len()).unwrap_or(i32::MAX)
+    }
+
+    /// Whether `approver_id` is one of the approvers this session asks.
+    #[must_use]
+    pub fn includes_approver(&self, approver_id: &str) -> bool {
+        self.approvers
+            .iter()
+            .any(|approver| approver.approver_id == approver_id)
+    }
+}
+
 /// The key a `ClientToken` is recorded under in
 /// [`ComAmazonawsMpaAwsfluffycoreserviceState::idempotency_tokens`].
 ///
@@ -523,6 +828,26 @@ pub const APPROVAL_TEAM_RESOURCE: &str = "approval-team";
 /// Resource kind of an identity source, as [`idempotency_key`] names it — the resource
 /// name the `IdentitySource` resource's `arn` template carries.
 pub const IDENTITY_SOURCE_RESOURCE: &str = "identity-source";
+
+/// Resource kind of an approval session — the resource name `SessionArn`'s pattern
+/// carries (`…:session/<team>/<id>`).
+pub const SESSION_RESOURCE: &str = "session";
+
+/// ARN of an approval session, in the form `SessionArn`'s pattern fixes
+/// (`^arn:aws(-[^:]+)?:mpa:[a-z0-9-]{1,20}:[0-9]{12}:session/[a-zA-Z0-9._-]+/[a-zA-Z0-9_-]+$`):
+/// the approval team's name, then the session's own id.
+///
+/// The id carries no modelled form beyond `[a-zA-Z0-9_-]+`, so its shape is this
+/// emulator's: the store's session counter, zero-padded, so an id is never reused and
+/// ARN order and initiation order agree.
+#[must_use]
+pub fn session_arn(region: &str, team_name: &str, seq: u64) -> String {
+    ::engine::emulator_arn(
+        "mpa",
+        region,
+        &format!("{SESSION_RESOURCE}/{team_name}/session-{seq:012}"),
+    )
+}
 
 /// ARN of an identity source, in the form the `IdentitySource` resource's own `arn`
 /// template fixes (`identity-source/{IdentitySourceArn}`):
@@ -916,12 +1241,17 @@ pub struct ComAmazonawsMpaAwsfluffycoreserviceState {
     /// Every identity source, keyed by its ARN. `CreateIdentitySource` records one here
     /// and `ListIdentitySources` reports them.
     pub identity_sources: BTreeMap<String, IdentitySource>,
+    /// Every approval session, keyed by its ARN. `StartApprovalTeamBaseline` records one
+    /// here and `GetSession` reports it, so both read one and the same record.
+    pub sessions: BTreeMap<String, Session>,
     /// Source of [`ApprovalTeam::seq`].
     next_team_seq: u64,
     /// Source of [`Approver::approver_id`].
     next_approver_seq: u64,
     /// Source of [`IdentitySource::seq`] and of the id its ARN carries.
     next_identity_source_seq: u64,
+    /// Source of [`Session::seq`] and of the id its ARN carries.
+    next_session_seq: u64,
 }
 
 impl Default for ComAmazonawsMpaAwsfluffycoreserviceState {
@@ -936,9 +1266,11 @@ impl Default for ComAmazonawsMpaAwsfluffycoreserviceState {
             organization_management_account_id: None,
             policies: seeded_policy_catalog(SystemTime::now()),
             identity_sources: BTreeMap::new(),
+            sessions: BTreeMap::new(),
             next_team_seq: 0,
             next_approver_seq: 0,
             next_identity_source_seq: 0,
+            next_session_seq: 0,
         }
     }
 }
@@ -1022,6 +1354,29 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
             source.status = IdentitySourceStatus::Active;
             source.activation_due = None;
         }
+
+        for session in self.sessions.values_mut() {
+            // A new session is PENDING — waiting on its approvers — once its activation
+            // comes due.
+            if session.status == SessionStatus::Creating
+                && session.activation_due.is_some_and(|due| due <= now)
+            {
+                session.status = SessionStatus::Pending;
+                session.activation_due = None;
+            }
+
+            // A session no approver answered before its expiration is over: it FAILED,
+            // with the `EXPIRED` status code, and completed at the instant it expired.
+            // The completion is stamped with the DUE instant, not with `now`, so a
+            // materialised value does not move between reads. Nothing claims an approver
+            // answered: every response stays `NO_RESPONSE`.
+            if session.status.is_outstanding() && session.expiration_time <= now {
+                session.status = SessionStatus::Failed;
+                session.status_code = Some(SessionStatusCode::Expired);
+                session.completion_time = Some(session.expiration_time);
+                session.activation_due = None;
+            }
+        }
     }
 
     /// Drop a team and everything that indexes it.
@@ -1032,6 +1387,11 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
             }
         }
         self.idempotency_tokens.retain(|_, stored| stored != arn);
+        // A session asks ONE team's approvers, so it cannot outlive that team: when the
+        // team is gone its sessions name nobody, and `GetSession` answers for them the
+        // same 404 `GetApprovalTeam` answers for the team.
+        self.sessions
+            .retain(|_, session| session.approval_team_arn != arn);
     }
 
     /// The stored team with this ARN.
@@ -1249,6 +1609,65 @@ impl ComAmazonawsMpaAwsfluffycoreserviceState {
         self.next_approver_seq += 1;
         format!("approver-{}", self.next_approver_seq)
     }
+
+    /// The stored session with this ARN.
+    #[must_use]
+    pub fn session(&self, arn: &str) -> Option<&Session> {
+        self.sessions.get(arn)
+    }
+
+    /// The stored session with this ARN, for update.
+    pub fn session_mut(&mut self, arn: &str) -> Option<&mut Session> {
+        self.sessions.get_mut(arn)
+    }
+
+    /// Record a session, replacing any entry under the same ARN.
+    pub fn insert_session(&mut self, session: Session) {
+        self.sessions.insert(session.arn.clone(), session);
+    }
+
+    /// Every stored session of one approval team, in initiation order — the stable
+    /// ordering a session listing pages over.
+    #[must_use]
+    pub fn team_sessions_in_initiation_order(&self, team_arn: &str) -> Vec<&Session> {
+        let mut sessions: Vec<&Session> = self
+            .sessions
+            .values()
+            .filter(|session| session.approval_team_arn == team_arn)
+            .collect();
+        sessions.sort_by_key(|session| session.seq);
+        sessions
+    }
+
+    /// The ARN of the team's OUTSTANDING baseline session that asks `approver_id`, or
+    /// `None` when that approver has no baseline session awaiting them.
+    ///
+    /// The one resolver for `GetApprovalTeamResponseApprover$PendingBaselineSessionArn`,
+    /// so the team read and `GetSession` report the same session for the same approver.
+    /// A session that has completed, expired or been cancelled is no longer pending and
+    /// so is not reported.
+    #[must_use]
+    pub fn pending_baseline_session_arn(
+        &self,
+        team_arn: &str,
+        approver_id: &str,
+    ) -> Option<String> {
+        self.team_sessions_in_initiation_order(team_arn)
+            .into_iter()
+            .find(|session| {
+                session.kind == SessionKind::Baseline
+                    && session.status.is_outstanding()
+                    && session.includes_approver(approver_id)
+            })
+            .map(|session| session.arn.clone())
+    }
+
+    /// The next initiation-order sequence number, which is also the id a session's ARN
+    /// carries ([`session_arn`]). Never reused.
+    pub fn next_session_seq(&mut self) -> u64 {
+        self.next_session_seq += 1;
+        self.next_session_seq
+    }
 }
 
 /// The `(PrimaryIdentityId, PrimaryIdentitySourceArn)` pair that `approvers` names more
@@ -1297,6 +1716,17 @@ pub fn caller_identity_arn() -> String {
 #[must_use]
 pub fn arn_account_id(arn: &str) -> Option<&str> {
     arn.split(':').nth(4)
+}
+
+/// The region an ARN embeds: its fourth colon-separated field, empty on a global
+/// resource's ARN.
+///
+/// A resource minted FOR another resource (a session for its approval team) takes its
+/// region from that resource's ARN rather than from the request, so the two ARNs cannot
+/// disagree about where the resource lives.
+#[must_use]
+pub fn arn_region(arn: &str) -> Option<&str> {
+    arn.split(':').nth(3).filter(|region| is_arn_region(region))
 }
 
 /// Whether `arn` is a well-formed Amazon Resource Name:

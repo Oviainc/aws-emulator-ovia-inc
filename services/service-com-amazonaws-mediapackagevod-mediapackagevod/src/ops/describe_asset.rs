@@ -150,7 +150,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(store) = crate::state::service_state(&*self.engine) else {
             return Err(DescribeAssetErrorModeled::InternalServerErrorException(
@@ -160,8 +160,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // MediaPackage VOD is regional: only the assets of the Region this request
+        // was served in resolve here.
+        let region = crate::state::request_region(ctx.parts());
         let state = store.lock();
-        let Some(stored) = state.assets.get(&input.id) else {
+        let Some(stored) = state.asset(&region, &input.id) else {
             return Err(DescribeAssetErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::scaffolded::not_found_message("Asset", &input.id)),
             })

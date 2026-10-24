@@ -181,7 +181,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        if state.packaging_groups.contains_key(&input.id) {
+        // Scoped to the Region this request was served in: the same `Id` in another
+        // Region is another group, so it is not a duplicate of this one.
+        if state.has_packaging_group(&region, &input.id) {
             return Err(CreatePackagingGroupErrorModeled::UnprocessableEntityException(
                 UnprocessableEntityException {
                     message: Some(crate::scaffolded::already_exists_message(
@@ -207,8 +209,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let arn = crate::state::resource_arn("packaging-groups", &region, &input.id);        let record = crate::state::PackagingGroupRecord {
+        let arn = crate::state::resource_arn("packaging-groups", &region, &input.id);
+        let record = crate::state::PackagingGroupRecord {
             id: input.id.clone(),
+            region: region.clone(),
             arn: arn.clone(),
             domain_name: crate::state::packaging_group_domain_name(&input.id, &region),
             created_at: crate::state::now_iso8601(),
@@ -216,11 +220,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             egress_access_logs: input.egress_access_logs,
         };
         state.set_tags(&arn, input.tags.as_ref());
-        state.packaging_groups.insert(input.id.clone(), record);
+        state.insert_packaging_group(record);
 
         // Answer from what is now stored, not from the request: a difference between
         // the two would show up only on the next describe.
-        let Some(stored) = state.packaging_groups.get(&input.id) else {
+        let Some(stored) = state.packaging_group(&region, &input.id) else {
             return Err(CreatePackagingGroupErrorModeled::InternalServerErrorException(
                 InternalServerErrorException {
                     message: Some("the PackagingGroup could not be read back".to_string()),
@@ -232,7 +236,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Counted from the asset map, exactly as `DescribePackagingGroup` counts
             // it, so the create answer and the following read agree: zero for a group
             // that has just been minted, and never a stored value that can drift.
-            approximate_asset_count: Some(state.asset_count(&input.id)),
+            approximate_asset_count: Some(state.asset_count(&region, &input.id)),
             arn: Some(stored.arn.clone()),
             authorization: stored.authorization.clone(),
             created_at: Some(stored.created_at.clone()),

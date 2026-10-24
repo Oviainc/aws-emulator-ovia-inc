@@ -262,6 +262,47 @@ impl Client {
             .await
     }
 
+    /// `UpdateReviewTemplateLensReview`:
+    /// `PATCH /reviewTemplates/{TemplateArn}/lensReviews/{LensAlias}`. Both labels are
+    /// non-greedy, so each travels percent-encoded in one path segment, exactly as an
+    /// SDK sends it.
+    pub(crate) async fn update_review_template_lens_review(
+        &self,
+        template_arn: &str,
+        lens: &str,
+        body: Value,
+    ) -> Answer {
+        self.send(
+            "PATCH",
+            &format!(
+                "/reviewTemplates/{}/lensReviews/{}",
+                encode_path_segment(template_arn),
+                encode_path_segment(lens)
+            ),
+            Some(body),
+        )
+        .await
+    }
+
+    /// `GetReviewTemplateLensReview`:
+    /// `GET /reviewTemplates/{TemplateArn}/lensReviews/{LensAlias}`.
+    pub(crate) async fn get_review_template_lens_review(
+        &self,
+        template_arn: &str,
+        lens: &str,
+    ) -> Answer {
+        self.send(
+            "GET",
+            &format!(
+                "/reviewTemplates/{}/lensReviews/{}",
+                encode_path_segment(template_arn),
+                encode_path_segment(lens)
+            ),
+            None,
+        )
+        .await
+    }
+
     /// `CreateWorkloadShare`: `POST /workloads/{WorkloadId}/shares`.
     pub(crate) async fn create_share(&self, workload_id: &str, body: Value) -> Answer {
         self.send(

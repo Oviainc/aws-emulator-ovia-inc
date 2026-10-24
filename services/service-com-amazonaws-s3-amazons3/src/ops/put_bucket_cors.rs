@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutBucketCors
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutBucketCors`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutBucketCors::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stores the request's `CORSConfiguration` as the named bucket's whole cors configuration,
+//! replacing whatever the bucket held, and answers 200 with an empty body. `GetBucketCors`
+//! reads the same state back.
 //!
 //! ## Shape of an operation
 //!
@@ -131,14 +126,22 @@ impl ::aws_smithy_schema::serde::SerializableStruct for PutBucketCorsOutput {
     fn serialize_members(&self, _s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer) -> Result<(), ::aws_smithy_schema::serde::SerdeError> { Ok(()) }
 }
 
-// The operation's MODELED errors. `#[operation_error]` accepts only variants the
-// model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `PutBucketCorsError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#PutBucketCors")]
+// The operation's MODELED errors, widened by `NoSuchBucket`.
+//
+// The model's error list for this operation is empty
+// (`smithy_query(query="operation",operation="PutBucketCors")` reports `errors: []`), but
+// `Bucket` is an @httpLabel, so a request can name a bucket that does not exist and AWS
+// answers the service-wide `NoSuchBucket` ("The specified bucket does not exist",
+// `httpError 404`). `extra_errors` widens the set with that shape, which the SERVICE
+// models, so this handler answers the same 404 every other bucket-scoped operation does
+// rather than inventing a second rule.
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#PutBucketCors",
+    extra_errors = ["NoSuchBucket"]
+)]
 #[derive(Debug)]
 pub enum PutBucketCorsErrorModeled {
+    NoSuchBucket(NoSuchBucket),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -192,18 +195,86 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutBucketCors` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutBucketCorsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutBucketCors"))
+        // A write needs nothing from the request beyond its deserialized input.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // The store is unreachable only when this service is mounted on an engine that
+            // is not the shared `InMemoryEngine`; nothing can then be persisted, and
+            // answering 200 would report a configuration that was never recorded, so this
+            // goes out as the server fault S3 publishes for a request it could not carry
+            // out (`InternalError`, HTTP 500) — the channel every bucket subresource put
+            // beside this one uses for the same case.
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INTERNAL_ERROR_CODE,
+                crate::state::INTERNAL_ERROR_STATUS,
+                "the shared S3 store is unreachable from this engine",
+            ));
+        };
+
+        // The rules the request carried, in the order they arrived. `CORSConfiguration` is
+        // the @httpPayload and is required, so reaching here means the boundary parsed it;
+        // `ChecksumAlgorithm` and `ContentMD5` describe the integrity of the bytes that
+        // parsed, so neither changes what is stored.
+        let _ = (&input.checksum_algorithm, &input.content_md5);
+        let rules = stored_rules(&input.cors_configuration);
+
+        // The bucket is looked up FIRST, so a request that names a bucket this emulator
+        // does not hold answers that — the order every other bucket subresource put keeps —
+        // rather than reporting whatever is wrong with a configuration the bucket could
+        // never have carried.
+        let mut store = state.lock();
+        let Some(bucket) = store.bucket_mut(&input.bucket) else {
+            return Err(PutBucketCorsErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+
+        // Validated BEFORE anything is written, so a refused put leaves the bucket's
+        // current cors configuration exactly as it was. Each rejection carries the code S3
+        // publishes for it (`MalformedXML` for a document that does not match the schema,
+        // `InvalidRequest` for one that breaks a published limit), neither of which this
+        // service's model declares a shape for, so the refusal goes out through the
+        // unmodelled channel carrying the code and status a client branches on.
+        if let Err(rejection) = crate::state::validate_cors_configuration(&rules) {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                rejection.code(),
+                CORS_REJECTION_STATUS,
+                rejection.to_string(),
+            ));
+        }
+
+        // "Sets the cors configuration for your bucket. If the configuration exists, Amazon
+        // S3 replaces it" (this operation's own documentation): the payload is the complete
+        // container, so what it names becomes the bucket's cors configuration in full,
+        // whether the bucket carried one already or none.
+        bucket.set_cors(rules);
+
+        // `Unit` output: success is the modelled 200 and an empty body.
+        Ok(PutBucketCorsOutput)
     }
+}
+
+/// The HTTP status both codes a refused cors configuration goes out with carry: 400, the
+/// status S3's error-responses list publishes for `MalformedXML` and for `InvalidRequest`
+/// alike. See [`crate::state::CorsConfigurationRejection::code`].
+const CORS_REJECTION_STATUS: u16 = 400;
+
+/// The stored form of the `CORSConfiguration` a request carried.
+///
+/// A straight transcription of the modelled container into the store's own shapes: every
+/// member is kept as it arrived, in the order it arrived, because this operation is the one
+/// place a bucket's cors configuration comes from and `GetBucketCors` has to report it back
+/// unchanged. The two optional lists flatten to empty `Vec`s for the reason
+/// [`crate::state::BucketCorsRule`] holds them as such.
+fn stored_rules(configuration: &CORSConfiguration) -> Vec<crate::state::BucketCorsRule> {
+    configuration
+        .cors_rules
+        .iter()
+        .map(|rule| crate::state::BucketCorsRule {
+            id: rule.id.clone(),
+            allowed_headers: rule.allowed_headers.clone().unwrap_or_default(),
+            allowed_methods: rule.allowed_methods.clone(),
+            allowed_origins: rule.allowed_origins.clone(),
+            expose_headers: rule.expose_headers.clone().unwrap_or_default(),
+            max_age_seconds: rule.max_age_seconds,
+        })
+        .collect()
 }

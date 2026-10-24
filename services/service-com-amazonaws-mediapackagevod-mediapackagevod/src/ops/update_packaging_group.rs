@@ -161,7 +161,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(store) = crate::state::service_state(&*self.engine) else {
             return Err(UpdatePackagingGroupErrorModeled::InternalServerErrorException(
@@ -171,12 +171,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        let region = crate::state::request_region(ctx.parts());
         let mut state = store.lock();
 
-        // This operation addresses an existing group by its `Id` path label, so a
-        // group this service holds none of is a missing addressed resource (404),
-        // never a member violation.
-        let Some(stored) = state.packaging_groups.get_mut(&input.id) else {
+        // This operation addresses an existing group by its `Id` path label within the
+        // Region it was served in, so a group that Region holds none of is a missing
+        // addressed resource (404), never a member violation — and a group of the same
+        // `Id` in another Region is left untouched.
+        let Some(stored) = state.packaging_group_mut(&region, &input.id) else {
             return Err(UpdatePackagingGroupErrorModeled::NotFoundException(
                 NotFoundException {
                     message: Some(crate::scaffolded::not_found_message(
@@ -196,7 +198,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Answer from what is now stored, not from the request: a difference between
         // the two would show up only on the next describe.
-        let Some(stored) = state.packaging_groups.get(&input.id) else {
+        let Some(stored) = state.packaging_group(&region, &input.id) else {
             return Err(UpdatePackagingGroupErrorModeled::InternalServerErrorException(
                 InternalServerErrorException {
                     message: Some("the PackagingGroup could not be read back".to_string()),
@@ -208,7 +210,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(UpdatePackagingGroupOutput {
             // Counted from the asset map on every read, exactly as the describe path
             // counts it, so an update never disturbs it.
-            approximate_asset_count: Some(state.asset_count(&input.id)),
+            approximate_asset_count: Some(state.asset_count(&region, &input.id)),
             arn: Some(arn.clone()),
             authorization: stored.authorization.clone(),
             created_at: Some(stored.created_at.clone()),

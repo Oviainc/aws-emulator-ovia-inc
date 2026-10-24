@@ -20,10 +20,9 @@
 //! The second suite pins the same property one level down, at the member schema the JSON
 //! codec actually looks the format up on (`vendor/smithy-schema-server/src/json.rs::
 //! write_timestamp` -> `Schema::timestamp_format()`). That covers the shapes whose
-//! operations are still 501 stubs (`ListWorkerConfigurations`,
-//! `ListConnectorOperations`, `DescribeConnectorOperation`) and so cannot be reached over
-//! HTTP yet, and it fails loudly if a shape ever goes back to a macro-built schema that
-//! drops the trait.
+//! operations are still 501 stubs (`ListWorkerConfigurations`) and so cannot be reached
+//! over HTTP yet, and it fails loudly if a shape ever goes back to a macro-built schema
+//! that drops the trait.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -477,9 +476,8 @@ async fn every_connector_timestamp_is_an_iso8601_string_on_the_read_and_list_pat
 /// The catalog is the complete set: it is every structure of
 /// `smithy-model/com-amazonaws-kafkaconnect-kafkaconnect.json` with a member targeting
 /// `com.amazonaws.kafkaconnect#__timestampIso8601`. It therefore also covers
-/// `WorkerConfigurationSummary`, `ConnectorOperationSummary` and
-/// `DescribeConnectorOperationResponse`, whose operations are still 501 stubs and so cannot
-/// be reached by the wire suites above.
+/// `WorkerConfigurationSummary`, whose operation (`ListWorkerConfigurations`) is still a
+/// 501 stub and so cannot be reached by the wire suites above.
 fn timestamp_shapes() -> Vec<(&'static str, &'static Schema, &'static [&'static str])> {
     vec![
         (

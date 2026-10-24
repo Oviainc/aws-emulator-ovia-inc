@@ -163,6 +163,40 @@ pub fn millis_of(value: &::aws_smithy_types::DateTime) -> i64 {
         .saturating_add(i64::from(value.subsec_nanos()) / 1_000_000)
 }
 
+/// The opaque `nextToken` a `@paginated` list in this service hands back: the place
+/// `(createdAt, creation sequence)` in a newest-first order the next page starts at,
+/// prefixed with the SCOPE that issued it, so a cursor one listing minted is never read as
+/// a position in another's order.
+///
+/// One encoder for every paginated list here, so the three cannot drift apart. The
+/// components are joined by `:`, which neither a scope (a `ResourceIdString` or a fixed
+/// label) nor a decimal millisecond (it may carry a leading `-`) nor a sequence can
+/// contain, so the split in [`decode_list_cursor`] is unambiguous whatever the stored
+/// instant is. A client must not read a cursor; the service only has to resume from it.
+pub fn encode_list_cursor(scope: &str, created_at_millis: i64, sequence: u64) -> String {
+    format!("{scope}:{created_at_millis}:{sequence}")
+}
+
+/// The place in a newest-first order a `nextToken` names.
+///
+/// `None` — refused as an invalid request — when the token is not a cursor this `scope`
+/// issued, so a token cannot be carried from one listing to another's.
+pub fn decode_list_cursor(scope: &str, token: &str) -> Option<(i64, u64)> {
+    let rest = token.strip_prefix(scope)?.strip_prefix(':')?;
+    let mut parts = rest.split(':');
+    let (Some(created_at_millis), Some(sequence), None) = (parts.next(), parts.next(), parts.next())
+    else {
+        return None;
+    };
+    Some((created_at_millis.parse().ok()?, sequence.parse().ok()?))
+}
+
+/// The scope [`encode_list_cursor`] tags a `ListJobTemplates` cursor with.
+pub const LIST_JOB_TEMPLATES_SCOPE: &str = "jobtemplates";
+
+/// The scope [`encode_list_cursor`] tags a `ListSecurityConfigurations` cursor with.
+pub const LIST_SECURITY_CONFIGURATIONS_SCOPE: &str = "securityconfigurations";
+
 /// `arn:aws:emr-containers:{region}:{account}:/virtualclusters/{id}` — the
 /// `VirtualClusterArn` shape's pattern.
 pub fn virtual_cluster_arn(region: &str, id: &str) -> String {
@@ -617,6 +651,9 @@ pub struct SecurityConfigurationRecord {
     /// at `CreateSecurityConfiguration` so every later read attributes it to the same
     /// identity.
     pub created_by: String,
+    /// Creation sequence, so configurations minted within one millisecond still have a
+    /// total order for `ListSecurityConfigurations` to page through.
+    pub sequence: u64,
 }
 
 impl SecurityConfigurationRecord {

@@ -241,29 +241,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Account IDs must be ... not associated with another billing group." The
         // same state method `AssociateAccounts` uses decides it, so the
         // one-account-one-group rule lives in one place; the group being created has
-        // no ARN yet, so EVERY existing association of one of its accounts conflicts.
-        // The refusal is permanent — it is the other group's membership that has to
-        // change — so the message names the group that owns the account.
+        // no ARN yet, so EVERY existing association of one of its accounts refuses
+        // the request. An account list naming an account another group owns is a
+        // fault in the input, so the modelled answer is the 400 `ValidationException`
+        // with the `ACCOUNTS_ALREADY_ASSOCIATED` reason the model enumerates — built
+        // in one place beside the duplicate-account refusal above.
         for account_id in &linked_account_ids {
             if let Some(owner) = state
                 .conflicting_association(account_id, "")
                 .map(str::to_string)
             {
-                return Err(CreateBillingGroupErrorModeled::ConflictException(
-                    ConflictException {
-                        message: format!(
-                            "the account is already associated with billing group {owner}"
-                        ),
-                        resource_id: account_id.clone(),
-                        resource_type: "account".to_string(),
-                        // No `Reason`: none of the values `ConflictExceptionReason`
-                        // enumerates describes an account that belongs to another
-                        // billing group, and `WRITE_CONFLICT_RETRY` would promise a
-                        // retry that can never succeed — the other group's
-                        // membership has to change first. The member is optional in
-                        // the model, so the honest answer is to omit it.
-                        reason: None,
-                    },
+                return Err(CreateBillingGroupErrorModeled::ValidationException(
+                    crate::state::accounts_already_associated(
+                        "AccountGrouping.LinkedAccountIds",
+                        account_id,
+                        &owner,
+                    ),
                 )
                 .into());
             }

@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateReviewTemplateLensReview
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateReviewTemplateLensReview`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateReviewTemplateLensReview::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Writes the notes of ONE lens review of ONE review template — "the notes that will be
+//! associated with the workload when the template is applied" — and reports that lens
+//! review back.
+//!
+//! A member the request supplies REPLACES the stored value and a member it omits leaves
+//! it as stored, so `LensNotes` and `PillarNotes` are written independently of each
+//! other. A lens review exists exactly while the lens is applied to the template, so a
+//! lens the template does not apply resolves to the same modelled 404 as a template ARN
+//! nothing is stored under, and — for a lens whose pillar set this emulator holds — a
+//! `PillarNotes` key that names no pillar of that lens is a modelled 400.
+//!
+//! The lens review is read back by `GetReviewTemplateLensReview`.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +169,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateReviewTemplateLensReview` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateReviewTemplateLensReviewErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateReviewTemplateLensReview"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateReviewTemplateLensReviewErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Well-Architected Tool review template store is unavailable"
+                        .to_string(),
+                },
+            )
+        })?;
+
+        // The Region the request was signed for is what an AWS-official lens's `LensArn`
+        // is reported in; a custom lens is reported by the ARN its import minted.
+        let region = crate::state::request_region(ctx.parts());
+        let now = std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        let lens_arn = store.lens_arn_of(&input.lens_alias, &region);
+        // The resource is resolved BEFORE the request's values are judged, so a request
+        // that names a template or a lens review that does not exist is answered with
+        // that 404 whatever else it carries.
+        let template = store
+            .review_templates
+            .get_mut(&input.template_arn)
+            .ok_or_else(|| {
+                UpdateReviewTemplateLensReviewErrorModeled::ResourceNotFoundException(
+                    crate::state::review_template_not_found(&input.template_arn),
+                )
+            })?;
+
+        // A lens review of a template exists only while that lens is applied to it, so a
+        // lens the template does not carry has no review to write to.
+        if !template.applies_lens(&input.lens_alias) {
+            return Err(
+                UpdateReviewTemplateLensReviewErrorModeled::ResourceNotFoundException(
+                    crate::state::review_template_lens_review_not_found(
+                        &template.template_arn,
+                        &input.lens_alias,
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        // A `PillarNotes` key is a `PillarId`, and the pillars of a lens are what its
+        // lens content names: a key naming a pillar the lens does NOT define belongs to
+        // no pillar of this lens review and is refused rather than stored. Only a lens
+        // this emulator holds content for has a pillar set to judge a key against
+        // (`crate::state::lens_pillars`); for a lens it holds none for there is nothing
+        // to judge, so the notes are stored as given and reported back by
+        // `ReviewTemplateRecord::lens_review_pillars` rather than refused for a pillar
+        // the real lens may well define.
+        let defined: std::collections::BTreeSet<&str> =
+            crate::state::lens_pillars(&input.lens_alias)
+                .iter()
+                .map(|(pillar_id, _, _)| *pillar_id)
+                .collect();
+        if let (false, Some(pillar_notes)) = (defined.is_empty(), input.pillar_notes.as_ref()) {
+            let mut undefined: Vec<&str> = pillar_notes
+                .keys()
+                .map(String::as_str)
+                .filter(|pillar_id| !defined.contains(pillar_id))
+                .collect();
+            if !undefined.is_empty() {
+                // Sorted so the refusal does not depend on the request map's iteration
+                // order.
+                undefined.sort_unstable();
+                return Err(UpdateReviewTemplateLensReviewErrorModeled::ValidationException(
+                    crate::state::member_constraint_exception(
+                        PILLAR_NOTES_MEMBER,
+                        &format!(
+                            "every key must name a pillar of lens {}, which {} does not",
+                            input.lens_alias,
+                            undefined.join(", ")
+                        ),
+                    ),
+                )
+                .into());
+            }
+        }
+
+        // Both note members are optional, so a request that supplies NEITHER asks for no
+        // change: it reports the lens review as it stands and leaves its `UpdatedAt`
+        // where it was, rather than recording an update nothing wrote.
+        if input.lens_notes.is_some() || input.pillar_notes.is_some() {
+            let written = template.lens_review_notes_mut(&input.lens_alias, now);
+            if let Some(lens_notes) = input.lens_notes {
+                written.notes = Some(lens_notes);
+            }
+            if let Some(pillar_notes) = input.pillar_notes {
+                // The supplied map REPLACES the stored one, the same way the supplied
+                // `LensNotes` replaces the stored notes: a member a request carries is
+                // the new value of that member, not an addition to it.
+                written.pillar_notes = pillar_notes.into_iter().collect();
+            }
+            written.updated_at = now;
+        }
+
+        Ok(UpdateReviewTemplateLensReviewOutput {
+            // The template as STORED, which is the resource this lens review belongs to.
+            template_arn: Some(template.template_arn.clone()),
+            lens_review: Some(template.to_lens_review(&input.lens_alias, lens_arn)),
+        })
     }
 }
+
+/// The member an undefined-pillar finding names (`UpdateReviewTemplateLensReviewInput$PillarNotes`).
+const PILLAR_NOTES_MEMBER: &str = "PillarNotes";

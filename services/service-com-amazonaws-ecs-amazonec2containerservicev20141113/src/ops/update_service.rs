@@ -442,6 +442,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     })
                 })?
         };
+        // Which of the groups the REQUEST names a load balancer forwards to, read from
+        // the same store and in the same place as their types. Only the request's own
+        // bindings are asked about: the ones the service already carries were resolved
+        // when they were set.
+        let requested_arns = crate::state::requested_target_group_arns(
+            input.load_balancers.as_deref().unwrap_or_default(),
+        );
+        let unattached = if requested_arns.is_empty() {
+            Vec::new()
+        } else {
+            crate::state::unattached_target_groups(&*self.engine, &requested_arns).ok_or_else(
+                || {
+                    UpdateServiceErrorModeled::ServerException(ServerException {
+                        message: Some(
+                            "the Elastic Load Balancing store is unavailable".to_string(),
+                        ),
+                    })
+                },
+            )?
+        };
 
         let mut guard = state.lock();
         guard.advance_clock(now);
@@ -551,6 +571,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .cloned(),
         };
 
+        // The same cross-field rules `CreateService` holds a service to, applied to what
+        // the service will be once this update lands: each member the request omits keeps
+        // the value the stored service carries ("If you do not want to override the value
+        // that was set when the service was created, you can set this to null"), so a
+        // request that changes only the task definition is still checked against the
+        // network configuration, the bindings and the controller the service already has.
+        let effective_network_configuration = input
+            .network_configuration
+            .as_ref()
+            .or(snapshot.network_configuration.as_ref());
+        // The bindings the service will carry once this update lands: the ones the
+        // request names, else the ones it already holds. (Distinct from the
+        // `effective_load_balancers` read above, which is `Vec::new()` for an update that
+        // can change no pairing and so reads neither store.)
+        let effective_bindings = input
+            .load_balancers
+            .as_deref()
+            .unwrap_or(&snapshot.load_balancers);
+        let effective_execute_command = input
+            .enable_execute_command
+            .unwrap_or(snapshot.enable_execute_command);
+        if let Some(definition) = definition.as_ref() {
+            if let Some(message) = crate::state::network_configuration_violation(
+                &definition.network_mode,
+                effective_network_configuration,
+            ) {
+                return Err(UpdateServiceErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+            if let Some(message) = crate::state::execute_command_violation(
+                effective_execute_command,
+                Some(definition),
+                crate::state::EXECUTE_COMMAND_SERVICE_UPDATE_SUBJECT,
+            ) {
+                return Err(UpdateServiceErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+        }
+        // The controller cannot be changed by an update, so a CODE_DEPLOY service that
+        // keeps its bindings stays legal; one whose update would leave it with none does
+        // not.
+        if snapshot.controller() == crate::state::DEPLOYMENT_CONTROLLER_CODE_DEPLOY
+            && effective_bindings.is_empty()
+        {
+            return Err(UpdateServiceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(
+                        crate::state::CODE_DEPLOY_LOAD_BALANCER_REQUIRED_MESSAGE.to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
         // A revision is placed with a launch type only where it was validated against it
         // (`TaskDefinition$compatibilities`), so an update that moves the service onto a
         // revision its launch type does not support is refused, as its create was. A
@@ -599,6 +681,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None
         };
         if let Some(message) = refusal {
+            return Err(UpdateServiceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // A load-balancer binding attaches ONE container port of the task to a target
+        // group, so the container and the port it names have to be ones the revision
+        // declares. Checked AFTER the target group's own type, as at create.
+        if let Some(message) =
+            crate::state::load_balancer_binding_violation(definition.as_ref(), effective_bindings)
+        {
+            return Err(UpdateServiceErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // And a target group this update binds the service to still has to be one a load
+        // balancer forwards to, exactly as at create.
+        if let Some(message) =
+            crate::state::orphan_target_group_refusal(&requested_arns, &unattached)
+        {
             return Err(UpdateServiceErrorModeled::InvalidParameterException(
                 InvalidParameterException {
                     message: Some(message),

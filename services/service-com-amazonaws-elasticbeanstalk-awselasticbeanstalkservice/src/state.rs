@@ -20,9 +20,9 @@ use std::time::{Duration, Instant};
 use crate::ops::types::{
     ApplicationDescription, ApplicationResourceLifecycleConfig, ApplicationVersionDescription,
     ApplicationVersionLifecycleConfig, ConfigurationOptionSetting, CustomAmi, EnvironmentTier,
-    EventDescription, ManagedActionHistoryItem, MaxAgeRule, MaxCountRule, PlatformBranchSummary,
-    PlatformDescription, PlatformFramework, PlatformProgrammingLanguage, PlatformSummary,
-    S3Location, Tag,
+    EventDescription, ManagedActionHistoryItem, MaxAgeRule, MaxCountRule, OptionSpecification,
+    PlatformBranchSummary, PlatformDescription, PlatformFramework, PlatformProgrammingLanguage,
+    PlatformSummary, S3Location, Tag,
 };
 
 /// This service's ARN namespace, from the model's `aws.api#service` trait
@@ -57,6 +57,11 @@ pub const STATUS_TERMINATED: &str = "Terminated";
 /// See [`STATUS_LAUNCHING`]. "Aborting: Environment is in the process of
 /// aborting a deployment."
 pub const STATUS_ABORTING: &str = "Aborting";
+/// See [`STATUS_LAUNCHING`]. "Updating: Environment is in the process of
+/// updating its configuration settings or application version" — the status an
+/// environment reports while the update `UpdateEnvironment` starts is in
+/// flight.
+pub const STATUS_UPDATING: &str = "Updating";
 
 /// `EnvironmentHealth` values this service writes (modelled set:
 /// `crate::ops::types::ENVIRONMENT_HEALTH_VALUES`). `Grey` is the value the model
@@ -1762,6 +1767,43 @@ pub fn option_setting_key(setting: &ConfigurationOptionSetting) -> (String, Stri
     )
 }
 
+/// The key an option SPECIFICATION identifies an option by — the same
+/// `(Namespace, OptionName, ResourceName)` triple [`option_setting_key`] builds
+/// from a setting, so a specification that names an option and the setting
+/// carrying it compare equal.
+///
+/// `OptionSpecification` is how a request NAMES an option without giving it a
+/// value (`UpdateEnvironment$OptionsToRemove`,
+/// `DescribeConfigurationOptions$Options`), which is why it needs a key of its
+/// own rather than being compared member by member at each call site.
+pub fn option_specification_key(specification: &OptionSpecification) -> (String, String, String) {
+    (
+        specification.namespace.clone().unwrap_or_default(),
+        specification.option_name.clone().unwrap_or_default(),
+        specification.resource_name.clone().unwrap_or_default(),
+    )
+}
+
+/// `settings` without the options `removed` names: "a list of custom
+/// user-defined configuration options to remove from the configuration set"
+/// (`UpdateEnvironment$OptionsToRemove`). An option the set does not carry is
+/// simply not there to remove, so naming it changes nothing.
+///
+/// Keys are collected into a set ONCE, so the work is linear in the two lists'
+/// combined length however long the caller's removal list is.
+pub fn remove_option_settings(
+    settings: &[ConfigurationOptionSetting],
+    removed: &[OptionSpecification],
+) -> Vec<ConfigurationOptionSetting> {
+    let removed: BTreeSet<(String, String, String)> =
+        removed.iter().map(option_specification_key).collect();
+    settings
+        .iter()
+        .filter(|setting| !removed.contains(&option_setting_key(setting)))
+        .cloned()
+        .collect()
+}
+
 /// `base` with every setting in `overrides` applied: a setting whose
 /// [`option_setting_key`] `base` already carries replaces that one in place, and
 /// one it does not carry is appended. This is what "Values specified in
@@ -2391,6 +2433,12 @@ pub struct PendingStatus {
     pub status: String,
     pub health: String,
     pub health_status: Option<String>,
+    /// What `AbortableOperationInProgress` reports once the change is
+    /// materialised. The flag is part of the state the clock owes: an operation
+    /// the clock has finished is no longer one "you can cancel", so it is
+    /// carried here beside the status rather than left at whatever the call that
+    /// STARTED the operation set.
+    pub abortable_operation_in_progress: bool,
     /// The request that started the change. The event the completion records
     /// belongs to that request's activity, not to whichever later call happened
     /// to observe the change as due.
@@ -2414,6 +2462,9 @@ impl PendingStatus {
             status: STATUS_READY.to_string(),
             health: HEALTH_GREEN.to_string(),
             health_status: Some(HEALTH_STATUS_OK.to_string()),
+            // The operation the completion ends is over, so there is nothing
+            // left to cancel.
+            abortable_operation_in_progress: false,
             request_id: request_id.to_string(),
             completion_message: completion_message.into(),
         }
@@ -2710,6 +2761,57 @@ impl EnvironmentResources {
             },
         }
     }
+
+    /// Bring this inventory in line with the configuration options the
+    /// environment now carries, keeping every resource the new configuration
+    /// still calls for under the name it was provisioned with.
+    ///
+    /// `UpdateEnvironment` "updates the configuration settings in the running
+    /// environment"; the operation that "deletes and recreates all of the Amazon
+    /// Web Services resources … for a specified environment" is
+    /// `RebuildEnvironment`. So an update is NOT a reprovision: the Auto Scaling
+    /// group, the launch template and the worker queue keep their names, and
+    /// what the options DECIDE follows the options — how many instances the
+    /// group holds (`aws:autoscaling:asg` / `MinSize`), whether it has the
+    /// triggers a group that can scale is driven by, and whether the environment
+    /// sits behind a load balancer (`aws:elasticbeanstalk:environment` /
+    /// `EnvironmentType`). An instance the group no longer holds is gone and a
+    /// new one gets its own id, the way a scaling group's membership changes.
+    ///
+    /// The tier is passed because the load balancer depends on it, and an
+    /// environment's tier cannot be changed by an update, so the queue a worker
+    /// environment reads is untouched.
+    pub fn reconfigure(
+        &mut self,
+        environment_id: &str,
+        tier: Option<&EnvironmentTier>,
+        option_settings: &[ConfigurationOptionSetting],
+    ) {
+        let stack = environment_stack_name(environment_id);
+        let load_balanced = is_load_balanced(option_settings);
+        let wanted = instance_count(load_balanced, option_settings);
+        self.instances.truncate(wanted);
+        while self.instances.len() < wanted {
+            self.instances.push(ec2_resource_id(EC2_INSTANCE_ID_PREFIX));
+        }
+        if !load_balanced {
+            self.triggers.clear();
+            self.load_balancer = None;
+            return;
+        }
+        if self.triggers.is_empty() {
+            self.triggers = STACK_RESOURCE_TRIGGERS
+                .iter()
+                .map(|logical_id| stack_resource_name(&stack, logical_id))
+                .collect();
+        }
+        if self.load_balancer.is_none() && !is_worker_tier(tier) {
+            self.load_balancer = Some(stack_resource_name(
+                &stack,
+                STACK_RESOURCE_LOAD_BALANCER,
+            ));
+        }
+    }
 }
 
 /// A stored environment.
@@ -2815,6 +2917,7 @@ impl Environment {
             // A terminated environment runs nothing, so it reports no health
             // status at all rather than one of the running values.
             health_status: None,
+            abortable_operation_in_progress: false,
             request_id: request_id.to_string(),
             completion_message: "terminateEnvironment completed successfully.".to_string(),
         });
@@ -2855,6 +2958,9 @@ impl Environment {
             status: self.status.clone(),
             health: self.health.clone(),
             health_status: self.health_status.clone(),
+            // A restart neither starts nor ends a cancellable operation, so the
+            // flag the environment reported is what it reports after it.
+            abortable_operation_in_progress: self.abortable_operation_in_progress,
             request_id: request_id.to_string(),
             completion_message: "restartAppServer completed successfully.".to_string(),
         };
@@ -2887,6 +2993,48 @@ impl Environment {
         ));
     }
 
+    /// Start the update `UpdateEnvironment` asks for: the environment moves to
+    /// `Updating` ("Environment is in the process of updating its configuration
+    /// settings or application version"), reports an abortable operation in
+    /// progress — `AbortableOperationInProgress` is "true: There is an update in
+    /// progress", which is what `AbortEnvironmentUpdate` then cancels — and the
+    /// return to `Ready` is what the clock owes one [`STATUS_TRANSITION_SPAN`]
+    /// later. `request_id` is the request asking for the update, which the
+    /// completion event is then attributed to.
+    ///
+    /// Health goes `Grey`/`Pending` for the duration, as the model documents for
+    /// an environment whose "health checks are suspended during an
+    /// UpdateEnvironment or RestartEnvironment request".
+    pub fn begin_update(&mut self, request_id: &str) {
+        self.status = STATUS_UPDATING.to_string();
+        self.health = HEALTH_GREY.to_string();
+        self.health_status = Some(HEALTH_STATUS_PENDING.to_string());
+        self.abortable_operation_in_progress = true;
+        self.date_updated = now();
+        self.pending_status = Some(PendingStatus::completion_to_ready(
+            request_id,
+            "updateEnvironment completed successfully.",
+        ));
+    }
+
+    /// Bring the Amazon Web Services resources this environment runs on in line
+    /// with the configuration it now carries, KEEPING the identity of every
+    /// resource the new configuration still calls for. See
+    /// [`EnvironmentResources::reconfigure`]. An environment with no inventory —
+    /// one the clock has terminated — has nothing to reconfigure.
+    pub fn reconfigure_resources(&mut self) {
+        // The inventory is taken out of the record so the reconfiguration can
+        // read the rest of it; it goes straight back.
+        if let Some(mut resources) = self.resources.take() {
+            resources.reconfigure(
+                &self.environment_id,
+                self.tier.as_ref(),
+                &self.option_settings,
+            );
+            self.resources = Some(resources);
+        }
+    }
+
     /// Apply the pending status change if the clock has already made it due, and
     /// answer the completion that change records (`None` when nothing was due).
     ///
@@ -2904,6 +3052,7 @@ impl Environment {
         self.status = pending.status;
         self.health = pending.health;
         self.health_status = pending.health_status;
+        self.abortable_operation_in_progress = pending.abortable_operation_in_progress;
         self.date_updated = pending.due_date;
         if self.status == STATUS_TERMINATED {
             self.date_terminated = Some(pending.due_date);

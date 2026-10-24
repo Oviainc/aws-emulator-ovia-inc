@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDocumentationPart
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDocumentationPart`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDocumentationPart::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes exactly the documentation part the request names from the REST API it names,
+//! and nothing else: the API's other parts, and every documentation version snapshot
+//! already taken of them, are left as they were. Every identifier is resolved against
+//! stored state first, so a request naming no stored API, or no stored part of that API,
+//! is the modelled `NotFoundException` and changes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +166,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDocumentationPart` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDocumentationPartErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDocumentationPart"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let mut store = state.lock();
+
+        // Both identifiers the request carries are resolved against stored state before
+        // anything is removed, each naming its own record so the refusal says which one
+        // was not found.
+        let api = store.rest_apis.get_mut(&input.rest_api_id).ok_or_else(|| {
+            DeleteDocumentationPartErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
+            })
+        })?;
+        // The part is keyed by the id `CreateDocumentationPart` minted for it, so removing
+        // that one entry is what makes a later `GetDocumentationPart` answer
+        // `NotFoundException` and drops it from `GetDocumentationParts` — while every other
+        // part of the API, and the documentation versions already snapshotted from them,
+        // stay exactly as they were.
+        if api
+            .documentation_parts
+            .remove(&input.documentation_part_id)
+            .is_none()
+        {
+            return Err(DeleteDocumentationPartErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::NO_SUCH_DOCUMENTATION_PART.to_string()),
+                },
+            )
+            .into());
+        }
+        // Everything below is owned, so the store lock is released before the access
+        // record is emitted: the critical section covers the state change only.
+        drop(store);
+        // The access record for a state-changing operation: who, what, and the outcome.
+        // Metadata only — never the deleted part's content map.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            rest_api = ?input.rest_api_id,
+            documentation_part = ?input.documentation_part_id,
+            outcome = "deleted",
+            "documentation part deleted",
+        );
+        Ok(DeleteDocumentationPartOutput)
     }
 }

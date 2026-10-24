@@ -33,6 +33,8 @@ mod harness;
 mod import_tasks;
 #[path = "all/ingestion_window.rs"]
 mod ingestion_window;
+#[path = "all/integrations.rs"]
+mod integrations;
 #[path = "all/log_anomaly_detectors.rs"]
 mod log_anomaly_detectors;
 #[path = "all/log_core_loop.rs"]

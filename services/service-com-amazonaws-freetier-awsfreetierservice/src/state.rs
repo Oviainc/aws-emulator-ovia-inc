@@ -24,7 +24,7 @@
 //! ([`Default`]), so a reporting operation serves a read without writing
 //! anything.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use ::aws_smithy_types::DateTime;
 
@@ -59,6 +59,84 @@ pub const CURRENCY_USD: &str = "USD";
 /// The page size the model declares for `maxResults` on both paginated
 /// operations (`@default: 10`).
 pub const DEFAULT_MAX_RESULTS: i32 = 10;
+
+/// The language a request that names no `languageCode` is answered in, and the
+/// language every catalog row holds its base text in.
+///
+/// Both activity readers model `languageCode` as OPTIONAL
+/// (`ListAccountActivitiesRequest$languageCode`,
+/// `GetAccountActivityRequest$languageCode`) and the model names no default, so
+/// which language a request without one is answered in is this emulator's
+/// choice; it is one of the modelled `LanguageCode` values
+/// (`crate::ops::types::LANGUAGE_CODE_VALUES`).
+pub const DEFAULT_LANGUAGE_CODE: &str = "en-US";
+
+/// The primary language subtag of a `LanguageCode` — `en` of `en-GB` — which is
+/// what makes a code with no stored translation resolve to another variant of
+/// the same language rather than straight to the base text.
+fn primary_subtag(language_code: &str) -> &str {
+    language_code
+        .split_once('-')
+        .map_or(language_code, |(primary, _)| primary)
+}
+
+/// A piece of catalog text the service returns translated: the base text in
+/// [`DEFAULT_LANGUAGE_CODE`] plus the translations the catalog holds for other
+/// `LanguageCode` values.
+///
+/// `languageCode` on the activity readers is documented as "the language code
+/// used to return translated titles" / "translated title and description
+/// fields", so the text a reader reports is a function of the row AND the
+/// requested code. Storing the translations beside the row — rather than
+/// deriving text from the request — is what makes both readers answer one
+/// code with the same text, every time.
+#[derive(Debug, Clone)]
+pub struct LocalizedText {
+    /// The text in [`DEFAULT_LANGUAGE_CODE`]; always present, so every request
+    /// has an answer whatever it asks for.
+    base: String,
+    /// Language code -> the text in that language, ordered so the resolution
+    /// below is deterministic.
+    translations: BTreeMap<String, String>,
+}
+
+impl LocalizedText {
+    /// Build the text from its base ([`DEFAULT_LANGUAGE_CODE`]) and the
+    /// `(language code, text)` pairs the catalog translates it into.
+    pub fn new(base: &str, translations: &[(&str, &str)]) -> Self {
+        Self {
+            base: base.to_string(),
+            translations: translations
+                .iter()
+                .map(|(code, text)| ((*code).to_string(), (*text).to_string()))
+                .collect(),
+        }
+    }
+
+    /// The text in the language a request asked for.
+    ///
+    /// Resolution, nearest match first: the exact code; then any variant of the
+    /// same language (`en-GB` is served by the `en-US` base, `zh-TW` by another
+    /// `zh-*` entry when the catalog holds no Taiwanese text); then the base
+    /// text. A request that names no code is answered in
+    /// [`DEFAULT_LANGUAGE_CODE`].
+    pub fn in_language(&self, language_code: Option<&str>) -> &str {
+        let Some(code) = language_code else {
+            return &self.base;
+        };
+        if let Some(text) = self.translations.get(code) {
+            return text;
+        }
+        let wanted = primary_subtag(code);
+        if wanted == primary_subtag(DEFAULT_LANGUAGE_CODE) {
+            return &self.base;
+        }
+        self.translations
+            .iter()
+            .find(|(stored, _)| primary_subtag(stored) == wanted)
+            .map_or(&self.base, |(_, text)| text.as_str())
+    }
+}
 
 /// Seconds in a day, for the seeded timestamps below.
 const DAY: i64 = 86_400;
@@ -154,8 +232,11 @@ impl AccountPlan {
 pub struct Activity {
     /// `ActivityId`: exactly 32 characters of `[a-zA-Z0-9]`.
     pub activity_id: String,
-    pub title: String,
-    pub description: String,
+    /// The short title, in every language the catalog holds it in: a reader
+    /// reports the one its `languageCode` asks for.
+    pub title: LocalizedText,
+    /// The detailed description, likewise translated.
+    pub description: LocalizedText,
     pub instructions_url: String,
     /// `ActivityStatus`: `COMPLETED` | `EXPIRING` | `IN_PROGRESS` |
     /// `NOT_STARTED`.
@@ -400,15 +481,97 @@ pub fn is_activity_id(activity_id: &str) -> bool {
 /// stored, and both activity readers read these same rows. The statuses span
 /// the whole `ActivityStatus` enum so a status filter has something to select,
 /// and each status carries exactly the timestamps that status implies.
+///
+/// Each row's `title` and `description` are stored as [`LocalizedText`]: the
+/// base text in [`DEFAULT_LANGUAGE_CODE`] plus a translation for every other
+/// language the model's `LanguageCode` enum declares
+/// (`crate::ops::types::LANGUAGE_CODE_VALUES`), so a reader's `languageCode`
+/// selects which stored text is reported. `en-GB` holds no separate entry
+/// because British English does not differ from the base text of these rows;
+/// it resolves to the base through [`LocalizedText::in_language`]'s
+/// same-language step. `instructionsUrl` is NOT localized: the model documents
+/// the title and description as the translated fields.
 fn seed_activities(now: DateTime) -> Vec<Activity> {
     let secs = now.secs();
     vec![
         Activity {
             activity_id: "a1b2c3d4e5f60718293a4b5c6d7e8f90".to_string(),
-            title: "Launch an Amazon EC2 instance".to_string(),
-            description: "Launch your first Amazon EC2 instance and keep it running for \
-                          five minutes to earn Free Tier credits."
-                .to_string(),
+            title: LocalizedText::new(
+                "Launch an Amazon EC2 instance",
+                &[
+                    ("de-DE", "Eine Amazon EC2-Instance starten"),
+                    ("es-ES", "Lanzar una instancia de Amazon EC2"),
+                    ("fr-FR", "Lancer une instance Amazon EC2"),
+                    ("id-ID", "Luncurkan instans Amazon EC2"),
+                    ("it-IT", "Avvia un'istanza Amazon EC2"),
+                    ("ja-JP", "Amazon EC2 インスタンスを起動する"),
+                    ("ko-KR", "Amazon EC2 인스턴스 시작하기"),
+                    ("pt-PT", "Iniciar uma instância do Amazon EC2"),
+                    ("tr-TR", "Amazon EC2 örneği başlatın"),
+                    ("zh-CN", "启动 Amazon EC2 实例"),
+                    ("zh-TW", "啟動 Amazon EC2 執行個體"),
+                ],
+            ),
+            description: LocalizedText::new(
+                "Launch your first Amazon EC2 instance and keep it running for five \
+                 minutes to earn Free Tier credits.",
+                &[
+                    (
+                        "de-DE",
+                        "Starten Sie Ihre erste Amazon EC2-Instance und lassen Sie sie fünf \
+                         Minuten laufen, um Free-Tier-Guthaben zu erhalten.",
+                    ),
+                    (
+                        "es-ES",
+                        "Lanza tu primera instancia de Amazon EC2 y mantenla en ejecución \
+                         durante cinco minutos para obtener créditos de la capa gratuita.",
+                    ),
+                    (
+                        "fr-FR",
+                        "Lancez votre première instance Amazon EC2 et laissez-la fonctionner \
+                         pendant cinq minutes pour gagner des crédits de l'offre gratuite.",
+                    ),
+                    (
+                        "id-ID",
+                        "Luncurkan instans Amazon EC2 pertama Anda dan biarkan berjalan \
+                         selama lima menit untuk mendapatkan kredit Tingkat Gratis.",
+                    ),
+                    (
+                        "it-IT",
+                        "Avvia la tua prima istanza Amazon EC2 e lasciala in esecuzione per \
+                         cinque minuti per ottenere crediti del piano gratuito.",
+                    ),
+                    (
+                        "ja-JP",
+                        "最初の Amazon EC2 インスタンスを起動し、5 分間実行したままにして\
+                         無料利用枠のクレジットを獲得します。",
+                    ),
+                    (
+                        "ko-KR",
+                        "첫 Amazon EC2 인스턴스를 시작하고 5분 동안 실행하여 프리 티어 \
+                         크레딧을 받으세요.",
+                    ),
+                    (
+                        "pt-PT",
+                        "Inicie a sua primeira instância do Amazon EC2 e mantenha-a em \
+                         execução durante cinco minutos para ganhar créditos do nível \
+                         gratuito.",
+                    ),
+                    (
+                        "tr-TR",
+                        "İlk Amazon EC2 örneğinizi başlatın ve Ücretsiz Kullanım kredisi \
+                         kazanmak için beş dakika çalışır durumda bırakın.",
+                    ),
+                    (
+                        "zh-CN",
+                        "启动您的第一个 Amazon EC2 实例并保持运行五分钟，即可获得免费套餐积分。",
+                    ),
+                    (
+                        "zh-TW",
+                        "啟動您的第一個 Amazon EC2 執行個體並保持執行五分鐘，即可獲得免費方案額度。",
+                    ),
+                ],
+            ),
             instructions_url: "https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/EC2_GetStarted.html"
                 .to_string(),
             status: ACTIVITY_STATUS_NOT_STARTED.to_string(),
@@ -420,10 +583,80 @@ fn seed_activities(now: DateTime) -> Vec<Activity> {
         },
         Activity {
             activity_id: "0f1e2d3c4b5a69788796a5b4c3d2e1f0".to_string(),
-            title: "Create a budget in AWS Budgets".to_string(),
-            description: "Create a cost budget so you are alerted before your spend \
-                          passes a threshold you choose."
-                .to_string(),
+            title: LocalizedText::new(
+                "Create a budget in AWS Budgets",
+                &[
+                    ("de-DE", "Ein Budget in AWS Budgets erstellen"),
+                    ("es-ES", "Crear un presupuesto en AWS Budgets"),
+                    ("fr-FR", "Créer un budget dans AWS Budgets"),
+                    ("id-ID", "Buat anggaran di AWS Budgets"),
+                    ("it-IT", "Crea un budget in AWS Budgets"),
+                    ("ja-JP", "AWS Budgets で予算を作成する"),
+                    ("ko-KR", "AWS Budgets에서 예산 생성하기"),
+                    ("pt-PT", "Criar um orçamento no AWS Budgets"),
+                    ("tr-TR", "AWS Budgets'ta bütçe oluşturun"),
+                    ("zh-CN", "在 AWS Budgets 中创建预算"),
+                    ("zh-TW", "在 AWS Budgets 中建立預算"),
+                ],
+            ),
+            description: LocalizedText::new(
+                "Create a cost budget so you are alerted before your spend passes a \
+                 threshold you choose.",
+                &[
+                    (
+                        "de-DE",
+                        "Erstellen Sie ein Kostenbudget, damit Sie benachrichtigt werden, \
+                         bevor Ihre Ausgaben einen von Ihnen gewählten Schwellenwert \
+                         überschreiten.",
+                    ),
+                    (
+                        "es-ES",
+                        "Crea un presupuesto de costes para recibir una alerta antes de que \
+                         tu gasto supere el umbral que elijas.",
+                    ),
+                    (
+                        "fr-FR",
+                        "Créez un budget de coûts pour être alerté avant que vos dépenses ne \
+                         dépassent le seuil que vous choisissez.",
+                    ),
+                    (
+                        "id-ID",
+                        "Buat anggaran biaya agar Anda mendapat peringatan sebelum \
+                         pengeluaran Anda melewati batas yang Anda pilih.",
+                    ),
+                    (
+                        "it-IT",
+                        "Crea un budget dei costi per ricevere un avviso prima che la tua \
+                         spesa superi la soglia che scegli.",
+                    ),
+                    (
+                        "ja-JP",
+                        "コスト予算を作成して、支出が選択したしきい値を超える前に通知を受け取ります。",
+                    ),
+                    (
+                        "ko-KR",
+                        "비용 예산을 만들어 지출이 선택한 임계값을 넘기 전에 알림을 받으세요.",
+                    ),
+                    (
+                        "pt-PT",
+                        "Crie um orçamento de custos para ser alertado antes de as suas \
+                         despesas excederem o limite que escolher.",
+                    ),
+                    (
+                        "tr-TR",
+                        "Harcamanız seçtiğiniz eşiği aşmadan önce uyarı almak için bir \
+                         maliyet bütçesi oluşturun.",
+                    ),
+                    (
+                        "zh-CN",
+                        "创建成本预算，以便在支出超过您选择的阈值之前收到提醒。",
+                    ),
+                    (
+                        "zh-TW",
+                        "建立成本預算，以便在支出超過您選擇的閾值之前收到警示。",
+                    ),
+                ],
+            ),
             instructions_url: "https://docs.aws.amazon.com/cost-management/latest/userguide/budgets-create.html"
                 .to_string(),
             status: ACTIVITY_STATUS_COMPLETED.to_string(),
@@ -435,10 +668,78 @@ fn seed_activities(now: DateTime) -> Vec<Activity> {
         },
         Activity {
             activity_id: "1122334455667788990011223344aabb".to_string(),
-            title: "Launch an Amazon RDS database".to_string(),
-            description: "Create a managed database instance with Amazon RDS and connect \
-                          to it."
-                .to_string(),
+            title: LocalizedText::new(
+                "Launch an Amazon RDS database",
+                &[
+                    ("de-DE", "Eine Amazon RDS-Datenbank starten"),
+                    ("es-ES", "Lanzar una base de datos de Amazon RDS"),
+                    ("fr-FR", "Lancer une base de données Amazon RDS"),
+                    ("id-ID", "Luncurkan basis data Amazon RDS"),
+                    ("it-IT", "Avvia un database Amazon RDS"),
+                    ("ja-JP", "Amazon RDS データベースを起動する"),
+                    ("ko-KR", "Amazon RDS 데이터베이스 시작하기"),
+                    ("pt-PT", "Iniciar uma base de dados do Amazon RDS"),
+                    ("tr-TR", "Amazon RDS veritabanı başlatın"),
+                    ("zh-CN", "启动 Amazon RDS 数据库"),
+                    ("zh-TW", "啟動 Amazon RDS 資料庫"),
+                ],
+            ),
+            description: LocalizedText::new(
+                "Create a managed database instance with Amazon RDS and connect to it.",
+                &[
+                    (
+                        "de-DE",
+                        "Erstellen Sie eine verwaltete Datenbankinstanz mit Amazon RDS und \
+                         verbinden Sie sich mit ihr.",
+                    ),
+                    (
+                        "es-ES",
+                        "Crea una instancia de base de datos administrada con Amazon RDS y \
+                         conéctate a ella.",
+                    ),
+                    (
+                        "fr-FR",
+                        "Créez une instance de base de données gérée avec Amazon RDS et \
+                         connectez-vous à celle-ci.",
+                    ),
+                    (
+                        "id-ID",
+                        "Buat instans basis data terkelola dengan Amazon RDS dan hubungkan \
+                         ke instans tersebut.",
+                    ),
+                    (
+                        "it-IT",
+                        "Crea un'istanza di database gestita con Amazon RDS e connettiti a \
+                         essa.",
+                    ),
+                    (
+                        "ja-JP",
+                        "Amazon RDS でマネージドデータベースインスタンスを作成し、接続します。",
+                    ),
+                    (
+                        "ko-KR",
+                        "Amazon RDS로 관리형 데이터베이스 인스턴스를 만들고 연결하세요.",
+                    ),
+                    (
+                        "pt-PT",
+                        "Crie uma instância de base de dados gerida com o Amazon RDS e \
+                         ligue-se a ela.",
+                    ),
+                    (
+                        "tr-TR",
+                        "Amazon RDS ile yönetilen bir veritabanı örneği oluşturun ve ona \
+                         bağlanın.",
+                    ),
+                    (
+                        "zh-CN",
+                        "使用 Amazon RDS 创建托管数据库实例并连接到它。",
+                    ),
+                    (
+                        "zh-TW",
+                        "使用 Amazon RDS 建立受管資料庫執行個體並連線到該執行個體。",
+                    ),
+                ],
+            ),
             instructions_url: "https://docs.aws.amazon.com/AmazonRDS/latest/UserGuide/CHAP_GettingStarted.html"
                 .to_string(),
             status: ACTIVITY_STATUS_IN_PROGRESS.to_string(),
@@ -450,9 +751,67 @@ fn seed_activities(now: DateTime) -> Vec<Activity> {
         },
         Activity {
             activity_id: "deadbeefcafef00d0123456789abcdef".to_string(),
-            title: "Invoke an AWS Lambda function".to_string(),
-            description: "Create a Lambda function from a blueprint and invoke it once."
-                .to_string(),
+            title: LocalizedText::new(
+                "Invoke an AWS Lambda function",
+                &[
+                    ("de-DE", "Eine AWS Lambda-Funktion aufrufen"),
+                    ("es-ES", "Invocar una función de AWS Lambda"),
+                    ("fr-FR", "Invoquer une fonction AWS Lambda"),
+                    ("id-ID", "Panggil fungsi AWS Lambda"),
+                    ("it-IT", "Richiama una funzione AWS Lambda"),
+                    ("ja-JP", "AWS Lambda 関数を呼び出す"),
+                    ("ko-KR", "AWS Lambda 함수 호출하기"),
+                    ("pt-PT", "Invocar uma função do AWS Lambda"),
+                    ("tr-TR", "AWS Lambda işlevi çağırın"),
+                    ("zh-CN", "调用 AWS Lambda 函数"),
+                    ("zh-TW", "叫用 AWS Lambda 函數"),
+                ],
+            ),
+            description: LocalizedText::new(
+                "Create a Lambda function from a blueprint and invoke it once.",
+                &[
+                    (
+                        "de-DE",
+                        "Erstellen Sie eine Lambda-Funktion aus einer Blaupause und rufen \
+                         Sie sie einmal auf.",
+                    ),
+                    (
+                        "es-ES",
+                        "Crea una función de Lambda a partir de un modelo e invócala una vez.",
+                    ),
+                    (
+                        "fr-FR",
+                        "Créez une fonction Lambda à partir d'un modèle et invoquez-la une \
+                         fois.",
+                    ),
+                    (
+                        "id-ID",
+                        "Buat fungsi Lambda dari cetak biru dan panggil sekali.",
+                    ),
+                    (
+                        "it-IT",
+                        "Crea una funzione Lambda da un modello e richiamala una volta.",
+                    ),
+                    (
+                        "ja-JP",
+                        "設計図から Lambda 関数を作成し、1 回呼び出します。",
+                    ),
+                    (
+                        "ko-KR",
+                        "블루프린트로 Lambda 함수를 만들고 한 번 호출하세요.",
+                    ),
+                    (
+                        "pt-PT",
+                        "Crie uma função do Lambda a partir de um modelo e invoque-a uma vez.",
+                    ),
+                    (
+                        "tr-TR",
+                        "Bir şablondan Lambda işlevi oluşturun ve bir kez çağırın.",
+                    ),
+                    ("zh-CN", "从蓝图创建 Lambda 函数并调用一次。"),
+                    ("zh-TW", "從藍圖建立 Lambda 函數並叫用一次。"),
+                ],
+            ),
             instructions_url: "https://docs.aws.amazon.com/lambda/latest/dg/getting-started.html"
                 .to_string(),
             status: ACTIVITY_STATUS_NOT_STARTED.to_string(),
@@ -464,10 +823,75 @@ fn seed_activities(now: DateTime) -> Vec<Activity> {
         },
         Activity {
             activity_id: "ABCDEF0123456789abcdef0123456789".to_string(),
-            title: "Run an inference with Amazon Bedrock".to_string(),
-            description: "Send a prompt to a foundation model in the Amazon Bedrock \
-                          console."
-                .to_string(),
+            title: LocalizedText::new(
+                "Run an inference with Amazon Bedrock",
+                &[
+                    ("de-DE", "Eine Inferenz mit Amazon Bedrock ausführen"),
+                    ("es-ES", "Ejecutar una inferencia con Amazon Bedrock"),
+                    ("fr-FR", "Exécuter une inférence avec Amazon Bedrock"),
+                    ("id-ID", "Jalankan inferensi dengan Amazon Bedrock"),
+                    ("it-IT", "Esegui un'inferenza con Amazon Bedrock"),
+                    ("ja-JP", "Amazon Bedrock で推論を実行する"),
+                    ("ko-KR", "Amazon Bedrock으로 추론 실행하기"),
+                    ("pt-PT", "Executar uma inferência com o Amazon Bedrock"),
+                    ("tr-TR", "Amazon Bedrock ile çıkarım çalıştırın"),
+                    ("zh-CN", "使用 Amazon Bedrock 运行推理"),
+                    ("zh-TW", "使用 Amazon Bedrock 執行推論"),
+                ],
+            ),
+            description: LocalizedText::new(
+                "Send a prompt to a foundation model in the Amazon Bedrock console.",
+                &[
+                    (
+                        "de-DE",
+                        "Senden Sie eine Eingabeaufforderung an ein Basismodell in der \
+                         Amazon Bedrock-Konsole.",
+                    ),
+                    (
+                        "es-ES",
+                        "Envía una indicación a un modelo fundacional en la consola de \
+                         Amazon Bedrock.",
+                    ),
+                    (
+                        "fr-FR",
+                        "Envoyez une invite à un modèle de fondation dans la console Amazon \
+                         Bedrock.",
+                    ),
+                    (
+                        "id-ID",
+                        "Kirim prompt ke model dasar di konsol Amazon Bedrock.",
+                    ),
+                    (
+                        "it-IT",
+                        "Invia un prompt a un modello di base nella console Amazon Bedrock.",
+                    ),
+                    (
+                        "ja-JP",
+                        "Amazon Bedrock コンソールで基盤モデルにプロンプトを送信します。",
+                    ),
+                    (
+                        "ko-KR",
+                        "Amazon Bedrock 콘솔에서 파운데이션 모델에 프롬프트를 보내세요.",
+                    ),
+                    (
+                        "pt-PT",
+                        "Envie um pedido a um modelo fundacional na consola do Amazon \
+                         Bedrock.",
+                    ),
+                    (
+                        "tr-TR",
+                        "Amazon Bedrock konsolunda bir temel modele istem gönderin.",
+                    ),
+                    (
+                        "zh-CN",
+                        "在 Amazon Bedrock 控制台中向基础模型发送提示。",
+                    ),
+                    (
+                        "zh-TW",
+                        "在 Amazon Bedrock 主控台中向基礎模型傳送提示。",
+                    ),
+                ],
+            ),
             instructions_url: "https://docs.aws.amazon.com/bedrock/latest/userguide/getting-started.html"
                 .to_string(),
             status: ACTIVITY_STATUS_EXPIRING.to_string(),

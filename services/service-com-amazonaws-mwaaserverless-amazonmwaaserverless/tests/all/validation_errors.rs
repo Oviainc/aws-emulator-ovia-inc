@@ -918,6 +918,14 @@ async fn a_well_formed_request_keeps_the_answer_it_had() {
             "StartWorkflowRun",
             serde_json::json!({"WorkflowArn": arn.clone()}),
         ),
+        (
+            "GetTaskInstance",
+            serde_json::json!({
+                "WorkflowArn": arn.clone(),
+                "RunId": "run-01",
+                "TaskInstanceId": "task-01",
+            }),
+        ),
         // The ARN member an operation resolves the resource through is not always
         // named `WorkflowArn`: the tagging operations name it `ResourceArn`.
         (
@@ -960,14 +968,6 @@ async fn a_well_formed_request_keeps_the_answer_it_had() {
         (
             "ListTaskInstances",
             serde_json::json!({"WorkflowArn": arn.clone(), "RunId": "run-01"}),
-        ),
-        (
-            "GetTaskInstance",
-            serde_json::json!({
-                "WorkflowArn": arn.clone(),
-                "RunId": "run-01",
-                "TaskInstanceId": "task-01",
-            }),
         ),
     ];
     for (operation, body) in stub_cases {

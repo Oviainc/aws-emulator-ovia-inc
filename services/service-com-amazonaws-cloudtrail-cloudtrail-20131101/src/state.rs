@@ -3022,7 +3022,9 @@ impl ComAmazonawsCloudtrailCloudtrail20131101State {
     /// The tag set stored for the resource `arn` names, or `None` when no stored
     /// resource answers to it.
     ///
-    /// An event data store and a channel are reachable only from the Region they live
+    /// Each of the four kinds resolves in the registry that HOLDS that kind, and `None`
+    /// is that registry holding no such record — never a kind answered without reading
+    /// it. An event data store and a channel are reachable only from the Region they live
     /// in, which is the Region their ARN pins — the same rule [`Self::event_data_store`]
     /// and [`Self::addressed_channel`] apply. A channel the registry does not hold (no
     /// channel carries that id in that Region) answers `None`, which its caller reports

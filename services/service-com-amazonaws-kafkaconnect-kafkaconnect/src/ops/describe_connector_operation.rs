@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeConnectorOperation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeConnectorOperation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeConnectorOperation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored connector operation the request names: the connector it ran
+//! against, its type, the state the clock has walked it to and, once it has reached its
+//! terminal state, when it ended. An ARN this emulator holds no operation of is a
+//! `NotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -173,18 +168,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeConnectorOperation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeConnectorOperationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeConnectorOperation"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeConnectorOperationErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the kafkaconnect store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let _ = ctx;
+        let mut state = store.lock();
+        state.settle_due();
+
+        let Some(operation) = state
+            .connector_operations
+            .get(&input.connector_operation_arn)
+        else {
+            return Err(DescribeConnectorOperationErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::invalid_parameter_because(
+                        "connectorOperationArn",
+                        crate::state::RESOURCE_DOES_NOT_EXIST,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        Ok(DescribeConnectorOperationOutput {
+            connector_arn: Some(operation.connector_arn.clone()),
+            connector_operation_arn: Some(operation.arn.clone()),
+            connector_operation_state: Some(operation.state.clone()),
+            connector_operation_type: Some(operation.operation_type.clone()),
+            // Every value `ConnectorOperationStepType` models names a step of an
+            // UPDATE (`INITIALIZE_UPDATE`, `VALIDATE_UPDATE`,
+            // `UPDATE_WORKER_SETTING`, `UPDATE_CONNECTOR_CONFIGURATION`,
+            // `FINALIZE_UPDATE`), so a restart has no modelled step to report
+            // and none is invented for it.
+            operation_steps: None,
+            // The origin and target settings are the before and after of an
+            // update; a restart changes neither the connector's worker setting
+            // nor its configuration, so there is no pair to report.
+            origin_worker_setting: None,
+            origin_connector_configuration: None,
+            target_worker_setting: None,
+            target_connector_configuration: None,
+            // `errorInfo` describes a FAILED operation; nothing in this
+            // emulator's progression fails.
+            error_info: None,
+            creation_time: Some(crate::state::date_time(operation.creation_time)),
+            end_time: operation.end_time(),
+        })
     }
 }

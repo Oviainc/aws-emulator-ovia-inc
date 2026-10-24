@@ -201,6 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             sequence,
             ingestions: ::std::collections::HashMap::new(),
             app_authorizations: ::std::collections::HashMap::new(),
+            user_access_tasks: ::std::collections::HashMap::new(),
         };
         store.app_bundles.insert(id.clone(), record);
         if let Some(token) = input.client_token.as_deref() {

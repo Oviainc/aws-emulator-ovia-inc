@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/account_settings.rs"]
 mod account_settings;
+#[path = "all/capacity_providers.rs"]
+mod capacity_providers;
 #[path = "all/cluster_capacity_and_statistics.rs"]
 mod cluster_capacity_and_statistics;
 #[path = "all/cluster_mutations.rs"]
@@ -33,6 +35,8 @@ mod load_balancer_target_groups;
 mod service_lifecycle;
 #[path = "all/service_projection.rs"]
 mod service_projection;
+#[path = "all/service_validation.rs"]
+mod service_validation;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/task_definition_projection.rs"]

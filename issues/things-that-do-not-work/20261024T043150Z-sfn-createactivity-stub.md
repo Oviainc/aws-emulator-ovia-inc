@@ -1,0 +1,32 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-ga-prod-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: cloudwatch__sfn.metrics-states-stream-activity-metrics-attribute-worker-outcomes-to-the-activity-arn-series cloudwatch__sfn.metrics-states-stream-late-activity-result-rejected-after-task-timeout-and-only-timed-out-moves cloudwatch__sfn.obs-sfn-1-redrive-to-succeeded-counts-once-and-second-redrive-rejected sfn.activity-deleted-mid-flight-orphans-its-outstanding-task sfn.activity-heartbeat-timeout-closes-task-before-task-timeout sfn.activity-list-describe-consistency sfn.activity-resource-wait-for-task-token-suffix-rejected sfn.activity-stopped-execution-refuses-its-outstanding-token sfn.activity-task-timeout-starts-at-the-claim-not-the-schedule sfn.activity-token-consumed-by-failure-refuses-a-later-success sfn.activity-two-queued-tasks-do-not-cross-executions sfn.activity-worker-input-and-reply-round-trip sfn.deep-sfn-2-sfn-jsonata-context-redrive-count-joins-describe-execution sfn.e2e-activity-worker-heartbeat-success-pipeline sfn.error-invalid-output-send-task-success sfn.get-activity-task-blocks-until-execution-schedules-task sfn.get-activity-task-long-poll-returns-empty-on-timeout sfn.list-activities-pagination-token sfn.redrive-execution-preserves-original-history-order sfn.redrive-execution-resumes-from-failed-state sfn.redrive-execution-resumes-from-failure-point sfn.redrive-succeeded-execution-rejected sfn.reject-delete-nonempty-activity-in-use sfn.reject-redrive-nonexistent-execution sfn.retry-intervals-grow-by-backoffrate-and-clamp-at-maxdelayseconds sfn.send-task-failure-after-timeout-token-invalid sfn.send-task-failure-kms-access-denied sfn.send-task-heartbeat-task-does-not-exist sfn.send-task-success-token-reuse-fails sfn.task-heartbeat-keeps-execution-alive sfn.task-io-base64-blob-round-trip sfn.task-timed-out-error-on-heartbeat-after-window
+Issue-Key: sfn|CreateActivity|NotImplemented
+Issue-Commit: 3ecafc116f2b44ac9fb7ddf17b83f092c778a529
+
+# Implement sfn CreateActivity: unimplemented scaffold stub
+
+> _Note: this issue was identified against the code base at commit `3ecafc116f2b44ac9fb7ddf17b83f092c778a529`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+CreateActivity
+
+## Description
+`CreateActivity` is an unmodified scaffold stub, so it answers HTTP 501 and persists nothing. Implement it in `services/service-com-amazonaws-sfn-awsstepfunctions/src/ops/create_activity.rs`: replace the `Err(crate::scaffolded::Scaffolded::not_implemented(..))` with a real handler that reads and writes the service's state, then DELETE that file's `//! SCAFFOLDED, NOT IMPLEMENTED:` header line.
+
+That header line is the stub census — the one record of which operations are still scaffolds. Deleting it without implementing the handler, or leaving it in place on a handler you did implement, corrupts that record rather than closing this issue. A stub's 501 is also CORRECT for a stub: this issue asks you to implement the operation, never to change the error it returns while unimplemented.
+
+32 recorded unit(s) fail on their `CreateActivity` call, so each one unblocks only when `CreateActivity` works: `cloudwatch__sfn.metrics-states-stream-activity-metrics-attribute-worker-outcomes-to-the-activity-arn-series`, `cloudwatch__sfn.metrics-states-stream-late-activity-result-rejected-after-task-timeout-and-only-timed-out-moves`, `cloudwatch__sfn.obs-sfn-1-redrive-to-succeeded-counts-once-and-second-redrive-rejected`, `sfn.activity-deleted-mid-flight-orphans-its-outstanding-task`, `sfn.activity-heartbeat-timeout-closes-task-before-task-timeout`, `sfn.activity-list-describe-consistency`, `sfn.activity-resource-wait-for-task-token-suffix-rejected`, `sfn.activity-stopped-execution-refuses-its-outstanding-token`, `sfn.activity-task-timeout-starts-at-the-claim-not-the-schedule`, `sfn.activity-token-consumed-by-failure-refuses-a-later-success`, `sfn.activity-two-queued-tasks-do-not-cross-executions`, `sfn.activity-worker-input-and-reply-round-trip`, `sfn.deep-sfn-2-sfn-jsonata-context-redrive-count-joins-describe-execution`, `sfn.e2e-activity-worker-heartbeat-success-pipeline`, `sfn.error-invalid-output-send-task-success`, `sfn.get-activity-task-blocks-until-execution-schedules-task`, `sfn.get-activity-task-long-poll-returns-empty-on-timeout`, `sfn.list-activities-pagination-token`, `sfn.redrive-execution-preserves-original-history-order`, `sfn.redrive-execution-resumes-from-failed-state` (+12 more).
+
+## Evidence
+The handler carries the scaffold marker `//! SCAFFOLDED, NOT IMPLEMENTED:` at the top of `services/service-com-amazonaws-sfn-awsstepfunctions/src/ops/create_activity.rs`. Replaying the corpus, the emulator refused the `CreateActivity` call: File "context.py", line 123, in wrapper
+    return func(*args, **kwargs)
+  File "client.py", line 1094, in _make_api_call
+    raise error_class(parsed_response, operation_name)
+botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling the CreateActivity operation: operation CreateActivity is scaffolded but not implemented in this emulator
+
+## Steps to Reproduce
+Boot the sfn emulator
+Call CreateActivity and observe HTTP 501 with no state persisted
+Replay any of the blocked units above and observe it fail on that refusal
