@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeEphemeris
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeEphemeris`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeEphemeris::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation reports
+//!
+//! The ephemeris this account holds under `{ephemerisId}`, as `CreateEphemeris` stored it:
+//! the satellite it applies to, its name, priority, whether the caller asked for it to be
+//! enabled, when it was created, its tags, the data it was supplied with (the Amazon S3
+//! object it names, or that data itself when it was supplied inline), the
+//! `EphemerisStatus` in force now, and — only while that status is `INVALID` — the
+//! `EphemerisInvalidReason` its validation reached. A read first materialises every status
+//! move the clock has already made due (`state::settle_due_ephemerides`), which is owed
+//! whether or not anybody called, and writes nothing else.
 //!
 //! ## Shape of an operation
 //!
@@ -160,20 +162,153 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeEphemeris` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeEphemerisErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeEphemeris"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeEphemerisErrorModeled::DependencyException(DependencyException {
+                message: Some("this service's state store is unavailable".to_string()),
+                parameter_name: None,
+            })
+        })?;
+
+        let mut guard = state.lock();
+        // An ephemeris leaves `VALIDATING` at an instant the create recorded, and becomes
+        // `EXPIRED` once its expiration time passes: both moves were owed at this instant
+        // whether or not anybody read, so materialising them before reading changes
+        // nothing a later caller could otherwise have seen.
+        guard.settle_due_ephemerides();
+
+        let stored = guard.ephemerides.get(&input.ephemeris_id).ok_or_else(|| {
+            DescribeEphemerisErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                // This service's read-path literal: it does not disclose the id that was
+                // asked for.
+                message: Some(crate::state::EPHEMERIS_NOT_FOUND.to_string()),
+            })
+        })?;
+
+        Ok(DescribeEphemerisOutput {
+            ephemeris_id: Some(stored.ephemeris_id.clone()),
+            // Reported only when the ephemeris applies to one: `satelliteId` is optional on
+            // the create, and an ephemeris created without one is associated with no
+            // satellite rather than with a blank.
+            satellite_id: stored.satellite_id.clone(),
+            status: Some(stored.status.clone()),
+            priority: Some(stored.priority),
+            creation_time: Some(stored.creation_time),
+            enabled: Some(stored.enabled),
+            name: Some(stored.name.clone()),
+            tags: crate::state::response_tags(&stored.tags),
+            supplied_data: Some(supplied_data(&stored.supplied_data)),
+            // "Reason that an ephemeris failed validation. Appears only when the status is
+            // INVALID" (`smithy_query(query="operation", operation="DescribeEphemeris")`),
+            // so the verdict the create took is withheld until the validation that reached
+            // it is the status in force.
+            invalid_reason: stored
+                .invalid_reason
+                .filter(|_| stored.status == crate::state::EPHEMERIS_INVALID)
+                .map(str::to_string),
+            // `errorReasons` is the per-error detail of a validation failure, each entry an
+            // `EphemerisErrorCode` plus a human-readable message
+            // (`smithy_query(query="shape", shape="EphemerisErrorReason")`). This
+            // emulator's validation records ONE verdict for an ephemeris — the
+            // `EphemerisInvalidReason` above — and no per-error detail beneath it, so there
+            // is no error list to report and none is invented here.
+            error_reasons: None,
+        })
     }
+}
+
+/// The supplied data of a stored ephemeris, as `suppliedData` describes it: the same union
+/// member the data was created under, carrying the Amazon S3 object it was supplied from,
+/// or the data itself when it was supplied inline.
+///
+/// `EphemerisTypeDescription` mirrors `EphemerisData` member for member (`tle`, `oem`,
+/// `azEl` — `smithy_query(query="shape", shape="EphemerisTypeDescription")`), and each of
+/// its arms is an `EphemerisDescription` of exactly those two members, so the description
+/// of an ephemeris is this projection of what the store holds.
+fn supplied_data(data: &EphemerisData) -> EphemerisTypeDescription {
+    match data {
+        EphemerisData::Tle(tle) => EphemerisTypeDescription::Tle(EphemerisDescription {
+            source_s3_object: tle.s3_object.clone(),
+            ephemeris_data: tle.tle_data.as_deref().and_then(tle_text),
+        }),
+        EphemerisData::Oem(oem) => EphemerisTypeDescription::Oem(EphemerisDescription {
+            source_s3_object: oem.s3_object.clone(),
+            // An OEM body is already the text of a CCSDS document, which this emulator
+            // stores verbatim: its description is that text.
+            ephemeris_data: oem.oem_data.clone(),
+        }),
+        EphemerisData::azEl(az_el) => {
+            let (source_s3_object, ephemeris_data) = match &az_el.data {
+                AzElSegmentsData::s3Object(object) => (Some(object.clone()), None),
+                AzElSegmentsData::azElData(segments) => (None, az_el_text(segments)),
+            };
+            EphemerisTypeDescription::azEl(EphemerisDescription {
+                source_s3_object,
+                ephemeris_data,
+            })
+        }
+    }
+}
+
+/// A two-line element set as its own text: each entry's two lines, one per line, in the
+/// order they were supplied.
+///
+/// That text is what a TLE IS — `tleLine1` and `tleLine2` are the "first line" and "second
+/// line of two-line element set (TLE) data" (`smithy_query(query="shape",
+/// shape="TLEData")`) — so an ephemeris supplied inline and the same one supplied as an
+/// Amazon S3 object describe one body of data. `None` for a set with no entry at all:
+/// `EphemerisDescription$ephemerisData` is `len 1..`, so "no data" is an absent member
+/// rather than an empty string.
+fn tle_text(entries: &[TLEData]) -> Option<String> {
+    if entries.is_empty() {
+        return None;
+    }
+    let mut lines: Vec<&str> = Vec::with_capacity(entries.len() * 2);
+    for entry in entries {
+        lines.push(entry.tle_line1.as_str());
+        lines.push(entry.tle_line2.as_str());
+    }
+    Some(lines.join("\n"))
+}
+
+/// Azimuth/elevation segments as their own text: the JSON form of `AzElSegments`.
+///
+/// JSON is the form the model itself gives this data — an `azEl` ephemeris supplied from
+/// Amazon S3 "must contain JSON-formatted azimuth elevation data matching the AzElSegments
+/// structure" (`smithy_query(query="shape", shape="AzElSegmentsData")`) — so segments
+/// supplied inline are described as that same document: the modelled member names, and
+/// each timestamp in the ISO-8601 UTC form its `@timestampFormat` names
+/// (`shape="AzElSegment"` / `shape="ISO8601TimeRange"`). `None` when an instant the
+/// segments hold cannot be rendered in that form, since a partial document would describe
+/// data the ephemeris does not hold.
+fn az_el_text(segments: &AzElSegments) -> Option<String> {
+    let mut rendered: Vec<::serde_json::Value> =
+        Vec::with_capacity(segments.az_el_segment_list.len());
+    for segment in &segments.az_el_segment_list {
+        let points: Vec<::serde_json::Value> = segment
+            .az_el_list
+            .iter()
+            .map(|point| ::serde_json::json!({"dt": point.dt, "az": point.az, "el": point.el}))
+            .collect();
+        rendered.push(::serde_json::json!({
+            "referenceEpoch": iso8601(segment.reference_epoch)?,
+            "validTimeRange": {
+                "startTime": iso8601(segment.valid_time_range.start_time)?,
+                "endTime": iso8601(segment.valid_time_range.end_time)?,
+            },
+            "azElList": points,
+        }));
+    }
+    ::serde_json::to_string(&::serde_json::json!({
+        "angleUnit": segments.angle_unit,
+        "azElSegmentList": rendered,
+    }))
+    .ok()
+}
+
+/// `at` in the ISO-8601 UTC form the az/el timestamps are modelled in
+/// (`@timestampFormat("date-time")`), as the library renders it.
+fn iso8601(at: ::aws_smithy_types::DateTime) -> Option<String> {
+    at.fmt(::aws_smithy_types::date_time::Format::DateTime).ok()
 }

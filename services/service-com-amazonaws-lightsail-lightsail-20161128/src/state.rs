@@ -646,6 +646,15 @@ pub const MAX_OPERATION_HISTORY: usize = 2_000;
 /// response carries a `nextPageToken` when more instances remain.
 pub const INSTANCE_PAGE_SIZE: usize = 10;
 
+/// How many managed relational databases one `GetRelationalDatabases` page
+/// carries.
+///
+/// CHOSEN: Lightsail publishes no page size for this operation, only that the
+/// response carries a `nextPageToken` when more databases remain. Matches
+/// [`INSTANCE_PAGE_SIZE`], so every stored-resource listing in this slice pages
+/// the same way.
+pub const RELATIONAL_DATABASE_PAGE_SIZE: usize = 10;
+
 /// How many database snapshots one `GetRelationalDatabaseSnapshots` page
 /// carries.
 ///
