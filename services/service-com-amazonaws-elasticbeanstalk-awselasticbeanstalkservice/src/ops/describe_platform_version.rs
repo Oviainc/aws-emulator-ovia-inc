@@ -165,16 +165,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A CUSTOM version is one this account created; a MANAGED one is a version
         // this service publishes. Both are described, from the one place each is
         // held, so a `PlatformArn` an environment can be launched on is also one
-        // this operation reports.
+        // this operation reports. A managed version's branch attributes come from
+        // the branch catalog the store holds — the same records
+        // `ListPlatformBranches` reports — so the two cannot disagree.
         let description = match store.platform_versions.get(platform_arn) {
             Some(platform_version) => platform_version.to_description(),
-            None => crate::state::managed_platform_version(&region, platform_arn)
-                .ok_or_else(|| {
-                    DescribePlatformVersionError::invalid_parameter_value(
-                        crate::state::missing_platform_message(platform_arn),
-                    )
-                })?
-                .to_description(&region),
+            None => {
+                let stack = crate::state::managed_platform_version(&region, platform_arn)
+                    .ok_or_else(|| {
+                        DescribePlatformVersionError::invalid_parameter_value(
+                            crate::state::missing_platform_message(platform_arn),
+                        )
+                    })?;
+                stack.to_description(&region, &store)
+            }
         };
 
         Ok(DescribePlatformVersionOutput {

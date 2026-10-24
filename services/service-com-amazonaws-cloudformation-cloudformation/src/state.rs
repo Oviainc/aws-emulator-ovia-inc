@@ -730,13 +730,15 @@ impl StoredStack {
     }
 
     /// Materialise what the stored template declares: one record per declared resource,
-    /// and the stack's outputs evaluated against those resources, the stack's parameters
-    /// and the pseudo parameters.
+    /// with its properties evaluated, and the stack's outputs evaluated against those
+    /// resources, the stack's parameters and the pseudo parameters.
     ///
-    /// Called by the operation that DEPLOYS the template (`CreateStack`, `UpdateStack`),
-    /// never by a read: the values are a function of the template body and the
-    /// parameters in force, so they are computed once where those change and read back
-    /// unchanged afterwards.
+    /// Called by the operation that DEPLOYS the template (`CreateStack`, `UpdateStack`,
+    /// `ExecuteChangeSet`), never by a read: the values are a function of the template body
+    /// and the parameters in force, so they are computed once where those change and read
+    /// back unchanged afterwards. Creating each declared resource in the service that OWNS
+    /// it is [`provisioning::reconcile`], which the deploying operation calls with these
+    /// records once the store is unlocked.
     ///
     /// The result is held as the operation's PENDING deployment and takes effect when
     /// [`Self::settle`] completes that operation — a stack reports the resources and
