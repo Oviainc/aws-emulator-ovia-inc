@@ -160,7 +160,7 @@ const MAX_COMPRESSION_SIZE: i32 = 10_485_760;
 
 /// The `apiStatus` a freshly created API is in: it is immediately usable, so it is
 /// created in the terminal `AVAILABLE` state and no later call moves it.
-const API_STATUS_AVAILABLE: &str = "AVAILABLE";
+pub const API_STATUS_AVAILABLE: &str = "AVAILABLE";
 
 /// The `path` of an API's implicit root resource.
 pub const ROOT_RESOURCE_PATH: &str = "/";
