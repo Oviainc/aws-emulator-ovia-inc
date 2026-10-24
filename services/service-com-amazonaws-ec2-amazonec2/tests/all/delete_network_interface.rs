@@ -21,9 +21,10 @@
 //! interface being deleted, the form of the id, the status of the attachment holding it —
 //! so no single recorded call is the specification.
 //!
-//! `DescribeNetworkInterfaces` is still a scaffold stub with its own open issue, so what
-//! the store holds is read through the store itself; what a LATER CALLER sees is read over
-//! the wire, through the second delete's refusal.
+//! What the store holds is read through the store itself, and what a LATER CALLER sees is
+//! read over the wire, through the second delete's refusal — the two readings this suite
+//! needs. What `DescribeNetworkInterfaces` reports out of that same store has its own
+//! suite, `tests/all/network_interfaces.rs`.
 
 use ec2::ops::types::{GroupIdentifier, NetworkInterfaceAttachment, Tag};
 use ec2::state::{
@@ -585,9 +586,9 @@ async fn a_dry_run_reports_the_permission_check_and_removes_nothing() {
 /// delete: `AssociateAddress` reads THE SAME store, so a malformed value is refused
 /// `InvalidNetworkInterfaceID.Malformed`, a well-formed id the account holds no interface
 /// for `InvalidNetworkInterfaceID.NotFound`, and an id the store DOES hold is no longer
-/// mis-reported as not found — it is answered with the scaffold's 501, because reporting
-/// the association on the interface needs `DescribeNetworkInterfaces` (its own open stub
-/// issue) and a fabricated association would be worse than an honest refusal.
+/// mis-reported as not found — it is answered with the scaffold's 501, because persisting
+/// the association on the interface is work the `AssociateAddress` slice has not done and a
+/// fabricated association would be worse than an honest refusal.
 ///
 /// This lives beside the store it exercises rather than in `super::associate_address`,
 /// whose own table covers that operation's address and instance rules; the rows here differ
