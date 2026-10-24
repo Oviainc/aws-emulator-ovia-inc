@@ -193,6 +193,12 @@ async fn a_created_vocabulary_is_pending_then_ready_and_reads_back() {
 /// Every way a create can fail to say where its terms come from, for both the
 /// vocabulary and the vocabulary-filter operations: each is the modelled
 /// `BadRequestException`, and nothing is stored.
+///
+/// A request that names a file as the source of its terms is NOT one of them for the
+/// vocabulary family: it is accepted and recorded, which `crate::vocabulary_file_uri`
+/// spans. The filter family has no `VocabularyState` anywhere in its model, so there
+/// is no modelled state a filter whose words nothing could read may end in, and its
+/// file form stays refused at the call.
 #[tokio::test]
 async fn a_create_without_usable_inline_terms_is_a_bad_request() {
     let transcribe = Transcribe::new();
@@ -219,24 +225,6 @@ async fn a_create_without_usable_inline_terms_is_a_bad_request() {
                 "LanguageCode": "en-US",
                 "Phrases": ["Aardvark"],
                 "VocabularyFileUri": "s3://example-bucket/vocab.txt"
-            }),
-        ),
-        (
-            "vocabulary from an s3 file this emulator cannot read",
-            "CreateVocabulary",
-            json!({
-                "VocabularyName": "from-s3",
-                "LanguageCode": "en-US",
-                "VocabularyFileUri": "s3://example-bucket/vocab.txt"
-            }),
-        ),
-        (
-            "vocabulary from an https file this emulator cannot read",
-            "CreateVocabulary",
-            json!({
-                "VocabularyName": "from-https",
-                "LanguageCode": "en-US",
-                "VocabularyFileUri": "https://example.invalid/vocab.txt"
             }),
         ),
         (

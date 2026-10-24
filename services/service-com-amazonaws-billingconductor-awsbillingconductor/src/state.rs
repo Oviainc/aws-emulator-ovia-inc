@@ -710,6 +710,39 @@ impl ComAmazonawsBillingconductorAwsbillingconductorState {
         Some(removed)
     }
 
+    /// Delete a pricing plan and the index entries that only existed because of it:
+    /// its name-index entry (so the name frees up for a later create) and the
+    /// idempotency entries that named it, so a `ClientToken` cannot replay into the
+    /// ARN of a plan that no longer exists. `None` when no such plan is stored.
+    ///
+    /// A plan's rule ASSOCIATIONS live on its own record, so they go with it; the
+    /// rules themselves are separate resources and outlive the plan.
+    pub fn remove_pricing_plan(&mut self, plan_arn: &str) -> Option<PricingPlanRecord> {
+        let removed = self.pricing_plans.remove(plan_arn)?;
+        self.pricing_plan_names.remove(&removed.name);
+
+        self.idempotency_tokens.retain(|_, arn| arn != plan_arn);
+        let remaining = &self.idempotency_tokens;
+        self.idempotency_order
+            .retain(|key| remaining.contains_key(key));
+
+        Some(removed)
+    }
+
+    /// The ARNs of every stored billing group whose
+    /// `ComputationPreference.PricingPlanArn` names this pricing plan — the
+    /// association "the pricing plan must not be associated with any billing groups
+    /// to delete successfully" is decided from. A group may have been created naming
+    /// the plan in either spelling the `PricingPlanArn` pattern allows, so both sides
+    /// are normalised.
+    pub fn billing_groups_referencing_pricing_plan(&self, plan_arn: &str) -> Vec<String> {
+        self.billing_groups
+            .iter()
+            .filter(|(_, group)| normalize_pricing_plan_arn(&group.pricing_plan_arn) == plan_arn)
+            .map(|(arn, _)| arn.clone())
+            .collect()
+    }
+
     /// The ARNs of every stored pricing plan whose `PricingRuleArns` names this
     /// pricing rule. A plan may name a rule in either spelling the
     /// `PricingRuleArn` pattern allows, so both sides are normalised.
