@@ -17,6 +17,9 @@ mod account_configuration;
 #[path = "all/batch_delete.rs"]
 mod batch_delete;
 
+#[path = "all/channel_alerts.rs"]
+mod channel_alerts;
+
 #[path = "all/channel_lifecycle.rs"]
 mod channel_lifecycle;
 

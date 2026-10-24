@@ -267,7 +267,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         }
                         crate::state::AttachmentDetail::Vpc { .. }
                         | crate::state::AttachmentDetail::Connect { .. }
-                        | crate::state::AttachmentDetail::SiteToSiteVpn => false,
+                        | crate::state::AttachmentDetail::SiteToSiteVpn
+                        | crate::state::AttachmentDetail::TransitGatewayRouteTable { .. } => false,
                     }
                     && crate::state::same_tags(
                         &existing.tags,

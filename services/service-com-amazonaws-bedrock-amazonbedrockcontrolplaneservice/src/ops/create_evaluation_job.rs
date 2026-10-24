@@ -242,7 +242,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .cloned();
         if let Some(minted) = replayed {
-            if let Some(job) = store.evaluation_job(&minted) {
+            if let Some(job) = store.evaluation_job(&minted, now) {
                 return Ok(CreateEvaluationJobOutput {
                     job_arn: job.arn.clone(),
                 });
@@ -302,6 +302,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The evaluation runs after this call returns, so the job is reported running
             // from here onwards.
             status: crate::state::EVALUATION_JOB_STATUS_IN_PROGRESS,
+            // Nothing has asked for a stop yet, so the clock owes this job no transition.
+            stopped_due_at: None,
             created_at: now,
             last_modified_at: now,
         };
@@ -317,7 +319,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Read the response back out of the STORED record, so what the caller is told is
         // exactly what a later GetEvaluationJob will find.
         let stored = store
-            .evaluation_job(&arn)
+            .evaluation_job(&arn, now)
             .expect("the evaluation job just inserted under this ARN");
         Ok(CreateEvaluationJobOutput {
             job_arn: stored.arn.clone(),

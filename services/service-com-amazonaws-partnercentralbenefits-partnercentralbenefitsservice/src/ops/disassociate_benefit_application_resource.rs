@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateBenefitApplicationResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateBenefitApplicationResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Removes one AWS resource from the stored benefit application's associated resources:
+//! the `ResourceArn` the request names is dropped from the record's
+//! `AssociatedResources`, every other association is left alone, and the application's
+//! revision and `UpdatedAt` advance because its content changed. The removal is read back
+//! through `GetBenefitApplication` (and filtered on by `ListBenefitApplications`).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateBenefitApplicationResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removal is a set difference, so a `ResourceArn` the application does not carry leaves
+//! the record — its associations, its revision and its `UpdatedAt` — exactly as it was and
+//! still answers success with the application's current `Id`, `Arn` and `Revision`; that
+//! is the same rule `crate::ops::untag_resource` applies to a tag key the resource never
+//! carried. A disassociation of an application AWS has finished with (a status in
+//! [`crate::state::TERMINAL_STATUSES`]) is refused with the modelled `ConflictException`
+//! and persists nothing, as every other change to a terminal application is.
 //!
 //! ## Shape of an operation
 //!
@@ -162,31 +166,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // The entitlement gate is a service-wide stage, so it sits ahead of this
-        // (unwritten) body too: a caller whose account holds no active AWS partner
-        // benefit is refused with the modelled `AccessDeniedException`, which is the
-        // WHOLE answer the service gives such a request — no unimplemented behaviour is
-        // involved. An entitled caller still gets the 501 below.
+        // The entitlement gate, ahead of everything else this handler does — see
+        // [`crate::state::entitlement_refusal`].
         if let Some(denied) = crate::state::entitlement_refusal(&*self.engine) {
             return Err(
                 DisassociateBenefitApplicationResourceErrorModeled::AccessDeniedException(denied)
                     .into(),
             );
         }
-        // Implement `DisassociateBenefitApplicationResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateBenefitApplicationResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateBenefitApplicationResource"))
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DisassociateBenefitApplicationResourceErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: crate::state::STORE_UNAVAILABLE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = crate::state::now_millis();
+        let mut store = state.lock();
+        let Some(application) =
+            store.application_mut(&input.catalog, &input.benefit_application_identifier)
+        else {
+            return Err(
+                DisassociateBenefitApplicationResourceErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::not_found_message(
+                            crate::state::APPLICATION_KIND,
+                            &input.benefit_application_identifier,
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // AWS has finished with a terminal application, so its record admits no change —
+        // see [`crate::state::TERMINAL_STATUSES`], the same gate
+        // `crate::ops::amend_benefit_application` applies. A disassociation from a
+        // submitted application is part of managing it, so every non-terminal status is
+        // accepted.
+        if application.is_terminal() {
+            return Err(
+                DisassociateBenefitApplicationResourceErrorModeled::ConflictException(
+                    ConflictException {
+                        message: crate::state::status_conflict_message(
+                            &application.id,
+                            &application.status,
+                            "disassociated from an AWS resource",
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A set difference: every occurrence of the named ARN is dropped and the
+        // associations this request did not name are kept. The revision and `UpdatedAt`
+        // move only when the record actually changed, so a request naming a resource this
+        // application never carried reports the revision it already had.
+        let associated_before = application.associated_resources.len();
+        application
+            .associated_resources
+            .retain(|associated| associated != &input.resource_arn);
+        if application.associated_resources.len() != associated_before {
+            application.revise(now);
+        }
+
+        Ok(DisassociateBenefitApplicationResourceOutput {
+            id: Some(application.id.clone()),
+            arn: Some(application.arn.clone()),
+            revision: Some(application.revision_text()),
+        })
     }
 }

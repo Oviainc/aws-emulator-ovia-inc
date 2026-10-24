@@ -73,6 +73,8 @@ mod git_object_ids;
 mod git_transport;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/merge_branches_fast_forward.rs"]
+mod merge_branches_fast_forward;
 #[path = "all/merge_options.rs"]
 mod merge_options;
 #[path = "all/object_store_bounds.rs"]

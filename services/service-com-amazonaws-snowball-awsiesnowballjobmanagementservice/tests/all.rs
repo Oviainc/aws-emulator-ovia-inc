@@ -19,6 +19,8 @@ mod cluster_cancellation;
 mod cluster_creation;
 #[path = "all/cluster_device_capability.rs"]
 mod cluster_device_capability;
+#[path = "all/cluster_job_listing.rs"]
+mod cluster_job_listing;
 #[path = "all/cluster_node_updates.rs"]
 mod cluster_node_updates;
 #[path = "all/cluster_updates.rs"]
