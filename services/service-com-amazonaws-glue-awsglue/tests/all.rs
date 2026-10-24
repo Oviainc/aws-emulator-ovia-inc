@@ -29,6 +29,8 @@ mod etl_connections;
 mod etl_jobs_and_connections;
 #[path = "all/get_table_entity_not_found.rs"]
 mod get_table_entity_not_found;
+#[path = "all/job_runs.rs"]
+mod job_runs;
 #[path = "all/jobs.rs"]
 mod jobs;
 #[path = "all/state_roundtrip.rs"]
