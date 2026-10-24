@@ -138,6 +138,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // `GlobalNetworkIds` documents a maximum of 10 ids that the modelled
+        // `GlobalNetworkIdList` does not express as `@length`, so a longer filter is
+        // refused here — before anything is listed — rather than silently honoured.
+        let requested = input.global_network_ids.unwrap_or_default();
+        crate::state::check_filter_ids("GlobalNetworkIds", &requested)
+            .map_err(DescribeGlobalNetworksErrorModeled::ValidationException)?;
+
         // An opaque token this service did not mint cannot name a key offset, so it is a
         // client error rather than an empty page.
         let after = match input.next_token.as_deref() {
@@ -155,7 +162,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
-        let requested = input.global_network_ids.unwrap_or_default();
         let store = state.lock();
         let entries: Vec<(String, GlobalNetwork)> = store
             .global_networks

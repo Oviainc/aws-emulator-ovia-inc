@@ -17,6 +17,8 @@ mod core_network_lifecycle;
 mod delete_dependency_refusal;
 #[path = "all/device_lifecycle.rs"]
 mod device_lifecycle;
+#[path = "all/filter_id_list_maximum.rs"]
+mod filter_id_list_maximum;
 #[path = "all/global_network_lifecycle.rs"]
 mod global_network_lifecycle;
 #[path = "all/link_lifecycle.rs"]

@@ -904,6 +904,39 @@ pub fn field_rejection(member: &str, reason: &str, message: String) -> Validatio
     }
 }
 
+/// How many ids ONE id-list filter of a reporting operation may name.
+///
+/// Every id-list filter this service models documents the same bound: "The IDs of one or
+/// more global networks. The maximum is 10." on
+/// `DescribeGlobalNetworksRequest$GlobalNetworkIds`, and the same sentence on
+/// `GetSitesRequest$SiteIds` ("One or more site IDs. The maximum is 10."),
+/// `GetLinksRequest$LinkIds` and `GetDevicesRequest$DeviceIds` (`smithy_query query="doc"
+/// shape="<Request>" member="<Member>"`). The modelled list shapes do NOT express it as
+/// `@length` — `smithy_query shape=GlobalNetworkIdList,SiteIdList,LinkIdList,DeviceIdList`
+/// carries a length on the member STRING only (0..50) — so the pre-handler constraint walk
+/// cannot enforce it and [`check_filter_ids`] does, exactly as the device and link
+/// descriptor maxima ([`MAX_DEVICE_DESCRIPTOR_CHARS`]) are enforced in handler code.
+pub const MAX_FILTER_IDS: usize = 10;
+
+/// Check one id-list filter against [`MAX_FILTER_IDS`].
+///
+/// Answers `Ok(())` when the filter names at most that many ids (an absent filter is an
+/// empty one, which always passes), otherwise the modelled `ValidationException`
+/// (HTTP 400) naming `member` — the input member that carried the list — so a request past
+/// the documented maximum is refused before any listing is computed. Shared by every
+/// reporting operation that takes such a filter, so one rule reaches all of them.
+pub fn check_filter_ids(member: &str, ids: &[String]) -> Result<(), ValidationException> {
+    let given = ids.len();
+    if given > MAX_FILTER_IDS {
+        return Err(field_rejection(
+            member,
+            REASON_FIELD_VALIDATION_FAILED,
+            format!("{member} may name at most {MAX_FILTER_IDS} ids, but {given} were given"),
+        ));
+    }
+    Ok(())
+}
+
 /// The modelled `ValidationException` (HTTP 400) an operation answers when the string in
 /// its ARN member `member` is not an ARN of this service at all.
 ///
