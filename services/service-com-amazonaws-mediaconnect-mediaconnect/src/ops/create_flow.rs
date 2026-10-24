@@ -392,6 +392,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let region = crate::state::request_region(ctx.parts());
+
+        // "The Availability Zone that you want to create the flow in. These options are
+        // limited to the Availability Zones within the current Region"
+        // (`CreateFlowRequest$AvailabilityZone`): a zone the request names has to be a zone
+        // of the Region this request reached, resolved through the one function every create
+        // in this crate resolves the member with, so nothing is stored for a zone this
+        // Region has not got.
+        let availability_zone =
+            crate::state::resolved_availability_zone(input.availability_zone.as_deref(), &region)
+                .map_err(bad_request)?;
+
+        // The maintenance window this request would store has to be expressible as one:
+        // `AddMaintenance$MaintenanceStartHour` is free-form on the wire but carries a
+        // documented format ("Use 24-hour HH:MM format. Minutes must be 00"), checked
+        // through the same function UpdateFlow checks the update shape with, so a window
+        // the create stores is one the update path would also accept.
+        if let Some(rejection) = crate::state::maintenance_window_rejection(
+            input
+                .maintenance
+                .as_ref()
+                .map(|maintenance| maintenance.maintenance_start_hour.as_str()),
+            // `AddMaintenance` models no scheduled date — the service schedules the window
+            // itself — so the create path has none to check.
+            None,
+        ) {
+            return Err(bad_request(rejection));
+        }
+
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
@@ -527,14 +555,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .first()
                     .and_then(|source| source.description.as_deref()),
             ),
-            // "The Availability Zone that you want to create the flow in. These options
-            // are limited to the Availability Zones within the current Region": when the
-            // request names none, the service picks one in the request's Region.
-            availability_zone: input
-                .availability_zone
-                .clone()
-                .filter(|zone| !zone.is_empty())
-                .unwrap_or_else(|| crate::state::default_availability_zone(&region)),
+            // The zone resolved above: the one the request named, or the Region's own when
+            // it named none.
+            availability_zone,
             // A new flow is not running: it stands by until StartFlow. AWS returns it in
             // this steady status, so no transition is owed here.
             status: crate::state::STATUS_STANDBY.to_string(),

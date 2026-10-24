@@ -143,7 +143,7 @@ use crate::ops::types::{
     AnywhereSettings, CdiInputSpecification, Channel, ChannelSummary,
     DescribeAnywhereSettings, DescribeFollowerChannelSettings, DescribeInferenceSettings,
     DescribeLinkedChannelSettings, DescribeNetworkSummary, DescribePrimaryChannelSettings,
-    EncoderSettings,
+    EncoderSettings, EventBridgeRuleTemplateGroupSummary,
     InferenceSettings, Input, InputAttachment, InputDestination, InputDestinationRequest,
     InputDestinationRoute, InputDeviceSettings, InputSecurityGroup, InputSource,
     InputSourceRequest, InputSpecification, InputVpcRequest, InputWhitelistRule,
@@ -2155,6 +2155,62 @@ impl ComAmazonawsMedialiveMedialiveState {
             .get(identifier)
             .filter(|group| group.region == region)
             .or_else(|| self.event_bridge_rule_template_group_named(region, identifier))
+    }
+
+    /// The eventbridge rule template groups stored in `region`, in the order
+    /// their ids were minted, beginning at the group `start` names when a
+    /// `NextToken` carried a resume point.
+    ///
+    /// The same reading of a group store a listing of the TEMPLATES inside them
+    /// already uses ([`Self::event_bridge_rule_templates_in`]): a `BTreeMap`
+    /// range scan from the resume point, which is why a token naming a group
+    /// deleted since the previous page resumes at the next surviving id instead
+    /// of failing. Groups of other regions are invisible, for the reason
+    /// [`Self::event_bridge_rule_template_group`] states.
+    pub fn event_bridge_rule_template_groups_in<'a>(
+        &'a self,
+        region: &'a str,
+        start: Option<&'a str>,
+    ) -> impl Iterator<Item = &'a EventBridgeRuleTemplateGroupRecord> + 'a {
+        let first = match start {
+            Some(token) => ::std::ops::Bound::Included(token),
+            None => ::std::ops::Bound::Unbounded,
+        };
+        self.event_bridge_rule_template_groups
+            .range::<str, _>((first, ::std::ops::Bound::Unbounded))
+            .map(|(_, group)| group)
+            .filter(move |group| group.region == region)
+    }
+
+    /// Project a stored group onto the `EventBridgeRuleTemplateGroupSummary` a
+    /// listing reports.
+    ///
+    /// Every member the summary shares with the flat group shape
+    /// ([`event_bridge_rule_template_group_output`]) carries the stored value, so
+    /// a listing and the `GetEventBridgeRuleTemplateGroup` beside it cannot
+    /// disagree about one group. Where the two shapes differ, the summary adds
+    /// `TemplateCount` — "The number of templates in a group", which is derived
+    /// from the templates that exist right now
+    /// ([`Self::event_bridge_rule_template_ids_in_group`]) rather than from
+    /// anything recorded on the group, so it tracks every later template create
+    /// and delete.
+    pub fn event_bridge_rule_template_group_summary(
+        &self,
+        group: &EventBridgeRuleTemplateGroupRecord,
+    ) -> EventBridgeRuleTemplateGroupSummary {
+        EventBridgeRuleTemplateGroupSummary {
+            arn: group.arn.clone(),
+            created_at: ::aws_smithy_types::DateTime::from(group.created_at),
+            description: group.description.clone(),
+            id: group.id.clone(),
+            modified_at: Some(::aws_smithy_types::DateTime::from(group.modified_at)),
+            name: group.name.clone(),
+            tags: Some(group.tags.clone()),
+            template_count: i32::try_from(
+                self.event_bridge_rule_template_ids_in_group(&group.id).len(),
+            )
+            .unwrap_or(i32::MAX),
+        }
     }
 
     /// Apply the members an `UpdateEventBridgeRuleTemplateGroup` request
