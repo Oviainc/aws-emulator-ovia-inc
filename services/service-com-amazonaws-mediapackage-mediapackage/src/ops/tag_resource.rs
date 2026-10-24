@@ -4,6 +4,11 @@
 //! Adds the request's tags to the stored MediaPackage resource, so every later read of
 //! that resource reports them.
 //!
+//! A tag the caller may not set — a key or value outside AWS's tag character set, or a key
+//! carrying the reserved `aws:` prefix only AWS itself may use — is refused with
+//! `UnprocessableEntityException` (422) keyed by `tags`, leaving the resource's tag set
+//! exactly as it was.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -188,10 +193,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // What the resource would be LEFT holding is what the tag limits judge, and they
+        // What the resource would be LEFT holding is what the tag rules judge, and they
         // judge it BEFORE anything is written: a tag set grows by one entry per distinct
         // caller-chosen key and shrinks only on an explicit `UntagResource`, so the
         // ceiling is what keeps its size from being decided by how many requests arrive.
+        // The same call judges what each key and value is allowed to SAY — the character
+        // set and the reserved `aws:` prefix — so a refused request leaves the stored tag
+        // set untouched. Judging the MERGED map is judging the request's own tags: every
+        // key already stored passed this very check on the way in.
         let mut merged = tags.clone();
         merged.extend(
             input

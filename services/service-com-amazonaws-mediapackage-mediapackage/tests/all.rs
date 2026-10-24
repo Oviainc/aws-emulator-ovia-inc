@@ -33,6 +33,8 @@ mod mutually_exclusive_list_filters;
 mod origin_endpoint_defaults;
 #[path = "all/origin_endpoint_durations.rs"]
 mod origin_endpoint_durations;
+#[path = "all/reserved_and_malformed_tags.rs"]
+mod reserved_and_malformed_tags;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/rotate_channel_credentials.rs"]

@@ -32,12 +32,12 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::channel_lifecycle::{call, create_channel, emulator, error_code, ACCOUNT, REGION};
 
 /// `arn:aws:mediapackage:<region>:<account>:channels/<id>`, as this service mints it.
-fn channel_arn(id: &str) -> String {
+pub(crate) fn channel_arn(id: &str) -> String {
     format!("arn:aws:mediapackage:{REGION}:{ACCOUNT}:channels/{id}")
 }
 
 /// `arn:aws:mediapackage:<region>:<account>:origin_endpoints/<id>`.
-fn origin_endpoint_arn(id: &str) -> String {
+pub(crate) fn origin_endpoint_arn(id: &str) -> String {
     format!("arn:aws:mediapackage:{REGION}:{ACCOUNT}:origin_endpoints/{id}")
 }
 
@@ -45,7 +45,7 @@ fn origin_endpoint_arn(id: &str) -> String {
 /// (`smithy_query(query="operation",operation="ListTagsForResource")`), so an SDK
 /// percent-encodes the ARN's reserved characters into one path segment and its `:` and
 /// `/` never split the path.
-fn tags_path(arn: &str) -> String {
+pub(crate) fn tags_path(arn: &str) -> String {
     let label: String = arn
         .chars()
         .map(|character| match character {
@@ -78,57 +78,64 @@ pub(crate) fn urlencode(value: &str) -> String {
 /// The two resource types this service tags, each as the create path, the create body a
 /// fresh one needs, the ARN form and the read-back path — so every row of every table
 /// below is asserted on both.
-enum Kind {
+pub(crate) enum Kind {
     Channel,
     OriginEndpoint,
 }
 
 impl Kind {
-    fn label(&self) -> &'static str {
+    pub(crate) fn label(&self) -> &'static str {
         match self {
             Self::Channel => "channel",
             Self::OriginEndpoint => "origin endpoint",
         }
     }
 
-    fn arn(&self, id: &str) -> String {
+    pub(crate) fn arn(&self, id: &str) -> String {
         match self {
             Self::Channel => channel_arn(id),
             Self::OriginEndpoint => origin_endpoint_arn(id),
         }
     }
 
-    fn describe_path(&self, id: &str) -> String {
+    pub(crate) fn describe_path(&self, id: &str) -> String {
         match self {
             Self::Channel => format!("/channels/{id}"),
             Self::OriginEndpoint => format!("/origin_endpoints/{id}"),
         }
     }
+
+    /// The create this resource type needs to be stored carrying `tags`: the path and the
+    /// body. One builder, so a suite asserting a create SUCCEEDS and one asserting it is
+    /// REFUSED send the same request but for the tag map under test.
+    pub(crate) fn create_request(&self, id: &str, tags: &Value) -> (&'static str, Value) {
+        match self {
+            Self::Channel => ("/channels", json!({ "id": id, "tags": tags })),
+            Self::OriginEndpoint => (
+                "/origin_endpoints",
+                json!({
+                    "channelId": PARENT_CHANNEL,
+                    "id": id,
+                    "hlsPackage": { "segmentDurationSeconds": 6 },
+                    "tags": tags
+                }),
+            ),
+        }
+    }
 }
 
 /// The channel every origin endpoint below is packaged from.
-const PARENT_CHANNEL: &str = "tags-parent-channel";
+pub(crate) const PARENT_CHANNEL: &str = "tags-parent-channel";
 
 /// Create a resource of `kind` with id `id` carrying `tags`, and return the record the
 /// create stored.
-async fn create_with_tags(
+pub(crate) async fn create_with_tags(
     router: &MultiServiceRouter,
     kind: &Kind,
     id: &str,
     tags: &Value,
 ) -> Value {
-    let (path, body) = match kind {
-        Kind::Channel => ("/channels", json!({ "id": id, "tags": tags })),
-        Kind::OriginEndpoint => (
-            "/origin_endpoints",
-            json!({
-                "channelId": PARENT_CHANNEL,
-                "id": id,
-                "hlsPackage": { "segmentDurationSeconds": 6 },
-                "tags": tags
-            }),
-        ),
-    };
+    let (path, body) = kind.create_request(id, tags);
     let (status, created) = call(router, "POST", path, Some(&body)).await;
     assert_eq!(
         status,
@@ -141,7 +148,7 @@ async fn create_with_tags(
 
 /// `ListTagsForResource` on `arn`: the status and the `Tags` map it reports, with an
 /// absent or `null` member read as the empty map.
-async fn list_tags(router: &MultiServiceRouter, arn: &str) -> (u16, Value) {
+pub(crate) async fn list_tags(router: &MultiServiceRouter, arn: &str) -> (u16, Value) {
     let (status, body) = call(router, "GET", &tags_path(arn), None).await;
     let tags = match body.get("tags") {
         None | Some(Value::Null) => json!({}),
@@ -152,7 +159,7 @@ async fn list_tags(router: &MultiServiceRouter, arn: &str) -> (u16, Value) {
 
 /// The `tags` member of a `Describe*` response, with an absent or `null` member read as
 /// the empty map.
-fn described_tags(record: &Value) -> Value {
+pub(crate) fn described_tags(record: &Value) -> Value {
     match record.get("tags") {
         None | Some(Value::Null) => json!({}),
         Some(value) => value.clone(),
@@ -186,7 +193,12 @@ fn tag_set_cases() -> Vec<(&'static str, Value)> {
         (
             "keys and values across the AWS tag character set",
             json!({
-                "aws:not:reserved_here": "a/b=c+d-e@f",
+                // `aws` is reserved only as the PREFIX `aws:`: a key that merely begins
+                // with those three letters, or carries `aws:` somewhere after its first
+                // character, is a caller's own key. The refusal of the reserved prefix
+                // itself is covered by `tests/all/reserved_and_malformed_tags.rs`.
+                "awsome:platform": "a/b=c+d-e@f",
+                "team:aws:owner": "video",
                 "with space": "value with space",
                 "dotted.key": "1.2.3",
                 "UPPER_lower-123": ""

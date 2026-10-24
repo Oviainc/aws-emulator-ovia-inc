@@ -412,10 +412,14 @@ fn tagging_cases() -> Vec<(&'static str, Vec<Value>, Vec<&'static str>, Value)> 
             json!({}),
         ),
         (
+            // Letters outside ASCII are letters: AWS's tag character set is the Unicode
+            // letters and digits, spaces and `_ . : / = + - @`. A symbol outside it (a
+            // currency sign, say) is refused instead —
+            // `tests/all/reserved_and_malformed_tags.rs` covers that half.
             "a key and a value of their own alphabet",
-            vec![json!({ "cost:center": "video-€/eu", "Ägare": "staffan" })],
+            vec![json!({ "cost:center": "vidéo/eu", "Ägare": "staffan" })],
             vec![],
-            json!({ "cost:center": "video-€/eu", "Ägare": "staffan" }),
+            json!({ "cost:center": "vidéo/eu", "Ägare": "staffan" }),
         ),
     ]
 }

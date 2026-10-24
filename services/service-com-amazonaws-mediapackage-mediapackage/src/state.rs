@@ -112,6 +112,23 @@ pub const MAX_TAG_KEY_CHARS: usize = 128;
 /// AWS's tagging limit: a tag value is at most 256 characters.
 pub const MAX_TAG_VALUE_CHARS: usize = 256;
 
+/// The tag-key prefix AWS reserves for its OWN tags, which no caller may create, modify
+/// or delete.
+///
+/// AWS's universal tag restrictions state it for every tagged resource: "Do not use
+/// `aws:` ... as a prefix for keys, as it is reserved for AWS use. You cannot edit or
+/// delete tag keys with this prefix", and such a tag "does not count against your tags
+/// per resource limit". It is NOT a modelled constraint —
+/// `smithy_query(query="operation",operation="TagResource",model_path="services/service-com-amazonaws-mediapackage-mediapackage/smithy-model/com-amazonaws-mediapackage-mediapackage.json")`
+/// types `Tags` as a plain `map<string,string>` with no key constraint — so the SERVICE
+/// enforces it, not the framework's constraint walk.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// The punctuation a tag key or value may carry, besides letters, numbers and spaces, as
+/// AWS's tag restrictions spell the set. One constant, because it appears only inside the
+/// refusal that names it.
+const TAG_PUNCTUATION_CHARACTERS: &str = "_ . : / = + - @";
+
 /// Emulator resource guard, NOT an AWS quota: the most `Whitelist` CIDR entries stored
 /// for one origin endpoint.
 pub const MAX_WHITELIST_ENTRIES: usize = 100;
@@ -440,10 +457,77 @@ pub fn bound_part_chars(
     Ok(())
 }
 
-/// Refuse a tag set that breaks AWS's tagging limits, by entry count and by the length of
-/// each key and value.
+/// Whether `c` is a character a tag key or a tag value may carry.
 ///
-/// This is the one place those limits are decided, so a create's request-shaped tag map
+/// AWS's tag restrictions publish the set for every tagged resource: a key or a value
+/// holds letters, numbers, spaces, and the characters
+/// [`TAG_PUNCTUATION_CHARACTERS`] names. The letters-and-numbers half is UNICODE-wide
+/// (the restrictions say "Unicode letters, digits"), which is what
+/// [`char::is_alphanumeric`] answers — so an accented or non-Latin key is accepted and a
+/// symbol outside the set is not.
+fn is_tag_character(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, ' ' | '_' | '.' | ':' | '/' | '=' | '+' | '-' | '@')
+}
+
+/// The first character of `text` outside [`is_tag_character`]'s set, as the refusal that
+/// names it — `None` when every character is one a tag may carry.
+fn offending_tag_character(text: &str) -> Option<char> {
+    text.chars().find(|c| !is_tag_character(*c))
+}
+
+/// Refuse a tag key a caller may not name — whatever it would do with it.
+///
+/// Two rules, both AWS's universal tag restrictions rather than a modelled constraint:
+/// the key is built from [`is_tag_character`]'s set, and it does not carry the reserved
+/// [`RESERVED_TAG_KEY_PREFIX`]. Because the reserved prefix is refused on NAMING the key
+/// and not on writing it, `UntagResource` answers the same refusal as a tag map does: a
+/// caller may neither create, nor modify, nor delete such a tag.
+///
+/// `member` is the member the wire named, so one request is refused by the member it
+/// actually carried: `tags` for a tag map, `tagKeys` for `UntagResource`'s key list.
+pub fn validate_tag_key(member: &str, key: &str) -> Result<(), ServiceError> {
+    if let Some(character) = offending_tag_character(key) {
+        return Err(member_invalid(
+            member,
+            format!(
+                "key {key:?} carries {character:?}, which is not one of the letters, numbers, \
+                 spaces and `{TAG_PUNCTUATION_CHARACTERS}` a tag key may use"
+            ),
+        ));
+    }
+    if key.starts_with(RESERVED_TAG_KEY_PREFIX) {
+        return Err(member_invalid(
+            member,
+            format!(
+                "key {key:?} uses the reserved `{RESERVED_TAG_KEY_PREFIX}` prefix, which only \
+                 Amazon Web Services may set"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a tag VALUE outside [`is_tag_character`]'s set; see [`validate_tag_key`], whose
+/// character rule this is the other half of. Keyed by the key it belongs to, because a
+/// map's value has no member path of its own.
+fn validate_tag_value(member: &str, key: &str, value: &str) -> Result<(), ServiceError> {
+    if let Some(character) = offending_tag_character(value) {
+        return Err(member_invalid(
+            member,
+            format!(
+                "the value of {key:?} carries {character:?}, which is not one of the letters, \
+                 numbers, spaces and `{TAG_PUNCTUATION_CHARACTERS}` a tag value may use"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a tag set that breaks AWS's tagging rules: by entry count, by the length of each
+/// key and value, and by what each key and value is ALLOWED TO SAY — the character set,
+/// and the reserved `aws:` key prefix only AWS itself may use.
+///
+/// This is the one place those rules are decided, so a create's request-shaped tag map
 /// and a `TagResource`'s merged result cannot be judged differently. Entries are sorted
 /// first, so the part named in the refusal does not depend on map ordering.
 pub fn bound_tag_entries<'a, I>(tags: I) -> Result<(), ServiceError>
@@ -461,11 +545,13 @@ where
             value,
             MAX_TAG_VALUE_CHARS,
         )?;
+        validate_tag_key("tags", key)?;
+        validate_tag_value("tags", key, value)?;
     }
     Ok(())
 }
 
-/// Refuse a tag map on an input that breaks AWS's tagging limits; see
+/// Refuse a tag map on an input that breaks AWS's tagging rules; see
 /// [`bound_tag_entries`].
 pub fn bound_tags(
     tags: &Option<std::collections::HashMap<String, String>>,

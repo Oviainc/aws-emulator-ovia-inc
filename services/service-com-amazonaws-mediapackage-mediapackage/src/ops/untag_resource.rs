@@ -4,6 +4,11 @@
 //! Removes the named tag keys from the stored MediaPackage resource, so every later read
 //! of that resource no longer reports them.
 //!
+//! A key a caller may not name at all — one outside AWS's tag character set, or one
+//! carrying the reserved `aws:` prefix, which only AWS itself may set and which no caller
+//! may edit or delete — is refused with `UnprocessableEntityException` (422) keyed by
+//! `tagKeys`, and nothing is removed.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -173,6 +178,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // Judged BEFORE anything is removed, so a refused call leaves the resource's tag
+        // set exactly as it found it. A key outside the documented character set could
+        // never have been stored, and a key carrying the reserved `aws:` prefix names a
+        // tag AWS owns — which a caller may no more DELETE than create ("You cannot edit
+        // or delete tag keys with this prefix"), so this operation refuses it rather than
+        // reporting a removal it is not allowed to perform. Idempotence is about a
+        // WELL-FORMED key the resource happens not to carry, which is removed below
+        // without error.
+        for key in &input.tag_keys {
+            crate::state::validate_tag_key("tagKeys", key)?;
+        }
 
         let mut state = state.lock();
         let Some(tags) = state.tags_mut(&target) else {
