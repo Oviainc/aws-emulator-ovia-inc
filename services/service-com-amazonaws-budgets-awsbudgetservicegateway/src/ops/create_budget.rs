@@ -5,7 +5,9 @@
 //! Persists a new budget under `(AccountId, Budget.BudgetName)` together with the
 //! notifications, subscribers and tags supplied with it, stamping
 //! `Budget.LastUpdatedTime` with the time of the call. The name is unique within an
-//! account, so a second create for the same pair is a `DuplicateRecordException`.
+//! account, so a second create for the same pair is a `DuplicateRecordException`, and a
+//! set of notifications or subscribers above the limits a budget can hold is a
+//! `CreationLimitExceededException`.
 //!
 //! ## Shape of an operation
 //!
@@ -195,6 +197,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             CreateBudgetErrorModeled::InvalidParameterException(InvalidParameterException {
                 message: Some(message),
             })
+        })?;
+
+        // "A budget can have up to five notifications, and each notification can have
+        // one SNS subscriber and up to 10 email subscribers" — the capacity limits of
+        // the notifications this call attaches, which the modelled list bounds
+        // (`@length(0, 10)` on the list, `@length(1, 11)` on `Subscribers`) are too wide
+        // to express. A budget this call cannot hold is not created at all, so the whole
+        // request is refused before anything is stored.
+        crate::state::notification_set_limit_violation(
+            // A create starts the budget empty, so the set it attaches is everything
+            // the budget will hold.
+            0,
+            input.notifications_with_subscribers.as_deref().unwrap_or(&[]),
+        )
+        .map_err(|message| {
+            CreateBudgetErrorModeled::CreationLimitExceededException(
+                CreationLimitExceededException {
+                    message: Some(message),
+                },
+            )
         })?;
 
         let key = (input.account_id.clone(), input.budget.budget_name.clone());

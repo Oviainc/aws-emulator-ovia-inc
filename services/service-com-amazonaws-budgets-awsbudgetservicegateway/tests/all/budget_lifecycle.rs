@@ -707,22 +707,20 @@ async fn pagination_partitions_the_account_in_budget_name_order() {
 async fn notifications_paginate_by_max_results() {
     let router = router();
     let account_id = account(444_444_444);
-    // `NotificationWithSubscribersList` is @length(max: 10), so ten is the largest set
-    // a single CreateBudget can establish.
-    let notifications: Vec<Value> = (0..10)
-        .map(|i| {
-            json!({
-                "Notification": {
-                    "NotificationType": if i % 2 == 0 { "ACTUAL" } else { "FORECASTED" },
-                    "ComparisonOperator": "GREATER_THAN",
-                    "Threshold": f64::from(i) + 0.5,
-                    "ThresholdType": "PERCENTAGE"
-                },
-                "Subscribers": [
-                    {"SubscriptionType": "EMAIL", "Address": format!("n{i}@example.com")}
-                ]
-            })
+    let notification = |i: u32| {
+        json!({
+            "NotificationType": if i.is_multiple_of(2) { "ACTUAL" } else { "FORECASTED" },
+            "ComparisonOperator": "GREATER_THAN",
+            "Threshold": f64::from(i) + 0.5,
+            "ThresholdType": "PERCENTAGE"
         })
+    };
+    let subscribers =
+        |i: u32| json!([{"SubscriptionType": "EMAIL", "Address": format!("n{i}@example.com")}]);
+    // A budget holds up to ten notifications, but a single CreateBudget attaches at most
+    // five of them, so the rest are added one at a time through CreateNotification.
+    let attached: Vec<Value> = (0..5)
+        .map(|i| json!({"Notification": notification(i), "Subscribers": subscribers(i)}))
         .collect();
     let (status, body) = call(
         &router,
@@ -735,14 +733,32 @@ async fn notifications_paginate_by_max_results() {
                 "BudgetType": "COST",
                 "BudgetLimit": {"Amount": "1", "Unit": "USD"}
             },
-            "NotificationsWithSubscribers": notifications
+            "NotificationsWithSubscribers": attached
         }),
     )
     .await;
     assert_eq!(
         status, 200,
-        "expected CreateBudget with ten notifications to answer 200, got {status} {body}"
+        "expected CreateBudget with five notifications to answer 200, got {status} {body}"
     );
+    for i in 5..10 {
+        let (status, body) = call(
+            &router,
+            "CreateNotification",
+            &json!({
+                "AccountId": &account_id,
+                "BudgetName": "with-notifications",
+                "Notification": notification(i),
+                "Subscribers": subscribers(i)
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case notification {i}: expected CreateNotification to answer 200, \
+             got {status} {body}"
+        );
+    }
 
     let expected: Vec<f64> = (0..10).map(|i| f64::from(i) + 0.5).collect();
     for max_results in [None, Some(1), Some(3), Some(10), Some(100)] {

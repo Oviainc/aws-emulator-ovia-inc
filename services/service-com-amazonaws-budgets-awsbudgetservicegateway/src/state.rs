@@ -20,7 +20,7 @@
 
 use crate::ops::types::{
     Action, ActionHistory, ActionHistoryDetails, Budget, CostTypes, Definition, HealthStatus,
-    Notification, ResourceTag, Spend, Subscriber, TimePeriod,
+    Notification, NotificationWithSubscribers, ResourceTag, Spend, Subscriber, TimePeriod,
 };
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
@@ -802,6 +802,46 @@ pub fn subscriber_limit_violation(subscribers: &[Subscriber]) -> Result<(), Stri
                  {kind} subscriber(s)."
             ));
         }
+    }
+    Ok(())
+}
+
+/// "A budget can have up to five notifications, and each notification can have one SNS
+/// subscriber and up to 10 email subscribers"
+/// (`CreateBudgetRequest$NotificationsWithSubscribers`) — the limit on the notifications
+/// a SINGLE create attaches to the budget it creates, which is tighter than the
+/// [`MAX_NOTIFICATIONS_PER_BUDGET`] a budget reaches by growing one notification at a
+/// time. The modelled `@length(max: 10)` on `NotificationWithSubscribersList` is the
+/// wire bound only, so a list between these two sizes deserialises and is refused here.
+pub const MAX_NOTIFICATIONS_PER_CREATE: usize = 5;
+
+/// The notification and subscriber limits over the set of notifications ONE call would
+/// attach to a budget that already holds `already_held` of them.
+///
+/// `Err` carries the sentence that goes in `CreationLimitExceededException$Message`; `Ok`
+/// means the call stays within [`MAX_NOTIFICATIONS_PER_CREATE`], within
+/// [`MAX_NOTIFICATIONS_PER_BUDGET`] once the set is attached, and within both per-type
+/// halves of [`subscriber_limit_violation`] for every notification in it.
+pub fn notification_set_limit_violation(
+    already_held: usize,
+    attaching: &[NotificationWithSubscribers],
+) -> Result<(), String> {
+    if attaching.len() > MAX_NOTIFICATIONS_PER_CREATE {
+        return Err(format!(
+            "Unable to create budget: a budget can have at most {MAX_NOTIFICATIONS_PER_CREATE} \
+             notifications, and {} were supplied.",
+            attaching.len()
+        ));
+    }
+    if already_held + attaching.len() > MAX_NOTIFICATIONS_PER_BUDGET {
+        return Err(format!(
+            "Unable to create budget: a budget can have at most {MAX_NOTIFICATIONS_PER_BUDGET} \
+             notifications, and it would hold {}.",
+            already_held + attaching.len()
+        ));
+    }
+    for supplied in attaching {
+        subscriber_limit_violation(&supplied.subscribers)?;
     }
     Ok(())
 }

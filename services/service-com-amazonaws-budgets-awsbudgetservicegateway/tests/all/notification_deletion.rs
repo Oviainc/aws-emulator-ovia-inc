@@ -30,7 +30,9 @@ use service_com_amazonaws_budgets_awsbudgetservicegateway::ops::types::{
     COMPARISON_OPERATOR_VALUES, NOTIFICATION_STATE_VALUES, NOTIFICATION_TYPE_VALUES,
     THRESHOLD_TYPE_VALUES,
 };
-use service_com_amazonaws_budgets_awsbudgetservicegateway::state::ComAmazonawsBudgetsAwsbudgetservicegatewayState;
+use service_com_amazonaws_budgets_awsbudgetservicegateway::state::{
+    ComAmazonawsBudgetsAwsbudgetservicegatewayState, MAX_NOTIFICATIONS_PER_CREATE,
+};
 
 use super::budget_lifecycle::{account, call, is_error, router, router_with_engine, same};
 
@@ -44,8 +46,8 @@ use super::budget_lifecycle::{account, call, is_error, router, router_with_engin
 /// service-owned alarm state varies across the rows too, so a table that matches on
 /// identity cannot be matching on the alarm state by accident.
 ///
-/// Six rows, which `NotificationWithSubscribersList`'s `@length(max: 10)` lets a single
-/// `CreateBudget` establish.
+/// Six rows, more than a single `CreateBudget` attaches, so
+/// [`create_with_notifications`] seeds the rest through `CreateNotification`.
 fn notification_catalog() -> Vec<Value> {
     let thresholds = [0.0_f64, 42.5, 15_000_000_000_000.0];
     let threshold_types: Vec<Option<&str>> = THRESHOLD_TYPE_VALUES
@@ -115,14 +117,18 @@ fn addresses(position: usize) -> Vec<String> {
         .collect()
 }
 
-/// Create `budget_name` holding `catalog`, each notification with [`subscribers`].
+/// Create `budget_name` holding `catalog`, each notification with [`subscribers`], in
+/// catalog order. `CreateBudget` attaches at most
+/// [`MAX_NOTIFICATIONS_PER_CREATE`] notifications, so any beyond that are appended one
+/// at a time through `CreateNotification`.
 async fn create_with_notifications(
     router: &MultiServiceRouter,
     account_id: &str,
     budget_name: &str,
     catalog: &[Value],
 ) {
-    let with_subscribers: Vec<Value> = catalog
+    let attached = catalog.len().min(MAX_NOTIFICATIONS_PER_CREATE);
+    let with_subscribers: Vec<Value> = catalog[..attached]
         .iter()
         .enumerate()
         .map(|(position, notification)| {
@@ -148,6 +154,24 @@ async fn create_with_notifications(
         status, 200,
         "setup {budget_name:?}: expected CreateBudget to answer 200, got {status} {body}"
     );
+    for (position, notification) in catalog.iter().enumerate().skip(attached) {
+        let (status, body) = call(
+            router,
+            "CreateNotification",
+            &json!({
+                "AccountId": account_id,
+                "BudgetName": budget_name,
+                "Notification": notification,
+                "Subscribers": subscribers(position)
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "setup {budget_name:?} notification {position}: expected CreateNotification to \
+             answer 200, got {status} {body}"
+        );
+    }
 }
 
 /// The notifications `DescribeNotificationsForBudget` reports for a budget, in order.
