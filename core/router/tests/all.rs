@@ -193,3 +193,5 @@ mod cloudformation_provisions_waf_regional_ip_sets;
 mod mediapackagev2_published_data_plane_urls;
 #[path = "all/pi_resource_features.rs"]
 mod pi_resource_features;
+#[path = "all/cloudformation_provisions_cloudwatch_metric_streams.rs"]
+mod cloudformation_provisions_cloudwatch_metric_streams;

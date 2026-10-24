@@ -241,14 +241,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             description: secret.description.clone(),
             kms_key_id: secret.kms_key_id.clone(),
             rotation_enabled: Some(secret.rotation_enabled),
-            // Rotation is not emulated (`RotateSecret` carries its own stub
-            // issue), so nothing has ever configured or run it for this secret.
-            rotation_lambda_arn: None,
-            rotation_rules: None,
-            external_secret_rotation_metadata: None,
-            external_secret_rotation_role_arn: None,
-            last_rotated_date: None,
-            next_rotation_date: None,
+            // The rotation configuration `RotateSecret` persisted, and the
+            // schedule's next due instant computed from it. `LastRotatedDate` is
+            // "the last date and time that this secret was modified in any way"
+            // by a COMPLETED rotation, so it stays absent until one completes.
+            rotation_lambda_arn: secret.rotation_lambda_arn.clone(),
+            rotation_rules: secret.rotation_rules_out(),
+            external_secret_rotation_metadata: secret.external_rotation_metadata_out(),
+            external_secret_rotation_role_arn: secret.external_rotation_role_arn.clone(),
+            last_rotated_date: secret.last_rotated_date.map(crate::state::timestamp),
+            next_rotation_date: secret.next_rotation_date.map(crate::state::timestamp),
             last_changed_date: Some(crate::state::timestamp(secret.last_changed_date)),
             last_accessed_date: secret.last_accessed_date.map(crate::state::timestamp),
             // "The date the secret is scheduled for deletion. If it is not

@@ -356,6 +356,15 @@ async fn an_additional_statistic_is_accepted_only_where_the_output_format_carrie
                     (400, "InvalidParameterValueException"),
                     "case {case:?}: expected a 400 InvalidParameterValueException, got {status} {body}"
                 );
+                // CloudWatch words this refusal as one fixed sentence carrying the
+                // statistic the request asked for, whichever format and statistic the row
+                // names.
+                assert_eq!(
+                    text(&body, "message").as_deref(),
+                    Some(format!("Unsupported statistic {statistic} for selected OutputFormat").as_str()),
+                    "case {case:?}: expected the refusal to name the statistic in \
+                     CloudWatch's sentence, got {body}"
+                );
                 // A refused request persists nothing.
                 let (get_status, get_body) = call(
                     &router,
@@ -571,4 +580,64 @@ async fn get_metric_stream_reports_a_stream_that_was_never_configured_as_missing
             "case {name:?}: expected HTTP 404 ResourceNotFoundException, got {status} {body}"
         );
     }
+}
+
+#[tokio::test]
+async fn delete_metric_stream_removes_exactly_the_stream_it_names() {
+    // "Permanently deletes the metric stream that you specify." The rows differ along what
+    // the delete is asked for: a stream that exists (in each output format a stream can
+    // carry, since the delete is by name whatever the stream was configured with), one that
+    // never existed, and the same name a second time — the operation models no not-found
+    // error, so asking for a state the service is already in succeeds.
+    let router = build_router();
+    let configured = ["json", "opentelemetry0.7", "opentelemetry1.0"];
+    for (index, format) in configured.iter().enumerate() {
+        ok(
+            &router,
+            "PutMetricStream",
+            &put_request(&format!("deletable-{index}"), format),
+        )
+        .await;
+    }
+
+    let cases: Vec<(&str, String)> = vec![
+        ("a stream configured for json", "deletable-0".to_string()),
+        (
+            "a stream configured for opentelemetry0.7",
+            "deletable-1".to_string(),
+        ),
+        (
+            "the same stream a second time",
+            "deletable-0".to_string(),
+        ),
+        ("a stream that never existed", "no-such-stream".to_string()),
+    ];
+
+    for (case, name) in cases {
+        let (status, body) = call(&router, "DeleteMetricStream", &json!({"Name": &name})).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from DeleteMetricStream, got {status} {body}"
+        );
+        let (get_status, get_body) = call(&router, "GetMetricStream", &json!({"Name": &name})).await;
+        assert_eq!(
+            (get_status, error_code(&get_body).as_str()),
+            (404, "ResourceNotFoundException"),
+            "case {case:?}: the deleted stream must be gone, got {get_status} {get_body}"
+        );
+    }
+
+    // Only the streams the deletes named are gone: the third one is untouched.
+    let survivor = ok(
+        &router,
+        "GetMetricStream",
+        &json!({"Name": "deletable-2"}),
+    )
+    .await;
+    assert_eq!(
+        text(&survivor, "OutputFormat").as_deref(),
+        Some("opentelemetry1.0"),
+        "case \"an unnamed stream survives\": expected the untouched stream to be reported as \
+         configured, got {survivor}"
+    );
 }
