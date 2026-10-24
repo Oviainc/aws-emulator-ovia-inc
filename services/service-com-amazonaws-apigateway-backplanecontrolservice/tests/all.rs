@@ -102,3 +102,5 @@ mod validation_message_rules;
 // next touched for another reason.
 #[path = "all/update_deployment.rs"]
 mod update_deployment;
+#[path = "all/delete_documentation_part.rs"]
+mod delete_documentation_part;
