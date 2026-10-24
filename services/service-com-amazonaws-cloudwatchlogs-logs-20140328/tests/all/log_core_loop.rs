@@ -12,7 +12,7 @@
 
 use serde_json::{json, Value};
 
-use crate::harness::{base_ms, group_with_stream, Logs, REGION};
+use crate::harness::{base_ms, batch, group_with_stream, Logs, REGION};
 
 /// A log group class the model declares. Source: the `LogGroupClass` enum, surfaced in
 /// the crate as `LOG_GROUP_CLASS_VALUES` ("DELIVERY", "INFREQUENT_ACCESS", "STANDARD").
@@ -35,16 +35,6 @@ fn messages(page: &Value) -> Vec<String> {
                 .to_string()
         })
         .collect()
-}
-
-/// A `logEvents` batch for `PutLogEvents`.
-fn batch(events: &[(i64, &str)]) -> Value {
-    Value::Array(
-        events
-            .iter()
-            .map(|(timestamp, message)| json!({"timestamp": timestamp, "message": message}))
-            .collect(),
-    )
 }
 
 /// A create is readable back through `DescribeLogGroups`, with the ARNs, the class and

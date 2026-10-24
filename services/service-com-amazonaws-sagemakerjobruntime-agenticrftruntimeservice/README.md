@@ -106,16 +106,19 @@ Do not add a second engine crate — the router and every service must share
 one `InMemoryEngine` type or the engine the router injects cannot be handed to this
 service's operations.
 
-## Known limitation: the job registry
+## Job resolution
 
-This service is a DATA plane: it serves rollouts of an AgenticRFT job that already
-exists, and models no operation that creates one, so `Sample` /
-`SampleWithResponseStream` refuse a `JobArn` the store does not hold with
-`400 ValidationException` ("Could not find job with jobArn …"), as the real service
-does. The store therefore seeds a fixture pair of job ARNs
-(`state::seed_job_arns`) standing in for the control-plane creation, and a test (or
-another in-process caller) adds its own with `state::register_job`.
+This service is a DATA plane: it serves the rollouts of an AgenticRFT job that is
+already running, and its model binds no operation that creates, lists or deletes
+one. The `JobArn` every operation carries is therefore the ARN the caller's own job
+execution was handed, and the runtime keeps no registry of jobs to resolve it
+against: every value the member's modelled constraints admit (`@length` 1..256 and
+the ARN `@pattern`, which allow any partition, region, account and job name) names
+the job the call is served for, and a trajectory is keyed by the
+`(JobArn, TrajectoryId)` pair. A value that misses those constraints is still
+refused `400 ValidationException` by the front door (`Input arn … is malformed`).
 
-A job created through the emulated SageMaker control plane is NOT visible here yet:
-the control plane holds no AgentRFT job store to read. When it grows one, that store
-replaces the seed and `register_job` becomes the wiring point.
+What a sampling call IS refused on is state this service owns: a trajectory
+`CompleteRollout` has already sealed, and the emulator's own store bounds
+(`state::MAX_TURNS_PER_TRAJECTORY`, `MAX_TRAJECTORIES`, `MAX_TURN_BODY_BYTES`,
+`MAX_RETAINED_BODY_BYTES`).

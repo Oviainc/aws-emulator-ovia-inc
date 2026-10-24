@@ -89,16 +89,6 @@ fn mounted_service() -> (Arc<engine::InMemoryEngine>, MultiServiceRouter) {
     (engine, router)
 }
 
-/// Record `job_arn` as a job this runtime serves rollouts for.
-///
-/// A sampling call is refused for a `JobArn` the store does not hold, and this service
-/// models no operation that creates a job (the store seeds a fixture pair for that
-/// reason — see `state::seed_job_arns`), so a test that samples a job of its own
-/// registers it first, the way the control plane's job creation would.
-fn register_job(engine: &engine::InMemoryEngine, job_arn: &str) {
-    engine.state::<ServiceState>().lock().register_job(job_arn);
-}
-
 async fn send(
     router: &MultiServiceRouter,
     path: &str,
@@ -315,7 +305,6 @@ async fn every_sampling_call_captures_a_turn_and_serves_what_it_recorded() {
         } = case;
 
         let mut served: Vec<Reply> = Vec::new();
-        register_job(&engine, &job_arn);
         for (index, (payload, streamed)) in turns.iter().enumerate() {
             let reply = sample(&router, &job_arn, &trajectory_id, payload, *streamed).await;
             assert_eq!(
@@ -484,10 +473,6 @@ async fn the_trajectory_key_is_the_job_and_trajectory_pair() {
     let third = job_arn("aws", "eu-west-1", "123456789012", "rft-job", "run-a");
     let rows = [(&first, 2usize), (&second, 1), (&third, 3)];
 
-    for (arn, _) in rows {
-        register_job(&engine, arn);
-    }
-
     for (arn, turns) in rows {
         for _ in 0..turns {
             let reply = sample(&router, arn, "shared-id", &chat_payload("hello"), false).await;
@@ -558,7 +543,6 @@ async fn complete_rollout_seals_the_trajectory_and_refuses_a_different_status() 
     for (case, requested, expected, other) in rows {
         let (engine, router) = mounted_service();
         let arn = job_arn("aws", "us-east-1", "123456789012", "rft-job", "run-1");
-        register_job(&engine, &arn);
         assert_eq!(
             sample(&router, &arn, "traj-1", &chat_payload("go"), false)
                 .await
@@ -694,7 +678,6 @@ async fn update_reward_records_scores_only_on_a_ready_trajectory() {
     for (case, rewards, other) in rows {
         let (engine, router) = mounted_service();
         let arn = job_arn("aws", "us-west-2", "123456789012", "rft-job", "run-1");
-        register_job(&engine, &arn);
 
         // Not eligible before CompleteRollout.
         assert_eq!(
@@ -851,8 +834,7 @@ async fn an_unknown_trajectory_is_not_found() {
     ];
 
     for (case, arn, trajectory_id) in rows {
-        let (engine, router) = mounted_service();
-        register_job(&engine, &known);
+        let (_engine, router) = mounted_service();
         assert_eq!(
             sample(&router, &known, "traj-1", &chat_payload("go"), false)
                 .await
@@ -953,7 +935,6 @@ async fn a_malformed_request_is_refused_as_invalid() {
     for (case, arn, trajectory_id, payload) in sampling_rows {
         for streamed in [false, true] {
             let (engine, router) = mounted_service();
-            register_job(&engine, &valid);
             let reply = sample(&router, &arn, &trajectory_id, &payload, streamed).await;
             assert_eq!(
                 reply.status,
@@ -981,8 +962,7 @@ async fn a_malformed_request_is_refused_as_invalid() {
     // The ARN rows above are refused on the pattern; this one satisfies it at the
     // job-run segment's 63-character maximum and is accepted, which is what makes
     // the refusals above about the pattern and not about length.
-    let (engine, router) = mounted_service();
-    register_job(&engine, &long_arn);
+    let (_engine, router) = mounted_service();
     let accepted = sample(&router, &long_arn, "traj-1", &chat_payload("go"), false).await;
     assert_eq!(
         accepted.status,
@@ -994,7 +974,6 @@ async fn a_malformed_request_is_refused_as_invalid() {
 
     // A `Status` outside the modelled enum, on a trajectory that does exist.
     let (engine, router) = mounted_service();
-    register_job(&engine, &valid);
     assert_eq!(
         sample(&router, &valid, "traj-1", &chat_payload("go"), false)
             .await
@@ -1034,7 +1013,6 @@ async fn the_turn_bound_is_reported_as_a_service_quota() {
     let arn = job_arn("aws", "us-east-1", "123456789012", "rft-job", "run-1");
     for streamed in [false, true] {
         let (engine, router) = mounted_service();
-        register_job(&engine, &arn);
 
         // Seed a trajectory that already holds the bound, so the test does not
         // have to drive a thousand requests to reach it.

@@ -648,6 +648,54 @@ pub fn tag_capacity_rejection(resulting_tags: usize) -> Option<String> {
         .then(|| format!("The resultant tag set must not have more than {MAX_TAGS} user tags."))
 }
 
+/// The tag-key prefix Amazon Web Services reserves for the tags IT applies.
+///
+/// A key carrying it names a system tag, which a caller may neither create, change nor
+/// remove — the AWS-wide tagging rule every taggable service's tagging surface enforces.
+/// No modelled constraint expresses it: the `TagKey` pattern
+/// (`smithy_query(query="shape",shape="Tags")`:
+/// `^([\p{L}\p{Z}\p{N}_.:/=+\-@]+)$`, length 1..128) admits `:` and every letter, so the
+/// boundary walk passes such a key through and the rule has to live here.
+///
+/// Tag keys are case sensitive, and what is reserved is this literal lowercase prefix —
+/// the same reading the sibling crates that already enforce it take
+/// (`services/service-com-amazonaws-xray-awsxray/src/state.rs`'s
+/// `RESERVED_TAG_KEY_PREFIX`, `services/service-com-amazonaws-acmpca-acmprivateca`'s
+/// `reserved_tag_rejection`). A key that merely CONTAINS it, or starts with `aws`
+/// without the colon, is an ordinary caller-owned key.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Why the tag keys a request names may not be written or removed, or `None` when every
+/// one of them is a key the caller owns.
+///
+/// The rule is about who OWNS the key, not about which direction the write goes, so it
+/// applies to every key a request would create, change or delete: the `tags` map of a
+/// create and of `TagResource`, and the `tagKeys` list of `UntagResource`. It is checked
+/// over the whole request before anything is written, so a request naming one reserved
+/// key stores and removes nothing at all — not even its other keys.
+///
+/// This rule is about the REQUEST alone, so it is applied before the store is consulted;
+/// [`tag_capacity_rejection`] bounds the set the resource ENDS UP with and so can only
+/// be applied once the resource has been resolved.
+///
+/// Answered through the same channel as [`tag_capacity_rejection`] and worded the same
+/// way: a tag write is served by the tagging frontend, whose refusal of a bad tag
+/// request is HTTP 400 with the error code `BadRequestException`
+/// ([`crate::scaffolded::Scaffolded::bad_request`]), and the sentence states the rule
+/// while carrying nothing the request sent.
+pub fn reserved_tag_key_rejection<'a>(
+    keys: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
+    keys.into_iter()
+        .any(|key| key.starts_with(RESERVED_TAG_KEY_PREFIX))
+        .then(|| {
+            format!(
+                "Tag keys starting with {RESERVED_TAG_KEY_PREFIX} are reserved for Amazon Web \
+                 Services use and cannot be created, changed or removed."
+            )
+        })
+}
+
 /// What the TAGGING operations answer when `resourceArn` names no resource.
 ///
 /// The same split as [`tag_capacity_rejection`], one status up: a tagging call is

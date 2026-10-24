@@ -183,6 +183,18 @@ pub fn base_ms() -> i64 {
     now_ms() - 60 * 60 * 1_000
 }
 
+/// A `logEvents` batch for `PutLogEvents`, built from `(timestamp, message)` pairs in the
+/// chronological order a batch must be written in. Shared here because every suite that
+/// writes events needs it.
+pub fn batch(events: &[(i64, &str)]) -> Value {
+    Value::Array(
+        events
+            .iter()
+            .map(|(timestamp, message)| serde_json::json!({"timestamp": timestamp, "message": message}))
+            .collect(),
+    )
+}
+
 /// A log group plus one stream, both created, with a retention in days when one is
 /// given. The whole of this target's core loop starts from this pair, so it lives here
 /// rather than once per suite.

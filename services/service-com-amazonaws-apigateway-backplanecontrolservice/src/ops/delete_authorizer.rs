@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAuthorizer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAuthorizer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAuthorizer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the `Authorizer` stored under `authorizerId` on the API named by
+//! `restApiId`, so a later `GetAuthorizer` for that id no longer finds one.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +161,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAuthorizer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAuthorizerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let mut store = state.lock();
+
+        // Every identifier the request carries is resolved against stored state before
+        // anything is removed, each naming its own record so the refusal says which one
+        // was not found. An authorizer belongs to ONE API, so an id is resolved inside
+        // the API that holds it and never account-wide.
+        let api = store.rest_apis.get_mut(&input.rest_api_id).ok_or_else(|| {
+            DeleteAuthorizerErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
+            })
+        })?;
+        // Removing the record under the id `CreateAuthorizer` minted is what makes a
+        // later read answer `NotFoundException` — including a second delete of the same
+        // id, which names no authorizer once the first one has taken it away.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAuthorizer"))
+        // A `Method` naming this authorizer in its `authorizerId` is left as the caller
+        // wrote it: nothing documents this call as rewriting the methods of the API, and
+        // a method whose `authorizerId` names no authorizer is already a case the invoke
+        // path answers (see `crate::service::invoke`), so the records stay as they are.
+        // The modelled `ConflictException` is left unreachable for the same reason: no
+        // documented rule for this operation makes a referenced authorizer a conflict,
+        // and `PutMethod` does not require the `authorizerId` it stores to resolve.
+        if api.authorizers.remove(&input.authorizer_id).is_none() {
+            return Err(DeleteAuthorizerErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::NO_SUCH_AUTHORIZER.to_string()),
+            })
+            .into());
+        }
+        // The store lock is released before the record is formatted: the critical
+        // section covers the state change only.
+        drop(store);
+        // The access record for a state-changing operation: who, what, and the outcome,
+        // as `crate::state::AUDIT_TARGET` documents it. Metadata only — the identifiers
+        // the request carried, never the deleted authorizer's configuration.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            rest_api_id = ?input.rest_api_id,
+            authorizer_id = ?input.authorizer_id,
+            outcome = "deleted",
+            "authorizer deleted",
+        );
+        Ok(DeleteAuthorizerOutput)
     }
 }

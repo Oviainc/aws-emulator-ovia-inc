@@ -8,6 +8,9 @@
 //! A suite that is not declared here compiles nowhere and its tests never run. A
 //! suite left at the top level of `tests/` fails the build.
 
+#[path = "all/job_arn_is_the_callers_job.rs"]
+mod job_arn_is_the_callers_job;
+
 #[path = "all/modelled_rejections.rs"]
 mod modelled_rejections;
 

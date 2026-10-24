@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UnpeerVpc
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UnpeerVpc`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Starts the teardown of the peering between the Lightsail VPC of the Region
+//! this request is made in and the account's default VPC there, and answers the
+//! operation-log entry that teardown appended.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UnpeerVpc::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +152,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UnpeerVpc` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UnpeerVpcErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UnpeerVpc"))
+        // The modelled `UnpeerVpcRequest` declares no members: what this call
+        // unpeers is "the Lightsail VPC", and Lightsail's API is regional, so the
+        // VPC it unpeers is the one in the Region the request's SigV4 credential
+        // scope names — which is also where the operation-log entry is located.
+        let _ = input;
+        let region = crate::state::request_region(ctx.parts());
+        let location = crate::state::StoredLocation::regional(&region);
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            // Only an established peering can be torn down: a Region whose
+            // Lightsail VPC nothing peered (or whose peering is already gone) has
+            // no connection to remove, and one whose peering or unpeering is
+            // still being carried out has none to remove YET. Each is refused
+            // rather than answered with a log entry for work nothing performed,
+            // and the refusal happens BEFORE the first write, so a refused
+            // request changes nothing. The record is matched ONCE, so the only
+            // path that reaches the write is the one that performed it.
+            match store.vpc_peering_mut(&region) {
+                Some(peering) if peering.phase == crate::state::VpcPeeringPhase::Peered => {
+                    peering.start_unpeering(now);
+                }
+                Some(peering) if peering.phase == crate::state::VpcPeeringPhase::Peering => {
+                    return Err(failed(format!(
+                        "the Lightsail VPC in {region} is still being peered with the \
+                         account's default VPC"
+                    )));
+                }
+                Some(peering) if peering.phase == crate::state::VpcPeeringPhase::Unpeering => {
+                    return Err(failed(format!(
+                        "the Lightsail VPC in {region} is already being unpeered from the \
+                         account's default VPC"
+                    )));
+                }
+                // The peering is gone, or there never was one.
+                Some(_) | None => {
+                    return Err(failed(format!(
+                        "the Lightsail VPC in {region} is not peered with the account's \
+                         default VPC"
+                    )));
+                }
+            }
+
+            // The connection is still up until the clock tears it down, which is
+            // why this call answers a NON-terminal entry (`settles_at_ms`) and
+            // why `IsVpcPeered` read straight after it still reports `true`: the
+            // clock owes the teardown the same instant it owes this entry its
+            // `Succeeded`.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_UNPEER_VPC,
+                crate::state::RESOURCE_TYPE_PEERED_VPC,
+                // A Lightsail VPC carries no caller-given name — nothing in this
+                // request names one — and there is exactly one per Region, so
+                // the Region it lives in is what identifies it in the log.
+                &region,
+                &location,
+                Some(now.saturating_add(crate::state::STATE_TRANSITION_MILLIS)),
+            );
+            Ok(UnpeerVpcOutput {
+                operation: Some(operation.view()),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// This operation's refusal for an unpeering request the service has no work
+/// for: the modelled `OperationFailureException` ("Lightsail throws this
+/// exception when an operation fails to execute"), whose message names the Region
+/// and the state its Lightsail VPC's peering is in.
+fn failed(message: String) -> UnpeerVpcError {
+    UnpeerVpcErrorModeled::OperationFailureException(OperationFailureException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> UnpeerVpcError {
+    UnpeerVpcErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail VPC peering store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }
