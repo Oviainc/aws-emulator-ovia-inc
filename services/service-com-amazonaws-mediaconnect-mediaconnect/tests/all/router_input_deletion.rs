@@ -144,6 +144,7 @@ pub(crate) fn seed_router_input(emulator: &Emulator, name: &str, state: &str) ->
             client_token: None,
             created_at: now,
             updated_at: now,
+            maintenance_schedule: None,
             removal_due_at: None,
         },
     );

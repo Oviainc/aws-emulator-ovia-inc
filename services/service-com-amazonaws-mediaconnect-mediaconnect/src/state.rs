@@ -26,7 +26,8 @@ use crate::ops::types::{
     GatewayBridgeSource, GrantEntitlementRequest, IngressGatewayBridge, InputConfiguration,
     Interface, ListedBridge, ListedFlow,
     ListedGateway,
-    Maintenance, MaintenanceConfiguration, MediaConnectFlowRouterInputStreamDetails,
+    Maintenance, MaintenanceConfiguration, MaintenanceSchedule,
+    MediaConnectFlowRouterInputStreamDetails,
     MediaConnectFlowRouterOutputStreamDetails, MediaStream,
     MediaLiveChannelRouterInputStreamDetails,
     MediaStreamAttributes, MediaStreamAttributesRequest,
@@ -45,7 +46,7 @@ use crate::ops::types::{
     StandardRouterInputStreamDetails, StandardRouterOutputConfiguration,
     StandardRouterOutputStreamDetails, Transport, UpdateEncryption,
     UpdateFailoverConfig, VpcInterface,
-    VpcInterfaceAttachment,
+    VpcInterfaceAttachment, WindowMaintenanceSchedule,
 };
 
 /// The `Status` enum the model declares for a flow
@@ -229,8 +230,8 @@ pub fn is_stopped_bridge_state(bridge_state: &str) -> bool {
 /// The `RouterInputState` enum the model declares for a router input
 /// (`smithy_query(query="shape",shape="RouterInputState")`: CREATING | STANDBY | STARTING
 /// | ACTIVE | STOPPING | DELETING | UPDATING | ERROR | RECOVERING | MIGRATING). Only the
-/// states a router input's create, restart and delete reach are named here; the rest belong
-/// to the router-input operations that are still scaffolded (start, stop, update, migrate).
+/// states a router input's create, start, restart and delete reach are named here; the rest
+/// belong to the router-input operations that are still scaffolded (stop, update, migrate).
 ///
 /// The non-terminal state a router input is answered in while it is being created; the
 /// clock settles it into [`ROUTER_INPUT_STATE_STANDBY`] one [`TRANSITION_SPAN`] later.
@@ -239,6 +240,10 @@ pub const ROUTER_INPUT_STATE_CREATING: &str = "CREATING";
 /// running yet: it waits in `STANDBY` until StartRouterInput starts it, exactly as a
 /// created bridge waits (see [`BRIDGE_STATE_STANDBY`]).
 pub const ROUTER_INPUT_STATE_STANDBY: &str = "STANDBY";
+/// See [`ROUTER_INPUT_STATE_CREATING`]. The non-terminal state a router input is answered
+/// in while StartRouterInput's start is in flight; the clock settles it into
+/// [`ROUTER_INPUT_STATE_ACTIVE`] one [`TRANSITION_SPAN`] later.
+pub const ROUTER_INPUT_STATE_STARTING: &str = "STARTING";
 /// See [`ROUTER_INPUT_STATE_CREATING`]. The state of a router input that is running.
 pub const ROUTER_INPUT_STATE_ACTIVE: &str = "ACTIVE";
 /// See [`ROUTER_INPUT_STATE_CREATING`]. The non-terminal state a router input is answered
@@ -2608,6 +2613,192 @@ pub fn maintenance_type(configuration: &MaintenanceConfiguration) -> &'static st
     }
 }
 
+/// The `MaintenanceScheduleType` enum the model declares
+/// (`smithy_query(query="shape",shape="MaintenanceScheduleType")`: WINDOW) — its only
+/// value, and `MaintenanceSchedule` is a union with exactly one member (`Window`), so a
+/// resource that has a maintenance schedule at all reports this type for it.
+pub const MAINTENANCE_SCHEDULE_TYPE_WINDOW: &str = "WINDOW";
+
+/// Seconds in a minute, in an hour and in a day — the units a maintenance preference
+/// states its time of day in, and the step the next occurrence of one is found over.
+const SECONDS_PER_MINUTE: u64 = 60;
+/// See [`SECONDS_PER_MINUTE`].
+const SECONDS_PER_HOUR: u64 = 60 * SECONDS_PER_MINUTE;
+/// See [`SECONDS_PER_MINUTE`].
+const SECONDS_PER_DAY: u64 = 24 * SECONDS_PER_HOUR;
+/// Days in a week — how far apart two occurrences of one preferred weekday are.
+const DAYS_PER_WEEK: u64 = 7;
+
+/// The time of day a maintenance window opens for a resource whose maintenance
+/// configuration names no preferred time.
+///
+/// "UTC time when the maintenance will happen. Use 24-hour HH:MM format. Minutes must be
+/// 00. Example: 13:00. The default value is 02:00."
+/// (`smithy_query(query="doc",shape="UpdateMaintenance",member="MaintenanceStartHour")`) —
+/// the default maintenance hour this service documents for a FLOW. AWS documents no default
+/// hour for a router resource, so that one is carried over rather than a second hour being
+/// invented: it is the hour this service states it maintains a resource at when nothing was
+/// asked for.
+pub const DEFAULT_MAINTENANCE_TIME_OF_DAY: Duration = Duration::from_secs(2 * SECONDS_PER_HOUR);
+
+/// How long a maintenance window stays open: the distance between
+/// `WindowMaintenanceSchedule$Start` and `WindowMaintenanceSchedule$End`.
+///
+/// AWS publishes no length for the window, so the span is this emulator's own choice. It is
+/// non-zero, so the window a schedule reports always contains its `ScheduledTime`.
+pub const MAINTENANCE_WINDOW_SPAN: Duration = Duration::from_secs(SECONDS_PER_HOUR);
+
+/// The day of the week `day` names, for a value of the `Day` enum the model declares
+/// (`smithy_query(query="shape",shape="Day")`: MONDAY | TUESDAY | WEDNESDAY | THURSDAY |
+/// FRIDAY | SATURDAY | SUNDAY), or `None` for a string that is not one of them.
+///
+/// The enum's values are matched exactly, so no other spelling of a weekday is read as a
+/// preference. A string this does not know leaves the schedule with no preferred day (see
+/// [`maintenance_window_schedule`]), which keeps the derivation total; it is not reachable
+/// through the API, because the member targets the enum and the boundary refuses every other
+/// value.
+pub fn maintenance_day_of_week(day: &str) -> Option<u64> {
+    let index = match day {
+        "MONDAY" => 0,
+        "TUESDAY" => 1,
+        "WEDNESDAY" => 2,
+        "THURSDAY" => 3,
+        "FRIDAY" => 4,
+        "SATURDAY" => 5,
+        "SUNDAY" => 6,
+        _ => return None,
+    };
+    Some(index)
+}
+
+/// The distance from midnight UTC that the maintenance time `time` names, or `None` for a
+/// string that is not a time of day.
+///
+/// `PreferredDayTimeMaintenanceConfiguration$Time` is "the preferred time for maintenance
+/// operations", stated in the 24-hour `HH:MM` form this service documents for the same
+/// preference on a flow
+/// (`smithy_query(query="doc",shape="UpdateMaintenance",member="MaintenanceStartHour")`:
+/// "UTC time when the maintenance will happen. Use 24-hour HH:MM format"). A seconds field
+/// is accepted after the minutes because that is the same time of day written out in full.
+pub fn maintenance_time_of_day(time: &str) -> Option<Duration> {
+    /// One field of the time, at most two digits and at most `ceiling`.
+    fn field(value: &str, ceiling: u64) -> Option<u64> {
+        if value.is_empty() || value.len() > 2 || !value.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return None;
+        }
+        value.parse::<u64>().ok().filter(|parsed| *parsed <= ceiling)
+    }
+
+    let mut fields = time.split(':');
+    let hours = field(fields.next()?, 23)?;
+    let minutes = field(fields.next()?, 59)?;
+    let seconds = match fields.next() {
+        Some(seconds) => field(seconds, 59)?,
+        None => 0,
+    };
+    if fields.next().is_some() {
+        return None;
+    }
+    Some(Duration::from_secs(
+        hours * SECONDS_PER_HOUR + minutes * SECONDS_PER_MINUTE + seconds,
+    ))
+}
+
+/// The maintenance window a resource configured by `configuration` is next maintained in,
+/// as of `from`.
+///
+/// The schedule is DERIVED from the resource's maintenance configuration and the instant it
+/// was scheduled at, never carried by a request: a configuration that states a preferred day
+/// and time is scheduled at the next occurrence of that weekday at that UTC time, and the
+/// `Default` configuration, which states no day, at the next occurrence of
+/// [`DEFAULT_MAINTENANCE_TIME_OF_DAY`]. The window opens there, lasts
+/// [`MAINTENANCE_WINDOW_SPAN`], and the maintenance is scheduled for the instant it opens,
+/// which is inside it.
+///
+/// The `Time` of a preference this cannot read is the documented default hour, which keeps
+/// this a total function: such a preference does not reach the store, because the operation
+/// that takes one refuses it as a bad request (see CreateRouterInput).
+pub fn maintenance_window_schedule(
+    configuration: &MaintenanceConfiguration,
+    from: SystemTime,
+) -> MaintenanceSchedule {
+    let (preferred_day, time_of_day) = match configuration {
+        MaintenanceConfiguration::PreferredDayTime(preference) => (
+            maintenance_day_of_week(&preference.day),
+            maintenance_time_of_day(&preference.time).unwrap_or(DEFAULT_MAINTENANCE_TIME_OF_DAY),
+        ),
+        MaintenanceConfiguration::Default(_) => (None, DEFAULT_MAINTENANCE_TIME_OF_DAY),
+    };
+    let start = next_time_of_day_occurrence(preferred_day, time_of_day, from);
+    MaintenanceSchedule::Window(WindowMaintenanceSchedule {
+        start: ::aws_smithy_types::DateTime::from(start),
+        end: ::aws_smithy_types::DateTime::from(start + MAINTENANCE_WINDOW_SPAN),
+        scheduled_time: ::aws_smithy_types::DateTime::from(start),
+    })
+}
+
+/// Whether the maintenance window `schedule` reports has closed by `now`.
+///
+/// `MaintenanceSchedule` is a union with one member, so the window is always the one to
+/// read; a closed window is spent, which is what makes the next occurrence of the
+/// preference due (see [`StoredRouterInput::settle`]).
+fn maintenance_window_has_closed(schedule: &MaintenanceSchedule, now: SystemTime) -> bool {
+    let MaintenanceSchedule::Window(window) = schedule;
+    let now_seconds = i64::try_from(
+        now.duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    )
+    .unwrap_or(i64::MAX);
+    now_seconds >= window.end.secs()
+}
+
+/// The first instant strictly after `from` that falls at `time_of_day` past midnight UTC on
+/// the weekday `day_of_week` (a Monday-first index as [`maintenance_day_of_week`] gives it,
+/// or `None` for any day).
+///
+/// A UTC instant's weekday and time of day are a function of its epoch second: UTC keeps no
+/// daylight saving, and neither the day boundary nor the week depends on the calendar's
+/// months, so no month or leap rule takes part in this derivation — only the weekday the
+/// epoch day itself fell on, which [`EPOCH_DAY_OF_WEEK`] anchors. A preference that has
+/// already passed comes round again a week later when it names a day, and the next day when
+/// it does not.
+fn next_time_of_day_occurrence(
+    day_of_week: Option<u64>,
+    time_of_day: Duration,
+    from: SystemTime,
+) -> SystemTime {
+    /// The Monday-first index of the epoch day, 1970-01-01, which was a Thursday.
+    const EPOCH_DAY_OF_WEEK: u64 = 3;
+
+    let since_epoch = from
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let midnight = since_epoch - since_epoch % SECONDS_PER_DAY;
+    let (days_ahead, step_days) = match day_of_week {
+        Some(day_of_week) => {
+            let today = (since_epoch / SECONDS_PER_DAY + EPOCH_DAY_OF_WEEK) % DAYS_PER_WEEK;
+            (
+                (day_of_week % DAYS_PER_WEEK + DAYS_PER_WEEK - today) % DAYS_PER_WEEK,
+                DAYS_PER_WEEK,
+            )
+        }
+        // No preferred day: the window comes round every day, so the next one is today's if
+        // it has not passed and tomorrow's otherwise.
+        None => (0, 1),
+    };
+    let candidate = midnight + days_ahead * SECONDS_PER_DAY + time_of_day.as_secs();
+    let start = if candidate > since_epoch {
+        candidate
+    } else {
+        // The preference has already passed: the next occurrence is one step on.
+        candidate + step_days * SECONDS_PER_DAY
+    };
+    SystemTime::UNIX_EPOCH + Duration::from_secs(start)
+}
+
 /// The maximum bitrate, in BITS PER SECOND, a router input of `tier` may carry, or `None`
 /// for a tier this function does not know.
 ///
@@ -2818,6 +3009,15 @@ pub struct StoredRouterInput {
     /// When this record was last changed. A restart is such a change, so the member moves;
     /// a read never moves it.
     pub updated_at: SystemTime,
+    /// The maintenance window this input is next maintained in
+    /// (`RouterInput$MaintenanceSchedule`), or `None` while nothing has scheduled one.
+    ///
+    /// StartRouterInput is the call that schedules the window, from the input's maintenance
+    /// CONFIGURATION ([`maintenance_window_schedule`]); it is held on the record rather than
+    /// recomputed per read so every later read reports the same window — until the clock
+    /// passes its end, when the next occurrence of the same preference is owed (see
+    /// [`Self::settle`]).
+    pub maintenance_schedule: Option<MaintenanceSchedule>,
     /// When the record stops existing, or `None` while the input is not being deleted.
     ///
     /// A router input delete is not instantaneous and it is not a soft delete: the input
@@ -2831,10 +3031,14 @@ pub struct StoredRouterInput {
 }
 
 impl StoredRouterInput {
-    /// Materialise the state change the clock already made due, if it is due at `now`.
+    /// Materialise the state change the clock already made due, if it is due at `now`, and
+    /// re-schedule a maintenance window the clock has already carried this input past.
     ///
-    /// As for a flow (see [`StoredFlow::settle`]) this is the only write a reporting
-    /// operation performs: the change was owed at `due_at` whether or not anybody called.
+    /// As for a flow (see [`StoredFlow::settle`]) these are the only writes a reporting
+    /// operation performs: each was owed at its own instant whether or not anybody called. A
+    /// window that has closed is spent, and the resource is maintained again at the next
+    /// occurrence of the preference it carries, so a read never reports a maintenance window
+    /// that lies entirely in the past.
     pub fn settle(&mut self, now: SystemTime) {
         if let Some(pending) = self.pending.take() {
             if now >= pending.due_at {
@@ -2842,6 +3046,16 @@ impl StoredRouterInput {
             } else {
                 self.pending = Some(pending);
             }
+        }
+        if self
+            .maintenance_schedule
+            .as_ref()
+            .is_some_and(|schedule| maintenance_window_has_closed(schedule, now))
+        {
+            self.maintenance_schedule = Some(maintenance_window_schedule(
+                &self.maintenance_configuration,
+                now,
+            ));
         }
     }
 
@@ -2929,13 +3143,16 @@ impl StoredRouterInput {
             maintenance_type: maintenance_type(&self.maintenance_configuration).to_string(),
             maintenance_configuration: self.maintenance_configuration.clone(),
             // A maintenance SCHEDULE is the window MediaConnect picked inside the
-            // configured preference, which StartRouterInput reports as it starts an input
+            // configured preference, which StartRouterInput schedules as it starts an input
             // (its response makes `MaintenanceScheduleType` and `MaintenanceSchedule`
-            // required). Nothing has scheduled a window for an input this emulator only
-            // created, so both optional members stay absent until the operation that
-            // schedules one is implemented.
-            maintenance_schedule_type: None,
-            maintenance_schedule: None,
+            // required). Both members are optional HERE because an input nothing has
+            // started yet has no window: the type follows from the schedule the record
+            // holds, the same way `MaintenanceType` follows from the configuration.
+            maintenance_schedule_type: self
+                .maintenance_schedule
+                .as_ref()
+                .map(|_| MAINTENANCE_SCHEDULE_TYPE_WINDOW.to_string()),
+            maintenance_schedule: self.maintenance_schedule.clone(),
             content_quality_analysis_type: ROUTER_CQA_TYPE_CONTENT_LEVEL.to_string(),
             content_quality_analysis_configuration: self
                 .content_quality_analysis_configuration
