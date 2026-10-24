@@ -258,7 +258,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             template.description = Some(description);
         }
         if let Some(encryption_configuration) = input.encryption_configuration {
-            template.encryption_config = Some(encryption_configuration);
+            template.encryption_config = encryption_configuration;
         }
         if let Some(resource_tags) = input.resource_tags {
             template.resource_tags = resource_tags;
