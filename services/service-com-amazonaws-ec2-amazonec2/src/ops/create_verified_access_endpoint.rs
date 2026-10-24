@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateVerifiedAccessEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateVerifiedAccessEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateVerifiedAccessEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: resolves the Verified Access group the request names against the account's
+//! stored groups, mints an endpoint on it from the request and stores it, so
+//! `DescribeVerifiedAccessEndpoints` reports what this call created — this is the ONLY file
+//! to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +160,481 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateVerifiedAccessEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateVerifiedAccessEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateVerifiedAccessEndpoint"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            invalid_group_not_found, invalid_network_interface_id_not_found,
+            invalid_subnet_id_not_found, invalid_verified_access_group_id_not_found, iso8601_utc,
+            request_region, require_service_state, tag_list, validate_tag_size,
+            verified_access_endpoint_limit_exceeded, verified_access_endpoint_payload_bytes,
+            ClockTransition, VerifiedAccessEndpointRecord, MAX_CLIENT_TOKEN_CHARS,
+            MAX_RESOURCE_IDS, MAX_STORED_BYTES, MAX_TAGS_PER_RESOURCE,
+            MAX_VERIFIED_ACCESS_ENDPOINTS, MAX_VERIFIED_ACCESS_ENDPOINT_PORT_RANGES,
+            VERIFIED_ACCESS_ENDPOINT_ATTACHMENT_TYPE_VPC,
+            VERIFIED_ACCESS_ENDPOINT_STATUS_ACTIVE, VERIFIED_ACCESS_ENDPOINT_STATUS_PENDING,
+            VERIFIED_ACCESS_ENDPOINT_TAGGABLE_RESOURCE, VERIFIED_ACCESS_ENDPOINT_TYPE_CIDR,
+            VERIFIED_ACCESS_ENDPOINT_TYPE_LOAD_BALANCER,
+            VERIFIED_ACCESS_ENDPOINT_TYPE_NETWORK_INTERFACE, VERIFIED_ACCESS_ENDPOINT_TYPE_RDS,
+        };
+
+        // The Region the request was signed for: the generated endpoint domain names it
+        // ([`crate::state::verified_access_endpoint_domain`]), so it is read off the request
+        // the way every other Region-bearing member of this service is.
+        let region = request_region(ctx.parts());
+
+        // "The type of Verified Access endpoint to create"
+        // (`CreateVerifiedAccessEndpointRequest$EndpointType`), one of the modelled
+        // `VerifiedAccessEndpointType` catalog. The modelled enum has already refused every
+        // other spelling before this handler runs, so a value the catalog does not hold can
+        // only be one the model learned and this handler has not.
+        let endpoint_type = input.endpoint_type.as_str();
+        if !VERIFIED_ACCESS_ENDPOINT_TYPE_VALUES.contains(&endpoint_type) {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{endpoint_type}' for endpointType"
+            )));
+        }
+        // "The type of attachment" (`CreateVerifiedAccessEndpointRequest$AttachmentType`),
+        // from the modelled `VerifiedAccessEndpointAttachmentType` catalog.
+        let attachment_type = input.attachment_type.as_str();
+        if !VERIFIED_ACCESS_ENDPOINT_ATTACHMENT_TYPE_VALUES.contains(&attachment_type) {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{attachment_type}' for attachmentType"
+            )));
+        }
+
+        // Each KIND of endpoint takes its OWN options block and only that one: "The load
+        // balancer details. This parameter is required if the endpoint type is
+        // load-balancer" (`LoadBalancerOptions`), "… required if the endpoint type is
+        // network-interface" (`NetworkInterfaceOptions`), "… required if the endpoint type
+        // is rds" (`RdsOptions`), "… required if the endpoint type is cidr"
+        // (`CidrOptions`). So the block the named kind needs is required, and a block
+        // belonging to another kind is refused rather than accepted and dropped — which
+        // would store an endpoint the caller did not describe.
+        let blocks = [
+            (
+                VERIFIED_ACCESS_ENDPOINT_TYPE_LOAD_BALANCER,
+                "loadBalancerOptions",
+                input.load_balancer_options.is_some(),
+            ),
+            (
+                VERIFIED_ACCESS_ENDPOINT_TYPE_NETWORK_INTERFACE,
+                "networkInterfaceOptions",
+                input.network_interface_options.is_some(),
+            ),
+            (
+                VERIFIED_ACCESS_ENDPOINT_TYPE_RDS,
+                "rdsOptions",
+                input.rds_options.is_some(),
+            ),
+            (
+                VERIFIED_ACCESS_ENDPOINT_TYPE_CIDR,
+                "cidrOptions",
+                input.cidr_options.is_some(),
+            ),
+        ];
+        for (kind, member, supplied) in blocks {
+            if kind == endpoint_type && !supplied {
+                return Err(Scaffolded::missing_parameter(format!(
+                    "{member} is required when endpointType is {kind}"
+                )));
+            }
+            if kind != endpoint_type && supplied {
+                return Err(Scaffolded::invalid_parameter_combination(format!(
+                    "{member} may be specified only when endpointType is {kind}"
+                )));
+            }
+        }
+
+        // "The IDs of the security groups to associate with the Verified Access endpoint.
+        // Required if AttachmentType is set to vpc"
+        // (`CreateVerifiedAccessEndpointRequest$SecurityGroupIds`).
+        let security_group_ids: &[String] = input.security_group_ids.as_deref().unwrap_or_default();
+        if attachment_type == VERIFIED_ACCESS_ENDPOINT_ATTACHMENT_TYPE_VPC
+            && security_group_ids.is_empty()
+        {
+            return Err(Scaffolded::missing_parameter(format!(
+                "securityGroupIds is required when attachmentType is \
+                 {VERIFIED_ACCESS_ENDPOINT_ATTACHMENT_TYPE_VPC}"
+            )));
+        }
+
+        // The subnets and the network interface the endpoint's own options block names. Read
+        // off the block that belongs to this kind, which the loop above has already
+        // established is the only one present.
+        let subnet_ids: &[String] = match endpoint_type {
+            VERIFIED_ACCESS_ENDPOINT_TYPE_LOAD_BALANCER => input
+                .load_balancer_options
+                .as_ref()
+                .and_then(|options| options.subnet_ids.as_deref())
+                .unwrap_or_default(),
+            VERIFIED_ACCESS_ENDPOINT_TYPE_RDS => input
+                .rds_options
+                .as_ref()
+                .and_then(|options| options.subnet_ids.as_deref())
+                .unwrap_or_default(),
+            VERIFIED_ACCESS_ENDPOINT_TYPE_CIDR => input
+                .cidr_options
+                .as_ref()
+                .and_then(|options| options.subnet_ids.as_deref())
+                .unwrap_or_default(),
+            // A `network-interface` endpoint names an interface rather than subnets: the
+            // interface already sits in one.
+            _ => &[],
+        };
+        let network_interface_id = input
+            .network_interface_options
+            .as_ref()
+            .and_then(|options| options.network_interface_id.as_deref());
+
+        // Resolving the references below costs one lookup per id, and the model bounds
+        // neither list, so the request-controlled count is capped here — before any work
+        // proportional to it is done under the state lock — against the same ceiling the
+        // describes cap a request's id list with.
+        let referenced_ids = security_group_ids.len().saturating_add(subnet_ids.len());
+        if referenced_ids > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The request names {referenced_ids} resource ids, above the maximum of \
+                 {MAX_RESOURCE_IDS}"
+            )));
+        }
+
+        // How many port ranges the options block carries is the CALLER's choice, and the
+        // modelled list declares no `@length`, so the count is capped here — before the
+        // record that would keep every entry for the process's lifetime is built, and before
+        // the state lock is taken. The entries are charged against the store's byte budget
+        // too ([`crate::state::verified_access_endpoint_payload_bytes`]).
+        let supplied_ranges = port_ranges_of(&input).count();
+        if supplied_ranges > MAX_VERIFIED_ACCESS_ENDPOINT_PORT_RANGES {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "portRanges carries {supplied_ranges} ranges, above the maximum of \
+                 {MAX_VERIFIED_ACCESS_ENDPOINT_PORT_RANGES}"
+            )));
+        }
+
+        // A port range runs from its lower bound to its upper one: a range whose `FromPort`
+        // is above its `ToPort` names no port at all, so it is refused rather than stored.
+        // The modelled `range 1..65535` on each member has already refused a port outside
+        // the published range before this handler runs.
+        for range in port_ranges_of(&input) {
+            match (range.from_port, range.to_port) {
+                (Some(from), Some(to)) if from > to => {
+                    return Err(Scaffolded::invalid_parameter_value(format!(
+                        "A port range runs from fromPort to toPort, so {from} is not a valid \
+                         fromPort for toPort {to}"
+                    )));
+                }
+                _ => {}
+            }
+        }
+
+        // "The tags to assign to the Verified Access endpoint"
+        // (`CreateVerifiedAccessEndpointRequest$TagSpecifications`): the endpoint is the only
+        // resource this call creates, so a specification naming any other resource type is
+        // refused rather than accepted and discarded.
+        let mut tags: ::std::collections::BTreeMap<String, String> =
+            ::std::collections::BTreeMap::new();
+        for specification in input.tag_specifications.iter().flatten() {
+            match specification.resource_type.as_deref() {
+                Some(VERIFIED_ACCESS_ENDPOINT_TAGGABLE_RESOURCE) | None => {}
+                Some(resource_type) => {
+                    return Err(Scaffolded::invalid_parameter_value(format!(
+                        "Invalid value '{resource_type}' for resourceType. \
+                         CreateVerifiedAccessEndpoint tags the \
+                         '{VERIFIED_ACCESS_ENDPOINT_TAGGABLE_RESOURCE}' it creates"
+                    )));
+                }
+            }
+            for tag in specification.tags.iter().flatten() {
+                let key = tag.key.clone().unwrap_or_default();
+                let value = tag.value.clone().unwrap_or_default();
+                validate_tag_size(&key, &value)?;
+                tags.insert(key, value);
+            }
+        }
+        if tags.len() > MAX_TAGS_PER_RESOURCE {
+            return Err(Scaffolded::tag_limit_exceeded(format!(
+                "A Verified Access endpoint carries at most {MAX_TAGS_PER_RESOURCE} tags, \
+                 not {}",
+                tags.len()
+            )));
+        }
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "clientToken accepts at most {MAX_CLIENT_TOKEN_CHARS} characters"
+            )));
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // Materialise what the clock already owed before reading the store, so this call
+        // resolves its references against the state a caller would have seen anyway.
+        store.materialize_due_transitions();
+
+        // "The ID of the Verified Access group to associate the endpoint with"
+        // (`CreateVerifiedAccessEndpointRequest$VerifiedAccessGroupId`): an id that names no
+        // group of the account is refused, and nothing is stored. The INSTANCE the endpoint
+        // reports is read off that group — an endpoint belongs to the instance its group
+        // belongs to — so the two can never disagree.
+        let verified_access_instance_id = store
+            .verified_access_groups
+            .get(&input.verified_access_group_id)
+            .ok_or_else(|| {
+                invalid_verified_access_group_id_not_found(&input.verified_access_group_id)
+            })?
+            .verified_access_instance_id
+            .clone();
+
+        // Every other EC2 resource the request references has to be one the account holds
+        // too, answered with that resource's own `Invalid<Kind>.NotFound` code. The ARNs the
+        // request may carry — the ACM certificate, the load balancer, the RDS instance,
+        // cluster or proxy — name resources of OTHER services, which this store does not
+        // hold, so they are stored as given.
+        if let Some(unknown) = security_group_ids
+            .iter()
+            .find(|group_id| !store.security_groups.contains_key(group_id.as_str()))
+        {
+            return Err(invalid_group_not_found(unknown));
+        }
+        if let Some(unknown) = subnet_ids
+            .iter()
+            .find(|subnet_id| !store.subnets.contains_key(subnet_id.as_str()))
+        {
+            return Err(invalid_subnet_id_not_found(unknown));
+        }
+        if let Some(unknown) = network_interface_id
+            .filter(|interface_id| !store.network_interfaces.contains_key(*interface_id))
+        {
+            return Err(invalid_network_interface_id_not_found(unknown));
+        }
+
+        // Idempotency: "A unique, case-sensitive token that you provide to ensure idempotency
+        // of your modification request" (`CreateVerifiedAccessEndpointRequest$ClientToken`) —
+        // one token names the one endpoint it minted, so a replay reports that endpoint and
+        // creates nothing. Read here, answered below the DryRun check, because a replay
+        // stores nothing and so passes the ceilings a fresh create has to clear.
+        let replayed = input.client_token.as_deref().and_then(|token| {
+            store
+                .verified_access_endpoint_client_tokens
+                .get(token)
+                .cloned()
+        });
+
+        // The record this call would store. Every member is either taken from the request,
+        // read off the group, or derived here; the id and the generated endpoint domain are
+        // minted by the store at the insert, so an id is never chosen twice and the domain
+        // cannot name a different endpoint than the record it sits on.
+        let created_at = iso8601_utc(::std::time::SystemTime::now());
+        let record = VerifiedAccessEndpointRecord {
+            view: VerifiedAccessEndpoint {
+                verified_access_instance_id,
+                verified_access_group_id: Some(input.verified_access_group_id.clone()),
+                // Minted by the store at the insert.
+                verified_access_endpoint_id: None,
+                application_domain: input.application_domain.clone(),
+                endpoint_type: Some(endpoint_type.to_string()),
+                attachment_type: Some(attachment_type.to_string()),
+                domain_certificate_arn: input.domain_certificate_arn.clone(),
+                // Derived at the insert from the minted id, the Region and the prefix the
+                // request asked to prepend.
+                endpoint_domain: None,
+                // "Returned if endpoint has a device trust provider attached"
+                // (`VerifiedAccessEndpoint$DeviceValidationDomain`). A trust provider is
+                // attached to the INSTANCE by `AttachVerifiedAccessTrustProvider`, which is
+                // still a scaffold stub with its own open issue, so no endpoint of this
+                // emulator has one yet and there is no validation domain to report.
+                device_validation_domain: None,
+                security_group_ids: input.security_group_ids.clone(),
+                load_balancer_options: input.load_balancer_options.as_ref().map(|options| {
+                    VerifiedAccessEndpointLoadBalancerOptions {
+                        protocol: options.protocol.clone(),
+                        port: options.port,
+                        load_balancer_arn: options.load_balancer_arn.clone(),
+                        subnet_ids: options.subnet_ids.clone(),
+                        port_ranges: reported_port_ranges(options.port_ranges.as_deref()),
+                    }
+                }),
+                network_interface_options: input.network_interface_options.as_ref().map(
+                    |options| VerifiedAccessEndpointEniOptions {
+                        network_interface_id: options.network_interface_id.clone(),
+                        protocol: options.protocol.clone(),
+                        port: options.port,
+                        port_ranges: reported_port_ranges(options.port_ranges.as_deref()),
+                    },
+                ),
+                // An endpoint AWS hands back is still being set up, so it is reported
+                // `pending` here and the clock owes it `active` one transition later
+                // (the `pending` member of `VerifiedAccessEndpointStatusCode`). Nothing is
+                // wrong with it, so the status carries no message.
+                status: Some(VerifiedAccessEndpointStatus {
+                    code: Some(VERIFIED_ACCESS_ENDPOINT_STATUS_PENDING.to_string()),
+                    message: None,
+                }),
+                description: input.description.clone(),
+                // An endpoint is created and updated in the same instant; its `active` move
+                // and a later modify are what carry `LastUpdatedTime` on.
+                creation_time: Some(created_at.clone()),
+                last_updated_time: Some(created_at),
+                // Nothing has deleted this endpoint, so there is no deletion time.
+                deletion_time: None,
+                tags: Some(tag_list(&tags)),
+                // "The options for server side encryption"
+                // (`CreateVerifiedAccessEndpointRequest$SseSpecification`). The response
+                // shape reports whether a customer managed key is in use and which one, so a
+                // request that named no specification reports the Amazon Web Services owned
+                // key: not customer managed, and no key ARN to name.
+                sse_specification: Some(VerifiedAccessSseSpecificationResponse {
+                    customer_managed_key_enabled: Some(
+                        input
+                            .sse_specification
+                            .as_ref()
+                            .and_then(|sse| sse.customer_managed_key_enabled)
+                            .unwrap_or(false),
+                    ),
+                    kms_key_arn: input
+                        .sse_specification
+                        .as_ref()
+                        .and_then(|sse| sse.kms_key_arn.clone()),
+                }),
+                rds_options: input.rds_options.as_ref().map(|options| {
+                    VerifiedAccessEndpointRdsOptions {
+                        protocol: options.protocol.clone(),
+                        port: options.port,
+                        rds_db_instance_arn: options.rds_db_instance_arn.clone(),
+                        rds_db_cluster_arn: options.rds_db_cluster_arn.clone(),
+                        rds_db_proxy_arn: options.rds_db_proxy_arn.clone(),
+                        rds_endpoint: options.rds_endpoint.clone(),
+                        subnet_ids: options.subnet_ids.clone(),
+                    }
+                }),
+                cidr_options: input.cidr_options.as_ref().map(|options| {
+                    VerifiedAccessEndpointCidrOptions {
+                        cidr: options.cidr.clone(),
+                        port_ranges: reported_port_ranges(options.port_ranges.as_deref()),
+                        protocol: options.protocol.clone(),
+                        subnet_ids: options.subnet_ids.clone(),
+                    }
+                }),
+            },
+            pending: Some(ClockTransition::starting_now(
+                VERIFIED_ACCESS_ENDPOINT_STATUS_ACTIVE,
+            )),
+            // "The Verified Access policy document"
+            // (`CreateVerifiedAccessEndpointRequest$PolicyDocument`): the endpoint shape
+            // carries no member for it, so it is kept beside the record for
+            // `GetVerifiedAccessEndpointPolicy` to report.
+            policy_document: input.policy_document.clone(),
+        };
+        // Both ceilings are asked only of a create that would STORE something: a replay
+        // stores nothing, so it passes the ceilings a fresh create has to clear. A COUNT
+        // ceiling admits gigabytes on its own, because the record holds strings the caller
+        // chose the length of, so both are asked.
+        if replayed.is_none() {
+            if !store.has_verified_access_endpoint_capacity() {
+                return Err(verified_access_endpoint_limit_exceeded(format!(
+                    "This emulator holds {MAX_VERIFIED_ACCESS_ENDPOINTS} Verified Access \
+                     endpoints, which is as many as it stores"
+                )));
+            }
+            // The caller-chosen bytes this create would retain for the process's lifetime,
+            // counted by the ONE definition of that charge — the `EndpointDomainPrefix` the
+            // generated domain carries and the stored port ranges included, so the figure
+            // checked here is exactly the one the insert charges.
+            let payload_bytes = verified_access_endpoint_payload_bytes(
+                &record,
+                input.endpoint_domain_prefix.as_deref(),
+                input.client_token.as_deref(),
+            );
+            if store.would_exceed_stored_bytes(payload_bytes) {
+                return Err(verified_access_endpoint_limit_exceeded(format!(
+                    "This emulator holds {} of at most {MAX_STORED_BYTES} bytes of \
+                     caller-supplied data, so it cannot store {payload_bytes} more",
+                    store.stored_bytes()
+                )));
+            }
+        }
+
+        // DryRun sits AFTER every parameter has been validated and every reference resolved,
+        // and BEFORE the first write: the flag asks whether the request WOULD have worked, so
+        // one that would have been refused is refused with that reason instead, and one that
+        // would have succeeded leaves state untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        let endpoint_id = match replayed {
+            Some(endpoint_id) => endpoint_id,
+            None => store.insert_verified_access_endpoint(
+                record,
+                input.endpoint_domain_prefix.as_deref(),
+                &region,
+                input.client_token.as_deref(),
+            ),
+        };
+
+        // Read the response back OUT of the store, so the caller sees what a later
+        // DescribeVerifiedAccessEndpoints will see rather than the request object.
+        store
+            .verified_access_endpoints
+            .get(&endpoint_id)
+            .map(|record| CreateVerifiedAccessEndpointOutput {
+                verified_access_endpoint: Some(record.view.clone()),
+            })
+            .ok_or_else(|| {
+                Scaffolded::internal_error(format!(
+                    "the newly created Verified Access endpoint '{endpoint_id}' could not be \
+                     read back"
+                ))
+            })
     }
+}
+
+/// Every port range the request's own options block carries, whichever kind of endpoint it
+/// describes — the one list the bound check above walks.
+///
+/// `RdsOptions` carries no `PortRanges` member
+/// (`smithy_query(query="shape",shape="CreateVerifiedAccessEndpointRdsOptions")`), so an RDS
+/// endpoint contributes none.
+fn port_ranges_of(
+    input: &CreateVerifiedAccessEndpointInput,
+) -> impl Iterator<Item = &CreateVerifiedAccessEndpointPortRange> {
+    input
+        .load_balancer_options
+        .iter()
+        .flat_map(|options| options.port_ranges.iter().flatten())
+        .chain(
+            input
+                .network_interface_options
+                .iter()
+                .flat_map(|options| options.port_ranges.iter().flatten()),
+        )
+        .chain(
+            input
+                .cidr_options
+                .iter()
+                .flat_map(|options| options.port_ranges.iter().flatten()),
+        )
+}
+
+/// The request's port ranges as the REPORTED shape spells them.
+///
+/// The create and the response shapes declare the same two members
+/// (`CreateVerifiedAccessEndpointPortRange` and `VerifiedAccessEndpointPortRange`), so this
+/// is the one place the two spellings are bridged — a range the request set round-trips
+/// member for member.
+fn reported_port_ranges(
+    ranges: Option<&[CreateVerifiedAccessEndpointPortRange]>,
+) -> Option<Vec<VerifiedAccessEndpointPortRange>> {
+    ranges.map(|ranges| {
+        ranges
+            .iter()
+            .map(|range| VerifiedAccessEndpointPortRange {
+                from_port: range.from_port,
+                to_port: range.to_port,
+            })
+            .collect()
+    })
 }

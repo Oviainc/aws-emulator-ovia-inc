@@ -45,3 +45,5 @@ mod resource_untagging;
 mod state_roundtrip;
 #[path = "all/virtual_machine_listing.rs"]
 mod virtual_machine_listing;
+#[path = "all/virtual_machine_reads.rs"]
+mod virtual_machine_reads;
