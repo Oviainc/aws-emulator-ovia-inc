@@ -1222,6 +1222,60 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
         Ok(())
     }
 
+    /// Store a registration: hold it by ARN, keep it in registration order, index it
+    /// under the `(provider key, product)` pair that also addresses it, and recompute
+    /// every instance view the new registration changes.
+    ///
+    /// The counterpart of
+    /// [`begin_identity_provider_deregistration`](Self::begin_identity_provider_deregistration)
+    /// and [`remove_identity_provider`](Self::remove_identity_provider), and there for the
+    /// same reason: which PRODUCTS an instance in this service's view provides is READ
+    /// from the live registrations of the directories its associations name
+    /// ([`refresh_instance_view`](Self::refresh_instance_view)), so a registration ADDED
+    /// for a directory changes those views exactly as one leaving that set does. One writer
+    /// owns the whole write, so no handler can store a registration and leave an instance
+    /// reporting products the state no longer implies.
+    pub fn insert_identity_provider(&mut self, key: String, record: IdentityProviderRecord) {
+        let arn = record.arn.clone();
+        let product = record.product.clone();
+        self.identity_providers.insert(arn.clone(), record);
+        self.identity_provider_order.push(arn.clone());
+        self.identity_provider_index.insert((key.clone(), product), arn);
+        self.refresh_instance_views_through(&key);
+    }
+
+    /// Recompute the view of every instance whose user associations resolve through the
+    /// directory `key`.
+    ///
+    /// Only those instances can have changed: what an instance provides is the products
+    /// the directories of the associations NAMING IT are registered for, so a change to
+    /// one directory's registrations leaves every other instance's view as it was.
+    ///
+    /// Costed like [`refresh_every_instance_view`](Self::refresh_every_instance_view), and
+    /// through the same two helpers so the two cannot drift: ONE pass over the
+    /// associations to select the instances this directory reaches, then the registrations
+    /// once and each selected instance's own associations through the reverse index
+    /// ([`associations_naming`](Self::associations_naming)). This runs with the
+    /// service-state lock held, so one request must not buy work that multiplies with the
+    /// store.
+    fn refresh_instance_views_through(&mut self, key: &str) {
+        let affected: HashSet<String> = self
+            .instance_user_order
+            .iter()
+            .filter_map(|arn| self.instance_users.get(arn))
+            .filter(|association| association.provider_key == key)
+            .map(|association| association.instance_id.clone())
+            .collect();
+        if affected.is_empty() {
+            return;
+        }
+        let products_by_key = self.products_by_provider_key();
+        for instance_id in affected {
+            let naming = self.associations_naming(&instance_id);
+            self.apply_instance_view(&instance_id, &naming, &products_by_key);
+        }
+    }
+
     /// The registrations in registration order.
     pub fn identity_providers_in_order(&self) -> Vec<IdentityProviderRecord> {
         self.identity_provider_order
@@ -1268,6 +1322,12 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
     /// read from the registrations rather than taken from the request), so a product stops
     /// being reported as soon as the last association or registration behind it is gone.
     /// Nothing else is recorded: no status check has been performed, so none is reported.
+    ///
+    /// Every write that can change what an instance provides runs this, so no read has to
+    /// (and no read does): an association created or removed refreshes the instance it
+    /// names, and a registration stored
+    /// ([`insert_identity_provider`](Self::insert_identity_provider)) or torn down
+    /// refreshes the instances reached through its directory.
     ///
     /// An association whose teardown is still running still NAMES the instance, so the
     /// instance stays in view while that association is `DISASSOCIATING` and leaves it

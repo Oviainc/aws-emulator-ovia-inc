@@ -10,6 +10,11 @@
 //! `REGISTERED` transition is owed by the clock (see `crate::state::materialise_due`)
 //! and materialises on any later read.
 //!
+//! The record is stored through `crate::state::insert_identity_provider`, the one writer
+//! for a registration, so this call also recomputes what the instances associated through
+//! the same directory provide: `InstanceSummary.Products` is read from the directory's
+//! registrations, so adding one changes those views just as deregistering one does.
+//!
 //! `Settings` is optional in the model, but `IdentityProviderSummary.Settings` is
 //! `@required` and `Settings` itself requires at least one subnet and a security group —
 //! so a registration without them could only be answered by inventing values. A request
@@ -278,11 +283,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(tags) = input.tags.as_ref() {
             state.merge_tags(&arn, tags).map_err(into_error)?;
         }
-        state.identity_providers.insert(arn.clone(), record.clone());
-        state.identity_provider_order.push(arn.clone());
-        state
-            .identity_provider_index
-            .insert((key, input.product.clone()), arn);
+        // The ONE writer that stores a registration: it holds and indexes the record and
+        // recomputes the view of every instance whose associations resolve through this
+        // directory, because what an instance provides is read from that directory's
+        // registrations — so the product this call adds is reported by the very next
+        // `ListInstances` instead of waiting for an unrelated later write.
+        state.insert_identity_provider(key, record.clone());
         // The `REGISTERING` -> `REGISTERED` transition the clock now owes, so a later
         // read materialises it without every request sweeping the whole store.
         state.schedule_transition(record.registered_due_at);
