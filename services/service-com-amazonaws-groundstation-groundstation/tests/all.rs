@@ -19,6 +19,8 @@ mod agent_lifecycle;
 mod config_defaults_and_references;
 #[path = "all/config_listing.rs"]
 mod config_listing;
+#[path = "all/contact_version_listing.rs"]
+mod contact_version_listing;
 #[path = "all/contact_versions.rs"]
 mod contact_versions;
 #[path = "all/dataflow_endpoint_group_listing.rs"]

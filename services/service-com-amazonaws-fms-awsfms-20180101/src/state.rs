@@ -246,6 +246,20 @@ pub const THIRD_PARTY_FIREWALL_NOT_EXIST: &str = "NOT_EXIST";
 /// down: the transient status a `DisassociateThirdPartyFirewall` starts.
 pub const THIRD_PARTY_FIREWALL_OFFBOARDING: &str = "OFFBOARDING";
 
+/// `ThirdPartyFirewallAssociationStatus` of an association that is being set
+/// up: the transient status an `AssociateThirdPartyFirewall` starts, in which
+/// the Firewall Manager administrator is not a tenant administrator of the
+/// vendor yet. One of
+/// [`crate::ops::types::THIRD_PARTY_FIREWALL_ASSOCIATION_STATUS_VALUES`].
+pub const THIRD_PARTY_FIREWALL_ONBOARDING: &str = "ONBOARDING";
+
+/// `ThirdPartyFirewallAssociationStatus` of a completed association: the
+/// Firewall Manager administrator IS a tenant administrator of the vendor, which
+/// is the only status in which the vendor's tenant — and so the firewall
+/// policies it holds — is reachable. One of
+/// [`crate::ops::types::THIRD_PARTY_FIREWALL_ASSOCIATION_STATUS_VALUES`].
+pub const THIRD_PARTY_FIREWALL_ONBOARD_COMPLETE: &str = "ONBOARD_COMPLETE";
+
 /// `ThirdPartyFirewallAssociationStatus` of a torn-down association: the
 /// terminal status the clock makes due after [`ASSOCIATION_SETTLE`].
 pub const THIRD_PARTY_FIREWALL_OFFBOARD_COMPLETE: &str = "OFFBOARD_COMPLETE";
@@ -488,6 +502,14 @@ impl ThirdPartyFirewallRecord {
         }
     }
 
+    /// Whether the Firewall Manager administrator is a tenant administrator of
+    /// this vendor, i.e. whether the vendor's tenant is reachable at all. Only
+    /// the terminal `ONBOARD_COMPLETE` status says so: in every other status the
+    /// administrator is being designated, being removed, or removed already.
+    pub fn is_onboarded(&self) -> bool {
+        self.status == THIRD_PARTY_FIREWALL_ONBOARD_COMPLETE
+    }
+
     /// Start tearing the association down: the status becomes `OFFBOARDING` now
     /// and the clock owes `OFFBOARD_COMPLETE` [`ASSOCIATION_SETTLE`] later.
     ///
@@ -504,6 +526,77 @@ impl ThirdPartyFirewallRecord {
         self.settles_to = Some(THIRD_PARTY_FIREWALL_OFFBOARD_COMPLETE.to_string());
         self.settles_at = Some(now + ASSOCIATION_SETTLE);
     }
+}
+
+/// One firewall policy that exists in ONE third-party firewall vendor's tenant:
+/// the `FirewallPolicyId` / `FirewallPolicyName` pair
+/// `ListThirdPartyFirewallFirewallPolicies` reports, keyed in
+/// [`ComAmazonawsFmsAwsfms20180101State::third_party_firewall_policies`] by
+/// [`third_party_firewall_policy_key`].
+///
+/// The vendor is part of the record (not only of its key) so a projection never
+/// has to parse the key back apart, exactly as [`ShieldAttackRecord`] keeps the
+/// `PolicyId` it is keyed under.
+#[derive(Debug, Clone)]
+pub struct ThirdPartyFirewallPolicyRecord {
+    /// The `ThirdPartyFirewall` enum value of the vendor whose tenant holds this
+    /// firewall policy. Also the first segment of the record's key, so one
+    /// vendor's policies are a contiguous range.
+    pub third_party_firewall: String,
+    /// The vendor's own id for the firewall policy (`FirewallPolicyId`). Also
+    /// the second segment of the record's key, so one vendor's policies are
+    /// served in id order.
+    pub firewall_policy_id: String,
+    /// The vendor's own name for the firewall policy (`FirewallPolicyName`).
+    pub firewall_policy_name: String,
+}
+
+impl ThirdPartyFirewallPolicyRecord {
+    /// The key this record is held under in
+    /// [`ComAmazonawsFmsAwsfms20180101State::third_party_firewall_policies`].
+    pub fn key(&self) -> String {
+        third_party_firewall_policy_key(&self.third_party_firewall, &self.firewall_policy_id)
+    }
+
+    /// The modelled `ThirdPartyFirewallFirewallPolicy` projection of this
+    /// record: "the firewall policy name and ID", both read off the stored
+    /// record, so an enumeration can never report an id or a name the store does
+    /// not hold.
+    ///
+    /// The shape is named by its full path rather than imported at the top of
+    /// this module, so adding it needs no edit to the shared `use` list every
+    /// other slice of this service also touches.
+    pub fn policy(&self) -> crate::ops::types::ThirdPartyFirewallFirewallPolicy {
+        crate::ops::types::ThirdPartyFirewallFirewallPolicy {
+            firewall_policy_id: Some(self.firewall_policy_id.clone()),
+            firewall_policy_name: Some(self.firewall_policy_name.clone()),
+        }
+    }
+}
+
+/// The key one third-party firewall policy is held under in
+/// [`ComAmazonawsFmsAwsfms20180101State::third_party_firewall_policies`]:
+/// `<ThirdPartyFirewall>#<FirewallPolicyId>`.
+///
+/// The vendor comes first so one vendor's policies are a CONTIGUOUS range in the
+/// map's total order ([`third_party_firewall_policy_key_prefix`] is that range's
+/// lower bound), and the id follows so the range is ordered by id — which makes
+/// a page boundary a key, the same way [`shield_attack_key`] does for attacks.
+///
+/// `#` separates them because it is in neither segment: the model's
+/// `ThirdPartyFirewall` values are `[A-Z_]` only, and `FirewallPolicyId` matches
+/// `^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$`, which excludes `#`. So no id can forge
+/// another vendor's prefix.
+pub fn third_party_firewall_policy_key(third_party_firewall: &str, policy_id: &str) -> String {
+    format!("{third_party_firewall}#{policy_id}")
+}
+
+/// The prefix every key of ONE vendor's firewall policies carries, which is also
+/// the lower bound of that vendor's range in
+/// [`ComAmazonawsFmsAwsfms20180101State::third_party_firewall_policies`]. See
+/// [`third_party_firewall_policy_key`].
+pub fn third_party_firewall_policy_key_prefix(third_party_firewall: &str) -> String {
+    format!("{third_party_firewall}#")
 }
 
 /// One stored Firewall Manager resource that carries TAGS, named by the kind of
@@ -840,6 +933,18 @@ pub struct ComAmazonawsFmsAwsfms20180101State {
     /// The third-party firewall associations, keyed by the `ThirdPartyFirewall`
     /// enum value. An absent entry is `NOT_EXIST`, not an error.
     pub third_party_firewalls: BTreeMap<String, ThirdPartyFirewallRecord>,
+    /// The firewall policies that exist in the third-party firewall vendors'
+    /// tenants, keyed by [`third_party_firewall_policy_key`] so ONE vendor's
+    /// policies are a contiguous range in id order that a
+    /// `ListThirdPartyFirewallFirewallPolicies` page can resume from.
+    ///
+    /// Like [`Self::discovered_resources`] this is an INVENTORY, not a cache: a
+    /// third-party firewall policy is created in the VENDOR's own console or
+    /// API — no Firewall Manager operation creates one — so the inventory is
+    /// empty unless something put a policy in it.
+    /// `ListThirdPartyFirewallFirewallPolicies` reports what is here for the
+    /// vendor the request names, and never a policy it made up.
+    pub third_party_firewall_policies: BTreeMap<String, ThirdPartyFirewallPolicyRecord>,
     /// The organisation's resources that are available to be associated with a
     /// resource set, keyed by the resource URI (its ARN) so the total order
     /// makes a `ListDiscoveredResources` page resumable from a key.

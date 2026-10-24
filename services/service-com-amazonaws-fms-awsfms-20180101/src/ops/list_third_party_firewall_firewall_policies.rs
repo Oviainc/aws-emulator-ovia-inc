@@ -1,15 +1,41 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListThirdPartyFirewallFirewallPolicies
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListThirdPartyFirewallFirewallPolicies`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListThirdPartyFirewallFirewallPolicies::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports a page of the firewall policies that exist in ONE third-party firewall
+//! vendor's tenant, in the stable `FirewallPolicyId` order the store keeps them in.
+//!
+//! The policies come from
+//! [`crate::state::ComAmazonawsFmsAwsfms20180101State::third_party_firewall_policies`],
+//! the INVENTORY of what the vendors' tenants hold: a third-party firewall policy is
+//! created in the vendor's own console or API and no Firewall Manager operation creates
+//! one, so this operation reports what the store holds for the vendor the request names
+//! — never a policy it made up — and the inventory of a vendor nobody has put a policy
+//! in is legitimately empty.
+//!
+//! These are the policies "associated with the third-party firewall ADMINISTRATOR's
+//! account", so the Firewall Manager administrator has to be a TENANT administrator of
+//! that vendor — the association's terminal `ONBOARD_COMPLETE` status. A vendor the
+//! organisation is not onboarded to has no tenant to enumerate, which is the modelled
+//! `ResourceNotFoundException`.
+//!
+//! Organisation-scoped, so it is refused by
+//! [`crate::state::require_administrator`] with HTTP 400 `AccessDeniedException` when the
+//! account/Region has no Firewall Manager administrator association — before the vendor
+//! association is looked up or any token is decoded — exactly as the
+//! `GetThirdPartyFirewallAssociationStatus` and `DisassociateThirdPartyFirewall`
+//! operations on the same records are.
+//!
+//! Paging follows the model's `@paginated(inputToken: NextToken, outputToken: NextToken,
+//! items: ThirdPartyFirewallFirewallPolicies, pageSize: MaxResults)`: at most `MaxResults`
+//! policies per page, and a `NextToken` ONLY when a policy of that vendor remains after
+//! the page. The token is opaque and carries the store key the next page starts at, so it
+//! round-trips into the next page without a server-side cursor, and a token minted for
+//! another vendor's page is refused rather than resumed from.
+//!
+//! A REPORTING operation: the single write it makes is materialising the association
+//! transition the CLOCK had already made due, which was owed whether or not anybody
+//! called.
 //!
 //! ## Shape of an operation
 //!
@@ -132,6 +158,12 @@ impl From<ListThirdPartyFirewallFirewallPoliciesErrorModeled> for ListThirdParty
     }
 }
 
+/// The largest page this operation serves, which is the maximum the model's
+/// `com.amazonaws.fms#PaginationMaxResults` declares for `MaxResults`
+/// (range 1..100). It bounds the response for every caller, and is the same
+/// bound `ListPolicies` and `ListProtocolsLists` apply.
+const MAX_PAGE_SIZE: usize = 100;
+
 /// The `ListThirdPartyFirewallFirewallPolicies` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -168,18 +200,107 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListThirdPartyFirewallFirewallPolicies` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListThirdPartyFirewallFirewallPoliciesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListThirdPartyFirewallFirewallPolicies"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListThirdPartyFirewallFirewallPoliciesErrorModeled::InternalErrorException(
+                    InternalErrorException {
+                        message: Some("the Firewall Manager store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The authorization gate, BEFORE the vendor association is looked up.
+        crate::state::require_administrator(&store, &crate::state::request_region(ctx.parts()))?;
+
+        // These are "the third-party firewall policies that are associated with
+        // the third-party firewall ADMINISTRATOR's account", so the Firewall
+        // Manager administrator has to BE a tenant administrator of the vendor:
+        // the terminal `ONBOARD_COMPLETE` status an `AssociateThirdPartyFirewall`
+        // leads to. Without that association there is no tenant to enumerate, so
+        // the vendor the request names is a resource this service does not have.
+        let onboarded = store
+            .third_party_firewalls
+            .get_mut(&input.third_party_firewall)
+            .is_some_and(|record| {
+                // The clock-due transition, materialised on read because it was
+                // owed at that instant even if nobody had called; the status the
+                // decision is then made from is the current one.
+                record.settle(now);
+                record.is_onboarded()
+            });
+        if !onboarded {
+            return Err(
+                ListThirdPartyFirewallFirewallPoliciesErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(),
+                )
+                .into(),
+            );
+        }
+
+        // A token this service did not mint, or one minted for ANOTHER vendor's
+        // page, names no boundary in this vendor's policies: every key of this
+        // vendor's range carries the vendor's prefix.
+        let prefix =
+            crate::state::third_party_firewall_policy_key_prefix(&input.third_party_firewall);
+        let start = match input.next_token.as_deref() {
+            Some(token) => {
+                match crate::state::decode_key_token(token).filter(|key| key.starts_with(&prefix)) {
+                    Some(start) => Some(start),
+                    None => {
+                        return Err(
+                            ListThirdPartyFirewallFirewallPoliciesErrorModeled::InvalidInputException(
+                                InvalidInputException {
+                                    message: Some(format!(
+                                        "NextToken is not a pagination token issued by \
+                                         ListThirdPartyFirewallFirewallPolicies for {}",
+                                        input.third_party_firewall
+                                    )),
+                                },
+                            )
+                            .into(),
+                        );
+                    }
+                }
+            }
+            None => None,
+        };
+
+        // The inventory is keyed by vendor, then by firewall policy id, so this
+        // vendor's policies are a contiguous range in id order and a page
+        // boundary is a key: resume at the first key at or after the token's, and
+        // stop at the first key outside this vendor's prefix.
+        let lower = start.unwrap_or_else(|| prefix.clone());
+        let mut remaining = store
+            .third_party_firewall_policies
+            .range(lower..)
+            .take_while(|(key, _)| key.starts_with(&prefix));
+
+        // The page is bounded by the modelled `PaginationMaxResults` range
+        // (1..100), clamped rather than only capped so a page can never be
+        // empty-with-a-token (which a client would follow forever) if that
+        // validation ever changes.
+        let page_size = usize::try_from(input.max_results)
+            .unwrap_or(0)
+            .clamp(1, MAX_PAGE_SIZE);
+        let policies: Vec<ThirdPartyFirewallFirewallPolicy> = remaining
+            .by_ref()
+            .take(page_size)
+            .map(|(_, record)| record.policy())
+            .collect();
+        // A token only when a policy of this vendor is left AFTER this page, so
+        // the last page carries none. It is the next policy's own key, which is
+        // where the following page resumes.
+        let next_token = remaining
+            .next()
+            .map(|(key, _)| crate::state::encode_key_token(key));
+
+        Ok(ListThirdPartyFirewallFirewallPoliciesOutput {
+            third_party_firewall_firewall_policies: Some(policies),
+            next_token,
+        })
     }
 }

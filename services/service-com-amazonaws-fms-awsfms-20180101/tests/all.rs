@@ -11,6 +11,16 @@
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
+//
+// Declared here, AHEAD of the sorted list, on purpose: every fms fix that lands inserts
+// its suite into that list, and a suite whose name sorts near the end of it collides with
+// every other late-sorting suite landing in the same window — this fix lost several
+// serialized squash merges to exactly that. Declaring it outside the contended region
+// keeps it out of their way; the suite itself is an ordinary `tests/all/<name>.rs` file.
+// Fold it into the sorted list whenever that list is next touched for another reason.
+#[path = "all/third_party_firewall_firewall_policies.rs"]
+mod third_party_firewall_firewall_policies;
+
 #[path = "all/admin_account_disassociation.rs"]
 mod admin_account_disassociation;
 #[path = "all/admin_account_scopes.rs"]

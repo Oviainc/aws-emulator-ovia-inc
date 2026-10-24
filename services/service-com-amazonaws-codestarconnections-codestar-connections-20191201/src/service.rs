@@ -63,6 +63,14 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             entry: crate::ServiceDefinition::new(engine),
         }
     }
+
+    /// This service's model shape id, as the generated identity states it
+    /// (`com.amazonaws.codestarconnections#CodeStar_connections_20191201`), whose LOCAL
+    /// name is the last segment of every `X-Amz-Target` prefix a client writes for it.
+    /// Read off the model rather than written out, so it cannot drift from it.
+    fn shape_id(&self) -> &str {
+        self.entry.identity().shape_id()
+    }
 }
 
 impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
@@ -77,37 +85,56 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // Claim a request whose resolved route key is this service's signing
         // name. Edit this for anything the model does not express — a signing
         // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
-            Some(key) => key == self.entry.identity().signing_name(),
-            None => false,
+        if smithy_server_runtime::resolve_route_key(parts)
+            .is_some_and(|key| key == self.entry.identity().signing_name())
+        {
+            return true;
         }
+        // A request that carries no SigV4 credential scope is routed by its
+        // `X-Amz-Target` before its `Host`, and the framework reads that signal as the
+        // segment before the FIRST dot — which, for this service's dotted target prefix,
+        // is a namespace label (`com`) that names no service, so such a request would
+        // reach nobody. The target still names THIS service, read by the same rule the
+        // operation below is read by: `service_common::rpc_target`, this emulator's one
+        // statement of the target rule (the service is the last segment of the prefix,
+        // the operation the segment after it). A target naming another service is still
+        // not claimed, signed or not.
+        service_common::rpc_target::target_operation_of(&parts.headers, self.shape_id())
+            .is_some()
     }
 
     fn override_operation(
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
+        // This service's awsJson1_0 RPC target prefix is the fully qualified Coral
+        // service name, which carries dots of its own, so an SDK sends
+        // `x-amz-target: com.amazonaws.codestar.connections.CodeStar_connections_20191201.<Operation>`.
+        // The framework resolves an awsJson routing key as everything after the FIRST
+        // dot of that header, which for a DOTTED prefix is
+        // `amazonaws.codestar.connections.CodeStar_connections_20191201.<Operation>` — a
+        // key no modeled operation is wired under, so every such request is refused as
+        // an unknown operation (HTTP 501 `NotImplemented`) before any handler runs.
         //
-        // NOTE for whoever fixes `codestar-connections`'s dispatch gap (the open issue
-        // `…-implemented-connection-operations-answer-501-notimplemented-instead-of.md`):
-        // this service's published awsJson1_0 target prefix is the Coral service name,
-        // dots and all (`com.amazonaws.codestar.connections.CodeStar_connections_20191201`),
-        // and the framework resolves an awsJson routing key as everything after the FIRST
-        // dot of `x-amz-target`, so an SDK's target resolves to a key no modeled
-        // operation is wired under and EVERY operation of this crate is refused here with
-        // the framework's unrouted 501 before its handler runs. The rule that fixes it —
-        // the operation is the segment after the target's LAST dot, the service the
-        // segment before it — is already stated once in `service_common::rpc_target`, and
-        // the CodeConnections crate's seam shows the two calls to make
-        // (`requested_operation` here, `target_operation_of` in `can_handle`). It is one
-        // service-wide change for all 27 operations, so it belongs to that issue rather
-        // than to any one operation's.
-        let _ = req;
-        None
+        // An RPC target names its operation in the segment after the LAST dot, whatever
+        // the prefix in front of it, so that is the segment resolved here; it is the
+        // same answer for the short prefix (`CodeStar_connections_20191201.<Operation>`)
+        // the in-process tests use, so one rule serves both forms. A target whose final
+        // segment names no modeled operation, or whose prefix names another service,
+        // resolves to `None` and is left to the generated routing table, which renders
+        // the protocol's own routing failure.
+        //
+        // The rule is protocol-general rather than service-specific, so it is stated
+        // ONCE, in `service_common::rpc_target`, and read from there by every service in
+        // this emulator whose published prefix carries dots. It belongs further down
+        // still — in the framework's own `routing_key_from_x_amz_target` — but `vendor/`
+        // is read-only here, so this seam is where the emulator can hold it. (This is
+        // the service-wide change the open issue
+        // `…-implemented-connection-operations-answer-501-notimplemented-instead-of.md`
+        // names: every operation of this crate was unreachable without it, including the
+        // `DeleteRepositoryLink` this change implements.)
+        let operation = service_common::rpc_target::requested_operation(req, self.shape_id())?;
+        self.entry.routing_table().get(operation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {

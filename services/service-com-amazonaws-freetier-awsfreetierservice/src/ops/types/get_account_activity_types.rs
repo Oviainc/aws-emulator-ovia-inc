@@ -18,7 +18,12 @@ pub struct GetAccountActivityInput {
     pub language_code: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.freetier#GetAccountActivityResponse")]
+/// `GetAccountActivityResponse`. Its schema and codec come from
+/// [`freetier_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`,
+/// because `expiresAt`, `startedAt` and `completedAt` each carry
+/// `@timestampFormat("date-time")` and the derive drops that trait; see
+/// `types::date_time_wire` for the whole story. Member set, order and requiredness from
+/// `smithy_query(query="operation",operation="GetAccountActivity")`.
 #[derive(Debug, Clone)]
 pub struct GetAccountActivityOutput {
     pub activity_id: String,
@@ -32,4 +37,39 @@ pub struct GetAccountActivityOutput {
     pub started_at: Option<::aws_smithy_types::DateTime>,
     pub completed_at: Option<::aws_smithy_types::DateTime>,
 }
+
+freetier_schema_and_codec!(
+    GetAccountActivityOutput,
+    GET_ACCOUNT_ACTIVITY_OUTPUT_SCHEMA,
+    "com.amazonaws.freetier#GetAccountActivityResponse",
+    "com.amazonaws.freetier",
+    "GetAccountActivityResponse",
+    (M_ACTIVITY_ID, activity_id, "activityId", 0, req, string),
+    (M_TITLE, title, "title", 1, req, string),
+    (M_DESCRIPTION, description, "description", 2, req, string),
+    // `ActivityStatus` is an enum shape: string-encoded on the wire.
+    (M_STATUS, status, "status", 3, req, string),
+    (
+        M_INSTRUCTIONS_URL,
+        instructions_url,
+        "instructionsUrl",
+        4,
+        req,
+        string
+    ),
+    (M_REWARD, reward, "reward", 5, req, union_of(ActivityReward)),
+    (
+        M_ESTIMATED_TIME_TO_COMPLETE_IN_MINUTES,
+        estimated_time_to_complete_in_minutes,
+        "estimatedTimeToCompleteInMinutes",
+        6,
+        opt,
+        integer
+    ),
+    // The three `@timestampFormat("date-time")` members — the reason this schema is not
+    // derived.
+    (M_EXPIRES_AT, expires_at, "expiresAt", 7, opt, date_time),
+    (M_STARTED_AT, started_at, "startedAt", 8, opt, date_time),
+    (M_COMPLETED_AT, completed_at, "completedAt", 9, opt, date_time),
+);
 

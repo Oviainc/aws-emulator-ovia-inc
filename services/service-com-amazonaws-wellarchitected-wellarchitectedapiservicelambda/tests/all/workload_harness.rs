@@ -469,6 +469,29 @@ pub(crate) fn encode_path_segment(value: &str) -> String {
         .collect()
 }
 
+/// Create a review template applying `lenses` and answer its `TemplateArn` — the one
+/// review-template seeding helper the suites in this crate share.
+pub(crate) async fn review_template(client: &Client, name: &str, lenses: &[&str]) -> String {
+    let answer = client
+        .create_review_template(json!({
+            "TemplateName": name,
+            "Description": "a review template under test",
+            "Lenses": lenses,
+            "ClientRequestToken": format!("tok-{name}"),
+        }))
+        .await;
+    assert_eq!(
+        answer.status, 200,
+        "case {name:?}: expected CreateReviewTemplate 200, got {answer:?}"
+    );
+    answer
+        .body
+        .get("TemplateArn")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
 /// An `AnswerRecord` that records `selected` as the best practices in place, `choices` as
 /// the status of each choice it speaks about, whether the question applies and the reason
 /// it does not — the one answer builder the suites in this crate share.

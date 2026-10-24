@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/activity_language_code.rs"]
 mod activity_language_code;
+#[path = "all/date_time_wire_form.rs"]
+mod date_time_wire_form;
 #[path = "all/free_tier.rs"]
 mod free_tier;
 #[path = "all/state_roundtrip.rs"]

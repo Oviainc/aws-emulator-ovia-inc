@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListContactVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListContactVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListContactVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -142,23 +133,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::LIST_CONTACT_VERSIONS_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Report the version history of the contact `{contactId}` names, one bounded page
+    /// at a time.
+    ///
+    /// A REPORTING operation (`@readonly`, per `smithy_query(query="operation",
+    /// operation="ListContactVersions")`): it persists nothing of its own. The one write
+    /// it makes is `settle_due_contacts`, which materialises the moves the clock already
+    /// owed at this instant — a reservation's `SCHEDULING` -> `SCHEDULED` and an
+    /// update's `UPDATING` -> `ACTIVE`, the latter being exactly what a version record
+    /// reports — each owed whether or not anybody called, so it changes nothing a later
+    /// caller could otherwise have seen.
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListContactVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListContactVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListContactVersions"))
+        /// Names this listing inside its pagination tokens, so a token another listing
+        /// issued is not accepted here.
+        const LISTING: &str = "contact-versions";
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListContactVersionsErrorModeled::DependencyException(DependencyException {
+                message: Some("this service's state store is unavailable".to_string()),
+                parameter_name: None,
+            })
+        })?;
+
+        // An offset counts within ONE contact's version history, so the contact the
+        // request addresses is part of the scope its token is issued under: a token from
+        // another contact's listing, or from another listing of this service, is refused
+        // rather than resuming at an offset into a different sequence.
+        let scope =
+            crate::state::page_scope(LISTING, ::std::slice::from_ref(&input.contact_id));
+
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => crate::state::decode_page_token(&scope, token).ok_or_else(|| {
+                ListContactVersionsErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(
+                            "nextToken was not issued by a previous ListContactVersions call \
+                             for this contact"
+                                .to_string(),
+                        ),
+                        parameter_name: Some("nextToken".to_string()),
+                    },
+                )
+            })?,
+        };
+
+        let mut guard = state.lock();
+        // Apply the moves the clock already owed — the reservation's SCHEDULING ->
+        // SCHEDULED and any update's UPDATING -> ACTIVE — so each version record reports
+        // the status and the `lastUpdated` in force now.
+        guard.settle_due_contacts();
+
+        let contact = guard.contacts.get(&input.contact_id).ok_or_else(|| {
+            ListContactVersionsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                // The status (434) and the error code are the contract; nothing documents
+                // a text for this operation, so it answers what this service's other read
+                // of a contact by its `{contactId}` label answers — `DescribeContact`'s
+                // fixed literal, which discloses no id.
+                message: Some("Contact not found".to_string()),
+            })
+        })?;
+
+        // Every version the store holds for this contact, oldest first
+        // (`Contact::version_history`): a page boundary is only stable over a stable
+        // order.
+        let versions = contact.version_history();
+
+        let (page, next_token) = crate::state::paginate(&scope, &versions, input.max_results, offset);
+
+        Ok(ListContactVersionsOutput {
+            next_token,
+            contact_versions_list: Some(page),
+        })
     }
 }

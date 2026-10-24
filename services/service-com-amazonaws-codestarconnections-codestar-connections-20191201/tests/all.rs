@@ -17,5 +17,7 @@ mod connection_lifecycle;
 mod host_deletion;
 #[path = "all/host_lifecycle.rs"]
 mod host_lifecycle;
+#[path = "all/repository_link_lifecycle.rs"]
+mod repository_link_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

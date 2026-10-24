@@ -2,8 +2,8 @@
 
 //! Engine state for the com-amazonaws-codestarconnections-codestar-connections-20191201 service.
 //!
-//! This module owns the service's persisted resources (connections and their tags)
-//! plus the few request-derived helpers every handler needs: the ARN namespace, the
+//! This module owns the service's persisted resources (connections, repository links
+//! and their tags) plus the few request-derived helpers every handler needs: the ARN namespace, the
 //! region the caller signed for, and the `NextToken` codec the paginated list
 //! operations share. `src/lib.rs` is generated, so a helper several handlers reach
 //! lives here rather than in a module of its own.
@@ -14,7 +14,7 @@ use std::fmt::Write as _;
 use std::hash::BuildHasher;
 use std::time::SystemTime;
 
-use crate::ops::types::{Connection, Host, Tag, VpcConfiguration};
+use crate::ops::types::{Connection, Host, RepositoryLinkInfo, Tag, VpcConfiguration};
 
 /// This service's ARN namespace (`awsService.arnNamespace` in the Smithy model), used
 /// for every ARN the service mints.
@@ -99,6 +99,16 @@ pub const MAX_PAGE_SIZE: usize = 100;
 /// long-lived process cannot grow its state without limit.
 pub const MAX_CONNECTIONS: usize = 1000;
 
+/// The largest number of repository links this emulator holds at once.
+///
+/// As with [`MAX_CONNECTIONS`], refusing past a maximum is the modeled behaviour: the
+/// model declares `LimitExceededException` on `CreateRepositoryLink`, whose doc is
+/// "Exceeded the maximum limit for connections.". The real per-account quota is
+/// adjustable and the model does not state it, so this value is the EMULATOR's bound —
+/// high enough that no realistic client workflow meets it, and finite so a long-lived
+/// process cannot grow its state without limit.
+pub const MAX_REPOSITORY_LINKS: usize = 1000;
+
 /// The largest number of hosts this emulator holds at once.
 ///
 /// A CHOSEN bound, exactly like [`MAX_CONNECTIONS`] and for the same reason: the store
@@ -155,6 +165,50 @@ impl StoredConnection {
             owner_account_id: Some(self.owner_account_id.clone()),
             connection_status: Some(self.connection_status.clone()),
             host_arn: self.host_arn.clone(),
+        }
+    }
+}
+
+/// A repository link as this service persists it.
+///
+/// One record per `RepositoryLinkId`; every member of the modeled `RepositoryLinkInfo`
+/// shape is stored here, so `CreateRepositoryLink` and every later reader of the link
+/// render the same row.
+#[derive(Debug, Clone)]
+pub struct StoredRepositoryLink {
+    /// The link's generated id — the last segment of its ARN, and the key of
+    /// [`ComAmazonawsCodestarconnectionsCodestarConnections20191201State::repository_links`].
+    pub repository_link_id: String,
+    /// The ARN minted for this link.
+    pub repository_link_arn: String,
+    /// The connection Git sync reaches the repository through, as supplied at create.
+    pub connection_arn: String,
+    /// `EncryptionKeyArn`, only when one was supplied at create.
+    pub encryption_key_arn: Option<String>,
+    /// The repository owner at the provider (the GitHub owner id, say).
+    pub owner_id: String,
+    /// DERIVED from the connection, never taken from the request: the modeled
+    /// `RepositoryLinkInfo.ProviderType` is "The provider type for the connection, such
+    /// as GitHub, associated with the repository link", so it is whatever the connection
+    /// the link names reports.
+    pub provider_type: String,
+    /// The repository the link points at.
+    pub repository_name: String,
+    /// Creation order, taken from the store's own monotonic sequence.
+    pub sequence: u64,
+}
+
+impl StoredRepositoryLink {
+    /// This record as the modeled `RepositoryLinkInfo` structure every reader returns.
+    pub fn to_repository_link_info(&self) -> RepositoryLinkInfo {
+        RepositoryLinkInfo {
+            connection_arn: self.connection_arn.clone(),
+            encryption_key_arn: self.encryption_key_arn.clone(),
+            owner_id: self.owner_id.clone(),
+            provider_type: self.provider_type.clone(),
+            repository_link_arn: self.repository_link_arn.clone(),
+            repository_link_id: self.repository_link_id.clone(),
+            repository_name: self.repository_name.clone(),
         }
     }
 }
@@ -216,6 +270,10 @@ impl StoredHost {
 pub struct ComAmazonawsCodestarconnectionsCodestarConnections20191201State {
     /// Every connection in this emulator, keyed by its ARN.
     pub connections: BTreeMap<String, StoredConnection>,
+    /// Every repository link in this emulator, keyed by its `RepositoryLinkId` — the id
+    /// `GetRepositoryLink`, `UpdateRepositoryLink` and `DeleteRepositoryLink` address a
+    /// link by.
+    pub repository_links: BTreeMap<String, StoredRepositoryLink>,
     /// Every host in this emulator, keyed by its ARN. A connection may name one
     /// through `StoredConnection::host_arn`, which is the association `DeleteHost`
     /// refuses to break.
@@ -245,6 +303,26 @@ impl ComAmazonawsCodestarconnectionsCodestarConnections20191201State {
         connections
     }
 
+    /// The repository link already registered for this connection, owner and repository,
+    /// when there is one.
+    ///
+    /// A repository link IS that triple — the connection Git sync reaches the repository
+    /// through, plus the owner and repository it names — so registering the same triple
+    /// twice is the duplicate `CreateRepositoryLink` refuses with the modeled
+    /// `ResourceAlreadyExistsException`.
+    pub fn repository_link_for(
+        &self,
+        connection_arn: &str,
+        owner_id: &str,
+        repository_name: &str,
+    ) -> Option<&StoredRepositoryLink> {
+        self.repository_links.values().find(|link| {
+            link.connection_arn == connection_arn
+                && link.owner_id == owner_id
+                && link.repository_name == repository_name
+        })
+    }
+
     /// How many connections are currently associated with `host_arn`.
     ///
     /// `DeleteHost`'s doc states the precondition this answers: "Before you delete a
@@ -265,10 +343,17 @@ impl ComAmazonawsCodestarconnectionsCodestarConnections20191201State {
     /// modeled over a `ResourceArn` rather than over one resource kind, so each
     /// resolves the ARN through this one predicate: EVERY resource kind this service
     /// persists is tag-addressable, and an ARN naming none of them is the
-    /// `ResourceNotFoundException` those operations declare. `CreateHost` and
-    /// `CreateConnection` both accept `Tags`, so both kinds have to resolve here.
+    /// `ResourceNotFoundException` those operations declare. `CreateHost`,
+    /// `CreateConnection` and `CreateRepositoryLink` all accept `Tags`, so all three
+    /// kinds have to resolve here. A repository link is keyed by its ID, so its ARN is
+    /// resolved over the link records rather than by a map lookup.
     pub fn holds_resource(&self, resource_arn: &str) -> bool {
-        self.connections.contains_key(resource_arn) || self.hosts.contains_key(resource_arn)
+        self.connections.contains_key(resource_arn)
+            || self.hosts.contains_key(resource_arn)
+            || self
+                .repository_links
+                .values()
+                .any(|link| link.repository_link_arn == resource_arn)
     }
 
     /// How many distinct keys `resource_arn` would hold after merging `tags`.
@@ -342,12 +427,16 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
 }
 
 /// Mint the id of a new resource: a hyphenated UUID, which is the shape the real
-/// service's connection and host ids carry (`connection/<uuid>`, `host/<uuid>` in the
-/// ARN).
+/// service's connection, host and repository-link ids carry (`connection/<uuid>`,
+/// `host/<uuid>`, `repository-link/<uuid>` in the ARN, and the modeled
+/// `RepositoryLinkId` pattern
+/// `^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`).
 ///
 /// The low 48 bits carry the store's monotonic `sequence`, so an id is unique BY
 /// CONSTRUCTION — never by probability — and is never handed out twice however many
-/// connections one process mints; the remaining bits come from the process's
+/// resources one process mints (every kind of resource draws from the one counter,
+/// [`ComAmazonawsCodestarconnectionsCodestarConnections20191201State::take_sequence`],
+/// so two kinds cannot collide either); the remaining bits come from the process's
 /// OS-seeded [`RandomState`], so one id does not reveal the next. The version and
 /// variant nibbles are set per RFC 4122 (version 4, variant `10xx`), so a client
 /// that parses the id as a UUID gets a well-formed one. Built from `std` alone: the
@@ -391,6 +480,18 @@ pub fn connection_arn(region: &str, connection_id: &str) -> String {
     )
 }
 
+/// The ARN of a repository link:
+/// `arn:aws:codestar-connections:<region>:<account>:repository-link/<id>` — the form the
+/// modeled `RepositoryLinkArn` pattern requires
+/// (`^arn:aws(?:-[a-z]+)*:codestar-connections:[a-z\-0-9]+:\d{12}:repository-link\/[a-zA-Z0-9\-:/]+$`).
+pub fn repository_link_arn(region: &str, repository_link_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("repository-link/{repository_link_id}"),
+    )
+}
+
 /// The ARN of a host: `arn:aws:codestar-connections:<region>:<account>:host/<id>` — the
 /// modeled `HostArn` form `^arn:aws(-[\w]+)*:codestar-connections:.+:[0-9]{12}:host\/.+$`.
 pub fn host_arn(region: &str, host_id: &str) -> String {
@@ -421,6 +522,77 @@ pub fn decode_next_token(token: &str) -> Option<u64> {
         return None;
     }
     u64::from_str_radix(token, 16).ok()
+}
+
+// ---------------------------------------------------------------------------
+// How this service WORDS a refusal.
+//
+// A refusal carries the FIXED template of the case it refuses, interpolated only from
+// the request and from the resource the service already holds, so two handlers refusing
+// the same case cannot word it differently.
+//
+// The refusals raised by the Git-sync component behind the repository-link surface carry
+// one extra thing: the service framework appends its own tail to the message
+// ([`with_framework_tail`]). The connection surface's refusals do not — what AWS is
+// recorded to answer there is the bare sentence.
+// ---------------------------------------------------------------------------
+
+/// The service name the framework tail states.
+///
+/// NOT this service's own `sdkId` (`CodeStar connections`): the Git-sync component behind
+/// the repository-link surface is the one CodeConnections service, and that is the name
+/// the recorded wire of this endpoint carries in the tail — the recorded
+/// `CreateRepositoryLink` duplicate refusal of
+/// `codestar-connections-repository-link-error-paths#task#3` reads
+/// `… (Service: CodeConnections; …)`.
+const FRAMEWORK_TAIL_SERVICE: &str = "CodeConnections";
+
+/// The HTTP status a refusal is answered with and the exception the framework names for
+/// it in the tail — kept PAIRED so the status the tail states can never drift from the
+/// status the response carries.
+type FrameworkTailFacts = (u16, &'static str);
+
+/// The status this service's recorded wire answers a duplicate repository link with:
+/// HTTP 400, the awsJson1_0 client-error status, not the `@httpError 409` the
+/// `ResourceAlreadyExistsException` shape declares (the recorded
+/// `codestar-connections-repository-link-error-paths#task#3` expectation). The handler
+/// passes it to `crate::scaffolded::Scaffolded::modeled_with_status`, and the tail below
+/// states the same number, so the status the message names cannot drift from the status
+/// the response carries.
+pub const REPOSITORY_LINK_ALREADY_EXISTS_STATUS: u16 = 400;
+
+/// A resource the request would create that is already there, paired with the status it
+/// is answered with ([`REPOSITORY_LINK_ALREADY_EXISTS_STATUS`]).
+const TAIL_RESOURCE_ALREADY_EXISTS: FrameworkTailFacts =
+    (REPOSITORY_LINK_ALREADY_EXISTS_STATUS, "ResourceAlreadyExistsException");
+
+/// `body` followed by the tail the service framework appends to the refusals its Git-sync
+/// component raises:
+/// ` (Service: CodeConnections; Status Code: <status>; Error Code: <code>; Request ID: <id>; Proxy: null)`.
+///
+/// The request id is the only per-run field: it is minted per call by the service —
+/// nothing in the request carries one — from the emulator's one request-id mint
+/// (`service_common::query_error_envelope::new_request_id`, a fresh v4 UUID), so it is
+/// indistinguishable from the one the framework's own renderers report.
+fn with_framework_tail(body: &str, facts: FrameworkTailFacts) -> String {
+    let (status_code, error_code) = facts;
+    format!(
+        "{body} (Service: {FRAMEWORK_TAIL_SERVICE}; Status Code: {status_code}; \
+         Error Code: {error_code}; Request ID: {}; Proxy: null)",
+        ::service_common::query_error_envelope::new_request_id()
+    )
+}
+
+/// What `CreateRepositoryLink` answers when the (connection, owner, repository) triple it
+/// was asked to register is already registered: the ARN of the link that holds it, so a
+/// caller can adopt that link, plus the framework tail.
+///
+/// The ARN is the STORED one, never one rebuilt from the request.
+pub fn repository_link_already_exists_message(existing_repository_link_arn: &str) -> String {
+    with_framework_tail(
+        &format!("RepoConfiguration already exists. Arn: {existing_repository_link_arn}"),
+        TAIL_RESOURCE_ALREADY_EXISTS,
+    )
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

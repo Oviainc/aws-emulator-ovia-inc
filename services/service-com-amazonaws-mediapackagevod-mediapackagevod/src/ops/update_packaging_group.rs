@@ -19,6 +19,11 @@
 //! alone — "You can't change the id attribute or any other system-generated
 //! attributes."
 //!
+//! A block whose members are not the ARNs they are documented as — a Secrets Manager
+//! secret and an IAM role — is refused with `UnprocessableEntityException` (422)
+//! attributing the violation to the offending member, and the group keeps the
+//! authorization it had: see [`crate::state::check_authorization_arns`].
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -174,16 +179,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         let region = crate::state::request_region(ctx.parts());
-        let mut state = store.lock();
 
         // The CDN authorization block names a Secrets Manager secret and the IAM role
         // MediaPackage reads it as, so both members are read as ARNs of those services
-        // BEFORE the addressed group is resolved and written: a value the caller has to
-        // fix is a violation of that PARAMETER whichever group the URI names, and a
-        // refused update leaves the group's previous authorization exactly as it was.
+        // BEFORE the store is reached and the addressed group resolved: a value the
+        // caller has to fix is a violation of that PARAMETER whichever group the URI
+        // names, and a refused update leaves the group's previous authorization
+        // exactly as it was.
         if let Some(authorization) = input.authorization.as_ref() {
             crate::state::check_authorization_arns(authorization)?;
         }
+
+        let mut state = store.lock();
 
         // This operation addresses an existing group by its `Id` path label within the
         // Region it was served in, so a group that Region holds none of is a missing

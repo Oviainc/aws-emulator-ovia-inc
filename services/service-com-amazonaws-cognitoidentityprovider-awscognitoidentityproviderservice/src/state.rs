@@ -16,10 +16,10 @@ use ::sha2::Digest;
 
 use crate::ops::types::{
     AccountRecoverySettingType, AcrLevelConfigType, AdminCreateUserConfigType,
-    AnalyticsConfigurationType, AttributeType, AuthenticationResultType, DeviceConfigurationType,
-    EmailConfigurationType, GroupType, IssuerConfigurationType, KeyConfigurationType,
-    LambdaConfigType, MFAOptionType, NumberAttributeConstraintsType, PasswordPolicyType,
-    RefreshTokenRotationType,
+    AnalyticsConfigurationType, AttributeType, AuthenticationResultType, CustomDomainConfigType,
+    DeviceConfigurationType, DomainDescriptionType, EmailConfigurationType, GroupType,
+    IssuerConfigurationType, KeyConfigurationType, LambdaConfigType, MFAOptionType,
+    NumberAttributeConstraintsType, PasswordPolicyType, RefreshTokenRotationType, RoutingType,
     SchemaAttributeType, SignInPolicyType, SmsConfigurationType, StringAttributeConstraintsType,
     TokenValidityUnitsType, UserAttributeUpdateSettingsType, UserPoolAddOnsType,
     UserPoolClientType, UserPoolPolicyType, UserPoolType, UserType, UsernameConfigurationType,
@@ -112,6 +112,54 @@ const DEFAULT_DELETION_PROTECTION: &str = "INACTIVE";
 const DEFAULT_PREVENT_USER_EXISTENCE_ERRORS: &str = "LEGACY";
 
 // ---------------------------------------------------------------------------
+// User pool domains
+// ---------------------------------------------------------------------------
+
+/// The managed login branding version for hosted UI (classic): "A value of `1`
+/// indicates hosted UI (classic) and a version of `2` indicates managed login"
+/// (`CreateUserPoolDomain.ManagedLoginVersion` in this service's model).
+pub const HOSTED_UI_CLASSIC_BRANDING: i32 = 1;
+
+/// The managed login branding version, which the same member documents as
+/// needing "your user pool be configured for any feature plan other than
+/// `Lite`".
+pub const MANAGED_LOGIN_BRANDING: i32 = 2;
+
+/// The only branding versions `ManagedLoginVersion` names, so a request asking
+/// for any other value asks for a version that does not exist.
+pub const MANAGED_LOGIN_VERSIONS: [i32; 2] = [HOSTED_UI_CLASSIC_BRANDING, MANAGED_LOGIN_BRANDING];
+
+/// The branding version a domain created without one carries: the model names
+/// only the two above, and hosted UI (classic) is the one that needs no feature
+/// plan.
+pub const DEFAULT_MANAGED_LOGIN_VERSION: i32 = HOSTED_UI_CLASSIC_BRANDING;
+
+/// The feature plan managed login is NOT included in
+/// (`CreateUserPoolDomain.ManagedLoginVersion`); one of the modelled
+/// `UserPoolTierType` values.
+pub const LITE_USER_POOL_TIER: &str = "LITE";
+
+/// The `DomainStatusType` a freshly created domain is in, until the clock makes
+/// its activation due: one of the modelled
+/// [`crate::ops::types::DOMAIN_STATUS_TYPE_VALUES`].
+pub const DOMAIN_STATUS_CREATING: &str = "CREATING";
+
+/// The `DomainStatusType` a domain reaches once [`DOMAIN_ACTIVATION_SPAN`] has
+/// elapsed: one of the modelled
+/// [`crate::ops::types::DOMAIN_STATUS_TYPE_VALUES`].
+pub const DOMAIN_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// How long a created domain stays `CREATING` before the clock owes it `ACTIVE`.
+///
+/// A chosen span, not a documented duration: `CreateUserPoolDomain` only says
+/// "Your prefix domain might take up to one minute to take effect" and "Your
+/// custom domain is online within five minutes", so a domain is NOT ready when
+/// the call returns, and this emulator makes the transition due shortly after
+/// instead of waiting minutes. Never zero, so a caller reading the domain right
+/// after creating it still sees `CREATING`.
+pub const DOMAIN_ACTIVATION_SPAN: Duration = Duration::from_millis(500);
+
+// ---------------------------------------------------------------------------
 // Store bounds
 //
 // This state lives in the emulator's memory, so every store a caller can grow
@@ -177,6 +225,18 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
         self.user_pools
             .values()
             .find(|pool| pool.clients.contains_key(client_id))
+    }
+
+    /// The stored user pool domain `domain` names, prefix or custom, or `None`
+    /// when no pool in this emulator holds it.
+    ///
+    /// `DescribeUserPoolDomain` identifies a domain by `Domain` ALONE and models
+    /// no `UserPoolId` member, so one domain string names at most one pool: the
+    /// lookup spans every pool rather than one.
+    pub fn domain(&self, domain: &str) -> Option<&UserPoolDomain> {
+        self.user_pools
+            .values()
+            .find_map(|pool| pool.domain_named(domain))
     }
 
     /// Store a challenge session and return its token.
@@ -454,6 +514,13 @@ pub struct UserPool {
     pub acr_configuration: Option<HashMap<String, AcrLevelConfigType>>,
     pub sms_authentication_message: Option<String>,
     pub tags: HashMap<String, String>,
+    /// This pool's Amazon Cognito prefix domain, once one is created:
+    /// `UserPoolType.Domain` is "The domain prefix, if the user pool has a
+    /// domain associated with it" — a single value, so a pool holds at most one.
+    pub domain: Option<UserPoolDomain>,
+    /// This pool's custom domain, once one is created: `UserPoolType.CustomDomain`
+    /// is a single value too, so a pool holds at most one of those as well.
+    pub custom_domain: Option<UserPoolDomain>,
     pub clients: HashMap<String, UserPoolClient>,
     /// Users keyed by [`UserPool::user_key`], so a pool configured
     /// case-insensitive treats `Alice` and `alice` as one user.
@@ -657,6 +724,15 @@ impl UserPool {
             .collect()
     }
 
+    /// This pool's domain under the name `domain` — its prefix domain or its
+    /// custom one — or `None` when this pool holds no domain of that name.
+    pub fn domain_named(&self, domain: &str) -> Option<&UserPoolDomain> {
+        [self.domain.as_ref(), self.custom_domain.as_ref()]
+            .into_iter()
+            .flatten()
+            .find(|stored| stored.domain == domain)
+    }
+
     /// The modelled view of this pool, rendered from what is stored.
     pub fn to_user_pool_type(&self) -> UserPoolType {
         UserPoolType {
@@ -689,8 +765,8 @@ impl UserPool {
             user_pool_tags: Some(self.tags.clone()),
             sms_configuration_failure: None,
             email_configuration_failure: None,
-            domain: None,
-            custom_domain: None,
+            domain: self.domain.as_ref().map(|domain| domain.domain.clone()),
+            custom_domain: self.custom_domain.as_ref().map(|domain| domain.domain.clone()),
             admin_create_user_config: Some(self.admin_create_user_config.clone()),
             user_pool_add_ons: self.user_pool_add_ons.clone(),
             username_configuration: self.username_configuration.clone(),
@@ -700,6 +776,104 @@ impl UserPool {
             key_configuration: self.key_configuration.clone(),
             issuer_configuration: self.issuer_configuration.clone(),
             acr_configuration: self.acr_configuration.clone(),
+        }
+    }
+}
+
+/// One stored user pool domain: what `CreateUserPoolDomain` persisted and every
+/// later read of that domain renders.
+///
+/// A domain is a PREFIX domain when it carries no `CustomDomainConfig` and a
+/// CUSTOM domain when it does (`CreateUserPoolDomain.CustomDomainConfig`:
+/// "Provide this parameter only if you want to use a custom domain for your user
+/// pool. Otherwise, you can omit this parameter and use a prefix domain
+/// instead.").
+#[derive(Debug, Clone)]
+pub struct UserPoolDomain {
+    /// The domain string the request named, which is this resource's key.
+    pub domain: String,
+    /// The pool the domain is attached to.
+    pub user_pool_id: String,
+    /// The custom-domain configuration as submitted; `None` for a prefix domain.
+    pub custom_domain_config: Option<CustomDomainConfigType>,
+    /// The managed login branding version in force for this domain.
+    pub managed_login_version: i32,
+    /// The routing configuration as submitted, which only a custom domain may
+    /// carry.
+    pub routing: Option<RoutingType>,
+    /// The CloudFront endpoint that hosts a CUSTOM domain, minted with it;
+    /// `None` for a prefix domain, for which `CreateUserPoolDomain` documents
+    /// "If you set an Amazon Cognito prefix domain, this parameter returns
+    /// null."
+    pub cloud_front_distribution: Option<String>,
+    /// When the domain was created.
+    pub creation_date: SystemTime,
+    /// The instant the clock owes this domain's `CREATING` -> `ACTIVE` move.
+    /// Stored, never slept on: a read computes the status from it.
+    pub active_at: SystemTime,
+}
+
+impl UserPoolDomain {
+    /// A new domain for `user_pool_id`, `CREATING` until the clock makes its
+    /// activation due one [`DOMAIN_ACTIVATION_SPAN`] from `now`.
+    pub fn new(
+        domain: String,
+        user_pool_id: String,
+        custom_domain_config: Option<CustomDomainConfigType>,
+        managed_login_version: i32,
+        routing: Option<RoutingType>,
+        now: SystemTime,
+    ) -> Self {
+        // A custom domain is served through CloudFront, and the caller has to
+        // point an alias record at that endpoint, so one is minted with the
+        // domain; a prefix domain has none.
+        let cloud_front_distribution = custom_domain_config
+            .is_some()
+            .then(new_cloud_front_domain);
+        Self {
+            domain,
+            user_pool_id,
+            custom_domain_config,
+            managed_login_version,
+            routing,
+            cloud_front_distribution,
+            creation_date: now,
+            active_at: now + DOMAIN_ACTIVATION_SPAN,
+        }
+    }
+
+    /// Whether this is a custom domain rather than an Amazon Cognito prefix one.
+    pub fn is_custom(&self) -> bool {
+        self.custom_domain_config.is_some()
+    }
+
+    /// This domain's `DomainStatusType` as of `now`: `CREATING` until the clock
+    /// has made its activation due, `ACTIVE` from then on.
+    pub fn status(&self, now: SystemTime) -> &'static str {
+        if now >= self.active_at {
+            DOMAIN_STATUS_ACTIVE
+        } else {
+            DOMAIN_STATUS_CREATING
+        }
+    }
+
+    /// The modelled view of this domain, rendered from what is stored.
+    pub fn to_domain_description(&self, now: SystemTime) -> DomainDescriptionType {
+        DomainDescriptionType {
+            user_pool_id: Some(self.user_pool_id.clone()),
+            aws_account_id: Some(::engine::emulator_account_id().to_string()),
+            domain: Some(self.domain.clone()),
+            // `S3Bucket` is "The Amazon S3 bucket where the static files for
+            // this domain are stored" and `Version` "The app version": both
+            // name AWS-internal hosted-UI infrastructure this emulator does not
+            // deploy, so neither is invented.
+            s3_bucket: None,
+            cloud_front_distribution: self.cloud_front_distribution.clone(),
+            version: None,
+            status: Some(self.status(now).to_string()),
+            custom_domain_config: self.custom_domain_config.clone(),
+            managed_login_version: Some(self.managed_login_version),
+            routing: self.routing.clone(),
         }
     }
 }
@@ -1279,6 +1453,8 @@ pub fn new_user_pool(name: String, region: &str, now: SystemTime) -> UserPool {
         acr_configuration: None,
         sms_authentication_message: None,
         tags: HashMap::new(),
+        domain: None,
+        custom_domain: None,
         clients: HashMap::new(),
         users: HashMap::new(),
         groups: BTreeMap::new(),
@@ -1316,6 +1492,15 @@ fn sanitize_region(region: &str) -> String {
 /// modelled pattern `^[\w-]+_[0-9a-zA-Z]+$` and length 1..55.
 fn new_pool_id(region: &str) -> String {
     format!("{region}_{}", random_token(9))
+}
+
+/// A fresh CloudFront endpoint for a custom domain: `<distribution>.cloudfront.net`,
+/// the form AWS reports as "The fully-qualified domain name (FQDN) of the Amazon
+/// CloudFront distribution" (`CreateUserPoolDomain.CloudFrontDomain`) and the
+/// value a caller's alias record has to point at. A CloudFront distribution
+/// domain is `d` followed by 13 lowercase alphanumerics.
+fn new_cloud_front_domain() -> String {
+    format!("d{}.cloudfront.net", random_token(13))
 }
 
 /// A fresh `ClientId`: 26 characters, satisfying the modelled `^[\w+]+$`.

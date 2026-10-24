@@ -31,3 +31,5 @@ mod token_signing;
 mod update_user_pool;
 #[path = "all/update_user_pool_client.rs"]
 mod update_user_pool_client;
+#[path = "all/user_pool_domain.rs"]
+mod user_pool_domain;

@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListClusters
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListClusters`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListClusters::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Retrieve the list of Clusters." Reports the clusters this service's store
+//! holds, each exactly once, in the order their ids were minted, cut into pages
+//! of at most `MaxResults` (bounded by [`crate::state::MAX_LIST_PAGE_SIZE`]) whose
+//! `NextToken` is the id the next page resumes at and is absent on the last page
+//! — the same page walk every other collection listing in this crate performs
+//! (see `list_networks`, `list_multiplexes`).
+//!
+//! Every reported cluster comes from the ONE projection `DescribeCluster` and
+//! `CreateCluster` answer from
+//! ([`crate::state::ComAmazonawsMedialiveMedialiveState::cluster_description`]),
+//! which answers the model's own `DescribeClusterSummary` — so a listed summary
+//! cannot drift from the described cluster.
+//!
+//! REPORTING only: the single write this handler's read performs is
+//! [`crate::state::ComAmazonawsMedialiveMedialiveState::settle`], which
+//! materialises the transitions the clock had already made due (a cluster's
+//! `CREATING` -> `ACTIVE` step among them) and were owed whether or not this
+//! listing ran.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +160,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListClusters` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListClustersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListClusters"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        // `MaxResults` is a page size, so a non-positive one asks for nothing and
+        // is a bad request. It is clamped to a finite ceiling, and an absent one
+        // uses that ceiling, so no single request can ask the service to project
+        // an unbounded number of clusters in one response.
+        let page_size = match input.max_results {
+            Some(max_results) if max_results < 1 => {
+                return Err(bad_request(&format!(
+                    "maxResults must be at least 1, got {max_results}"
+                )));
+            }
+            Some(max_results) => (max_results as usize).min(crate::state::MAX_LIST_PAGE_SIZE),
+            None => crate::state::MAX_LIST_PAGE_SIZE,
+        };
+
+        let mut state = state.lock();
+        // Reporting only: `settle` materialises the transitions the clock had
+        // already made due — a cluster's `CREATING` -> `ACTIVE` step among them —
+        // which were owed whether or not this listing ran, so a listed cluster
+        // reports the same `State` a describe of it does.
+        state.settle(::std::time::SystemTime::now());
+        let state = &*state;
+
+        // `NextToken` is the id the next page starts at, and ids sort in mint
+        // order in the `BTreeMap`, so resuming is a range scan from that id. A
+        // token naming a cluster gone since the previous page simply resumes at
+        // the next surviving id instead of failing.
+        let first = match input.next_token.as_deref() {
+            Some(token) => ::std::ops::Bound::Included(token),
+            None => ::std::ops::Bound::Unbounded,
+        };
+        let mut remaining = state
+            .clusters
+            .range::<str, _>((first, ::std::ops::Bound::Unbounded));
+
+        // Every cluster is reported through the ONE projection `DescribeCluster`
+        // answers from, so a summary cannot drift from the described cluster.
+        let clusters: Vec<DescribeClusterSummary> = remaining
+            .by_ref()
+            .take(page_size)
+            .filter_map(|(id, _)| state.cluster_description(id))
+            .collect();
+        // Absent on the last page: a token is handed out only when a cluster is
+        // left over after this one.
+        let next_token = remaining.next().map(|(id, _)| id.clone());
+
+        Ok(ListClustersOutput {
+            clusters: Some(clusters),
+            next_token,
+        })
     }
+}
+
+/// A request this operation cannot read, as its modelled 400.
+fn bad_request(message: &str) -> ListClustersError {
+    ListClustersErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no store to list the clusters from. A modelled server error,
+/// never a fresh engine (which would answer from an empty private store).
+fn unavailable() -> ListClustersError {
+    ListClustersErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
 }
