@@ -1,15 +1,38 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SubmitFeedback
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SubmitFeedback`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SubmitFeedback::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Files the caller's feedback about one anomaly instance against the named profiling
+//! group's stored record, and answers the modelled empty 204.
+//!
+//! What this handler writes, and against what:
+//!
+//! * the group must exist, or the operation answers its modelled
+//!   `ResourceNotFoundException` (HTTP 404) in the sentence every operation ON a group
+//!   states for a name it cannot resolve ([`crate::state::group_not_found_message`]);
+//! * the submission is stored on that group as a [`crate::state::AnomalyFeedback`] — the
+//!   anomaly instance it is about, the `FeedbackType` submitted, the optional comment as
+//!   sent, and the instant it was filed — keyed by the anomaly instance, so the latest
+//!   submission about one instance is the one the group holds (the modelled `UserFeedback`
+//!   reported on an `AnomalyInstance` carries a single `type`, not a history). Submitting
+//!   again about the same instance therefore supersedes, and is accepted rather than
+//!   refused as a conflict.
+//!
+//! The feedback is scoped to the group it was submitted for, so one anomaly instance id
+//! used under two groups files two independent submissions, and deleting a group takes the
+//! feedback submitted against it with it.
+//!
+//! Why the anomaly instance itself is NOT looked up: an `AnomalyInstance` reaches a caller
+//! only through the analysis `GetRecommendations` reports, and this emulator runs no
+//! anomaly detector over the agent profiles it stores (see that operation's module docs),
+//! so there is no stored catalogue of anomaly instances to resolve the id against —
+//! inventing one to refuse against would be fabricated state. The id's shape is the
+//! model's (`AnomalyInstanceId`'s UUID pattern), already enforced by the boundary walk,
+//! and the 404 is the answer about the resource this store does hold: the profiling group.
+//!
+//! The model marks this operation `@readonly`, which its own documentation contradicts —
+//! "Sends feedback to CodeGuru Profiler", over `POST` and with no output members: what the
+//! operation DOES is submit feedback, so the submission is persisted here.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +170,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SubmitFeedback` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SubmitFeedbackErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SubmitFeedback"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            SubmitFeedbackErrorModeled::InternalServerException(InternalServerException {
+                message: "the profiling-group store is unavailable".to_string(),
+            })
+        })?;
+
+        let mut guard = state.lock();
+        let group = guard
+            .groups
+            .get_mut(&input.profiling_group_name)
+            .ok_or_else(|| {
+                SubmitFeedbackErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: crate::state::group_not_found_message(&input.profiling_group_name),
+                })
+            })?;
+
+        // One anomaly instance carries one feedback, so a submission about an instance the
+        // group already holds feedback about supersedes it. The submitted members are MOVED
+        // out of the request: nothing else reads them after this.
+        group.submit_anomaly_feedback(crate::state::AnomalyFeedback {
+            anomaly_instance_id: input.anomaly_instance_id,
+            feedback_type: input.r#type,
+            comment: input.comment,
+            submitted_at: crate::state::now(),
+        });
+
+        Ok(SubmitFeedbackOutput {})
     }
 }

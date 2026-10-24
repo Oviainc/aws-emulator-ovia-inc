@@ -47,7 +47,8 @@ use crate::ops::types::{
     DBStorageConfiguration, Filter,
     EBSEffectiveRecommendationPreferences, EBSEstimatedMonthlySavings, EBSFilter,
     EBSSavingsEstimationMode,
-    EBSSavingsOpportunityAfterDiscounts, EBSUtilizationMetric, EffectivePreferredResource,
+    EBSSavingsOpportunityAfterDiscounts, EBSUtilizationMetric, ECSServiceRecommendationFilter,
+    EffectivePreferredResource,
     EffectiveRecommendationPreferences, EnrollmentFilter, EstimatedMonthlySavings,
     ExportDestination, ExternalMetricsPreference, IdleEstimatedMonthlySavings, IdleRecommendation,
     IdleRecommendationFilter, IdleSavingsOpportunity, IdleSavingsOpportunityAfterDiscounts,
@@ -68,6 +69,9 @@ use crate::ops::types::{
     IDLE_VALUES, INFERRED_WORKLOAD_TYPE_VALUES,
     INSTANCE_RECOMMENDATION_FINDING_REASON_CODE_VALUES, JOB_FILTER_NAME_VALUES,
     JOB_STATUS_VALUES, E_B_S_FILTER_NAME_VALUES, E_B_S_FINDING_VALUES,
+    E_C_S_SERVICE_RECOMMENDATION_FILTER_NAME_VALUES,
+    E_C_S_SERVICE_RECOMMENDATION_FINDING_REASON_CODE_VALUES,
+    E_C_S_SERVICE_RECOMMENDATION_FINDING_VALUES,
     LAMBDA_FUNCTION_RECOMMENDATION_FILTER_NAME_VALUES,
     LAMBDA_FUNCTION_RECOMMENDATION_FINDING_REASON_CODE_VALUES,
     LAMBDA_FUNCTION_RECOMMENDATION_FINDING_VALUES, LICENSE_FINDING_REASON_CODE_VALUES,
@@ -4972,6 +4976,74 @@ fn observed_licensed_instances() -> Vec<ObservedLicensedInstance> {
             &[],
         ),
     ]
+}
+
+/// The `ECSServiceRecommendationFilterName` values
+/// (`crate::ops::types::E_C_S_SERVICE_RECOMMENDATION_FILTER_NAME_VALUES`), named so the
+/// rules over them read as the model spells them: "Specify `Finding` to return
+/// recommendations with a specific finding classification"; "Specify `FindingReasonCode` to
+/// return recommendations with a specific finding reason code".
+pub const ECS_FILTER_FINDING: &str = "Finding";
+/// See [`ECS_FILTER_FINDING`].
+pub const ECS_FILTER_FINDING_REASON_CODE: &str = "FindingReasonCode";
+
+/// Check an `ECSServiceRecommendationFilters` list against the vocabulary the model declares
+/// for it, returning the reason it is not valid.
+///
+/// `name` is an `ECSServiceRecommendationFilterName` and the values a filter carries are the
+/// value set of the member that name selects on: "If you specify the `name` parameter as
+/// `Finding`, specify `Optimized`, `Underprovisioned`, or `Overprovisioned`"; "If you
+/// specify the `name` parameter as `FindingReasonCode`, specify `CPUUnderprovisioned`,
+/// `CPUOverprovisioned`, `MemoryUnderprovisioned`, or `MemoryOverprovisioned`". A name or a
+/// value outside those sets is refused rather than silently matching nothing, and so is a
+/// filter that names no member to select on at all: the same rule [`ebs_filter_rejection`]
+/// applies to the other recommendation filters of this service. Stated once here, so the
+/// Amazon ECS service recommendations READER and the Amazon ECS service recommendations
+/// EXPORT admit exactly the same filter set.
+pub fn ecs_filter_rejection(filters: &[ECSServiceRecommendationFilter]) -> Option<String> {
+    for filter in filters {
+        let Some(name) = filter.name.as_deref() else {
+            return Some(format!(
+                "The value supplied for parameter filters is not valid: a filter name must be \
+                 supplied, one of [{}].",
+                E_C_S_SERVICE_RECOMMENDATION_FILTER_NAME_VALUES.join(", ")
+            ));
+        };
+        let Some(vocabulary) = ecs_filter_vocabulary(name) else {
+            return Some(format!(
+                "The value supplied for parameter filters is not valid: {name} is not a filter \
+                 name, which must be one of [{}].",
+                E_C_S_SERVICE_RECOMMENDATION_FILTER_NAME_VALUES.join(", ")
+            ));
+        };
+        if let Some(value) = filter
+            .values
+            .iter()
+            .flatten()
+            .find(|value| !vocabulary.contains(&value.as_str()))
+        {
+            return Some(format!(
+                "The value supplied for parameter filters is not valid: {value} is not a value \
+                 of the {name} filter, which must be one of [{}].",
+                vocabulary.join(", ")
+            ));
+        }
+    }
+    None
+}
+
+/// The value set an `ECSServiceRecommendationFilterName` selects on — `Finding` selects on
+/// `ECSServiceRecommendationFinding` and `FindingReasonCode` on
+/// `ECSServiceRecommendationFindingReasonCode` — or `None` for a name the model does not
+/// declare, which is what makes [`ecs_filter_rejection`] refuse it.
+fn ecs_filter_vocabulary(name: &str) -> Option<&'static [&'static str]> {
+    match name {
+        ECS_FILTER_FINDING => Some(E_C_S_SERVICE_RECOMMENDATION_FINDING_VALUES),
+        ECS_FILTER_FINDING_REASON_CODE => {
+            Some(E_C_S_SERVICE_RECOMMENDATION_FINDING_REASON_CODE_VALUES)
+        }
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
