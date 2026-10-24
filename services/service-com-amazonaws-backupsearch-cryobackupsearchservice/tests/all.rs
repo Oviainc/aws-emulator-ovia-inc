@@ -21,6 +21,8 @@ mod export_listing_order;
 mod resource_tags;
 #[path = "all/search_job_outcome_and_paging.rs"]
 mod search_job_outcome_and_paging;
+#[path = "all/search_job_status_phases.rs"]
+mod search_job_status_phases;
 #[path = "all/search_jobs.rs"]
 mod search_jobs;
 #[path = "all/state_roundtrip.rs"]

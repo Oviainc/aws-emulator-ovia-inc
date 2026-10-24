@@ -3,8 +3,8 @@
 //! Engine state for the com-amazonaws-iotsitewise-awsiotsitewise service.
 //!
 //! The asset-model / asset / property-value, gateway and dataset slices of IoT
-//! SiteWise
-//! live here: one map per resource plus the indexes the modelled lookup forms need
+//! SiteWise live here: one map per resource plus the indexes the modelled lookup
+//! forms need
 //! (`externalId:<id>` labels, property aliases, a gateway's platform device). A
 //! resource's tags live on that resource's own record, reached by ARN through
 //! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::tags_for_resource`], so the
@@ -12,22 +12,26 @@
 //! stream no asset property owns lives in its own map
 //! ([`ComAmazonawsIotsitewiseAwsiotsitewiseState::disassociated_time_series`]),
 //! which is what `DisassociateTimeSeriesFromAssetProperty` leaves behind and what
-//! alias-addressed ingestion creates. The service's own settings live here too:
+//! alias-addressed ingestion creates. A workspace's pipelines live in
+//! [`ComAmazonawsIotsitewiseAwsiotsitewiseState::pipelines`], keyed by the
+//! workspace and the pipeline name, each record carrying every version written
+//! to it, bounded by [`MAX_PIPELINE_VERSIONS`], so a read naming an older
+//! version still answers from it. The service's own settings live here too:
 //! the logging options, one entry per scope a call named
 //! ([`ComAmazonawsIotsitewiseAwsiotsitewiseState::logging_options`]). Every
 //! handler reads and writes THIS struct through [`service_state`]; nothing in
 //! `src/ops/` keeps state of its own.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AggregatedValue, Aggregates, AssetHierarchy, AssetModelCompositeModel,
     AssetModelCompositeModelPathSegment, AssetModelCompositeModelSummary, AssetModelHierarchy,
     AssetModelProperty, AssetModelPropertyDefinition, AssetModelStatus, AssetProperty,
-    AssetPropertyValue, AssetStatus, AssetSummary, DatasetConfig, DatasetSource, DatasetStatus,
-    ExpressionVariable, GatewayCapabilitySummary, GatewayPlatform, LoggingOptions, PropertyType,
-    TimeInNanos, Variant,
+    AssetPropertyValue, AssetStatus, AssetSummary, ComputeNode, DatasetConfig, DatasetSource,
+    DatasetStatus, ExpressionVariable, GatewayCapabilitySummary, GatewayPlatform, LoggingOptions,
+    PropertyType, ResourceStatus, TimeInNanos, Variant,
 };
 
 /// The `iotsitewise` ARN service namespace, as `OPERATIONS.md` reports it.
@@ -189,6 +193,46 @@ pub const ASSET_RESOURCE_TYPE: &str = "asset";
 pub const ASSET_MODEL_RESOURCE_TYPE: &str = "asset-model";
 /// The ARN resource-type segment of a gateway ARN, as [`gateway_arn`] builds it.
 pub const GATEWAY_RESOURCE_TYPE: &str = "gateway";
+/// The ARN resource-type segment of a pipeline ARN, as [`pipeline_arn`] builds it.
+pub const PIPELINE_RESOURCE_TYPE: &str = "pipeline";
+
+/// How many pipelines one workspace holds.
+///
+/// The same kind of bound, and for the same reason, as [`MAX_GATEWAYS`]: a create
+/// is the only thing that adds a pipeline and nothing evicts one, so the map needs
+/// a maximum entry count. The emulator's own bound, not a published AWS default,
+/// and high enough that no ordinary workflow meets it; `CreatePipeline` refuses
+/// past it with the modelled `LimitExceededException` (HTTP 410).
+pub const MAX_PIPELINES_PER_WORKSPACE: usize = 100;
+
+/// How many pipelines the store holds in total, across every workspace.
+///
+/// The per-workspace cap above cannot bound the store on its own: `workspaceName`
+/// is a caller-supplied string and this service holds no workspace registry to
+/// resolve it against, so a caller naming a fresh workspace each time would open a
+/// new per-workspace bucket. This is the whole map's entry count, refused past the
+/// cap with the modelled `LimitExceededException` (HTTP 410) — the same bound, and
+/// for the same reason, as [`MAX_GATEWAYS`].
+pub const MAX_PIPELINES: usize = 1_000;
+
+/// How many versions one pipeline keeps.
+///
+/// Unlike the entry-count caps above, a pipeline's version history HAS an
+/// eviction policy available to it: a read answers from the newest version unless
+/// it names an older one, so the OLDEST superseded version is the one that can go.
+/// Past this many versions [`PipelineRecord::record_update`] drops the oldest, so
+/// repeated updates cannot grow one record without limit, and a read naming an
+/// evicted version is the same not-found answer as one naming a version no write
+/// ever produced. The emulator's own bound; AWS publishes no retained-version
+/// count.
+pub const MAX_PIPELINE_VERSIONS: usize = 50;
+
+/// The `version` a freshly created pipeline reports: its first version, counted
+/// from one, as `CreatePipeline`'s `version` member ("The version of the newly
+/// created pipeline") and `UpdatePipeline`'s ("The new version of the pipeline
+/// created by this update") describe the counter.
+pub const FIRST_PIPELINE_VERSION: u64 = 1;
+
 /// The ARN resource-type segment of a dataset ARN, as [`dataset_arn`] builds it.
 pub const DATASET_RESOURCE_TYPE: &str = "dataset";
 
@@ -855,6 +899,244 @@ pub fn gateway_platform_count(platform: &GatewayPlatform) -> usize {
     .count()
 }
 
+/// One version of a pipeline: the caller-owned configuration as of the call that
+/// wrote it.
+///
+/// A pipeline is VERSIONED — `UpdatePipeline` answers with "The new version of
+/// the pipeline created by this update", and `DescribePipeline`'s
+/// `pipelineVersion` reads "The version number of the pipeline to retrieve. If
+/// not specified, returns the latest version" — so an accepted write appends one
+/// of these instead of overwriting the configuration in place, and a read naming
+/// an older version still answers from the configuration that version carried.
+#[derive(Debug, Clone)]
+pub struct PipelineVersion {
+    /// This version's number, as the modelled `Version` string spells it.
+    pub version: u64,
+    pub description: Option<String>,
+    /// Kept as an `Option` so a pipeline that was never given environment
+    /// variables reports none, rather than an empty map it never carried.
+    pub environment_variables: Option<HashMap<String, String>>,
+    pub computations: Vec<ComputeNode>,
+    /// When the call that wrote this version landed — what `updatedAt` reports
+    /// for it.
+    pub recorded_at: SystemTime,
+}
+
+/// A stored pipeline: its identity within a workspace, the version a read answers
+/// from, every version a later write superseded, and the `tags` the tagging
+/// operations read.
+#[derive(Debug, Clone)]
+pub struct PipelineRecord {
+    /// The workspace this pipeline lives in. A pipeline name is "unique within
+    /// the workspace", so the pair is the pipeline's identity.
+    pub workspace_name: String,
+    pub name: String,
+    pub arn: String,
+    /// The newest version: what a read naming no version answers from.
+    pub current: PipelineVersion,
+    /// The versions a later write replaced, ascending by version number.
+    pub superseded: Vec<PipelineVersion>,
+    pub created_at: SystemTime,
+    /// The instant the transition the clock owes — from [`Self::settling_state`]
+    /// to `ACTIVE` — falls due.
+    pub active_at: SystemTime,
+    /// The `ResourceState` this pipeline reports until [`Self::active_at`] falls
+    /// due: [`STATE_CREATING`] for a freshly created pipeline, [`STATE_UPDATING`]
+    /// while a mutating call it already accepted settles.
+    pub settling_state: String,
+    /// The `clientToken` of the create that made this pipeline, if it carried
+    /// one, so a retry of that same create replays its answer rather than
+    /// colliding with the pipeline it already made.
+    pub client_token: Option<String>,
+    pub tags: HashMap<String, String>,
+}
+
+impl PipelineRecord {
+    /// The pipeline's `version` as the modelled `Version` string.
+    pub fn version_label(&self) -> String {
+        self.current.version.to_string()
+    }
+
+    /// The version a `Version` label names — the current one or any it
+    /// superseded — or `None` when no write ever produced it.
+    ///
+    /// Compared NUMERICALLY, after parsing the label the modelled `Version`
+    /// pattern (`^(0|([1-9]{1}\d*))$`, at most 10 digits) admits.
+    pub fn version(&self, label: &str) -> Option<&PipelineVersion> {
+        let wanted: u64 = label.parse().ok()?;
+        if self.current.version == wanted {
+            return Some(&self.current);
+        }
+        self.superseded
+            .iter()
+            .find(|version| version.version == wanted)
+    }
+
+    /// When the pipeline was last written: the instant its current version was
+    /// recorded.
+    pub fn updated_at(&self) -> SystemTime {
+        self.current.recorded_at
+    }
+
+    /// The pipeline's `ResourceState` as of `now`: its [`Self::settling_state`]
+    /// until the owed transition falls due, `ACTIVE` from then on. Derived, so a
+    /// read never has to write.
+    pub fn state(&self, now: SystemTime) -> &str {
+        state_at(&self.settling_state, self.active_at, now)
+    }
+
+    /// The pipeline's status as of `now`. No write has failed, so it carries no
+    /// error.
+    pub fn status(&self, now: SystemTime) -> ResourceStatus {
+        ResourceStatus {
+            state: Some(self.state(now).to_string()),
+            error: None,
+        }
+    }
+
+    /// Record that an accepted update landed at `now`: the configuration it
+    /// carries becomes a NEW version, the version it replaces is kept for a read
+    /// that names it, and the pipeline reports `UPDATING` until the transition
+    /// this call owes falls due.
+    ///
+    /// The due instant is STORED, never slept on, so the caller's own call
+    /// returns immediately and the transient state is still what a read taken
+    /// straight afterwards observes.
+    pub fn record_update(
+        &mut self,
+        description: Option<String>,
+        environment_variables: Option<HashMap<String, String>>,
+        computations: Vec<ComputeNode>,
+        now: SystemTime,
+    ) {
+        let next = PipelineVersion {
+            version: self.current.version + 1,
+            description,
+            environment_variables,
+            computations,
+            recorded_at: now,
+        };
+        let previous = ::std::mem::replace(&mut self.current, next);
+        self.superseded.push(previous);
+        // The retained history is BOUNDED: past [`MAX_PIPELINE_VERSIONS`] the
+        // oldest superseded version is evicted, the way a time series evicts its
+        // oldest sample, so no number of updates grows one record without limit.
+        let retained = self.superseded.len() + 1;
+        if retained > MAX_PIPELINE_VERSIONS {
+            self.superseded.drain(..retained - MAX_PIPELINE_VERSIONS);
+        }
+        self.settling_state = STATE_UPDATING.to_string();
+        self.active_at = now + ACTIVATION_DELAY;
+    }
+}
+
+/// The key a pipeline is stored under in
+/// [`ComAmazonawsIotsitewiseAwsiotsitewiseState::pipelines`]: the workspace it
+/// lives in and its own name, since the name is unique only within the workspace.
+pub fn pipeline_key(workspace_name: &str, pipeline_name: &str) -> (String, String) {
+    (workspace_name.to_string(), pipeline_name.to_string())
+}
+
+/// The canonical ARN of a pipeline in `region`.
+///
+/// The resource section carries the WORKSPACE as well as the pipeline name: the
+/// name is unique only within its workspace, so two workspaces may each hold a
+/// pipeline of one name and the ARN has to tell them apart.
+pub fn pipeline_arn(region: &str, workspace_name: &str, pipeline_name: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{PIPELINE_RESOURCE_TYPE}/{workspace_name}/{pipeline_name}"),
+    )
+}
+
+/// Refuse a `computations` list that is not a pipeline DAG, in the wording the
+/// refusal carries; `Ok` for one that is.
+///
+/// The three rules `CreatePipeline` and the `ComputeNode` shape state, enforced
+/// in ONE place because both the create and the update supply the same list:
+/// `computeNodeName` is "The unique name for this compute node within the
+/// pipeline", `dependsOn` is "A list of compute node names that must complete
+/// successfully before this node can start" — so a dependency names a node of
+/// this same pipeline — and "Cyclic dependencies are not allowed".
+///
+/// Linear in the nodes and their dependencies: the names go into a hashed set,
+/// and the acyclicity check is one in-degree pass plus a worklist (Kahn's
+/// algorithm), so no shape of list makes the walk cost more than the list itself.
+pub fn check_compute_nodes(computations: &[ComputeNode]) -> Result<(), String> {
+    let mut names: HashSet<&str> = HashSet::with_capacity(computations.len());
+    for node in computations {
+        if !names.insert(node.compute_node_name.as_str()) {
+            return Err(format!(
+                "The compute node name {} is used by more than one compute node; \
+                 a compute node name is unique within the pipeline.",
+                node.compute_node_name
+            ));
+        }
+    }
+
+    // How many dependencies each node is still waiting on, and which nodes wait
+    // on it — built in the same pass that checks every dependency names a node of
+    // this pipeline.
+    let mut waiting: HashMap<&str, usize> = HashMap::with_capacity(computations.len());
+    let mut dependents: HashMap<&str, Vec<&str>> = HashMap::with_capacity(computations.len());
+    for node in computations {
+        let name = node.compute_node_name.as_str();
+        let mut outstanding = 0usize;
+        for dependency in node.depends_on.iter().flatten() {
+            if !names.contains(dependency.as_str()) {
+                return Err(format!(
+                    "The compute node {name} depends on {dependency}, which is not a \
+                     compute node of this pipeline."
+                ));
+            }
+            outstanding += 1;
+            dependents
+                .entry(dependency.as_str())
+                .or_default()
+                .push(name);
+        }
+        waiting.insert(name, outstanding);
+    }
+
+    // Kahn's algorithm: start from the nodes waiting on nothing and release the
+    // nodes whose last dependency has been released. A node still waiting when
+    // the worklist empties sits on a cycle — including a node that depends on
+    // itself, which waits on a dependency that is never released.
+    let mut ready: Vec<&str> = waiting
+        .iter()
+        .filter(|(_, outstanding)| **outstanding == 0)
+        .map(|(name, _)| *name)
+        .collect();
+    let mut settled = 0usize;
+    while let Some(name) = ready.pop() {
+        settled += 1;
+        for dependent in dependents.get(name).into_iter().flatten().copied() {
+            if let Some(outstanding) = waiting.get_mut(dependent) {
+                *outstanding -= 1;
+                if *outstanding == 0 {
+                    ready.push(dependent);
+                }
+            }
+        }
+    }
+    if settled < computations.len() {
+        let mut cyclic: Vec<&str> = waiting
+            .iter()
+            .filter(|(_, outstanding)| **outstanding > 0)
+            .map(|(name, _)| *name)
+            .collect();
+        cyclic.sort_unstable();
+        return Err(format!(
+            "The compute nodes {} form a cyclic dependency; a pipeline is a \
+             directed acyclic graph.",
+            cyclic.join(", ")
+        ));
+    }
+
+    Ok(())
+}
+
 /// The `ListTimeSeriesType` value of a series associated with an asset property.
 pub const TIME_SERIES_TYPE_ASSOCIATED: &str = "ASSOCIATED";
 
@@ -902,6 +1184,7 @@ macro_rules! tagged_record {
 tagged_record!(AssetRecord);
 tagged_record!(AssetModelRecord);
 tagged_record!(GatewayRecord);
+tagged_record!(PipelineRecord);
 tagged_record!(DatasetRecord);
 
 /// `record`'s tag set, but only when `record` is the one `arn` names exactly —
@@ -970,6 +1253,9 @@ pub struct ComAmazonawsIotsitewiseAwsiotsitewiseState {
     /// on a given platform device. One device hosts at most one gateway, so this
     /// is what makes a second create naming the same device a conflict.
     pub gateway_devices: HashMap<String, String>,
+    /// Pipelines by [`pipeline_key`] — the workspace they live in and their own
+    /// name — because a pipeline name is unique only within its workspace.
+    pub pipelines: HashMap<(String, String), PipelineRecord>,
     /// The logging options each scope has been SET to, keyed by the
     /// `workspaceName` the call named and by [`ACCOUNT_LOGGING_SCOPE`] for a call
     /// that named none. An absent key is a scope no `PutLoggingOptions` has
@@ -1442,6 +1728,10 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
             ASSET_RESOURCE_TYPE => tags_of(self.assets.get(id), arn),
             ASSET_MODEL_RESOURCE_TYPE => tags_of(self.asset_models.get(id), arn),
             GATEWAY_RESOURCE_TYPE => tags_of(self.gateways.get(id), arn),
+            PIPELINE_RESOURCE_TYPE => {
+                let (workspace, name) = id.split_once('/')?;
+                tags_of(self.pipelines.get(&pipeline_key(workspace, name)), arn)
+            }
             DATASET_RESOURCE_TYPE => tags_of(self.datasets.get(id), arn),
             _ => None,
         }
@@ -1454,6 +1744,10 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
             ASSET_RESOURCE_TYPE => tags_of_mut(self.assets.get_mut(id), arn),
             ASSET_MODEL_RESOURCE_TYPE => tags_of_mut(self.asset_models.get_mut(id), arn),
             GATEWAY_RESOURCE_TYPE => tags_of_mut(self.gateways.get_mut(id), arn),
+            PIPELINE_RESOURCE_TYPE => {
+                let (workspace, name) = id.split_once('/')?;
+                tags_of_mut(self.pipelines.get_mut(&pipeline_key(workspace, name)), arn)
+            }
             DATASET_RESOURCE_TYPE => tags_of_mut(self.datasets.get_mut(id), arn),
             _ => None,
         }
@@ -1806,6 +2100,9 @@ pub const RESOURCE_ASSET: &str = "Asset";
 
 /// The resource kind those errors name for an asset model.
 pub const RESOURCE_ASSET_MODEL: &str = "Asset Model";
+
+/// The resource kind those errors name for a pipeline.
+pub const RESOURCE_PIPELINE: &str = "Pipeline";
 
 /// The resource kind those errors name for a dataset.
 pub const RESOURCE_DATASET: &str = "Dataset";

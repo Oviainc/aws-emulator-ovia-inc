@@ -1,16 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListLenses
-//! The available lenses: the AWS-official lens this emulator ships, and the custom
+//! The available lenses: the AWS-official lenses this emulator publishes, and the custom
 //! lenses `ImportLens` imported into this store.
 //!
 //! The rules this handler follows, and where each comes from:
 //!
-//! * The catalog is the AWS-official lens whose content this emulator ships
-//!   (`crate::state::FRAMEWORK_LENS_QUESTIONS`, summarised by
-//!   `crate::state::framework_lens_summary`) plus every custom lens the store holds.
-//!   Nothing here is hardcoded per request: the custom entries are the lens store's own
-//!   records, projected by `crate::state::LensRecord::to_summary`.
+//! * The catalog is EVERY AWS-official lens this emulator publishes content for
+//!   (`crate::state::OFFICIAL_LENS_CATALOG`, each entry summarised by
+//!   `crate::state::OfficialLens::summary`) plus every custom lens the store holds.
+//!   Nothing here is hardcoded per request: the official entries are the one lens catalog
+//!   every operation reads a lens's content from, and the custom entries are the lens
+//!   store's own records, projected by `crate::state::LensRecord::to_summary`.
 //! * `LensType` and `LensName` select by the summary's own type and full name; a request
 //!   that names neither asks for every lens.
 //! * `LensStatus` selects by publication state, the state a summary reports as its own
@@ -33,8 +34,8 @@
 //!   `AccessDeniedException` and `ThrottlingException` are therefore unreachable from this
 //!   handler, which fails only on an unavailable store (500) or an undecodable cursor
 //!   (400).
-//! * Regional scoping of the lens store. The request's Region is used for the
-//!   AWS-official lens's ARN, the one member here that varies by Region; the custom lenses
+//! * Regional scoping of the lens store. The request's Region is used for an
+//!   AWS-official lens's ARN, the one member there that varies by Region; the custom lenses
 //!   are reported whatever Region the request names, each carrying the ARN of the Region it
 //!   was imported in. The store `ImportLens` writes is not partitioned by Region, so this
 //!   handler has nothing to scope by.
@@ -212,19 +213,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = std::time::SystemTime::now();
         let store = state.lock();
 
-        // The lenses available to the caller: the AWS-official lens whose content this
-        // emulator ships, plus every custom lens the store holds. A lens exists from the
-        // moment `ImportLens` accepts it — that call answers its ARN — so it is listed
+        // The lenses available to the caller: every AWS-official lens this emulator
+        // publishes content for, plus every custom lens the store holds. A lens exists from
+        // the moment `ImportLens` accepts it — that call answers its ARN — so it is listed
         // from then on, described by the document that import carried; what the import's
         // instant gates is the CONTENT a read of the lens returns.
-        let mut catalog: Vec<CatalogEntry> = Vec::with_capacity(store.lenses.len() + 1);
-        catalog.push(CatalogEntry {
-            key: crate::state::lens_catalog_key(
-                crate::state::LENS_TYPE_AWS_OFFICIAL,
-                crate::state::FRAMEWORK_LENS_ALIAS,
-            ),
-            summary: crate::state::framework_lens_summary(&region),
-        });
+        let mut catalog: Vec<CatalogEntry> =
+            Vec::with_capacity(store.lenses.len() + crate::state::OFFICIAL_LENS_CATALOG.len());
+        for official in crate::state::OFFICIAL_LENS_CATALOG {
+            catalog.push(CatalogEntry {
+                key: crate::state::lens_catalog_key(
+                    crate::state::LENS_TYPE_AWS_OFFICIAL,
+                    official.alias,
+                ),
+                summary: official.summary(&region),
+            });
+        }
         for record in store.lenses.values() {
             if let Some(summary) = record.to_summary(now) {
                 catalog.push(CatalogEntry {

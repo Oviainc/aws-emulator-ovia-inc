@@ -2,7 +2,9 @@
 
 //! @op GetAlternateContact
 //! Reports the alternate contact of the named type stored on the resolved
-//! account, member for member. A type with no stored contact is a
+//! account, member for member. An account this service holds no record of is an
+//! `AccessDeniedException`, resolved before the contact is looked up; on an
+//! account it does hold, a type with no stored contact is a
 //! `ResourceNotFoundException`, never an empty success.
 //!
 //! ## Shape of an operation
@@ -181,14 +183,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let account_id = crate::state::resolve_account_id(input.account_id.as_deref());
         // A REPORTING operation: the store is read, never written.
         let store = state.lock();
-        let contact = store
-            .account(&account_id)
-            .and_then(|account| account.alternate_contacts.get(&contact_type));
+        // The account is resolved BEFORE the contact is looked up: naming another
+        // account requires the caller to be an identity in the organization's
+        // management account with the named account a member of the same
+        // organization, which an account this emulator holds no record of is not.
+        // Reporting "no contact of that type" for such an id would answer about an
+        // account the caller may not read at all, so the refusal is the same
+        // `AccessDeniedException` every other read of this service answers with.
+        let Some(account) = store.account(&account_id) else {
+            return Err(GetAlternateContactErrorModeled::AccessDeniedException(
+                crate::state::account_not_accessible(&account_id),
+            )
+            .into());
+        };
 
-        match contact {
+        match account.alternate_contacts.get(&contact_type) {
             Some(record) => Ok(GetAlternateContactOutput {
                 alternate_contact: Some(record.to_alternate_contact()),
             }),
+            // The account exists, but nothing of that type is stored on it: the
+            // resource this call names can't be found.
             None => Err(GetAlternateContactErrorModeled::ResourceNotFoundException(
                 crate::state::alternate_contact_not_found(),
             )

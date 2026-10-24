@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates a stored group's precedence, IAM role and description, and returns the
+//! STORED group, so a later `GetGroup` renders the same resource. The operation
+//! updates ANY OF those three properties: a member the request carries replaces what
+//! the group held, and one it leaves out keeps its stored value, while the group's
+//! name, pool and creation instant are untouched. An unknown `UserPoolId` or
+//! `GroupName` is refused with `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -175,20 +172,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut guard = state.lock();
+        let pool = guard
+            .pool_mut(&input.user_pool_id)
+            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+        let group = pool
+            .groups
+            .get_mut(&input.group_name)
+            .ok_or_else(|| group_not_found(&input.group_name))?;
+
+        // This operation "updates ANY OF the properties for precedence, IAM role, or
+        // description" of the named group (`UpdateGroup`), so a member the request
+        // carries replaces what the group held and a member it leaves out keeps its
+        // stored value: an update of one property never discards another. A
+        // `Description` can still be emptied by sending the empty string, which its
+        // modelled length 0..2048 admits. The group's identity (its name and its pool)
+        // and its creation instant are not members of this input, so they stay exactly
+        // as `CreateGroup` stored them.
+        if input.description.is_some() {
+            group.description = input.description;
+        }
+        if input.role_arn.is_some() {
+            group.role_arn = input.role_arn;
+        }
+        if input.precedence.is_some() {
+            group.precedence = input.precedence;
+        }
+
+        // The group changed, so its last-modified instant advances.
+        group.last_modified_date = now;
+
+        // Rendered from the STORED group, so the response is what a later read sees.
+        Ok(UpdateGroupOutput {
+            group: Some(group.to_group_type()),
+        })
     }
+}
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> UpdateGroupError {
+    UpdateGroupErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `ResourceNotFoundException` for a group the pool does not hold.
+fn group_not_found(group_name: &str) -> UpdateGroupError {
+    UpdateGroupErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("Group not found: {group_name}")),
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> UpdateGroupError {
+    UpdateGroupErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }

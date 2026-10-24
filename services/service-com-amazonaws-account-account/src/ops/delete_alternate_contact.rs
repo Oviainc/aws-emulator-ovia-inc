@@ -2,8 +2,10 @@
 
 //! @op DeleteAlternateContact
 //! Removes the alternate contact of the named type from the resolved account.
-//! A type with no stored contact is a `ResourceNotFoundException`: there is
-//! nothing to delete.
+//! An account this service holds no record of is an `AccessDeniedException`,
+//! resolved before the contact is looked up; on an account it does hold, a type
+//! with no stored contact is a `ResourceNotFoundException`: there is nothing to
+//! delete.
 //!
 //! ## Shape of an operation
 //!
@@ -198,13 +200,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let account_id = crate::state::resolve_account_id(input.account_id.as_deref());
-        let removed = state
-            .lock()
-            .accounts
-            .get_mut(&account_id)
-            .and_then(|account| account.alternate_contacts.remove(&contact_type));
+        let mut store = state.lock();
+        // Deleting a contact acts on an account that already exists, so this call
+        // never creates a record: the account is resolved BEFORE the contact is
+        // looked up, and an id this emulator holds no record of earns the same
+        // `AccessDeniedException` a call naming an account outside the caller's
+        // organization does, rather than a report about that account's contacts.
+        let Some(account) = store.existing_account_mut(&account_id) else {
+            return Err(DeleteAlternateContactErrorModeled::AccessDeniedException(
+                crate::state::account_not_accessible(&account_id),
+            )
+            .into());
+        };
 
-        if removed.is_none() {
+        if account.alternate_contacts.remove(&contact_type).is_none() {
             // Nothing of that type was stored, so there was no resource to delete —
             // which is also what a second delete of the same type sees. The message
             // is the one constant sentence this service states for an unset contact

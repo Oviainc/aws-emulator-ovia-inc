@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateOpenIDConnectProvider
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateOpenIDConnectProvider`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateOpenIDConnectProvider::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Registers an OIDC identity provider under the account: the provider is named by
+//! its URL, its ARN is derived from that URL, and the record this writes is what
+//! `GetOpenIDConnectProvider` reports.
 //!
 //! ## Shape of an operation
 //!
@@ -207,18 +202,192 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateOpenIDConnectProvider` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateOpenIDConnectProviderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateOpenIDConnectProvider"))
+        // `ctx` carries request metadata only; nothing here depends on it — IAM is global,
+        // so not even the ARN's region segment comes from the request.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateOpenIDConnectProviderErrorModeled::ServiceFailureException(
+                    ServiceFailureException {
+                        message: Some("the IAM store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "The URL must begin with https:// and should correspond to the iss claim in the
+        // provider's OpenID Connect ID tokens. Per the OIDC standard, path components are
+        // allowed but query parameters are not" (`$Url`). A value failing either is "an
+        // invalid … value … supplied for an input parameter", so the refusal names the
+        // member and the constraint it broke.
+        let Some(host_and_path) = input
+            .url
+            .strip_prefix(crate::state::OPEN_ID_CONNECT_URL_SCHEME)
+        else {
+            return Err(CreateOpenIDConnectProviderErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "Invalid Url {}: the URL must begin with {}",
+                        input.url,
+                        crate::state::OPEN_ID_CONNECT_URL_SCHEME
+                    )),
+                },
+            )
+            .into());
+        };
+        if host_and_path.contains('?') {
+            return Err(CreateOpenIDConnectProviderErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "Invalid Url {}: the URL must carry no query parameters",
+                        input.url
+                    )),
+                },
+            )
+            .into());
+        }
+        // The URL "typically consists of only a hostname" and "should correspond to the iss
+        // claim": a value whose first path segment is empty names no host at all, so there
+        // is no provider for it to identify.
+        if host_and_path.split('/').next().unwrap_or_default().is_empty() {
+            return Err(CreateOpenIDConnectProviderErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "Invalid Url {}: the URL must name a host",
+                        input.url
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The provider is stored and reported WITHOUT the scheme: `GetOpenIDConnectProvider`
+        // answers the host-and-path form that "corresponds to the iss claim in the
+        // provider's OpenID Connect ID tokens" (`$Url`) and that the ARN is built from, so
+        // a client matching a token's issuer against the provider compares like for like.
+        let url = host_and_path.to_string();
+
+        // "You cannot register more than 100 client IDs with a single IAM OIDC provider"
+        // (`$ClientIDList`) and "IAM lets you have up to five thumbprints for an OIDC
+        // provider" (`$ThumbprintList`): neither bound is modelled on the list, so both are
+        // taken here, before anything is written.
+        let client_id_list = input.client_id_list.unwrap_or_default();
+        if client_id_list.len() > crate::state::MAX_CLIENT_IDS_PER_OPEN_ID_CONNECT_PROVIDER {
+            return Err(CreateOpenIDConnectProviderErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Cannot exceed quota for ClientIdsPerOpenIdConnectProvider: {}",
+                        crate::state::MAX_CLIENT_IDS_PER_OPEN_ID_CONNECT_PROVIDER
+                    )),
+                },
+            )
+            .into());
+        }
+        // "This parameter is optional. If it is not included, IAM will retrieve and use the
+        // top intermediate certificate authority (CA) thumbprint of the OpenID Connect
+        // identity provider server certificate" (`$ThumbprintList`). This emulator makes no
+        // outbound connection to an IdP, so a create naming no thumbprint registers a
+        // provider carrying none rather than one carrying a thumbprint nothing fetched.
+        let thumbprint_list = input.thumbprint_list.unwrap_or_default();
+        if thumbprint_list.len() > crate::state::MAX_THUMBPRINTS_PER_OPEN_ID_CONNECT_PROVIDER {
+            return Err(CreateOpenIDConnectProviderErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Cannot exceed quota for ThumbprintsPerOpenIdConnectProvider: {}",
+                        crate::state::MAX_THUMBPRINTS_PER_OPEN_ID_CONNECT_PROVIDER
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // AWS reserves the `aws:` tag-key prefix, so a request naming one supplied an
+        // "invalid … value … for an input parameter" — and "if any one of the tags is
+        // invalid or if you exceed the allowed maximum number of tags, then the entire
+        // request fails and the resource is not created" (`$Tags`), which is why this is
+        // checked before anything is written.
+        let supplied_tags = input.tags.unwrap_or_default();
+        if let Some(reserved) =
+            crate::state::reserved_tag_key(supplied_tags.iter().map(|tag| tag.key.as_str()))
+        {
+            return Err(CreateOpenIDConnectProviderErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "Tag key {reserved} is reserved: keys must not begin with {}",
+                        crate::state::RESERVED_TAG_KEY_PREFIX
+                    )),
+                },
+            )
+            .into());
+        }
+        // A key repeated inside one request settles on its LAST value, the rule every tag
+        // call in this service follows, and the provider's tags are held sorted by key
+        // because "the returned list of tags is sorted by tag key" (`$Tags`).
+        let Some(mut tags) = crate::state::merge_tags(None, supplied_tags) else {
+            return Err(CreateOpenIDConnectProviderErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Cannot exceed quota for TagsPerResource: {}",
+                        crate::state::MAX_TAGS_PER_ENTITY
+                    )),
+                },
+            )
+            .into());
+        };
+        tags.sort_by(|left, right| left.key.cmp(&right.key));
+        let tags = (!tags.is_empty()).then_some(tags);
+
+        let arn = crate::state::open_id_connect_provider_arn(&url);
+        let mut store = state.lock();
+
+        // "You cannot register the same provider multiple times in a single Amazon Web
+        // Services account. If you try to submit a URL that has already been used for an
+        // OpenID Connect provider in the Amazon Web Services account, you will get an
+        // error" (`$Url`) — the URL is the provider's identity, and its ARN is derived from
+        // it, so a held ARN is a held URL.
+        if store.open_id_connect_providers.contains_key(&arn) {
+            return Err(
+                CreateOpenIDConnectProviderErrorModeled::EntityAlreadyExistsException(
+                    EntityAlreadyExistsException {
+                        message: Some(format!("Provider with url {} already exists.", input.url)),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // An account holds a bounded number of OIDC providers, so a caller cannot grow the
+        // account without limit; past the quota IAM refuses the create.
+        if store.open_id_connect_providers.len()
+            >= crate::state::MAX_OPEN_ID_CONNECT_PROVIDERS_PER_ACCOUNT
+        {
+            return Err(CreateOpenIDConnectProviderErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Cannot exceed quota for OpenIdConnectProvidersPerAccount: {}",
+                        crate::state::MAX_OPEN_ID_CONNECT_PROVIDERS_PER_ACCOUNT
+                    )),
+                },
+            )
+            .into());
+        }
+
+        store.open_id_connect_providers.insert(
+            arn.clone(),
+            crate::state::OpenIdConnectProviderRecord {
+                url,
+                client_id_list,
+                thumbprint_list,
+                create_date: crate::state::now(),
+                tags: tags.clone(),
+            },
+        );
+        // The response reports the stored record's ARN and tags, so a caller sees exactly
+        // what a later `GetOpenIDConnectProvider` reports.
+        Ok(CreateOpenIDConnectProviderOutput {
+            open_id_connect_provider_arn: Some(arn),
+            tags,
+        })
     }
 }

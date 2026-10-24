@@ -180,27 +180,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let account_id = crate::state::caller_account_id();
+        let now = crate::state::now();
         let mut store = state.lock();
         // The plan this call writes, established on the free plan when the
         // account holds none: moving an account onto a plan is the mutation the
         // caller asked for, and this is the one operation allowed to make it.
         let plan = store.plan_mut(account_id);
         // The plan the clock already moved is what this call starts from.
-        plan.settle(crate::state::now());
+        plan.settle(now);
 
         // The plan moves one way: this operation takes an account onto the paid
-        // plan, and an account already on it cannot be put back onto the free
-        // plan — the free plan is a one-off window, not a tier an account can
-        // re-enter.
-        if target == crate::state::PLAN_TYPE_FREE && plan.plan_type == crate::state::PLAN_TYPE_PAID
-        {
-            return Err(validation(
-                "accountPlanType: an account on the PAID plan cannot be moved back to the \
-                 FREE plan",
-            ));
+        // plan, and an account whose free-plan window is no longer open cannot
+        // be put back onto the free plan — the free plan is a one-off,
+        // time-boxed window, not a tier an account can re-enter. The window is
+        // closed both for an account that left it for the paid plan and for one
+        // whose expiration instant the clock has already passed, so neither can
+        // be returned to it.
+        if target == crate::state::PLAN_TYPE_FREE && !plan.free_window_open() {
+            return Err(validation(format!(
+                "accountPlanType: the FREE plan is a one-off window this account no longer \
+                 holds (its account plan is {} and {}), so it cannot be moved back onto it",
+                plan.plan_type, plan.plan_status
+            )));
         }
 
-        plan.upgrade_to(target);
+        plan.upgrade_to(target, now);
 
         Ok(UpgradeAccountPlanOutput {
             account_id: plan.account_id.clone(),

@@ -336,6 +336,19 @@ async fn an_unset_alternate_contact_states_one_constant_message() {
             Some(id) => json!({"AlternateContactType": contact_type, "AccountId": id}),
             None => json!({"AlternateContactType": contact_type}),
         };
+        // The not-found message is about an account the caller MAY read with the
+        // contact type unset, so the member account needs a record first: an
+        // account the store holds no record of is refused before any contact is
+        // looked at (`an_account_with_no_record_is_an_authorization_refusal`).
+        if let Some(id) = account {
+            let created =
+                put_account_name(&router, json!({"AccountName": "Member", "AccountId": id})).await;
+            assert_eq!(
+                created.status, 200,
+                "case {id:?}: the member account's record must be created, got {} with {:?}",
+                created.status, created.body
+            );
+        }
         for contact_type in ALTERNATE_CONTACT_TYPES {
             // (how the type is unset, which operation asks)
             let mut answers: Vec<(String, Answer)> = Vec::new();

@@ -23,6 +23,8 @@ mod application_access_scopes;
 mod application_assignments;
 #[path = "all/application_authentication_methods.rs"]
 mod application_authentication_methods;
+#[path = "all/application_create.rs"]
+mod application_create;
 #[path = "all/application_provider_describe.rs"]
 mod application_provider_describe;
 #[path = "all/application_providers.rs"]

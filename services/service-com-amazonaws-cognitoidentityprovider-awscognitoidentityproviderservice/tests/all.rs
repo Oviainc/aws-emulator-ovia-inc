@@ -27,6 +27,8 @@ mod initiate_auth;
 mod state_roundtrip;
 #[path = "all/token_signing.rs"]
 mod token_signing;
+#[path = "all/update_group.rs"]
+mod update_group;
 #[path = "all/update_user_pool.rs"]
 mod update_user_pool;
 #[path = "all/update_user_pool_client.rs"]

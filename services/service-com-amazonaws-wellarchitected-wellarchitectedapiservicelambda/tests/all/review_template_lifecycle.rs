@@ -115,12 +115,17 @@ async fn a_created_review_template_round_trips_through_get() {
             }),
             FRAMEWORK_LENS_QUESTIONS,
         ),
-        // A lens whose definition this emulator does not ship asks no questions here, so
-        // it adds nothing to the roll-up.
-        ("unshipped-lens-only", json!({ "Lenses": ["serverless"] }), 0),
+        // A lens whose content this emulator's AWS-official catalog does not carry asks no
+        // questions here, so it adds nothing to the roll-up. The catalog it does carry is
+        // pinned by `super::official_lens_catalog`.
         (
-            "framework-and-unshipped-lenses",
-            json!({ "Lenses": ["wellarchitected", "serverless", "softwareasaservice"] }),
+            "uncarried-lens-only",
+            json!({ "Lenses": ["mergersandacquisitions"] }),
+            0,
+        ),
+        (
+            "framework-and-uncarried-lens",
+            json!({ "Lenses": ["wellarchitected", "mergersandacquisitions"] }),
             FRAMEWORK_LENS_QUESTIONS,
         ),
         // `TemplateName` is @length(3, 100) and `Description` @length(3, 250): each at

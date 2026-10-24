@@ -20,9 +20,10 @@
 //!
 //! ## The clock, not the reader, moves a status
 //!
-//! A search job AWS returns is `RUNNING` — a non-terminal status — so the service owes
-//! it a later status without anybody calling again. That owed transition is stored as a
-//! DUE INSTANT ([`SearchJob::next_status_due`]) and materialised by
+//! A search job AWS returns is `CREATING` — a non-terminal status — so the service owes
+//! it a later status without anybody calling again, and then another: a scan is set up
+//! (`CREATING`), runs (`RUNNING`) and ends (a terminal status). Those owed transitions
+//! are stored as DUE INSTANTS ([`SearchJob::owed_statuses`]) and materialised by
 //! [`ComAmazonawsBackupsearchCryobackupsearchserviceState::settle`], which every handler
 //! calls first: a read therefore reports what the clock has already made due and never
 //! advances a job because it was polled.
@@ -33,7 +34,7 @@
 //! into the terminal status the scan is owed, and the `StatusMessage` that status comes
 //! with travels with it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ::aws_smithy_types::DateTime;
@@ -65,6 +66,22 @@ pub const NO_CONTENT_SUCCESS_STATUS: u16 = 204;
 /// The `SearchJobState` values the model declares, so no handler spells one as a bare
 /// literal. The full set is `ops::types::SEARCH_JOB_STATE_VALUES`.
 pub const RUNNING: &str = "RUNNING";
+/// The status a search job the service has accepted but not yet started scanning for is
+/// in — the FIRST status any caller can observe after `StartSearchJob`, before
+/// [`RUNNING`].
+///
+/// This value is NOT in the model's `SearchJobState` enum
+/// (`ops::types::SEARCH_JOB_STATE_VALUES`), and that is not a contradiction: restJson1
+/// enums are open on the wire, and the service's own recordings report a just-started
+/// search job with this status — the status-parameterised refusal an export started
+/// back-to-back with `StartSearchJob` is answered with names it. A client reading the
+/// status as a string therefore sees the setting-up phase it sees on AWS; one that
+/// matches only the closed enum treats it as an unknown variant, exactly as it would
+/// against AWS.
+///
+/// It is a TRANSIENT status (it is not in [`TERMINAL_STATES`]) and the clock owes the job
+/// [`RUNNING`] after [`CREATING_DELAY`], so no caller is left in it.
+pub const CREATING: &str = "CREATING";
 /// See [`RUNNING`].
 pub const COMPLETED: &str = "COMPLETED";
 /// See [`RUNNING`].
@@ -75,7 +92,7 @@ pub const STOPPED: &str = "STOPPED";
 pub const FAILED: &str = "FAILED";
 
 /// The statuses a search job never leaves: a scan that ended, a stop that took effect,
-/// or a scan that failed. `RUNNING` and `STOPPING` are the two transient ones.
+/// or a scan that failed. `CREATING`, `RUNNING` and `STOPPING` are the transient ones.
 pub const TERMINAL_STATES: &[&str] = &[COMPLETED, STOPPED, FAILED];
 
 /// The statuses `StopSearchJob` is already satisfied by.
@@ -105,10 +122,20 @@ pub const EXPORTABLE_SEARCH_JOB_STATES: &[&str] = &[COMPLETED, STOPPED];
 /// AWS documents no duration for any of them — how long a scan or an export takes
 /// depends on the backups in scope — so this span is CHOSEN, not modelled: 500 ms,
 /// inside the project's 250-750 ms band. It is deliberately non-zero, so a caller acting
-/// straight after `StartSearchJob` still observes `RUNNING` and `StopSearchJob` can still
-/// accept it. Nothing sleeps for it: the due instant is stored and compared against the
-/// clock.
+/// straight after `StartSearchJob` still observes a transient status and `StopSearchJob`
+/// can still accept it. Nothing sleeps for it: the due instant is stored and compared
+/// against the clock.
 pub const TRANSITION_DELAY: Duration = Duration::from_millis(500);
+
+/// How long after `StartSearchJob` the clock owes the job [`RUNNING`], i.e. how long it
+/// sits in [`CREATING`] first.
+///
+/// Also CHOSEN rather than modelled — AWS documents no duration for the set-up phase
+/// either — at 250 ms, inside the same 250-750 ms band, and deliberately SHORTER than
+/// [`TRANSITION_DELAY`], which is when the scan itself is owed its terminal status: both
+/// transient phases a scan passes through are therefore observable, the first one by a
+/// caller acting straight after the start call.
+pub const CREATING_DELAY: Duration = Duration::from_millis(250);
 
 /// `MaxResults`'s modelled `@default(1000)`, shared by `ListSearchJobs` and
 /// `ListSearchJobResults`: the page size to serve when the member is absent.
@@ -286,7 +313,7 @@ pub struct SearchJob {
     pub identifier: String,
     pub arn: String,
     pub name: Option<String>,
-    /// One of [`TERMINAL_STATES`], [`RUNNING`] or [`STOPPING`].
+    /// One of [`TERMINAL_STATES`], [`CREATING`], [`RUNNING`] or [`STOPPING`].
     pub status: String,
     pub creation_time: DateTime,
     pub completion_time: Option<DateTime>,
@@ -312,10 +339,12 @@ pub struct SearchJob {
     /// of the same body under the same `ClientToken` is idempotent; a different body
     /// under that token is a conflict.
     pub request_fingerprint: String,
-    /// The status the clock owes this job, the instant it is owed from, and the
-    /// `StatusMessage` that status comes with (`None` for one that needs no message).
-    /// `None` for a job in a terminal status, which owes nothing.
-    pub next_status_due: Option<(SystemTime, &'static str, Option<&'static str>)>,
+    /// The statuses the clock owes this job IN DUE ORDER: each entry is the instant the
+    /// status is owed from, the status, and the `StatusMessage` that status comes with
+    /// (`None` for one that needs no message). A scan owes two — [`RUNNING`] and then its
+    /// terminal status — so this is a queue and not a single transition; it is EMPTY for a
+    /// job in a terminal status, which owes nothing.
+    pub owed_statuses: VecDeque<(SystemTime, &'static str, Option<&'static str>)>,
 }
 
 impl SearchJob {
@@ -330,33 +359,55 @@ impl SearchJob {
         STOP_SATISFIED_STATES.contains(&self.status.as_str())
     }
 
-    /// Apply the owed status transition if the clock has already made it due.
+    /// Make `status` the ONE status this job is still owed, due at `due`, dropping
+    /// whatever it was owed before.
+    ///
+    /// What a stop does to a scan: the statuses the scan's own schedule still held are no
+    /// longer owed, so a stopped job cannot later settle to the terminal status its scan
+    /// would have reached.
+    pub fn owe_only(
+        &mut self,
+        due: SystemTime,
+        status: &'static str,
+        message: Option<&'static str>,
+    ) {
+        self.owed_statuses.clear();
+        self.owed_statuses.push_back((due, status, message));
+    }
+
+    /// Apply every owed status transition the clock has already made due, in order — so a
+    /// job nobody looked at while two of its spans passed reports the later status rather
+    /// than catching up one call at a time.
     ///
     /// The scan's progress is brought to the scope it was given — a scan that ran to
     /// `COMPLETED` has scanned everything in scope and matched exactly the results it
     /// recorded; one that was `STOPPED` keeps the progress it had reached, and one that
     /// `FAILED` never got through its scope, so it keeps the progress it had too.
     fn settle(&mut self, now: SystemTime) {
-        let Some((due, next, message)) = self.next_status_due else {
-            return;
-        };
-        if now < due {
-            return;
-        }
-        self.status = next.to_string();
-        self.next_status_due = None;
-        self.completion_time = Some(timestamp(due));
-        // The status and the message that status comes with are written together, so a
-        // record can never explain a failure it has not reached, nor reach one silently.
-        self.status_message = message.map(ToString::to_string);
-        if next == COMPLETED {
-            self.current_search_progress = CurrentSearchProgress {
-                recovery_points_scanned_count: self
-                    .search_scope_summary
-                    .total_recovery_points_to_scan_count,
-                items_scanned_count: self.search_scope_summary.total_items_to_scan_count,
-                items_matched_count: Some(self.results.len() as i64),
-            };
+        while let Some(&(due, next, message)) = self.owed_statuses.front() {
+            if now < due {
+                return;
+            }
+            self.owed_statuses.pop_front();
+            self.status = next.to_string();
+            // The status and the message that status comes with are written together, so
+            // a record can never explain a failure it has not reached, nor reach one
+            // silently.
+            self.status_message = message.map(ToString::to_string);
+            // `CompletionTime` is when the job COMPLETED, so only a status the job never
+            // leaves sets it: passing through a transient status completes nothing.
+            if TERMINAL_STATES.contains(&next) {
+                self.completion_time = Some(timestamp(due));
+            }
+            if next == COMPLETED {
+                self.current_search_progress = CurrentSearchProgress {
+                    recovery_points_scanned_count: self
+                        .search_scope_summary
+                        .total_recovery_points_to_scan_count,
+                    items_scanned_count: self.search_scope_summary.total_items_to_scan_count,
+                    items_matched_count: Some(self.results.len() as i64),
+                };
+            }
         }
     }
 }
