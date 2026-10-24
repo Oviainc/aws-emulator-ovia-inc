@@ -51,8 +51,9 @@ pub(crate) async fn get_usage_plan(gateway: &Gateway, id: &str) -> Answer {
     gateway.call("GET", &format!("/usageplans/{id}"), None).await
 }
 
-/// A tag map of `count` entries.
-fn tag_map(count: usize) -> Value {
+/// A tag map of `count` entries. Shared with the sibling `usage_plan_creation_bounds`
+/// suite, which drives the same map at the tag-count bound and one past it.
+pub(crate) fn tag_map(count: usize) -> Value {
     Value::Object(
         (0..count)
             .map(|n| (format!("k{n}"), Value::String(format!("v{n}"))))
