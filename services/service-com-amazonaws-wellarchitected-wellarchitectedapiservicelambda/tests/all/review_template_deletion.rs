@@ -9,9 +9,11 @@
 //!    operation that resolves a `TemplateArn` reports the ARN as absent, and no other
 //!    stored template is touched.
 //! 2. A `TemplateArn` naming no stored template is a `404 ResourceNotFoundException`
-//!    carrying the ARN as sent and the missing resource's type — which a repeat delete of
-//!    an already-deleted template is a case of, so the delete persists rather than
-//!    replaying.
+//!    carrying the ARN as sent and the missing resource's type — which a delete of an
+//!    already-deleted template under a `ClientRequestToken` this service has not spent is
+//!    a case of, so the delete persists rather than being undone. (A delete repeated under
+//!    the ORIGINAL token is the `@idempotencyToken` replay, pinned in
+//!    `delete_idempotency`.)
 //! 3. A delete frees what was keyed to the template: the `ClientRequestToken` that minted
 //!    it no longer replays, so the same token creates a fresh template rather than
 //!    answering the ARN of a template that is gone.
@@ -280,7 +282,8 @@ async fn deleting_a_review_template_drops_it_and_everything_it_holds() {
 
 /// Rule 2. The rows differ along WHY the ARN resolves to nothing — never minted, minted
 /// in another Region, deleted a moment ago, deleted twice — because a `TemplateArn` is
-/// resolved against the store rather than parsed.
+/// resolved against the store rather than parsed. Every row carries a `ClientRequestToken`
+/// this service has not spent, so each is a NEW request rather than a retry.
 #[tokio::test]
 async fn deleting_a_template_arn_that_names_no_template_is_not_found() {
     let client = Client::new();
@@ -339,12 +342,12 @@ async fn deleting_a_template_arn_that_names_no_template_is_not_found() {
         assert_template_absent(&answer, &template_arn, case);
     }
 
-    // Deleting the same template a third time is still the same refusal: the delete
-    // persisted rather than being replayed off its idempotency token.
+    // Deleting the same template again under a token the service has not spent is still
+    // the same refusal: the delete persisted rather than being undone.
     let again = client
-        .delete_review_template(&deleted, "tok-delete-deleted")
+        .delete_review_template(&deleted, "tok-delete-deleted-again")
         .await;
-    assert_template_absent(&again, &deleted, "repeat-delete-with-the-original-token");
+    assert_template_absent(&again, &deleted, "repeat-delete-under-a-fresh-token");
 
     // The template that DOES exist still resolves, so the rows above failed on resolution
     // and not on a broken route.

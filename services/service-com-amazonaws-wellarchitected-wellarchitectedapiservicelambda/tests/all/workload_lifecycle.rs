@@ -698,7 +698,8 @@ async fn update_workload_applies_only_the_members_present() {
     }
 }
 
-/// A deleted workload disappears from every reader, and a second delete is a 404.
+/// A deleted workload disappears from every reader, and a delete under a token this
+/// service has not spent is a 404.
 #[tokio::test]
 async fn deleted_workload_disappears_from_every_reader() {
     let client = Client::new();
@@ -736,10 +737,15 @@ async fn deleted_workload_disappears_from_every_reader() {
             "case {case:?}: expected ResourceNotFoundException, got {fetched:?}"
         );
 
-        let again = client.delete(&victim, &format!("tok-del-{cohort}")).await;
+        // A FRESH token is a new request, so it resolves the id and finds nothing. (The
+        // retry under the ORIGINAL token is the `@idempotencyToken` replay, pinned by
+        // `delete_idempotency`.)
+        let again = client
+            .delete(&victim, &format!("tok-del-again-{cohort}"))
+            .await;
         assert_eq!(
             again.status, 404,
-            "case {case:?}: a second DeleteWorkload must be 404, got {again:?}"
+            "case {case:?}: a second DeleteWorkload under a fresh token must be 404, got {again:?}"
         );
 
         let listed = client.list(json!({})).await;
@@ -767,7 +773,11 @@ async fn deleted_workload_disappears_from_every_reader() {
                 remaining.contains(survivor),
                 "case {case:?}: deleting one workload must not remove {survivor}: {remaining:?}"
             );
-            let kept = client.delete(survivor, "tok-cleanup").await;
+            // One token per teardown: a `ClientRequestToken` names ONE request, so
+            // reusing one across workloads would not be a retry.
+            let kept = client
+                .delete(survivor, &format!("tok-cleanup-{cohort}-{survivor}"))
+                .await;
             assert_eq!(
                 kept.status, 200,
                 "case {case:?}: tearing down {survivor} must succeed, got {kept:?}"
