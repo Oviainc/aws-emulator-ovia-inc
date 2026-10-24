@@ -22,6 +22,13 @@
 //! scaffold stub (its own issue), so until it is written the only records in
 //! [`ComAmazonawsHealthlakeHealthlakeState::export_jobs`] are the ones a test
 //! seeds.
+//!
+//! The data transformation job is the fourth: a job record is addressed by its
+//! own `JobId` and `DescribeDataTransformationJob` reports the record held
+//! here. `StartDataTransformationJob` is the operation that MINTS one; it is
+//! still a scaffold stub (its own issue), so until it is written the only
+//! records in [`ComAmazonawsHealthlakeHealthlakeState::transformation_jobs`]
+//! are the ones a test seeds.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
@@ -30,6 +37,8 @@ use crate::ops::types::{
     AnalyticsConfiguration, BackupConfiguration, DatastoreBackupStatus, DatastoreProperties,
     ErrorCause, ExportJobProperties, IdentityProviderConfiguration, NlpConfiguration,
     OutputDataConfig, PreloadDataConfig, ProfileConfiguration, SseConfiguration, Tag,
+    TransformationInputDataConfig, TransformationJobProgressReport, TransformationJobProperties,
+    TransformationOutputDataConfig,
 };
 
 /// How long after the call that starts it a data store's pending lifecycle
@@ -136,6 +145,16 @@ pub const PROFILE_NOT_FOUND_MESSAGE: &str = "Could not find specified profile.";
 /// its DRAFT. Fixed for the same reason as [`PROFILE_NOT_FOUND_MESSAGE`].
 pub const PROFILE_VERSION_NOT_FOUND_MESSAGE: &str =
     "Could not find specified profile version.";
+
+/// The sentence this service's `ResourceNotFoundException` carries when the
+/// request names a data transformation job no record holds.
+///
+/// Fixed, for the reason [`DATASTORE_NOT_FOUND_MESSAGE`] is: the same sentence
+/// whatever `JobId` was asked about, so a not-found answer never quotes the
+/// request back at the caller. Every transformation-job not-found path in this
+/// crate states it through this one constant.
+pub const TRANSFORMATION_JOB_NOT_FOUND_MESSAGE: &str =
+    "Could not find specified data transformation job.";
 
 /// The most data stores this emulator holds at once.
 ///
@@ -727,6 +746,150 @@ impl ExportJob {
     }
 }
 
+/// The states a data transformation job moves through, as the modelled
+/// `TransformationJobStatus` enum names them on the wire
+/// (`TRANSFORMATION_JOB_STATUS_VALUES`).
+///
+/// Kept apart from [`JobStatus`] — the FHIR import/export job status — because
+/// the two are DIFFERENT modelled enums: `TransformationJobStatus` declares no
+/// `CANCEL_*` value (a transformation job models no cancel operation), so a
+/// record of this kind can never report one. A typed status rather than a
+/// stored string, so no read can report a status the model would refuse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransformationJobStatus {
+    Submitted,
+    Queued,
+    InProgress,
+    Completed,
+    CompletedWithErrors,
+    Failed,
+}
+
+impl TransformationJobStatus {
+    /// The modelled enum value this status serializes as.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Submitted => "SUBMITTED",
+            Self::Queued => "QUEUED",
+            Self::InProgress => "IN_PROGRESS",
+            Self::Completed => "COMPLETED",
+            Self::CompletedWithErrors => "COMPLETED_WITH_ERRORS",
+            Self::Failed => "FAILED",
+        }
+    }
+
+    /// Whether this is a status a transformation job never leaves.
+    ///
+    /// What makes it matter is `TransformationJobProperties$EndTime` — "the
+    /// timestamp when the job completed or failed" — which is owed exactly
+    /// once, when the job reaches one of these and not while it is still
+    /// moving.
+    pub fn is_terminal(self) -> bool {
+        match self {
+            Self::Completed | Self::CompletedWithErrors | Self::Failed => true,
+            Self::Submitted | Self::Queued | Self::InProgress => false,
+        }
+    }
+}
+
+/// One persisted data transformation job: what the request that started it
+/// asked for, plus the identifier, the status and the progress the service
+/// owns.
+///
+/// Held in ONE map keyed by `JobId`, the identifier
+/// `DescribeDataTransformationJob` addresses a job by. Unlike an
+/// [`ExportJob`] a transformation job belongs to no data store — it reads and
+/// writes Amazon S3 — so there is no record it is dropped with; the profile it
+/// names is recorded by id, NAME and VERSION as the start call resolved them,
+/// so a read reports what the job ran with rather than re-deriving it from a
+/// profile that may since have changed.
+#[derive(Debug, Clone)]
+pub struct TransformationJob {
+    /// The `JobId` the service minted for this job.
+    pub id: String,
+    /// The `JobName` the request carried, if any.
+    pub name: Option<String>,
+    pub status: TransformationJobStatus,
+    /// The next transition the clock owes this job, as `(due instant, next
+    /// status)`. `None` when the job is not waiting on the clock. A job that
+    /// moves through several statuses re-arms this as each one falls due, so
+    /// one slot carries one step.
+    pub pending: Option<(Instant, TransformationJobStatus)>,
+    /// `SubmitTime`: the instant the job was submitted.
+    pub submitted_at: ::aws_smithy_types::DateTime,
+    /// `EndTime`: the instant the job reached a terminal status, written ONCE
+    /// by [`TransformationJob::settle`] so two reads of a finished job cannot
+    /// differ.
+    pub ended_at: Option<::aws_smithy_types::DateTime>,
+    /// The `InputDataConfig` the request supplied, reported back verbatim.
+    pub input_data_config: TransformationInputDataConfig,
+    /// The `OutputDataConfig` the request supplied, reported back verbatim.
+    pub output_data_config: TransformationOutputDataConfig,
+    /// The `DataAccessRoleArn` the request supplied.
+    pub data_access_role_arn: String,
+    /// The `ProfileId` the request named.
+    pub profile_id: Option<String>,
+    /// The profile's `ProfileName` as it stood when the job was submitted.
+    pub profile_name: Option<String>,
+    /// The profile's `ProfileVersion` the job runs against.
+    pub profile_version: Option<i32>,
+    /// `DriftDetectionEnabled` as the request set it, absent when it set none.
+    pub drift_detection_enabled: Option<bool>,
+    /// `ProvenanceEnabled` as the request set it, including the modelled
+    /// default the boundary applies.
+    pub provenance_enabled: Option<bool>,
+    /// `Message`: why the job ended as it did, when there is anything to say.
+    pub message: Option<String>,
+    /// `JobProgressReport`: the counts the run itself produced. `None` until
+    /// there is anything to report — nothing here is derived on read.
+    pub progress_report: Option<TransformationJobProgressReport>,
+}
+
+impl TransformationJob {
+    /// This record as the modelled `TransformationJobProperties`, the shape
+    /// `DescribeDataTransformationJob` reports a job through.
+    pub fn properties(&self) -> TransformationJobProperties {
+        TransformationJobProperties {
+            job_id: self.id.clone(),
+            job_status: self.status.as_wire().to_string(),
+            input_data_config: self.input_data_config.clone(),
+            output_data_config: self.output_data_config.clone(),
+            data_access_role_arn: self.data_access_role_arn.clone(),
+            submit_time: self.submitted_at,
+            job_name: self.name.clone(),
+            profile_id: self.profile_id.clone(),
+            profile_name: self.profile_name.clone(),
+            profile_version: self.profile_version,
+            end_time: self.ended_at,
+            drift_detection_enabled: self.drift_detection_enabled,
+            provenance_enabled: self.provenance_enabled,
+            message: self.message.clone(),
+            job_progress_report: self.progress_report.clone(),
+        }
+    }
+
+    /// Materialise the transition the clock has ALREADY made due on this job.
+    ///
+    /// The transition was owed at `now` whether or not anybody called, so a
+    /// reporting operation applying it is the record catching up with the clock
+    /// rather than a read with a side effect.
+    fn settle(&mut self, now: Instant) {
+        let Some((due, next)) = self.pending else {
+            return;
+        };
+        if now < due {
+            return;
+        }
+        self.status = next;
+        self.pending = None;
+        // `EndTime` is owed once, by the step that reaches a status the job
+        // never leaves, and is then stored — never re-derived per read.
+        if next.is_terminal() && self.ended_at.is_none() {
+            self.ended_at = Some(::aws_smithy_types::DateTime::from(SystemTime::now()));
+        }
+    }
+}
+
 /// What one `CreateFHIRDatastore` `ClientToken` recorded: the data store it
 /// minted, and a fingerprint of the request that minted it, so a token reused
 /// with a DIFFERENT request is refused instead of silently answering with the
@@ -930,6 +1093,12 @@ pub struct ComAmazonawsHealthlakeHealthlakeState {
     /// is dropped with the data store it belongs to, by this state's own
     /// `forget_export_jobs_for`.
     pub export_jobs: BTreeMap<String, ExportJob>,
+    /// Every data transformation job, by `JobId` — the identifier
+    /// `DescribeDataTransformationJob` addresses one by. A `BTreeMap` so
+    /// `ListDataTransformationJobs` can page in a stable, resumable order once
+    /// it is written. A transformation job belongs to no data store, so no
+    /// record reaps one.
+    pub transformation_jobs: BTreeMap<String, TransformationJob>,
 }
 
 impl ComAmazonawsHealthlakeHealthlakeState {
@@ -1018,6 +1187,23 @@ impl ComAmazonawsHealthlakeHealthlakeState {
     pub fn settle_export_jobs(&mut self) {
         let now = Instant::now();
         for job in self.export_jobs.values_mut() {
+            job.settle(now);
+        }
+    }
+
+    /// Materialise every transformation job transition the clock has ALREADY
+    /// made due.
+    ///
+    /// The companion of [`Self::settle_export_jobs`] for the transformation job
+    /// records, and called for the same reason: the transition was owed at this
+    /// instant whether or not anybody called, so a reporting operation applying
+    /// it is the record catching up with the clock. The ceiling on how many job
+    /// records there can be belongs with the operation that MINTS them
+    /// (`StartDataTransformationJob`, still a scaffold stub), which is the only
+    /// place a job count can be refused, so none is asserted here.
+    pub fn settle_transformation_jobs(&mut self) {
+        let now = Instant::now();
+        for job in self.transformation_jobs.values_mut() {
             job.settle(now);
         }
     }
