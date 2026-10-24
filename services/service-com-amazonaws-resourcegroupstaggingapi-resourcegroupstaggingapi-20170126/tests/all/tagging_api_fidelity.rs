@@ -329,6 +329,373 @@ async fn an_absent_resource_fails_with_the_owning_services_not_found_code() {
     );
 }
 
+/// The SigV4 signing name of EventBridge, the service that owns an `events` ARN.
+const EVENTS: &str = "events";
+
+/// `arn:aws:events:<region>:<account>:rule/<bus-if-not-default>/<name>` — the ARN
+/// form EventBridge mints for a rule, built here rather than read from that
+/// crate.
+fn events_rule_arn(bus: &str, rule: &str) -> String {
+    let resource = if bus == "default" {
+        format!("rule/{rule}")
+    } else {
+        format!("rule/{bus}/{rule}")
+    };
+    format!(
+        "arn:aws:events:{REGION}:{}:{resource}",
+        engine::emulator_account_id()
+    )
+}
+
+/// `arn:aws:events:<region>:<account>:event-bus/<name>`, built here for the same
+/// reason.
+fn events_bus_arn(name: &str) -> String {
+    format!(
+        "arn:aws:events:{REGION}:{}:event-bus/{name}",
+        engine::emulator_account_id()
+    )
+}
+
+/// The tag map EventBridge's own `ListTagsForResource` reports for an ARN.
+async fn events_tags(router: &MultiServiceRouter, arn: &str) -> BTreeMap<String, String> {
+    let (status, body) = call(
+        router,
+        EVENTS,
+        "AWSEvents.ListTagsForResource",
+        serde_json::json!({ "ResourceARN": arn }),
+    )
+    .await;
+    assert_eq!(status, 200, "ListTagsForResource({arn}): body {body}");
+    body["Tags"]
+        .as_array()
+        .unwrap_or_else(|| panic!("a ListTagsForResource body with no Tags: {body}"))
+        .iter()
+        .map(|tag| {
+            (
+                tag["Key"].as_str().expect("Tag.Key").to_string(),
+                tag["Value"].as_str().expect("Tag.Value").to_string(),
+            )
+        })
+        .collect()
+}
+
+/// EventBridge models the tag set of BOTH kinds it tags, so each has ONE tag
+/// home: that service's own record. A tag written through this API is the
+/// resource's own tag, which EventBridge's `ListTagsForResource` reports, and a
+/// tag written through EventBridge is reported by `GetResources` — one set, read
+/// and written from both sides, with nothing to keep in step.
+///
+/// The rows differ along the resource kind and, with it, the ARN form: an event
+/// bus, a rule on the default bus, and a rule on a custom bus (whose ARN carries
+/// that bus).
+#[tokio::test]
+async fn eventbridge_tags_live_in_eventbridges_own_records() {
+    let router = emulator();
+    let (status, body) = call(
+        &router,
+        EVENTS,
+        "AWSEvents.CreateEventBus",
+        serde_json::json!({ "Name": "shared-bus" }),
+    )
+    .await;
+    assert_eq!(status, 200, "CreateEventBus: body {body}");
+    for (rule, bus) in [("default-rule", None), ("bus-rule", Some("shared-bus"))] {
+        let mut request = serde_json::json!({
+            "Name": rule,
+            "EventPattern": r#"{"source":["com.demo"]}"#,
+        });
+        if let Some(bus) = bus {
+            request["EventBusName"] = serde_json::json!(bus);
+        }
+        let (status, body) = call(&router, EVENTS, "AWSEvents.PutRule", request).await;
+        assert_eq!(status, 200, "PutRule {rule}: body {body}");
+    }
+
+    let rows: Vec<(&str, String)> = vec![
+        ("an event bus", events_bus_arn("shared-bus")),
+        (
+            "a rule on the default bus",
+            events_rule_arn("default", "default-rule"),
+        ),
+        (
+            "a rule on a custom bus",
+            events_rule_arn("shared-bus", "bus-rule"),
+        ),
+    ];
+
+    for (case, arn) in rows {
+        let (status, body) = tagging(
+            &router,
+            "TagResources",
+            serde_json::json!({ "ResourceARNList": [&arn], "Tags": { "Owner": "tagging-api" } }),
+        )
+        .await;
+        assert_eq!(status, 200, "case {case}: TagResources body {body}");
+        assert_eq!(
+            body["FailedResourcesMap"],
+            serde_json::json!({}),
+            "case {case}: tagging a live resource must not fail, got {body}"
+        );
+
+        // The round trip through the OWNING service's own reader.
+        let native = events_tags(&router, &arn).await;
+        assert_eq!(
+            native,
+            BTreeMap::from([("Owner".to_string(), "tagging-api".to_string())]),
+            "case {case}: the tag written here must be the resource's own, got {native:?}"
+        );
+
+        // And the other direction: a tag written through EventBridge is part of
+        // the set this API reports, because it is the same set.
+        let (status, body) = call(
+            &router,
+            EVENTS,
+            "AWSEvents.TagResource",
+            serde_json::json!({
+                "ResourceARN": &arn,
+                "Tags": [{ "Key": "Team", "Value": "platform" }]
+            }),
+        )
+        .await;
+        assert_eq!(status, 200, "case {case}: TagResource body {body}");
+        let (status, read) = tagging(
+            &router,
+            "GetResources",
+            serde_json::json!({ "ResourceARNList": [&arn] }),
+        )
+        .await;
+        assert_eq!(status, 200, "case {case}: GetResources body {read}");
+        let reported = page_tags(&read, &arn);
+        assert_eq!(
+            reported,
+            BTreeMap::from([
+                ("Owner".to_string(), "tagging-api".to_string()),
+                ("Team".to_string(), "platform".to_string()),
+            ]),
+            "case {case}: both writes must be in the one tag set, got {reported:?}"
+        );
+
+        // A removal through this API removes exactly that key from the same set.
+        let (status, body) = tagging(
+            &router,
+            "UntagResources",
+            serde_json::json!({ "ResourceARNList": [&arn], "TagKeys": ["Owner"] }),
+        )
+        .await;
+        assert_eq!(status, 200, "case {case}: UntagResources body {body}");
+        let native = events_tags(&router, &arn).await;
+        assert_eq!(
+            native,
+            BTreeMap::from([("Team".to_string(), "platform".to_string())]),
+            "case {case}: an untag here must remove the resource's own tag, got {native:?}"
+        );
+    }
+}
+
+/// A per-resource failure carries the hosting service's own error — its MESSAGE
+/// as much as its code — so for an absent EventBridge rule it reads the way
+/// EventBridge itself words a missing rule: the rule NAMED, and the event bus it
+/// was looked up on named too, with no ARN echoed back. The same ARN put to
+/// EventBridge's own tagging operation must answer that identical message, which
+/// is what "the error returned by the service that hosts the resource" means.
+///
+/// The rows differ along the bus the ghost rule is sought on and the form of its
+/// name, and with the bus the ARN form differs too (`rule/<name>` on the default
+/// bus, `rule/<bus>/<name>` on any other).
+#[tokio::test]
+async fn an_absent_eventbridge_rule_fails_with_eventbridges_own_wording() {
+    let router = emulator();
+
+    // A live bus and a live rule, so a row can name a stored rule under a bus it
+    // was never created on: that names a resource nothing created.
+    let (status, body) = call(
+        &router,
+        EVENTS,
+        "AWSEvents.CreateEventBus",
+        serde_json::json!({ "Name": "orders-bus" }),
+    )
+    .await;
+    assert_eq!(status, 200, "CreateEventBus: body {body}");
+    let (status, body) = call(
+        &router,
+        EVENTS,
+        "AWSEvents.PutRule",
+        serde_json::json!({
+            "Name": "live-rule",
+            "EventPattern": r#"{"source":["com.demo"]}"#,
+            "State": "ENABLED",
+        }),
+    )
+    .await;
+    assert_eq!(status, 200, "PutRule: body {body}");
+
+    let rows: &[(&str, &str, &str)] = &[
+        ("the default bus", "default", "ghost-rule"),
+        ("the default bus, a dotted name", "default", "ghost.rule.v2"),
+        ("a custom bus that exists", "orders-bus", "ghost_rule"),
+        ("a custom bus that does not exist", "ghost-bus", "ghost-rule"),
+        (
+            "a stored rule's name under another bus",
+            "orders-bus",
+            "live-rule",
+        ),
+    ];
+
+    for (case, bus, rule) in rows {
+        let ghost = events_rule_arn(bus, rule);
+        // The wording this test holds the emulator to, composed here from the
+        // row's own rule and bus.
+        let expected = format!("Rule {rule} does not exist on EventBus {bus}.");
+
+        for (operation, request) in [
+            (
+                "TagResources",
+                serde_json::json!({
+                    "ResourceARNList": [UNOWNED, &ghost],
+                    "Tags": { "Env": "partial" }
+                }),
+            ),
+            (
+                "UntagResources",
+                serde_json::json!({
+                    "ResourceARNList": [UNOWNED, &ghost],
+                    "TagKeys": ["Env"]
+                }),
+            ),
+        ] {
+            let (status, body) = tagging(&router, operation, request).await;
+            assert_eq!(
+                status, 200,
+                "case {case}/{operation}: expected a 200 with a partial failure, \
+                 got {status} with {body}"
+            );
+            let failed: Vec<String> = body["FailedResourcesMap"]
+                .as_object()
+                .unwrap_or_else(|| panic!("case {case}/{operation}: no FailedResourcesMap: {body}"))
+                .keys()
+                .cloned()
+                .collect();
+            assert_eq!(
+                failed,
+                vec![ghost.clone()],
+                "case {case}/{operation}: expected exactly the absent ARN to fail, got {failed:?}"
+            );
+            let failure = &body["FailedResourcesMap"][&ghost];
+            assert_eq!(
+                failure["StatusCode"],
+                serde_json::json!(400),
+                "case {case}/{operation}: expected StatusCode 400, got {body}"
+            );
+            assert_eq!(
+                failure["ErrorCode"],
+                serde_json::json!("ResourceNotFoundException"),
+                "case {case}/{operation}: expected EventBridge's own not-found code, got {body}"
+            );
+            assert_eq!(
+                failure["ErrorMessage"],
+                serde_json::json!(&expected),
+                "case {case}/{operation}: expected {expected:?}, got {body}"
+            );
+            let reported = failure["ErrorMessage"].as_str().unwrap_or_default();
+            assert!(
+                !reported.contains("arn:"),
+                "case {case}/{operation}: the failure must name the rule and its bus, \
+                 not echo the ARN, got {reported:?}"
+            );
+        }
+
+        // The same ARN, put to the hosting service's OWN tagging operation: the
+        // per-resource failure above carries that service's message verbatim.
+        let (status, native) = call(
+            &router,
+            EVENTS,
+            "AWSEvents.TagResource",
+            serde_json::json!({
+                "ResourceARN": &ghost,
+                "Tags": [{ "Key": "Env", "Value": "partial" }]
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case}: EventBridge's own TagResource must refuse the ghost ARN, \
+             got {status} {native}"
+        );
+        assert_eq!(
+            native["message"],
+            serde_json::json!(&expected),
+            "case {case}: the hosting service's own message must be the one the \
+             per-resource failure carried, got {native}"
+        );
+    }
+
+    // An `events` ARN that names no taggable EventBridge resource KIND at all is
+    // not a missing resource but a request that service refuses, so the
+    // per-resource failure carries THAT refusal — its code, its status and its
+    // own message, which the hosting service is asked for here rather than
+    // spelled out. The rows differ along the resource kind the ARN names.
+    for (case, ghost) in [
+        (
+            "an archive",
+            events_rule_arn("default", "x").replace(":rule/", ":archive/"),
+        ),
+        (
+            "an api destination",
+            events_rule_arn("default", "x").replace(":rule/", ":api-destination/"),
+        ),
+    ] {
+        let (status, native) = call(
+            &router,
+            EVENTS,
+            "AWSEvents.TagResource",
+            serde_json::json!({
+                "ResourceARN": &ghost,
+                "Tags": [{ "Key": "Env", "Value": "partial" }]
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case}: EventBridge's own TagResource must refuse the ARN, got {status} {native}"
+        );
+        let refused = error_code(&native);
+        let refusal = native["message"].as_str().unwrap_or_default().to_string();
+        assert!(
+            refusal.contains("ResourceARN"),
+            "case {case}: that refusal must name the member it refused, got {refusal:?}"
+        );
+
+        let (status, body) = tagging(
+            &router,
+            "TagResources",
+            serde_json::json!({
+                "ResourceARNList": [UNOWNED, &ghost],
+                "Tags": { "Env": "partial" }
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case}: expected a 200 with a partial failure, got {status} with {body}"
+        );
+        let failure = &body["FailedResourcesMap"][&ghost];
+        assert_eq!(
+            (
+                failure["StatusCode"].clone(),
+                failure["ErrorCode"].clone(),
+                failure["ErrorMessage"].clone()
+            ),
+            (
+                serde_json::json!(400),
+                serde_json::json!(refused),
+                serde_json::json!(refusal)
+            ),
+            "case {case}: the per-resource failure must carry the hosting service's own \
+             refusal ({refused} {refusal:?}), got {body}"
+        );
+    }
+}
+
 /// A tag written through this API is written to the OWNING service's own tag
 /// set — so that service reports it — and the resource is discoverable by both
 /// the bare and the qualified `ResourceTypeFilters` form.
