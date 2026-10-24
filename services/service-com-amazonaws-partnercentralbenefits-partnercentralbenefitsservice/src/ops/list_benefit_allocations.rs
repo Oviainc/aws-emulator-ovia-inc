@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListBenefitAllocations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListBenefitAllocations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the benefit allocations of one catalog from this service's state, filtered and
+//! paged — this is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListBenefitAllocations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The allocations themselves are service-owned data, like the benefit catalog they draw
+//! from: AWS grants an allocation when it fulfills a benefit for a partner and this API
+//! models no operation that creates one, so they live in `crate::state` (seeded, plus any
+//! the engine's holder has granted) and this operation reports them.
 //!
 //! ## Shape of an operation
 //!
@@ -127,6 +125,21 @@ impl From<ListBenefitAllocationsErrorModeled> for ListBenefitAllocationsError {
     }
 }
 
+/// Why a `NextToken` that is not one this operation issued is refused.
+fn invalid_next_token() -> ListBenefitAllocationsError {
+    let message = "NextToken is not a pagination token issued by ListBenefitAllocations";
+    ListBenefitAllocationsErrorModeled::ValidationException(ValidationException {
+        message: message.to_string(),
+        reason: crate::state::VALIDATION_REASON_FIELD.to_string(),
+        field_list: Some(crate::state::validation_field(
+            "NextToken",
+            message,
+            crate::state::VALIDATION_CODE_INVALID_VALUE,
+        )),
+    })
+    .into()
+}
+
 /// The `ListBenefitAllocations` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -163,26 +176,155 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // The entitlement gate is a service-wide stage, so it sits ahead of this
-        // (unwritten) body too: a caller whose account holds no active AWS partner
-        // benefit is refused with the modelled `AccessDeniedException`, which is the
-        // WHOLE answer the service gives such a request — no unimplemented behaviour is
-        // involved. An entitled caller still gets the 501 below.
+        // The entitlement gate, ahead of everything else this handler does — see
+        // [`crate::state::entitlement_refusal`].
         if let Some(denied) = crate::state::entitlement_refusal(&*self.engine) {
             return Err(ListBenefitAllocationsErrorModeled::AccessDeniedException(denied).into());
         }
-        // Implement `ListBenefitAllocations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListBenefitAllocationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListBenefitAllocations"))
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListBenefitAllocationsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::STORE_UNAVAILABLE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // `Catalog`'s own pattern and every filter's modelled `@length` are refused by the
+        // centralized walk before this body runs.
+        let region = crate::state::request_region(ctx);
+        let now_millis = crate::state::now_millis();
+        let page_size = crate::state::page_size(input.max_results);
+        let resume_from = match input.next_token.as_deref() {
+            Some(token) => Some(
+                crate::state::decode_page_token(token, crate::state::ALLOCATION_ID_PREFIX)
+                    .ok_or_else(invalid_next_token)?,
+            ),
+            None => None,
+        };
+
+        let mut store = state.lock();
+        if !store.catalogs.contains_key(&input.catalog) {
+            return Err(ListBenefitAllocationsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::not_found_message(
+                        crate::state::CATALOG_KIND,
+                        &input.catalog,
+                    ),
+                },
+            )
+            .into());
+        }
+        // An allocation past its `ExpiresAt` is no longer usable whether or not anybody
+        // has looked at it, so this report first materialises the expiries the clock has
+        // ALREADY made due; it writes nothing else, and a later caller sees exactly what
+        // this one did. See `crate::state::BenefitAllocation::expire_due`.
+        store.expire_allocations_due(&input.catalog, now_millis);
+
+        // `BenefitIdentifiers` accepts either form the modelled `BenefitId` allows and
+        // `BenefitApplicationIdentifiers` either form `BenefitApplicationIdentifier`
+        // allows, so each entry is resolved to the catalog's own id before the comparison.
+        // A filter the caller DID supply whose entries name nothing in this catalog
+        // therefore selects nothing — unlike an absent or empty filter, which selects
+        // everything.
+        let application_filter: Option<Vec<String>> = input
+            .benefit_application_identifiers
+            .as_ref()
+            .and_then(|wanted| {
+                (!wanted.is_empty()).then(|| {
+                    wanted
+                        .iter()
+                        .filter_map(|identifier| {
+                            store.resolve_application_id(&input.catalog, identifier)
+                        })
+                        .collect()
+                })
+            });
+
+        // The catalog itself: present, since the lookup above found it and nothing since
+        // could have removed it (the store is locked for the whole body).
+        let Some(catalog) = store.catalogs.get(&input.catalog) else {
+            return Err(ListBenefitAllocationsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::STORE_UNAVAILABLE.to_string(),
+                },
+            )
+            .into());
+        };
+        let benefit_filter: Option<Vec<String>> =
+            input.benefit_identifiers.as_ref().and_then(|wanted| {
+                (!wanted.is_empty()).then(|| {
+                    wanted
+                        .iter()
+                        .filter_map(|identifier| {
+                            catalog.resolve_benefit_id(&input.catalog, identifier)
+                        })
+                        .collect()
+                })
+            });
+
+        // The allocations are keyed by id in a `BTreeMap`, so this walk is in one stable
+        // order and the token is simply the id to resume at — the range starts directly at
+        // that key rather than rescanning from the front. One extra matching record is
+        // taken to decide whether a further page exists, and is not reported.
+        let mut page: Vec<&crate::state::BenefitAllocation> = catalog
+            .allocations
+            .range(resume_from.unwrap_or_default()..)
+            .map(|(_, allocation)| allocation)
+            .filter(|allocation| {
+                crate::state::matches_any(
+                    input.fulfillment_types.as_ref(),
+                    &allocation.fulfillment_types,
+                ) && crate::state::matches_any(
+                    input.status.as_ref(),
+                    std::slice::from_ref(&allocation.status),
+                ) && benefit_filter
+                    .as_ref()
+                    .is_none_or(|ids| ids.contains(&allocation.benefit_id))
+                    && application_filter.as_ref().is_none_or(|ids| {
+                        allocation
+                            .benefit_application_id
+                            .as_ref()
+                            .is_some_and(|id| ids.contains(id))
+                    })
+            })
+            .take(page_size.saturating_add(1))
+            .collect();
+
+        let next_token = page
+            .get(page_size)
+            .map(|allocation| crate::state::encode_page_token(&allocation.id));
+        page.truncate(page_size);
+
+        Ok(ListBenefitAllocationsOutput {
+            benefit_allocation_summaries: Some(
+                page.into_iter()
+                    .map(|allocation| BenefitAllocationSummary {
+                        id: Some(allocation.id.clone()),
+                        catalog: Some(allocation.catalog.clone()),
+                        arn: Some(crate::state::allocation_arn(
+                            &region,
+                            &allocation.catalog,
+                            &allocation.id,
+                        )),
+                        status: Some(allocation.status.clone()),
+                        status_reason: allocation.status_reason.clone(),
+                        name: Some(allocation.name.clone()),
+                        benefit_id: Some(allocation.benefit_id.clone()),
+                        benefit_application_id: allocation.benefit_application_id.clone(),
+                        fulfillment_types: crate::state::optional_list(
+                            &allocation.fulfillment_types,
+                        ),
+                        created_at: Some(crate::state::timestamp(allocation.created_at_millis)),
+                        expires_at: Some(crate::state::timestamp(allocation.expires_at_millis)),
+                        applicable_benefit_ids: crate::state::optional_list(
+                            &allocation.applicable_benefit_ids,
+                        ),
+                    })
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }
