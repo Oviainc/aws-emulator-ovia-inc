@@ -204,6 +204,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // Every one of the update's configuration members below is documented
+        // `[Default policies only]`, so the policy addressed must BE a default
+        // policy for the request to state one — in the request body or inside
+        // `PolicyDetails`. The check runs after the lookup (the policy has to
+        // exist before its kind can be read) and before the first write, so a
+        // refused update leaves the stored policy exactly as it was.
+        if !policy.default_policy {
+            let mut refused = crate::state::DefaultPolicyOnlyParameters {
+                resource_type: false,
+                create_interval: input.create_interval.is_some(),
+                retain_interval: input.retain_interval.is_some(),
+                copy_tags: input.copy_tags.is_some(),
+                cross_region_copy_targets: input.cross_region_copy_targets.is_some(),
+                extend_deletion: input.extend_deletion.is_some(),
+                exclusions: input.exclusions.is_some(),
+            }
+            .stated_names("");
+            refused.extend(
+                crate::state::DefaultPolicyOnlyParameters::in_policy_details(
+                    input.policy_details.as_ref(),
+                )
+                .stated_names(crate::state::POLICY_DETAILS_PREFIX),
+            );
+            if !refused.is_empty() {
+                return Err(
+                    UpdateLifecyclePolicyErrorModeled::InvalidRequestException(
+                        crate::state::default_policy_only_parameters_refused(&refused),
+                    )
+                    .into(),
+                );
+            }
+        }
+
         // A partial update: only the members the request carries overwrite the
         // stored policy, and every absent member keeps the value the create or an
         // earlier update stored.

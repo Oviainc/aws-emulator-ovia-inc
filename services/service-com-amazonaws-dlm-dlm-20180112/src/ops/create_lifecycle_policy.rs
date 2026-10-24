@@ -207,11 +207,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // model cannot express: "If you create a default policy, you can specify
         // the request parameters either in the request body, or in the
         // PolicyDetails request structure, but not both."
+        let stated_in_body = default_policy_only_body_parameters(&input);
         if is_default && input.policy_details.is_some() {
-            let duplicated = duplicated_default_policy_parameters(&input);
+            let duplicated = stated_in_body.stated_names("");
             if !duplicated.is_empty() {
                 let mut parameters = vec!["PolicyDetails".to_string()];
-                parameters.extend(duplicated.iter().map(|name| (*name).to_string()));
+                parameters.extend(duplicated.iter().cloned());
                 return Err(CreateLifecyclePolicyErrorModeled::InvalidRequestException(
                     crate::state::parameters_cannot_be_combined(
                         format!(
@@ -221,6 +222,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         ),
                         parameters,
                     ),
+                )
+                .into());
+            }
+        }
+
+        // The members above are each documented `[Default policies only]`, so a
+        // request that is not creating a default policy may not state one — in
+        // the request body or inside `PolicyDetails`. Refused before anything is
+        // stored, so no policy is left holding a configuration no read reports.
+        if !is_default {
+            let mut refused = stated_in_body.stated_names("");
+            refused.extend(
+                crate::state::DefaultPolicyOnlyParameters::in_policy_details(
+                    input.policy_details.as_ref(),
+                )
+                .stated_names(crate::state::POLICY_DETAILS_PREFIX),
+            );
+            if !refused.is_empty() {
+                return Err(CreateLifecyclePolicyErrorModeled::InvalidRequestException(
+                    crate::state::default_policy_only_parameters_refused(&refused),
                 )
                 .into());
             }
@@ -323,26 +344,21 @@ fn policy_language_is_simplified(details: Option<&PolicyDetails>) -> bool {
 }
 
 /// The `[Default policies only]` parameters this request states in the request
-/// body while also carrying a `PolicyDetails` structure that can state them.
-fn duplicated_default_policy_parameters(input: &CreateLifecyclePolicyInput) -> Vec<&'static str> {
-    let mut names = Vec::new();
-    if input.create_interval.is_some() {
-        names.push("CreateInterval");
+/// BODY, as against inside its `PolicyDetails` structure.
+///
+/// `PolicyDetails$ResourceType` has no request-body counterpart of its own:
+/// `DefaultPolicy` states the type of default policy to create, and it is what
+/// makes the request a default-policy request in the first place.
+fn default_policy_only_body_parameters(
+    input: &CreateLifecyclePolicyInput,
+) -> crate::state::DefaultPolicyOnlyParameters {
+    crate::state::DefaultPolicyOnlyParameters {
+        resource_type: false,
+        create_interval: input.create_interval.is_some(),
+        retain_interval: input.retain_interval.is_some(),
+        copy_tags: input.copy_tags.is_some(),
+        cross_region_copy_targets: input.cross_region_copy_targets.is_some(),
+        extend_deletion: input.extend_deletion.is_some(),
+        exclusions: input.exclusions.is_some(),
     }
-    if input.retain_interval.is_some() {
-        names.push("RetainInterval");
-    }
-    if input.copy_tags.is_some() {
-        names.push("CopyTags");
-    }
-    if input.extend_deletion.is_some() {
-        names.push("ExtendDeletion");
-    }
-    if input.cross_region_copy_targets.is_some() {
-        names.push("CrossRegionCopyTargets");
-    }
-    if input.exclusions.is_some() {
-        names.push("Exclusions");
-    }
-    names
 }
