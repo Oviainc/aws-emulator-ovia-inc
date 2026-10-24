@@ -70,6 +70,12 @@ pub(crate) fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryE
             Arc::clone(&engine),
         ),
     );
+    // Amazon RDS, for the `AWS::RDS::DBInstance` and `AWS::RDS::DBSubnetGroup` a stack
+    // really creates there: a suite that deploys one reads the database back through RDS's
+    // own wire ([`rds`]).
+    router.register_service(
+        service_com_amazonaws_rds_amazonrdsv19::EmulatedService::new(Arc::clone(&engine)),
+    );
     (router, engine)
 }
 
@@ -222,6 +228,45 @@ pub(crate) async fn sns(
         )
         .body(bytes::Bytes::from(body))
         .expect("a well-formed SNS request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let body = String::from_utf8_lossy(response.body()).to_string();
+    (status, body)
+}
+
+/// One awsQuery call to Amazon RDS over the same router, answered with the HTTP status and
+/// the XML body.
+///
+/// The ONE RDS caller of this crate's suites: a DB instance or DB subnet group a stack
+/// CREATES lives in Amazon RDS, so a case that reads one back goes through RDS's own wire
+/// here, signed for `rds` in the Region the stack was created in — which is the Region its
+/// identifiers are scoped to. The API version is RDS's own (`version: 2014-10-31`).
+pub(crate) async fn rds(
+    router: &MultiServiceRouter,
+    action: &str,
+    params: &[(&str, &str)],
+) -> (u16, String) {
+    let mut body = format!("Action={action}&Version=2014-10-31");
+    for (name, value) in params {
+        body.push('&');
+        body.push_str(&form_encode(name));
+        body.push('=');
+        body.push_str(&form_encode(value));
+    }
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("host", format!("rds.{REGION}.amazonaws.com"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/rds/aws4_request, \
+                 SignedHeaders=host, Signature=0123456789abcdef"
+            ),
+        )
+        .body(bytes::Bytes::from(body))
+        .expect("a well-formed RDS request");
     let response = router.dispatch(request).await;
     let status = response.status().as_u16();
     let body = String::from_utf8_lossy(response.body()).to_string();

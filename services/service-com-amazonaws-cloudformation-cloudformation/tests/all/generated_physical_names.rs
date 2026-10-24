@@ -146,12 +146,15 @@ const OWNED: &[Owned] = &[
 
 /// The properties the declaration of `resource_type` carries.
 ///
-/// Only an `AWS::IAM::Role` needs any: `AssumeRolePolicyDocument` is required on the type
-/// and on IAM's own `CreateRole`, and this emulator CREATES the role in IAM, so the trust
-/// policy is the issue's own (a role the AWS Config recorder assumes). The other types here
-/// are recorded by CloudFormation rather than created in their owning service, and the
-/// naming rule reads no property of theirs — a declaration that names the resource nowhere
-/// is exactly the case under test.
+/// Only the two types this emulator really CREATES in their owning service need any, and
+/// each needs exactly what that service's create requires of a caller: an
+/// `AWS::IAM::Role`'s `AssumeRolePolicyDocument` is required on the type and on IAM's own
+/// `CreateRole` (the policy here is the issue's own — a role the AWS Config recorder
+/// assumes), and an `AWS::RDS::DBInstance` is created through `CreateDBInstance`, whose
+/// `Engine` and `DBInstanceClass` are required members. The other types here are recorded
+/// by CloudFormation rather than created in their owning service, and the naming rule reads
+/// no property of theirs — a declaration that names the resource nowhere is exactly the case
+/// under test.
 fn properties(resource_type: &str) -> Value {
     if resource_type == "AWS::IAM::Role" {
         return json!({
@@ -164,6 +167,9 @@ fn properties(resource_type: &str) -> Value {
                 }]
             }
         });
+    }
+    if resource_type == "AWS::RDS::DBInstance" {
+        return json!({"Engine": "mysql", "DBInstanceClass": "db.t3.micro"});
     }
     json!({})
 }

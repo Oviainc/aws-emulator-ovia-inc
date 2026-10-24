@@ -285,12 +285,21 @@ fn rds_instance_arn(identifier: &str) -> String {
 /// endpoint's infix is `.cluster-`, the reader endpoint's `.cluster-ro-` and a DB
 /// instance's a plain `.` ("Amazon Aurora connection management" / "Finding the connection
 /// information for an RDS DB instance").
+///
+/// The label is SERVICE-ASSIGNED — for a DB instance the stack really creates it is the one
+/// Amazon RDS minted and reported, not a value CloudFormation computed — so the only thing
+/// asserted about it is the alphabet AWS's own endpoints use: lowercase alphanumeric.
 fn is_rds_endpoint(value: &str, identifier: &str, infix: &str) -> bool {
     let suffix = format!(".{REGION}.rds.amazonaws.com");
     value
         .strip_prefix(&format!("{identifier}{infix}"))
         .and_then(|rest| rest.strip_suffix(&suffix))
-        .is_some_and(|label| !label.is_empty() && label.chars().all(is_lower_hex))
+        .is_some_and(|label| {
+            !label.is_empty()
+                && label
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || c.is_ascii_lowercase())
+        })
 }
 
 /// Whether `value` is an Amazon RDS immutable resource id: `prefix-` and 26 UPPERCASE
@@ -1145,7 +1154,10 @@ fn output_cases() -> Vec<OutputCase> {
             // row takes both from parameters, so `Endpoint.Port` can only be right if the
             // declared properties were evaluated. The last resource's engine resolves to
             // nothing (a `Ref` to a name the template never declares), so its port is
-            // reported with no value rather than defaulted to one engine's.
+            // reported with no value rather than defaulted to one engine's. Every resource
+            // of this row is a DB CLUSTER, a type this emulator records rather than
+            // provisions, so the row stays about evaluating the declared properties: an
+            // engine that resolves to nothing is not a create Amazon RDS would accept.
             case: "a db port and engine declared through intrinsics, and an unresolvable engine",
             stack_name: "db-intrinsics",
             template: concat!(
@@ -1167,9 +1179,9 @@ fn output_cases() -> Vec<OutputCase> {
                 "      DBClusterIdentifier: probe-default-port\n",
                 "      Engine: !Ref EngineName\n",
                 "  UnknownEngineDatabase:\n",
-                "    Type: AWS::RDS::DBInstance\n",
+                "    Type: AWS::RDS::DBCluster\n",
                 "    Properties:\n",
-                "      DBInstanceIdentifier: probe-unknown-engine\n",
+                "      DBClusterIdentifier: probe-unknown-engine\n",
                 "      Engine: !Ref NoSuchParameter\n",
                 "Outputs:\n",
                 "  FixedPort:\n",
