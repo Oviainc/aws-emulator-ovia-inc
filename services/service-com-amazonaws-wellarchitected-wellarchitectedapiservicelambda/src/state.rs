@@ -786,6 +786,13 @@ pub const PROFILE_RESOURCE_TYPE: &str = "PROFILE";
 /// kind `WORKLOAD`, so a share of one is named here by what it is.
 pub const WORKLOAD_SHARE_RESOURCE_TYPE: &str = "WORKLOAD_SHARE";
 
+/// `ConflictException$ResourceType` for a share of a LENS — the counterpart of
+/// [`WORKLOAD_SHARE_RESOURCE_TYPE`] for the other resource kind this emulator shares.
+/// The share is a resource of its own (its own `ShareId`), while
+/// [`LENS_RESOURCE_TYPE`] is the `ShareResourceType` member naming the shared resource
+/// KIND, so the two are spelled apart for the same reason.
+pub const LENS_SHARE_RESOURCE_TYPE: &str = "LENS_SHARE";
+
 /// `ConflictException$ResourceType` / `ResourceNotFoundException$ResourceType` for a
 /// share invitation. The invitation is a resource of its own — it has its own
 /// `ShareInvitationId`, which `UpdateShareInvitation` resolves it by — so it is named
@@ -793,12 +800,13 @@ pub const WORKLOAD_SHARE_RESOURCE_TYPE: &str = "WORKLOAD_SHARE";
 /// ([`WORKLOAD_SHARE_RESOURCE_TYPE`]).
 pub const SHARE_INVITATION_RESOURCE_TYPE: &str = "SHARE_INVITATION";
 
-/// `ShareStatus` a newly created workload share carries.
+/// `ShareStatus` a newly created share carries, whatever resource it shares.
 ///
-/// A share is mediated by a workload invitation — "Shared access to a workload is not
-/// removed until the workload invitation is deleted" (`CreateWorkloadShare` doc) — so a
-/// share the sharer has just created is waiting on the principal it was offered to, and
-/// `PENDING` is the `ShareStatus` member for exactly that
+/// A share is mediated by an invitation — "Shared access to a workload is not removed
+/// until the workload invitation is deleted" (`CreateWorkloadShare` doc), and the same
+/// sentence about the lens invitation in `CreateLensShare`'s — so a share the sharer has
+/// just created is waiting on the principal it was offered to, and `PENDING` is the
+/// `ShareStatus` member for exactly that
 /// (`smithy_query(query="shape", shape="ShareStatus")`). Nothing the CLOCK does moves it:
 /// it leaves `PENDING` only when the recipient answers the invitation
 /// (`UpdateShareInvitation`).
@@ -853,6 +861,16 @@ pub const TEMPLATE_SHARE_RESOURCE_TYPE: &str = "TEMPLATE";
 /// principal per workload, and every create token is 1:1 with a live share — and it sits
 /// far above any realistic client workflow, so a caller never meets it by accident.
 pub const MAX_SHARES_PER_WORKLOAD: usize = 1_000;
+
+/// The most shares one lens holds in this emulator.
+///
+/// The same reasoning as [`MAX_SHARES_PER_WORKLOAD`], for the other resource kind that
+/// is shared here: `CreateLensShare` models `ServiceQuotaExceededException` (HTTP 402,
+/// "The user has reached their resource quota") for the metered case and the real quota
+/// is adjustable through Service Quotas, so the number is this emulator's own ceiling
+/// rather than a value read off a doc page. It bounds the lens-share map's growth — one
+/// share per principal per lens, and every create token is 1:1 with a live share.
+pub const MAX_SHARES_PER_LENS: usize = 1_000;
 
 /// `ResourceNotFoundException$ResourceType` for the review of one lens in one workload
 /// — the resource `ListAnswers` and the other per-lens reads resolve. The modelled
@@ -2778,6 +2796,77 @@ pub struct CreateWorkloadShareToken {
     pub fingerprint: String,
 }
 
+/// One stored share of a CUSTOM LENS: the principal the lens was shared WITH and where
+/// the share stands.
+///
+/// The lens counterpart of [`WorkloadShareRecord`], and recorded for the same reasons: a
+/// share is its own resource identified by its `ShareId`, it belongs to the lens it
+/// shares, and `shared_by` is that lens's owning account — the principal that did the
+/// sharing, which `ShareInvitationSummary$SharedBy` reports. A lens share carries NO
+/// permission: `CreateLensShare` takes none (`smithy_query(query="operation",
+/// operation="CreateLensShare")` publishes only `LensAlias`, `SharedWith` and
+/// `ClientRequestToken`), so a lens invitation reports none either.
+///
+/// `share_invitation_id` is the id of the invitation the recipient has to answer. It is
+/// 1:1 with the share and exists from the moment the share is created — "Shared access
+/// to a lens is not removed until the lens invitation is deleted" (`CreateLensShare`
+/// doc) — but it is a resource of its OWN, named by its own `ShareInvitationId`, so it
+/// is minted and recorded beside the `ShareId`.
+///
+/// `lens_arn` is held by value because the invitation reports it
+/// (`ShareInvitationSummary$LensArn`) and a lens's ARN never changes; the lens's NAME is
+/// lens CONTENT, which a later `ImportLens` can change, so it is read from the lens
+/// record at projection time instead.
+#[derive(Debug, Clone)]
+pub struct LensShareRecord {
+    pub share_id: String,
+    pub share_invitation_id: String,
+    /// The lens id the share belongs to — the key of [`LensRecord`] in the store.
+    pub lens_id: String,
+    pub lens_arn: String,
+    pub shared_by: String,
+    pub shared_with: String,
+    pub status: String,
+    pub status_message: Option<String>,
+}
+
+impl LensShareRecord {
+    /// The `ShareInvitationSummary` projection `ListShareInvitations` pages over: this
+    /// share seen as the invitation its recipient was offered.
+    ///
+    /// `lens_name` is the name of the lens the share shares, which the lens's CONTENT
+    /// owns, so the caller reads it off the lens record rather than off the share; it is
+    /// `None` for a lens that carries no readable content. Only the members of the shared
+    /// resource KIND are filled, and a lens share grants no permission, so
+    /// `PermissionType` is left off too.
+    pub fn to_invitation_summary(&self, lens_name: Option<&str>) -> ShareInvitationSummary {
+        ShareInvitationSummary {
+            share_invitation_id: Some(self.share_invitation_id.clone()),
+            shared_by: Some(self.shared_by.clone()),
+            shared_with: Some(self.shared_with.clone()),
+            permission_type: None,
+            share_resource_type: Some(LENS_RESOURCE_TYPE.to_string()),
+            workload_name: None,
+            workload_id: None,
+            lens_name: lens_name.map(ToString::to_string),
+            lens_arn: Some(self.lens_arn.clone()),
+            profile_name: None,
+            profile_arn: None,
+            template_name: None,
+            template_arn: None,
+        }
+    }
+}
+
+/// What a `CreateLensShare` idempotency token resolves to: the share the original
+/// request created, plus that request's parameter fingerprint.
+#[derive(Debug, Clone)]
+pub struct CreateLensShareToken {
+    pub lens_id: String,
+    pub share_id: String,
+    pub fingerprint: String,
+}
+
 /// What a `CreateReviewTemplate` idempotency token resolves to: the review template the
 /// original request created, plus that request's parameter fingerprint.
 #[derive(Debug, Clone)]
@@ -3280,6 +3369,13 @@ pub struct ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// `CreateWorkloadShare`'s `ClientRequestToken` -> what the original request created.
     /// Caller input keys it, so it is a BOUNDED [`TokenLedger`].
     pub create_workload_share_tokens: TokenLedger<CreateWorkloadShareToken>,
+    /// Every share recorded against a custom lens, keyed by the lens id then by
+    /// `ShareId`. A `BTreeMap` because `ShareId` order is the stable order a listing of
+    /// a lens's shares pages over, exactly as [`Self::workload_shares`] is ordered.
+    pub lens_shares: HashMap<String, BTreeMap<String, LensShareRecord>>,
+    /// `CreateLensShare`'s `ClientRequestToken` -> what the original request created.
+    /// Caller input keys it, so it is a BOUNDED [`TokenLedger`].
+    pub create_lens_share_tokens: TokenLedger<CreateLensShareToken>,
     /// Normalized workload name -> `WorkloadId`. Backs the documented "name must be
     /// unique within an account within a Region; spaces and capitalization are
     /// ignored" rule.
@@ -3397,35 +3493,49 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// A fresh `ShareId`: 32 lowercase hex characters, as `^[0-9a-f]{32}$` requires, and
     /// unused by any share this store holds. A `ShareId` identifies the share on its own
     /// (`DeleteWorkloadShare` resolves one by id), so uniqueness is checked over every
-    /// workload's shares rather than within one workload.
+    /// share of every SHARED RESOURCE rather than within one of them — a workload's and a
+    /// lens's shares live in one id space.
     pub fn mint_share_id(&mut self) -> String {
         loop {
             let id = self.next_hex_id();
-            if !self
-                .workload_shares
-                .values()
-                .any(|shares| shares.contains_key(&id))
-            {
+            if !self.share_id_taken(&id) {
                 return id;
             }
         }
     }
 
+    /// Whether any stored share already carries `share_id`.
+    fn share_id_taken(&self, share_id: &str) -> bool {
+        self.workload_shares
+            .values()
+            .any(|shares| shares.contains_key(share_id))
+            || self
+                .lens_shares
+                .values()
+                .any(|shares| shares.contains_key(share_id))
+    }
+
     /// A fresh `ShareInvitationId`: 32 lowercase hex characters, as `^[0-9a-f]{32}$`
     /// requires, and unused by any invitation this store holds. An invitation is named by
     /// this id alone (`UpdateShareInvitation` resolves one by it), so uniqueness is
-    /// checked over every workload's shares — and against the `ShareId`s too, so the two
-    /// id spaces of one share can never hand out the same value and be mistaken for each
-    /// other.
+    /// checked over every share of every shared resource — and against the `ShareId`s too,
+    /// so the two id spaces of one share can never hand out the same value and be mistaken
+    /// for each other.
     pub fn mint_share_invitation_id(&mut self) -> String {
         loop {
             let id = self.next_hex_id();
-            if !self.workload_shares.values().any(|shares| {
-                shares.contains_key(&id)
-                    || shares
-                        .values()
-                        .any(|share| share.share_invitation_id == id)
-            }) {
+            let taken = self.share_id_taken(&id)
+                || self
+                    .workload_shares
+                    .values()
+                    .flat_map(BTreeMap::values)
+                    .any(|share| share.share_invitation_id == id)
+                || self
+                    .lens_shares
+                    .values()
+                    .flat_map(BTreeMap::values)
+                    .any(|share| share.share_invitation_id == id);
+            if !taken {
                 return id;
             }
         }
@@ -3849,10 +3959,9 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// answered it. `ShareInvitationId` order is the stable order the pages are cut on,
     /// which is why the enumeration sorts here rather than at the caller.
     ///
-    /// Only workload invitations can exist in this emulator so far: a lens, profile or
-    /// review-template share has no store because `CreateLensShare`,
-    /// `CreateProfileShare` and `CreateTemplateShare` are still stubs with their own
-    /// issues.
+    /// Workload and LENS invitations can exist in this emulator: a profile or
+    /// review-template share has no store yet because `CreateProfileShare` and
+    /// `CreateTemplateShare` are still stubs with their own issues.
     pub fn pending_share_invitations_for(&self, principal: &str) -> Vec<ShareInvitationSummary> {
         let mut invitations: Vec<ShareInvitationSummary> = self
             .workload_shares
@@ -3870,6 +3979,27 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
                 share.to_invitation_summary(workload_name)
             })
             .collect();
+        // A lens share raises an invitation of its own kind, reported through the same
+        // enumeration so one order and one `PENDING` rule cover every shared resource.
+        let now = SystemTime::now();
+        invitations.extend(
+            self.lens_shares
+                .values()
+                .flat_map(|shares| shares.values())
+                .filter(|share| {
+                    share.shared_with == principal && share.status == DEFAULT_SHARE_STATUS
+                })
+                .map(|share| {
+                    // The lens's NAME is its content's, which a later import can change,
+                    // so it is read here rather than copied onto the share.
+                    let lens_name = self
+                        .lenses
+                        .get(&share.lens_id)
+                        .and_then(|lens| lens.summary_content(now))
+                        .map(|content| content.definition.name.as_str());
+                    share.to_invitation_summary(lens_name)
+                }),
+        );
         invitations.sort_by(|left, right| {
             left.share_invitation_id
                 .cmp(&right.share_invitation_id)
@@ -3887,6 +4017,34 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     ) -> Option<&WorkloadShareRecord> {
         self.workload_shares
             .get(workload_id)?
+            .values()
+            .find(|share| share.shared_with == shared_with)
+    }
+
+    /// Every share recorded against the lens `lens_id`, in `ShareId` order — the lens
+    /// counterpart of [`Self::workload_shares_of`].
+    pub fn lens_shares_of(&self, lens_id: &str) -> Vec<&LensShareRecord> {
+        self.lens_shares
+            .get(lens_id)
+            .map(|shares| shares.values().collect())
+            .unwrap_or_default()
+    }
+
+    /// The share `share_id` of the lens `lens_id`, if the lens holds it.
+    pub fn lens_share(&self, lens_id: &str, share_id: &str) -> Option<&LensShareRecord> {
+        self.lens_shares.get(lens_id)?.get(share_id)
+    }
+
+    /// The share of the lens `lens_id` the principal `shared_with` already holds, if it
+    /// holds one: a principal holds at most one share of one lens, so this is what a
+    /// second share request for the same principal collides with.
+    pub fn lens_share_with(
+        &self,
+        lens_id: &str,
+        shared_with: &str,
+    ) -> Option<&LensShareRecord> {
+        self.lens_shares
+            .get(lens_id)?
             .values()
             .find(|share| share.shared_with == shared_with)
     }
@@ -4657,6 +4815,22 @@ pub fn workload_share_conflict(existing: &WorkloadShareRecord) -> ConflictExcept
         &format!(
             "The workload with ID {} is already shared with {}.",
             existing.workload_id, existing.shared_with
+        ),
+    )
+}
+
+/// [`conflict`] for a principal a LENS is already shared with — the lens counterpart of
+/// [`workload_share_conflict`], for the same reason: a share is the grant of access to
+/// one lens to one principal, so the principal already holding one is what a second
+/// share request for it collides with. `existing` is the share that is in the way, which
+/// `resource_id` names so the caller can delete it.
+pub fn lens_share_conflict(existing: &LensShareRecord) -> ConflictException {
+    conflict(
+        LENS_SHARE_RESOURCE_TYPE,
+        existing.share_id.clone(),
+        &format!(
+            "The lens with ARN {} is already shared with {}.",
+            existing.lens_arn, existing.shared_with
         ),
     )
 }

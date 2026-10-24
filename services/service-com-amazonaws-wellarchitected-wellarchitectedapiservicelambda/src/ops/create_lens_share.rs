@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateLensShare
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateLensShare`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateLensShare::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: shares one CUSTOM lens with one principal and persists the share in
+//! [`crate::state`], so the invitation it raises is reported by `ListShareInvitations`
+//! and the share itself is the one `ListLensShares` and `DeleteLensShare` resolve (both
+//! still stubs with their own issues). "Lenses provided by Amazon Web Services (Amazon
+//! Web Services Official Content) cannot be shared" and a lens "cannot be … shared with
+//! other Amazon Web Services accounts until it's published with CreateLensVersion"
+//! (`ImportLens` doc), so both are refused with `ValidationException` (400); a
+//! `LensAlias` naming no stored custom lens is `ResourceNotFoundException` (404), the
+//! lens's own owning account as `SharedWith` is `ValidationException` (400), a principal
+//! the lens is already shared with is `ConflictException` (409), and a share beyond this
+//! emulator's per-lens ceiling is `ServiceQuotaExceededException` (402).
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +180,190 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateLensShare` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateLensShareErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateLensShare"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateLensShareErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool lens store is unavailable".to_string(),
+            })
+        })?;
+
+        // "Lenses provided by Amazon Web Services (Amazon Web Services Official Content)
+        // cannot be shared" (this operation's doc). The refusal is about the lens the
+        // request NAMED, so it is a validation failure on `LensAlias` rather than a lookup
+        // miss — the lens exists, it just cannot be shared. An official lens is the one
+        // named by a bare alias or by an ARN carrying no owner account
+        // (`crate::state::is_aws_official_lens`), the same distinction `ExportLens` reads
+        // for its own "cannot be exported" rule.
+        if crate::state::is_aws_official_lens(&input.lens_alias) {
+            return Err(field_validation(
+                LENS_ALIAS_MEMBER,
+                "Member must be the ARN of a custom lens; a lens provided by Amazon Web \
+                 Services cannot be shared",
+            ));
+        }
+
+        let fingerprint = crate::state::parameter_fingerprint(&serde_json::json!({
+            "LensAlias": &input.lens_alias,
+            "SharedWith": &input.shared_with,
+        }));
+
+        let now = std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // `@idempotencyToken` replay: the same token with the same parameters returns the
+        // share the original request created instead of creating a second one.
+        if let Some(token) = store
+            .create_lens_share_tokens
+            .get(&input.client_request_token)
+        {
+            if token.fingerprint != fingerprint {
+                let share_id = token.share_id.clone();
+                return Err(CreateLensShareErrorModeled::ConflictException(
+                    crate::state::idempotency_token_conflict(
+                        crate::state::LENS_SHARE_RESOURCE_TYPE,
+                        share_id,
+                        &input.client_request_token,
+                    ),
+                )
+                .into());
+            }
+            if let Some(recorded) = store.lens_share(&token.lens_id, &token.share_id) {
+                return Ok(CreateLensShareOutput {
+                    share_id: Some(recorded.share_id.clone()),
+                });
+            }
+        }
+
+        // "The owner of a lens can share it with other Amazon Web Services accounts"
+        // (this operation's doc): the lens being shared is resolved by this lookup, so a
+        // `LensAlias` no stored custom lens answers to is the lookup's 404 whatever its
+        // syntax, and the account that owns the lens is the principal doing the sharing.
+        let Some(record) = store.lens_by_alias(&input.lens_alias) else {
+            return Err(CreateLensShareErrorModeled::ResourceNotFoundException(
+                crate::state::lens_not_found(&input.lens_alias),
+            )
+            .into());
+        };
+        let published = record.published_version(now).is_some();
+        let lens_id = record.lens_id.clone();
+        let lens_arn = record.lens_arn.clone();
+        let shared_by = record.owner.clone();
+
+        // "The new or updated lens will have a status of DRAFT. The lens cannot be applied
+        // to workloads or shared with other Amazon Web Services accounts until it's
+        // published with CreateLensVersion" (`ImportLens` doc). Whether the content the
+        // lens now carries has been published is the lens's own question
+        // (`crate::state::LensRecord::published_version`), so an import that has not landed
+        // yet and a draft nothing was published from are refused by the same rule.
+        if !published {
+            return Err(field_validation(
+                LENS_ALIAS_MEMBER,
+                "Member must name a published lens; a lens cannot be shared until a version \
+                 of it is published with CreateLensVersion",
+            ));
+        }
+
+        // A share GRANTS access to a principal that does not have it: the sharer already
+        // has it, so sharing with the sharer's own principal is not a share at all. The
+        // comparison is against the identity that shares the lens — the owning account
+        // this request is attributed to — never against a literal account id, and the
+        // refusal states the PRINCIPAL RELATIONSHIP that was refused rather than a
+        // constraint on the member's value, so it discloses no account id
+        // (`crate::state::SELF_SHARE_MESSAGE`).
+        if input.shared_with == shared_by {
+            return Err(CreateLensShareErrorModeled::ValidationException(
+                crate::state::self_share_exception(),
+            )
+            .into());
+        }
+
+        // One principal holds at most one share of one lens: the access a second share
+        // would grant belongs to the share that already exists, which `DeleteLensShare`
+        // revokes.
+        if let Some(existing) = store.lens_share_with(&lens_id, &input.shared_with) {
+            let conflict = crate::state::lens_share_conflict(existing);
+            return Err(CreateLensShareErrorModeled::ConflictException(conflict).into());
+        }
+
+        // Shares are metered per lens, and this operation models
+        // `ServiceQuotaExceededException` for the case. Refusing here is also what keeps
+        // the store bounded: a share and its create token are both 1:1 with a live grant.
+        if store
+            .lens_shares
+            .get(&lens_id)
+            .map_or(0, |shares| shares.len())
+            >= crate::state::MAX_SHARES_PER_LENS
+        {
+            return Err(CreateLensShareErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The lens with ARN {lens_arn} already holds the maximum of {} shares",
+                        crate::state::MAX_SHARES_PER_LENS
+                    ),
+                    resource_id: Some(lens_arn.clone()),
+                    resource_type: Some(crate::state::LENS_SHARE_RESOURCE_TYPE.to_string()),
+                    // The model publishes no numeric Service Quotas code for this quota,
+                    // so it is named by what it meters; the service code is this service's
+                    // own signing name.
+                    quota_code: "SharesPerLens".to_string(),
+                    service_code: crate::state::ARN_NAMESPACE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        let share_id = store.mint_share_id();
+        // Creating the share is what raises the invitation the recipient has to answer
+        // ("Shared access to a lens is not removed until the lens invitation is deleted"),
+        // so the invitation exists from here. It is a resource of its own, named by its own
+        // `ShareInvitationId` rather than by this share's `ShareId`, and it is what
+        // `ListShareInvitations` reports to the principal offered the share.
+        let share_invitation_id = store.mint_share_invitation_id();
+        let record = crate::state::LensShareRecord {
+            share_id: share_id.clone(),
+            share_invitation_id,
+            lens_id: lens_id.clone(),
+            lens_arn,
+            shared_by,
+            shared_with: input.shared_with,
+            // A new share waits on the invitation the principal it was offered to has to
+            // answer; nothing this operation does accepts it on their behalf.
+            status: crate::state::DEFAULT_SHARE_STATUS.to_string(),
+            status_message: None,
+        };
+        store
+            .lens_shares
+            .entry(lens_id.clone())
+            .or_default()
+            .insert(share_id.clone(), record);
+        // Written through the ledger's bounded `remember`, which holds the remembered
+        // tokens at `MAX_REMEMBERED_REQUEST_TOKENS` by forgetting the oldest: the token is
+        // caller-chosen, so the ledger cannot be allowed to grow with the stream of them.
+        store.create_lens_share_tokens.remember(
+            input.client_request_token,
+            crate::state::CreateLensShareToken {
+                lens_id,
+                share_id: share_id.clone(),
+                fingerprint,
+            },
+        );
+
+        Ok(CreateLensShareOutput {
+            share_id: Some(share_id),
+        })
     }
+}
+
+/// The modelled member a refusal about the lens being shared names
+/// (`CreateLensShareInput$LensAlias`).
+const LENS_ALIAS_MEMBER: &str = "LensAlias";
+
+/// The service's own modelled `ValidationException` (HTTP 400) naming the member that
+/// failed and the constraint it violated — preferred over the scaffold's synthetic one
+/// because the modelled shape carries `Reason` and `Fields`, which a client reads.
+fn field_validation(member: &str, constraint: &str) -> CreateLensShareError {
+    CreateLensShareErrorModeled::ValidationException(
+        crate::state::member_constraint_exception(member, constraint),
+    )
+    .into()
 }

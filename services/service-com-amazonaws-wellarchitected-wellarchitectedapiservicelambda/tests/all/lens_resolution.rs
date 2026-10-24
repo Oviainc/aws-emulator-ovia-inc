@@ -41,7 +41,7 @@ use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state
 
 /// The members a `ValidationException` reported as having failed, in the order it reports
 /// them.
-fn field_names(answer: &Answer) -> Vec<String> {
+pub(crate) fn field_names(answer: &Answer) -> Vec<String> {
     answer
         .body
         .get("Fields")

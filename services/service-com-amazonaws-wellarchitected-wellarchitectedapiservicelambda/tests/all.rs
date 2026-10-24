@@ -41,6 +41,9 @@ mod lens_review_answers;
 #[path = "all/lens_review_rollup.rs"]
 mod lens_review_rollup;
 
+#[path = "all/lens_shares.rs"]
+mod lens_shares;
+
 #[path = "all/lens_version_difference.rs"]
 mod lens_version_difference;
 
