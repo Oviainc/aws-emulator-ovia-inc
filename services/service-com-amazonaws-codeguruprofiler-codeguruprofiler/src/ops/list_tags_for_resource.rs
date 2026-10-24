@@ -4,7 +4,11 @@
 //!
 //! Reports the tags currently stored on the profiling group the `resourceArn` names.
 //! A pure read: it answers from `state.groups[<name from the ARN>].tags` and writes
-//! nothing, so a later caller sees exactly what the last tag write left.
+//! nothing, so a later caller sees exactly what the last tag write left. An ARN this
+//! store holds no resource for answers the ARN-addressed tagging surface's own 404
+//! `NotFoundException` ("Resource was not found"), not the `ResourceNotFoundException`
+//! the profiling-group operations state; a string that is not a profiling-group ARN of
+//! this service at all is a bad request (400 `ValidationException`).
 //!
 //! ## Shape of an operation
 //!
@@ -159,13 +163,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let guard = state.lock();
+        // A well-formed ARN that addresses no live resource is the TAGGING surface's
+        // not-found, reported in that surface's own terms rather than as a refusal about
+        // a profiling group — see `crate::state::TAGGING_RESOURCE_NOT_FOUND`.
         let group = guard.group_by_arn(&input.resource_arn).ok_or_else(|| {
-            ListTagsForResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: crate::state::group_not_found_message(
-                    crate::state::profiling_group_name_from_arn(&input.resource_arn)
-                        .unwrap_or(&input.resource_arn),
-                ),
-            })
+            crate::scaffolded::Scaffolded::not_found(crate::state::TAGGING_RESOURCE_NOT_FOUND)
         })?;
 
         // The stored tag set, whatever it holds — an empty map for a resource carrying

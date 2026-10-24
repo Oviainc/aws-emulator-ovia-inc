@@ -84,6 +84,9 @@ impl Answer {
 /// mounted service.
 struct Harness {
     router: MultiServiceRouter,
+    /// Kept so a case about an AGGREGATED profile can let the aggregation a posted
+    /// profile is owed fall due, through the shared helper every suite uses.
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Harness {
@@ -92,9 +95,17 @@ impl Harness {
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
         router.register_service(
-            service_com_amazonaws_codeguruprofiler_codeguruprofiler::EmulatedService::new(engine),
+            service_com_amazonaws_codeguruprofiler_codeguruprofiler::EmulatedService::new(
+                Arc::clone(&engine),
+            ),
         );
-        Self { router }
+        Self { router, engine }
+    }
+
+    /// [`crate::profiling_group_lifecycle::complete_aggregation_in`] on this harness's
+    /// engine.
+    fn complete_aggregation(&self, name: &str) {
+        crate::profiling_group_lifecycle::complete_aggregation_in(&self.engine, name);
     }
 
     async fn send(&self, method: &str, uri: &str, body: Vec<u8>) -> Answer {
@@ -648,6 +659,9 @@ async fn get_profile_states_its_fixed_text_for_a_window_no_profile_covers() {
         posted.status,
         String::from_utf8_lossy(&posted.body)
     );
+    // `GetProfile` serves an AGGREGATED profile, and aggregation is not instant: the
+    // posted profile reads back once the aggregation its window owes has fallen due.
+    harness.complete_aggregation("cgp-held");
     let read_back = harness
         .get("/profilingGroups/cgp-held/profile?period=PT5M")
         .await;

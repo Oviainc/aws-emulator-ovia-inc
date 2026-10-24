@@ -5,6 +5,11 @@
 //! API addresses by ARN is a profiling group, so `resourceArn` resolves to a stored
 //! group and the request's tags are merged into the ONE tag map every other operation
 //! reports (`ListTagsForResource`, `DescribeProfilingGroup`, `ListProfilingGroups`).
+//! A `tags` map with no entry breaks this operation's own non-empty constraint, so it is
+//! refused (400 `BadRequestException`) naming that member, ahead of every other check;
+//! an ARN this store holds no resource for answers the ARN-addressed tagging surface's
+//! own 404 `NotFoundException` ("Resource was not found"), not the
+//! `ResourceNotFoundException` the profiling-group operations state.
 //! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -140,14 +145,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // against the ARN this service stored for the group.
         let _ = ctx;
 
-        // The front door first. A tag write carrying no tag at all is refused by the
-        // REST layer AHEAD of the application code, with that layer's own code and
-        // sentence (HTTP 400 `BadRequestException`) and before any lookup — so an empty
-        // `tags` on an ARN that names nothing is still this refusal, not a 404. The
-        // model declares no length bound on `TagsMap`, so the boundary validator cannot
-        // see this rule; the recorded refusal of this operation is what states it.
+        // This operation's OWN tags validation, ahead of every other check and of any
+        // state mutation: a tag write carrying no tag at all breaks the non-empty
+        // constraint on `tags`, so it is refused naming that member and that constraint
+        // — with the code this surface answers a bad request with (HTTP 400
+        // `BadRequestException`), not the body parser's fixed sentence, which would say
+        // nothing about which member was wrong. An empty `tags` on an ARN that names
+        // nothing is still this refusal, not a 404: the request is wrong before the
+        // lookup is worth doing. The model declares no length bound on `TagsMap`, so the
+        // boundary validator cannot see this rule.
         if input.tags.is_empty() {
-            return Err(crate::scaffolded::Scaffolded::bad_request_body());
+            return Err(crate::scaffolded::Scaffolded::bad_request(
+                crate::state::empty_tag_map_message("tags"),
+            ));
         }
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
@@ -158,12 +168,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // An ARN that names no profiling group of this service addresses nothing this
         // API can tag, which is a bad INPUT rather than a missing resource.
-        let name = crate::state::profiling_group_name_from_arn(&input.resource_arn)
-            .ok_or_else(|| {
-                TagResourceErrorModeled::ValidationException(ValidationException {
+        if crate::state::profiling_group_name_from_arn(&input.resource_arn).is_none() {
+            return Err(TagResourceErrorModeled::ValidationException(
+                ValidationException {
                     message: crate::state::resource_arn_validation_message(&input.resource_arn),
-                })
-            })?;
+                },
+            )
+            .into());
+        }
 
         // Every tag in the request is inside AWS's published tagging limits before any
         // of them is stored: the count, and each key's and value's length. The model
@@ -173,11 +185,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let mut guard = state.lock();
-        let group = guard.group_by_arn_mut(&input.resource_arn).ok_or_else(|| {
-            TagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: crate::state::group_not_found_message(name),
-            })
-        })?;
+        // The ARN is well formed but addresses no live resource. That is the TAGGING
+        // surface's not-found, which it reports in its own terms — see
+        // `crate::state::TAGGING_RESOURCE_NOT_FOUND`.
+        let group = guard
+            .group_by_arn_mut(&input.resource_arn)
+            .ok_or_else(|| {
+                crate::scaffolded::Scaffolded::not_found(crate::state::TAGGING_RESOURCE_NOT_FOUND)
+            })?;
 
         // What the merge would LEAVE on the resource is what the per-resource limit
         // bounds, so it is computed and refused before anything is written: a request

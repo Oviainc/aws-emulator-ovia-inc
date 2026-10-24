@@ -6,9 +6,11 @@
 //! identifies. Removal is by key and is idempotent (the operation is `@idempotent`): a
 //! key the resource does not carry is simply not there afterwards, so naming it is a
 //! no-op rather than an error, and nothing about the resource other than its tag map
-//! changes. An ARN this store holds no resource for answers the modelled 404
-//! `ResourceNotFoundException`; a string that is not a profiling-group ARN of this
-//! service at all is a bad request (400 `ValidationException`).
+//! changes. An ARN this store holds no resource for answers the ARN-addressed tagging
+//! surface's own 404 `NotFoundException` ("Resource was not found"), not the
+//! `ResourceNotFoundException` the profiling-group operations state; a string that is not
+//! a profiling-group ARN of this service at all is a bad request (400
+//! `ValidationException`).
 //!
 //! ## Shape of an operation
 //!
@@ -149,23 +151,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // boundary validator passed any string: a `resourceArn` that is not one of this
         // service's profiling-group ARNs names no resource of any kind, which is a bad
         // request rather than a missing resource.
-        let name = crate::state::profiling_group_name_from_arn(&input.resource_arn)
-            .ok_or_else(|| {
-                UntagResourceErrorModeled::ValidationException(ValidationException {
+        if crate::state::profiling_group_name_from_arn(&input.resource_arn).is_none() {
+            return Err(UntagResourceErrorModeled::ValidationException(
+                ValidationException {
                     message: crate::state::resource_arn_validation_message(&input.resource_arn),
-                })
-            })?;
+                },
+            )
+            .into());
+        }
 
         let mut guard = state.lock();
-        let group = guard.group_by_arn_mut(&input.resource_arn).ok_or_else(|| {
-            UntagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                // The only taggable resource of this service is a profiling group, so
-                // this is the group-scoped not-found refusal, in the service's own
-                // wording and naming the group the ARN names (the ARN parsed above, so
-                // it has one).
-                message: crate::state::group_not_found_message(name),
-            })
-        })?;
+        // A well-formed ARN that addresses no live resource is the TAGGING surface's
+        // not-found, reported in that surface's own terms rather than as a refusal about
+        // a profiling group — see `crate::state::TAGGING_RESOURCE_NOT_FOUND`.
+        let group = guard
+            .group_by_arn_mut(&input.resource_arn)
+            .ok_or_else(|| {
+                crate::scaffolded::Scaffolded::not_found(crate::state::TAGGING_RESOURCE_NOT_FOUND)
+            })?;
 
         // Remove by KEY, whatever the stored value was, and ignore a key the resource
         // does not carry: the post-state a caller asked for — none of these keys present
