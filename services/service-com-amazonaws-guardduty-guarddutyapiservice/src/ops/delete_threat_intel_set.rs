@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteThreatIntelSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteThreatIntelSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: accepts the deletion of the threat list the request's detector holds
+//! under `ThreatIntelSetId`, moving it to `DELETE_PENDING` with the clock owing it
+//! `DELETED`, which is what `GetThreatIntelSet` reports afterwards.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteThreatIntelSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -136,18 +132,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteThreatIntelSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteThreatIntelSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteThreatIntelSet"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DeleteThreatIntelSetErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+
+        let region = crate::state::request_region(ctx);
+        let mut state = state.lock();
+
+        // Every refusal is classified BEFORE the clock moves, so a refused delete
+        // leaves nothing observable behind: not the detector, not the id, and not
+        // the service clock either.
+        let Some(detector) = state.detector_in(&region, &input.detector_id) else {
+            // Classified from the REQUEST, the way every other threat-list operation
+            // classifies a `DetectorId` it cannot resolve.
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::detector_id_rejection(&input.detector_id),
+            ));
+        };
+        if detector
+            .threat_intel_set(&input.threat_intel_set_id)
+            .is_none()
+        {
+            // A `ThreatIntelSetId` this detector does not hold, classified from the
+            // REQUEST exactly as `GetThreatIntelSet` classifies it.
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::minted_id_rejection(
+                    crate::state::THREAT_INTEL_SET_ID_MEMBER,
+                    &input.threat_intel_set_id,
+                ),
+            ));
+        }
+
+        // Past the refusals this is a MUTATION, so it advances this state's clock:
+        // the instant it hands out is when the deletion was accepted, and what the
+        // `DELETED` transition is owed from.
+        let now = state.tick_millis();
+        let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
+            // The detector resolved above under the same lock, so this cannot be
+            // reached; answering the modelled server fault keeps it from panicking.
+            return Err(
+                DeleteThreatIntelSetErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+
+        // "Deletes the ThreatIntelSet specified by the ThreatIntelSet ID" (this
+        // operation's own documentation): the list moves to `DELETE_PENDING` and the
+        // clock owes it `DELETED` — `GetThreatIntelSet`'s `Status` is `@required` and
+        // its enum carries both (`smithy_query(shape="ThreatIntelSetStatus")`), so
+        // the status after a delete is something a read reports rather than a
+        // refusal. A second delete of the same id is accepted and moves nothing: the
+        // id still resolves, and deleting an already-deleted list asks for the state
+        // it is already in.
+        let accepted = detector
+            .delete_threat_intel_set(&input.threat_intel_set_id, now)
+            .unwrap_or(false);
+        if accepted {
+            // The detector holds one fewer LIVE sub-resource than before, which is
+            // the same change `CreateThreatIntelSet` records on it in the other
+            // direction. A repeated delete changed nothing, so it moves nothing here
+            // either.
+            detector.updated_at_millis = now;
+        }
+
+        // `Unit` output: success is the modelled 200 and an empty body.
+        Ok(DeleteThreatIntelSetOutput {})
     }
 }

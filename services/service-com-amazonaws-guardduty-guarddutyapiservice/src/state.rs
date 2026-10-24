@@ -2101,10 +2101,111 @@ impl Detector {
 
     /// The threat list a create carrying `token` already minted, if any — the
     /// `@idempotencyToken` lookup, scoped to the detector the list hangs off.
+    ///
+    /// A list a delete has already accepted ([`ThreatIntelSetRecord::is_deleting`])
+    /// resolves to nothing, so a replayed create never answers with a list the
+    /// service is no longer keeping — the same rule [`Self::ip_set_for_token`]
+    /// follows for a deleted IPSet.
     pub fn threat_intel_set_for_token(&self, token: &str) -> Option<&ThreatIntelSetRecord> {
         self.threat_intel_sets
             .values()
-            .find(|set| set.client_token.as_deref() == Some(token))
+            .find(|set| set.client_token.as_deref() == Some(token) && !set.is_deleting())
+    }
+
+    /// How many of this detector's threat lists are LIVE — held and not being
+    /// deleted.
+    ///
+    /// This is the count [`THREAT_INTEL_SETS_PER_DETECTOR`] bounds: a list whose
+    /// delete has been accepted is only still REPORTED, never used, so it occupies
+    /// none of the detector's slots — the same rule
+    /// [`Self::live_ip_set_count`] applies to a deleted IPSet.
+    pub fn live_threat_intel_set_count(&self) -> usize {
+        self.threat_intel_sets
+            .values()
+            .filter(|set| !set.is_deleting())
+            .count()
+    }
+
+    /// The ids of the LIVE threat lists this detector holds, in
+    /// `ThreatIntelSetId` order (the id is the key they are stored under, so the
+    /// order is TOTAL — what makes a page token mean the same thing on the call
+    /// that handed it back).
+    ///
+    /// LIVE is the same set [`Self::live_threat_intel_set_count`] counts: a list
+    /// whose delete has been accepted is no longer one of the detector's threat
+    /// lists, so `ListThreatIntelSets` stops naming it. Its record is still
+    /// retained ([`DELETED_THREAT_INTEL_SETS_RETAINED`]) so `GetThreatIntelSet` can
+    /// report the status the delete moved it to — being readable on its own id is
+    /// not the same as being part of the collection a list enumerates, which is the
+    /// rule [`Self::live_ip_set_ids`] follows for a deleted IPSet.
+    pub fn live_threat_intel_set_ids(&self) -> Vec<String> {
+        self.threat_intel_sets
+            .values()
+            .filter(|set| !set.is_deleting())
+            .map(|set| set.id.clone())
+            .collect()
+    }
+
+    /// Accept the deletion of the threat list `id` names.
+    ///
+    /// `None` when this detector holds no such list at all; `Some(true)` when this
+    /// call is the one that accepted the deletion, and `Some(false)` when a delete
+    /// had already been accepted for it — the caller needs that distinction because
+    /// only the first delete changes the set of LIVE sub-resources the detector
+    /// holds, and so only the first moves the detector's own `UpdatedAt`.
+    ///
+    /// The list moves to [`THREAT_INTEL_SET_DELETE_PENDING`] and the clock owes it
+    /// [`THREAT_INTEL_SET_DELETED`], which is what `GetThreatIntelSet` reports
+    /// afterwards.
+    ///
+    /// Keeping a deleted record is what lets a read report that status, so this is
+    /// also where the retention is BOUNDED: at most
+    /// [`DELETED_THREAT_INTEL_SETS_RETAINED`] deleted records survive per detector,
+    /// and a delete past that drops the one deleted longest ago — the same
+    /// oldest-first eviction [`Self::delete_ip_set`] uses, and for the same reason:
+    /// without it a caller could create and delete without limit and make the
+    /// service retain every record.
+    pub fn delete_threat_intel_set(&mut self, id: &str, now: i64) -> Option<bool> {
+        let accepted = self.threat_intel_sets.get_mut(id)?.begin_delete(now);
+        if accepted {
+            self.evict_deleted_threat_intel_sets(Some(id));
+        }
+        Some(accepted)
+    }
+
+    /// Drop deleted threat lists, oldest deletion first, until at most
+    /// [`DELETED_THREAT_INTEL_SETS_RETAINED`] remain, so the TOTAL this detector
+    /// holds is bounded at [`THREAT_INTEL_SETS_PER_DETECTOR`] live records plus that
+    /// allowance however many create-and-delete cycles a caller sends. Called on
+    /// BOTH write paths — the delete that leaves a record behind and the create that
+    /// adds one — so neither can grow the map past that total.
+    ///
+    /// `keep` is never evicted: it is the record the delete that triggered this just
+    /// accepted, and a caller reads that one back.
+    pub fn evict_deleted_threat_intel_sets(&mut self, keep: Option<&str>) {
+        let surplus = self
+            .threat_intel_sets
+            .values()
+            .filter(|set| set.is_deleting())
+            .count()
+            .saturating_sub(DELETED_THREAT_INTEL_SETS_RETAINED);
+        if surplus == 0 {
+            return;
+        }
+        // The oldest deletions first: `deleted_at_millis` is the instant the delete
+        // was ACCEPTED and nothing moves it afterwards, and `tick_millis` makes
+        // those instants strictly increasing, so the ordering is total and the id
+        // only breaks a tie that cannot arise.
+        let mut deleted: Vec<(i64, String)> = self
+            .threat_intel_sets
+            .values()
+            .filter(|set| set.is_deleting() && Some(set.id.as_str()) != keep)
+            .map(|set| (set.deleted_at_millis.unwrap_or_default(), set.id.clone()))
+            .collect();
+        deleted.sort_unstable();
+        for (_, id) in deleted.into_iter().take(surplus) {
+            self.threat_intel_sets.remove(&id);
+        }
     }
 
     /// Set one feature's status, recording `now` as its `UpdatedAt`. Adds the
@@ -3393,6 +3494,13 @@ pub struct ThreatIntelSetRecord {
     /// The status the CLOCK owes this list and the instant it comes due, or `None`
     /// when nothing is outstanding. See [`Self::settle`].
     pub pending_status: Option<(String, i64)>,
+    /// The instant a delete was ACCEPTED for this list, or `None` while no delete
+    /// has been. It is the key [`Detector::delete_threat_intel_set`] evicts the
+    /// retained deleted records by, oldest deletion first, so it records the
+    /// acceptance and nothing else moves it — not the clock settling
+    /// [`THREAT_INTEL_SET_DELETE_PENDING`] to [`THREAT_INTEL_SET_DELETED`], which
+    /// would otherwise reorder two deletions accepted within one span.
+    pub deleted_at_millis: Option<i64>,
 }
 
 impl ThreatIntelSetRecord {
@@ -3401,14 +3509,53 @@ impl ThreatIntelSetRecord {
     /// The change is owed at its due instant whether or not anybody called, so a
     /// reporting operation may apply it: it shows no caller anything it would not
     /// have seen anyway, and it never moves a status the clock does not owe.
+    ///
+    /// The status it settles to was fixed when the transition started, not when
+    /// somebody looked, so two reads of a settled list agree.
     pub fn settle(&mut self, now_millis: i64) {
-        let Some((next, due)) = self.pending_status.as_ref() else {
+        let Some((next, due)) = self.pending_status.clone() else {
             return;
         };
-        if now_millis >= *due {
-            self.status = next.clone();
+        if now_millis >= due {
+            self.status = next;
             self.pending_status = None;
         }
+    }
+
+    /// Has a delete already been accepted for this threat list — is it
+    /// [`THREAT_INTEL_SET_DELETE_PENDING`] or [`THREAT_INTEL_SET_DELETED`]?
+    ///
+    /// Such a record is no longer a live threat list: it is still REPORTED, so a
+    /// read can answer with the status the delete put it in, but GuardDuty is not
+    /// using it, so it occupies none of the detector's
+    /// [`THREAT_INTEL_SETS_PER_DETECTOR`] slots and no list names it.
+    pub fn is_deleting(&self) -> bool {
+        self.deleted_at_millis.is_some()
+    }
+
+    /// Accept this list's deletion: [`THREAT_INTEL_SET_DELETE_PENDING`] now, with
+    /// the clock owing [`THREAT_INTEL_SET_DELETED`] at
+    /// [`THREAT_INTEL_SET_DELETION_SPAN_MILLIS`]. Reports whether this call is the
+    /// one that accepted it.
+    ///
+    /// A record already being deleted is left exactly where it is — neither the
+    /// status nor the instant the clock owes it moves — so a repeated delete
+    /// neither restarts the transition nor walks a `DELETED` record backwards, and
+    /// it answers `false` so a caller writes nothing else either. Whatever status
+    /// the list was in when the delete arrived, including a transition the clock
+    /// had not settled yet, the deletion replaces what was owed: nothing activates
+    /// a list on its way out.
+    pub fn begin_delete(&mut self, now: i64) -> bool {
+        if self.is_deleting() {
+            return false;
+        }
+        self.status = THREAT_INTEL_SET_DELETE_PENDING.to_string();
+        self.pending_status = Some((
+            THREAT_INTEL_SET_DELETED.to_string(),
+            now.saturating_add(THREAT_INTEL_SET_DELETION_SPAN_MILLIS),
+        ));
+        self.deleted_at_millis = Some(now);
+        true
     }
 }
 
@@ -3452,6 +3599,36 @@ pub const THREAT_INTEL_SET_ACTIVE: &str = "ACTIVE";
 /// observes the transient status the real service reports, and short enough that
 /// the activation lands without anybody sleeping on it.
 pub const THREAT_INTEL_SET_ACTIVATION_SPAN_MILLIS: i64 = 500;
+
+/// `ThreatIntelSetStatus`: a delete has been accepted and the list is on its way
+/// out of use. TRANSIENT — the clock owes it [`THREAT_INTEL_SET_DELETED`]
+/// (`smithy_query(shape="ThreatIntelSetStatus")` carries both).
+pub const THREAT_INTEL_SET_DELETE_PENDING: &str = "DELETE_PENDING";
+
+/// `ThreatIntelSetStatus`: the list has been deleted. Terminal — nothing moves a
+/// deleted list anywhere else.
+pub const THREAT_INTEL_SET_DELETED: &str = "DELETED";
+
+/// How long a list a delete has accepted spends in
+/// [`THREAT_INTEL_SET_DELETE_PENDING`] before the clock owes it
+/// [`THREAT_INTEL_SET_DELETED`].
+///
+/// AWS documents no duration for removing a threat list, so this span is CHOSEN,
+/// matching the activation span this record already uses: non-zero, so a caller
+/// reading straight after the delete still observes the transient
+/// `DELETE_PENDING` the real service reports, and short enough that the deletion
+/// lands without anybody sleeping on it.
+pub const THREAT_INTEL_SET_DELETION_SPAN_MILLIS: i64 = THREAT_INTEL_SET_ACTIVATION_SPAN_MILLIS;
+
+/// How many DELETED threat-list records one detector retains, so a read can still
+/// report the [`THREAT_INTEL_SET_DELETE_PENDING`] / [`THREAT_INTEL_SET_DELETED`]
+/// status a delete moved a list to.
+///
+/// Retention needs its own ceiling because [`THREAT_INTEL_SETS_PER_DETECTOR`]
+/// bounds only the LIVE lists: a caller creating and deleting in a loop would
+/// otherwise make the detector keep a record per request. The ceiling is the live
+/// quota, the way [`DELETED_IP_SETS_RETAINED`] is the IPSet one.
+pub const DELETED_THREAT_INTEL_SETS_RETAINED: usize = THREAT_INTEL_SETS_PER_DETECTOR;
 
 /// A Malware Protection plan: the resource `CreateMalwareProtectionPlan` mints for
 /// one protected S3 bucket.

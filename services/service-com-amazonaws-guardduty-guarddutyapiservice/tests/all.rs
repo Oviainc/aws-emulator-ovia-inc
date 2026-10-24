@@ -85,6 +85,8 @@ mod sample_finding_catalog;
 mod state_roundtrip;
 #[path = "all/threat_entity_set_lifecycle.rs"]
 mod threat_entity_set_lifecycle;
+#[path = "all/threat_intel_set_delete.rs"]
+mod threat_intel_set_delete;
 #[path = "all/threat_intel_set_listing.rs"]
 mod threat_intel_set_listing;
 #[path = "all/threat_intel_sets.rs"]

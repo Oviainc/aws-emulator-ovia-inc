@@ -177,7 +177,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // page token mean the same thing on the call that hands it back. A threat list is
         // owned by its detector, which is regional, so this endpoint names only the
         // threat lists the Region it serves holds.
-        let ids: Vec<String> = detector.threat_intel_sets.keys().cloned().collect();
+        //
+        // The LIVE lists: a list `DeleteThreatIntelSet` accepted is no longer one of the
+        // detector's threat lists, so this stops naming it even though its record is
+        // retained for `GetThreatIntelSet` to report the status the delete moved it to.
+        let ids: Vec<String> = detector.live_threat_intel_set_ids();
         let (page, next_token) = crate::state::paginate(
             &ids,
             input.max_results,

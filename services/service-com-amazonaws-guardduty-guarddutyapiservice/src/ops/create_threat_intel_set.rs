@@ -203,10 +203,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // none of it, and before anything is minted, so a refused create writes
         // nothing. It is also what bounds this store: a caller varying or omitting
         // `ClientToken` would otherwise add an entry per request.
+        //
+        // The quota bounds the LIVE lists: a list `DeleteThreatIntelSet` accepted is
+        // only still reported, never used, so it occupies none of the detector's
+        // slots.
         if state
             .detector_in(&region, &input.detector_id)
             .is_some_and(|detector| {
-                detector.threat_intel_sets.len() >= crate::state::THREAT_INTEL_SETS_PER_DETECTOR
+                detector.live_threat_intel_set_count()
+                    >= crate::state::THREAT_INTEL_SETS_PER_DETECTOR
             })
         {
             return Err(invalid_input(crate::state::threat_intel_set_limit_message()));
@@ -231,6 +236,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .unwrap_or_default(),
             client_token: token,
             created_at_millis: now,
+            // Nothing has been deleted: a delete is what fills this in.
+            deleted_at_millis: None,
             // `Activate` says "whether GuardDuty is to start using the uploaded
             // ThreatIntelSet": a list the create activates is not in use the instant
             // the call returns, so it reports the transient `ACTIVATING` until the
@@ -260,6 +267,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // The quota above bounds the LIVE lists. The records a delete leaves behind
+        // so `GetThreatIntelSet` can report the status it moved them to are bounded
+        // in turn, on this write path as well as on the delete's, so the TOTAL this
+        // detector holds never exceeds `THREAT_INTEL_SETS_PER_DETECTOR` live records
+        // plus `DELETED_THREAT_INTEL_SETS_RETAINED` retained ones however many
+        // create-and-delete cycles a caller sends.
+        detector.evict_deleted_threat_intel_sets(None);
         detector.threat_intel_sets.insert(id.clone(), record);
 
         Ok(CreateThreatIntelSetOutput {
