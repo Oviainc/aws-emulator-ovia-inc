@@ -25,6 +25,8 @@ mod cluster_security_groups;
 mod cluster_structure;
 #[path = "all/cluster_versions.rs"]
 mod cluster_versions;
+#[path = "all/default_cluster_parameters.rs"]
+mod default_cluster_parameters;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
 #[path = "all/existence_preconditions.rs"]

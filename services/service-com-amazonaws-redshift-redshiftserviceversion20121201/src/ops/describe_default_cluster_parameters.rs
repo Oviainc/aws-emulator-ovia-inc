@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDefaultClusterParameters
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDefaultClusterParameters`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDefaultClusterParameters::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the ENGINE default parameters of one cluster parameter group family:
+//! the settings the family's own DEFAULT parameter group carries (the group this
+//! store seeds for every published family, and which holds no value of its own),
+//! cut into the requested page.
 //!
 //! ## Shape of an operation
 //!
@@ -88,9 +84,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `DescribeDefaultClusterParametersError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#DescribeDefaultClusterParameters")]
+// `DependentServiceUnavailableFault` is widened in: the model lists no error for
+// this operation at all, but the service declares the shape, and it is the only
+// modelled way to say "the control-plane store could not be reached" (the same
+// widening `DescribeClusterParameters` makes).
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#DescribeDefaultClusterParameters",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum DescribeDefaultClusterParametersErrorModeled {
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -142,20 +146,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDefaultClusterParameters` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDefaultClusterParametersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDefaultClusterParameters"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                DescribeDefaultClusterParametersErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A pure report: nothing here changes what a later caller sees, and a
+        // parameter group family has no status the clock owes a transition on.
+        let store = state.lock();
+
+        // "The parameter group family names associated with the default parameter
+        // groups provide you the valid values": a family's engine defaults are
+        // exactly what that family's own DEFAULT parameter group carries, and a
+        // default group holds no value of its own, so every parameter it reports
+        // is sourced `engine-default` — which is what this operation is asked
+        // for. The lookup is keyed on Redshift's own name for that group, and the
+        // record must be one the SERVICE owns, so a group an account happened to
+        // name that way cannot stand in for a family's defaults.
+        let defaults: Vec<Parameter> = store
+            .parameter_group(&st::family_default_parameter_group(
+                &input.parameter_group_family,
+            ))
+            .filter(|group| group.default_group)
+            .map(|group| group.parameters())
+            // A family this service publishes no default group for has no engine
+            // defaults to report: an empty page, never another family's catalog.
+            // The model declares no error for it, so it is reported, not refused.
+            .unwrap_or_default();
+
+        let (start, end, next_marker) =
+            match st::page_bounds(input.marker.as_deref(), input.max_records, defaults.len()) {
+                Ok(page) => page,
+                Err(message) => return Err(crate::scaffolded::Scaffolded::validation(message)),
+            };
+
+        Ok(DescribeDefaultClusterParametersOutput {
+            default_cluster_parameters: Some(DefaultClusterParameters {
+                parameter_group_family: Some(input.parameter_group_family.clone()),
+                parameters: Some(defaults[start..end].to_vec()),
+                marker: next_marker,
+            }),
+        })
     }
 }
