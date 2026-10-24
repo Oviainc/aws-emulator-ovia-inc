@@ -1217,6 +1217,134 @@ pub fn default_key_policy() -> String {
     .to_string()
 }
 
+/// The only key policy name KMS serves: "If no policy name is specified, the
+/// default value is `default`. The only valid name is `default`"
+/// (`smithy_query(query="doc",shape="GetKeyPolicyRequest",member="PolicyName")`).
+/// A request that omits `PolicyName` names this one, and a request naming anything
+/// else names a policy no key has.
+pub const KEY_POLICY_NAME_DEFAULT: &str = "default";
+
+/// The largest key policy document a key holds: KMS's published resource quota
+/// "Key policy document size: 32 KB" (Quotas in the Key Management Service
+/// Developer Guide, which the modelled `LimitExceededException` — "a length
+/// constraint or quota was exceeded" — points at). It is what "if the key policy
+/// exceeds the length constraint, KMS returns a `LimitExceededException`"
+/// (`smithy_query(query="doc",shape="PutKeyPolicyRequest",member="Policy")`) is
+/// measured against here: the modelled `@length(1..131072)` is refused by the
+/// boundary validator before any handler runs, so the quota is the bound a handler
+/// still gets to enforce — and it is also what bounds how far one request can grow
+/// this store.
+pub const MAX_KEY_POLICY_BYTES: usize = 32 * 1024;
+
+/// Whether `policy` is a key policy document KMS would accept, and why not when it
+/// is not — the sentence a `MalformedPolicyDocumentException` ("the specified policy
+/// is not syntactically or semantically correct") carries.
+///
+/// The criteria are the `Policy` member's own
+/// (`smithy_query(query="doc",shape="PutKeyPolicyRequest",member="Policy")`, which
+/// `CreateKeyRequest` and `ReplicateKeyRequest` repeat verbatim), so ONE function
+/// judges a key policy wherever a request carries one:
+///
+/// * it is an IAM JSON policy document — a JSON object carrying a `Statement`,
+///   either one statement object or a non-empty list of them, each with an `Effect`
+///   of `Allow` or `Deny`;
+/// * "each statement in the key policy must contain one or more principals", which
+///   is the criterion that separates a KEY policy from an identity policy.
+///
+/// What it deliberately does NOT refuse is a statement missing `Action` or
+/// `Resource`: "if either of the required `Resource` or `Action` elements are
+/// missing from a key policy statement, the policy statement has no effect … but the
+/// `PutKeyPolicy` API request succeeds, even though the policy statement is
+/// ineffective" (same doc). Nor does it judge the policy-lockout safety check: that
+/// check asks whether the policy lets the CALLING PRINCIPAL make a subsequent
+/// `PutKeyPolicy` request, which needs the caller's IAM identity — something this
+/// emulator does not model — so `BypassPolicyLockoutSafetyCheck` is accepted and has
+/// no effect, exactly as `CreateKey` already records.
+///
+/// The sentences are this emulator's wording; what this function pins is WHICH
+/// documents are refused.
+pub fn validate_key_policy(policy: &str) -> Result<(), String> {
+    let document: ::serde_json::Value = ::serde_json::from_str(policy)
+        .map_err(|error| format!("The key policy is not valid JSON: {error}."))?;
+    let Some(object) = document.as_object() else {
+        return Err("The key policy must be a JSON object.".to_string());
+    };
+    // An IAM JSON policy document's `Statement` is either one statement or a list
+    // of them; a key policy with no statement at all grants nothing and is not a
+    // document KMS stores.
+    let statements: Vec<&::serde_json::Value> = match object.get("Statement") {
+        Some(::serde_json::Value::Array(statements)) if !statements.is_empty() => {
+            statements.iter().collect()
+        }
+        Some(statement @ ::serde_json::Value::Object(_)) => vec![statement],
+        Some(_) => {
+            return Err(
+                "The key policy's Statement must be a statement or a non-empty list of \
+                 statements."
+                    .to_string(),
+            )
+        }
+        None => return Err("The key policy must contain a Statement.".to_string()),
+    };
+    for (index, statement) in statements.iter().enumerate() {
+        let Some(statement) = statement.as_object() else {
+            return Err(format!(
+                "Statement {index} of the key policy must be a JSON object."
+            ));
+        };
+        match statement.get("Effect").and_then(::serde_json::Value::as_str) {
+            Some("Allow" | "Deny") => {}
+            _ => {
+                return Err(format!(
+                    "Statement {index} of the key policy must have an Effect of Allow or Deny."
+                ))
+            }
+        }
+        if !names_a_principal(statement) {
+            return Err(format!(
+                "Statement {index} of the key policy must contain one or more principals."
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether one policy statement names at least one principal, in either of the two
+/// elements that name principals (`Principal`, and its negation `NotPrincipal`).
+fn names_a_principal(statement: &::serde_json::Map<String, ::serde_json::Value>) -> bool {
+    ["Principal", "NotPrincipal"]
+        .iter()
+        .any(|element| statement.get(*element).is_some_and(is_non_empty_principal))
+}
+
+/// Whether a `Principal` element names anybody: the element is a string (`"*"`), a
+/// map from principal kind to one principal or a list of them, or a list — so it
+/// names somebody exactly when some leaf is a non-empty string.
+fn is_non_empty_principal(value: &::serde_json::Value) -> bool {
+    match value {
+        ::serde_json::Value::String(principal) => !principal.is_empty(),
+        ::serde_json::Value::Array(principals) => principals.iter().any(is_non_empty_principal),
+        ::serde_json::Value::Object(by_kind) => by_kind.values().any(is_non_empty_principal),
+        _ => false,
+    }
+}
+
+/// How a request naming a key policy other than the one KMS serves is refused.
+///
+/// `GetKeyPolicy` and `PutKeyPolicy` both take a `PolicyName`, and the only name a
+/// key has a policy under is [`KEY_POLICY_NAME_DEFAULT`], so any other name asks for
+/// a policy that does not exist on the key — a `NotFoundException` ("the specified
+/// entity or resource could not be found"), naming the key by its ARN as every other
+/// refusal in this service does. One function for both operations, so a reader and a
+/// writer cannot judge the same name differently.
+pub fn policy_not_found_message(key: &Cmk, policy_name: &str) -> String {
+    format!(
+        "No such policy exists: {policy_name}. The only valid key policy name for {} is \
+         \"{KEY_POLICY_NAME_DEFAULT}\".",
+        key.arn
+    )
+}
+
 /// Render an instant the way KMS renders `CreationDate` / `DeletionDate`.
 pub fn date_time(at: SystemTime) -> ::aws_smithy_types::DateTime {
     let millis = at
