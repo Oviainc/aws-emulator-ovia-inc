@@ -280,6 +280,18 @@ pub struct JobExecutionRecord {
     /// [`JobExecutionStore::concurrent_command_executions`]), which a job execution
     /// does not consume.
     pub command_arn: Option<String>,
+    /// The store-wide position this execution was enqueued at, stamped by
+    /// [`JobExecutionStore::try_insert_execution`] from the store's monotonic
+    /// counter: strictly increasing over every execution the store holds, whatever
+    /// thing each belongs to.
+    ///
+    /// It exists because `queued_at` is epoch SECONDS and therefore cannot order two
+    /// executions created inside the same second, while a lister that must report
+    /// executions "in the ascending or descending order" they were created in (`iot`:
+    /// `ListCommandExecutions$sortOrder`) needs one total order. No response carries
+    /// it — it is an ordering key, not a modelled member — and it is 0 on a record the
+    /// store has not accepted yet.
+    pub enqueue_sequence: u64,
 }
 
 impl JobExecutionRecord {
@@ -308,6 +320,8 @@ impl JobExecutionRecord {
             in_progress_timeout_minutes: None,
             job_document,
             command_arn: None,
+            // Stamped by the store when it accepts the record; see the field.
+            enqueue_sequence: 0,
         }
     }
 
@@ -621,7 +635,7 @@ impl JobExecutionStore {
     /// error. Enqueueing also evicts the thing's oldest FINISHED executions beyond
     /// [`MAX_TERMINAL_EXECUTIONS_PER_THING`], so a long-lived store does not keep
     /// every completed execution forever.
-    pub fn try_insert_execution(&mut self, record: JobExecutionRecord) -> Result<(), String> {
+    pub fn try_insert_execution(&mut self, mut record: JobExecutionRecord) -> Result<(), String> {
         let thing_name = record.thing_name.clone();
         // Every quota is checked WITHOUT touching the map, so a refused request
         // leaves no entry behind and consumes no thing slot.
@@ -684,6 +698,9 @@ impl JobExecutionStore {
             ));
         }
 
+        // The accepted record's place in the store's total enqueue order, which is
+        // what orders two executions whose whole-second `queued_at` is the same.
+        record.enqueue_sequence = self.next_sequence();
         self.things.entry(thing_name).or_default().push(record);
         self.stored_executions = self.stored_executions.saturating_add(1);
         self.stored_document_bytes = self.stored_document_bytes.saturating_add(bytes);
@@ -1472,5 +1489,49 @@ mod tests {
              got {:?}",
             untouched.status
         );
+    }
+
+    /// Every accepted execution gets a STRICTLY INCREASING `enqueue_sequence`,
+    /// whatever thing it belongs to and whether or not its `queued_at` ties with
+    /// another's: the field is the store's total enqueue order, which is what lets a
+    /// lister order two executions created inside the same whole second.
+    #[test]
+    fn the_store_stamps_a_total_enqueue_order() {
+        let mut store = JobExecutionStore::default();
+
+        // (case, thing, job, queued_at) — the rows tie on the second, spread across
+        // things, and go BACKWARDS in `queued_at` on the last row, so nothing about
+        // the expected order can come from the timestamps.
+        let rows: [(&str, &str, &str, i64); 5] = [
+            ("first, thing a", "thing-a", "job-1", 1_000),
+            ("second, same thing and second", "thing-a", "job-2", 1_000),
+            ("third, another thing, same second", "thing-b", "job-3", 1_000),
+            ("fourth, a later second", "thing-b", "job-4", 1_001),
+            ("fifth, an earlier second", "thing-a", "job-5", 999),
+        ];
+
+        for (case, thing, job, queued_at) in rows {
+            store
+                .try_insert_execution(JobExecutionRecord::queued(
+                    job.to_string(),
+                    thing.to_string(),
+                    None,
+                    queued_at,
+                ))
+                .unwrap_or_else(|refusal| panic!("case {case:?}: {refusal}"));
+        }
+
+        let mut previous = 0u64;
+        for (case, thing, job, _) in rows {
+            let sequence = store
+                .resolve_record(thing, job, None)
+                .unwrap_or_else(|| panic!("case {case:?}: the execution must be held"))
+                .enqueue_sequence;
+            assert!(
+                sequence > previous,
+                "case {case:?}: expected a sequence above {previous}, got {sequence}"
+            );
+            previous = sequence;
+        }
     }
 }

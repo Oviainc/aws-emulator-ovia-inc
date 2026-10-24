@@ -1664,3 +1664,138 @@ pub fn command_registry<Eng: Send + Sync + 'static>(
         .downcast_ref::<::engine::InMemoryEngine>()
         .map(::engine::InMemoryEngine::state::<iot_commands::IotCommandRegistry>)
 }
+
+/// The `CommandExecutionStatus` a stored execution's `JobExecutionStatus` is reported
+/// as, or `None` for a stored status no `CommandExecutionStatus` value names.
+///
+/// A COMMAND execution and a JOB execution are one record in the shared store (the
+/// data plane's `StartCommandExecution` enqueues the command one, and from then on the
+/// same device-facing operations move it), but the two models name the lifecycle
+/// differently: `JobExecutionStatus` admits `QUEUED` and `CommandExecutionStatus` does
+/// not, declaring `CREATED` instead
+/// (`smithy_query(query="shape",shape="CommandExecutionStatus")`: `CREATED`,
+/// `IN_PROGRESS`, `SUCCEEDED`, `FAILED`, `REJECTED`, `TIMED_OUT`) — an execution that
+/// has been created for its device and not yet taken up. The other five values are
+/// spelled the same in both models, so they are reported unchanged.
+///
+/// `None` is for a stored status this model cannot express (`CANCELED`, `REMOVED` —
+/// job-level statuses a command execution does not reach, since those moves are made
+/// by operations that resolve a `jobId` of the control plane's job registry, and a
+/// command execution is keyed by a minted `executionId` that is not one). A reader
+/// reports no command execution for such a record rather than inventing a status the
+/// model does not declare.
+pub fn command_execution_status(stored_status: &str) -> Option<&'static str> {
+    match stored_status {
+        ::service_common::iot_job_executions::STATUS_QUEUED => Some("CREATED"),
+        ::service_common::iot_job_executions::STATUS_IN_PROGRESS => Some("IN_PROGRESS"),
+        "SUCCEEDED" => Some("SUCCEEDED"),
+        "FAILED" => Some("FAILED"),
+        ::service_common::iot_job_executions::STATUS_REJECTED => Some("REJECTED"),
+        ::service_common::iot_job_executions::STATUS_TIMED_OUT => Some("TIMED_OUT"),
+        _ => None,
+    }
+}
+
+/// When a command execution STARTED, in epoch seconds.
+///
+/// `CommandExecutionSummary$startedAt` is "The date and time at which the command
+/// started executing on the target device", and the operation that brings a command
+/// execution into existence is `iot-jobs-data:StartCommandExecution` — the call that
+/// STARTS it on that device. So an execution has a start instant from the moment it is
+/// created: the instant the DEVICE reported taking the work up when it has reported
+/// one, and otherwise the instant the start call started it. The instant therefore only
+/// ever moves forward, and never from a read.
+///
+/// `completedAt` has no such floor ([`command_execution_completed_at`]): an execution
+/// that has not reached a status it never leaves has not completed, so there is no
+/// instant to report for it.
+pub fn command_execution_started_at(record: &JobExecutionRecord) -> i64 {
+    record.started_at.unwrap_or(record.queued_at)
+}
+
+/// When a command execution COMPLETED, in epoch seconds, or `None` while it has not.
+///
+/// `CommandExecutionSummary$completedAt` is "The date and time at which the command
+/// completed executing on the target device", so it exists exactly for an execution
+/// that has reached a status it never leaves, and it is the instant of that last
+/// write: the device's terminal update stamps `last_updated_at`, and an execution the
+/// clock timed out is stamped at its DEADLINE
+/// (`JobExecutionRecord::time_out_if_due`), which is when it completed rather than
+/// when it was next read.
+pub fn command_execution_completed_at(record: &JobExecutionRecord) -> Option<i64> {
+    record.is_terminal().then_some(record.last_updated_at)
+}
+
+/// A stored command execution as the modelled `CommandExecutionSummary` this service
+/// reports, or `None` when the record is not one a reader may report.
+///
+/// `None` for a record that is not a command execution at all (it carries no
+/// `commandArn`, so it was created by `CreateJob` and belongs to the job-execution
+/// readers) and for one whose stored status this model cannot name
+/// ([`command_execution_status`]).
+///
+/// Every member is read off the stored record: `executionId` is the id the data plane
+/// minted and keyed the record by, `targetArn` is "The Amazon Resource Name (ARN) of
+/// the target device for which the command is being executed" built from the thing
+/// NAME the execution is keyed by and the region the request is signed for
+/// ([`thing_arn`]), `createdAt` is when the execution was created for the device,
+/// `startedAt` is when it started on that device ([`command_execution_started_at`])
+/// and `completedAt` only once it finished ([`command_execution_completed_at`]).
+pub fn to_command_execution_summary(
+    record: &JobExecutionRecord,
+    region: &str,
+) -> Option<crate::ops::types::CommandExecutionSummary> {
+    let command_arn = record.command_arn.clone()?;
+    let status = command_execution_status(&record.status)?;
+    Some(crate::ops::types::CommandExecutionSummary {
+        command_arn: Some(command_arn),
+        execution_id: Some(record.job_id.clone()),
+        target_arn: Some(thing_arn(region, &record.thing_name)),
+        status: Some(status.to_string()),
+        created_at: Some(::aws_smithy_types::DateTime::from_secs(record.queued_at)),
+        started_at: Some(::aws_smithy_types::DateTime::from_secs(
+            command_execution_started_at(record),
+        )),
+        completed_at: command_execution_completed_at(record)
+            .map(::aws_smithy_types::DateTime::from_secs),
+    })
+}
+
+/// The instant, in epoch seconds, that a `StringDateTime` names, or `None` for text
+/// that names none.
+///
+/// The members that carry one here are `TimeFilter$after` / `TimeFilter$before`, whose
+/// documentation states the form as "the format yyyy-MM-dd'T'HH:mm"
+/// (`smithy_query(query="doc",shape="TimeFilter",member="after")`) — a CIVIL date and
+/// time with no zone and no seconds, which no modelled `timestamp` reader accepts. So
+/// the text is normalised here instead: a value with no zone suffix is read as UTC,
+/// one carrying any of the zone forms RFC 3339 admits is shifted by that offset
+/// through the ONE shared reader (`service_common::rfc3339::split_utc_offset`), and a
+/// civil part given to minute precision is completed to the second. The calendar
+/// conversion itself (month lengths, leap years) still comes from the library.
+///
+/// TOTAL over arbitrary text: the value comes straight off the wire, so every form
+/// this does not recognise answers `None` for the caller to refuse as its modelled
+/// client error.
+pub fn parse_string_date_time(value: &str) -> Option<i64> {
+    let (civil, offset_seconds) = ::service_common::rfc3339::split_utc_offset(value)
+        // No zone suffix at all is the documented form, which is UTC.
+        .unwrap_or((value, 0));
+    // `yyyy-MM-ddTHH:mm` carries no seconds field; the reader below requires one.
+    let completed = if civil.len() == MINUTE_PRECISION_LENGTH {
+        format!("{civil}:00")
+    } else {
+        civil.to_string()
+    };
+    let parsed = ::aws_smithy_types::DateTime::from_str(
+        &format!("{completed}Z"),
+        ::aws_smithy_types::date_time::Format::DateTime,
+    )
+    .ok()?;
+    parsed.secs().checked_sub(offset_seconds)
+}
+
+/// How many characters a civil date-time given to MINUTE precision has
+/// (`yyyy-MM-ddTHH:mm`), the form `TimeFilter`'s members document.
+const MINUTE_PRECISION_LENGTH: usize = "yyyy-MM-ddTHH:mm".len();
+
