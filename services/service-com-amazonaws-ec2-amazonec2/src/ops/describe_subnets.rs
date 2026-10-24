@@ -4,7 +4,11 @@
 //!
 //! Reports the account's subnets out of [`crate::state`]: the whole store by default, or
 //! the subset the request's `SubnetIds` and `Filters` select, one `MaxResults`-sized page
-//! at a time. A reporting operation only — it writes nothing.
+//! at a time. A reporting operation — the only thing it writes is what was already owed at
+//! the instant it was called: the clock-owed subnet transitions, and the ambient default
+//! network the account holds in the Region the request is signed for
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::ensure_default_network`], which is
+//! idempotent per Region).
 //!
 //! ## Shape of an operation
 //!
@@ -154,9 +158,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; this operation reads none of it. The store
-        // is reached through the engine held on `self`.
-        let _ = ctx;
+        // The Region this request was signed for: "Describes your subnets" is answered for
+        // the Region the caller is asking in, and that Region is what says which ambient
+        // default network the account already holds (see below).
+        let region = crate::state::request_region(ctx.parts());
 
         // "Checks whether you have the required permissions for the action, without
         // actually making the request, and provides an error response. If you have the
@@ -203,6 +208,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // service handed over is owed — `CreateSubnet` is synchronous and answers
         // `available`, so a subnet EC2 minted has none.
         store.materialize_due_transitions();
+
+        // The ambient default network of the Region this request is signed for: "when you
+        // create an AWS account, we create a default VPC for you in each AWS Region" with
+        // "a default subnet in each Availability Zone in the Region" (Amazon VPC User
+        // Guide, "Default VPCs"), so those subnets are already the account's whatever it
+        // has created — they are what a client bootstraps a VPC-bound create from. The
+        // call is idempotent per Region and materialises a network owed since the account
+        // existed rather than one this read created, so it changes nothing a later caller
+        // would not have seen anyway, exactly like the transitions above.
+        store.ensure_default_network(&region);
 
         // "The IDs of the subnets" (`DescribeSubnetsRequest$SubnetIds`): an id that names
         // no subnet of the account is an error, not an absent row.

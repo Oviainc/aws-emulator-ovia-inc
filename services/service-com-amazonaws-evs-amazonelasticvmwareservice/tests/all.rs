@@ -54,6 +54,8 @@ mod hosts;
 mod list_vm_entitlements_connector;
 #[path = "all/list_while_initializing.rs"]
 mod list_while_initializing;
+#[path = "all/reserved_tag_keys.rs"]
+mod reserved_tag_keys;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tagging_not_found.rs"]

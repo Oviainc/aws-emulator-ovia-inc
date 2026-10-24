@@ -155,11 +155,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // tokens walks the whole store. A token this service did not mint names no
         // position, so it is refused rather than silently read as "from the beginning".
         // This operation models no client-input error, so the refusal goes through the
-        // scaffold's 400 `ValidationException` channel.
+        // scaffold's 400 `ValidationException` channel — worded in this service's own
+        // validation envelope, like every other request-validation refusal it raises.
         let start_at = match input.next_token.as_deref() {
             None => 0,
             Some(token) => crate::state::decode_cursor(token).ok_or_else(|| {
-                crate::scaffolded::Scaffolded::validation("the specified nextToken is not valid")
+                crate::scaffolded::Scaffolded::validation(
+                    crate::state::invalid_pagination_token_message(Self::NAME),
+                )
             })?,
         };
 

@@ -5,12 +5,15 @@
 //! Three rules are under test, and each is service-wide rather than tied to one
 //! operation or one recorded request:
 //!
-//! 1. A request refused for the rule the model cannot express — the
-//!    `notifyOnCaseSeverity` / notification-flag combination documented on
-//!    `CreateSlackChannelConfigurationRequest$notifyOnCaseSeverity` — is answered 400
-//!    `ValidationException` whose message is service prose naming the OPERATION that
-//!    was called, restating the documented rule with the parameters spelled the way
-//!    the API spells them, and closing with "Try your request again.".
+//! 1. A request a HANDLER refuses — one the boundary validator passed, because the rule
+//!    it broke is not a modelled constraint — is answered 400 `ValidationException`
+//!    whose message is service prose naming the OPERATION that was called, restating
+//!    the rule with the request members spelled the way the API spells them, and
+//!    closing with "Try your request again.". That holds for every such rule this
+//!    service enforces: the `notifyOnCaseSeverity` / notification-flag combination
+//!    documented on `CreateSlackChannelConfigurationRequest$notifyOnCaseSeverity`, a
+//!    `nextToken` that is not a cursor this service minted, and a registration past the
+//!    documented Slack workspace quota.
 //! 2. A request refused for a constraint the model DOES declare is answered in the
 //!    standard validation envelope (`N validation error(s) detected: ` over one
 //!    clause per violation, each naming the rejected value and the member path), with
@@ -34,8 +37,10 @@
 //! model_path="services/service-com-amazonaws-supportapp-supportapp/smithy-model/com-amazonaws-supportapp-supportapp.json")`.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_supportapp_supportapp::state::MAX_SLACK_WORKSPACE_CONFIGURATIONS;
 
 use crate::slack_channel_configurations::{role_arn, Emulator, Reply};
+use crate::slack_workspace_configurations::list_workspaces;
 
 /// The clause stating the documented `all`/`high` rule: "If you specify high or all,
 /// you must specify true for at least one of the following parameters:
@@ -112,10 +117,11 @@ fn refusal(case: &str, reply: &Reply, status: u16, error_type: &str) -> String {
     message_of(case, reply)
 }
 
-/// The invariants of rule 1, checked on every row: the operation-named prose
-/// envelope, and no lowerCamel wire spelling of a parameter, which is what an
-/// internal paraphrase reads like.
-fn assert_service_prose(case: &str, operation: &str, message: &str) {
+/// The invariants of the envelope itself, checked on every handler-raised
+/// `ValidationException` whatever rule it states: it names the OPERATION whose request
+/// was refused, and closes with the retry sentence. A message that is an internal
+/// paraphrase has neither.
+fn assert_prose_envelope(case: &str, operation: &str, message: &str) {
     let prefix = format!("Your {operation} request isn't valid. ");
     assert!(
         message.starts_with(&prefix),
@@ -125,6 +131,33 @@ fn assert_service_prose(case: &str, operation: &str, message: &str) {
         message.ends_with("Try your request again."),
         "case {case:?}: expected the message to close with the retry sentence, got {message:?}"
     );
+    assert!(
+        message.len() > prefix.len() + "Try your request again.".len(),
+        "case {case:?}: expected a rule clause between the two sentences, got {message:?}"
+    );
+}
+
+/// A request member this service's prose names must be spelled the way the API spells
+/// it (PascalCase), never in the lowerCamel wire spelling an internal paraphrase uses.
+fn assert_names_member(case: &str, message: &str, member_in_prose: &str) {
+    assert!(
+        message.contains(member_in_prose),
+        "case {case:?}: expected the message to name {member_in_prose:?}, got {message:?}"
+    );
+    let mut wire_spelling = member_in_prose.to_string();
+    wire_spelling.replace_range(..1, &member_in_prose[..1].to_lowercase());
+    assert!(
+        !message.contains(&wire_spelling),
+        "case {case:?}: a member must be named as the API names it, not {wire_spelling:?}: got \
+         {message:?}"
+    );
+}
+
+/// The invariants of rule 1, checked on every row: the operation-named prose
+/// envelope, and no lowerCamel wire spelling of a parameter, which is what an
+/// internal paraphrase reads like.
+fn assert_service_prose(case: &str, operation: &str, message: &str) {
+    assert_prose_envelope(case, operation, message);
     for wire_spelling in [
         "notifyOnCaseSeverity",
         "notifyOnCreateOrReopenCase",
@@ -556,4 +589,153 @@ async fn every_other_constraint_class_keeps_the_standard_clause() {
         );
     }
     assert_validation_envelope("two patterned members at once", &message);
+}
+
+/// The clause a refused pagination token is stated with, for the operation that was
+/// called.
+///
+/// It restates what the member documents — "To retrieve the next batch of results,
+/// reissue the search request and include the returned token"
+/// (`smithy_query(query="doc", shape="ListSlackChannelConfigurationsRequest", member="nextToken")`)
+/// — and names the member in the API's PascalCase spelling, as this service's prose
+/// names a request parameter.
+fn invalid_token_rule(operation: &str) -> String {
+    format!("NextToken must be a pagination token that an earlier {operation} response returned.")
+}
+
+/// The clause a registration past the workspace quota is stated with: the documented
+/// quota itself ("You can add up to 5 Slack workspaces for your account" —
+/// `smithy_query(query="doc", shape="CreateSlackChannelConfiguration")`), read from the
+/// constant that enforces it so the test cannot pin a bound the store does not apply.
+fn workspace_quota_rule() -> String {
+    format!(
+        "You can add up to {MAX_SLACK_WORKSPACE_CONFIGURATIONS} Slack workspaces for your account."
+    )
+}
+
+/// Tokens no `nextToken` this service mints can be, each row a different reason: not
+/// hex at all, hex that is not a whole number of bytes, hex that decodes to bytes that
+/// are not text, hex of whitespace, hex of an id rather than a position, hex of a
+/// position spelled in a way the codec never mints, hex of a count no `usize` holds,
+/// and a token at the published `paginationToken` length maximum. Every row satisfies
+/// the member's own `@length` / `@pattern` constraints, so each is refused by the
+/// HANDLER rather than by the boundary validator.
+fn bogus_tokens() -> Vec<(&'static str, String)> {
+    vec![
+        ("not hex", "not-a-cursor".to_string()),
+        ("odd-length hex", "abc".to_string()),
+        ("hex of bytes that are not text", "fffe".to_string()),
+        ("hex of a space", hex::encode(" ")),
+        ("hex of a team id", hex::encode("T012ABCDEFG")),
+        ("hex of a negative position", hex::encode("-1")),
+        ("hex of a padded position", hex::encode("007")),
+        ("hex of a fractional position", hex::encode("1.5")),
+        ("hex of a position past any count", hex::encode("9".repeat(40))),
+        // `paginationToken` is `len 1..256`, so 256 characters is the published upper
+        // bound rather than a value past it.
+        ("hex-shaped and at the length maximum", "a".repeat(256)),
+    ]
+}
+
+#[tokio::test]
+async fn a_pagination_token_this_service_did_not_mint_is_refused_in_the_service_prose_envelope() {
+    let emulator = Emulator::new();
+    // Stored state on both resources, so each refusal is about the token rather than
+    // about an empty store.
+    assert_eq!(
+        emulator
+            .create_in_registered_workspace(valid_create())
+            .await
+            .status,
+        200,
+        "the fixture configuration must be created"
+    );
+
+    // Rows span both paginated operations — each names ITSELF, because the message
+    // states which request was refused — and every form of a token this service cannot
+    // have minted.
+    for (label, token) in bogus_tokens() {
+        for operation in [
+            "ListSlackChannelConfigurations",
+            "ListSlackWorkspaceConfigurations",
+        ] {
+            let case = format!("{operation} / {label}");
+            let reply = if operation == "ListSlackChannelConfigurations" {
+                emulator.list(Some(&token)).await
+            } else {
+                list_workspaces(&emulator, Some(&token)).await
+            };
+            let message = refusal(&case, &reply, 400, "ValidationException");
+            let expected = invalid_request(operation, &invalid_token_rule(operation));
+            assert_eq!(
+                message, expected,
+                "case {case:?}: expected {expected:?}, got {message:?}"
+            );
+            assert_prose_envelope(&case, operation, &message);
+            assert_names_member(&case, &message, "NextToken");
+        }
+    }
+
+    // A listing with no token is still served, so the refusals above are about the
+    // token and not about pagination being refused outright.
+    for (operation, reply) in [
+        (
+            "ListSlackChannelConfigurations",
+            emulator.list(None).await,
+        ),
+        (
+            "ListSlackWorkspaceConfigurations",
+            list_workspaces(&emulator, None).await,
+        ),
+    ] {
+        assert_eq!(
+            reply.status, 200,
+            "case {operation:?}: expected an untokened listing to be served, got {} / {}",
+            reply.status, reply.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_registration_past_the_documented_workspace_quota_is_stated_in_the_same_envelope() {
+    let emulator = Emulator::new();
+    for index in 0..MAX_SLACK_WORKSPACE_CONFIGURATIONS {
+        let team_id = format!("T{index:03}FILLER");
+        assert_eq!(
+            emulator.register_workspace(&team_id).await.status,
+            200,
+            "case {team_id:?}: the account must fill to its documented workspace quota"
+        );
+    }
+
+    // Rows differ in the form and length of the team id that cannot be registered,
+    // including both published `teamId` `@length` bounds.
+    let longest_id = "T".repeat(SLACK_ID_MAX_LEN);
+    let rows: [(&str, &str); 4] = [
+        ("Slack-shaped id", "T999ZZZZZZZ"),
+        ("single-character id", "t"),
+        ("id at the length maximum", &longest_id),
+        ("punctuated id", "T-0_1.2"),
+    ];
+    let expected = invalid_request(
+        "RegisterSlackWorkspaceForOrganization",
+        &workspace_quota_rule(),
+    );
+    for (label, team_id) in rows {
+        let reply = emulator.register_workspace(team_id).await;
+        let message = refusal(label, &reply, 400, "ValidationException");
+        assert_eq!(
+            message, expected,
+            "case {label:?}: expected {expected:?}, got {message:?}"
+        );
+        assert_prose_envelope(label, "RegisterSlackWorkspaceForOrganization", &message);
+    }
+
+    // A workspace the account already holds is not a new registration, so it is not
+    // past the quota: the refusals above are about the quota and not about the call.
+    assert_eq!(
+        emulator.register_workspace("T000FILLER").await.status,
+        200,
+        "expected re-registering a held workspace to be served"
+    );
 }

@@ -198,20 +198,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let desired_state = match input.desired_state.as_deref() {
             None => crate::state::requested_state::RUNNING.to_string(),
             Some(value) if REQUESTED_PIPE_STATE_VALUES.contains(&value) => value.to_string(),
-            Some(value) => {
-                return Err(CreatePipeErrorModeled::ValidationException(ValidationException {
-                    message: Some(format!(
-                        "DesiredState must be one of {}; got '{value}'",
-                        REQUESTED_PIPE_STATE_VALUES.join(", "),
-                    )),
-                    field_list: Some(vec![ValidationExceptionField {
-                        name: "DesiredState".to_string(),
-                        message: format!(
+            Some(_) => {
+                return Err(CreatePipeErrorModeled::ValidationException(
+                    crate::state::validation_error(vec![crate::state::validation_field(
+                        "DesiredState",
+                        format!(
                             "must be one of {}",
                             REQUESTED_PIPE_STATE_VALUES.join(", ")
                         ),
-                    }]),
-                })
+                    )]),
+                )
                 .into());
             }
         };

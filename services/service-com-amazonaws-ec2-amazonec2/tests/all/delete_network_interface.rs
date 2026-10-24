@@ -62,7 +62,7 @@ fn place(engine: &engine::InMemoryEngine) -> Place {
     let store = engine.state::<Ec2State>();
     let store = store.lock();
     let vpc_id = store
-        .default_vpc_id()
+        .default_vpc_id(REGION)
         .expect("a fresh account has a default VPC");
     let (subnet_id, subnet) = store
         .subnets

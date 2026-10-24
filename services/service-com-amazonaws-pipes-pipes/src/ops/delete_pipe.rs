@@ -167,9 +167,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Removed from the store, so a later DescribePipe/ListPipes no longer sees it and
         // a second DeletePipe is a 404.
         let mut pipe = state.pipes.remove(&input.name).ok_or_else(|| {
-            DeletePipeErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!("Pipe not found: {}", input.name)),
-            })
+            DeletePipeErrorModeled::NotFoundException(crate::state::pipe_not_found(&input.name))
         })?;
 
         pipe.desired_state = crate::state::requested_state::DELETED.to_string();
