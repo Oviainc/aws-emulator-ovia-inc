@@ -89,3 +89,5 @@ mod select_resource_config;
 mod configuration_recorder_refusal_messages;
 #[path = "all/list_stored_queries.rs"]
 mod list_stored_queries;
+#[path = "all/delete_stored_query.rs"]
+mod delete_stored_query;

@@ -2892,7 +2892,7 @@ pub const STORED_QUERY_NAME_MAX_LENGTH: usize = 64;
 /// The message is BUILT FROM THE REQUEST — it quotes the `QueryName` the caller sent —
 /// so every operation that refuses an absent stored query words it the same way.
 pub fn no_such_stored_query_message(name: &str) -> String {
-    format!("The stored query '{name}' provided in the request does not exist.")
+    format!("The query '{name}' provided in the request is invalid. Please check the query name.")
 }
 
 /// The ARN resource type of a conformance pack, as Config spells it in the ARNs it
