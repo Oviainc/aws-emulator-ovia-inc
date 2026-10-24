@@ -176,7 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `UserPool::user` resolves a user.
         let user = pool
             .user(&input.username)
-            .ok_or_else(|| user_not_found(&input.username))?;
+            .ok_or_else(user_not_found)?;
 
         // The stored membership, restricted to groups the pool still holds and
         // in ascending name order — the stable order the page token indexes
@@ -221,10 +221,12 @@ fn user_pool_not_found(user_pool_id: &str) -> AdminListGroupsForUserError {
     .into()
 }
 
-/// This operation's `UserNotFoundException` for an absent user.
-fn user_not_found(username: &str) -> AdminListGroupsForUserError {
+/// This operation's `UserNotFoundException` for an absent user. Carries the
+/// fixed message of [`crate::state::USER_NOT_FOUND_MESSAGE`], which names no
+/// username.
+fn user_not_found() -> AdminListGroupsForUserError {
     AdminListGroupsForUserErrorModeled::UserNotFoundException(UserNotFoundException {
-        message: Some(format!("User {username} does not exist.")),
+        message: Some(crate::state::USER_NOT_FOUND_MESSAGE.to_string()),
     })
     .into()
 }

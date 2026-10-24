@@ -203,7 +203,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `UserPool::user_mut` resolves a user.
         let user = pool
             .user_mut(&input.username)
-            .ok_or_else(|| user_not_found(&input.username))?;
+            .ok_or_else(user_not_found)?;
 
         // Membership is a set, so a repeated add stores nothing new and the user
         // belongs to the group exactly once.
@@ -229,10 +229,12 @@ fn group_not_found(group_name: &str) -> AdminAddUserToGroupError {
     .into()
 }
 
-/// This operation's `UserNotFoundException` for an absent user.
-fn user_not_found(username: &str) -> AdminAddUserToGroupError {
+/// This operation's `UserNotFoundException` for an absent user. Carries the
+/// fixed message of [`crate::state::USER_NOT_FOUND_MESSAGE`], which names no
+/// username.
+fn user_not_found() -> AdminAddUserToGroupError {
     AdminAddUserToGroupErrorModeled::UserNotFoundException(UserNotFoundException {
-        message: Some(format!("User {username} does not exist.")),
+        message: Some(crate::state::USER_NOT_FOUND_MESSAGE.to_string()),
     })
     .into()
 }
