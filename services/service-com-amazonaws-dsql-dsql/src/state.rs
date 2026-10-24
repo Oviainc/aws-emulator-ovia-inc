@@ -303,11 +303,60 @@ pub enum TokenVerdict {
     /// The token has not been used on this operation: serve the request.
     Unused,
     /// The token was used with the SAME parameters: this is a retry of that
-    /// request, so answer from the resource it names and have no further effect.
-    Replay(String),
+    /// request, so answer from the call the ledger recorded and have no further
+    /// effect.
+    Replay(RecordedCall),
     /// The token was used with DIFFERENT parameters: refuse with the
     /// operation's `ConflictException`.
     Mismatch,
+}
+
+/// The call a `clientToken` was first used on, as the ledger keeps it: the
+/// resource that call acted on, and the values it answered with.
+///
+/// A retry has to answer with the result of the ORIGINAL call, and the state the
+/// service holds when the retry arrives need not still determine that result: a
+/// value the first call MINTED can be superseded by a later call or dropped
+/// altogether. Such a value is therefore kept here, keyed by the output member
+/// it belongs to, so the retry is served from the record rather than
+/// re-derived. A value that IS a field of [`Self::resource`]'s stored record
+/// needs no copy: the handler renders it from that record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedCall {
+    /// The resource that call acted on, as the handler names it — the record a
+    /// retry's answer is rendered from, and the resource
+    /// [`TokenLedger::forget`] drops the token with.
+    pub resource: String,
+    /// The values the call answered, keyed by output member name. Sorted so the
+    /// record is deterministic.
+    answer: BTreeMap<String, String>,
+}
+
+impl RecordedCall {
+    /// A call against `resource` that answered nothing the resource's own record
+    /// does not determine.
+    pub fn new(resource: &str) -> Self {
+        Self {
+            resource: resource.to_string(),
+            answer: BTreeMap::new(),
+        }
+    }
+
+    /// The same call, recording that it answered `member` with `value`.
+    pub fn answering(mut self, member: &str, value: &str) -> Self {
+        self.answer.insert(member.to_string(), value.to_string());
+        self
+    }
+
+    /// What the call answered for `member`, or `None` when it recorded no value
+    /// for it — which is the case for every member the handler renders from
+    /// [`Self::resource`]'s stored record instead ([`Self::answering`] is the
+    /// only writer). `None` is never a value to serve: a handler that recorded a
+    /// member has to find it, so one that does not must refuse rather than
+    /// answer an empty one.
+    pub fn answered(&self, member: &str) -> Option<&str> {
+        self.answer.get(member).map(String::as_str)
+    }
 }
 
 /// One recorded use of a `clientToken`.
@@ -315,8 +364,8 @@ pub enum TokenVerdict {
 struct TokenEntry {
     /// [`request_fingerprint`] of the parameters the first call carried.
     fingerprint: String,
-    /// The resource that call acted on, as the handler names it.
-    resource: String,
+    /// The call that token served.
+    call: RecordedCall,
 }
 
 /// The `clientToken`s one operation has already served, bounded by
@@ -335,16 +384,16 @@ impl TokenLedger {
         match self.entries.get(token) {
             None => TokenVerdict::Unused,
             Some(entry) if entry.fingerprint == fingerprint => {
-                TokenVerdict::Replay(entry.resource.clone())
+                TokenVerdict::Replay(entry.call.clone())
             }
             Some(_) => TokenVerdict::Mismatch,
         }
     }
 
-    /// Record that `token` served a request with `fingerprint` against
-    /// `resource`, evicting the oldest token first if that would push the ledger
-    /// past [`MAX_CLIENT_TOKENS`].
-    pub fn record(&mut self, token: String, fingerprint: String, resource: &str) {
+    /// Record that `token` served the request `fingerprint` describes, as `call`
+    /// describes what it did and answered, evicting the oldest token first if
+    /// that would push the ledger past [`MAX_CLIENT_TOKENS`].
+    pub fn record(&mut self, token: String, fingerprint: String, call: RecordedCall) {
         while self.entries.len() >= MAX_CLIENT_TOKENS {
             match self.order.pop_front() {
                 Some(oldest) => {
@@ -359,10 +408,7 @@ impl TokenLedger {
                 }
             }
         }
-        let entry = TokenEntry {
-            fingerprint,
-            resource: resource.to_string(),
-        };
+        let entry = TokenEntry { fingerprint, call };
         if self.entries.insert(token.clone(), entry).is_none() {
             self.order.push_back(token);
         }
@@ -381,7 +427,7 @@ impl TokenLedger {
     /// Drop every token recorded against `resource`, so a token never outlives
     /// the resource it names.
     pub fn forget(&mut self, resource: &str) {
-        self.entries.retain(|_, entry| entry.resource != resource);
+        self.entries.retain(|_, entry| entry.call.resource != resource);
         let live = &self.entries;
         self.order.retain(|token| live.contains_key(token));
     }
@@ -1081,6 +1127,20 @@ pub fn unissued_pagination_token(value: &str) -> ValidationException {
 /// (`smithy_query(query="operation", operation="ListClusters")`: `nextToken`,
 /// bound to the `next-token` query parameter).
 pub const NEXT_TOKEN_MEMBER: &str = "nextToken";
+
+/// The name a cluster's and a stream's status member carries on the wire
+/// (`smithy_query(query="operation",
+/// operation="CreateCluster,UpdateCluster,CreateStream")`: `status`), and so the
+/// key a recorded call keeps the status it answered under
+/// ([`RecordedCall::answering`]).
+pub const STATUS_MEMBER: &str = "status";
+
+/// The name the policy operations' answer carries on the wire
+/// (`smithy_query(query="operation",
+/// operation="PutClusterPolicy,DeleteClusterPolicy")`: a `@required`
+/// `policyVersion`), and so the key a recorded call keeps that answer under
+/// ([`RecordedCall::answering`]).
+pub const POLICY_VERSION_MEMBER: &str = "policyVersion";
 
 /// The modelled `ResourceNotFoundException` for a cluster this service does not
 /// hold: [`resource_not_found`] over the ARN the addressed identifier has in the
