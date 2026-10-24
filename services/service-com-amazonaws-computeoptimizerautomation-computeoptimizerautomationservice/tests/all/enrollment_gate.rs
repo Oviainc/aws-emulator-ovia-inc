@@ -66,6 +66,11 @@ fn gated_calls() -> Vec<(&'static str, Value, u16)> {
         ),
         ("GetAutomationRule", json!({"ruleArn": arn}), 404),
         ("ListAutomationEvents", json!({}), 200),
+        (
+            "ListAutomationEventSteps",
+            json!({"eventId": ABSENT_EVENT_ID}),
+            404,
+        ),
         ("ListAutomationRules", json!({}), 200),
         ("ListRecommendedActions", json!({}), 200),
         (

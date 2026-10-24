@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ResetRuntimeLogConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ResetRuntimeLogConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ResetRuntimeLogConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the runtime log configuration installed on the managed thing the URI names from
+//! `crate::state`'s `runtime_log_configurations` store, so the thing is back to having none
+//! and `GetRuntimeLogConfiguration` reports the modelled `ResourceNotFoundException` again.
+//! `@idempotent`, so a reset of a managed thing that already has no configuration is the
+//! same success as the first one; a `ManagedThingId` this region holds no managed thing
+//! under is the modelled `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -139,6 +137,20 @@ pub struct ResetRuntimeLogConfiguration<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
 
+/// Record this state-changing call for attribution: the access key id the caller presented
+/// (a public identifier, never a secret), the region the managed thing was resolved in, and
+/// how the call ended.
+fn audit(akid: &str, region: &str, outcome: &str) {
+    ::tracing::info!(
+        target: "emulator::audit",
+        operation = "ResetRuntimeLogConfiguration",
+        akid = %akid,
+        region = %region,
+        outcome = %outcome,
+        "state-changing operation"
+    );
+}
+
 impl<Eng> ResetRuntimeLogConfiguration<Eng> {
     /// Construct the operation from the shared engine. INFALLIBLE — the engine is a
     /// construction-time dependency, so engine access is guaranteed by the time any
@@ -165,18 +177,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ResetRuntimeLogConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ResetRuntimeLogConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ResetRuntimeLogConfiguration"))
+        // The credential scope's access key id is read only to ATTRIBUTE the change
+        // ([`audit`]); the region it names is the region the managed thing is resolved in.
+        let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
+        let region = crate::state::request_region(ctx.parts());
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            audit(&akid, &region, "unavailable");
+            ResetRuntimeLogConfigurationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the runtime-log-configuration store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        let mut store = state.lock();
+        if store
+            .managed_thing_in(&region, &input.managed_thing_id)
+            .is_none()
+        {
+            drop(store);
+            audit(&akid, &region, "not-found");
+            return Err(
+                ResetRuntimeLogConfigurationErrorModeled::ResourceNotFoundException(
+                    // A mutation states the reason from the identifier the request carried.
+                    crate::state::managed_thing_not_found_on_mutation(&input.managed_thing_id),
+                )
+                .into(),
+            );
+        }
+
+        // The operation is `@idempotent`: it RETURNS the managed thing to having no
+        // configuration installed, so a reset of a thing that already has none is the same
+        // success rather than a refusal. The removal is keyed by the (region, id) tuple the
+        // managed thing was just resolved under, so one region's reset cannot reach the
+        // configuration another region installed.
+        let removed = store.remove_runtime_log_configuration(&region, &input.managed_thing_id);
+        drop(store);
+
+        audit(
+            &akid,
+            &region,
+            if removed { "reset" } else { "already-reset" },
+        );
+        Ok(ResetRuntimeLogConfigurationOutput)
     }
 }

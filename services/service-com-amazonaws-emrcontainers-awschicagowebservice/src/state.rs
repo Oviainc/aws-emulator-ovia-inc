@@ -16,7 +16,10 @@
 //! * [`ComAmazonawsEmrcontainersAwschicagowebserviceState::settle`] — the one place a
 //!   status transition the clock has already made due is materialised. Every handler,
 //!   reporting or mutating, calls it first, so a reader never has to know which other
-//!   call started the transition.
+//!   call started the transition. It is also where a job run's start waits for a running
+//!   slot when its virtual cluster configures a `maxConcurrentJobRuns`, so the counts
+//!   [`ComAmazonawsEmrcontainersAwschicagowebserviceState::cluster_scheduler_status`]
+//!   reports never exceed the capacity the cluster was created with.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -26,7 +29,7 @@ use sha2::{Digest, Sha256};
 use crate::ops::types::{
     Configuration, ConfigurationOverrides, ContainerProvider, JobDriver, JobRun, JobTemplate,
     JobTemplateData, ParametricConfigurationOverrides, RetryPolicyConfiguration,
-    SchedulerConfiguration, SecurityConfiguration, SecurityConfigurationData,
+    SchedulerConfiguration, SchedulerStatus, SecurityConfiguration, SecurityConfigurationData,
     TemplateParameterConfiguration, VirtualCluster,
 };
 
@@ -77,6 +80,17 @@ pub const JOB_TERMINAL_STATES: &[&str] = &[JOB_CANCELLED, JOB_FAILED, JOB_COMPLE
 /// Whether a `JobRunState` is one a job run never leaves.
 pub fn job_state_is_terminal(state: &str) -> bool {
     JOB_TERMINAL_STATES.contains(&state)
+}
+
+/// The `JobRunState` values a run WAITING for scheduler capacity is in. Both
+/// `SchedulerStatus$currentInQueueJobRuns` ("job runs currently waiting in the queue
+/// (`PENDING` or `SUBMITTED`)") and `SchedulerConfiguration$maxInQueueJobRuns` ("job runs
+/// that can be in the `PENDING` or `SUBMITTED` state at any time") name the same two.
+pub const JOB_IN_QUEUE_STATES: &[&str] = &[JOB_PENDING, JOB_SUBMITTED];
+
+/// Whether a `JobRunState` is one a run waiting in the scheduler queue is in.
+pub fn job_state_is_in_queue(state: &str) -> bool {
+    JOB_IN_QUEUE_STATES.contains(&state)
 }
 
 /// The alphabet a minted id is drawn from: `ResourceIdString` is
@@ -312,11 +326,11 @@ impl VirtualClusterRecord {
 
     /// The modelled `VirtualCluster` this record represents.
     ///
-    /// `schedulerStatus` stays absent: it reports the live queue of a scheduler, and
-    /// this slice persists a `schedulerConfiguration` without scheduling against it
-    /// (the queue-depth and concurrency limits the shape documents are not enforced
-    /// yet), so reporting a queue state would be reporting work nothing did.
-    fn to_virtual_cluster(&self) -> VirtualCluster {
+    /// `schedulerStatus` is not a property of this record — it is the live count of the
+    /// cluster's job runs — so it is counted out of the store by
+    /// [`ComAmazonawsEmrcontainersAwschicagowebserviceState::cluster_scheduler_status`]
+    /// and handed in, which is why this is not a parameterless rendering.
+    fn to_virtual_cluster(&self, scheduler_status: SchedulerStatus) -> VirtualCluster {
         VirtualCluster {
             id: Some(self.id.clone()),
             name: Some(self.name.clone()),
@@ -328,7 +342,7 @@ impl VirtualClusterRecord {
             security_configuration_id: self.security_configuration_id.clone(),
             session_enabled: self.session_enabled,
             scheduler_configuration: self.scheduler_configuration.clone(),
-            scheduler_status: None,
+            scheduler_status: Some(scheduler_status),
         }
     }
 }
@@ -761,7 +775,40 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
                 self.pending_clusters.insert(id);
             }
         }
-        for id in std::mem::take(&mut self.pending_job_runs) {
+        // Job runs oldest submission first, so a start that needs a free running slot
+        // takes one in the order the runs were submitted rather than in whatever order
+        // the pending set happens to hash.
+        let mut queued: Vec<(i64, u64, String)> = std::mem::take(&mut self.pending_job_runs)
+            .into_iter()
+            .filter_map(|id| {
+                let record = self.job_runs.get(&id)?;
+                Some((record.created_at_millis, record.sequence, id))
+            })
+            .collect();
+        queued.sort();
+        for (_, _, id) in queued {
+            // A START the clock has made due still waits while the cluster's configured
+            // concurrency is fully taken: `maxConcurrentJobRuns` caps the runs that may
+            // be RUNNING at once, and "as running slots free up, queued job runs start
+            // automatically". The run keeps the transition it already owes, with its due
+            // instant in the past, so the first call after a slot frees starts it. Every
+            // other transition (a cancellation, a teardown) answers to the clock alone.
+            let waiting_for_a_slot = self
+                .job_runs
+                .get(&id)
+                .and_then(|record| {
+                    let transition = record.pending.as_ref()?;
+                    Some(
+                        now >= transition.due_at
+                            && transition.next_state == JOB_RUNNING
+                            && !self.cluster_has_free_running_slot(&record.virtual_cluster_id),
+                    )
+                })
+                .unwrap_or(false);
+            if waiting_for_a_slot {
+                self.pending_job_runs.insert(id);
+                continue;
+            }
             let still_pending = match self.job_runs.get_mut(&id) {
                 Some(record) => {
                     record.settle(now);
@@ -773,6 +820,73 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
                 self.pending_job_runs.insert(id);
             }
         }
+    }
+
+    /// How many of this cluster's stored job runs are in a state `wanted` accepts, as the
+    /// `NonNegativeInteger` the model counts them in.
+    fn cluster_run_count(&self, virtual_cluster_id: &str, wanted: fn(&str) -> bool) -> i32 {
+        let counted = self
+            .cluster_job_runs(virtual_cluster_id)
+            .filter(|record| wanted(&record.state))
+            .count();
+        i32::try_from(counted).unwrap_or(i32::MAX)
+    }
+
+    /// The current in-queue and concurrent job-run counts for this cluster
+    /// (`VirtualCluster$schedulerStatus`), counted out of the job runs this service holds
+    /// for it: the `PENDING`/`SUBMITTED` runs are the queue, the `RUNNING` runs are the
+    /// concurrency in use.
+    ///
+    /// Reported for every cluster, whatever its `schedulerConfiguration`: the counts are a
+    /// fact about the stored runs rather than a property of a limit, and the model gives
+    /// both members the default `0`, so a cluster holding no run reports zeros.
+    pub fn cluster_scheduler_status(&self, virtual_cluster_id: &str) -> SchedulerStatus {
+        SchedulerStatus {
+            current_in_queue_job_runs: self
+                .cluster_run_count(virtual_cluster_id, job_state_is_in_queue),
+            current_concurrent_job_runs: self
+                .cluster_run_count(virtual_cluster_id, |state| state == JOB_RUNNING),
+        }
+    }
+
+    /// Whether this cluster may take one more RUNNING job run right now.
+    ///
+    /// `schedulerConfiguration.maxConcurrentJobRuns` is "the maximum number of job runs
+    /// that can be in the `RUNNING` state at any time for the virtual cluster"; a cluster
+    /// that configures none is never gated ("if you omit this field, the service applies
+    /// no concurrency limit"), and nor is an id that names no cluster — a run whose
+    /// cluster is gone is not held back by a limit nobody set.
+    pub fn cluster_has_free_running_slot(&self, virtual_cluster_id: &str) -> bool {
+        let limit = self
+            .virtual_clusters
+            .get(virtual_cluster_id)
+            .and_then(|record| record.scheduler_configuration.as_ref())
+            .and_then(|configuration| configuration.max_concurrent_job_runs);
+        match limit {
+            Some(limit) => {
+                self.cluster_run_count(virtual_cluster_id, |state| state == JOB_RUNNING) < limit
+            }
+            None => true,
+        }
+    }
+
+    /// This cluster's `schedulerConfiguration.maxInQueueJobRuns`, but only when its queue
+    /// already holds that many runs: "when the queue is full, the service rejects
+    /// `StartJobRun` requests with a `ValidationException`", and the caller needs the
+    /// limit to say so.
+    ///
+    /// `None` when the cluster sets no queue-depth limit ("if you omit this field, the
+    /// service applies no queue-depth limit"), when its queue still has room, or when the
+    /// id names no cluster.
+    pub fn cluster_full_queue_limit(&self, virtual_cluster_id: &str) -> Option<i32> {
+        let limit = self
+            .virtual_clusters
+            .get(virtual_cluster_id)?
+            .scheduler_configuration
+            .as_ref()?
+            .max_in_queue_job_runs?;
+        (self.cluster_run_count(virtual_cluster_id, job_state_is_in_queue) >= limit)
+            .then_some(limit)
     }
 
     /// Make room for one more virtual cluster, reclaiming the oldest RETIRED ones (a
@@ -965,9 +1079,11 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
             .filter(|record| record.virtual_cluster_id == virtual_cluster_id)
     }
 
-    /// The modelled `VirtualCluster` for this id.
+    /// The modelled `VirtualCluster` for this id, with its `schedulerStatus` counted out
+    /// of the cluster's stored job runs (see [`Self::cluster_scheduler_status`]).
     pub fn virtual_cluster_view(&self, id: &str) -> Option<VirtualCluster> {
-        Some(self.virtual_clusters.get(id)?.to_virtual_cluster())
+        let record = self.virtual_clusters.get(id)?;
+        Some(record.to_virtual_cluster(self.cluster_scheduler_status(id)))
     }
 
     /// This cluster's stored job runs, in creation order.
