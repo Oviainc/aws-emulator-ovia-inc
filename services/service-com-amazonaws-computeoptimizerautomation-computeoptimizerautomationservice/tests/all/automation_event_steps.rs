@@ -335,11 +335,12 @@ async fn an_event_with_no_stored_steps_lists_none() {
 // What the clock makes due
 // ---------------------------------------------------------------------------
 
-/// Once the event's terminal status falls due, the step the run was ON takes
-/// that outcome and is stamped completed, while a step still queued behind it
-/// keeps `Ready` and no timestamps: nothing claims work that never ran.
+/// Once the event's terminal status falls due, every step of the run is
+/// terminal too: each one reports the step success status and the slice of the
+/// run window it occupied, in the order the event performed them, and the last
+/// step ends exactly when the event did.
 #[tokio::test]
-async fn the_step_the_run_was_on_takes_the_events_outcome() {
+async fn every_step_of_a_completed_run_is_stamped_complete() {
     let (router, engine) = emulator_with_engine();
     let action = recommended_action(
         "SettleAction001A",
@@ -372,31 +373,35 @@ async fn the_step_the_run_was_on_takes_the_events_outcome() {
         "case {:?}: settling changes no step's identity, got {settled}",
         "after-due"
     );
-    assert_eq!(
-        string_member(&steps[0], "stepStatus"),
-        "Failed",
-        "case {:?}: the step the run was on takes the event's outcome, got {settled}",
-        "after-due"
-    );
-    assert!(
-        !member(&steps[0], "completedTimestamp").is_null(),
-        "case {:?}: the step that ended is stamped completed, got {settled}",
-        "after-due"
-    );
-    assert_eq!(
-        string_member(&steps[1], "stepStatus"),
-        "Ready",
-        "case {:?}: a step that never started keeps its queued status, got {settled}",
-        "after-due"
-    );
-    assert!(
-        member(&steps[1], "startTimestamp").is_null()
-            && member(&steps[1], "completedTimestamp").is_null(),
-        "case {:?}: a step that never started carries no timestamp, got {settled}",
-        "after-due"
-    );
+    let mut previous_end: Option<f64> = None;
+    for (position, step) in steps.iter().enumerate() {
+        let case = format!("after-due-step-{position}");
+        assert_eq!(
+            string_member(step, "stepStatus"),
+            "Complete",
+            "case {case:?}: every step of a completed run is complete, got {settled}"
+        );
+        let start = member(step, "startTimestamp").as_f64();
+        let end = member(step, "completedTimestamp").as_f64();
+        let (Some(start), Some(end)) = (start, end) else {
+            panic!("case {case:?}: a step that ran carries both timestamps, got {settled}");
+        };
+        assert!(
+            start <= end,
+            "case {case:?}: a step cannot end before it starts, got {start} then {end}"
+        );
+        if let Some(previous_end) = previous_end {
+            assert!(
+                previous_end <= start,
+                "case {case:?}: a step starts no earlier than its predecessor ended, \
+                 got {previous_end} then {start}"
+            );
+        }
+        previous_end = Some(end);
+    }
 
-    // The event reader and the step reader agree on what the run reached.
+    // The event reader and the step reader agree on what the run reached, and
+    // the last step ends when the event does.
     let event = call_ok(
         &router,
         "GetAutomationEvent",
@@ -406,8 +411,14 @@ async fn the_step_the_run_was_on_takes_the_events_outcome() {
     .await;
     assert_eq!(
         string_member(&event, "eventStatus"),
-        "Failed",
+        "Complete",
         "case {:?}: the event itself reports the same outcome, got {event}",
+        "after-due"
+    );
+    assert_eq!(
+        member(&event, "completedTimestamp").as_f64(),
+        previous_end,
+        "case {:?}: the run ends when its last step does, got {event} and {settled}",
         "after-due"
     );
 }

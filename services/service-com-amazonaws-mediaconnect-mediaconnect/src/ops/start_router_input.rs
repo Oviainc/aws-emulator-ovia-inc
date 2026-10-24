@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartRouterInput
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartRouterInput`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartRouterInput::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts the STORED router input its ARN addresses: the input enters the non-terminal
+//! `STARTING` state and the clock settles it into `ACTIVE` one
+//! [`crate::state::TRANSITION_SPAN`] later, and the maintenance window the input is next
+//! maintained in is scheduled from its maintenance CONFIGURATION
+//! ([`crate::state::maintenance_window_schedule`]) and stored, so GetRouterInput reports
+//! the same window this call answered.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +165,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartRouterInput` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartRouterInputErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StartRouterInputErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: "the mediaconnect router input store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The lookup materialises everything the clock already made due before the start is
+        // judged — the state change an earlier call owes, and the removal of an input whose
+        // deletion has finished, which is what makes such an input a not-found rather than
+        // something this call can still start.
+        let Some(router_input) = store.router_input_mut(&input.arn, now) else {
+            return Err(StartRouterInputErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: crate::state::not_found_message(&input.arn),
+                },
+            )
+            .into());
+        };
+
+        // A start MOVES the input's state, so it cannot be accepted for an input that is on
+        // its way out, or one the clock already owes a DIFFERENT state (a create still
+        // settling, a restart still recovering): the input is leaving or between two states,
+        // which is the conflict `ConflictException` describes ("would cause a conflict with
+        // the current state of a service resource associated with the request", 409 and
+        // retryable — the caller retries once the transition it is waiting on has settled).
+        // The status and the error code are the contract; the sentence states the
+        // precondition, and carries neither of this service's refusal envelopes, which word
+        // a `BadRequestException` (`crate::state::validation_failed_message`) and a
+        // `NotFoundException` (`crate::state::not_found_message`).
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartRouterInput"))
+        // The on-its-way-out case is judged FIRST, before the already-started one below, so
+        // an input whose removal is owed is refused whatever state it is reported in rather
+        // than answered as a start that succeeded.
+        let conflict = |router_input: &crate::state::StoredRouterInput| {
+            StartRouterInputErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "Router input {} is in state {} and a state change is already in \
+                     progress, so it cannot be started yet.",
+                    router_input.arn, router_input.state
+                ),
+            })
+        };
+        if router_input.is_deleting() {
+            return Err(conflict(router_input).into());
+        }
+
+        // An input that is already running, or already on its way there, keeps the state it
+        // is in: a repeat of the start answers the same thing rather than restarting the
+        // transition the first one began. Skipping the conflict check below for those two
+        // states masks no other transition: a record the clock owes a state is parked in a
+        // non-terminal one by `begin_transition`, `ACTIVE` is terminal, and the only
+        // transition that reports `STARTING` is this operation's own one towards `ACTIVE`.
+        let already_started = router_input.state == crate::state::ROUTER_INPUT_STATE_ACTIVE
+            || router_input.state == crate::state::ROUTER_INPUT_STATE_STARTING;
+
+        if !already_started {
+            if router_input.is_transitioning() {
+                return Err(conflict(router_input).into());
+            }
+
+            // Starting is not instantaneous: the input reports `STARTING` and the clock owes
+            // it `ACTIVE` one transition span later, so a caller that reads the input
+            // straight afterwards still sees the start in flight.
+            router_input.begin_transition(
+                crate::state::ROUTER_INPUT_STATE_STARTING,
+                crate::state::ROUTER_INPUT_STATE_ACTIVE,
+                now,
+            );
+            // The start changed the resource, so the record's `UpdatedAt` moves with it.
+            router_input.updated_at = now;
+        }
+
+        // A started input has a maintenance window — this response reports both
+        // `MaintenanceSchedule` and `MaintenanceScheduleType` as REQUIRED members — and that
+        // window is the next occurrence of the input's maintenance CONFIGURATION, resolved
+        // once and then stored, so this response and every later read of the input report
+        // the same window. A window the clock has already carried the input past is spent:
+        // the lookup above re-scheduled it, so the window reused here is never in the past.
+        let maintenance_schedule = match router_input.maintenance_schedule.clone() {
+            Some(maintenance_schedule) => maintenance_schedule,
+            None => {
+                let maintenance_schedule = crate::state::maintenance_window_schedule(
+                    &router_input.maintenance_configuration,
+                    now,
+                );
+                router_input.maintenance_schedule = Some(maintenance_schedule.clone());
+                maintenance_schedule
+            }
+        };
+
+        // The response is the STORED record: "the current state of the router input after
+        // being started".
+        Ok(StartRouterInputOutput {
+            arn: router_input.arn.clone(),
+            name: router_input.name.clone(),
+            state: router_input.state.clone(),
+            maintenance_schedule_type: crate::state::MAINTENANCE_SCHEDULE_TYPE_WINDOW.to_string(),
+            maintenance_schedule,
+        })
     }
 }

@@ -107,6 +107,25 @@ pub const MAX_HEALTH_CHECKS: usize = 200;
 /// repeated associations cannot grow one zone's association list without end.
 pub const MAX_VPCS_PER_HOSTED_ZONE: usize = 100;
 
+/// The most VPC association authorizations one hosted zone may hold.
+///
+/// Route 53's documented per-zone quota ("Authorizations for associating VPCs
+/// with a private hosted zone: 1,000 per hosted zone"), and the model declares
+/// `TooManyVPCAssociationAuthorizations` for exactly this refusal: "You've
+/// created the maximum number of authorizations that can be created for the
+/// specified hosted zone. To authorize another VPC to be associated with the
+/// hosted zone, submit a DeleteVPCAssociationAuthorization request to remove an
+/// existing authorization." Without it a caller could grow one zone's
+/// authorization list without end.
+pub const MAX_VPC_ASSOCIATION_AUTHORIZATIONS: usize = 1_000;
+
+/// The most VPC association authorizations one response carries.
+///
+/// `ListVPCAssociationAuthorizations$MaxResults`'s own documentation: "If you
+/// don't specify a value for MaxResults, Route 53 returns up to 50 VPCs per
+/// page."
+pub const MAX_VPC_AUTHORIZATIONS_PER_PAGE: i32 = 50;
+
 /// The most reusable delegation sets the account may hold.
 ///
 /// Route 53's documented account quota ("Reusable delegation sets: 100 per
@@ -274,6 +293,19 @@ pub struct StoredZone {
     pub name_servers: Vec<String>,
     /// The VPCs associated with a private hosted zone.
     pub vpcs: Vec<VPC>,
+    /// The VPCs another account has been authorized to associate with this
+    /// zone, in the order they were authorized — the list
+    /// `ListVPCAssociationAuthorizations` pages over and
+    /// `DeleteVPCAssociationAuthorization` removes from.
+    ///
+    /// An authorization is held ON the zone, like the association list beside
+    /// it, so deleting the zone takes its authorizations with it and the two
+    /// lists cannot disagree about which zone they belong to. It is SEPARATE
+    /// from `vpcs`: an authorization only permits a later
+    /// `AssociateVPCWithHostedZone`, and associating the VPC does not consume
+    /// it (Route 53 keeps it listed until it is deleted). Bounded by
+    /// [`MAX_VPC_ASSOCIATION_AUTHORIZATIONS`].
+    pub vpc_authorizations: Vec<VPC>,
     /// This zone's record sets, keyed (and therefore ordered) by [`RecordKey`].
     pub records: BTreeMap<RecordKey, ResourceRecordSet>,
     /// The zone's tags, keyed by tag key — the set `ChangeTagsForResource`
@@ -361,10 +393,28 @@ impl StoredZone {
     /// A zone therefore holds at most one association per VPC id, which is what
     /// makes associating a VPC a second time a no-op rather than a duplicate.
     pub fn vpc_position(&self, vpc_id: &str) -> Option<usize> {
-        self.vpcs
-            .iter()
-            .position(|vpc| vpc.vpc_id.as_deref() == Some(vpc_id))
+        vpc_position_in(&self.vpcs, vpc_id)
     }
+
+    /// Where this zone's authorization list holds the VPC named by `vpc_id`, if
+    /// it holds it at all.
+    ///
+    /// Keyed by VPC id for the same reason [`StoredZone::vpc_position`] is: the
+    /// id identifies the VPC on its own, so a zone holds at most one
+    /// authorization per VPC and authorizing the same VPC again is a no-op
+    /// rather than a duplicate.
+    pub fn vpc_authorization_position(&self, vpc_id: &str) -> Option<usize> {
+        vpc_position_in(&self.vpc_authorizations, vpc_id)
+    }
+}
+
+/// Where `vpcs` holds the VPC named by `vpc_id`, if it holds it at all.
+///
+/// The one lookup both of a zone's VPC lists use, so the association list and
+/// the authorization list cannot drift apart on what identifies a VPC.
+pub fn vpc_position_in(vpcs: &[VPC], vpc_id: &str) -> Option<usize> {
+    vpcs.iter()
+        .position(|vpc| vpc.vpc_id.as_deref() == Some(vpc_id))
 }
 
 /// Per-service state for com-amazonaws-route53-awsdnsv20130401. A handler reaches it through [`service_state`].

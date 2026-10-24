@@ -275,6 +275,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags.insert(key, value);
         }
 
+        // `PreferredDayTimeMaintenanceConfiguration$Time` is "the preferred time for
+        // maintenance operations" — a time of day, in the 24-hour `HH:MM` form this service
+        // documents for the same preference on a flow (see
+        // `crate::state::maintenance_time_of_day`). A string that names no time of day names
+        // no preference either, and the maintenance window StartRouterInput schedules is
+        // derived from it, so the create refuses it here rather than storing a preference no
+        // window can be scheduled inside.
+        if let Some(MaintenanceConfiguration::PreferredDayTime(preference)) =
+            input.maintenance_configuration.as_ref()
+        {
+            if crate::state::maintenance_time_of_day(&preference.time).is_none() {
+                return Err(bad_request(format!(
+                    "MaintenanceConfiguration PreferredDayTime Time {:?} is not a time of \
+                     day. Use 24-hour HH:MM format, for example 02:00.",
+                    preference.time
+                )));
+            }
+        }
+
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
@@ -379,6 +398,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 client_token: input.client_token.clone(),
                 created_at: now,
                 updated_at: now,
+                // A created input is not running, and only StartRouterInput schedules the
+                // maintenance window an input is next maintained in, so the create stores
+                // none.
+                maintenance_schedule: None,
                 // Only DeleteRouterInput owes a record's removal: the input this call
                 // creates is live.
                 removal_due_at: None,

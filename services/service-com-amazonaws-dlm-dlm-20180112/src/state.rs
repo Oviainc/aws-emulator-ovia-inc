@@ -60,11 +60,21 @@ pub const RESERVED_TAG_KEY_MESSAGE: &str =
 /// "The default is `EBS_SNAPSHOT_MANAGEMENT`."
 pub const DEFAULT_POLICY_TYPE: &str = "EBS_SNAPSHOT_MANAGEMENT";
 
-/// The policy type of a policy whose target resource type is `INSTANCE`: a
-/// default policy for `INSTANCE` "creates EBS-backed AMIs from all instances in
-/// the Region", and `IMAGE_MANAGEMENT` is the `PolicyTypeValues` member that
-/// "manages the lifecycle of EBS-backed AMIs".
+/// The `PolicyTypeValues` member that "manages the lifecycle of EBS-backed
+/// AMIs".
 pub const IMAGE_POLICY_TYPE: &str = "IMAGE_MANAGEMENT";
+
+/// The `DefaultPolicyTypeValues` member a DEFAULT policy names when what it
+/// manages is EBS-backed AMIs: `DefaultPolicy` documents "Specify `INSTANCE` to
+/// create a default policy that creates EBS-backed AMIs", against `VOLUME`,
+/// which creates snapshots.
+///
+/// This is the type of a DEFAULT policy only. The identically spelled
+/// `ResourceTypeValues` member a CUSTOM policy's `PolicyDetails$ResourceTypes`
+/// may name says nothing about the policy's type: it is documented "[Custom
+/// snapshot policies only] ... use `INSTANCE` to create multi-volume snapshots
+/// from the volumes for an instance".
+pub const INSTANCE_DEFAULT_POLICY_TYPE: &str = "INSTANCE";
 
 /// The `PolicyLanguage` value that marks a policy as a DEFAULT policy:
 /// `PolicyDetails$PolicyLanguage` documents `SIMPLIFIED` as "To create a default
@@ -263,6 +273,18 @@ fn iam_arn_parts(arn: &str) -> Option<(&str, &str)> {
 /// holds is released by `DeleteLifecyclePolicy`.
 pub const POLICY_QUOTA: usize = 1_000;
 
+/// True when `details` configures an EVENT-BASED policy rather than a custom
+/// snapshot or AMI one.
+///
+/// `PolicyDetails$PolicyType` names the type, and `EventSource` ("[Event-based
+/// policies only] The event that activates the event-based policy") is declared
+/// by that kind of policy alone, so either of them makes the configuration an
+/// event-based one.
+pub fn configures_event_based_policy(details: &PolicyDetails) -> bool {
+    details.policy_type.as_deref() == Some(EVENT_BASED_POLICY_TYPE)
+        || details.event_source.is_some()
+}
+
 /// The `PolicyDetails` this service STORES for a policy whose configuration was
 /// stated as a `PolicyDetails` structure: the submitted structure with every
 /// member the service itself materializes stamped onto it.
@@ -277,6 +299,9 @@ pub const POLICY_QUOTA: usize = 1_000;
 ///
 /// * `PolicyLanguage` — `STANDARD`, which `PolicyDetails$PolicyLanguage`
 ///   documents as the language of a custom policy.
+/// * `PolicyType` — the documented default `EBS_SNAPSHOT_MANAGEMENT` for a
+///   configuration that names no type ("The default is
+///   `EBS_SNAPSHOT_MANAGEMENT`"), whatever the policy targets.
 /// * `ResourceLocations` — `[CLOUD]`, the in-Region location. The member is
 ///   `@length(min: 1, max: 1)`, so a read of a custom snapshot or AMI policy
 ///   reports exactly one location.
@@ -292,18 +317,6 @@ pub const POLICY_QUOTA: usize = 1_000;
 /// interval unit, a nested deprecate/archive/fast-restore rule's members. They
 /// keep exactly what the request stated, because inventing one would be
 /// fabrication.
-/// True when `details` configures an EVENT-BASED policy rather than a custom
-/// snapshot or AMI one.
-///
-/// `PolicyDetails$PolicyType` names the type, and `EventSource` ("[Event-based
-/// policies only] The event that activates the event-based policy") is declared
-/// by that kind of policy alone, so either of them makes the configuration an
-/// event-based one.
-pub fn configures_event_based_policy(details: &PolicyDetails) -> bool {
-    details.policy_type.as_deref() == Some(EVENT_BASED_POLICY_TYPE)
-        || details.event_source.is_some()
-}
-
 pub fn materialized_policy_details(mut details: PolicyDetails) -> PolicyDetails {
     if details.policy_language.as_deref() == Some(SIMPLIFIED_POLICY_LANGUAGE) {
         // A DEFAULT policy's configuration. Its `[Default policies only]`
@@ -316,15 +329,35 @@ pub fn materialized_policy_details(mut details: PolicyDetails) -> PolicyDetails 
         .policy_language
         .get_or_insert_with(|| STANDARD_POLICY_LANGUAGE.to_string());
 
+    // Which kind of configuration this is, read BEFORE the type is stamped, so
+    // the stamped default cannot turn an event-based configuration into
+    // something else.
+    let event_based = configures_event_based_policy(&details);
+
+    // `PolicyType` — the documented default for a configuration that names no
+    // type: "The default is `EBS_SNAPSHOT_MANAGEMENT`." It is stamped here, so
+    // the type is stored once and both reads report the same one, and it is
+    // never derived from what the policy TARGETS: `ResourceTypes` documents
+    // `INSTANCE` as "create multi-volume snapshots from the volumes for an
+    // instance", which is snapshot management. That holds for a configuration
+    // carrying an `EventSource` and no type too: by the same documentation such
+    // a request describes a snapshot policy that omits the members one is built
+    // from, so there is no accepted event-based policy whose type was left
+    // unstated, and guessing the type from which members a configuration
+    // happens to carry is the very inference this default replaces.
+    details
+        .policy_type
+        .get_or_insert_with(|| DEFAULT_POLICY_TYPE.to_string());
+
     // Resource locations and schedules are `[Custom snapshot and AMI policies
     // only]`; an event-based policy configures an `EventSource` and `Actions`
     // instead, so it carries neither.
-    if configures_event_based_policy(&details) {
+    if event_based {
         return details;
     }
     // `CreateRule$Location` is `[Custom snapshot policies only]`, so an AMI
     // policy's creation rule has no location to report. `PolicyDetails$PolicyType`
-    // is what states the type, and "the default is `EBS_SNAPSHOT_MANAGEMENT`".
+    // is what states the type, stamped just above.
     let creates_snapshots = details.policy_type.as_deref() != Some(IMAGE_POLICY_TYPE);
 
     details
@@ -511,39 +544,43 @@ impl LifecyclePolicyRecord {
 
     /// This policy's `PolicyTypeValues`.
     ///
-    /// `PolicyDetails$PolicyType` is what states it; absent that, a policy whose
-    /// target resource type is `INSTANCE` manages EBS-backed AMIs
-    /// ([`IMAGE_POLICY_TYPE`]) and anything else takes the documented default
-    /// ([`DEFAULT_POLICY_TYPE`]).
+    /// `PolicyDetails$PolicyType` is the member that states it, and a policy
+    /// whose configuration states none carries the documented default
+    /// ([`DEFAULT_POLICY_TYPE`]) — never a type derived from the resource the
+    /// policy TARGETS, which says nothing about what it manages: a custom
+    /// policy targeting `INSTANCE` is documented as creating "multi-volume
+    /// snapshots from the volumes for an instance".
+    ///
+    /// A DEFAULT policy is the one case where the target IS the statement of
+    /// what the policy manages, because such a policy configures no type of its
+    /// own: `DefaultPolicy` `INSTANCE` creates EBS-backed AMIs
+    /// ([`IMAGE_POLICY_TYPE`]) and `VOLUME` creates snapshots. That is judged
+    /// FIRST, so the type a default policy reports follows the kind of default
+    /// policy it is however its configuration structure was written.
     pub fn policy_type(&self) -> String {
-        if let Some(declared) = self
-            .policy_details
+        if self.default_policy {
+            return match self.default_policy_target().as_deref() {
+                Some(INSTANCE_DEFAULT_POLICY_TYPE) => IMAGE_POLICY_TYPE.to_string(),
+                _ => DEFAULT_POLICY_TYPE.to_string(),
+            };
+        }
+        self.policy_details
             .as_ref()
             .and_then(|details| details.policy_type.clone())
-        {
-            return declared;
-        }
-        match self.target_resource_type().as_deref() {
-            Some("INSTANCE") => IMAGE_POLICY_TYPE.to_string(),
-            _ => DEFAULT_POLICY_TYPE.to_string(),
-        }
+            .unwrap_or_else(|| DEFAULT_POLICY_TYPE.to_string())
     }
 
-    /// The single resource type this policy targets, however it was stated: a
-    /// default policy names it in `DefaultPolicy` (or `PolicyDetails$ResourceType`),
-    /// a custom snapshot policy in `PolicyDetails$ResourceTypes`.
-    fn target_resource_type(&self) -> Option<String> {
+    /// The `DefaultPolicyTypeValues` member a DEFAULT policy names, from
+    /// whichever of the two alternative places the request stated it in:
+    /// `DefaultPolicy` at the request-body level, or the `[Default policies
+    /// only]` `PolicyDetails$ResourceType`.
+    fn default_policy_target(&self) -> Option<String> {
         if let Some(default_type) = self.default_policy_type.clone() {
             return Some(default_type);
         }
-        let details = self.policy_details.as_ref()?;
-        if let Some(resource_type) = details.resource_type.clone() {
-            return Some(resource_type);
-        }
-        details
-            .resource_types
+        self.policy_details
             .as_ref()
-            .and_then(|types| types.first().cloned())
+            .and_then(|details| details.resource_type.clone())
     }
 
     /// Every resource type this policy targets, for the `resourceTypes` filter.

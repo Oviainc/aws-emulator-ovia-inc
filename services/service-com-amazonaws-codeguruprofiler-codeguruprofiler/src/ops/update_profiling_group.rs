@@ -159,7 +159,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 UpdateProfilingGroupErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: crate::state::group_not_found_message(
+                        // This operation's OWN not-found sentence: it states the lookup
+                        // that found nothing (the account it was scoped to, the member
+                        // it looked the group up by) and the operation that could not be
+                        // carried out, so a client telling which of several lookups on
+                        // one name failed reads it off the message — see
+                        // `crate::state::update_group_not_found_message`.
+                        message: crate::state::update_group_not_found_message(
                             &input.profiling_group_name,
                         ),
                     },

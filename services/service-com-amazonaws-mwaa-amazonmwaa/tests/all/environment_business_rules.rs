@@ -428,9 +428,23 @@ fn enumerated_rows() -> Vec<Row> {
         });
     }
     for class in ENVIRONMENT_CLASSES {
+        // A class also fixes the scheduler and web-server counts it runs, so the row that
+        // puts an environment on the single-instance class carries the counts that class
+        // accepts (that rule has its own table in
+        // `tests/all/environment_unit_count_ranges.rs`).
+        let members = if class == state::MICRO_ENVIRONMENT_CLASS {
+            json!({
+                "EnvironmentClass": class,
+                "Schedulers": 1,
+                "MinWebservers": 1,
+                "MaxWebservers": 1,
+            })
+        } else {
+            json!({"EnvironmentClass": class})
+        };
         rows.push(Row {
             label: "a supported EnvironmentClass",
-            members: json!({"EnvironmentClass": class}),
+            members,
             accepted: true,
         });
     }

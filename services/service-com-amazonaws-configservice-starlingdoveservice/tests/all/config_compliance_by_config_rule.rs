@@ -67,8 +67,10 @@ async fn emulator_with_rules(names: &[&str]) -> Emulator {
 /// for a distinct resource.
 ///
 /// This is the state `PutEvaluations` writes; that operation is still scaffolded, so
-/// the results are seeded into the shared store the handler reads.
-fn record_results(emulator: &Emulator, name: &str, results: &[&str]) {
+/// the results are seeded into the shared store the handler reads. `pub(crate)` because
+/// every suite about what a rule's recorded results roll up to needs exactly this seed
+/// (`aggregate_config_rule_compliance_summary` is the other one).
+pub(crate) fn record_results(emulator: &Emulator, name: &str, results: &[&str]) {
     let state = emulator.engine.state::<ConfigState>();
     let mut store = state.lock();
     let rule = store

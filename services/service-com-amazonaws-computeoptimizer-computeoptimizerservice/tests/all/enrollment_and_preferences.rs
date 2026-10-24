@@ -200,7 +200,7 @@ async fn a_written_preference_is_read_back_at_its_own_resource_type_and_scope() 
             "lambda function account default",
             "LambdaFunction",
             None,
-            json!({"inferredWorkloadTypes": "Active"}),
+            json!({"savingsEstimationMode": "BeforeDiscounts"}),
         ),
     ];
 

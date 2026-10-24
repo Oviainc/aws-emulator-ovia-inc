@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeTrusts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeTrusts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeTrusts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the trust relationships this service holds, narrowed by the request's
+//! `DirectoryId` and `TrustIds` and paged by its `Limit`/`NextToken`. Implemented here —
+//! this is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +154,152 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeTrusts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeTrustsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeTrusts"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // `TrustIds`' own documentation: "If this member is null, all trust relationships
+        // that belong to the current account are returned. An empty list results in an
+        // InvalidParameterException being thrown." — so an EMPTY list is a refusal here,
+        // unlike `DescribeSnapshots$SnapshotIds`, where it is an unfiltered listing.
+        if let Some(requested) = input.trust_ids.as_ref() {
+            if requested.is_empty() {
+                return Err(invalid_parameter(
+                    "TrustIds must name at least one trust relationship when it is present"
+                        .to_string(),
+                ));
+            }
+            // Nothing caller-sized reaches the store, or the store LOCK, unchecked: the
+            // filter is bounded here — before anything is allocated from it and before
+            // `state.lock()` is taken — by a guard set well above any list a caller has
+            // reason to send.
+            if requested.len() > crate::state::MAX_TRUST_IDS_PER_REQUEST {
+                return Err(invalid_parameter(format!(
+                    "TrustIds may carry at most {max} entries, got {got}",
+                    max = crate::state::MAX_TRUST_IDS_PER_REQUEST,
+                    got = requested.len()
+                )));
+            }
+        }
+        let requested_ids: Option<::std::collections::BTreeSet<&String>> =
+            input.trust_ids.as_ref().map(|ids| ids.iter().collect());
+
+        // The cursor a previous page handed back: the creation rank this page resumes
+        // after, together with the filter it was issued under. A token this service did
+        // not issue, or one issued for a different listing, is refused rather than served
+        // as a page of another listing.
+        let filter = cursor_filter(input.directory_id.as_deref(), input.trust_ids.as_ref());
+        let after_seq = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => crate::state::decode_cursor(CURSOR_KIND, token)
+                .and_then(|value| {
+                    let (seq, issued_for) = value.split_once(crate::state::CURSOR_SEPARATOR)?;
+                    if issued_for != filter.as_str() {
+                        return None;
+                    }
+                    seq.parse::<u64>().ok()
+                })
+                .ok_or_else(|| {
+                    DescribeTrustsErrorModeled::InvalidNextTokenException(
+                        crate::state::invalid_next_token(),
+                    )
+                })?,
+        };
+        let page_size = crate::state::page_size(input.limit);
+
+        let mut store = state.lock();
+        store.advance_clock(::std::time::SystemTime::now());
+
+        // A `DirectoryId` narrows the listing to one directory's trusts, and an id naming
+        // no stored directory is reported rather than served as an empty page.
+        if let Some(directory_id) = input.directory_id.as_deref() {
+            if !store.directories.contains_key(directory_id) {
+                return Err(entity_does_not_exist(crate::state::no_such_directory(
+                    directory_id,
+                )));
+            }
+        }
+
+        // Likewise for a `TrustIds` filter: an id naming no stored trust is reported
+        // rather than silently dropped from the page.
+        if let Some(requested) = requested_ids.as_ref() {
+            for trust_id in requested {
+                if !store.trusts.contains_key(*trust_id) {
+                    return Err(entity_does_not_exist(crate::state::no_such_trust(trust_id)));
+                }
+            }
+        }
+
+        // Every trust the request asks for, in creation order, from the cursor on. The two
+        // filters are a conjunction: a `TrustIds` entry belonging to another directory is
+        // not part of the asked-for directory's listing.
+        let mut selected: Vec<(u64, Trust)> = store
+            .trusts_in_creation_order()
+            .into_iter()
+            .filter(|trust| trust.seq > after_seq)
+            .filter(|trust| {
+                input
+                    .directory_id
+                    .as_deref()
+                    .is_none_or(|directory_id| trust.directory_id == directory_id)
+            })
+            .filter(|trust| {
+                requested_ids
+                    .as_ref()
+                    .is_none_or(|ids| ids.contains(&trust.trust_id))
+            })
+            .map(|trust| (trust.seq, trust.to_trust()))
+            .collect();
+        drop(store);
+
+        let truncated = selected.len() > page_size;
+        selected.truncate(page_size);
+        let page_ended_after = selected.last().map(|(seq, _)| *seq);
+        let trusts: Vec<Trust> = selected.into_iter().map(|(_, trust)| trust).collect();
+
+        Ok(DescribeTrustsOutput {
+            trusts: Some(trusts),
+            // Only a truncated page has a next one; the final page carries no token.
+            next_token: if truncated {
+                page_ended_after.map(|seq| {
+                    crate::state::encode_cursor(
+                        CURSOR_KIND,
+                        &format!(
+                            "{seq}{separator}{filter}",
+                            separator = crate::state::CURSOR_SEPARATOR
+                        ),
+                    )
+                })
+            } else {
+                None
+            },
+        })
     }
+}
+
+/// Which listing this operation's `NextToken` belongs to, so a token issued by another
+/// paginated operation is refused rather than misread.
+const CURSOR_KIND: &str = "trusts";
+
+/// How this operation's filter is recorded in a cursor: the `DirectoryId` and the
+/// `TrustIds` as the request listed them, through the one shared
+/// [`crate::state::cursor_filter`] encoding. A later page must be asked for with the same
+/// filter, so a token cannot silently resume a different listing.
+fn cursor_filter(directory_id: Option<&str>, trust_ids: Option<&Vec<String>>) -> String {
+    let trusts = trust_ids
+        .map(|requested| requested.join(","))
+        .unwrap_or_default();
+    crate::state::cursor_filter(&[directory_id.unwrap_or_default(), &trusts])
+}
+
+/// Refuse the request with the modelled `InvalidParameterException`, naming the member
+/// and the rule it broke so the caller can fix the request from the message alone.
+fn invalid_parameter(message: String) -> DescribeTrustsError {
+    DescribeTrustsErrorModeled::InvalidParameterException(crate::state::refusal(message)).into()
+}
+
+/// Report that an id in the request names nothing this service holds — the modelled
+/// `EntityDoesNotExistException`, "The specified entity could not be found".
+fn entity_does_not_exist(message: String) -> DescribeTrustsError {
+    DescribeTrustsErrorModeled::EntityDoesNotExistException(crate::state::refusal(message)).into()
 }

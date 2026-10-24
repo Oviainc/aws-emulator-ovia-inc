@@ -6,7 +6,7 @@
 //! import/export tasks, private endpoints and queries all hang off a graph, so the
 //! store below is the one every later slice extends rather than duplicates.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
@@ -159,6 +159,161 @@ impl PendingTransition {
     }
 }
 
+/// One node of a graph's data: the labels it carries and the properties set on it.
+///
+/// A node is addressed by its own id (openCypher's `~id`), which is the key it sits
+/// under in [`GraphData::nodes`], so the id is not repeated here.
+#[derive(Debug, Clone, Default)]
+pub struct GraphNode {
+    /// The node's labels. openCypher lets one node carry several, and a summary of
+    /// the data counts DISTINCT labels, so they are held as a set.
+    pub labels: BTreeSet<String>,
+    /// The properties set on the node, by key. A value is held as the JSON document
+    /// the data plane exchanges it as, so a property keeps the type it was written
+    /// with; a summary of the data counts keys and usages only.
+    pub properties: BTreeMap<String, serde_json::Value>,
+}
+
+/// One edge of a graph's data: its label, the nodes it joins, and its properties.
+///
+/// An edge is addressed by its own id, which is the key it sits under in
+/// [`GraphData::edges`], so the id is not repeated here.
+#[derive(Debug, Clone)]
+pub struct GraphEdge {
+    /// The edge's label. openCypher gives an edge exactly one.
+    pub label: String,
+    /// The id of the node this edge leaves.
+    pub from_node: String,
+    /// The id of the node this edge enters.
+    pub to_node: String,
+    /// The properties set on the edge, by key, held as [`GraphNode::properties`]
+    /// holds a node's.
+    pub properties: BTreeMap<String, serde_json::Value>,
+}
+
+/// The DATA one graph holds: its nodes and its edges, plus the instant the
+/// statistics over them were last computed.
+///
+/// It lives INSIDE [`Graph`] rather than in a map of its own, so a graph's data is
+/// created, read and reclaimed with the graph that holds it, and no second copy of
+/// a graph's contents can drift from this one. Both maps are `BTreeMap`s, so every
+/// reading of the data — a count, a label list, a grouping — has one stable total
+/// order to walk.
+///
+/// Writing it belongs to the data plane (an openCypher write, a reset, a bulk
+/// load); the mutators below are the one way in, because each of them also moves
+/// [`GraphData::statistics_computed_at`].
+#[derive(Debug, Clone)]
+pub struct GraphData {
+    /// Every node of this graph, keyed by its node id.
+    pub nodes: BTreeMap<String, GraphNode>,
+    /// Every edge of this graph, keyed by its edge id.
+    pub edges: BTreeMap<String, GraphEdge>,
+    /// When the statistics over this data were last computed.
+    ///
+    /// Statistics are a function of the data, so they are recomputed when the data
+    /// changes and not otherwise: every mutator below sets this to the instant its
+    /// caller is writing at, and a graph nobody has written to since it was created
+    /// still reports the statistics of its empty data, computed when the graph came
+    /// up.
+    pub statistics_computed_at: SystemTime,
+}
+
+impl GraphData {
+    /// The empty data a graph starts out holding, its statistics computed `as_of` —
+    /// the instant the graph itself was created.
+    pub fn empty(as_of: SystemTime) -> Self {
+        Self {
+            nodes: BTreeMap::new(),
+            edges: BTreeMap::new(),
+            statistics_computed_at: as_of,
+        }
+    }
+
+    /// Store one node under `id`, replacing the node that id already named. The
+    /// statistics over the data are recomputed `as_of` the instant the caller is
+    /// writing at — the store reads no clock of its own.
+    ///
+    /// `Err` carries the reason the store refuses the write, for the caller to
+    /// report in the wording its own operation uses.
+    pub fn insert_node(
+        &mut self,
+        id: &str,
+        node: GraphNode,
+        as_of: SystemTime,
+    ) -> Result<(), String> {
+        if node.properties.len() > MAX_PROPERTIES_PER_ELEMENT {
+            return Err(format!(
+                "this emulator holds at most {MAX_PROPERTIES_PER_ELEMENT} properties per node"
+            ));
+        }
+        if !self.nodes.contains_key(id) && self.nodes.len() >= MAX_NODES_PER_GRAPH {
+            return Err(format!(
+                "this emulator holds at most {MAX_NODES_PER_GRAPH} nodes per graph"
+            ));
+        }
+        self.nodes.insert(id.to_string(), node);
+        self.statistics_computed_at = as_of;
+        Ok(())
+    }
+
+    /// Store one edge under `id`, replacing the edge that id already named, with
+    /// the statistics recomputed `as_of` the instant the caller is writing at.
+    ///
+    /// An edge joins two nodes OF THIS GRAPH, so an endpoint the graph does not
+    /// hold is refused: an edge dangling off a node nobody can read would be
+    /// counted by every later summary of the data.
+    pub fn insert_edge(
+        &mut self,
+        id: &str,
+        edge: GraphEdge,
+        as_of: SystemTime,
+    ) -> Result<(), String> {
+        if edge.properties.len() > MAX_PROPERTIES_PER_ELEMENT {
+            return Err(format!(
+                "this emulator holds at most {MAX_PROPERTIES_PER_ELEMENT} properties per edge"
+            ));
+        }
+        for endpoint in [&edge.from_node, &edge.to_node] {
+            if !self.nodes.contains_key(endpoint) {
+                return Err(format!(
+                    "edge {id} joins node {endpoint}, which this graph does not hold"
+                ));
+            }
+        }
+        if !self.edges.contains_key(id) && self.edges.len() >= MAX_EDGES_PER_GRAPH {
+            return Err(format!(
+                "this emulator holds at most {MAX_EDGES_PER_GRAPH} edges per graph"
+            ));
+        }
+        self.edges.insert(id.to_string(), edge);
+        self.statistics_computed_at = as_of;
+        Ok(())
+    }
+
+    /// Drop every node and edge: the data a graph holds after it is emptied, with
+    /// the statistics recomputed `as_of` the instant the caller is emptying it at.
+    pub fn clear(&mut self, as_of: SystemTime) {
+        self.nodes.clear();
+        self.edges.clear();
+        self.statistics_computed_at = as_of;
+    }
+
+    /// The distinct labels of the edges LEAVING `node_id`.
+    ///
+    /// Derived from the edges rather than stored on the node, so it cannot disagree
+    /// with the edges the graph holds. It SCANS the edges, so it answers about ONE
+    /// node: a reading that needs this for every node indexes the edges once
+    /// instead (see `crate::ops::get_graph_summary`).
+    pub fn outgoing_edge_labels(&self, node_id: &str) -> BTreeSet<String> {
+        self.edges
+            .values()
+            .filter(|edge| edge.from_node == node_id)
+            .map(|edge| edge.label.clone())
+            .collect()
+    }
+}
+
 /// One stored Neptune Analytics graph: every member `GetGraph` reports, plus the
 /// status change the clock still owes it, if any.
 #[derive(Debug, Clone)]
@@ -197,6 +352,10 @@ pub struct Graph {
     /// the record, which no `GraphStatus` can express, so it is carried here rather
     /// than in [`Graph::pending`].
     pub deletes_at: Option<Instant>,
+    /// The nodes and edges this graph holds: the data every reading of the graph's
+    /// contents (a summary of it, a query over it, an export of it) is computed
+    /// from. A freshly created graph holds none.
+    pub data: GraphData,
 }
 
 impl Graph {
@@ -1636,6 +1795,40 @@ pub const MAX_EXPORT_TASKS: usize = 100;
 /// leave the store on their own as the clock makes their end due.
 pub const MAX_QUERIES: usize = 100;
 
+/// The most nodes one graph's data may hold.
+///
+/// Emulator resource guard, NOT a quota AWS publishes, and the same kind of bound
+/// [`MAX_GRAPHS`] puts on the graph map: a graph's data grows by what the data plane
+/// writes into it and is reclaimed only when the graph is emptied or deleted, so
+/// without a ceiling repeated writes grow the emulator's memory without bound.
+/// [`GraphData::insert_node`] hands the reason back for the operation that was
+/// writing to report.
+///
+/// It also bounds the work ONE reading of the data costs: a report over the data
+/// walks the nodes, the edges and the properties on them once each, so the cost of a
+/// request is bounded by this ceiling, [`MAX_EDGES_PER_GRAPH`] and
+/// [`MAX_PROPERTIES_PER_ELEMENT`] TOGETHER rather than by any of them alone. Set
+/// above any realistic use of a local emulator and low enough that the whole product
+/// stays small.
+pub const MAX_NODES_PER_GRAPH: usize = 10_000;
+
+/// The most edges one graph's data may hold.
+///
+/// The same guard [`MAX_NODES_PER_GRAPH`] puts on the nodes, set higher because a
+/// graph holds more relationships than things: a node can be an endpoint of many
+/// edges. [`GraphData::insert_edge`] hands the reason back for the operation that
+/// was writing to report.
+pub const MAX_EDGES_PER_GRAPH: usize = 20_000;
+
+/// The most properties one node or one edge may carry.
+///
+/// Emulator resource guard, NOT a quota AWS publishes: without it one element's
+/// property map is unbounded, so the number of properties a graph holds — and the
+/// work a report over them costs — would not be bounded by the two ceilings above.
+/// [`GraphData::insert_node`] and [`GraphData::insert_edge`] hand the reason back for
+/// the operation that was writing to report.
+pub const MAX_PROPERTIES_PER_ELEMENT: usize = 100;
+
 /// The most characters one stored query's text may carry.
 ///
 /// Emulator resource guard, NOT a quota AWS publishes: `queryString` is modelled as an
@@ -2937,7 +3130,148 @@ mod tests {
             tags: BTreeMap::new(),
             pending: None,
             deletes_at: None,
+            data: GraphData::empty(SystemTime::UNIX_EPOCH),
         }
+    }
+
+    /// A node with the labels and property keys a case names, which is all the data
+    /// invariants below look at.
+    fn sample_node(labels: &[&str], property_keys: &[&str]) -> GraphNode {
+        GraphNode {
+            labels: labels.iter().map(|label| (*label).to_string()).collect(),
+            properties: property_keys
+                .iter()
+                .map(|key| ((*key).to_string(), serde_json::Value::from(1)))
+                .collect(),
+        }
+    }
+
+    /// The data a graph holds accepts a node and an edge between stored nodes,
+    /// refuses an edge with an endpoint the graph does not hold, derives a node's
+    /// outgoing edge labels from the edges, and empties on `clear`.
+    #[test]
+    fn graph_data_writes_keep_the_edges_joined_to_stored_nodes() {
+        let created_at = SystemTime::UNIX_EPOCH;
+        let written_at = created_at + Duration::from_secs(1);
+        let mut data = GraphData::empty(created_at);
+
+        // (case, the edge to store, whether the data accepts it) — an edge is
+        // refused for EITHER endpoint, so there is a row for each.
+        data.insert_node("n1", sample_node(&["Person"], &["name"]), written_at)
+            .expect("case stored node: expected the write to be accepted");
+        data.insert_node("n2", sample_node(&["Person", "Author"], &[]), written_at)
+            .expect("case second stored node: expected the write to be accepted");
+        for (case, from_node, to_node, accepted) in [
+            ("both endpoints stored", "n1", "n2", true),
+            ("unknown source", "n9", "n2", false),
+            ("unknown target", "n1", "n9", false),
+        ] {
+            let outcome = data.insert_edge(
+                "e1",
+                GraphEdge {
+                    label: "KNOWS".to_string(),
+                    from_node: from_node.to_string(),
+                    to_node: to_node.to_string(),
+                    properties: BTreeMap::new(),
+                },
+                written_at,
+            );
+            assert_eq!(
+                outcome.is_ok(),
+                accepted,
+                "case {case:?}: expected accepted={accepted}, got {outcome:?}"
+            );
+        }
+
+        assert_eq!(
+            data.outgoing_edge_labels("n1"),
+            BTreeSet::from(["KNOWS".to_string()]),
+            "case outgoing labels of the edge's source: got {:?}",
+            data.outgoing_edge_labels("n1")
+        );
+        assert!(
+            data.outgoing_edge_labels("n2").is_empty(),
+            "case outgoing labels of the edge's target: expected none, got {:?}",
+            data.outgoing_edge_labels("n2")
+        );
+
+        // A write recomputes the statistics as of the instant it was made; a read
+        // leaves them where they are.
+        assert_eq!(
+            data.statistics_computed_at, written_at,
+            "case statistics after a write: expected {written_at:?}, got {:?}",
+            data.statistics_computed_at
+        );
+        assert_eq!(
+            data.outgoing_edge_labels("n1").len(),
+            1,
+            "case reading the data twice: a read must not change it"
+        );
+        assert_eq!(
+            data.statistics_computed_at, written_at,
+            "case reading the data: expected the statistics time to stand still"
+        );
+
+        let cleared_at = written_at + Duration::from_secs(1);
+        data.clear(cleared_at);
+        assert!(
+            data.nodes.is_empty() && data.edges.is_empty(),
+            "case cleared: expected no nodes and no edges, got {} nodes and {} edges",
+            data.nodes.len(),
+            data.edges.len()
+        );
+        assert_eq!(
+            data.statistics_computed_at, cleared_at,
+            "case cleared: expected {cleared_at:?}, got {:?}",
+            data.statistics_computed_at
+        );
+    }
+
+    /// Each map of a graph's data is bounded at its growth site, and a write that
+    /// REPLACES an entry is accepted at the bound.
+    #[test]
+    fn graph_data_is_bounded_at_every_growth_site() {
+        let written_at = SystemTime::UNIX_EPOCH;
+        let mut data = GraphData::empty(written_at);
+        for index in 0..MAX_NODES_PER_GRAPH {
+            data.insert_node(&format!("n{index}"), GraphNode::default(), written_at)
+                .unwrap_or_else(|reason| panic!("case node {index}: refused with {reason}"));
+        }
+        let refused = data.insert_node("one-too-many", GraphNode::default(), written_at);
+        assert!(
+            refused.is_err(),
+            "case node past the bound: expected a refusal, got {refused:?}"
+        );
+        let replacement =
+            data.insert_node("n0", sample_node(&["Person"], &["name"]), written_at);
+        assert!(
+            replacement.is_ok(),
+            "case replacing a node at the bound: expected acceptance, got {replacement:?}"
+        );
+        assert_eq!(
+            data.nodes.len(),
+            MAX_NODES_PER_GRAPH,
+            "case at the bound: expected {MAX_NODES_PER_GRAPH} nodes, got {}",
+            data.nodes.len()
+        );
+
+        // One element's properties are bounded too, so the properties a graph holds
+        // — and the work a report over them costs — stay bounded by the ceilings.
+        let keys: Vec<String> = (0..=MAX_PROPERTIES_PER_ELEMENT)
+            .map(|index| format!("p{index}"))
+            .collect();
+        let over_propertied = GraphNode {
+            labels: BTreeSet::new(),
+            properties: keys
+                .iter()
+                .map(|key| (key.clone(), serde_json::Value::from(1)))
+                .collect(),
+        };
+        let refused_properties = data.insert_node("n0", over_propertied, written_at);
+        assert!(
+            refused_properties.is_err(),
+            "case a node past the property bound: expected a refusal, got {refused_properties:?}"
+        );
     }
 
     /// The transition is owed at a future instant, so a read taken immediately

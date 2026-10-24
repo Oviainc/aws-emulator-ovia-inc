@@ -179,6 +179,114 @@ pub const FIRST_PLUGIN_REVISION: i64 = 1;
 /// per the `networkType` member's own documentation.
 pub const DEFAULT_NETWORK_TYPE: &str = "IPV4";
 
+/// The MCU counts one connector worker may be allocated.
+///
+/// `AutoScaling$mcuCount` and `ProvisionedCapacity$mcuCount` (and their `*Update`
+/// twins) all document "The valid values are 1,2,4,8", while the model can only
+/// bound the member as `__integerMin1Max8` — a range that also admits 3, 5, 6 and
+/// 7. The set itself is therefore checked by the service, not by the framework.
+pub const MCU_COUNT_VALUES: [i32; 4] = [1, 2, 4, 8];
+
+/// The counts one capacity form asks for, read out of whichever shape carried
+/// them (`AutoScaling` / `ProvisionedCapacity` on a create, their `*Update` twins
+/// on an update), so the relations the service documents between them are decided
+/// in ONE place for every form and every operation that takes a capacity.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CapacityCounts {
+    /// `mcuCount`, which must be one of [`MCU_COUNT_VALUES`].
+    pub mcu_count: i32,
+    /// `(minWorkerCount, maxWorkerCount)` for an auto-scaled form, which the
+    /// service bounds against each other; `None` for a fixed form, whose single
+    /// `workerCount` is bounded by nothing else in the request.
+    pub worker_count_range: Option<(i32, i32)>,
+    /// `maxAutoscalingTaskCount`, or zero when the request named none (the
+    /// member's modelled default, and the value the service reports for a
+    /// capacity that carries no task ceiling).
+    pub max_autoscaling_task_count: i32,
+}
+
+impl CapacityCounts {
+    /// The counts the named form of `capacity` asks for, or `None` when it names
+    /// neither form — which every operation that takes a capacity refuses on the
+    /// `capacity` member itself ([`ONE_CAPACITY_FORM`]) before reading its
+    /// counts.
+    ///
+    /// An update's `CapacityUpdate` mirrors `Capacity` member for member and is
+    /// read through [`capacity_from_update`], so both operations' forms reach
+    /// this one reader.
+    pub fn of(capacity: &Capacity) -> Option<Self> {
+        if let Some(scaling) = capacity.auto_scaling.as_ref() {
+            return Some(Self {
+                mcu_count: scaling.mcu_count,
+                worker_count_range: Some((scaling.min_worker_count, scaling.max_worker_count)),
+                max_autoscaling_task_count: scaling.max_autoscaling_task_count,
+            });
+        }
+        let fixed = capacity.provisioned_capacity.as_ref()?;
+        Some(Self {
+            mcu_count: fixed.mcu_count,
+            // A fixed form has a single `workerCount`, which no other member of
+            // the request bounds, and no task ceiling at all.
+            worker_count_range: None,
+            max_autoscaling_task_count: 0,
+        })
+    }
+
+    /// The message a refusal of these counts carries — in the one
+    /// member-naming form every kafkaconnect rejection uses — or `None` when
+    /// every documented relation holds.
+    ///
+    /// The relations are the members' own documentation: `mcuCount`'s valid
+    /// value set ([`MCU_COUNT_VALUES`]), the worker window being a window at all
+    /// (a minimum above the maximum is no window), and
+    /// `maxAutoscalingTaskCount` "Must be at least equal to maxWorkerCount" —
+    /// checked only when the request named one, since the member is optional and
+    /// its absence reads as the modelled default zero.
+    pub fn refusal(&self) -> Option<String> {
+        if !MCU_COUNT_VALUES.contains(&self.mcu_count) {
+            return Some(invalid_parameter_because("mcuCount", &mcu_count_reason()));
+        }
+        // A fixed form has no worker window, so there is nothing further to
+        // check once its MCU count is one the service allocates: `?` here means
+        // "no refusal", not an error.
+        let (minimum, maximum) = self.worker_count_range?;
+        if minimum > maximum {
+            return Some(invalid_parameter_because(
+                "minWorkerCount",
+                "It must not exceed maxWorkerCount.",
+            ));
+        }
+        if self.max_autoscaling_task_count != 0 && self.max_autoscaling_task_count < maximum {
+            return Some(invalid_parameter_because(
+                "maxAutoscalingTaskCount",
+                "It must be at least equal to maxWorkerCount.",
+            ));
+        }
+        None
+    }
+}
+
+/// The message a refusal of `capacity` carries, or `None` when every relation
+/// its members document holds.
+///
+/// The ONE capacity check every operation that takes a capacity runs: a create
+/// on the `Capacity` its request carried, an update on the `Capacity` its
+/// `CapacityUpdate` converts to ([`capacity_from_update`]), so neither can
+/// accept a capacity the other refuses.
+pub fn capacity_refusal(capacity: &Capacity) -> Option<String> {
+    CapacityCounts::of(capacity)?.refusal()
+}
+
+/// The reason an `mcuCount` outside [`MCU_COUNT_VALUES`] is refused with,
+/// rendered from that set so the sentence and the check can never disagree.
+pub fn mcu_count_reason() -> String {
+    let values: Vec<String> = MCU_COUNT_VALUES
+        .iter()
+        .map(|value| value.to_string())
+        .collect();
+    format!("The valid values are {}.", values.join(","))
+}
+
 /// The largest page either list operation returns, and the page it returns when
 /// the caller names no `maxResults`: the `MaxResults` shape's own maximum
 /// (`range 1..100`).

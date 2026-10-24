@@ -7,7 +7,12 @@
 //! `UPDATE_CONNECTOR_CONFIGURATION` connector operation is stored, starting `PENDING`
 //! and walking the model's update states and steps on the clock. The answer carries the
 //! connector's ARN, its new state and the new operation's ARN, which
-//! `DescribeConnectorOperation` and `ListConnectorOperations` report from.
+//! `DescribeConnectorOperation` and `ListConnectorOperations` report from. A body naming
+//! both of the two settings or neither, a `capacity` naming neither or both of its two
+//! forms, or capacity counts the members' documentation does not admit (an `mcuCount`
+//! outside the documented value set, auto-scaling worker and task counts that do not
+//! bound each other) is a `BadRequestException`, as is a `currentVersion` that is not the
+//! connector's or a connector that is not `RUNNING`.
 //!
 //! ## Shape of an operation
 //!
@@ -196,9 +201,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                     .into());
                 }
-                crate::state::ConnectorSettings::Capacity(crate::state::capacity_from_update(
-                    capacity,
-                ))
+                // The counts inside that form. Their own documentation states
+                // relations the model cannot — `mcuCount`'s valid value set and
+                // the auto-scaled worker window and task ceiling — and an
+                // update's `AutoScalingUpdate` / `ProvisionedCapacityUpdate`
+                // carry the same members under the same documentation as a
+                // create's, so both answer to the one check.
+                let capacity = crate::state::capacity_from_update(capacity);
+                if let Some(message) = crate::state::capacity_refusal(&capacity) {
+                    return Err(UpdateConnectorErrorModeled::BadRequestException(
+                        BadRequestException {
+                            message: Some(message),
+                        },
+                    )
+                    .into());
+                }
+                crate::state::ConnectorSettings::Capacity(capacity)
             }
             (None, Some(configuration)) => {
                 crate::state::ConnectorSettings::Configuration(configuration)

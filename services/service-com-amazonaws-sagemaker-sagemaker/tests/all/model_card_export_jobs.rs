@@ -31,13 +31,13 @@ const SETTLES_AFTER: Duration = MODEL_CARD_EXPORT_JOB_SETTLES_AFTER;
 
 /// Long enough to pass [`SETTLES_AFTER`], so the terminal status the clock owes is due by
 /// the time the next call runs.
-const PAST_SETTLE_DUE: Duration = SETTLES_AFTER.saturating_mul(3);
+pub(crate) const PAST_SETTLE_DUE: Duration = SETTLES_AFTER.saturating_mul(3);
 
 /// `ModelCardExportOutputConfig$S3OutputPath` is an `S3Uri`, modelled
 /// `^(https|s3)://([^/]+)/?(.*)$` (smithy_query query="shape"
 /// shape="ModelCardExportOutputConfig") — so both schemes, with and without a key, name
 /// a path a caller may export to, and the job stores whichever it was given.
-const OUTPUT_PATHS: [&str; 4] = [
+pub(crate) const OUTPUT_PATHS: [&str; 4] = [
     "s3://export-bucket",
     "s3://export-bucket/model-cards/",
     "s3://export-bucket/deeply/nested/prefix",
@@ -48,7 +48,7 @@ const OUTPUT_PATHS: [&str; 4] = [
 /// `^[a-zA-Z0-9](-*[a-zA-Z0-9]){0,62}$` (smithy_query query="operation"
 /// operation="CreateModelCardExportJob"): one character, digits, hyphens, and the
 /// modelled 63-character maximum.
-const JOB_NAMES: [&str; 4] = [
+pub(crate) const JOB_NAMES: [&str; 4] = [
     "e",
     "export1",
     "nightly-export-of-the-card",
@@ -57,7 +57,7 @@ const JOB_NAMES: [&str; 4] = [
 
 /// A `CreateModelCardExportJob` body exporting `card` under the job name `job` to `path`,
 /// naming `version` when the case pins one.
-fn export_body(card: &str, job: &str, path: &str, version: Option<i32>) -> Value {
+pub(crate) fn export_body(card: &str, job: &str, path: &str, version: Option<i32>) -> Value {
     let mut body = json!({
         "ModelCardName": card,
         "ModelCardExportJobName": job,
@@ -70,13 +70,13 @@ fn export_body(card: &str, job: &str, path: &str, version: Option<i32>) -> Value
 }
 
 /// The ARN a job of `job` exporting `card` carries in `region`.
-fn job_arn(region: &str, card: &str, job: &str) -> String {
+pub(crate) fn job_arn(region: &str, card: &str, job: &str) -> String {
     format!("arn:aws:sagemaker:{region}:{ACCOUNT}:model-card/{card}/export-job/{job}")
 }
 
 /// Create `card` in `emulator` with `versions` versions: the create mints version 1 and
 /// each further version is appended by an `UpdateModelCard` carrying new content.
-async fn with_card(emulator: &Emulator, card: &str, versions: i32) {
+pub(crate) async fn with_card(emulator: &Emulator, card: &str, versions: i32) {
     emulator
         .ok(
             "CreateModelCard",

@@ -64,6 +64,51 @@ pub fn aggregation_window_start(at: DateTime, period_seconds: i64) -> DateTime {
     DateTime::from_secs(at.secs().div_euclid(period_seconds) * period_seconds)
 }
 
+/// The SHORTEST aggregation period this service aggregates at, in whole seconds: the
+/// smallest of [`AGGREGATION_PERIODS`], which is the finest window a posted profile can
+/// be collected into. `0` only if the table were empty, which it is not.
+pub fn finest_aggregation_period_seconds() -> i64 {
+    AGGREGATION_PERIODS
+        .iter()
+        .map(|(_, seconds)| *seconds)
+        .min()
+        .unwrap_or(0)
+}
+
+/// How long after an aggregation window CLOSES its aggregated profile is available, in
+/// milliseconds.
+///
+/// Collecting posted agent profiles into an aggregated profile is work the service does
+/// after the fact, not part of answering the post, so the aggregate a window owes falls
+/// due a span after the window ends rather than at the instant of the post. The span is
+/// this emulator's own choice (the real service's is neither modelled nor documented)
+/// and is deliberately NON-ZERO, so a caller that posts at the very end of a window and
+/// reads immediately still sees the pending-aggregation state.
+pub const AGGREGATION_PASS_MILLIS: i64 = 500;
+
+/// When the aggregated profile covering a profile received at `received_at` becomes
+/// available: the end of the finest aggregation window containing it, plus
+/// [`AGGREGATION_PASS_MILLIS`].
+///
+/// A window still open cannot have been aggregated — the service is still collecting
+/// profiles into it — so this is never earlier than the window's end.
+pub fn aggregated_at(received_at: DateTime) -> DateTime {
+    let period = finest_aggregation_period_seconds();
+    let window_end = aggregation_window_start(received_at, period)
+        .secs()
+        .saturating_add(period);
+    // The pass is stated in milliseconds, so it splits into the whole seconds to add and
+    // the sub-second remainder. `div_euclid`/`rem_euclid` keep that split correct for a
+    // span of any size and either sign: the remainder is always in `0..1_000`, so the
+    // nanoseconds are always the in-range part of the instant.
+    let whole_seconds = AGGREGATION_PASS_MILLIS.div_euclid(1_000);
+    let millis_within_second = AGGREGATION_PASS_MILLIS.rem_euclid(1_000);
+    DateTime::from_secs_and_nanos(
+        window_end.saturating_add(whole_seconds),
+        u32::try_from(millis_within_second).unwrap_or(0) * 1_000_000,
+    )
+}
+
 /// How many posted profiles one group retains. An emulator-chosen bound, not an AWS
 /// duration: the real service expires profiles over time (the `GetProfile` doc:
 /// "Because aggregated profiles expire over time GetProfile is not idempotent"), and
@@ -504,6 +549,24 @@ pub struct AgentProfile {
     pub received_at: DateTime,
 }
 
+impl AgentProfile {
+    /// When this posted profile has been collected into an aggregated profile — the
+    /// instant [`aggregated_at`] places for its receipt time.
+    pub fn aggregated_at(&self) -> DateTime {
+        aggregated_at(self.received_at)
+    }
+
+    /// Whether, as of `at`, this posted profile is part of an aggregated profile.
+    ///
+    /// The operations that report AGGREGATED profiles (`GetProfile`, `ListProfileTimes`)
+    /// count a posted profile only once this holds: until then the group has received
+    /// the profile — `profilingStatus.latestAgentProfileReportedAt` says so — and no
+    /// aggregated profile covers it yet.
+    pub fn is_aggregated(&self, at: DateTime) -> bool {
+        instant_key(self.aggregated_at()) <= instant_key(at)
+    }
+}
+
 /// One anomaly-notification channel of a profiling group, as
 /// `AddNotificationChannels` stored it.
 ///
@@ -808,17 +871,21 @@ impl ProfilingGroup {
     }
 
     /// The start instants of the aggregated profiles this group holds for an
-    /// aggregation period `period_seconds` long, ASCENDING and distinct.
+    /// aggregation period `period_seconds` long, as of `at`, ASCENDING and distinct.
     ///
     /// The `GetProfile` doc fixes the rule: "Amazon CodeGuru Profiler collects posted
     /// agent profiles for a profiling group into aggregated profiles", at periods
     /// "aligned to UTC". So each posted profile belongs to the one aligned window that
-    /// contains its receipt time, and every window holding at least one posted profile
-    /// is exactly one available aggregated profile, reported by its window start.
-    pub fn aggregated_profile_starts(&self, period_seconds: i64) -> Vec<DateTime> {
+    /// contains its receipt time, and every window holding at least one AGGREGATED
+    /// posted profile is exactly one available aggregated profile, reported by its
+    /// window start. A profile whose aggregation is not due yet
+    /// ([`AgentProfile::is_aggregated`]) is in no aggregated profile, so it contributes
+    /// no profile time.
+    pub fn aggregated_profile_starts(&self, period_seconds: i64, at: DateTime) -> Vec<DateTime> {
         let mut starts: Vec<i64> = self
             .profiles
             .iter()
+            .filter(|profile| profile.is_aggregated(at))
             .map(|profile| aggregation_window_start(profile.received_at, period_seconds).secs())
             .collect();
         starts.sort_unstable();
@@ -915,16 +982,24 @@ impl ProfilingGroup {
         self.ordered_findings_reports(|report| !daily_only || report.is_daily())
     }
 
-    /// The most recently received profile whose receipt time falls in
-    /// `[start, end]` (either bound absent means unbounded).
+    /// The most recently received AGGREGATED profile whose receipt time falls in
+    /// `[start, end]` (either bound absent means unbounded), as of `at`.
+    ///
+    /// A profile the service has received but not yet collected into an aggregated
+    /// profile ([`AgentProfile::is_aggregated`]) is not one `GetProfile` can serve: the
+    /// operation reports the aggregated profile of a window, and there is none covering
+    /// a profile whose aggregation is still pending.
     pub fn latest_profile_in(
         &self,
         start: Option<DateTime>,
         end: Option<DateTime>,
+        at: DateTime,
     ) -> Option<&AgentProfile> {
         self.profiles.iter().rfind(|profile| {
-            let at = profile.received_at.as_secs_f64();
-            start.is_none_or(|s| at >= s.as_secs_f64()) && end.is_none_or(|e| at <= e.as_secs_f64())
+            let received = profile.received_at.as_secs_f64();
+            profile.is_aggregated(at)
+                && start.is_none_or(|s| received >= s.as_secs_f64())
+                && end.is_none_or(|e| received <= e.as_secs_f64())
         })
     }
 }
@@ -1496,6 +1571,45 @@ pub fn policy_group_not_found_message(name: &str) -> String {
         "No profiling group with accountId: {}; name: {name} was found.",
         ::engine::emulator_account_id()
     )
+}
+
+/// How `UpdateProfilingGroup` says that the profiling group a request names does not
+/// exist: it states the lookup it performed — the account it was scoped to and the
+/// `profilingGroupName` member it looked the group up by — and the operation that could
+/// not be carried out, rather than the sentence every other group-scoped operation
+/// states ([`group_not_found_message`]).
+///
+/// Why this operation has a form of its own: a client that probes a name before writing
+/// to it reads the message to tell WHICH lookup failed, and an update's refusal has to
+/// be distinguishable from the same name's read refusals (`DescribeProfilingGroup`'s
+/// sentence, `GetPolicy`'s in [`policy_group_not_found_message`]).
+pub fn update_group_not_found_message(name: &str) -> String {
+    format!(
+        "Unable to find profiling group with accountId: {}; profilingGroupName: {name} \
+         during update",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// What the ARN-addressed TAGGING surface (`TagResource`, `UntagResource`,
+/// `ListTagsForResource`) says about a `resourceArn` that resolves to no live resource:
+/// a FIXED sentence about the resource, naming nothing from the request.
+///
+/// That surface is generic over resource types — it addresses whatever a resource ARN
+/// names, not a profiling group by name — so it reports the absence in its own terms,
+/// with its own error code ([`crate::scaffolded::Scaffolded::not_found`]'s
+/// `NotFoundException`) rather than the `ResourceNotFoundException` the
+/// profiling-group operations answer with.
+pub const TAGGING_RESOURCE_NOT_FOUND: &str = "Resource was not found";
+
+/// Why a tag map that carries no entry is refused: it names the member the map arrived
+/// in and the constraint it broke (non-empty), so the caller can tell a well-formed
+/// request carrying an empty map from a body the parser could not read.
+///
+/// `TagsMap` has no modelled length bound, so the boundary validator passes an empty
+/// map and this is the operation's own check.
+pub fn empty_tag_map_message(member: &str) -> String {
+    format!("Invalid request input, expected non-empty {member} map")
 }
 
 /// The resource-type prefix a profiling-group ARN carries in its resource field, as

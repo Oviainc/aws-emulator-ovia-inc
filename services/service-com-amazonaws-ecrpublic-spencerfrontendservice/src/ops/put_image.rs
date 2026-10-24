@@ -133,6 +133,14 @@ pub enum PutImageErrorModeled {
 /// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
 pub type PutImageError = crate::scaffolded::Scaffolded<PutImageErrorModeled>;
 
+/// The most absent blob digests one `LayersNotFoundException` names.
+///
+/// The refusal states the blobs the push needs, which comes from the manifest the caller
+/// sent: `imageManifest` is modelled `@length(1..4194304)` and a document may name up to
+/// `crate::state::MAX_MANIFEST_LAYER_ENTRIES` layer descriptors, so the list is capped
+/// here and an error body cannot grow with the request that caused it.
+const MAX_REPORTED_MISSING_LAYERS: usize = 100;
+
 /// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
 /// implemented handler writes `Err(SomeModeledError.into())` rather than naming the
 /// wrapper variant. See `crate::scaffolded` for how to drop the wrapper entirely once
@@ -179,12 +187,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // ECR Public serves its API from ONE Region, so a call signed for any other is
-        // refused with the service-common `UnsupportedCommandException` before this
-        // handler reads or changes anything — see `crate::state::unsupported_in_region`.
-        if let Some(unsupported) = crate::state::unsupported_in_region(ctx.parts(), Self::NAME) {
-            return Err(PutImageErrorModeled::UnsupportedCommandException(unsupported).into());
-        }
+        // This operation is served from every Region ECR Public publishes an endpoint in,
+        // so nothing here reads the Region the request was signed for — see
+        // `crate::state::unsupported_in_region` for the one call that is Region-scoped.
+        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(PutImageErrorModeled::ServerException(ServerException {
                 message: Some(
@@ -227,6 +233,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .clone()
             .or_else(|| media_type_of(Some(&manifest_json)));
         let artifact_media_type = media_type_of(manifest_json.get("config"));
+
+        // A manifest is only a manifest of the kind it declares itself to be: the schema
+        // its media type names fixes which content member the document has to carry, and
+        // a document that declares one schema while carrying the content of another is
+        // refused with the modelled `InvalidParameterException` — before the store is
+        // reached, so no image and no tag is created for it. The declared type is the
+        // manifest's own, or the request's for a manifest that states none.
+        if let Some(message) = crate::state::manifest_schema_violation(
+            "ImageManifest",
+            manifest_media_type.as_deref(),
+            &manifest_json,
+        ) {
+            return Err(PutImageErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // The blobs this manifest references, read from the same parsed document: a push
+        // commits an image over layers that are already in the repository, so these are
+        // resolved against its completed layers below. A document naming more layer
+        // descriptors than this registry reads
+        // (`crate::state::MAX_MANIFEST_LAYER_ENTRIES`) names blobs it cannot resolve, so
+        // it is refused here with the parameter clause for that count — before the store
+        // is reached, and before any per-descriptor work is done.
+        let Some(referenced_blobs) = crate::state::manifest_blob_digests(&manifest_json) else {
+            return Err(PutImageErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(crate::state::manifest_layer_count_message("ImageManifest")),
+                },
+            )
+            .into());
+        };
 
         // What this manifest references, read from the document already parsed above so
         // one push parses one manifest exactly once. (A body that is not JSON never
@@ -284,6 +325,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // "When an image is pushed and all new image layers have been uploaded, the
+        // PutImage API is called" (`PutImage`): a manifest may only be committed over
+        // blobs the repository already holds, so every digest it references is resolved
+        // against the completed layers (`CompleteLayerUpload` is what adds one), and a
+        // push naming any blob that is absent is refused with the modelled
+        // `LayersNotFoundException` — creating neither the image nor the tag. The digests
+        // are compared under the spelling layer digests are compared by
+        // (`crate::state::canonical_layer_digest`), so the hex's case does not decide
+        // whether a layer resolves, and reported back as the request spelled them.
+        //
+        // The resolution is one map lookup per referenced blob and the count is capped by
+        // `crate::state::MAX_MANIFEST_LAYER_ENTRIES`, so what runs under the store's lock
+        // is bounded; the message itself is built after the lock is released.
+        let missing: Vec<String> = referenced_blobs
+            .iter()
+            .filter(|named| {
+                !repository
+                    .layers
+                    .contains_key(&crate::state::canonical_layer_digest(named))
+            })
+            .take(MAX_REPORTED_MISSING_LAYERS)
+            .cloned()
+            .collect();
+        if !missing.is_empty() {
+            let repository_name = repository.name.clone();
+            drop(store);
+            return Err(PutImageErrorModeled::LayersNotFoundException(
+                LayersNotFoundException {
+                    message: Some(format!(
+                        "Layers with digests '[{}]' required for pushing image into \
+                         repository with name '{repository_name}' in the registry with id \
+                         '{registry_id}' do not exist",
+                        missing.join(", ")
+                    )),
+                },
+            )
+            .into());
+        }
+
         // Re-pushing a manifest already in the repository is only a success when it
         // brings a tag the stored image does not carry yet: a tag is mutable, so it
         // moves onto this digest. Pushing the same digest with nothing new is a
@@ -293,16 +373,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !brings_new_tag {
                 return Err(PutImageErrorModeled::ImageAlreadyExistsException(
                     ImageAlreadyExistsException {
+                        // The clause the service states for an image already in a
+                        // repository: the digest, the tag the request named when it named
+                        // one, then the repository and the registry.
                         message: Some(match image_tag {
                             Some(tag) => format!(
                                 "Image with digest '{digest}' and tag '{tag}' already exists \
-                                 in the repository with name '{}' in the registry with id \
+                                 in the repository with name '{}' in registry with id \
                                  '{registry_id}'",
                                 repository.name
                             ),
                             None => format!(
                                 "Image with digest '{digest}' already exists in the repository \
-                                 with name '{}' in the registry with id '{registry_id}'",
+                                 with name '{}' in registry with id '{registry_id}'",
                                 repository.name
                             ),
                         }),

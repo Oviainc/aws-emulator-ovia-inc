@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutApplicationAssignmentConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutApplicationAssignmentConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutApplicationAssignmentConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Sets one application's assignment configuration: whether a principal needs a direct
+//! assignment to reach it. The flag lives on the application record
+//! ([`crate::state::ApplicationRecord::assignment_required`]), so the put resolves the
+//! same application every other read resolves and the next
+//! `GetApplicationAssignmentConfiguration` reports exactly what this call stored.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +156,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutApplicationAssignmentConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutApplicationAssignmentConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutApplicationAssignmentConfiguration"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutApplicationAssignmentConfigurationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the SSO Admin state store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // What the CLOCK already owes every instance, so this write resolves the same
+        // application a read at this instant would resolve (an application whose instance
+        // the clock has already removed no longer exists).
+        store.on_request(&region, ::std::time::SystemTime::now());
+
+        // The application being configured must exist: the configuration lives ON the
+        // application record, so an `ApplicationArn` nothing holds is the modelled
+        // `ResourceNotFoundException` rather than a flag stored under an ARN no read
+        // resolves.
+        let application = store
+            .application_mut(&input.application_arn)
+            .ok_or_else(|| {
+                PutApplicationAssignmentConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::application_not_found_message(
+                            &input.application_arn,
+                        )),
+                        // The model's `ResourceNotFoundExceptionReason` enum carries only
+                        // `KMS_NotFoundException`, which this is not.
+                        reason: None,
+                    },
+                )
+            })?;
+
+        // The whole configuration is this one flag, so the put REPLACES it. The operation
+        // is `@idempotent`: repeating the same request leaves the same value, and the
+        // assignments the application already carries are untouched either way — "If an
+        // assignment is created using CreateApplicationAssignment, the user retains
+        // access if AssignmentsRequired is set to true."
+        application.assignment_required = input.assignment_required;
+        Ok(PutApplicationAssignmentConfigurationOutput {})
     }
 }

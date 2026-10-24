@@ -7,7 +7,7 @@
 //! one stored resource its `resourceArn` identifies — the whole map, only that
 //! resource's map, and whatever the last tag write left in it — and writes nothing, so
 //! two reads and a `DescribeProfilingGroup` of the same resource agree. An ARN this
-//! store holds no resource for answers the modelled 404 `ResourceNotFoundException`; a
+//! store holds no resource for answers the tagging surface's 404 `NotFoundException`; a
 //! `resourceArn` that is not a profiling-group ARN of this service answers the modelled
 //! 400 `ValidationException`.
 //!
@@ -352,8 +352,8 @@ async fn an_arn_this_store_holds_no_resource_for_is_not_found() {
         );
         assert_eq!(
             missing.error_code(),
-            "ResourceNotFoundException",
-            "case {case:?} ({arn}): expected ResourceNotFoundException, got {}",
+            "NotFoundException",
+            "case {case:?} ({arn}): expected NotFoundException, got {}",
             String::from_utf8_lossy(&missing.body)
         );
     }

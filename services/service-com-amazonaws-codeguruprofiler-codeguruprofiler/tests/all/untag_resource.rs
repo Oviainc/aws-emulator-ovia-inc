@@ -10,7 +10,7 @@
 //! already absent is a success, not an error) — and it writes no other member of that
 //! record, so a later `DescribeProfilingGroup` reports the surviving tags and an
 //! unchanged group otherwise. An ARN this store holds no resource for answers the
-//! modelled 404 `ResourceNotFoundException`; a `resourceArn` that is not a
+//! tagging surface's 404 `NotFoundException`; a `resourceArn` that is not a
 //! profiling-group ARN of this service answers the modelled 400 `ValidationException`.
 //!
 //! The harness is the one [`crate::profiling_group_lifecycle`] already builds. The table
@@ -385,7 +385,7 @@ async fn untagging_touches_only_the_resource_its_arn_names() {
 }
 
 #[tokio::test]
-async fn untagging_an_arn_the_store_holds_no_resource_for_answers_the_modelled_404() {
+async fn untagging_an_arn_the_store_holds_no_resource_for_answers_the_tagging_404() {
     let harness = Harness::new();
     assert_eq!(
         create(&harness, &CASES[0]).await.status,
@@ -421,8 +421,8 @@ async fn untagging_an_arn_the_store_holds_no_resource_for_answers_the_modelled_4
         );
         assert_eq!(
             answer.error_code(),
-            "ResourceNotFoundException",
-            "arn {arn:?}: expected ResourceNotFoundException, got {}",
+            "NotFoundException",
+            "arn {arn:?}: expected NotFoundException, got {}",
             String::from_utf8_lossy(&answer.body)
         );
     }

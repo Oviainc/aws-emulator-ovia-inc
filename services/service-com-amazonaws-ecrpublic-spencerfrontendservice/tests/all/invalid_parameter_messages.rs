@@ -25,10 +25,12 @@ use crate::repository_image_lifecycle::{call, ok, refused, service};
 const REPOSITORY_NAME_MIN: usize = 2;
 const REPOSITORY_NAME_MAX: usize = 205;
 
-/// The expression `RepositoryName`'s `@pattern` states, as the refusal reports it: the
-/// model's expression without the anchors that make its match total.
+/// The expression `RepositoryName`'s `@pattern` fails against, as the refusal reports it:
+/// the registry naming grammar in the form the SERVICE publishes, which is a different
+/// spelling of the same language from the model's non-capturing-group `@pattern` source
+/// (`smithy_query(query="shape", shape="RepositoryName")`).
 const REPOSITORY_NAME_EXPRESSION: &str =
-    "(?:[a-z0-9]+(?:[._-][a-z0-9]+)*/)*[a-z0-9]+(?:[._-][a-z0-9]+)*";
+    r"[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*(/[a-z0-9]+((\.|_|__|-+)[a-z0-9]+)*)*";
 
 /// `RepositoryDescription`'s modelled maximum (`@length(0..1024)`), reached through
 /// `CreateRepository.catalogData.description`.
@@ -140,11 +142,24 @@ fn refusal_cases() -> Vec<RefusalCase> {
             case: "a policy document over its maximum",
             operation: "SetRepositoryPolicy",
             body: json!({"repositoryName": "team/app", "policyText": too_long_policy.clone()}),
-            member_path: "policyText",
-            requirement: format!(
-                "Member must have length less than or equal to {POLICY_TEXT_MAX}"
-            ),
+            // The policy document is the one member of this API the service states under a
+            // capitalised path, and whose length rule it words without the leading
+            // `Member`.
+            member_path: "PolicyText",
+            requirement: format!("Must have length less than or equal to {POLICY_TEXT_MAX}"),
             rejected_value: Some(too_long_policy),
+        },
+        RefusalCase {
+            case: "a repository name outside the pattern inside a reader's name list",
+            operation: "DescribeRepositories",
+            body: json!({"repositoryNames": [bad_name]}),
+            // A repository name is validated as a repository name wherever it is carried,
+            // so the clause names the parameter and not the list position.
+            member_path: "repositoryName",
+            requirement: format!(
+                "must satisfy regular expression '{REPOSITORY_NAME_EXPRESSION}'"
+            ),
+            rejected_value: Some(bad_name.to_string()),
         },
         RefusalCase {
             case: "a page size under the modelled range",

@@ -359,6 +359,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let graph_id = store.next_graph_id();
+        let create_time = ::std::time::SystemTime::now();
         let graph = crate::state::Graph {
             arn: ::engine::emulator_arn(
                 crate::state::ARN_NAMESPACE,
@@ -386,7 +387,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 now,
             )),
             status_reason: None,
-            create_time: ::std::time::SystemTime::now(),
+            create_time,
             // Neither memory member IS the provisioned memory: they bound the value the
             // service chooses (`crate::state::import_provisioned_memory`).
             provisioned_memory: crate::state::import_provisioned_memory(
@@ -412,6 +413,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: input.tags.unwrap_or_default().into_iter().collect(),
             // Nothing has deleted this graph.
             deletes_at: None,
+            // The graph comes into service EMPTY: the import this call starts reads
+            // nothing, so no node or edge is ever written to it, and the statistics
+            // over that empty data are the ones the graph came up with.
+            data: crate::state::GraphData::empty(create_time),
         };
 
         let task_id = store.next_import_task_id();
