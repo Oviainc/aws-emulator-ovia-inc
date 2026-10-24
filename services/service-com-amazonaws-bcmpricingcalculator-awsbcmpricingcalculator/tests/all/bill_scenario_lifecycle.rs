@@ -74,26 +74,7 @@ impl Emulator {
     }
 
     pub(crate) async fn call(&self, operation: &str, body: Value) -> (u16, Value) {
-        let request = http::Request::builder()
-            .method("POST")
-            .uri("/")
-            .header("content-type", "application/x-amz-json-1.0")
-            .header(
-                "x-amz-target",
-                format!("AWSBCMPricingCalculator.{operation}"),
-            )
-            .header(
-                "authorization",
-                "AWS4-HMAC-SHA256 \
-                 Credential=AKIDEMULATOR/20260101/us-east-1/bcm-pricing-calculator/aws4_request, \
-                 SignedHeaders=host;x-amz-target, Signature=unsigned",
-            )
-            .body(Bytes::from(
-                serde_json::to_vec(&body).expect("the request body serializes"),
-            ))
-            .expect("a well-formed request");
-
-        let response = self.router.dispatch(request).await;
+        let response = self.router.dispatch(request(Some(operation), &body)).await;
         let status = response.status().as_u16();
         let bytes = response.into_body();
         let payload = if bytes.is_empty() {
@@ -117,6 +98,50 @@ impl Emulator {
             .unwrap_or_else(|| panic!("CreateBillScenario({name}): no id in {body}"))
             .to_string()
     }
+}
+
+/// The media type an awsJson1_0 REQUEST of this service is sent under — the one the model's
+/// protocol trait implies (smithy_query `query="service_info"` → `protocols: ["awsJson1_0"]`).
+/// What a RESPONSE announces is a separate fact of this service's wire; see
+/// `tests/all/response_media_type.rs`.
+pub(crate) const REQUEST_MEDIA_TYPE: &str = "application/x-amz-json-1.0";
+
+/// The SigV4 authorization header every call carries: it is here to name the service in its
+/// credential scope (how the router picks a service), not to be verified — the routers these
+/// suites build have request authentication off.
+pub(crate) const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
+     Credential=AKIDEMULATOR/20260101/us-east-1/bcm-pricing-calculator/aws4_request, \
+     SignedHeaders=host;x-amz-target, Signature=unsigned";
+
+/// A request to this service's wire, up to its body: `POST /` with the awsJson1_0 request
+/// framing, the credential scope above, and the `X-Amz-Target` naming `operation` when there
+/// is one (a request that names NO operation is what the routing failure is driven with).
+///
+/// `pub(crate)` and shared with [`Emulator::call`] so a suite that needs the WHOLE response —
+/// its headers, or a header this builder does not set — sends the same bytes every other
+/// suite does, instead of a second copy of the front door's framing that could drift from it.
+pub(crate) fn request_builder(operation: Option<&str>) -> http::request::Builder {
+    let mut builder = http::Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("content-type", REQUEST_MEDIA_TYPE)
+        .header("authorization", AUTHORIZATION);
+    if let Some(operation) = operation {
+        builder = builder.header(
+            "x-amz-target",
+            format!("AWSBCMPricingCalculator.{operation}"),
+        );
+    }
+    builder
+}
+
+/// [`request_builder`] carrying `body` as its payload.
+pub(crate) fn request(operation: Option<&str>, body: &Value) -> http::Request<Bytes> {
+    request_builder(operation)
+        .body(Bytes::from(
+            serde_json::to_vec(body).expect("the request body serializes"),
+        ))
+        .expect("a well-formed request")
 }
 
 /// Whether `value` is a `ResourceId`: the lowercase-hex v4 UUID form
