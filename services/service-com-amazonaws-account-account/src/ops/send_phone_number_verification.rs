@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SendPhoneNumberVerification
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SendPhoneNumberVerification`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SendPhoneNumberVerification::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Sends the one-time passcode that `VerifyPhoneNumber` checks: the passcode is
+//! minted here, stored against the phone number in the account's primary contact
+//! information, and never returned on the wire (`Otp` is `@sensitive` and this
+//! operation's output carries only `Status`) — exactly as AWS, which sends it to
+//! the phone number itself.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +165,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SendPhoneNumberVerification` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SendPhoneNumberVerificationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SendPhoneNumberVerification"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                SendPhoneNumberVerificationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: crate::state::STORE_UNAVAILABLE.to_string(),
+                        error_type: None,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `AccountId` is optional here, so an absent one lands on the caller's
+        // own account; its `^\d{12}$` was already refused at the boundary.
+        let account_id = crate::state::resolve_account_id(input.account_id.as_deref());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A passcode goes to the phone number of an account that already exists,
+        // so this call never brings a record into being: an id this emulator
+        // holds no record of earns the same `AccessDeniedException` a read of an
+        // account outside the caller's organization does.
+        let Some(account) = store.existing_account_mut(&account_id) else {
+            return Err(
+                SendPhoneNumberVerificationErrorModeled::AccessDeniedException(
+                    crate::state::account_not_accessible(&account_id),
+                )
+                .into(),
+            );
+        };
+
+        // The passcode goes to "the phone number in the primary contact
+        // information": with no primary contact stored there is no number to
+        // send it to, which is the resource this call names not being found.
+        let Some(phone_number) = account.primary_phone_number().map(str::to_string) else {
+            return Err(
+                SendPhoneNumberVerificationErrorModeled::ResourceNotFoundException(
+                    crate::state::contact_information_not_set(&account_id),
+                )
+                .into(),
+            );
+        };
+
+        // Sending REPLACES any earlier verification of that number: the passcode
+        // just sent is the only one outstanding, so a resend invalidates the one
+        // before it and the status after this call is `PENDING` — "a one-time
+        // passcode has been sent and is waiting to be submitted" — whatever the
+        // number's status was before.
+        let verification =
+            crate::state::PhoneNumberVerification::sent(phone_number, crate::state::new_otp(), now);
+        let status = verification.state.as_wire();
+        account.phone_verification = Some(verification);
+
+        Ok(SendPhoneNumberVerificationOutput {
+            status: Some(status.to_string()),
+        })
     }
 }
+

@@ -197,10 +197,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(GetContactInformationOutput {
             contact_information: Some(contact_information),
-            // The status of the phone number IN that contact information; see
-            // `state::UNVERIFIED_PHONE_NUMBER` for why a number this emulator
-            // stores is unverified.
-            verification_status: Some(crate::state::UNVERIFIED_PHONE_NUMBER.to_string()),
+            // The status of the phone number IN that contact information, as the
+            // one-time-passcode flow left it: `UNVERIFIED` until
+            // `SendPhoneNumberVerification` sends a passcode to that number,
+            // `PENDING` while one is outstanding and `VERIFIED` once
+            // `VerifyPhoneNumber` was handed it back. Read off the record, so
+            // this report writes nothing.
+            verification_status: Some(account.phone_number_verification_status().to_string()),
         })
     }
 }

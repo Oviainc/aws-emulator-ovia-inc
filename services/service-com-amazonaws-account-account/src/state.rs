@@ -8,7 +8,11 @@
 //! report it, and `DeleteAlternateContact` removes one of its contacts. The
 //! record below is the one copy every one of those handlers reads and writes.
 //! It also carries the account's most recent primary email update, which
-//! `StartPrimaryEmailUpdate` records and `GetPrimaryEmailUpdateStatus` reports.
+//! `StartPrimaryEmailUpdate` records and `GetPrimaryEmailUpdateStatus` reports,
+//! and the phone-number verification of its primary contact, which
+//! `SendPhoneNumberVerification` starts, `VerifyPhoneNumber` completes and
+//! `GetContactInformation` reports as `VerificationStatus`
+//! ([`PhoneNumberVerification`]).
 //!
 //! Account Management operations all take an OPTIONAL `AccountId`: absent, the
 //! call lands on "the Amazon Web Services account of the identity used to call
@@ -49,15 +53,60 @@ pub const FIELD_VALIDATION_FAILED: &str = "fieldValidationFailed";
 pub const INVALID_REGION_OPT_TARGET: &str = "invalidRegionOptTarget";
 
 /// The `PhoneNumberVerificationStatus` the phone number of a stored primary
-/// contact carries: "UNVERIFIED – The phone number has not been verified"
+/// contact carries before any one-time-passcode flow has run on THAT number:
+/// "UNVERIFIED – The phone number has not been verified"
 /// (`PHONE_NUMBER_VERIFICATION_STATUS_VALUES` is
 /// `NOT_SUPPORTED | PENDING | UNVERIFIED | VERIFIED`).
 ///
-/// A phone number only becomes `PENDING` and then `VERIFIED` through the
-/// one-time-passcode flow (`SendPhoneNumberVerification` / `VerifyPhoneNumber`),
-/// which this emulator still answers 501 for — so a number it stores has never
-/// been through that flow, and `UNVERIFIED` is what the store knows about it.
+/// A phone number becomes `PENDING` when `SendPhoneNumberVerification` sends a
+/// one-time passcode to it and `VERIFIED` when `VerifyPhoneNumber` is handed
+/// that passcode back; see [`PhoneNumberVerification`].
 pub const UNVERIFIED_PHONE_NUMBER: &str = "UNVERIFIED";
+
+/// The `PhoneNumberVerificationStatus` of a phone number a one-time passcode has
+/// been sent to and not yet submitted for: "PENDING – A one-time passcode has
+/// been sent and is waiting to be submitted".
+///
+/// `PENDING` is not a status the CLOCK moves on: nothing advances it but a
+/// `VerifyPhoneNumber` call carrying the passcode, so no due instant is stored
+/// for it and a number nobody verifies stays `PENDING`.
+pub const PENDING_PHONE_NUMBER_VERIFICATION: &str = "PENDING";
+
+/// The `PhoneNumberVerificationStatus` of a phone number the one-time passcode
+/// was submitted for: "VERIFIED – The phone number has been verified".
+pub const VERIFIED_PHONE_NUMBER: &str = "VERIFIED";
+
+/// How many characters a one-time passcode has: `Otp` is modelled
+/// `^[a-zA-Z0-9]{6}$` (`smithy_query(query="operation",
+/// operation="VerifyPhoneNumber")`), so a passcode this service mints has to be
+/// six alphanumerics for the caller to be able to submit it at all.
+pub const OTP_LENGTH: usize = 6;
+
+/// A fresh one-time passcode: [`OTP_LENGTH`] hex characters, which satisfies
+/// `Otp`'s modelled `^[a-zA-Z0-9]{6}$`.
+///
+/// The randomness is the `uuid` crate's, reached through `emulator_telemetry`'s
+/// uuid-backed id newtype (`BatchId::random()` is a v4 UUID rendered
+/// canonically), which this crate already depends on — nothing here is a
+/// hand-rolled generator. A passcode is never derived from the request or from
+/// the account, so two sends never produce the same one.
+///
+/// The passcode is `@sensitive` on the wire and is NEVER returned or logged:
+/// AWS sends it to the phone number itself, and the only thing this service
+/// reports is the resulting status.
+pub fn new_otp() -> String {
+    let mut passcode = String::with_capacity(OTP_LENGTH);
+    while passcode.len() < OTP_LENGTH {
+        passcode.extend(
+            ::emulator_telemetry::BatchId::random()
+                .as_str()
+                .chars()
+                .filter(char::is_ascii_alphanumeric),
+        );
+    }
+    passcode.truncate(OTP_LENGTH);
+    passcode
+}
 
 /// What a handler reports when the engine it was built on carries no store for
 /// this service — a server fault, never a bad request.
@@ -368,6 +417,74 @@ impl PrimaryEmailUpdate {
     }
 }
 
+/// Where one phone number got to in the one-time-passcode flow.
+///
+/// There is no third state: a number this emulator holds no record for is
+/// `UNVERIFIED`, which is what [`Account::phone_number_verification_status`]
+/// reports for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PhoneNumberVerificationState {
+    /// `SendPhoneNumberVerification` sent a passcode and it has not been
+    /// submitted yet. The passcode is held so `VerifyPhoneNumber` can check what
+    /// the caller submits against it; it is `@sensitive` and never leaves the
+    /// store.
+    Pending { otp: String },
+    /// The passcode was submitted and matched.
+    Verified,
+}
+
+impl PhoneNumberVerificationState {
+    /// The wire `PhoneNumberVerificationStatus` of this state, one of
+    /// `PHONE_NUMBER_VERIFICATION_STATUS_VALUES`.
+    pub fn as_wire(&self) -> &'static str {
+        match self {
+            Self::Pending { .. } => PENDING_PHONE_NUMBER_VERIFICATION,
+            Self::Verified => VERIFIED_PHONE_NUMBER,
+        }
+    }
+}
+
+/// The phone-number verification of one account, as
+/// `SendPhoneNumberVerification` recorded it and `VerifyPhoneNumber` advanced
+/// it.
+///
+/// A verification is ABOUT a phone number, not about an account: AWS sends the
+/// passcode to "the phone number in the primary contact information", so the
+/// number it was sent to is stored with it and a record only speaks for the
+/// number it names. Replace the primary contact's phone number and the stored
+/// record no longer applies to it — see
+/// [`Account::phone_number_verification_status`].
+#[derive(Debug, Clone)]
+pub struct PhoneNumberVerification {
+    /// The primary-contact phone number the passcode was sent to.
+    pub phone_number: String,
+    /// How far that number got.
+    pub state: PhoneNumberVerificationState,
+    /// When this state was last set.
+    pub updated_at: SystemTime,
+}
+
+impl PhoneNumberVerification {
+    /// The record `SendPhoneNumberVerification` writes at `now`: a passcode is
+    /// outstanding for `phone_number`, so the number is `PENDING`.
+    pub fn sent(phone_number: String, otp: String, now: SystemTime) -> Self {
+        Self {
+            phone_number,
+            state: PhoneNumberVerificationState::Pending { otp },
+            updated_at: now,
+        }
+    }
+
+    /// The passcode outstanding for this number, or `None` once it has been
+    /// submitted: a one-time passcode is consumed by the call that verifies it.
+    pub fn outstanding_otp(&self) -> Option<&str> {
+        match &self.state {
+            PhoneNumberVerificationState::Pending { otp } => Some(otp.as_str()),
+            PhoneNumberVerificationState::Verified => None,
+        }
+    }
+}
+
 /// One Amazon Web Services account, as this emulator persists it.
 #[derive(Debug, Clone)]
 pub struct Account {
@@ -403,6 +520,11 @@ pub struct Account {
     /// none has ever been started — which is what makes a status read of an
     /// account with no update a refusal rather than a reported status.
     pub primary_email_update: Option<PrimaryEmailUpdate>,
+    /// The MOST RECENT phone-number verification of this account, or `None`
+    /// while no `SendPhoneNumberVerification` has ever sent a passcode. The
+    /// record names the number the passcode went to, so it stops applying when
+    /// the primary contact's phone number changes.
+    pub phone_verification: Option<PhoneNumberVerification>,
 }
 
 impl Account {
@@ -417,7 +539,51 @@ impl Account {
             contact_information: None,
             region_opt_status: BTreeMap::new(),
             primary_email_update: None,
+            phone_verification: None,
         }
+    }
+
+    /// The phone number in this account's primary contact information, or `None`
+    /// while no contact information is stored. `PhoneNumber` is `@required` on
+    /// `ContactInformation`, so a stored contact always has one.
+    pub fn primary_phone_number(&self) -> Option<&str> {
+        self.contact_information
+            .as_ref()
+            .map(|contact| contact.phone_number.as_str())
+    }
+
+    /// The `PhoneNumberVerificationStatus` this account reports for the phone
+    /// number currently in its primary contact information.
+    ///
+    /// A verification speaks only for the number it was sent to, so a stored
+    /// record is honoured only while that number is still the primary contact's
+    /// — otherwise, and with no record at all, the number is
+    /// [`UNVERIFIED_PHONE_NUMBER`]. A pure function of the record: a reporting
+    /// operation answers from it without writing anything.
+    ///
+    /// `NOT_SUPPORTED` ("phone number verification isn't available for this
+    /// account") is never reported: every account this emulator holds can run
+    /// the passcode flow.
+    pub fn phone_number_verification_status(&self) -> &'static str {
+        let Some(phone_number) = self.primary_phone_number() else {
+            return UNVERIFIED_PHONE_NUMBER;
+        };
+        match &self.phone_verification {
+            Some(verification) if verification.phone_number == phone_number => {
+                verification.state.as_wire()
+            }
+            _ => UNVERIFIED_PHONE_NUMBER,
+        }
+    }
+
+    /// This account's verification record, but only while it speaks for the
+    /// phone number currently in the primary contact information — what
+    /// `VerifyPhoneNumber` checks a submitted passcode against.
+    pub fn current_phone_verification_mut(&mut self) -> Option<&mut PhoneNumberVerification> {
+        let phone_number = self.primary_phone_number()?.to_string();
+        self.phone_verification
+            .as_mut()
+            .filter(|verification| verification.phone_number == phone_number)
     }
 
     /// Materialise every Region opt transition the clock already owes: an
@@ -536,6 +702,17 @@ impl ComAmazonawsAccountAccountState {
                 .entry(account_id.to_string())
                 .or_insert_with(|| Account::new(account_id.to_string(), now)),
         )
+    }
+
+    /// The account `account_id` names, for a mutating operation that must NOT
+    /// bring a record into existence: `None` when this emulator holds no record
+    /// of that account, and nothing is written.
+    ///
+    /// What the phone-number passcode operations need: they act on the primary
+    /// contact information of an account that already exists, so an id naming no
+    /// record is a refusal rather than a new account.
+    pub fn existing_account_mut(&mut self, account_id: &str) -> Option<&mut Account> {
+        self.accounts.get_mut(account_id)
     }
 }
 
@@ -709,6 +886,47 @@ pub fn region_opt_in_progress(region_name: &str, status: &str) -> ConflictExcept
              before changing its opt status again"
         ),
         error_type: None,
+    }
+}
+
+/// The `ConflictException` payload for a `VerifyPhoneNumber` on a phone number
+/// that has no outstanding one-time passcode: the request conflicts with the
+/// current status of the resource, which is what that error is modelled for.
+///
+/// `status` is the `PhoneNumberVerificationStatus` the number carries instead of
+/// `PENDING` — `UNVERIFIED` when no passcode was ever sent to it (or the primary
+/// contact's number changed since), `VERIFIED` when the passcode was already
+/// submitted and consumed. No passcode is named: `Otp` is `@sensitive`.
+pub fn no_outstanding_passcode(status: &str) -> ConflictException {
+    ConflictException {
+        message: format!(
+            "The phone number in the primary contact information is in status {status}; no \
+             one-time passcode is waiting to be submitted. Call SendPhoneNumberVerification \
+             to send one"
+        ),
+        error_type: None,
+    }
+}
+
+/// The `ValidationException` payload for a `VerifyPhoneNumber` whose `Otp` is
+/// not the outstanding passcode.
+///
+/// WHICH six alphanumerics are the passcode is not something the model can
+/// express, so the boundary admits any `^[a-zA-Z0-9]{6}$` and this service
+/// refuses the wrong one itself: `reason` is `fieldValidationFailed` and
+/// `fieldList` names the member, so a client can see which input was invalid.
+/// Neither the submitted nor the outstanding passcode is echoed — `Otp` is
+/// `@sensitive`.
+pub fn incorrect_passcode() -> ValidationException {
+    ValidationException {
+        message: "The one-time passcode submitted in Otp is not the passcode sent to the phone \
+                  number in the primary contact information"
+            .to_string(),
+        reason: Some(FIELD_VALIDATION_FAILED.to_string()),
+        field_list: Some(vec![ValidationExceptionField {
+            name: "Otp".to_string(),
+            message: "the submitted one-time passcode is incorrect".to_string(),
+        }]),
     }
 }
 

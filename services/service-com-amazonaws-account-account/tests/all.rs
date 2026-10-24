@@ -21,6 +21,8 @@ mod contact_information;
 mod enum_input_validation;
 #[path = "all/pattern_validation_messages.rs"]
 mod pattern_validation_messages;
+#[path = "all/phone_number_verification.rs"]
+mod phone_number_verification;
 #[path = "all/primary_email_update.rs"]
 mod primary_email_update;
 #[path = "all/region_opt_in.rs"]

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op VerifyPhoneNumber
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `VerifyPhoneNumber`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`VerifyPhoneNumber::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Completes the one-time-passcode flow `SendPhoneNumberVerification` starts:
+//! the passcode the caller submits is checked against the one outstanding for
+//! the phone number in the account's primary contact information, and a match
+//! moves that number to `VERIFIED` — which `GetContactInformation` then reports
+//! as its `VerificationStatus`. The passcode is one-time: verifying consumes it.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +168,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `VerifyPhoneNumber` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(VerifyPhoneNumberErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("VerifyPhoneNumber"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(VerifyPhoneNumberErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::STORE_UNAVAILABLE.to_string(),
+                    error_type: None,
+                },
+            )
+            .into());
+        };
+
+        // `Otp`'s `^[a-zA-Z0-9]{6}$` and `AccountId`'s `^\d{12}$` were refused at
+        // the boundary already, so what reaches here is a well-formed passcode;
+        // WHICH passcode is the right one is this service's own rule. `AccountId`
+        // is optional, so an absent one lands on the caller's own account.
+        let account_id = crate::state::resolve_account_id(input.account_id.as_deref());
+        let mut store = state.lock();
+        // Verifying acts on the primary contact of an account that already
+        // exists, so this call never creates a record: an id this emulator holds
+        // no record of earns the `AccessDeniedException` a call naming an account
+        // outside the caller's organization does.
+        let Some(account) = store.existing_account_mut(&account_id) else {
+            return Err(VerifyPhoneNumberErrorModeled::AccessDeniedException(
+                crate::state::account_not_accessible(&account_id),
+            )
+            .into());
+        };
+
+        // The number being verified is the one in the primary contact
+        // information: with no primary contact stored there is no such number,
+        // which is the resource this call names not being found.
+        if account.primary_phone_number().is_none() {
+            return Err(VerifyPhoneNumberErrorModeled::ResourceNotFoundException(
+                crate::state::contact_information_not_set(&account_id),
+            )
+            .into());
+        }
+
+        // Nothing to evaluate the submitted passcode against: either no passcode
+        // was ever sent to the number now in the primary contact information, or
+        // the one sent was already submitted and consumed. Both are a conflict
+        // with the number's current status, which the refusal reports.
+        let status_before = account.phone_number_verification_status();
+        let now = ::std::time::SystemTime::now();
+        let Some(verification) = account.current_phone_verification_mut() else {
+            return Err(VerifyPhoneNumberErrorModeled::ConflictException(
+                crate::state::no_outstanding_passcode(status_before),
+            )
+            .into());
+        };
+        let Some(outstanding) = verification.outstanding_otp() else {
+            return Err(VerifyPhoneNumberErrorModeled::ConflictException(
+                crate::state::no_outstanding_passcode(status_before),
+            )
+            .into());
+        };
+
+        // A passcode is checked as the whole literal value it is: six
+        // alphanumerics, compared exactly, so a value differing in case or in one
+        // character is not the passcode that was sent.
+        if input.otp != outstanding {
+            // A wrong submission does NOT consume the outstanding passcode: the
+            // number stays `PENDING` and the caller can submit the right one.
+            return Err(VerifyPhoneNumberErrorModeled::ValidationException(
+                crate::state::incorrect_passcode(),
+            )
+            .into());
+        }
+
+        // The passcode matched: the number is verified and the passcode is
+        // consumed, so submitting it a second time finds nothing outstanding.
+        verification.state = crate::state::PhoneNumberVerificationState::Verified;
+        verification.updated_at = now;
+
+        Ok(VerifyPhoneNumberOutput {
+            // "The verification status of the phone number in the primary contact
+            // information AFTER the submitted one-time passcode is evaluated."
+            status: Some(verification.state.as_wire().to_string()),
+        })
     }
 }
+
