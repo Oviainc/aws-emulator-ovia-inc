@@ -27,7 +27,7 @@
 //! `ring::rand::SystemRandom`) rather than from anything written here: this file
 //! composes the envelope, it does not implement cryptography.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::SystemTime;
 
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM, NONCE_LEN};
@@ -98,6 +98,10 @@ pub const ENCRYPTION_ALGORITHM_SYMMETRIC_DEFAULT: &str = "SYMMETRIC_DEFAULT";
 /// The `MultiRegionKeyType` of the key a `MultiRegion` create mints, from
 /// `smithy_query(shape="MultiRegionKeyType")`.
 pub const MULTI_REGION_KEY_TYPE_PRIMARY: &str = "PRIMARY";
+
+/// The `MultiRegionKeyType` of a key of a multi-Region set that is not the set's
+/// primary key, from `smithy_query(shape="MultiRegionKeyType")`.
+pub const MULTI_REGION_KEY_TYPE_REPLICA: &str = "REPLICA";
 
 /// The Region an unsigned request is attributed to.
 pub const DEFAULT_REGION: &str = "us-east-1";
@@ -477,6 +481,15 @@ pub fn alias_arn(region: &str, alias_name: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, alias_name)
 }
 
+/// The ARN of the key `key_id` in `region`:
+/// `arn:aws:kms:<region>:<account>:key/<key-id>`. A KMS key is a regional
+/// resource, so the Region is part of the name it is known by — which is what lets
+/// one key id of a multi-Region set be named per Region. One builder for every key
+/// ARN, as [`alias_arn`] is for an alias.
+pub fn key_arn(region: &str, key_id: &str) -> String {
+    ::engine::emulator_arn(ARN_SERVICE, region, &format!("key/{key_id}"))
+}
+
 /// Whether a `KeyId`-shaped identifier names an ALIAS (`alias/<name>` or an alias
 /// ARN) rather than a key.
 ///
@@ -608,7 +621,11 @@ pub struct Cmk {
     pub key_spec: String,
     pub origin: String,
     pub key_manager: String,
-    pub multi_region: bool,
+    /// Which Region of this key's multi-Region key set holds its primary key and
+    /// which hold its replicas, or `None` for a single-Region key — see
+    /// [`MultiRegionTopology`]. `Some` is exactly what the `MultiRegion` metadata
+    /// member reports as `true`, so the two can never disagree.
+    pub multi_region_topology: Option<MultiRegionTopology>,
     /// The key policy document, as supplied or as defaulted by
     /// [`default_key_policy`].
     pub policy: String,
@@ -644,7 +661,7 @@ impl std::fmt::Debug for Cmk {
             .field("key_spec", &self.key_spec)
             .field("origin", &self.origin)
             .field("key_manager", &self.key_manager)
-            .field("multi_region", &self.multi_region)
+            .field("multi_region_topology", &self.multi_region_topology)
             .field("policy", &self.policy)
             .field("deletion_date", &self.deletion_date)
             .field("pending_window_in_days", &self.pending_window_in_days)
@@ -677,8 +694,14 @@ impl Cmk {
         tags: BTreeMap<String, String>,
         material: KeyMaterial,
     ) -> Self {
-        let arn = ::engine::emulator_arn(ARN_SERVICE, &region, &format!("key/{key_id}"));
+        let arn = key_arn(&region, &key_id);
         let awaiting_import = matches!(material, KeyMaterial::AwaitingImport);
+        // A `MultiRegion` create mints the PRIMARY key of a new set, in the Region
+        // it was created in: "creates a multi-Region primary key that you can
+        // replicate into other Amazon Web Services Regions"
+        // (`smithy_query(query="doc",shape="CreateKeyRequest",member="MultiRegion")`).
+        let multi_region_topology =
+            multi_region.then(|| MultiRegionTopology::primary_in(region.clone()));
         Self {
             key_id,
             arn,
@@ -696,7 +719,7 @@ impl Cmk {
             key_spec,
             origin,
             key_manager: KEY_MANAGER_CUSTOMER.to_string(),
-            multi_region,
+            multi_region_topology,
             policy,
             deletion_date: None,
             pending_window_in_days: None,
@@ -744,17 +767,14 @@ impl Cmk {
             encryption_algorithms: self.algorithms_under(KEY_USAGE_ENCRYPT_DECRYPT),
             signing_algorithms: self.algorithms_under(KEY_USAGE_SIGN_VERIFY),
             key_agreement_algorithms: self.algorithms_under(KEY_USAGE_KEY_AGREEMENT),
-            multi_region: Some(self.multi_region),
-            multi_region_configuration: self.multi_region.then(|| MultiRegionConfiguration {
-                multi_region_key_type: Some(MULTI_REGION_KEY_TYPE_PRIMARY.to_string()),
-                primary_key: Some(MultiRegionKey {
-                    arn: Some(self.arn.clone()),
-                    region: Some(self.region.clone()),
-                }),
-                // `ReplicateKey` is not implemented, so a primary key has no
-                // replicas to report.
-                replica_keys: Some(Vec::new()),
-            }),
+            multi_region: Some(self.is_multi_region()),
+            // Both members are projected from the one topology record, so which key
+            // of the set this is, which Region holds the primary and which hold the
+            // replicas are always reported in agreement.
+            multi_region_configuration: self
+                .multi_region_topology
+                .as_ref()
+                .map(|topology| topology.configuration(&self.key_id, &self.region)),
             pending_deletion_window_in_days: None,
             mac_algorithms: self.algorithms_under(KEY_USAGE_GENERATE_VERIFY_MAC),
             xks_key_configuration: None,
@@ -773,6 +793,12 @@ impl Cmk {
         Some(algorithms.iter().map(|name| (*name).to_string()).collect())
     }
 
+    /// Whether this key belongs to a multi-Region key set, which is what the
+    /// `MultiRegion` metadata member reports.
+    pub fn is_multi_region(&self) -> bool {
+        self.multi_region_topology.is_some()
+    }
+
     /// Whether this key can be used in a cryptographic operation right now.
     pub fn is_usable(&self) -> bool {
         self.enabled && self.key_state == KEY_STATE_ENABLED
@@ -784,6 +810,92 @@ impl Cmk {
     /// actually in.
     pub fn is_enableable(&self) -> bool {
         self.key_state == KEY_STATE_ENABLED || self.key_state == KEY_STATE_DISABLED
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-Region key sets
+// ---------------------------------------------------------------------------
+
+/// Which Region of one multi-Region key set holds its PRIMARY key, and which
+/// Regions hold its replica keys.
+///
+/// Every key of a multi-Region set shares one key id — "these KMS keys have the
+/// same key ID, key material, and other metadata"
+/// (`smithy_query(query="doc",shape="UpdatePrimaryRegion")`) — and this store holds
+/// one record per key id, so the set is ONE record and what distinguishes its
+/// members is the Region each of them lives in. Exactly one Region holds the
+/// primary key at any instant; every other Region named here holds a replica of
+/// it, and which is which is what `MultiRegionConfiguration` reports.
+#[derive(Debug, Clone)]
+pub struct MultiRegionTopology {
+    /// The Region holding the set's primary key: the Region a `MultiRegion` create
+    /// minted it in, until `UpdatePrimaryRegion` moves the designation elsewhere.
+    pub primary_region: String,
+    /// The Regions holding a replica key of the set. Sorted, so a reader reports
+    /// the replicas in a stable order across calls.
+    pub replica_regions: BTreeSet<String>,
+}
+
+impl MultiRegionTopology {
+    /// A freshly minted multi-Region primary key's topology: primary in the Region
+    /// it was created in, with no replica anywhere until one is created in another
+    /// Region.
+    pub fn primary_in(region: String) -> Self {
+        Self {
+            primary_region: region,
+            replica_regions: BTreeSet::new(),
+        }
+    }
+
+    /// Make the replica key in `region` this set's primary key and the former
+    /// primary key a replica, answering whether that Region held a replica to
+    /// promote at all.
+    ///
+    /// "This operation changes the replica key in the specified Region to a primary
+    /// key and changes the former primary key to a replica key"
+    /// (`smithy_query(query="doc",shape="UpdatePrimaryRegion")`), so the two moves
+    /// are one step: the set never has two primary keys, nor none. A Region holding
+    /// no replica of the set — including the one that already holds the primary key
+    /// — has nothing to promote and leaves the topology exactly as it was.
+    pub fn promote(&mut self, region: &str) -> bool {
+        if !self.replica_regions.remove(region) {
+            return false;
+        }
+        let former_primary = std::mem::replace(&mut self.primary_region, region.to_string());
+        self.replica_regions.insert(former_primary);
+        true
+    }
+
+    /// This set as the `MultiRegionConfiguration` of the key `region`'s endpoint
+    /// serves: that key is the set's primary exactly when the primary Region is its
+    /// own, and `ReplicaKeys` names every Region holding a replica, each by the key
+    /// ARN that Region's endpoint serves it under.
+    pub fn configuration(&self, key_id: &str, region: &str) -> MultiRegionConfiguration {
+        let key_type = if self.primary_region == region {
+            MULTI_REGION_KEY_TYPE_PRIMARY
+        } else {
+            MULTI_REGION_KEY_TYPE_REPLICA
+        };
+        MultiRegionConfiguration {
+            multi_region_key_type: Some(key_type.to_string()),
+            primary_key: Some(multi_region_member(key_id, &self.primary_region)),
+            replica_keys: Some(
+                self.replica_regions
+                    .iter()
+                    .map(|replica| multi_region_member(key_id, replica))
+                    .collect(),
+            ),
+        }
+    }
+}
+
+/// One key of a multi-Region set, as `MultiRegionConfiguration` names it: the
+/// Region it lives in, and the key ARN that Region's endpoint serves it under.
+fn multi_region_member(key_id: &str, region: &str) -> MultiRegionKey {
+    MultiRegionKey {
+        arn: Some(key_arn(region, key_id)),
+        region: Some(region.to_string()),
     }
 }
 

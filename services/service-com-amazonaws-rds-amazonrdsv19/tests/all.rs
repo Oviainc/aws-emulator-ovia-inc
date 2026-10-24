@@ -65,3 +65,5 @@ mod query_catalog_reads;
 mod query_error_envelope;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/valid_db_instance_modifications.rs"]
+mod valid_db_instance_modifications;

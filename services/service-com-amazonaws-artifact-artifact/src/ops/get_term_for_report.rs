@@ -4,15 +4,20 @@
 //! Serves the term document attached to one report version, and MINTS the `termToken`
 //! that document is served under — "a unique token representing this request event", as
 //! the model puts it, and the acceptance receipt `GetReport` requires. The grant is
-//! persisted in [`crate::state`] so `GetReport` can check a token against the report and
-//! version it was issued for; minting it is what this operation DOES, not a side effect
-//! of reading, and no earlier grant is altered or consumed.
+//! persisted in [`crate::state`] so `GetReport` can check a token against the TERM it
+//! covers; minting it is what this operation DOES, not a side effect of reading, and no
+//! earlier grant is altered or consumed.
+//!
+//! A `reportId` the catalog does not hold is refused by the front door's 401
+//! `UnauthorizedException`, because AWS Artifact authorises the report resource before
+//! looking it up; `ResourceNotFoundException` is left for a VERSION a reachable report
+//! never published.
 //!
 //! The grant store is bounded (`crate::state::TERM_GRANT_CAPACITY`), oldest released
 //! first, so repeated acceptance cannot grow the state without end. The emulator models
 //! no IAM, so the modelled `AccessDeniedException` is never raised here, and the grant
-//! records the report version it covers rather than a principal: a pass is not a
-//! statement about an AWS-side authorisation decision.
+//! records the term it covers rather than a principal: a pass is not a statement about
+//! an AWS-side authorisation decision.
 //!
 //! The report catalog IS the account's entitlement, though: AWS Artifact is served
 //! through a gateway that authorizes the report the request targets before the service
@@ -173,7 +178,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let region = crate::state::request_region(ctx.parts());
+        // The URL announced below names the endpoint the CALLER reached this emulator
+        // on, because this emulator serves the document it points at.
+        let host = crate::state::document_url_host(ctx.parts());
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
@@ -186,23 +193,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::unauthorized());
         };
         let Some(version) = report.resolve(input.report_version) else {
-            // Total in both shapes: the request either named a version this report never
-            // published, or named none and the report publishes none at all. Nothing a
-            // request carries may abort the handler, so neither arm unwraps.
-            let missing = match input.report_version {
-                Some(requested) => {
-                    crate::state::report_version_not_found(&input.report_id, requested)
-                }
-                None => crate::state::report_not_found(&input.report_id),
-            };
+            // The report is reachable; this version of it does not exist.
+            let missing =
+                crate::state::report_version_not_found(&input.report_id, input.report_version);
             return Err(GetTermForReportErrorModeled::ResourceNotFoundException(missing).into());
         };
         let resolved_version = version.version;
         let report = report.clone();
 
-        let term_token = store.mint_term_grant(&report.id, resolved_version, now);
+        let term_token = store.mint_term_grant(&report, resolved_version, now);
         let document_presigned_url =
-            crate::state::term_document_url(&region, &report, resolved_version, &term_token);
+            crate::state::term_document_url(&host, &report, resolved_version, &term_token);
 
         // The acceptance is a state change, so it is attributable: the report version
         // accepted, never the token itself.
