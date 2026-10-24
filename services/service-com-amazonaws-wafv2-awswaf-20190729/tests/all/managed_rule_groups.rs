@@ -24,7 +24,7 @@ use service_com_amazonaws_wafv2_awswaf_20190729::state::{
 use crate::web_acl_lifecycle::{create_web_acl, sqli_statement, visibility, Waf};
 
 /// A `ManagedRuleGroupStatement` for `(vendor, name)`.
-fn managed_statement(vendor: &str, name: &str) -> Value {
+pub(crate) fn managed_statement(vendor: &str, name: &str) -> Value {
     json!({
         "ManagedRuleGroupStatement": { "VendorName": vendor, "Name": name }
     })

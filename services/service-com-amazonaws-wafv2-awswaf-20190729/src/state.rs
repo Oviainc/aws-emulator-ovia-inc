@@ -1123,17 +1123,29 @@ pub fn validate_cidr(address: &str, ip_address_version: &str) -> Result<(), Stri
 /// statement naming a group the catalogue does not list is refused on ingress by
 /// the same resolution, so this function never has to price a statement whose cost
 /// it cannot know and no caller is handed an understated `Capacity`.
+///
+/// Every term is added with SATURATING arithmetic: one of them — a referenced rule
+/// group's declared `Capacity` — is caller-supplied and modelled `range 1..`, so a
+/// rule list referencing enough expensive groups could drive the sum past
+/// `i64::MAX`. Saturating at the modelled maximum answers a capacity that is simply
+/// above any limit, where wrapping would answer a NEGATIVE capacity (which
+/// `ConsumedCapacity` is `range 0..`) and overflow-checked arithmetic would panic on
+/// a request.
+///
+/// What this reports decides a SAVE as well as a report: `CheckCapacity` publishes
+/// it, and `CreateRuleGroup` refuses a rule list that needs more than the
+/// `Capacity` the request declares ("WAF enforces this limit"). So a figure below
+/// publishes an understated price, and a figure ABOVE the published cost of its
+/// statement kind would refuse a save WAF accepts — re-price and re-read that
+/// refusal together.
 pub fn web_acl_capacity(rules: &[Rule], rule_group_capacities: &HashMap<String, i64>) -> i64 {
-    rules
-        .iter()
-        .map(|rule| {
-            statement_capacity(
-                &rule.statement,
-                MAX_STATEMENT_NESTING_DEPTH,
-                rule_group_capacities,
-            )
-        })
-        .sum()
+    rules.iter().fold(0_i64, |total, rule| {
+        total.saturating_add(statement_capacity(
+            &rule.statement,
+            MAX_STATEMENT_NESTING_DEPTH,
+            rule_group_capacities,
+        ))
+    })
 }
 
 /// The WCUs one `ByteMatchStatement` consumes.
@@ -1182,9 +1194,10 @@ fn statement_capacity(
     if depth_budget == 0 {
         return 0;
     }
+    // Every term is added with saturating arithmetic; see [`web_acl_capacity`].
     let mut capacity = 0_i64;
     if statement.byte_match_statement.is_some() {
-        capacity += BYTE_MATCH_WCU;
+        capacity = capacity.saturating_add(BYTE_MATCH_WCU);
     }
     // Base cost 1: size constraint, geo match, IP set reference, label match and
     // ASN match statements.
@@ -1196,53 +1209,61 @@ fn statement_capacity(
         statement.asn_match_statement.is_some(),
     ] {
         if present {
-            capacity += 1;
+            capacity = capacity.saturating_add(1);
         }
     }
     if statement.sqli_match_statement.is_some() {
-        capacity += 20;
+        capacity = capacity.saturating_add(20);
     }
     if statement.xss_match_statement.is_some() {
-        capacity += 40;
+        capacity = capacity.saturating_add(40);
     }
     if statement.regex_match_statement.is_some() {
-        capacity += 3;
+        capacity = capacity.saturating_add(3);
     }
     if statement.regex_pattern_set_reference_statement.is_some() {
-        capacity += 25;
+        capacity = capacity.saturating_add(25);
     }
     // A rate-based statement costs `RATE_BASED_WCU` on its own, plus
     // `RATE_BASED_CUSTOM_KEYS_WCU` when it aggregates on custom keys; every nesting
     // (logical operator or scope-down) costs what it nests, which
     // `nested_statements` enumerates.
     if let Some(rate) = statement.rate_based_statement.as_ref() {
-        capacity += RATE_BASED_WCU;
+        capacity = capacity.saturating_add(RATE_BASED_WCU);
         if !rate.custom_keys.as_deref().unwrap_or_default().is_empty() {
-            capacity += RATE_BASED_CUSTOM_KEYS_WCU;
+            capacity = capacity.saturating_add(RATE_BASED_CUSTOM_KEYS_WCU);
         }
     }
     // A rule group reference costs the referenced group's declared capacity, which
     // `rule_group_capacities` carries for every rule group of this scope. A
     // reference naming one this service does not hold never reaches here.
     if let Some(reference) = statement.rule_group_reference_statement.as_ref() {
-        capacity += rule_group_capacities
-            .get(&reference.arn)
-            .copied()
-            .unwrap_or_default();
+        capacity = capacity.saturating_add(
+            rule_group_capacities
+                .get(&reference.arn)
+                .copied()
+                .unwrap_or_default(),
+        );
     }
     // A managed rule group reference costs the published capacity of the group it
     // names. A statement naming a group the catalogue does not list never reaches
     // here.
     if let Some(managed) = statement.managed_rule_group_statement.as_ref() {
-        capacity += managed_rule_group(&managed.vendor_name, &managed.name)
-            .map(|group| group.capacity)
-            .unwrap_or_default();
+        capacity = capacity.saturating_add(
+            managed_rule_group(&managed.vendor_name, &managed.name)
+                .map(|group| group.capacity)
+                .unwrap_or_default(),
+        );
     }
-    capacity += nested_statements(statement)
+    nested_statements(statement)
         .into_iter()
-        .map(|nested| statement_capacity(nested, depth_budget - 1, rule_group_capacities))
-        .sum::<i64>();
-    capacity
+        .fold(capacity, |total, nested| {
+            total.saturating_add(statement_capacity(
+                nested,
+                depth_budget - 1,
+                rule_group_capacities,
+            ))
+        })
 }
 
 /// The `Description` a WAFv2 entity reports when the save that created it supplied

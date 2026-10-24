@@ -59,7 +59,7 @@ fn label_summaries(names: &[&str]) -> Value {
 }
 
 /// A `ByteMatchStatement` over the URI path.
-fn byte_match_statement() -> Value {
+pub(crate) fn byte_match_statement() -> Value {
     json!({
         "ByteMatchStatement": {
             "SearchString": "YQ==",
@@ -129,7 +129,7 @@ fn create_body(
 }
 
 /// Create a rule group and answer `(id, arn, lock token)`.
-async fn create_rule_group(
+pub(crate) async fn create_rule_group(
     waf: &Waf,
     scope: &str,
     name: &str,
