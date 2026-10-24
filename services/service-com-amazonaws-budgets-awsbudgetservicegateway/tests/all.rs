@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/budget_action_execution.rs"]
 mod budget_action_execution;
+#[path = "all/budget_action_history.rs"]
+mod budget_action_history;
 #[path = "all/budget_lifecycle.rs"]
 mod budget_lifecycle;
 #[path = "all/budget_read_projection.rs"]
