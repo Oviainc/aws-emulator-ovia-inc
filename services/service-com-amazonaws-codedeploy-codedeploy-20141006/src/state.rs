@@ -1323,8 +1323,64 @@ struct BuiltinDeploymentConfig {
     compute_platform: &'static str,
     /// `minimumHealthyHosts` as (type, value), for the EC2/on-premises built-ins.
     minimum_healthy_hosts: Option<(&'static str, i32)>,
-    /// `trafficRoutingConfig.type`, for the Lambda and ECS built-ins.
-    traffic_routing: Option<&'static str>,
+    /// `trafficRoutingConfig`, for the Lambda and ECS built-ins.
+    traffic_routing: Option<BuiltinTrafficRouting>,
+}
+
+/// How a built-in on the Lambda or Amazon ECS compute platform shifts traffic:
+/// one of the model's `TrafficRoutingType` values
+/// (`smithy_query(query="shape",shape="TrafficRoutingType")`: TimeBasedCanary |
+/// TimeBasedLinear | AllAtOnce), carrying the percentage and the interval the
+/// time-based ones shift it over.
+#[derive(Debug, Clone, Copy)]
+enum BuiltinTrafficRouting {
+    /// The whole fleet of traffic at once, so there is no percentage or interval
+    /// to carry.
+    AllAtOnce,
+    /// `timeBasedCanary`: `canaryPercentage` of the traffic shifted first, the
+    /// rest `canaryInterval` minutes later. Both members are modelled in those
+    /// units — "the percentage of traffic to shift in the first increment" and
+    /// "the number of minutes between the first and second traffic shifts"
+    /// (`smithy_query(query="shape",shape="TimeBasedCanary")`).
+    TimeBasedCanary { percentage: i32, interval: i32 },
+    /// `timeBasedLinear`: `linearPercentage` of the traffic shifted at the start
+    /// of each increment, `linearInterval` minutes between increments
+    /// (`smithy_query(query="shape",shape="TimeBasedLinear")`).
+    TimeBasedLinear { percentage: i32, interval: i32 },
+}
+
+impl BuiltinTrafficRouting {
+    /// This routing as the modelled `TrafficRoutingConfig` a reader answers.
+    fn to_config(self) -> TrafficRoutingConfig {
+        match self {
+            Self::AllAtOnce => TrafficRoutingConfig {
+                r#type: Some("AllAtOnce".to_string()),
+                ..Default::default()
+            },
+            Self::TimeBasedCanary {
+                percentage,
+                interval,
+            } => TrafficRoutingConfig {
+                r#type: Some("TimeBasedCanary".to_string()),
+                time_based_canary: Some(crate::ops::types::TimeBasedCanary {
+                    canary_percentage: percentage,
+                    canary_interval: interval,
+                }),
+                time_based_linear: None,
+            },
+            Self::TimeBasedLinear {
+                percentage,
+                interval,
+            } => TrafficRoutingConfig {
+                r#type: Some("TimeBasedLinear".to_string()),
+                time_based_canary: None,
+                time_based_linear: Some(crate::ops::types::TimeBasedLinear {
+                    linear_percentage: percentage,
+                    linear_interval: interval,
+                }),
+            },
+        }
+    }
 }
 
 /// The built-in deployment configurations CodeDeploy ships, with the
@@ -1332,6 +1388,12 @@ struct BuiltinDeploymentConfig {
 /// documents for each ("Deployment configurations on an EC2/on-premises compute
 /// platform" and "Deployment configurations on an AWS Lambda or Amazon ECS
 /// compute platform").
+///
+/// Every one of them resolves for every account without being created, so the
+/// whole catalog is seeded — not only the all-at-once entry of each platform:
+/// the time-based (canary and linear) traffic-shifting configurations are what a
+/// Lambda or Amazon ECS client names to deploy gradually, and no client creates
+/// them first.
 const BUILTIN_DEPLOYMENT_CONFIGS: &[BuiltinDeploymentConfig] = &[
     BuiltinDeploymentConfig {
         name: "CodeDeployDefault.OneAtATime",
@@ -1355,13 +1417,125 @@ const BUILTIN_DEPLOYMENT_CONFIGS: &[BuiltinDeploymentConfig] = &[
         name: "CodeDeployDefault.LambdaAllAtOnce",
         compute_platform: "Lambda",
         minimum_healthy_hosts: None,
-        traffic_routing: Some("AllAtOnce"),
+        traffic_routing: Some(BuiltinTrafficRouting::AllAtOnce),
+    },
+    BuiltinDeploymentConfig {
+        name: "CodeDeployDefault.LambdaCanary10Percent5Minutes",
+        compute_platform: "Lambda",
+        minimum_healthy_hosts: None,
+        traffic_routing: Some(BuiltinTrafficRouting::TimeBasedCanary {
+            percentage: 10,
+            interval: 5,
+        }),
+    },
+    BuiltinDeploymentConfig {
+        name: "CodeDeployDefault.LambdaCanary10Percent10Minutes",
+        compute_platform: "Lambda",
+        minimum_healthy_hosts: None,
+        traffic_routing: Some(BuiltinTrafficRouting::TimeBasedCanary {
+            percentage: 10,
+            interval: 10,
+        }),
+    },
+    BuiltinDeploymentConfig {
+        name: "CodeDeployDefault.LambdaCanary10Percent15Minutes",
+        compute_platform: "Lambda",
+        minimum_healthy_hosts: None,
+        traffic_routing: Some(BuiltinTrafficRouting::TimeBasedCanary {
+            percentage: 10,
+            interval: 15,
+        }),
+    },
+    BuiltinDeploymentConfig {
+        name: "CodeDeployDefault.LambdaCanary10Percent30Minutes",
+        compute_platform: "Lambda",
+        minimum_healthy_hosts: None,
+        traffic_routing: Some(BuiltinTrafficRouting::TimeBasedCanary {
+            percentage: 10,
+            interval: 30,
+        }),
+    },
+    // The one-minute Lambda linear built-in is spelled "Minute", singular, as
+    // the User Guide's table spells it; the others are "Minutes".
+    BuiltinDeploymentConfig {
+        name: "CodeDeployDefault.LambdaLinear10PercentEvery1Minute",
+        compute_platform: "Lambda",
+        minimum_healthy_hosts: None,
+        traffic_routing: Some(BuiltinTrafficRouting::TimeBasedLinear {
+            percentage: 10,
+            interval: 1,
+        }),
+    },
+    BuiltinDeploymentConfig {
+        name: "CodeDeployDefault.LambdaLinear10PercentEvery2Minutes",
+        compute_platform: "Lambda",
+        minimum_healthy_hosts: None,
+        traffic_routing: Some(BuiltinTrafficRouting::TimeBasedLinear {
+            percentage: 10,
+            interval: 2,
+        }),
+    },
+    BuiltinDeploymentConfig {
+        name: "CodeDeployDefault.LambdaLinear10PercentEvery3Minutes",
+        compute_platform: "Lambda",
+        minimum_healthy_hosts: None,
+        traffic_routing: Some(BuiltinTrafficRouting::TimeBasedLinear {
+            percentage: 10,
+            interval: 3,
+        }),
+    },
+    BuiltinDeploymentConfig {
+        name: "CodeDeployDefault.LambdaLinear10PercentEvery10Minutes",
+        compute_platform: "Lambda",
+        minimum_healthy_hosts: None,
+        traffic_routing: Some(BuiltinTrafficRouting::TimeBasedLinear {
+            percentage: 10,
+            interval: 10,
+        }),
     },
     BuiltinDeploymentConfig {
         name: "CodeDeployDefault.ECSAllAtOnce",
         compute_platform: "ECS",
         minimum_healthy_hosts: None,
-        traffic_routing: Some("AllAtOnce"),
+        traffic_routing: Some(BuiltinTrafficRouting::AllAtOnce),
+    },
+    BuiltinDeploymentConfig {
+        name: "CodeDeployDefault.ECSCanary10Percent5Minutes",
+        compute_platform: "ECS",
+        minimum_healthy_hosts: None,
+        traffic_routing: Some(BuiltinTrafficRouting::TimeBasedCanary {
+            percentage: 10,
+            interval: 5,
+        }),
+    },
+    BuiltinDeploymentConfig {
+        name: "CodeDeployDefault.ECSCanary10Percent15Minutes",
+        compute_platform: "ECS",
+        minimum_healthy_hosts: None,
+        traffic_routing: Some(BuiltinTrafficRouting::TimeBasedCanary {
+            percentage: 10,
+            interval: 15,
+        }),
+    },
+    // The Amazon ECS linear built-ins are both spelled "Minutes", the
+    // one-minute one included, as the User Guide's table spells them.
+    BuiltinDeploymentConfig {
+        name: "CodeDeployDefault.ECSLinear10PercentEvery1Minutes",
+        compute_platform: "ECS",
+        minimum_healthy_hosts: None,
+        traffic_routing: Some(BuiltinTrafficRouting::TimeBasedLinear {
+            percentage: 10,
+            interval: 1,
+        }),
+    },
+    BuiltinDeploymentConfig {
+        name: "CodeDeployDefault.ECSLinear10PercentEvery3Minutes",
+        compute_platform: "ECS",
+        minimum_healthy_hosts: None,
+        traffic_routing: Some(BuiltinTrafficRouting::TimeBasedLinear {
+            percentage: 10,
+            interval: 3,
+        }),
     },
 ];
 
@@ -1423,12 +1597,9 @@ impl ComAmazonawsCodedeployCodedeploy20141006State {
                         value,
                     }
                 }),
-                traffic_routing_config: builtin.traffic_routing.map(|kind| {
-                    TrafficRoutingConfig {
-                        r#type: Some(kind.to_string()),
-                        ..Default::default()
-                    }
-                }),
+                traffic_routing_config: builtin
+                    .traffic_routing
+                    .map(BuiltinTrafficRouting::to_config),
                 zonal_config: None,
                 compute_platform: builtin.compute_platform.to_string(),
                 create_time_ms: now_ms,

@@ -22,8 +22,11 @@ use service_com_amazonaws_apigateway_backplanecontrolservice::ops::types::GATEWA
 
 use crate::rest_api_lifecycle::{assert_failure, create_api, Answer, Gateway};
 
-/// `PutGatewayResponse` for `response_type` on `api`. Shared with the sibling
-/// `gateway_response_collection` suite, which customizes types before listing them.
+/// `PutGatewayResponse` for `response_type` on `api`.
+///
+/// Shared with the sibling `gateway_response_collection` suite, which customizes types
+/// before listing them, and with `control_plane_deletes`, which clears the
+/// customizations it puts — so every suite writes one the same way.
 pub(crate) async fn put_gateway_response(
     gateway: &Gateway,
     api: &str,
@@ -40,7 +43,8 @@ pub(crate) async fn put_gateway_response(
 }
 
 /// `GetGatewayResponse` for `response_type` on `api`. Shared with the sibling
-/// `gateway_response_collection` suite, which compares a single read with the listing.
+/// `gateway_response_collection` suite, which compares a single read with the listing,
+/// and with `control_plane_deletes`; see [`put_gateway_response`].
 pub(crate) async fn get_gateway_response(
     gateway: &Gateway,
     api: &str,
@@ -503,13 +507,13 @@ async fn a_request_outside_a_modelled_constraint_is_refused_and_stores_nothing()
         assert_failure(
             &put_gateway_response(&gateway, &api, response_type, json!({})).await,
             400,
-            "ValidationException",
+            "BadRequestException",
             &format!("PutGatewayResponse({response_type})"),
         );
         assert_failure(
             &get_gateway_response(&gateway, &api, response_type).await,
             400,
-            "ValidationException",
+            "BadRequestException",
             &format!("GetGatewayResponse({response_type})"),
         );
     }
@@ -527,7 +531,7 @@ async fn a_request_outside_a_modelled_constraint_is_refused_and_stores_nothing()
             )
             .await,
             400,
-            "ValidationException",
+            "BadRequestException",
             &format!("PutGatewayResponse(statusCode {status})"),
         );
     }

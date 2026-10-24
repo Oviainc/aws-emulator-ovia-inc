@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteIntegrationResponse
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteIntegrationResponse`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteIntegrationResponse::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -76,6 +67,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use super::put_method::method_key;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -173,18 +166,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteIntegrationResponse` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteIntegrationResponseErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteIntegrationResponse"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let mut store = state.lock();
+
+        // Every identifier the request carries is resolved against stored state before
+        // anything is removed, each naming its own record so the refusal says which one
+        // was not found — the same walk `GetIntegrationResponse` reads the record
+        // through.
+        let api = store
+            .rest_apis
+            .get_mut(&input.rest_api_id)
+            .ok_or_else(|| not_found(&crate::state::no_such_rest_api(&input.rest_api_id)))?;
+        let resource = api
+            .resources
+            .get_mut(&input.resource_id)
+            .ok_or_else(|| not_found(crate::state::NO_SUCH_RESOURCE))?;
+        let method = resource
+            .methods
+            .get_mut(&method_key(&input.http_method))
+            .ok_or_else(|| not_found(crate::state::NO_SUCH_METHOD))?;
+        // A method with no integration carries no integration responses either: the
+        // identifiers in the URI name a record that does not exist.
+        let integration = method
+            .integration
+            .as_mut()
+            .ok_or_else(|| not_found(crate::state::NO_SUCH_INTEGRATION))?;
+        // A status code names at most one response of an integration, under the key
+        // `PutIntegrationResponse` stored it with; removing it is what makes a later read
+        // — and the owning integration's `integrationResponses` — stop reporting it. A
+        // status code that names no response is nothing to delete, so the call is refused
+        // rather than answering a silent success. The refusal is
+        // `NO_SUCH_METHOD_RESPONSE`: a method response and an integration response are
+        // keyed by the same `StatusCode`, so this service says the same thing about a
+        // status code that names neither (see that constant's own documentation).
+        let removed = integration
+            .integration_responses
+            .as_mut()
+            .and_then(|responses| responses.remove(&input.status_code));
+        if removed.is_none() {
+            return Err(not_found(crate::state::NO_SUCH_METHOD_RESPONSE));
+        }
+        // An integration reports its `integrationResponses` only while it has one, the
+        // way every other caller-sized map of this surface is reported: absent once its
+        // last entry is removed, which is exactly what `crate::state::non_empty_map`
+        // means by an empty map, so the two cannot drift.
+        integration.integration_responses =
+            crate::state::non_empty_map(integration.integration_responses.take());
+        // The lock covers the state change only; everything below is owned.
+        drop(store);
+        // The access record for a state-changing operation: who, what, and the outcome,
+        // the way the sibling deletes of this service record theirs. Metadata only —
+        // never a request body.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            rest_api_id = ?input.rest_api_id,
+            resource_id = ?input.resource_id,
+            http_method = ?input.http_method,
+            status_code = ?input.status_code,
+            outcome = "deleted",
+            "integration response deleted",
+        );
+        Ok(DeleteIntegrationResponseOutput)
     }
+}
+
+/// Refuse a request naming a record that does not exist, with the message this service
+/// shares for that identifier.
+fn not_found(message: &str) -> DeleteIntegrationResponseError {
+    DeleteIntegrationResponseErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }

@@ -354,9 +354,10 @@ async fn a_patch_this_service_cannot_apply_is_refused_and_changes_nothing() {
         );
     }
 
-    // An `op` the model's `Op` enum does not declare is refused by the modelled-value    // check the request walk runs BEFORE the handler, so it answers that refusal's
-    // `ValidationException` rather than this operation's `BadRequestException` — and
-    // the record is left alone just the same.
+    // An `op` the model's `Op` enum does not declare is refused by the modelled-value
+    // check the request walk runs BEFORE the handler, which names the same
+    // `BadRequestException` this operation's own refusals do — and the record is left
+    // alone just the same.
     let (id, _) = baseline(&gateway, "an off-model op").await;
     let answer = patch(
         &gateway,
@@ -364,7 +365,7 @@ async fn a_patch_this_service_cannot_apply_is_refused_and_changes_nothing() {
         vec![json!({ "op": "upsert", "path": "/name", "value": "x" })],
     )
     .await;
-    assert_failure(&answer, 400, "ValidationException", "an off-model op");
+    assert_failure(&answer, 400, "BadRequestException", "an off-model op");
     let read = get_key(&gateway, &id, false).await;
     assert_members(&read.body, &baseline_members, "an off-model op", "GetApiKey");
 

@@ -212,25 +212,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         // `deploymentWaitType` is a modelled value set, so the boundary already
-        // refused anything outside it in this service's own words; what is left
-        // here is a request that named NO wait to continue past, which is what
-        // `InvalidDeploymentWaitTypeException` ("The wait type is invalid")
-        // answers — a blue/green deployment has two waits, so which of them to
-        // continue past is not something this service can choose for the caller.
+        // refused anything outside it in this service's own words. Which wait
+        // the caller named is a question about the REQUEST, so it is answered
+        // only once the deployment the request names has been resolved below:
+        // whether this deployment can be continued at all is settled first.
         let wait_type = input.deployment_wait_type.unwrap_or_default();
-        if wait_type.trim().is_empty() {
-            return Err(
-                ContinueDeploymentErrorModeled::InvalidDeploymentWaitTypeException(
-                    InvalidDeploymentWaitTypeException {
-                        message: Some(format!(
-                            "The deployment wait type was not specified: it must be \
-                             {READY_WAIT} or {TERMINATION_WAIT}"
-                        )),
-                    },
-                )
-                .into(),
-            );
-        }
 
         let outcome = crate::state::with_state(&*self.engine, |state| {
             let Some(deployment) = state.deployments.get_mut(&deployment_id) else {
@@ -267,6 +253,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             message: Some(format!(
                                 "The deployment {deployment_id} is already complete with status {}",
                                 deployment.status
+                            )),
+                        },
+                    ),
+                );
+            }
+            // Only now that the deployment itself is one that CAN be continued is
+            // the wait the request named judged: a request that named NO wait to
+            // continue past is what `InvalidDeploymentWaitTypeException` ("The
+            // wait type is invalid") answers — a blue/green deployment has two
+            // waits, so which of them to continue past is not something this
+            // service can choose for the caller.
+            if wait_type.trim().is_empty() {
+                return Err(
+                    ContinueDeploymentErrorModeled::InvalidDeploymentWaitTypeException(
+                        InvalidDeploymentWaitTypeException {
+                            message: Some(format!(
+                                "The deployment wait type was not specified: it must be \
+                                 {READY_WAIT} or {TERMINATION_WAIT}"
                             )),
                         },
                     ),
