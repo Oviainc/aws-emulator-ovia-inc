@@ -252,13 +252,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .tokens_of(crate::state::TokenScope::CreateStream)
                 .verdict(token, &fingerprint)
             {
-                crate::state::TokenVerdict::Replay(stream_identifier) => {
+                crate::state::TokenVerdict::Replay(recorded) => {
                     if let Some(existing) = state
                         .clusters
                         .get(&input.cluster_identifier)
-                        .and_then(|cluster| cluster.streams.get(&stream_identifier))
+                        .and_then(|cluster| cluster.streams.get(&recorded.resource))
                     {
-                        return Ok(created_stream_output(&input.cluster_identifier, existing));
+                        let mut answer =
+                            created_stream_output(&input.cluster_identifier, existing);
+                        // The status this call answered: the clock settles the
+                        // stream to `ACTIVE` afterwards, which is not what this
+                        // request produced.
+                        if let Some(status) = recorded.answered(crate::state::STATUS_MEMBER) {
+                            answer.status = status.to_string();
+                        }
+                        return Ok(answer);
                     }
                 }
                 crate::state::TokenVerdict::Mismatch => {
@@ -337,7 +345,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(token) = input.client_token {
             state
                 .tokens(crate::state::TokenScope::CreateStream)
-                .record(token, fingerprint, &stream_identifier);
+                .record(
+                    token,
+                    fingerprint,
+                    crate::state::RecordedCall::new(&stream_identifier)
+                        .answering(crate::state::STATUS_MEMBER, &created.status),
+                );
         }
         Ok(created)
     }

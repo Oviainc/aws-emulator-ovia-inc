@@ -22,8 +22,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use service_com_amazonaws_devopsguru_capstonecontrolplaneservice::state::{
-    ComAmazonawsDevopsguruCapstonecontrolplaneserviceState, InsightRecord, MAX_COVERED_STACK_NAMES,
-    MAX_NOTIFICATION_CHANNELS, MAX_TAG_VALUES_PER_KEY, PAGE_SIZE,
+    AnomalyRecord, ComAmazonawsDevopsguruCapstonecontrolplaneserviceState, InsightRecord,
+    MAX_COVERED_STACK_NAMES, MAX_NOTIFICATION_CHANNELS, MAX_TAG_VALUES_PER_KEY, PAGE_SIZE,
 };
 
 /// Host that routes a request to this service: `resolve_route_key` falls back to the
@@ -102,6 +102,19 @@ impl Emulator {
         let mut guard = state.lock();
         for record in records {
             guard.insights.insert(record.id.clone(), record);
+        }
+    }
+
+    /// Put `records` in the store's `anomalies` map, the same way [`Self::seed_insights`]
+    /// seeds the insights: DevOps Guru detects an anomaly through its own analysis, so no
+    /// client call creates one. Keyed by `AnomalyRecord::id`, which is the map's key.
+    pub(crate) fn seed_anomalies(&self, records: Vec<AnomalyRecord>) {
+        let state = self
+            .engine
+            .state::<ComAmazonawsDevopsguruCapstonecontrolplaneserviceState>();
+        let mut guard = state.lock();
+        for record in records {
+            guard.anomalies.insert(record.id.clone(), record);
         }
     }
 

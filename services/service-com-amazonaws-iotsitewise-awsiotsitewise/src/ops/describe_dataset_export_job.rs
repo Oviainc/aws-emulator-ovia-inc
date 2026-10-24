@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDatasetExportJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDatasetExportJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDatasetExportJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -166,20 +157,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDatasetExportJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDatasetExportJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDatasetExportJob"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeDatasetExportJobError::Modeled(
+                DescribeDatasetExportJobErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: "the IoT SiteWise store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        let key = crate::state::dataset_export_job_key(&input.workspace_name, &input.job_id);
+        // A read, so nothing here writes: how far the job has got is DERIVED from the
+        // instant the create started it, which is why two readers of one job cannot
+        // disagree and a read cannot move a job on.
+        let store = state.lock();
+        let record = store
+            .dataset_export_jobs
+            .get(&key)
+            .ok_or_else(|| not_found(&input.job_id))?;
+
+        Ok(DescribeDatasetExportJobOutput {
+            job_id: record.job_id.clone(),
+            workspace_name: record.workspace_name.clone(),
+            status: record.status(now).to_string(),
+            started_at: crate::state::to_date_time(record.started_at),
+            completed_at: record.completed_at(now).map(crate::state::to_date_time),
+            destination_s3_uri: record.destination_s3_uri.clone(),
+            error_report_location: record.error_report_location.clone(),
+            input: record.input.clone(),
+        })
     }
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the job the request addressed. A
+/// job is addressed within a workspace, so this is also what a job of ANOTHER
+/// workspace answers.
+fn not_found(job_id: &str) -> DescribeDatasetExportJobError {
+    DescribeDatasetExportJobError::Modeled(
+        DescribeDatasetExportJobErrorModeled::ResourceNotFoundException(
+            ResourceNotFoundException {
+                message: crate::state::not_found_message(
+                    crate::state::RESOURCE_DATASET_EXPORT_JOB,
+                    job_id,
+                ),
+            },
+        ),
+    )
 }
