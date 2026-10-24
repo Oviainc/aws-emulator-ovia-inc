@@ -76,12 +76,24 @@ pub(crate) fn recovery_point(
     }
 }
 
-/// Put `points` in the store as the recovery points this account holds. Nothing in THIS
-/// service creates one — the Backup data plane does — so a test that needs a scope to
-/// resolve to something seeds them, exactly as the store would hold them.
+/// Put `points` in the store as the recovery points this account holds, each with an
+/// EMPTY backup index. Nothing in THIS service creates one — the Backup data plane does —
+/// so a test that needs a scope to resolve to something seeds them, exactly as the store
+/// would hold them. A test that needs the ITEM layer too seeds the items with
+/// [`seed_indexed_recovery_points`].
 pub(crate) fn seed_recovery_points(
     engine: &engine::InMemoryEngine,
     points: Vec<types::SearchJobBackupsResult>,
+) {
+    seed_indexed_recovery_points(engine, points.into_iter().map(Into::into).collect());
+}
+
+/// Put `points` in the store as the recovery points this account holds, each with the
+/// items its backup index holds — the layer a job's `ItemFilters` select from and
+/// `ListSearchJobResults` pages.
+pub(crate) fn seed_indexed_recovery_points(
+    engine: &engine::InMemoryEngine,
+    points: Vec<state::IndexedRecoveryPoint>,
 ) {
     let store = engine.state::<state::ComAmazonawsBackupsearchCryobackupsearchserviceState>();
     store.lock().recovery_points = points;
@@ -1326,6 +1338,7 @@ async fn starting_a_job_past_the_store_cap_is_refused_with_the_quota_error() {
                 search_scope_summary: types::SearchScopeSummary::default(),
                 current_search_progress: types::CurrentSearchProgress::default(),
                 results: Vec::new(),
+                scan_matches: Vec::new(),
                 backups: Vec::new(),
                 tags: std::collections::HashMap::new(),
                 client_token: None,

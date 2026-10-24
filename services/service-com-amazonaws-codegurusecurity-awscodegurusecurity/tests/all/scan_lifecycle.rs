@@ -17,9 +17,9 @@ use service_com_amazonaws_codegurusecurity_awscodegurusecurity::ops::types::Find
 use service_com_amazonaws_codegurusecurity_awscodegurusecurity::state::{
     self as cgs_state, Scan, ScanRun, Store, UploadArtifact, ANALYSIS_TYPE_SECURITY,
     EXPRESS_SCAN_SETTLE_MILLIS, QUOTA_CODE_RUNS, QUOTA_CODE_SCANS, QUOTA_CODE_UPLOAD_ARTIFACTS,
-    RUNS_PER_SCAN_QUOTA, SCAN_QUOTA, SCAN_STATE_FAILED, SCAN_STATE_IN_PROGRESS, SCAN_TYPE_EXPRESS,
-    SCAN_TYPE_STANDARD, STANDARD_SCAN_SETTLE_MILLIS, UPLOAD_ARTIFACT_QUOTA,
-    UPLOAD_ARTIFACT_TTL_MILLIS,
+    RUNS_PER_SCAN_QUOTA, SCAN_QUOTA, SCAN_STATE_FAILED, SCAN_STATE_IN_PROGRESS,
+    SCAN_STATE_SUCCESSFUL, SCAN_TYPE_EXPRESS, SCAN_TYPE_STANDARD, STANDARD_SCAN_SETTLE_MILLIS,
+    UPLOAD_ARTIFACT_QUOTA, UPLOAD_ARTIFACT_TTL_MILLIS,
 };
 use service_com_amazonaws_codegurusecurity_awscodegurusecurity::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -139,6 +139,37 @@ pub(crate) async fn artifact_for(router: &MultiServiceRouter, scan_name: &str) -
     answer.str_of("codeArtifactId")
 }
 
+/// Mint an artifact for `scan_name` AND perform the documented upload to the target it
+/// publishes — the whole workflow a client follows before `CreateScan`, so the run the
+/// next `CreateScan` starts has a code resource to analyse. Returns the
+/// `codeArtifactId` the uploaded resource is held against.
+pub(crate) async fn uploaded_artifact_for(
+    router: &MultiServiceRouter,
+    scan_name: &str,
+    archive: Vec<u8>,
+) -> String {
+    let minted = create_upload_url(router, scan_name).await;
+    assert_eq!(
+        minted.status, 200,
+        "CreateUploadUrl({scan_name}): expected 200, got {} {}",
+        minted.status, minted.json
+    );
+    let answer = crate::upload_target::upload(
+        router,
+        &minted.str_of("s3Url"),
+        &crate::upload_target::required_headers(&minted),
+        archive,
+    )
+    .await;
+    assert_eq!(
+        answer.status, 200,
+        "the documented upload for {scan_name}: expected 200, got {} {:?}",
+        answer.status,
+        String::from_utf8_lossy(&answer.body)
+    );
+    minted.str_of("codeArtifactId")
+}
+
 pub(crate) async fn create_scan(
     router: &MultiServiceRouter,
     mut body: Value,
@@ -255,7 +286,23 @@ async fn upload_url_then_scan_round_trips_through_get_scan_list_scans_and_findin
         upload.get("requestHeaders")
     );
 
-    // 2. CreateScan records a scan against that artifact.
+    // 2. The documented upload puts the code resource the scan will analyse against that
+    //    artifact: "upload your code resource to the URL" (CreateUploadUrl docs).
+    let uploaded = crate::upload_target::upload(
+        &router,
+        &upload.str_of("s3Url"),
+        &crate::upload_target::required_headers(&upload),
+        crate::upload_target::archive_of(512, 23),
+    )
+    .await;
+    assert_eq!(
+        uploaded.status, 200,
+        "the documented upload: expected 200, got {} {:?}",
+        uploaded.status,
+        String::from_utf8_lossy(&uploaded.body)
+    );
+
+    // 3. CreateScan records a scan against that artifact.
     let created = create_scan(&router, json!({ "scanName": scan_name }), &artifact).await;
     assert_eq!(
         created.status, 200,
@@ -287,7 +334,7 @@ async fn upload_url_then_scan_round_trips_through_get_scan_list_scans_and_findin
         created.get("resourceId")
     );
 
-    // 3. GetScan reads the SAME record back.
+    // 4. GetScan reads the SAME record back.
     let got = get_scan(&router, scan_name, None).await;
     assert_eq!(
         got.status, 200,
@@ -340,7 +387,7 @@ async fn upload_url_then_scan_round_trips_through_get_scan_list_scans_and_findin
         again.json
     );
 
-    // 4. ListScans builds its summary from the same record.
+    // 5. ListScans builds its summary from the same record.
     let listed = list_scans(&router, "").await;
     assert_eq!(
         listed.status, 200,
@@ -374,7 +421,7 @@ async fn upload_url_then_scan_round_trips_through_get_scan_list_scans_and_findin
         listed.json
     );
 
-    // 5. GetFindings conflicts while the run has not finished.
+    // 6. GetFindings conflicts while the run has not finished.
     let in_progress = get_findings(&router, scan_name, "?status=All").await;
     assert_eq!(
         in_progress.status, 409,
@@ -387,7 +434,7 @@ async fn upload_url_then_scan_round_trips_through_get_scan_list_scans_and_findin
         in_progress.error_type
     );
 
-    // 6. Once the run's transition falls due, it is reported as settled.
+    // 7. Once the run's transition falls due, it is reported as settled.
     wait_for_settle(SCAN_TYPE_STANDARD).await;
     let settled = get_scan(&router, scan_name, Some(&run_id)).await;
     assert_eq!(
@@ -397,14 +444,13 @@ async fn upload_url_then_scan_round_trips_through_get_scan_list_scans_and_findin
     );
     assert_eq!(
         settled.str_of("scanState"),
-        SCAN_STATE_FAILED,
-        "GetScan: a run whose analysis this emulator cannot perform ends in the modelled \
-         failure state, got {}",
+        SCAN_STATE_SUCCESSFUL,
+        "GetScan: a run over an uploaded code resource completes, got {}",
         settled.json
     );
     assert!(
-        !settled.str_of("errorMessage").is_empty(),
-        "GetScan: a Failed run must say why, got {}",
+        settled.get("errorMessage").is_null(),
+        "GetScan: a run that did not fail carries no errorMessage, got {}",
         settled.json
     );
     assert!(
@@ -413,7 +459,7 @@ async fn upload_url_then_scan_round_trips_through_get_scan_list_scans_and_findin
         settled.json
     );
 
-    // 7. GetFindings now reports the stored findings of that scan.
+    // 8. GetFindings now reports the stored findings of that scan.
     let findings = get_findings(&router, scan_name, "?status=All").await;
     assert_eq!(
         findings.status, 200,
@@ -423,7 +469,7 @@ async fn upload_url_then_scan_round_trips_through_get_scan_list_scans_and_findin
     let listed_findings = findings.get("findings").as_array().cloned().unwrap_or_default();
     assert!(
         listed_findings.is_empty(),
-        "GetFindings: a run nothing analyzed produced no findings, got {}",
+        "GetFindings: no finding is stored for this scan, got {}",
         findings.json
     );
     assert!(
@@ -432,7 +478,7 @@ async fn upload_url_then_scan_round_trips_through_get_scan_list_scans_and_findin
         findings.json
     );
 
-    // 8. BatchGetFindings resolves against the same store: every id GetFindings did not
+    // 9. BatchGetFindings resolves against the same store: every id GetFindings did not
     //    list is a failedFindings entry, not a 404 for the whole call.
     let batch = batch_get_findings(
         &router,
@@ -785,8 +831,8 @@ async fn batch_get_findings_classifies_every_identifier_it_cannot_resolve() {
 // ---------------------------------------------------------------------------------
 
 /// A finding as a run's analysis would have stored it. Seeded directly into the store:
-/// this emulator performs no analysis (see `state::SCAN_NOT_ANALYSED_MESSAGE`), so this
-/// is the only way to exercise the readers over a non-empty list.
+/// no request path writes findings yet, so this is the only way to exercise the readers
+/// over a non-empty list.
 fn seeded_finding(finding_id: &str, status: &str) -> Finding {
     Finding {
         id: Some(finding_id.to_string()),

@@ -221,6 +221,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // cluster is resolved, because the engine it must belong to is the one the
         // cluster will be left running.
         let engine = input.engine.clone();
+        // Every MemoryDB cluster is a REPLICATED cluster, so an engine that does not
+        // replicate can back none of them — the same rule, and the same refusal, the
+        // create path makes.
+        if let Some(message) = crate::state::engine_replication_rejection(engine.as_deref()) {
+            return Err(
+                UpdateClusterErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
         if let Some(message) = crate::state::engine_rejection(engine.as_deref()) {
             return Err(UpdateClusterErrorModeled::InvalidParameterValueException(
                 InvalidParameterValueException {
@@ -228,6 +241,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        }
+        // A `NodeType` an update scales the cluster to is checked against the node types
+        // MemoryDB publishes, through the same rule the create path reads: the same
+        // value cannot be accepted by one write path and refused by the other.
+        if let Some(node_type) = input.node_type.as_deref() {
+            if let Some(message) = crate::state::node_type_rejection(node_type) {
+                return Err(UpdateClusterErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
         }
         // Every name this request carries is folded the way the stores are keyed, so a
         // reference written in mixed case resolves to the one resource.

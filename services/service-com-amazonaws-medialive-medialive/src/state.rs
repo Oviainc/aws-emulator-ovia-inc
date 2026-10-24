@@ -336,6 +336,18 @@ pub use clusters::{
 
 pub(crate) use clusters::cluster_description_output;
 
+/// The thumbnail slice: the frames a channel's encoder pipelines captured, the
+/// bound on that log, the derived reader `DescribeThumbnails` reports through
+/// and the store's one writer, in one module of its own for the same reason as
+/// the cluster slice above. Its store is the `thumbnails` member of
+/// [`ChannelRecord`] below, so a capture log goes away with the channel that
+/// owns it.
+pub mod thumbnails;
+
+pub use thumbnails::{
+    thumbnail_detail_output, thumbnail_state, ThumbnailRecord, MAX_CHANNEL_THUMBNAILS,
+};
+
 /// The OFFERING slice: the catalog of reserved resources available for purchase
 /// that `ListOfferings`, `DescribeOffering` and `PurchaseOffering` all answer
 /// from, in one module of its own for the same reason as the slices above. It is
@@ -878,11 +890,37 @@ pub struct ChannelRecord {
     /// it — `DeleteChannel` takes the schedule with it, and no operation reaches
     /// a schedule without naming its channel.
     pub schedule: ChannelSchedule,
+    /// The thumbnail frames this channel's pipelines have captured, oldest
+    /// first — the [`thumbnails`] slice's store. Nothing in this emulator
+    /// captures one, so this is empty unless
+    /// [`ComAmazonawsMedialiveMedialiveState::capture_channel_thumbnail`] put
+    /// something in it. Private, and written ONLY through
+    /// [`ChannelRecord::push_thumbnail_bounded`] just below, which is where the
+    /// bound ([`MAX_CHANNEL_THUMBNAILS`]) is enforced; the capture writer owns
+    /// the conditions under which a frame can have been captured at all.
+    thumbnails: Vec<ThumbnailRecord>,
     /// The transition the clock owes this channel, if any.
     transition: Option<Transition>,
 }
 
 impl ChannelRecord {
+    /// Append `thumbnail` as the newest frame of this channel's capture log,
+    /// dropping the OLDEST frames first so the log never holds more than
+    /// [`MAX_CHANNEL_THUMBNAILS`] of them.
+    ///
+    /// The clamp lives here, beside the private store it bounds and BEFORE the
+    /// push, because the log is caller-driven — one frame per capture — so an
+    /// unbounded log would grow the emulator's heap without end, exactly as
+    /// [`MAX_CLUSTER_ALERTS`] bounds the cluster slice's alert log. The field is
+    /// private and this is its only writer, so no caller can push past the
+    /// bound.
+    pub(crate) fn push_thumbnail_bounded(&mut self, thumbnail: ThumbnailRecord) {
+        while self.thumbnails.len() >= MAX_CHANNEL_THUMBNAILS {
+            self.thumbnails.remove(0);
+        }
+        self.thumbnails.push(thumbnail);
+    }
+
     /// The number of encoding pipelines this channel's class gives it: two for
     /// `STANDARD`, one for `SINGLE_PIPELINE` (the `ChannelClass` doc: "A standard
     /// channel has two encoding pipelines and a single pipeline channel only has
@@ -4396,6 +4434,7 @@ pub fn new_channel(
         channel_engine_version: None,
         restarting_pipelines: Vec::new(),
         schedule: ChannelSchedule::default(),
+        thumbnails: Vec::new(),
         transition: None,
     };
     channel.begin_transition(channel_state::CREATING, Settled::Idle, now);

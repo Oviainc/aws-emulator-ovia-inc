@@ -325,6 +325,31 @@ impl ComAmazonawsCognitoidentityAwscognitoidentityserviceState {
         ))
     }
 
+    /// Every login value this pool has indexed for `provider` against `identity_id`, in
+    /// a stable (sorted) order — for the pool's own `DeveloperProviderName`, the developer
+    /// user identifiers one identity is registered under. The index is a hash map, so the
+    /// order has to come from the values themselves for two successive pages of a listing
+    /// to neither overlap nor skip one.
+    pub fn logins_of_identity(
+        &self,
+        identity_pool_id: &str,
+        provider: &str,
+        identity_id: &str,
+    ) -> Vec<String> {
+        let mut logins: Vec<String> = self
+            .login_index
+            .iter()
+            .filter(|((pool_id, login_provider, _), linked)| {
+                pool_id == identity_pool_id
+                    && login_provider == provider
+                    && linked.as_str() == identity_id
+            })
+            .map(|((_, _, login), _)| login.clone())
+            .collect();
+        logins.sort();
+        logins
+    }
+
     /// Link `(provider, login)` in this pool to `identity_id`, so a later `GetId`
     /// presenting it resolves to that identity.
     pub fn link_login(

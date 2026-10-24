@@ -182,6 +182,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // `Engine` names one of the engines this service RUNS, and it is checked on its
+        // own: an engine the service does not run is not a filter that happens to select
+        // nothing but a value that cannot go with this listing at all, which is the
+        // modelled `InvalidParameterCombinationException` naming the engine asked for.
+        if let Some(engine) = input.engine.as_deref() {
+            if !crate::state::ENGINE_VERSIONS
+                .iter()
+                .any(|candidate| candidate.engine == engine)
+            {
+                return Err(
+                    DescribeEngineVersionsErrorModeled::InvalidParameterCombinationException(
+                        InvalidParameterCombinationException {
+                            message: Some(format!("Invalid engine: {engine}")),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
         // Each filter selects on a value the catalog itself publishes for an entry, so
         // the three of them COMPOSE: a version is reported only when it matches every
         // filter the request supplied. That is what makes an engine together with a
@@ -206,28 +226,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .collect();
 
         if selected.is_empty() {
-            // Each filter is a free-form string the model constrains in no way, so this
-            // is not a malformed VALUE but a combination naming no engine version this
-            // service offers — including the degenerate combination of one filter that
-            // matches nothing. The message is built from the filters the request
-            // actually carried.
-            let mut named: Vec<String> = Vec::new();
-            if let Some(engine) = input.engine.as_deref() {
-                named.push(format!("engine {engine}"));
-            }
-            if let Some(version) = input.engine_version.as_deref() {
-                named.push(format!("version {version}"));
-            }
-            if let Some(family) = input.parameter_group_family.as_deref() {
-                named.push(format!("parameter group family {family}"));
-            }
+            // The engine is one this service runs (above), so what selected nothing is
+            // the VERSION or the FAMILY asked for — or the two together with the engine,
+            // since a version and a family each belong to one engine. That is a value
+            // this service does not offer, which is what its modelled
+            // `InvalidParameterValueException` says, in the service's own sentence.
             return Err(
-                DescribeEngineVersionsErrorModeled::InvalidParameterCombinationException(
-                    InvalidParameterCombinationException {
-                        message: Some(format!(
-                            "Cannot find an engine version for {}.",
-                            named.join(" with ")
-                        )),
+                DescribeEngineVersionsErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(crate::state::INVALID_ENGINE_VERSION_MESSAGE.to_string()),
                     },
                 )
                 .into(),

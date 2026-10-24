@@ -8,6 +8,14 @@
 //! members it answers with are read back out of that record, so `GetSearchJob` reports
 //! the same values.
 //!
+//! A scope resolves in TWO layers, both counted from the store: the recovery points it
+//! selects (`TotalRecoveryPointsToScanCount`) and the items their backup indexes hold
+//! (`TotalItemsToScanCount`, [`crate::state::scanned_items`]). The submitted `ItemFilters`
+//! select the scan's matches from that item layer
+//! ([`crate::state::item_matches_filters`]), and the record keeps them until the clock
+//! makes the scan's completion due — which is when `ListSearchJobResults` can page them
+//! and `ItemsMatchedCount` counts them.
+//!
 //! The clock then owes the job `RUNNING` and after that a terminal status, and WHICH
 //! terminal one follows from the resolved scope: a scan with recovery points in scope
 //! runs to `COMPLETED`, while a scope that resolved to none ends `FAILED` with the
@@ -274,19 +282,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &identifier,
         );
 
-        // What the scan has to get through: the recovery points of this account the
-        // submitted scope resolves to, counted from the store rather than assumed. A
-        // recovery point exists only once the Backup data plane holds one and nothing in
-        // this service creates one, so ordinarily the scope resolves to the empty set —
-        // and then the scan has nothing to search. The items to scan are the items those
-        // recovery points' backup indexes hold, which is none here. The progress starts
-        // at nothing scanned.
-        let backups = state.recovery_points_in_scope(&input.search_scope);
+        // What the scan has to get through, in both layers and counted from the store
+        // rather than assumed: the recovery points of this account the submitted scope
+        // resolves to, and the items their backup indexes hold. A recovery point exists
+        // only once the Backup data plane holds one and nothing in this service creates
+        // one, so ordinarily the scope resolves to the empty set — and then the scan has
+        // nothing to search. The progress starts at nothing scanned: the clock has not
+        // run the scan yet.
+        let points = state.recovery_points_in_scope(&input.search_scope);
+        let scanned = crate::state::scanned_items(&points);
+        // `@required` on GetSearchJob's output: a job started with no item filters
+        // filtered on nothing, which is an `ItemFilters` holding no filter — and a filter
+        // that is not there admits every item.
+        let item_filters = input.item_filters.clone().unwrap_or_default();
+        // The matches the scan finds: exactly the scanned items this job's filters admit.
+        let scan_matches: Vec<ResultItem> = scanned
+            .iter()
+            .filter(|item| crate::state::item_matches_filters(item, &item_filters))
+            .cloned()
+            .collect();
         let search_scope_summary = SearchScopeSummary {
             total_recovery_points_to_scan_count: Some(
-                i32::try_from(backups.len()).unwrap_or(i32::MAX),
+                i32::try_from(points.len()).unwrap_or(i32::MAX),
             ),
-            total_items_to_scan_count: Some(0),
+            total_items_to_scan_count: Some(i64::try_from(scanned.len()).unwrap_or(i64::MAX)),
         };
         let current_search_progress = CurrentSearchProgress {
             recovery_points_scanned_count: Some(0),
@@ -296,7 +315,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The terminal status the clock owes this scan follows from that resolved scope:
         // a scope holding nothing to search is a terminal FAILURE the service explains
         // in StatusMessage, and anything else runs to COMPLETED.
-        let (owed_status, owed_message) = crate::state::scan_outcome(backups.len());
+        let (owed_status, owed_message) = crate::state::scan_outcome(points.len());
+        // The recovery points the scan covers are exactly the ones in scope, which is
+        // what `ListSearchJobBackups` reports.
+        let backups: Vec<SearchJobBackupsResult> =
+            points.into_iter().map(|point| point.backup).collect();
 
         let job = SearchJob {
             identifier: identifier.clone(),
@@ -312,16 +335,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             status_message: None,
             encryption_key_arn: input.encryption_key_arn.clone(),
             search_scope: input.search_scope.clone(),
-            // `@required` on GetSearchJob's output: a job started with no item filters
-            // filtered on nothing, which is an `ItemFilters` holding no filter.
-            item_filters: input.item_filters.clone().unwrap_or_default(),
+            item_filters,
             search_scope_summary,
             current_search_progress,
-            // The matches recorded so far: the backup indexes of the recovery points in
-            // scope hold no items here, so the scan finds none.
+            // The matches RECORDED so far: a scan that has not run yet has recorded
+            // none, and the ones it finds are recorded when the clock makes its
+            // completion due.
             results: Vec::new(),
-            // The recovery points the scan covers are exactly the ones in scope, which
-            // is what `ListSearchJobBackups` reports.
+            scan_matches,
             backups,
             tags,
             // The window the token takes part in idempotency for starts when the

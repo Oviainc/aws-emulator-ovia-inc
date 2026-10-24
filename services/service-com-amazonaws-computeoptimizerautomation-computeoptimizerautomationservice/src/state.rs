@@ -935,6 +935,67 @@ pub fn previewed_actions<'store>(
         .filter(move |action| action_matches_criteria(action, criteria))
 }
 
+/// One group of recommended actions a summaries list reports as a row: the
+/// grouping key and what the actions under it accumulate.
+///
+/// An action Compute Optimizer has not estimated savings for carries no
+/// estimate, which adds nothing to the group's savings and is still one action
+/// of its count.
+#[derive(Debug, Default, Clone)]
+pub struct ActionGroup {
+    /// The value of the grouping dimension this group holds, which is the row's
+    /// `key`.
+    pub key: String,
+    /// How many actions the group holds, estimate or not.
+    pub count: i32,
+    /// The estimates the group's actions carry, which [`total_savings`] reduces
+    /// to the group's `estimatedMonthlySavings`.
+    pub estimates: Vec<EstimatedMonthlySavings>,
+}
+
+/// The recommended actions of `actions`, grouped by `recommendedActionType`:
+/// one group per type the set holds, in the order the set first holds an action
+/// of that type.
+///
+/// Every summaries list of this service reports its rows this way — a
+/// `key`-bearing summary row is one group of the dimension it is grouped by, so
+/// the rows are the distinct values the summarised actions carry for it, never a
+/// key for a dimension nothing was grouped by. The summarised actions are what
+/// gets grouped, so a type nothing matched is no group and an action the store
+/// records no type for belongs to no group.
+///
+/// The groups are kept as a SEQUENCE, so a group's key and its tally are one
+/// value: there is no second lookup that could miss and report a plausible zero
+/// total. The number of groups is bounded by the `RecommendedActionType` value
+/// set, so finding one by key is a walk over a handful of entries.
+pub fn group_by_recommended_action_type<'a>(
+    actions: impl Iterator<Item = &'a RecommendedAction>,
+) -> Vec<ActionGroup> {
+    let mut grouped: Vec<ActionGroup> = Vec::new();
+    for action in actions {
+        let Some(action_type) = action.recommended_action_type.as_deref() else {
+            continue;
+        };
+        let index = match grouped.iter().position(|group| group.key == action_type) {
+            Some(index) => index,
+            None => {
+                grouped.push(ActionGroup {
+                    key: action_type.to_string(),
+                    ..ActionGroup::default()
+                });
+                grouped.len().saturating_sub(1)
+            }
+        };
+        if let Some(group) = grouped.get_mut(index) {
+            group.count = group.count.saturating_add(1);
+            if let Some(savings) = action.estimated_monthly_savings.as_ref() {
+                group.estimates.push(savings.clone());
+            }
+        }
+    }
+    grouped
+}
+
 /// The `estimatedMonthlySavings` of a GROUP of recommended actions: the sums of
 /// the before- and after-discount figures of the estimates the group carries.
 ///

@@ -39,6 +39,16 @@
 //! ([`ComAmazonawsBackupsearchCryobackupsearchserviceState::recovery_points_in_scope`])
 //! into the terminal status the scan is owed, and the `StatusMessage` that status comes
 //! with travels with it.
+//!
+//! ## Two layers: backups, and the items inside them
+//!
+//! A scan resolves a `SearchScope` to recovery points and then gets through the ITEMS
+//! their backup indexes hold ([`IndexedRecoveryPoint`]) — the objects of a backed-up
+//! bucket, the files of a backed-up volume. That inner layer is what a job's `ItemFilters`
+//! select from ([`item_matches_filters`]), what `TotalItemsToScanCount` and
+//! `ItemsScannedCount` count ([`scanned_items`]) and what `ListSearchJobResults` pages, so
+//! every one of those answers is counted from the records this store holds rather than
+//! assumed by a handler.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -46,8 +56,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    CurrentSearchProgress, ExportSpecification, ItemFilters, ResultItem, SearchJobBackupsResult,
-    SearchScope, SearchScopeSummary,
+    CurrentSearchProgress, EBSItemFilter, EBSResultItem, ExportSpecification, ItemFilters,
+    LongCondition, ResultItem, S3ItemFilter, S3ResultItem, SearchJobBackupsResult, SearchScope,
+    SearchScopeSummary, StringCondition, TimeCondition,
 };
 
 /// The HTTP status a successful call of this service that has NO content to report
@@ -100,6 +111,32 @@ pub const FAILED: &str = "FAILED";
 /// The statuses a search job never leaves: a scan that ended, a stop that took effect,
 /// or a scan that failed. `CREATING`, `RUNNING` and `STOPPING` are the transient ones.
 pub const TERMINAL_STATES: &[&str] = &[COMPLETED, STOPPED, FAILED];
+
+/// The comparison an item-filter condition states, as the model's three condition-operator
+/// enums declare them (`types::STRING_CONDITION_OPERATOR_VALUES`,
+/// `types::LONG_CONDITION_OPERATOR_VALUES`, `types::TIME_CONDITION_OPERATOR_VALUES`), so
+/// no comparison spells one as a bare literal. This one and [`NOT_EQUALS_TO`] are declared
+/// by all three; the orderings by the numeric and time enums, and the substring ones by the
+/// string enum. `EQUALS_TO` is also the `@default` every `Operator` member carries.
+pub const EQUALS_TO: &str = "EQUALS_TO";
+/// See [`EQUALS_TO`].
+pub const NOT_EQUALS_TO: &str = "NOT_EQUALS_TO";
+/// See [`EQUALS_TO`].
+pub const LESS_THAN_EQUAL_TO: &str = "LESS_THAN_EQUAL_TO";
+/// See [`EQUALS_TO`].
+pub const GREATER_THAN_EQUAL_TO: &str = "GREATER_THAN_EQUAL_TO";
+/// See [`EQUALS_TO`].
+pub const CONTAINS: &str = "CONTAINS";
+/// See [`EQUALS_TO`].
+pub const DOES_NOT_CONTAIN: &str = "DOES_NOT_CONTAIN";
+/// See [`EQUALS_TO`].
+pub const BEGINS_WITH: &str = "BEGINS_WITH";
+/// See [`EQUALS_TO`].
+pub const DOES_NOT_BEGIN_WITH: &str = "DOES_NOT_BEGIN_WITH";
+/// See [`EQUALS_TO`].
+pub const ENDS_WITH: &str = "ENDS_WITH";
+/// See [`EQUALS_TO`].
+pub const DOES_NOT_END_WITH: &str = "DOES_NOT_END_WITH";
 
 /// The statuses `StopSearchJob` is already satisfied by.
 ///
@@ -403,12 +440,23 @@ pub struct SearchJob {
     pub item_filters: ItemFilters,
     pub search_scope_summary: SearchScopeSummary,
     pub current_search_progress: CurrentSearchProgress,
-    /// The matches the scan recorded. `ListSearchJobResults` pages over exactly this.
+    /// The matches the scan RECORDED. `ListSearchJobResults` pages over exactly this, so
+    /// it is empty for a scan that has not got through its scope yet — the matches it will
+    /// record wait in [`SearchJob::scan_matches`] until the clock makes the scan's
+    /// completion due.
     pub results: Vec<ResultItem>,
+    /// The matches the scan FINDS: the items held by the backup indexes of the recovery
+    /// points in scope that this job's `ItemFilters` admit, resolved from the store when
+    /// the job was started (the same instant the scope itself was resolved, so a recovery
+    /// point indexed later does not change a running scan's outcome).
+    ///
+    /// [`SearchJob::settle`] moves them into [`SearchJob::results`] when the scan reaches
+    /// [`COMPLETED`], which is the instant the progress reports them matched: a reader can
+    /// page exactly the matches the progress counts, never more.
+    pub scan_matches: Vec<ResultItem>,
     /// The recovery points the scan covered, each with the status its backup index had.
-    /// `ListSearchJobBackups` pages over exactly this. A recovery point exists for this
-    /// account only once the Backup data plane holds one, and this emulator holds none,
-    /// so a job minted here covers none.
+    /// `ListSearchJobBackups` pages over exactly this: the recovery points of this account
+    /// the job's scope resolved to ([`ComAmazonawsBackupsearchCryobackupsearchserviceState::recovery_points_in_scope`]).
     pub backups: Vec<SearchJobBackupsResult>,
     pub tags: HashMap<String, String>,
     /// The `ClientToken` the call that minted this job carried, if any, with the instant
@@ -465,6 +513,11 @@ impl SearchJob {
     /// `COMPLETED` has scanned everything in scope and matched exactly the results it
     /// recorded; one that was `STOPPED` keeps the progress it had reached, and one that
     /// `FAILED` never got through its scope, so it keeps the progress it had too.
+    ///
+    /// The matches the scan found are RECORDED by the same transition
+    /// ([`SearchJob::scan_matches`] -> [`SearchJob::results`]), so what
+    /// `ListSearchJobResults` pages and what the progress counts as matched are written at
+    /// one instant and can never disagree.
     fn settle(&mut self, now: SystemTime) {
         expire_client_token(&mut self.client_token, now);
         while let Some(&(due, next, message)) = self.owed_statuses.front() {
@@ -483,6 +536,11 @@ impl SearchJob {
                 self.completion_time = Some(timestamp(due));
             }
             if next == COMPLETED {
+                // A scan that got through its scope has RECORDED the matches it found, so
+                // they become readable at this instant and not before — and the progress
+                // is written from the same record, so the matched count and the results a
+                // reader pages cannot disagree.
+                self.results = std::mem::take(&mut self.scan_matches);
                 self.current_search_progress = CurrentSearchProgress {
                     recovery_points_scanned_count: self
                         .search_scope_summary
@@ -490,7 +548,53 @@ impl SearchJob {
                     items_scanned_count: self.search_scope_summary.total_items_to_scan_count,
                     items_matched_count: Some(self.results.len() as i64),
                 };
+            } else if TERMINAL_STATES.contains(&next) {
+                // The scan ended without getting through its scope, so the matches it
+                // would have recorded are no longer owed to anybody: it keeps whatever it
+                // had already recorded and finds nothing more.
+                self.scan_matches = Vec::new();
             }
+        }
+    }
+}
+
+/// One recovery point of this account's backup index, WITH the items that index holds.
+///
+/// A scan has two layers and this record carries both. The outer one is the recovery
+/// point itself, which a `SearchScope` selects and `ListSearchJobBackups` reports. The
+/// inner one is the items inside that backup's index — the objects of a backed-up S3
+/// bucket, the files of a backed-up EBS volume — which is the layer a job's `ItemFilters`
+/// select from, `SearchScopeSummary.TotalItemsToScanCount` counts and
+/// `ListSearchJobResults` pages. Holding them on ONE record is what keeps a recovery
+/// point and the items it holds from drifting apart.
+#[derive(Debug, Clone, Default)]
+pub struct IndexedRecoveryPoint {
+    /// The recovery point itself, exactly as `ListSearchJobBackups` reports it.
+    pub backup: SearchJobBackupsResult,
+    /// The backup vault holding it. A result item reports the vault its backup lives in
+    /// while `SearchJobBackupsResult` carries no vault member, so the name is held here:
+    /// it is a property of the backup, not of one item inside it.
+    pub backup_vault_name: Option<String>,
+    /// The items this recovery point's backup index holds, in index order: an
+    /// `S3ResultItem` per backed-up object (its key, size, creation time, ETag and
+    /// version id) or an `EBSResultItem` per backed-up file (its path, size and times).
+    ///
+    /// The three members naming the BACKUP an item came from
+    /// (`BackupResourceArn`/`SourceResourceArn`/`BackupVaultName`) belong to this record
+    /// rather than to one item, so a scan stamps them from here as it reads the index
+    /// ([`scanned_items`]) and a result cannot name a backup it was not found in.
+    pub items: Vec<ResultItem>,
+}
+
+impl From<SearchJobBackupsResult> for IndexedRecoveryPoint {
+    /// A recovery point whose backup index this store holds no items for, which is every
+    /// recovery point until something writes its index: a scope resolving to it has a
+    /// backup to scan and no item inside it.
+    fn from(backup: SearchJobBackupsResult) -> Self {
+        Self {
+            backup,
+            backup_vault_name: None,
+            items: Vec::new(),
         }
     }
 }
@@ -561,8 +665,9 @@ pub struct ComAmazonawsBackupsearchCryobackupsearchserviceState {
     /// [`jobs_newest_first`](Self::jobs_newest_first)).
     pub job_order: Vec<String>,
     /// The recovery points of this account a search job's `SearchScope` is resolved
-    /// against — the backup index the Backup data plane builds, which is what a scan
-    /// actually scans.
+    /// against, each with the items its backup index holds — the backup index the Backup
+    /// data plane builds, which is what a scan actually scans, down to the item layer
+    /// ([`IndexedRecoveryPoint`]).
     ///
     /// A recovery point exists for this account only once that data plane holds one, and
     /// nothing in THIS service creates one — no operation it models takes a backup or
@@ -572,11 +677,12 @@ pub struct ComAmazonawsBackupsearchCryobackupsearchserviceState {
     /// The `COMPLETED` branch of [`scan_outcome`] is reached as soon as this holds a
     /// recovery point the scope selects: a test seeds them, and a future Backup data
     /// plane in this emulator would write them here rather than teach the scan a second
-    /// source. The resolution is COUNTED from here ([`recovery_points_in_scope`](
-    /// Self::recovery_points_in_scope)) rather than assumed by a handler, so every member
-    /// a job reports about its scope — and the terminal status it settles to — follows the
+    /// source. BOTH layers a job reports are COUNTED from here — the scope from
+    /// [`recovery_points_in_scope`](Self::recovery_points_in_scope) and the items from
+    /// [`scanned_items`] — rather than assumed by a handler, so every member a job reports
+    /// about its scope and its progress, and the terminal status it settles to, follows the
     /// records this store holds.
-    pub recovery_points: Vec<SearchJobBackupsResult>,
+    pub recovery_points: Vec<IndexedRecoveryPoint>,
     /// Every export job, keyed by its `ExportJobIdentifier`.
     pub export_jobs: HashMap<String, ExportJob>,
     /// Export-job identifiers in creation order, so `ListSearchResultExportJobs` pages
@@ -698,17 +804,19 @@ impl ComAmazonawsBackupsearchCryobackupsearchserviceState {
     }
 
     /// The recovery points this store holds that `scope` selects — the scan's resolved
-    /// scope, and so what a search job over that scope has to get through.
+    /// scope, and so what a search job over that scope has to get through. Each one
+    /// carries the items its backup index holds, which is the layer
+    /// [`scanned_items`] reads.
     ///
     /// A recovery point is in scope when its resource type is one the scope names and
     /// every filter the scope carries admits it; a filter the records cannot be judged
     /// against (a tag filter: a recovery point record here carries no tags, nor does the
     /// model give it any) admits none, because this store holds nothing that can be
     /// shown to match it.
-    pub fn recovery_points_in_scope(&self, scope: &SearchScope) -> Vec<SearchJobBackupsResult> {
+    pub fn recovery_points_in_scope(&self, scope: &SearchScope) -> Vec<IndexedRecoveryPoint> {
         self.recovery_points
             .iter()
-            .filter(|point| in_scope(point, scope))
+            .filter(|point| in_scope(&point.backup, scope))
             .cloned()
             .collect()
     }
@@ -952,6 +1060,182 @@ pub fn scan_outcome(recovery_points_in_scope: usize) -> (&'static str, Option<&'
         (FAILED, Some(SCOPE_EMPTY))
     } else {
         (COMPLETED, None)
+    }
+}
+
+/// The items the backup indexes of `points` hold, in recovery-point order and then index
+/// order, each naming the backup it was found in.
+///
+/// This is the ITEM layer of a scan: what a job over that resolved scope has to get
+/// through (`SearchScopeSummary.TotalItemsToScanCount`,
+/// `CurrentSearchProgress.ItemsScannedCount`) and the sequence its `ItemFilters` select
+/// the matches from. The three members naming the backup are stamped from the recovery
+/// point record the item was read out of, so a result never names a backup it was not
+/// found in and never reports a vault the record does not hold.
+pub fn scanned_items(points: &[IndexedRecoveryPoint]) -> Vec<ResultItem> {
+    points
+        .iter()
+        .flat_map(|point| point.items.iter().map(|item| item_of_backup(item, point)))
+        .collect()
+}
+
+/// `item` as the scan read it out of `point`'s backup index: its own properties, with the
+/// backup it was found in named from that record.
+fn item_of_backup(item: &ResultItem, point: &IndexedRecoveryPoint) -> ResultItem {
+    let backup_resource_arn = point.backup.backup_resource_arn.clone();
+    let source_resource_arn = point.backup.source_resource_arn.clone();
+    let backup_vault_name = point.backup_vault_name.clone();
+    match item.clone() {
+        ResultItem::S3ResultItem(object) => ResultItem::S3ResultItem(S3ResultItem {
+            backup_resource_arn,
+            source_resource_arn,
+            backup_vault_name,
+            ..object
+        }),
+        ResultItem::EBSResultItem(file) => ResultItem::EBSResultItem(EBSResultItem {
+            backup_resource_arn,
+            source_resource_arn,
+            backup_vault_name,
+            ..file
+        }),
+    }
+}
+
+/// Whether `filters` admit `item`, i.e. whether a scan over the item layer records it as
+/// a match.
+///
+/// `ItemFilters` carries one list per item type and each list holds up to ten filter
+/// objects, so the rule has three levels: an item is admitted when ANY filter object of
+/// the list for ITS OWN type matches it, a filter object matches when EVERY item property
+/// it constrains is satisfied, and a property is satisfied by ANY ONE of the conditions
+/// listed for it — which is what the model documents for every one of those condition
+/// lists ("if one value is included, the results will return only items that match the
+/// value. If more than one value is included, the results will return all items that
+/// match any of the values").
+///
+/// A list that is absent or empty constrains nothing and admits every item, exactly as an
+/// absent scope filter admits every recovery point — and so does the list for the OTHER
+/// item type, which says nothing about items of this one.
+pub fn item_matches_filters(item: &ResultItem, filters: &ItemFilters) -> bool {
+    match item {
+        ResultItem::S3ResultItem(object) => {
+            satisfied_by_any(filters.s3_item_filters.as_deref(), |filter| {
+                s3_filter_matches(filter, object)
+            })
+        }
+        ResultItem::EBSResultItem(file) => {
+            satisfied_by_any(filters.ebs_item_filters.as_deref(), |filter| {
+                ebs_filter_matches(filter, file)
+            })
+        }
+    }
+}
+
+/// Whether one `S3ItemFilter` matches a backed-up object: every property the filter
+/// constrains is satisfied, and a property it leaves out constrains nothing.
+fn s3_filter_matches(filter: &S3ItemFilter, object: &S3ResultItem) -> bool {
+    satisfied_by_any(filter.object_keys.as_deref(), |condition| {
+        string_condition_met(condition, object.object_key.as_deref())
+    }) && satisfied_by_any(filter.sizes.as_deref(), |condition| {
+        long_condition_met(condition, object.object_size)
+    }) && satisfied_by_any(filter.creation_times.as_deref(), |condition| {
+        time_condition_met(condition, object.creation_time)
+    }) && satisfied_by_any(filter.version_ids.as_deref(), |condition| {
+        string_condition_met(condition, object.version_id.as_deref())
+    }) && satisfied_by_any(filter.e_tags.as_deref(), |condition| {
+        string_condition_met(condition, object.e_tag.as_deref())
+    })
+}
+
+/// Whether one `EBSItemFilter` matches a backed-up file, by the same rule
+/// [`s3_filter_matches`] applies to an object.
+fn ebs_filter_matches(filter: &EBSItemFilter, file: &EBSResultItem) -> bool {
+    satisfied_by_any(filter.file_paths.as_deref(), |condition| {
+        string_condition_met(condition, file.file_path.as_deref())
+    }) && satisfied_by_any(filter.sizes.as_deref(), |condition| {
+        long_condition_met(condition, file.file_size)
+    }) && satisfied_by_any(filter.creation_times.as_deref(), |condition| {
+        time_condition_met(condition, file.creation_time)
+    }) && satisfied_by_any(filter.last_modification_times.as_deref(), |condition| {
+        time_condition_met(condition, file.last_modified_time)
+    })
+}
+
+/// Whether an optional list of ALTERNATIVES is satisfied: an absent or empty list states
+/// no requirement at all, and a list that states one is satisfied by any ONE of its
+/// entries. One helper behind both levels of the item filters that read this way — the
+/// filter objects of a list, and the conditions of one property.
+fn satisfied_by_any<T>(alternatives: Option<&[T]>, met: impl Fn(&T) -> bool) -> bool {
+    alternatives.is_none_or(|list| list.is_empty() || list.iter().any(met))
+}
+
+/// Whether `candidate` satisfies one `StringCondition`.
+///
+/// A property the item does not carry cannot be SHOWN to satisfy a condition on it, so it
+/// satisfies none — the same rule the scope resolution applies to a record it cannot
+/// judge. An operator outside the model's enum is likewise not satisfied (restJson1 enums
+/// are open on the wire, so an unknown value reaches here) rather than silently admitting
+/// every item.
+fn string_condition_met(condition: &StringCondition, candidate: Option<&str>) -> bool {
+    let Some(candidate) = candidate else {
+        return false;
+    };
+    let value = condition.value.as_str();
+    match condition_operator(&condition.operator) {
+        EQUALS_TO => candidate == value,
+        NOT_EQUALS_TO => candidate != value,
+        CONTAINS => candidate.contains(value),
+        DOES_NOT_CONTAIN => !candidate.contains(value),
+        BEGINS_WITH => candidate.starts_with(value),
+        DOES_NOT_BEGIN_WITH => !candidate.starts_with(value),
+        ENDS_WITH => candidate.ends_with(value),
+        DOES_NOT_END_WITH => !candidate.ends_with(value),
+        _ => false,
+    }
+}
+
+/// Whether `candidate` satisfies one `LongCondition` — an item's size, by the operators
+/// `LongConditionOperator` declares. Judged like [`string_condition_met`]: a size the item
+/// does not carry satisfies nothing.
+fn long_condition_met(condition: &LongCondition, candidate: Option<i64>) -> bool {
+    let Some(candidate) = candidate else {
+        return false;
+    };
+    match condition_operator(&condition.operator) {
+        EQUALS_TO => candidate == condition.value,
+        NOT_EQUALS_TO => candidate != condition.value,
+        LESS_THAN_EQUAL_TO => candidate <= condition.value,
+        GREATER_THAN_EQUAL_TO => candidate >= condition.value,
+        _ => false,
+    }
+}
+
+/// Whether `candidate` satisfies one `TimeCondition` — an item's creation or last
+/// modification instant, by the operators `TimeConditionOperator` declares. The two
+/// instants are compared as ordered keys ([`instant_key`]), so sub-second precision
+/// counts.
+fn time_condition_met(condition: &TimeCondition, candidate: Option<DateTime>) -> bool {
+    let Some(candidate) = candidate.map(instant_key) else {
+        return false;
+    };
+    let value = instant_key(condition.value);
+    match condition_operator(&condition.operator) {
+        EQUALS_TO => candidate == value,
+        NOT_EQUALS_TO => candidate != value,
+        LESS_THAN_EQUAL_TO => candidate <= value,
+        GREATER_THAN_EQUAL_TO => candidate >= value,
+        _ => false,
+    }
+}
+
+/// The operator a condition compares with: the one the request spelled, or the model's
+/// `@default("EQUALS_TO")` when it left the member out — the framework leaves an absent
+/// enum member as the empty string, which is not an operator.
+fn condition_operator(operator: &str) -> &str {
+    if operator.is_empty() {
+        EQUALS_TO
+    } else {
+        operator
     }
 }
 

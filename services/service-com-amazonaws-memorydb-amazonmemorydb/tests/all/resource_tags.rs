@@ -859,10 +859,9 @@ async fn an_arn_that_names_no_resource_is_that_kinds_not_found_fault() {
     }
 }
 
-/// An ARN is resolved WHOLE: a stored resource's name in another region, account or
-/// partition names no resource, so it answers that kind's not-found fault rather than
-/// the stored
-/// resource's tags.
+/// An ARN is resolved WHOLE, against the ENDPOINT it was sent to: an ARN naming another
+/// region or another account is a scope this endpoint does not serve, and one naming
+/// another partition or another resource type of this scope names no resource in it.
 #[tokio::test]
 async fn an_arn_from_another_scope_does_not_resolve_to_a_stored_resource() {
     const OTHER_REGION: &str = "eu-west-1";
@@ -875,8 +874,10 @@ async fn an_arn_from_another_scope_does_not_resolve_to_a_stored_resource() {
     )
     .await;
 
-    // The same name under a different region, account or partition.
-    let rows = [
+    // The same name under a region or an account this endpoint does not serve: the
+    // request named a scope, not a missing resource, so it is the modelled
+    // `InvalidParameterValueException`.
+    let foreign_scope = [
         (
             "another region",
             format!("arn:aws:memorydb:{OTHER_REGION}:{ACCOUNT}:cluster/scoped"),
@@ -886,32 +887,56 @@ async fn an_arn_from_another_scope_does_not_resolve_to_a_stored_resource() {
             format!("arn:aws:memorydb:{REGION}:999988887777:cluster/scoped"),
         ),
         (
+            "another region and another account",
+            format!("arn:aws:memorydb:{OTHER_REGION}:999988887777:cluster/scoped"),
+        ),
+        (
+            // A name NO resource of this store carries: the scope is checked before the
+            // store is consulted, so the answer is the same.
+            "another region, naming nothing",
+            format!("arn:aws:memorydb:{OTHER_REGION}:{ACCOUNT}:cluster/nothing-here"),
+        ),
+    ];
+    for (label, candidate) in foreign_scope {
+        let (status, answered) =
+            call(&router, "ListTags", &json!({ "ResourceArn": candidate })).await;
+        assert_eq!(
+            (status, error_code(&answered).as_str()),
+            (400, "InvalidParameterValueException"),
+            "case {label:?}: expected 400 InvalidParameterValueException for {candidate}, \
+             got {status} with {answered}"
+        );
+    }
+
+    // In THIS endpoint's scope, but naming no resource of this store: the ARN resolves
+    // as far as its kind, so each of these is that kind's not-found fault.
+    let in_scope = [
+        (
             "another partition",
             format!("arn:aws-cn:memorydb:{REGION}:{ACCOUNT}:cluster/scoped"),
+            "ClusterNotFoundFault",
         ),
         (
             "another resource type",
             format!("arn:aws:memorydb:{REGION}:{ACCOUNT}:acl/scoped"),
+            "ACLNotFoundFault",
         ),
     ];
-    for (label, candidate) in rows {
-        let (status, answered) = call(&router, "ListTags", &json!({ "ResourceArn": candidate })).await;
+    for (label, candidate, code) in in_scope {
+        let (status, answered) =
+            call(&router, "ListTags", &json!({ "ResourceArn": candidate })).await;
         assert_eq!(
-            status, 400,
-            "case {label:?}: expected a 400 for {candidate}, got {status} with {answered}"
+            (status, error_code(&answered).as_str()),
+            (400, code),
+            "case {label:?}: expected 400 {code} for {candidate}, got {status} with {answered}"
         );
     }
 
-    // And the resource itself is still reachable, from a call signed ELSEWHERE: the ARN
-    // decides which resource is read, not the caller's region.
-    let case = "the stored ARN read from another region";
-    let (status, answered) = call_signed(
-        &router,
-        OTHER_REGION,
-        "ListTags",
-        &json!({ "ResourceArn": resource_arn }),
-    )
-    .await;
+    // And the resource is read from the endpoint whose scope its ARN names, while the
+    // SAME ARN sent to another region's endpoint is refused: a regional endpoint serves
+    // its own region's resources.
+    let case = "the stored ARN read from its own region";
+    let (status, answered) = call(&router, "ListTags", &json!({ "ResourceArn": resource_arn })).await;
     assert_eq!(
         status, 200,
         "case {case:?}: got {status} with {answered}"
@@ -921,6 +946,20 @@ async fn an_arn_from_another_scope_does_not_resolve_to_a_stored_resource() {
         reported,
         expected(&[("env", Some("test"))]),
         "case {case:?}: expected the stored tags, got {reported:?}"
+    );
+
+    let case = "the stored ARN sent to another region's endpoint";
+    let (status, answered) = call_signed(
+        &router,
+        OTHER_REGION,
+        "ListTags",
+        &json!({ "ResourceArn": resource_arn }),
+    )
+    .await;
+    assert_eq!(
+        (status, error_code(&answered).as_str()),
+        (400, "InvalidParameterValueException"),
+        "case {case:?}: got {status} with {answered}"
     );
 }
 

@@ -196,33 +196,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )));
             }
         }
+        // A `SourceName` identifies a source WITHIN a kind of source: two kinds can
+        // carry the same name, so the name alone identifies nothing and the two members
+        // only select together.
+        if input.source_name.is_some() && input.source_type.is_none() {
+            return Err(
+                DescribeEventsErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: Some(
+                            crate::state::SOURCE_NAME_WITHOUT_TYPE_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
         if let Some(duration) = input.duration {
             // "The number of minutes worth of events to retrieve": fewer than one
-            // minute bounds no window at all, and nothing older than the retention
-            // period is kept, so neither is a window this listing can serve.
-            if !(crate::state::MIN_EVENT_DURATION_MINUTES
-                ..=crate::state::MAX_EVENT_DURATION_MINUTES)
-                .contains(&duration)
-            {
-                return Err(invalid_value(format!(
-                    "Invalid value for duration. Must be between {} and {} minutes",
-                    crate::state::MIN_EVENT_DURATION_MINUTES,
-                    crate::state::MAX_EVENT_DURATION_MINUTES
-                )));
+            // minute bounds no window at all, so it is a value this listing cannot
+            // serve. How far back a window may REACH is not a bound on this member: it
+            // is the retention rule below, which holds whichever member bounds the
+            // window from beneath.
+            if duration < crate::state::MIN_EVENT_DURATION_MINUTES {
+                return Err(invalid_value(
+                    crate::state::NON_POSITIVE_DURATION_MESSAGE.to_string(),
+                ));
+            }
+            // `Duration` and the explicit interval are two ways of saying the same
+            // thing, and the service takes ONE of them: a request carrying `Duration`
+            // beside either end of the interval states the window twice, which is a
+            // combination it cannot serve rather than a bound to prefer.
+            if input.start_time.is_some() || input.end_time.is_some() {
+                return Err(
+                    DescribeEventsErrorModeled::InvalidParameterCombinationException(
+                        InvalidParameterCombinationException {
+                            message: Some(
+                                crate::state::DURATION_WITH_INTERVAL_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
             }
         }
 
         // The window this listing reports over, which the request bounds from the top
         // down: `EndTime` or now, then `StartTime`, else `Duration` minutes before the
         // end, else the documented default of one hour ("By default, only the events
-        // occurring within the last hour are returned"). `StartTime` is the stronger
-        // statement of the same bound, so a request carrying both it and `Duration` is
-        // served from `StartTime`.
+        // occurring within the last hour are returned"). `Duration` and the interval
+        // never arrive together (refused just above). ONE `now` bounds the default
+        // window and the retention check below, so a window reaching exactly to the
+        // retention floor is inside it.
+        let now = std::time::SystemTime::now();
         let end = match input.end_time.as_ref() {
             Some(stamp) => system_time(stamp).ok_or_else(|| {
                 invalid_value("EndTime does not name a point in time.".to_string())
             })?,
-            None => std::time::SystemTime::now(),
+            None => now,
         };
         let start = match input.start_time.as_ref() {
             Some(stamp) => system_time(stamp).ok_or_else(|| {
@@ -238,6 +268,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
             }
         };
+        if let Some(message) = crate::state::event_window_rejection(start, now) {
+            // The window reaches further back than the service keeps events, so the
+            // members bounding it ask together for history that does not exist.
+            return Err(
+                DescribeEventsErrorModeled::InvalidParameterCombinationException(
+                    InvalidParameterCombinationException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+        if start > now {
+            // A log holds what has already happened, so the instant a window STARTS at
+            // is a point in the past: one in the future names no reportable event, and
+            // it is the start itself that is wrong rather than its pairing with the end.
+            return Err(invalid_value(
+                crate::state::FUTURE_START_TIME_MESSAGE.to_string(),
+            ));
+        }
         if start > end {
             // An interval that ends before it begins holds no instant, so the two
             // members cannot be served together.
@@ -245,7 +295,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 DescribeEventsErrorModeled::InvalidParameterCombinationException(
                     InvalidParameterCombinationException {
                         message: Some(
-                            "StartTime must not be later than EndTime.".to_string(),
+                            "End time must not precede start time".to_string(),
                         ),
                     },
                 )

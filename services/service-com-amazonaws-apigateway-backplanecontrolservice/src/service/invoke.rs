@@ -14,17 +14,26 @@
 //! unknown to the service.
 //!
 //! So this module is the second half of [`crate::service::EmulatedService`]: the claim
-//! ([`invoke_api_id`], read by `Service::can_handle`) and the serving
+//! ([`claims_parts`], read by `Service::can_handle`) and the serving
 //! ([`serve`], reached from the two seams the router offers before and after
 //! authentication). It is a READ of the control plane's own records — a request to a
 //! stage changes nothing — and every status it answers is computed from them.
 //!
+//! A client on the machine this emulator runs on cannot reach that host at all: nothing
+//! resolves `{rest-api-id}.execute-api.{region}.amazonaws.com` there, so it points at the
+//! emulator's own endpoint and carries in the PATH what it cannot carry in the host — the
+//! api id ahead of the stage, or the stage alone. [`resolve`] reads all three addressings,
+//! and each one is checked against this service's own records, so one request still has
+//! one claimant.
+//!
 //! # What it resolves, in order
 //!
-//! 1. the host's first label names a stored `RestApi` (the claim), whose
-//!    `disableExecuteApiEndpoint` must not have turned this endpoint off;
-//! 2. the first path segment names a `Stage` of that API, and that stage's
-//!    `deploymentId` names a stored `Deployment`;
+//! 1. the request names a stored `RestApi` — by the host's first label, by the first path
+//!    segment, or, on a host that names no service, by the stage segment of its path
+//!    ([`resolve`]) — whose `disableExecuteApiEndpoint` must not have turned this endpoint
+//!    off;
+//! 2. the first segment of the path WITHIN that api names a `Stage` of it, and that
+//!    stage's `deploymentId` names a stored `Deployment`;
 //! 3. the rest of the path matches one of the resource paths THAT DEPLOYMENT holds
 //!    (`Deployment$apiSummary`), most specific match first: a literal segment beats a
 //!    `{parameter}`, which beats a greedy `{proxy+}`;
@@ -43,9 +52,14 @@
 //!
 //! Only the `MOCK` integration type returns a backend's answer without a backend: it is
 //! "for testing without actually invoking the backend" (`IntegrationType`), so its
-//! response is entirely the API's own records — the integration response selected for the
-//! call, the response template for the negotiated content type, and the headers the
-//! method response declares. That path is served in full, from state.
+//! response is entirely the API's own records — the integration response the call's
+//! request template selects, the response template for the negotiated content type, and
+//! the headers the method response declares. That path is served in full, from state. One
+//! narrowing is worth stating: the status the request template names selects the
+//! integration response stored UNDER THAT STATUS CODE, and otherwise the default one — a
+//! `selectionPattern` is not matched against it, because a pattern is documented as
+//! choosing "an integration response based on the response from the back end" and a `MOCK`
+//! produces no back-end response to match.
 //!
 //! Every other integration type names a backend this emulator cannot call:
 //!
@@ -136,6 +150,16 @@ const IDENTITY_SOURCE_QUERY_PREFIX: &str = "method.request.querystring.";
 /// empty JSON body.
 const JSON_CONTENT_TYPE: &str = "application/json";
 
+/// The `passthroughBehavior` that passes an unmapped body through whenever no template
+/// keys the request's content type; the default one
+/// ([`crate::ops::put_integration::DEFAULT_PASSTHROUGH_BEHAVIOR`]).
+const PASSTHROUGH_WHEN_NO_MATCH: &str = "WHEN_NO_MATCH";
+
+/// The `passthroughBehavior` that passes no unmapped body through at all, which
+/// `PutIntegrationRequest$passthroughBehavior` documents as rejecting the request "with an
+/// HTTP 415 Unsupported Media Type response".
+const PASSTHROUGH_NEVER: &str = "NEVER";
+
 /// The member a gateway response body carries the reason under: API Gateway's default
 /// gateway-response template is `{"message":$context.error.messageString}`.
 const MESSAGE_MEMBER: &str = "message";
@@ -216,25 +240,203 @@ const AUTHORIZER_CONFIGURATION_ERROR: GatewayRefusal = GatewayRefusal {
     message: "Internal server error",
 };
 
-/// The API id a request addresses on an `execute-api` host, or `None` when the request is
-/// not one this data plane serves.
+/// The request's content type maps to no integration request template and the
+/// integration's `passthroughBehavior` does not let an unmapped body through: `415`
+/// `{"message":"Unsupported Media Type"}`.
+const UNSUPPORTED_MEDIA_TYPE: GatewayRefusal = GatewayRefusal {
+    response_type: "UNSUPPORTED_MEDIA_TYPE",
+    message: "Unsupported Media Type",
+};
+
+/// What an invoke addresses, as the wire carries it: the request's host — absent on a
+/// request that carries neither a `Host` header nor an absolute URI — and its path.
 ///
-/// `None` for a host that is not an `execute-api` endpoint (the control plane's
-/// `apigateway.{region}.amazonaws.com` included, whose first label names the service), and
-/// for the `@connections` path space, which belongs to ApiGatewayManagementApi — see
-/// [`CONNECTIONS_SEGMENT`].
-pub fn invoke_api_id(parts: &http::request::Parts) -> Option<&str> {
-    let host = request_host(parts)?;
-    let api_id = api_id_of_host(host)?;
-    (!addresses_connections(parts.uri.path())).then_some(api_id)
+/// Built from BOTH shapes the router hands this module, the buffered parts the claim reads
+/// and the runtime-API request the two serving seams read, so one rule resolves both and
+/// the claim cannot resolve a different api than the answer does.
+#[derive(Debug)]
+pub struct Addressed<'a> {
+    host: Option<&'a str>,
+    path: &'a str,
 }
 
-/// [`invoke_api_id`] for the runtime-API request the router hands an operation and the
-/// routing-error seam, which carries its URI as a string.
-pub fn invoke_api_id_of_request(req: &RtRequest) -> Option<&str> {
-    let host = req.headers().get("host").or_else(|| authority_of(req.uri()))?;
-    let api_id = api_id_of_host(host)?;
-    (!addresses_connections(path_of(req.uri()))).then_some(api_id)
+impl<'a> Addressed<'a> {
+    /// The addressing of the buffered request these parts came from.
+    fn of_parts(parts: &'a http::request::Parts) -> Self {
+        Self {
+            host: request_host(parts),
+            path: parts.uri.path(),
+        }
+    }
+
+    /// The addressing of a runtime-API request, which carries its URI as a string.
+    fn of_request(req: &'a RtRequest) -> Self {
+        Self {
+            host: req.headers().get("host").or_else(|| authority_of(req.uri())),
+            path: path_of(req.uri()),
+        }
+    }
+}
+
+/// What an invoke request addresses, as this service's records resolve it: the api, and
+/// the path WITHIN that api's endpoint — `/{stage}/{resource-path}`, which is what the
+/// stage and the resource are read from.
+#[derive(Debug)]
+struct Resolved<'s, 'r> {
+    api: &'s RestApiEntry,
+    invoke_path: &'r str,
+}
+
+/// What `addressed` addresses, or `None` when this data plane serves it not at all.
+///
+/// THREE addressings resolve, because a client reaches this emulator at a different
+/// address than it reaches AWS at:
+///
+/// * HOST-STYLE, the addressing `RestApi$disableExecuteApiEndpoint` documents: the host's
+///   first label names the api (`{api_id}.execute-api.{region}.amazonaws.com`) and the
+///   whole path is the invoke path. A host that IS an `execute-api` endpoint but whose api
+///   id this service does not hold resolves to nothing at all: that host is another api's
+///   (an API Gateway V2 api is reached on the same host shape, and its own service claims
+///   it), so reading its path as one of THIS service's stages would make two services claim
+///   one request;
+/// * PATH-STYLE: the api id is the FIRST PATH SEGMENT and the invoke path is what follows
+///   it. A client on the machine this emulator runs on resolves
+///   `{api_id}.execute-api.{region}.amazonaws.com` nowhere, so it reaches the emulator's own
+///   endpoint and carries in the path what it cannot carry in the host — the same move S3
+///   path-style addressing makes with a bucket, and the same one Lightsail's container-service
+///   URL makes with the labels AWS puts in a hostname. It is read only on a host that names
+///   NO SERVICE (the emulator's own endpoint) or names THIS one, so a first segment that
+///   happens to equal an api id cannot take a request away from the service whose endpoint
+///   the host names;
+/// * STAGE-ONLY, for a client that carries the invoke path alone: a host that names NO
+///   SERVICE at all is resolved by the STAGE segment of the path, the only part of such a
+///   request that names a deployed stage. That is the host-independent claim
+///   ApiGatewayManagementApi makes over its own `@connections` path space and
+///   `service-com-amazonaws-apigatewayv2-apigatewayv2`'s WebSocket data plane makes over a
+///   stage's. Which service a host names is the FRONT DOOR's own rule
+///   ([`service_named_by_host`]), so the stage is read exactly for the request the front door
+///   could place nowhere, and a host that names some service — this service's own control
+///   plane, or another service's endpoint — keeps answering as that service. The host alone
+///   decides it, and not the whole routing key: an `AWS_IAM` method is invoked with a SigV4
+///   credential, whose scope resolves a routing key for every such request, so a claim
+///   conditioned on the key having resolved nothing would leave exactly the signed invokes
+///   unclaimed. When two apis hold a stage of that name the request names no ONE api, so
+///   nothing is resolved rather than one of them guessed at.
+///
+/// This service's own CONTROL-plane path space is never read as a stage: a request whose
+/// first segment is one of the model's route segments is a control-plane call on whatever
+/// host it arrives at, and answering it from the data plane would take `/restapis` away
+/// from the operations that serve it. A stage named like one of those segments is reachable
+/// through the two addressings above, where the api is named before the stage is.
+fn resolve<'s, 'r>(
+    store: &'s crate::state::ComAmazonawsApigatewayBackplanecontrolserviceState,
+    addressed: &Addressed<'r>,
+) -> Option<Resolved<'s, 'r>> {
+    // The `@connections` path space belongs to ApiGatewayManagementApi, on either host —
+    // see [`CONNECTIONS_SEGMENT`].
+    if addresses_connections(addressed.path) {
+        return None;
+    }
+    if let Some(api_id) = addressed.host.and_then(api_id_of_host) {
+        return store.rest_apis.get(api_id).map(|api| Resolved {
+            api,
+            invoke_path: addressed.path,
+        });
+    }
+    let (first, rest) = split_first_segment(addressed.path)?;
+    // Which service the host names, by the front door's own rule: `None` is the emulator's
+    // own endpoint, and this service's own key is its control-plane host.
+    let host_service = addressed.host.and_then(service_named_by_host);
+    if host_service
+        .as_deref()
+        .is_some_and(|service| service != crate::ROUTE_KEY)
+    {
+        // Another service's endpoint: whatever its path carries is that service's to
+        // answer, so neither addressing below is read and one request keeps one claimant.
+        return None;
+    }
+    // PATH-STYLE: the first segment names an api this service holds, and the invoke path
+    // is what follows it.
+    if let Some(api) = store.rest_apis.get(first) {
+        return Some(Resolved {
+            api,
+            invoke_path: rest,
+        });
+    }
+    if host_service.is_some() {
+        // This service's own control-plane host: a path segment that is no api id of this
+        // account is a control-plane call, not a stage.
+        return None;
+    }
+    if crate::ROUTE_PATH_SEGMENTS.contains(&first) {
+        return None;
+    }
+    // STAGE-ONLY: the first segment names a stage, and the api is the one that holds a
+    // stage of that name. When two apis hold one the request names no ONE api, so nothing
+    // is resolved rather than one of them guessed at — the two addressings above carry the
+    // api id and are never ambiguous.
+    let mut holding = store
+        .rest_apis
+        .values()
+        .filter(|api| api.stages.contains_key(first));
+    let api = holding.next()?;
+    holding.next().is_none().then_some(Resolved {
+        api,
+        invoke_path: addressed.path,
+    })
+}
+
+/// The first non-empty segment of `path` and the path that follows it, or `None` for a
+/// path with no segment at all.
+///
+/// The remainder keeps no leading `/` — [`path_segments`] drops empty segments, so the two
+/// spellings read the same — and is a SLICE of the path, so a resolved addressing borrows
+/// the request rather than copying it.
+fn split_first_segment(path: &str) -> Option<(&str, &str)> {
+    let trimmed = path.trim_start_matches('/');
+    let (first, rest) = match trimmed.split_once('/') {
+        Some((first, rest)) => (first, rest),
+        None => (trimmed, ""),
+    };
+    (!first.is_empty()).then_some((first, rest))
+}
+
+/// The service `host` names to the emulator's front door, or `None` when it names none.
+///
+/// The front door's OWN host reader decides it (`emulator_server::service_from_host`, the
+/// last tier of the routing key every front door resolves), rather than a second rule
+/// written here: the request the two path addressings are read for is exactly the one that
+/// reader can place nowhere — a loopback address or `localhost`, which is the only endpoint
+/// a client on this machine can reach. It is handed the host as a `Host` header because
+/// that is the shape it reads, and a host no header can carry names no service.
+fn service_named_by_host(host: &str) -> Option<String> {
+    let mut headers = http::HeaderMap::new();
+    let value = http::HeaderValue::from_str(host).ok()?;
+    headers.insert(http::header::HOST, value);
+    ::emulator_server::service_from_host(&headers)
+}
+
+/// Whether THIS data plane serves the request these parts came from — the data-plane half
+/// of `Service::can_handle`.
+///
+/// Narrowed to an api this service HOLDS, read from the one shared store, so nothing is
+/// claimed that this service cannot answer about and exactly one service claims a request.
+pub fn claims_parts<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    parts: &http::request::Parts,
+) -> bool {
+    claims(engine, &Addressed::of_parts(parts))
+}
+
+/// [`claims_parts`] for the runtime-API request the two serving seams are handed.
+pub fn claims_request<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> bool {
+    claims(engine, &Addressed::of_request(req))
+}
+
+/// Whether this data plane serves `addressed`.
+fn claims<Eng: Send + Sync + 'static>(engine: &Eng, addressed: &Addressed<'_>) -> bool {
+    crate::state::service_state(engine)
+        .is_some_and(|state| resolve(&state.lock(), addressed).is_some())
 }
 
 /// The first label of `host` when `host` is an `execute-api` endpoint: the API id.
@@ -287,28 +489,25 @@ fn addresses_connections(path: &str) -> bool {
 /// `CredentialedDataPlane` for one carrying a SigV4 credential — answer identically; they
 /// differ only in whether the emulator verified a signature on the way in.
 pub fn serve<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> RtResponse {
-    let Some(api_id) = invoke_api_id_of_request(req) else {
-        // Unreachable through either seam: both name this only for a request whose host is
-        // an `execute-api` endpoint. Answered as an endpoint that serves nothing.
-        return refusal_response(None, FORBIDDEN);
-    };
+    let addressed = Addressed::of_request(req);
     let Some(state) = crate::state::service_state(engine) else {
         return refusal_response(None, API_CONFIGURATION_ERROR);
     };
     let store = state.lock();
-    let Some(api) = store.rest_apis.get(api_id) else {
-        // The API was deleted between the claim and now, or another process minted the
-        // host: an id this account does not serve is `403 Forbidden`.
+    let Some(resolved) = resolve(&store, &addressed) else {
+        // The api was deleted between the claim and now, or another process minted the
+        // host: an endpoint that serves no api of this account is `403 Forbidden`.
         return refusal_response(None, FORBIDDEN);
     };
+    let api = resolved.api;
+    let api_id = api.id.as_str();
     if api.disable_execute_api_endpoint {
         // `disableExecuteApiEndpoint`: "Specifies whether clients can invoke your API by
         // using the default execute-api endpoint." Turned off, the endpoint serves nothing.
         return refusal_response(Some(api), FORBIDDEN);
     }
 
-    let path = path_of(req.uri());
-    let Some((stage_name, resource_path)) = split_stage(path) else {
+    let Some((stage_name, resource_path)) = split_stage(resolved.invoke_path) else {
         return refusal_response(Some(api), FORBIDDEN);
     };
     let Some(stage) = api.stages.get(stage_name) else {
@@ -495,12 +694,30 @@ fn serve_integration(
         return refusal_response(Some(api), API_CONFIGURATION_ERROR);
     }
 
-    // A `MOCK` invokes nothing, so there is no backend answer for a `selectionPattern` to
-    // match: the DEFAULT integration response — the one with no pattern — is the response
-    // of the call.
-    let Some(selected) = default_integration_response(integration) else {
+    // A `MOCK` invokes nothing: the integration REQUEST template this call selects IS what
+    // the integration returns, and the `statusCode` that template carries names the
+    // integration response the call maps to. A call no template maps is passed through or
+    // refused as `passthroughBehavior` says, and one whose mapping names no stored response
+    // maps to the DEFAULT integration response — the one with no `selectionPattern`, since
+    // a `MOCK` produces no backend response for a pattern to match.
+    let mapped_status = match request_mapping(integration, req) {
+        RequestMapping::Mapped(template) => mock_status_code(template),
+        RequestMapping::PassedThrough => None,
+        RequestMapping::Unsupported => {
+            return refusal_response(Some(api), UNSUPPORTED_MEDIA_TYPE);
+        }
+    };
+    let selected = mapped_status
+        .and_then(|code| {
+            integration
+                .integration_responses
+                .as_ref()
+                .and_then(|responses| responses.get(&code))
+        })
+        .or_else(|| default_integration_response(integration));
+    let Some(selected) = selected else {
         tracing::warn!(
-            "the MOCK integration has no default integration response, so the call maps to \
+            "the MOCK integration has no integration response for this call, so it maps to \
              no method response"
         );
         return refusal_response(Some(api), API_CONFIGURATION_ERROR);
@@ -568,7 +785,106 @@ fn serve_integration(
     response
 }
 
-/// The integration response a `MOCK` call maps to: the one with no `selectionPattern`.
+/// What the integration's request templates and `passthroughBehavior` make of this call.
+#[derive(Debug)]
+enum RequestMapping<'i> {
+    /// The template the request's content type selects, which for a `MOCK` is what the
+    /// integration returns.
+    Mapped(&'i str),
+    /// No template maps this content type, and the behaviour lets the body through
+    /// unmapped — so the call produces no mapped response of its own.
+    PassedThrough,
+    /// No template maps this content type and the behaviour forbids passing it through.
+    Unsupported,
+}
+
+/// The integration request template this call selects, by the content type it declares.
+///
+/// `requestTemplates` is "a key-value map ... the key is an `Accept`/`Content-Type` header
+/// value and the value is a mapping template", and `passthroughBehavior` decides a request
+/// no key matches: `WHEN_NO_MATCH` "passes the method request body through the integration
+/// request without transformation", `WHEN_NO_TEMPLATES` allows that only when the
+/// integration declares NO template at all, and `NEVER` "rejects the method request with an
+/// HTTP 415 Unsupported Media Type response". A request that declares no content type is
+/// read as the JSON one, the type API Gateway assumes for template selection.
+fn request_mapping<'i>(
+    integration: &'i GetIntegrationOutput,
+    req: &RtRequest,
+) -> RequestMapping<'i> {
+    let behaviour = integration
+        .passthrough_behavior
+        .as_deref()
+        .unwrap_or(crate::ops::put_integration::DEFAULT_PASSTHROUGH_BEHAVIOR);
+    let templates = integration
+        .request_templates
+        .as_ref()
+        .filter(|templates| !templates.is_empty());
+    let Some(templates) = templates else {
+        // No template at all: only `NEVER` refuses such a call, and the other two
+        // behaviours pass the body through.
+        return if behaviour == PASSTHROUGH_NEVER {
+            RequestMapping::Unsupported
+        } else {
+            RequestMapping::PassedThrough
+        };
+    };
+    let declared = request_media_type(req);
+    if let Some(template) = templates.get(&declared) {
+        return RequestMapping::Mapped(template);
+    }
+    // Templates exist but none keys this content type: `WHEN_NO_MATCH` is the only
+    // behaviour that still lets the body through.
+    if behaviour == PASSTHROUGH_WHEN_NO_MATCH {
+        RequestMapping::PassedThrough
+    } else {
+        RequestMapping::Unsupported
+    }
+}
+
+/// The media type the request declares, as a `requestTemplates` key is compared: the
+/// `Content-Type` header with any parameter (`; charset=…`) dropped and the type
+/// lowercased, defaulting to [`JSON_CONTENT_TYPE`] when the request declares none.
+fn request_media_type(req: &RtRequest) -> String {
+    req.headers()
+        .get("content-type")
+        .map(|value| {
+            value
+                .split(';')
+                .next()
+                .unwrap_or(value)
+                .trim()
+                .to_ascii_lowercase()
+        })
+        .filter(|media| !media.is_empty())
+        .unwrap_or_else(|| JSON_CONTENT_TYPE.to_string())
+}
+
+/// The integration-response status code the selected `MOCK` request template names, or
+/// `None` when it names none.
+///
+/// A `MOCK` integration's request template is where the call's status comes from: the
+/// documented form is a literal object carrying the status to return
+/// (`{"statusCode": 200}`), and that code is the key of the integration response the call
+/// maps to. A template this emulator cannot render — a Velocity one — names no code, and
+/// neither does one that is not such an object: the call then maps to the default
+/// integration response rather than to a code guessed at.
+fn mock_status_code(template: &str) -> Option<String> {
+    if is_velocity_template(template) {
+        return None;
+    }
+    let value: ::serde_json::Value = ::serde_json::from_str(template).ok()?;
+    let status = value.get("statusCode")?;
+    // A JSON number, and the string spelling a template written with quotes produces;
+    // both name the same integration response.
+    match status {
+        ::serde_json::Value::Number(number) => number.as_u64().map(|code| code.to_string()),
+        ::serde_json::Value::String(code) => Some(code.clone()),
+        _ => None,
+    }
+}
+
+/// The integration response a `MOCK` call maps to when its request mapping names none:
+/// the one with no `selectionPattern`.
 ///
 /// `selectionPattern` is "the regular expression (regex) pattern used to choose an
 /// integration response based on the response from the back end" — there is no back-end

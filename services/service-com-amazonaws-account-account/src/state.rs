@@ -9,8 +9,9 @@
 //! record below is the one copy every one of those handlers reads and writes.
 //! It also carries the account's most recent primary email update, which
 //! `StartPrimaryEmailUpdate` records, `AcceptPrimaryEmailUpdate` confirms and
-//! `GetPrimaryEmailUpdateStatus` reports, the primary email address a confirmed
-//! update put on the account once it completed, and the phone-number
+//! `GetPrimaryEmailUpdateStatus` reports, the primary email address every
+//! account carries and a confirmed update replaces once it completed, which
+//! `GetPrimaryEmail` reports, and the phone-number
 //! verification of its primary contact, which `SendPhoneNumberVerification`
 //! starts, `VerifyPhoneNumber` completes and `GetContactInformation` reports as
 //! `VerificationStatus` ([`PhoneNumberVerification`]).
@@ -194,6 +195,35 @@ pub fn initial_contact_information(account_id: &str) -> ContactInformation {
         company_name: None,
         website_url: None,
     }
+}
+
+/// The local part of the primary email address an account record carries from
+/// the moment it exists, before any primary email update has completed on it.
+const INITIAL_PRIMARY_EMAIL_LOCAL_PART: &str = "root+";
+
+/// The domain of that address: the domain RFC 2606 reserves for examples, so no
+/// mailbox a real person could own is named.
+const INITIAL_PRIMARY_EMAIL_DOMAIN: &str = "@example.com";
+
+/// The primary email address (the root user email address) an account record
+/// carries from the moment it exists, before a primary email update has
+/// completed on it.
+///
+/// Every Amazon Web Services account HAS a primary email address: it is the root
+/// user's email address, captured when the account is signed up for, and
+/// `GetPrimaryEmail` is documented to retrieve "the primary email address
+/// associated with the specified account" — so an account record this emulator
+/// holds reports one from the moment it exists, exactly as it reports a name and
+/// primary contact information (see [`initial_account_name`] and
+/// [`initial_contact_information`]), rather than reporting that member absent
+/// until a caller has run the update flow.
+///
+/// The value names the account by its id, which keeps it distinct per record and
+/// inside `PrimaryEmailAddress`'s modelled `@length(min: 5, max: 64)`: 5
+/// characters of local part, a 12-digit id and 12 of domain is 29, and the
+/// shape carries no `@pattern` to satisfy beyond that.
+pub fn initial_primary_email(account_id: &str) -> String {
+    format!("{INITIAL_PRIMARY_EMAIL_LOCAL_PART}{account_id}{INITIAL_PRIMARY_EMAIL_DOMAIN}")
 }
 
 /// How many account records the store holds before a call that would create a
@@ -549,6 +579,18 @@ impl PrimaryEmailUpdate {
         }
     }
 
+    /// The address this update has already PUT ON the account as of `now`: the
+    /// address it was started for, once the completion the clock owes it has
+    /// come due, and `None` while the update has not completed. A pure function
+    /// of the record and the clock, so a reader answers the settled address
+    /// without writing anything — the counterpart of
+    /// [`settled_status`](Self::settled_status).
+    pub fn settled_address(&self, now: SystemTime) -> Option<&str> {
+        self.completes_at
+            .is_some_and(|due| now >= due)
+            .then_some(self.requested_email.as_str())
+    }
+
     /// When the status [`settled_status`](Self::settled_status) reports was set:
     /// the due instant for a completion the clock already owes, else the instant
     /// the stored status was written.
@@ -683,17 +725,17 @@ pub struct Account {
     /// none has ever been started — which is what makes a status read of an
     /// account with no update a refusal rather than a reported status.
     pub primary_email_update: Option<PrimaryEmailUpdate>,
-    /// The account's primary email address (the root user email address), and
-    /// `None` until an update has COMPLETED on this record: this emulator
-    /// learns an account's primary email only by being told it through the
-    /// `StartPrimaryEmailUpdate` / `AcceptPrimaryEmailUpdate` flow, and never
-    /// invents one.
+    /// The account's primary email address (the root user email address):
+    /// [`initial_primary_email`] from the moment the record exists, and the
+    /// address of the last primary email update that COMPLETED on it after
+    /// that. Never absent — every account has a root user email address (see
+    /// [`initial_primary_email`]), which is what `GetPrimaryEmail` reports.
     ///
     /// Written by [`settle_primary_email_update`](Self::settle_primary_email_update)
-    /// when the accepted update completes, and read to decide whether an
+    /// when an accepted update completes, and read to decide whether an
     /// address is already in use — which is the conflict Account Management
     /// documents for a root user email change.
-    pub primary_email: Option<String>,
+    pub primary_email: String,
     /// The MOST RECENT phone-number verification of this account, or `None`
     /// while no `SendPhoneNumberVerification` has ever sent a passcode. The
     /// record names the number the passcode went to, so it stops applying when
@@ -707,13 +749,13 @@ impl Account {
         Self {
             account_name: initial_account_name(&account_id),
             contact_information: initial_contact_information(&account_id),
+            primary_email: initial_primary_email(&account_id),
             account_id,
             created_date: now,
             state: ACTIVE_ACCOUNT_STATE.to_string(),
             alternate_contacts: BTreeMap::new(),
             region_opt_status: BTreeMap::new(),
             primary_email_update: None,
-            primary_email: None,
             phone_verification: None,
         }
     }
@@ -733,8 +775,22 @@ impl Account {
             .as_mut()
             .and_then(|update| update.settle(now));
         if let Some(address) = completed {
-            self.primary_email = Some(address);
+            self.primary_email = address;
         }
+    }
+
+    /// This account's primary email address as of `now`: the address of an
+    /// accepted update whose completion the clock already owes, else the stored
+    /// one.
+    ///
+    /// A pure function of the record and the clock, exactly like
+    /// [`PrimaryEmailUpdate::settled_status`], so a REPORTING operation answers
+    /// the settled address without writing anything.
+    pub fn settled_primary_email(&self, now: SystemTime) -> &str {
+        self.primary_email_update
+            .as_ref()
+            .and_then(|update| update.settled_address(now))
+            .unwrap_or(self.primary_email.as_str())
     }
 
     /// The phone number in this account's primary contact information.
@@ -914,7 +970,7 @@ impl ComAmazonawsAccountAccountState {
     /// passcode it waits for may never arrive.
     pub fn primary_email_in_use(&self, address: &str) -> bool {
         self.accounts.values().any(|account| {
-            account.primary_email.as_deref() == Some(address)
+            account.primary_email == address
                 || account
                     .primary_email_update
                     .as_ref()
@@ -1080,11 +1136,13 @@ pub fn primary_email_already_in_use() -> ConflictException {
 /// only be called from the management account or the delegated administrator
 /// account of an organization for a member account", and "the management account
 /// can't specify its own `AccountId`". The message names no account id, so it is
-/// the same sentence whichever account the caller is.
+/// the same sentence whichever account the caller is, and it names neither the
+/// operation nor whether that operation reads or writes — the rule is the same
+/// for a read of a member account (`GetPrimaryEmail`) as for a write of one.
 pub fn cannot_target_own_account() -> AccessDeniedException {
     AccessDeniedException {
         message: "The operation failed because the management account can't specify its own \
-                  AccountId; this operation updates a member account of the organization"
+                  AccountId; this operation acts on a member account of the organization"
             .to_string(),
         error_type: None,
     }

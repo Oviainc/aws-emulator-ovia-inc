@@ -166,6 +166,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.settle(std::time::Instant::now());
 
+        // WHICH CLUSTER FIRST, then what the request asks of it: a request naming a
+        // cluster this store does not hold is answered not-found whatever else it
+        // carries, rather than reporting a parameter problem for a resource that does
+        // not exist. The cluster is only LOOKED UP here — nothing is removed until every
+        // refusal below is behind us.
+        //
+        // A cluster name is a case-insensitive identifier, so the name this request
+        // deletes is folded exactly as the store is keyed.
+        let cluster_name = crate::state::fold_name(&input.cluster_name);
+        if !state.clusters.contains_key(&cluster_name) {
+            return Err(DeleteClusterErrorModeled::ClusterNotFoundFault(
+                ClusterNotFoundFault {
+                    // The service's own sentence for a cluster it does not hold, which
+                    // names no value of the request: this operation is reached with a
+                    // name, and what the caller is told is that no cluster carries it.
+                    message: Some(crate::state::NO_SUCH_CLUSTER_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
         // Refused BEFORE anything is removed, so a request this emulator cannot serve
         // faithfully leaves the cluster exactly where it was. A final snapshot would
         // have to be a real snapshot (the operation even models
@@ -197,17 +218,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A cluster name is a case-insensitive identifier, so the name this request
-        // deletes is folded exactly as the store is keyed.
-        let cluster_name = crate::state::fold_name(&input.cluster_name);
-        let Some(mut cluster) = state.clusters.remove(&cluster_name) else {
-            return Err(DeleteClusterErrorModeled::ClusterNotFoundFault(
-                ClusterNotFoundFault {
-                    message: Some(format!("Cluster {cluster_name} not found.")),
-                },
-            )
-            .into());
-        };
+        let mut cluster = state
+            .clusters
+            .remove(&cluster_name)
+            .expect("the cluster was just resolved under the same lock");
         // The cluster is gone from state, so no later call reports it; the response
         // describes it as the caller last had it, in the terminal `deleting` status.
         // Nothing settles a removed cluster, so it carries no due transition.

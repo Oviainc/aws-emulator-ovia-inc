@@ -217,23 +217,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The members this operation can change — `AccessString` and
         // `AuthenticationMode`, the two the model declares beside the required name.
-        // A request carrying NEITHER asks for no change at all, which is a parameter
-        // combination this operation cannot act on; it is refused HERE, before the
-        // stored user is reached mutably at all, so "a refused update writes nothing" is
-        // structural rather than a property of the order of the branches below.
+        // A request carrying NEITHER names no field to update, which is a VALUE
+        // problem with the request as a whole rather than a pair of members that
+        // cannot hold together: the service answers it with the sentence below. It is
+        // refused HERE, before the stored user is reached mutably at all, so "a refused
+        // update writes nothing" is structural rather than a property of the order of
+        // the branches below.
         if input.access_string.is_none() && input.authentication_mode.is_none() {
-            return Err(
-                UpdateUserErrorModeled::InvalidParameterCombinationException(
-                    InvalidParameterCombinationException {
-                        message: Some(
-                            "No modifications were requested. Supply AccessString or \
-                             AuthenticationMode to update a user."
-                                .to_string(),
-                        ),
-                    },
-                )
-                .into(),
-            );
+            return Err(UpdateUserErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(crate::state::EMPTY_USER_UPDATE_MESSAGE.to_string()),
+                },
+            )
+            .into());
         }
 
         // The authentication rules are checked BEFORE anything is persisted, so a
