@@ -113,6 +113,9 @@ mod multiplex_update;
 #[path = "all/networks.rs"]
 mod networks;
 
+#[path = "all/node_lifecycle.rs"]
+mod node_lifecycle;
+
 #[path = "all/rejection_messages.rs"]
 mod rejection_messages;
 

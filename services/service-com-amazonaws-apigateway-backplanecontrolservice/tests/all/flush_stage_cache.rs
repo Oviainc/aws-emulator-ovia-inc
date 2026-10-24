@@ -31,8 +31,9 @@ use crate::stage_lifecycle::{create_deployment, get_stage};
 /// A margin on top of a stored span, so a test waiting one out is not racing it.
 const MARGIN: Duration = Duration::from_millis(150);
 
-/// `FlushStageCache` for `stage_name` of `api`.
-async fn flush_cache(gateway: &Gateway, api: &str, stage_name: &str) -> Answer {
+/// `FlushStageCache` for `stage_name` of `api`. Shared with the `delete_stage` suite,
+/// which flushes a deleted stage's cache to show the record is gone for every reader.
+pub(crate) async fn flush_cache(gateway: &Gateway, api: &str, stage_name: &str) -> Answer {
     gateway
         .call(
             "DELETE",
