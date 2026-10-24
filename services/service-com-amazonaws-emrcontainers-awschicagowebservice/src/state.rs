@@ -3,10 +3,10 @@
 //! Engine state for the com-amazonaws-emrcontainers-awschicagowebservice service.
 //!
 //! This holds the virtual-cluster / job-run core loop of EMR on EKS, the job templates
-//! `StartJobRun` values are stored in, plus the security-configuration templates a
-//! virtual cluster can reference. Every field a describe or a list answers with is read
-//! back out of one of these records: nothing is echoed from the request that asked for
-//! it, and nothing is canned.
+//! `StartJobRun` values are stored in, the security-configuration templates a virtual
+//! cluster can reference, and the managed endpoints that gateway into one. Every field a
+//! describe or a list answers with is read back out of one of these records: nothing is
+//! echoed from the request that asked for it, and nothing is canned.
 //!
 //! Two things live here beside the records because several operations need them and a
 //! second copy would let two operations disagree:
@@ -27,8 +27,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    Configuration, ConfigurationOverrides, ContainerProvider, JobDriver, JobRun, JobTemplate,
-    JobTemplateData, ParametricConfigurationOverrides, RetryPolicyConfiguration,
+    Configuration, ConfigurationOverrides, ContainerProvider, Endpoint, JobDriver, JobRun,
+    JobTemplate, JobTemplateData, ParametricConfigurationOverrides, RetryPolicyConfiguration,
     SchedulerConfiguration, SchedulerStatus, SecurityConfiguration, SecurityConfigurationData,
     TemplateParameterConfiguration, VirtualCluster,
 };
@@ -76,6 +76,30 @@ pub const JOB_CANCEL_PENDING: &str = "CANCEL_PENDING";
 pub const JOB_CANCELLED: &str = "CANCELLED";
 pub const JOB_FAILED: &str = "FAILED";
 pub const JOB_COMPLETED: &str = "COMPLETED";
+
+/// `EndpointState` members this slice uses. Each is a value of the generated
+/// `ENDPOINT_STATE_VALUES` catalog in `ops::types::shared_types`
+/// (`smithy_query(query="shape", shape="EndpointState")`:
+/// `CREATING`, `ACTIVE`, `TERMINATING`, `TERMINATED`, `TERMINATED_WITH_ERRORS`).
+///
+/// A managed endpoint is accepted `CREATING` and reaches `ACTIVE` on the clock.
+/// `TERMINATED_WITH_ERRORS` is the one state nothing here writes: it reports a teardown
+/// that failed, and nothing in this emulator can fail a teardown. It is named because
+/// [`endpoint_state_is_terminal`] is written against the whole catalog.
+pub const ENDPOINT_CREATING: &str = "CREATING";
+pub const ENDPOINT_ACTIVE: &str = "ACTIVE";
+pub const ENDPOINT_TERMINATING: &str = "TERMINATING";
+pub const ENDPOINT_TERMINATED: &str = "TERMINATED";
+pub const ENDPOINT_TERMINATED_WITH_ERRORS: &str = "TERMINATED_WITH_ERRORS";
+
+/// The `EndpointState` values no further transition leaves.
+pub const ENDPOINT_TERMINAL_STATES: &[&str] =
+    &[ENDPOINT_TERMINATED, ENDPOINT_TERMINATED_WITH_ERRORS];
+
+/// Whether an `EndpointState` is one a managed endpoint never leaves.
+pub fn endpoint_state_is_terminal(state: &str) -> bool {
+    ENDPOINT_TERMINAL_STATES.contains(&state)
+}
 
 /// The `JobRunState` values no further transition leaves. A job run that reaches one of
 /// them has a `finishedAt`.
@@ -154,6 +178,15 @@ pub const MAX_JOB_TEMPLATES: usize = 500;
 /// further. Sized well above any plausible test or demo workload.
 pub const MAX_SECURITY_CONFIGURATIONS: usize = 200;
 
+/// The most managed endpoints this emulator keeps at once.
+///
+/// Not an AWS quota: the emulator's own retention cap, on the same terms as
+/// [`MAX_VIRTUAL_CLUSTERS`]. An endpoint in a terminal `EndpointState` is reclaimed
+/// oldest-first to make room, and the endpoints of a reclaimed virtual cluster go with it;
+/// once every slot holds a live endpoint, `CreateManagedEndpoint` is refused rather than
+/// growing the store without bound.
+pub const MAX_MANAGED_ENDPOINTS: usize = 200;
+
 /// The idempotency scope `CreateVirtualCluster` remembers a `clientToken` under.
 ///
 /// A token is scoped to the operation that minted the resource, so the same token on
@@ -181,6 +214,14 @@ pub const CREATE_SECURITY_CONFIGURATION_SCOPE: &str = "CreateSecurityConfigurati
 /// to one cluster.
 pub fn start_job_run_scope(virtual_cluster_id: &str) -> String {
     format!("StartJobRun:{virtual_cluster_id}")
+}
+
+/// The idempotency scope `CreateManagedEndpoint` remembers a `clientToken` under: scoped
+/// to the virtual cluster as well as the operation, because a managed endpoint is created
+/// IN one cluster (`POST /virtualclusters/{virtualClusterId}/endpoints`) and the token
+/// identifies one creation in it.
+pub fn create_managed_endpoint_scope(virtual_cluster_id: &str) -> String {
+    format!("CreateManagedEndpoint:{virtual_cluster_id}")
 }
 
 /// The idempotency scope `CreateJobTemplate` remembers a `clientToken` under. A job
@@ -243,6 +284,13 @@ pub const LIST_JOB_TEMPLATES_SCOPE: &str = "jobtemplates";
 
 /// The scope [`encode_list_cursor`] tags a `ListSecurityConfigurations` cursor with.
 pub const LIST_SECURITY_CONFIGURATIONS_SCOPE: &str = "securityconfigurations";
+
+/// The scope [`encode_list_cursor`] tags a `ListManagedEndpoints` cursor with: one cluster's
+/// endpoint listing, so a cursor is never read as a position in another cluster's order, nor
+/// in the SAME cluster's job-run listing (which scopes its cursors by the cluster id alone).
+pub fn list_managed_endpoints_scope(virtual_cluster_id: &str) -> String {
+    format!("endpoints:{virtual_cluster_id}")
+}
 
 /// `arn:aws:emr-containers:{region}:{account}:/virtualclusters/{id}` — the
 /// `VirtualClusterArn` shape's pattern.
@@ -820,12 +868,94 @@ impl SecurityConfigurationRecord {
     }
 }
 
+/// One managed endpoint, as `CreateManagedEndpoint` persisted it.
+#[derive(Debug, Clone)]
+pub struct ManagedEndpointRecord {
+    pub id: String,
+    pub name: String,
+    pub virtual_cluster_id: String,
+    pub arn: String,
+    /// The endpoint's `type` (an `EndpointType`, free-form `\S` in the model), spelled
+    /// without the keyword so the record needs no raw identifier.
+    pub endpoint_type: String,
+    pub state: String,
+    pub release_label: String,
+    pub execution_role_arn: String,
+    pub certificate_arn: Option<String>,
+    pub configuration_overrides: Option<ConfigurationOverrides>,
+    /// `CreateManagedEndpoint$sessionIdleTimeoutInMinutes`, persisted as submitted. The
+    /// `Endpoint` shape declares no member for it, so no read reports it; it is kept
+    /// because it is part of the endpoint this request asked for.
+    pub session_idle_timeout_in_minutes: i32,
+    pub created_at_millis: i64,
+    pub tags: HashMap<String, String>,
+    pub client_token: String,
+    /// Creation sequence, so endpoints minted within one millisecond still have a total
+    /// order for `ListManagedEndpoints` to page through.
+    pub sequence: u64,
+    pub pending: Option<PendingTransition>,
+}
+
+impl ManagedEndpointRecord {
+    /// Materialise this endpoint's transition if the clock has made it due. `Endpoint`
+    /// declares no "finished" instant, so a transition only moves the state.
+    fn settle(&mut self, now: Instant) {
+        let Some(pending) = self.pending.take() else {
+            return;
+        };
+        if now < pending.due_at {
+            self.pending = Some(pending);
+            return;
+        }
+        self.state = pending.next_state.to_string();
+    }
+
+    /// The modelled `Endpoint` this record represents.
+    ///
+    /// The members this emulator leaves ABSENT are the ones AWS fills from infrastructure
+    /// that exists nowhere here, and a value for any of them would be fabricated:
+    ///
+    /// * `serverUrl` / `authProxyUrl` — the endpoint's gateway, served by the EKS cluster.
+    ///   Nothing in this emulator listens for an EMR Studio client, so reporting a URL
+    ///   would name an address no client can reach.
+    /// * `certificateAuthority` — "the certificate generated by emr control plane on
+    ///   customer behalf"; this emulator issues no certificate.
+    /// * `securityGroup` / `subnetIds` — read from the EKS cluster's networking, which the
+    ///   create request does not carry and this emulator does not model.
+    /// * `stateDetails` / `failureReason` — "additional details of the endpoint state" and
+    ///   "the reasons why the endpoint has failed": nothing here failed.
+    pub fn to_endpoint(&self) -> Endpoint {
+        Endpoint {
+            id: Some(self.id.clone()),
+            name: Some(self.name.clone()),
+            arn: Some(self.arn.clone()),
+            virtual_cluster_id: Some(self.virtual_cluster_id.clone()),
+            r#type: Some(self.endpoint_type.clone()),
+            state: Some(self.state.clone()),
+            release_label: Some(self.release_label.clone()),
+            execution_role_arn: Some(self.execution_role_arn.clone()),
+            certificate_arn: self.certificate_arn.clone(),
+            certificate_authority: None,
+            configuration_overrides: self.configuration_overrides.clone(),
+            server_url: None,
+            auth_proxy_url: None,
+            created_at: Some(date_time(self.created_at_millis)),
+            security_group: None,
+            subnet_ids: None,
+            state_details: None,
+            failure_reason: None,
+            tags: Some(self.tags.clone()),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-emrcontainers-awschicagowebservice. A handler reaches it through [`service_state`].
 ///
 /// # Bounding the store
 ///
 /// Every record set is CAPPED ([`MAX_VIRTUAL_CLUSTERS`], [`MAX_JOB_RUNS`],
-/// [`MAX_JOB_TEMPLATES`], [`MAX_SECURITY_CONFIGURATIONS`]) and retired
+/// [`MAX_JOB_TEMPLATES`], [`MAX_SECURITY_CONFIGURATIONS`], [`MAX_MANAGED_ENDPOINTS`]) and
+/// retired
 /// records are reclaimed oldest-first when a cap is reached, so the store cannot grow
 /// with the number of requests served: a caller that creates resources in a loop ends up
 /// recycling the same bounded set of slots, and once every slot holds a LIVE resource the
@@ -843,6 +973,10 @@ pub struct ComAmazonawsEmrcontainersAwschicagowebserviceState {
     pub security_configurations: HashMap<String, SecurityConfigurationRecord>,
     /// Job-run ids per virtual cluster, in creation order.
     pub job_runs_by_cluster: HashMap<String, Vec<String>>,
+    /// Managed endpoints by `id`, capped at [`MAX_MANAGED_ENDPOINTS`].
+    pub managed_endpoints: HashMap<String, ManagedEndpointRecord>,
+    /// Managed-endpoint ids per virtual cluster, in creation order.
+    pub managed_endpoints_by_cluster: HashMap<String, Vec<String>>,
     /// Job templates by `id`. Capped by [`MAX_JOB_TEMPLATES`]; a template leaves only
     /// when `DeleteJobTemplate` removes it.
     pub job_templates: HashMap<String, JobTemplateRecord>,
@@ -856,6 +990,8 @@ pub struct ComAmazonawsEmrcontainersAwschicagowebserviceState {
     pub pending_clusters: HashSet<String>,
     /// The ids of the job runs that owe the clock a transition.
     pub pending_job_runs: HashSet<String>,
+    /// The ids of the managed endpoints that owe the clock a transition.
+    pub pending_managed_endpoints: HashSet<String>,
     /// Monotonic counter behind [`Self::mint_id`].
     pub id_counter: u64,
 }
@@ -952,6 +1088,20 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
             };
             if still_pending {
                 self.pending_job_runs.insert(id);
+            }
+        }
+        // A managed endpoint's CREATING -> ACTIVE step answers to the clock alone: it
+        // takes no scheduler slot and nothing else gates it.
+        for id in std::mem::take(&mut self.pending_managed_endpoints) {
+            let still_pending = match self.managed_endpoints.get_mut(&id) {
+                Some(record) => {
+                    record.settle(now);
+                    record.pending.is_some()
+                }
+                None => false,
+            };
+            if still_pending {
+                self.pending_managed_endpoints.insert(id);
             }
         }
     }
@@ -1055,6 +1205,21 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
                         .remove(&(start_job_run_scope(&id), run.client_token));
                 }
             }
+            // A managed endpoint lives UNDER a virtual cluster, so the cluster's endpoints
+            // are reclaimed with it rather than left naming a cluster that is gone.
+            for endpoint_id in self
+                .managed_endpoints_by_cluster
+                .remove(&id)
+                .unwrap_or_default()
+            {
+                self.pending_managed_endpoints.remove(&endpoint_id);
+                if let Some(endpoint) = self.managed_endpoints.remove(&endpoint_id) {
+                    self.idempotency.remove(&(
+                        create_managed_endpoint_scope(&id),
+                        endpoint.client_token,
+                    ));
+                }
+            }
             self.virtual_clusters.remove(&id);
             self.pending_clusters.remove(&id);
             self.idempotency
@@ -1130,6 +1295,88 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
             record.id.clone(),
         );
         self.job_runs.insert(record.id.clone(), record);
+    }
+
+    /// Make room for one more managed endpoint, reclaiming the oldest RETIRED ones (an
+    /// endpoint in a terminal [`EndpointState`](endpoint_state_is_terminal)) when the cap
+    /// is reached.
+    ///
+    /// `false` when every slot holds an endpoint that has not been torn down: the caller
+    /// must then refuse the create rather than grow the store.
+    pub fn reserve_managed_endpoint(&mut self) -> bool {
+        while self.managed_endpoints.len() >= MAX_MANAGED_ENDPOINTS {
+            let retired = self
+                .managed_endpoints
+                .values()
+                .filter(|record| endpoint_state_is_terminal(&record.state))
+                .min_by_key(|record| (record.created_at_millis, record.sequence))
+                .map(|record| {
+                    (
+                        record.id.clone(),
+                        record.virtual_cluster_id.clone(),
+                        record.client_token.clone(),
+                    )
+                });
+            let Some((id, virtual_cluster_id, client_token)) = retired else {
+                return false;
+            };
+            self.managed_endpoints.remove(&id);
+            self.pending_managed_endpoints.remove(&id);
+            if let Some(ids) = self.managed_endpoints_by_cluster.get_mut(&virtual_cluster_id) {
+                ids.retain(|stored| stored != &id);
+            }
+            self.idempotency.remove(&(
+                create_managed_endpoint_scope(&virtual_cluster_id),
+                client_token,
+            ));
+        }
+        true
+    }
+
+    /// Store a freshly minted managed endpoint, with its per-cluster index entry, its
+    /// idempotency entry and its pending transition registered. One function, so a record
+    /// can never be stored without them.
+    pub fn insert_managed_endpoint(&mut self, record: ManagedEndpointRecord) {
+        if record.pending.is_some() {
+            self.pending_managed_endpoints.insert(record.id.clone());
+        }
+        self.managed_endpoints_by_cluster
+            .entry(record.virtual_cluster_id.clone())
+            .or_default()
+            .push(record.id.clone());
+        self.idempotency.insert(
+            (
+                create_managed_endpoint_scope(&record.virtual_cluster_id),
+                record.client_token.clone(),
+            ),
+            record.id.clone(),
+        );
+        self.managed_endpoints.insert(record.id.clone(), record);
+    }
+
+    /// The stored managed endpoint with this id, only when it really belongs to this
+    /// cluster: an endpoint id under the wrong virtual cluster is not found, not somebody
+    /// else's endpoint.
+    pub fn managed_endpoint(
+        &self,
+        virtual_cluster_id: &str,
+        id: &str,
+    ) -> Option<&ManagedEndpointRecord> {
+        self.managed_endpoints
+            .get(id)
+            .filter(|record| record.virtual_cluster_id == virtual_cluster_id)
+    }
+
+    /// This cluster's stored managed endpoints, in creation order.
+    pub fn cluster_managed_endpoints(
+        &self,
+        virtual_cluster_id: &str,
+    ) -> impl Iterator<Item = &ManagedEndpointRecord> {
+        self.managed_endpoints_by_cluster
+            .get(virtual_cluster_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|id| self.managed_endpoints.get(id))
     }
 
     /// Make room for one more job template.
@@ -1258,9 +1505,12 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
             } => self
                 .job_run(virtual_cluster_id, id)
                 .map(|record| record.arn.as_str()),
-            // No managed endpoint is ever stored: `CreateManagedEndpoint` is still a
-            // scaffold, so an `EndpointArn` is well formed and names nothing.
-            TaggedResource::ManagedEndpoint { .. } => None,
+            TaggedResource::ManagedEndpoint {
+                virtual_cluster_id,
+                id,
+            } => self
+                .managed_endpoint(virtual_cluster_id, id)
+                .map(|record| record.arn.as_str()),
         };
         stored == Some(arn)
     }
@@ -1292,7 +1542,14 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
                 .get_mut(id)
                 .filter(|record| &record.virtual_cluster_id == virtual_cluster_id)
                 .map(|record| &mut record.tags),
-            TaggedResource::ManagedEndpoint { .. } => None,
+            TaggedResource::ManagedEndpoint {
+                virtual_cluster_id,
+                id,
+            } => self
+                .managed_endpoints
+                .get_mut(id)
+                .filter(|record| &record.virtual_cluster_id == virtual_cluster_id)
+                .map(|record| &mut record.tags),
         }
     }
 
