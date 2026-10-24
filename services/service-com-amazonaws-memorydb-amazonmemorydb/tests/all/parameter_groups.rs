@@ -41,10 +41,10 @@ const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 ///
 /// The rows differ along everything `CreateParameterGroup`'s rule generalises over: the
 /// group name, the parameter group family, whether a description was supplied, and
-/// whether tags were. The families are the ones MemoryDB publishes for its engines; the
-/// model carries no family catalog (`smithy_query query="shape" shape="ParameterGroup"`
-/// documents `Family` as free text), so the service records whichever the caller sends
-/// and these rows only have to differ from one another.
+/// whether tags were. The families are the ones the engine catalog publishes
+/// (`DescribeEngineVersions$ParameterGroupFamily`), which is what the service resolves
+/// `Family` against — a family it does not publish carries no engine defaults, and the
+/// refusal for one has its own case below.
 struct Case {
     name: &'static str,
     family: &'static str,
@@ -78,7 +78,7 @@ const CASES: &[Case] = &[
     // an absent member.
     Case {
         name: "delta-group",
-        family: "memorydb_valkey8",
+        family: "memorydb_valkey7",
         description: Some(""),
         tags: &[("only", "one")],
     },

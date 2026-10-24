@@ -7,6 +7,10 @@
 //! modules, and `types/mod.rs` re-exports them all.
 #![allow(unused_imports)]
 
+use aws_smithy_schema::serde::{SerdeError, SerializableStruct, ShapeDeserializer, ShapeSerializer};
+use aws_smithy_schema::{Schema, ShapeId, ShapeType};
+use aws_smithy_schema_server::DeserializableStruct;
+
 use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-memorydb-amazonmemorydb.json");
@@ -26,8 +30,20 @@ pub struct DescribeParametersOutput {
     pub parameters: Option<Vec<Parameter>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.memorydb#Parameter")]
-#[derive(Debug, Clone, Default)]
+/// One reported setting of a parameter group: "Describes an individual setting that
+/// controls some aspect of MemoryDB behavior".
+///
+/// Written out rather than derived from the model for ONE member: `Source`. The modelled
+/// shape carries `Name`, `Value`, `Description`, `DataType`, `AllowedValues` and
+/// `MinimumEngineVersion`; the service's wire answers those AND a `Source`, which says
+/// where the value a parameter reports came from — the family's engine defaults, or an
+/// update a caller made. A client that reads a group to learn which settings were changed
+/// cannot tell the two apart without it, so the member is published here. The shape of
+/// this code is the one `crate::scaffolded` uses for the shapes it states itself: a
+/// member schema per member, in member-index order, plus the
+/// `SerializableStruct`/`DeserializableStruct` pair the codec walks to read and write
+/// them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Parameter {
     pub name: Option<String>,
     pub value: Option<String>,
@@ -35,5 +51,146 @@ pub struct Parameter {
     pub data_type: Option<String>,
     pub allowed_values: Option<String>,
     pub minimum_engine_version: Option<String>,
+    /// Where the reported `Value` came from — see `crate::state::parameter_source`.
+    pub source: Option<String>,
 }
 
+impl Parameter {
+    const M_NAME: Schema = Schema::new_member(
+        ShapeId::from_static(
+            "com.amazonaws.memorydb#Parameter$Name",
+            "com.amazonaws.memorydb",
+            "Name",
+        ),
+        ShapeType::String,
+        "Name",
+        0,
+    );
+    const M_VALUE: Schema = Schema::new_member(
+        ShapeId::from_static(
+            "com.amazonaws.memorydb#Parameter$Value",
+            "com.amazonaws.memorydb",
+            "Value",
+        ),
+        ShapeType::String,
+        "Value",
+        1,
+    );
+    const M_DESCRIPTION: Schema = Schema::new_member(
+        ShapeId::from_static(
+            "com.amazonaws.memorydb#Parameter$Description",
+            "com.amazonaws.memorydb",
+            "Description",
+        ),
+        ShapeType::String,
+        "Description",
+        2,
+    );
+    const M_DATA_TYPE: Schema = Schema::new_member(
+        ShapeId::from_static(
+            "com.amazonaws.memorydb#Parameter$DataType",
+            "com.amazonaws.memorydb",
+            "DataType",
+        ),
+        ShapeType::String,
+        "DataType",
+        3,
+    );
+    const M_ALLOWED_VALUES: Schema = Schema::new_member(
+        ShapeId::from_static(
+            "com.amazonaws.memorydb#Parameter$AllowedValues",
+            "com.amazonaws.memorydb",
+            "AllowedValues",
+        ),
+        ShapeType::String,
+        "AllowedValues",
+        4,
+    );
+    const M_MINIMUM_ENGINE_VERSION: Schema = Schema::new_member(
+        ShapeId::from_static(
+            "com.amazonaws.memorydb#Parameter$MinimumEngineVersion",
+            "com.amazonaws.memorydb",
+            "MinimumEngineVersion",
+        ),
+        ShapeType::String,
+        "MinimumEngineVersion",
+        5,
+    );
+    /// The member the model does not declare and the wire does.
+    const M_SOURCE: Schema = Schema::new_member(
+        ShapeId::from_static(
+            "com.amazonaws.memorydb#Parameter$Source",
+            "com.amazonaws.memorydb",
+            "Source",
+        ),
+        ShapeType::String,
+        "Source",
+        6,
+    );
+
+    pub const SCHEMA: Schema = Schema::new_struct(
+        ShapeId::from_static(
+            "com.amazonaws.memorydb#Parameter",
+            "com.amazonaws.memorydb",
+            "Parameter",
+        ),
+        ShapeType::Structure,
+        &[
+            &Self::M_NAME,
+            &Self::M_VALUE,
+            &Self::M_DESCRIPTION,
+            &Self::M_DATA_TYPE,
+            &Self::M_ALLOWED_VALUES,
+            &Self::M_MINIMUM_ENGINE_VERSION,
+            &Self::M_SOURCE,
+        ],
+    );
+}
+
+pub static PARAMETER_SCHEMA: &Schema = &Parameter::SCHEMA;
+
+impl SerializableStruct for Parameter {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        // Every member is optional, so each one is written only when it is set: an
+        // absent member must not render as an empty string a client would read as a
+        // value.
+        for (member, value) in [
+            (&Self::M_NAME, self.name.as_deref()),
+            (&Self::M_VALUE, self.value.as_deref()),
+            (&Self::M_DESCRIPTION, self.description.as_deref()),
+            (&Self::M_DATA_TYPE, self.data_type.as_deref()),
+            (&Self::M_ALLOWED_VALUES, self.allowed_values.as_deref()),
+            (
+                &Self::M_MINIMUM_ENGINE_VERSION,
+                self.minimum_engine_version.as_deref(),
+            ),
+            (&Self::M_SOURCE, self.source.as_deref()),
+        ] {
+            if let Some(value) = value {
+                s.write_string(member, value)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl DeserializableStruct for Parameter {
+    fn deserialize(d: &mut dyn ShapeDeserializer) -> Result<Self, SerdeError> {
+        let mut parameter = Self::default();
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            let slot = match member.member_index() {
+                Some(0) => &mut parameter.name,
+                Some(1) => &mut parameter.value,
+                Some(2) => &mut parameter.description,
+                Some(3) => &mut parameter.data_type,
+                Some(4) => &mut parameter.allowed_values,
+                Some(5) => &mut parameter.minimum_engine_version,
+                Some(6) => &mut parameter.source,
+                _ => return Ok(()),
+            };
+            *slot = Some(d.read_string(member)?);
+            Ok(())
+        })?;
+        Ok(parameter)
+    }
+}

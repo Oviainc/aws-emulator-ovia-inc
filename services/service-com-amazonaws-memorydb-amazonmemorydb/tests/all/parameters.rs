@@ -40,9 +40,9 @@ use crate::cluster_lifecycle::{call, error_code, ok, router};
 ///
 /// Source: the AWS MemoryDB User Guide's per-family default parameter groups. Redis OSS
 /// 7.0 renamed the collection-encoding settings (`*-ziplist-*` → `*-listpack-*`) and
-/// replaced `lua-time-limit` with `busy-reply-threshold`, and Valkey 7.2 and 8.0
-/// continue that line — which is exactly why a family's parameter list cannot be the
-/// same for every family.
+/// replaced `lua-time-limit` with `busy-reply-threshold`, and the Valkey line continues
+/// that line and adds MemoryDB's own vector-search settings — which is exactly why a
+/// family's parameter list cannot be the same for every family.
 struct FamilyExpectation {
     family: &'static str,
     /// Parameters this family must carry.
@@ -65,6 +65,7 @@ const FAMILY_EXPECTATIONS: &[FamilyExpectation] = &[
             "hash-max-listpack-entries",
             "latency-tracking",
             "set-max-listpack-entries",
+            "search-enabled",
         ],
     },
     FamilyExpectation {
@@ -80,6 +81,7 @@ const FAMILY_EXPECTATIONS: &[FamilyExpectation] = &[
             "hash-max-ziplist-value",
             "lua-time-limit",
             "zset-max-ziplist-entries",
+            "search-enabled",
         ],
     },
     FamilyExpectation {
@@ -89,21 +91,7 @@ const FAMILY_EXPECTATIONS: &[FamilyExpectation] = &[
             "hash-max-listpack-entries",
             "latency-tracking",
             "set-max-listpack-entries",
-        ],
-        lacks: &[
-            "hash-max-ziplist-entries",
-            "hash-max-ziplist-value",
-            "lua-time-limit",
-            "zset-max-ziplist-entries",
-        ],
-    },
-    FamilyExpectation {
-        family: "memorydb_valkey8",
-        carries: &[
-            "busy-reply-threshold",
-            "hash-max-listpack-entries",
-            "latency-tracking",
-            "set-max-listpack-entries",
+            "search-enabled",
         ],
         lacks: &[
             "hash-max-ziplist-entries",
@@ -126,9 +114,10 @@ const UPDATES: &[(&str, &str)] = &[
     ("notify-keyspace-events", "KEA"),
 ];
 
-/// The engine versions the service publishes, as `(family, "<major>.<minor>")` pairs
-/// read from `DescribeEngineVersions` — the catalog a family's parameters follow.
-async fn published_versions(router: &MultiServiceRouter) -> Vec<(String, String)> {
+/// The engine versions the service publishes, as `(family, "<major>.<minor>",
+/// "<major>.<minor>.<patch>")` triples read from `DescribeEngineVersions` — the catalog a
+/// family's parameters follow.
+async fn published_versions(router: &MultiServiceRouter) -> Vec<(String, String, String)> {
     let body = ok(router, "DescribeEngineVersions", &json!({}), "engine catalog").await;
     let versions = body["EngineVersions"]
         .as_array()
@@ -136,34 +125,27 @@ async fn published_versions(router: &MultiServiceRouter) -> Vec<(String, String)
     versions
         .iter()
         .map(|version| {
-            let family = version["ParameterGroupFamily"]
-                .as_str()
-                .unwrap_or_else(|| panic!("expected ParameterGroupFamily in {version}"));
-            let engine_version = version["EngineVersion"]
-                .as_str()
-                .unwrap_or_else(|| panic!("expected EngineVersion in {version}"));
-            (family.to_string(), engine_version.to_string())
+            let member = |name: &str| {
+                version
+                    .get(name)
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| panic!("expected {name} in {version}"))
+                    .to_string()
+            };
+            (
+                member("ParameterGroupFamily"),
+                member("EngineVersion"),
+                member("EnginePatchVersion"),
+            )
         })
         .collect()
 }
 
-/// `"<major>.<minor>"` as a comparable pair.
-fn version_parts(version: &str, case: &str) -> (u32, u32) {
-    let (major, minor) = version
-        .split_once('.')
-        .unwrap_or_else(|| panic!("case {case:?}: expected <major>.<minor>, got {version:?}"));
-    (
-        major
-            .parse()
-            .unwrap_or_else(|_| panic!("case {case:?}: expected a numeric major in {version:?}")),
-        minor
-            .parse()
-            .unwrap_or_else(|_| panic!("case {case:?}: expected a numeric minor in {version:?}")),
-    )
-}
-
 /// Create one parameter group of `family`, named after the case.
-async fn create_group(router: &MultiServiceRouter, name: &str, family: &str) {
+///
+/// `pub(crate)` so the catalog suite drives the same helpers rather than standing up a
+/// second set.
+pub(crate) async fn create_group(router: &MultiServiceRouter, name: &str, family: &str) {
     ok(
         router,
         "CreateParameterGroup",
@@ -174,7 +156,7 @@ async fn create_group(router: &MultiServiceRouter, name: &str, family: &str) {
 }
 
 /// Every parameter one group reports, by name, from an unpaged `DescribeParameters`.
-async fn parameters(router: &MultiServiceRouter, group: &str) -> BTreeMap<String, Value> {
+pub(crate) async fn parameters(router: &MultiServiceRouter, group: &str) -> BTreeMap<String, Value> {
     let body = ok(
         router,
         "DescribeParameters",
@@ -224,7 +206,7 @@ fn parameter_names(body: &Value, case: &str) -> Vec<String> {
 }
 
 /// One `UpdateParameterGroup` call carrying `pairs`.
-async fn update(
+pub(crate) async fn update(
     router: &MultiServiceRouter,
     group: &str,
     pairs: &[(&str, &str)],
@@ -240,7 +222,7 @@ async fn update(
 }
 
 /// A string field of a reported parameter.
-fn field(parameter: &Value, member: &str, case: &str) -> String {
+pub(crate) fn field(parameter: &Value, member: &str, case: &str) -> String {
     parameter
         .get(member)
         .and_then(Value::as_str)
@@ -318,7 +300,7 @@ fn domain_of(parameter: &Value, case: &str) -> Domain {
 async fn a_groups_parameters_are_the_engine_defaults_of_its_family() {
     let router = router();
     let catalog = published_versions(&router).await;
-    let families: BTreeSet<String> = catalog.iter().map(|(family, _)| family.clone()).collect();
+    let families: BTreeSet<String> = catalog.iter().map(|(family, _, _)| family.clone()).collect();
     assert!(
         !families.is_empty(),
         "case {:?}: the engine catalog must publish at least one family",
@@ -326,7 +308,7 @@ async fn a_groups_parameters_are_the_engine_defaults_of_its_family() {
     );
     let published: BTreeSet<String> = catalog
         .iter()
-        .map(|(_, version)| version.clone())
+        .map(|(_, _, patch_version)| patch_version.clone())
         .collect();
 
     for family in &families {
@@ -361,14 +343,17 @@ async fn a_groups_parameters_are_the_engine_defaults_of_its_family() {
             );
         }
 
-        // The newest version the catalog publishes for this family: no parameter of the
-        // family may require a version newer than that.
-        let family_top = catalog
+        // The releases the catalog publishes for THIS family: the earliest engine
+        // version a parameter of the family can apply to is one of them.
+        let family_releases: BTreeSet<String> = catalog
             .iter()
-            .filter(|(candidate, _)| candidate == family)
-            .map(|(_, version)| version_parts(version, family))
-            .max()
-            .unwrap_or_else(|| panic!("case {family:?}: the family has no published version"));
+            .filter(|(candidate, _, _)| candidate == family)
+            .map(|(_, _, patch_version)| patch_version.clone())
+            .collect();
+        assert!(
+            !family_releases.is_empty(),
+            "case {family:?}: the family has no published release"
+        );
 
         for (name, parameter) in &reported {
             let case = format!("{family}/{name}");
@@ -381,12 +366,12 @@ async fn a_groups_parameters_are_the_engine_defaults_of_its_family() {
             assert!(
                 published.contains(&minimum),
                 "case {case:?}: MinimumEngineVersion {minimum:?} must be a published \
-                 engine version, published {published:?}"
+                 engine release, published {published:?}"
             );
             assert!(
-                version_parts(&minimum, &case) <= family_top,
-                "case {case:?}: MinimumEngineVersion {minimum:?} must not be newer than \
-                 the family's own {family_top:?}"
+                family_releases.contains(&minimum),
+                "case {case:?}: MinimumEngineVersion {minimum:?} must be a release of \
+                 the parameter's own family, which publishes {family_releases:?}"
             );
             // The default value must itself satisfy the domain the parameter publishes.
             match domain_of(parameter, &case) {
@@ -429,7 +414,7 @@ async fn a_groups_parameters_are_the_engine_defaults_of_its_family() {
 async fn an_update_persists_its_values_and_the_describe_reports_them() {
     let router = router();
     let catalog = published_versions(&router).await;
-    let families: BTreeSet<String> = catalog.into_iter().map(|(family, _)| family).collect();
+    let families: BTreeSet<String> = catalog.into_iter().map(|(family, _, _)| family).collect();
 
     for family in &families {
         // A second group of the SAME family, never updated, is the reference for "every
@@ -638,7 +623,7 @@ async fn a_refused_update_leaves_the_group_unchanged() {
 async fn every_published_bound_is_accepted_and_one_past_it_is_refused() {
     let router = router();
     const GROUP: &str = "bounds";
-    const FAMILY: &str = "memorydb_valkey8";
+    const FAMILY: &str = "memorydb_valkey7";
     create_group(&router, GROUP, FAMILY).await;
 
     for (name, parameter) in parameters(&router, GROUP).await {

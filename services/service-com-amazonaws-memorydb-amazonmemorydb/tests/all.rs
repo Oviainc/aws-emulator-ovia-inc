@@ -27,6 +27,8 @@ mod engine_versions;
 mod events;
 #[path = "all/fault_http_status.rs"]
 mod fault_http_status;
+#[path = "all/parameter_catalog.rs"]
+mod parameter_catalog;
 #[path = "all/parameter_groups.rs"]
 mod parameter_groups;
 #[path = "all/parameters.rs"]
