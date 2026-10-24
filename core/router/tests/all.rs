@@ -56,6 +56,11 @@ mod cloudfront_key_value_store_handshake;
 // this file is where every concurrent suite lands.
 #[path = "all/cloudtrail_channel_routing.rs"]
 mod cloudtrail_channel_routing;
+// Declared HERE, in the sorted list, rather than appended at the end of this file: the
+// tail is where every suite landing in the same window appends, so it is the contended
+// region, while this span of the sorted list is untouched by those appends.
+#[path = "all/cloudtrail_import_failures_routing.rs"]
+mod cloudtrail_import_failures_routing;
 #[path = "all/connect_signing_name_routing.rs"]
 mod connect_signing_name_routing;
 #[path = "all/dynamodb_streams_routing.rs"]

@@ -667,6 +667,51 @@ pub fn iso8601(at: SystemTime) -> Option<String> {
         .ok()
 }
 
+/// How many import failures one `ListImportFailures` page carries when the request
+/// names no `MaxResults`.
+///
+/// The model bounds `ListImportFailuresRequest$MaxResults` at
+/// [`LIST_IMPORT_FAILURES_MAX_RESULTS_MIN`]..=[`LIST_IMPORT_FAILURES_MAX_RESULTS_MAX`]
+/// and documents no default, so the default page size is the service's to choose;
+/// whatever a page leaves over is reached through `NextToken`.
+pub const LIST_IMPORT_FAILURES_DEFAULT_MAX_RESULTS: usize = 100;
+
+/// The smallest `MaxResults` the model accepts, from the `range` trait on
+/// `ListImportFailuresMaxResultsCount` (1..1000).
+pub const LIST_IMPORT_FAILURES_MAX_RESULTS_MIN: usize = 1;
+/// See [`LIST_IMPORT_FAILURES_MAX_RESULTS_MIN`].
+pub const LIST_IMPORT_FAILURES_MAX_RESULTS_MAX: usize = 1000;
+
+/// One failure an import recorded for a single source location, as
+/// `ListImportFailures` reports it.
+///
+/// `status` carries one of the values the model's `ImportFailureStatus` enum
+/// accepts (`crate::ops::types::IMPORT_FAILURE_STATUS_VALUES`).
+#[derive(Debug, Clone)]
+pub struct ImportFailureRecord {
+    pub location: String,
+    pub status: String,
+    pub error_type: String,
+    pub error_message: String,
+    pub last_updated_time: SystemTime,
+}
+
+impl ImportFailureRecord {
+    /// Project onto the modelled `ImportFailureListItem` shape, as
+    /// `ListImportFailures` reports it. The shape is named in full rather than
+    /// imported: this module's `use crate::ops::types::{..}` list is edited by every
+    /// operation that lands, and a one-line addition there conflicts with all of them.
+    pub fn to_failure_list_item(&self) -> crate::ops::types::ImportFailureListItem {
+        crate::ops::types::ImportFailureListItem {
+            location: Some(self.location.clone()),
+            status: Some(self.status.clone()),
+            error_type: Some(self.error_type.clone()),
+            error_message: Some(self.error_message.clone()),
+            last_updated_time: Some(::aws_smithy_types::DateTime::from(self.last_updated_time)),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Event data store lifecycle (CloudTrail Lake)
 // ---------------------------------------------------------------------------
@@ -1702,6 +1747,17 @@ pub struct ComAmazonawsCloudtrailCloudtrail20131101State {
     /// adds a record — refuses past, on the terms [`TRAIL_QUOTA`] and
     /// [`DASHBOARD_QUOTA`] state.
     pub imports: BTreeMap<ImportKey, ImportRecord>,
+    /// The failures each import recorded, in the order it recorded them — the order
+    /// `ListImportFailures` reports and pages through — under the same [`ImportKey`]
+    /// as the import itself.
+    ///
+    /// A one-to-many child collection rather than a `Vec` inside [`ImportRecord`]: an
+    /// import's own members and the failures it recorded are read by different
+    /// operations (`GetImport`/`ListImports`/`StopImport` against
+    /// `ListImportFailures`), and keeping them apart means an import carries exactly
+    /// one record of itself here while the page a listing serves is still computed
+    /// from this one store.
+    pub import_failures: BTreeMap<ImportKey, Vec<ImportFailureRecord>>,
     /// Every CloudTrail Lake event data store, keyed by its id (the resource
     /// suffix of its ARN), which is unique across Regions.
     pub event_data_stores: BTreeMap<String, EventDataStoreRecord>,
@@ -1900,6 +1956,18 @@ impl ComAmazonawsCloudtrailCloudtrail20131101State {
     pub fn import_mut(&mut self, import_id: &str, region: &str) -> Option<&mut ImportRecord> {
         self.imports
             .get_mut(&(import_id.to_string(), region.to_string()))
+    }
+
+    /// The failures the import `import_id` names in `region` recorded, in the order
+    /// it recorded them.
+    ///
+    /// An id naming no import of the caller's Region, and an import that recorded
+    /// nothing, both hold no failures: `ListImportFailures` models no not-found error,
+    /// so both are one empty page.
+    pub fn import_failures(&self, import_id: &str, region: &str) -> &[ImportFailureRecord] {
+        self.import_failures
+            .get(&(import_id.to_string(), region.to_string()))
+            .map_or(&[], Vec::as_slice)
     }
 
     /// The import still running in `region`, if there is one — what a NEW import
