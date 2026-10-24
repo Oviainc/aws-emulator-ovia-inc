@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListExecutions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListExecutions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListExecutions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: this operation lists, from the shared engine store (`crate::state`),
+//! the executions recorded against the ONE target resource the request names,
+//! narrowed by its `actionType` and `resolveTo` filters and ordered oldest first so
+//! `nextToken` resumes a stable enumeration; an id that names no stored resource is
+//! a modelled refusal rather than an empty page. This is the ONLY file to touch for
+//! it.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +161,183 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListExecutions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListExecutionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListExecutions"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListExecutionsError::Modeled(ListExecutionsErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: "the IoT SiteWise store is unavailable".to_string(),
+                },
+            ))
+        })?;
+        // Nothing a summary carries is scoped to the caller's region, so this
+        // listing reads no value off the request itself.
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+        let store = state.lock();
+
+        // The listing is scoped to ONE target resource, so that resource has to
+        // exist: an id that names no stored resource is a modelled refusal rather
+        // than an empty page, which would report absence as success. One match
+        // over `TargetResourceType` decides BOTH which resources the id is
+        // resolved against and which kind the refusal names, so the two cannot
+        // drift apart.
+        let target_type = input.target_resource_type.as_str();
+        let (target_exists, target_kind) = match target_type {
+            crate::state::TARGET_RESOURCE_TYPE_ASSET => (
+                store.assets.contains_key(&input.target_resource_id),
+                crate::state::RESOURCE_ASSET,
+            ),
+            // Computation models are created by `CreateComputationModel`, which is
+            // still a scaffold stub here, so this service stores none and the one a
+            // request names resolves to nothing. When that writer lands it brings a
+            // store of its own, which is what this arm then resolves against.
+            crate::state::TARGET_RESOURCE_TYPE_COMPUTATION_MODEL => {
+                (false, crate::state::RESOURCE_COMPUTATION_MODEL)
+            }
+            // Unreachable: the runtime refuses a value the enum does not declare
+            // before this handler runs. A value the model gains later names a
+            // resource this listing cannot resolve, which is the refusal below,
+            // worded for the kind the request asked for.
+            other => (false, other),
+        };
+        if !target_exists {
+            return Err(not_found(crate::state::not_found_message(
+                target_kind,
+                &input.target_resource_id,
+            )));
+        }
+
+        // The `resolveTo` filter is a resource reference: a type and an id that
+        // together name one resolved resource, so half of the pair identifies
+        // nothing and is refused as the bad request it is. `ResolveToResourceType`
+        // models the single value `ASSET`, which the runtime has already checked,
+        // so the id names an asset — and one that is absent draws the same refusal
+        // the target does.
+        let resolved_asset = match (
+            input.resolve_to_resource_type.as_deref(),
+            input.resolve_to_resource_id.as_deref(),
+        ) {
+            (Some(_), Some(asset_id)) => {
+                if !store.assets.contains_key(asset_id) {
+                    return Err(not_found(crate::state::not_found_message(
+                        crate::state::RESOURCE_ASSET,
+                        asset_id,
+                    )));
+                }
+                Some(asset_id)
+            }
+            (None, None) => None,
+            (Some(_), None) => {
+                return Err(invalid_request(
+                    "resolveToResourceId is required when resolveToResourceType is specified.",
+                ))
+            }
+            (None, Some(_)) => {
+                return Err(invalid_request(
+                    "resolveToResourceType is required when resolveToResourceId is specified.",
+                ))
+            }
+        };
+
+        // Every stored execution of the named target resource, narrowed by the
+        // filters the request carries: the type of action executed, and the
+        // detailed resource the execution resolves to.
+        let mut selected: Vec<&crate::state::ExecutionRecord> = store
+            .executions
+            .values()
+            .filter(|record| record.targets(target_type, &input.target_resource_id))
+            .filter(|record| {
+                input
+                    .action_type
+                    .as_deref()
+                    .is_none_or(|wanted| record.action_type.as_deref() == Some(wanted))
+            })
+            .filter(|record| {
+                resolved_asset.is_none_or(|asset_id| {
+                    record
+                        .resolve_to
+                        .as_ref()
+                        .is_some_and(|resolve_to| resolve_to.asset_id == asset_id)
+                })
+            })
+            .collect();
+
+        // A stable order is what makes `nextToken` resumable: oldest first, ties
+        // broken by id so two executions that started in the same instant still
+        // order deterministically.
+        selected.sort_by(|left, right| {
+            left.execution_start_time
+                .cmp(&right.execution_start_time)
+                .then_with(|| left.execution_id.cmp(&right.execution_id))
+        });
+
+        // `nextToken` is this enumeration's resume point: the id of the first
+        // execution of the next page, hex-encoded so the token matches the modelled
+        // `^[A-Za-z0-9+/=]+$`. A token whose resume point is not in this
+        // enumeration is refused rather than answered with an empty page.
+        let start = match input.next_token.as_deref() {
+            Some(token) => {
+                let resume = decode_token(token)?;
+                selected
+                    .iter()
+                    .position(|record| record.execution_id == resume)
+                    .ok_or_else(invalid_token)?
+            }
+            None => 0,
+        };
+        // `maxResults` carries the modelled range 1..250, which the runtime
+        // validates BEFORE this handler runs, so a value that arrives here is
+        // already in range and nothing is being coerced; `max(1)` only keeps the
+        // slice arithmetic below total.
+        let max_results = input.max_results.unwrap_or(DEFAULT_MAX_RESULTS).max(1) as usize;
+        let end = start.saturating_add(max_results).min(selected.len());
+        let next_token = selected
+            .get(end)
+            .map(|record| ::hex::encode(record.execution_id.as_bytes()));
+
+        Ok(ListExecutionsOutput {
+            execution_summaries: selected[start..end]
+                .iter()
+                .map(|record| record.summary(now))
+                .collect(),
+            next_token,
+        })
     }
+}
+
+/// The page size this listing answers with when the caller gives no `maxResults`.
+///
+/// CHOSEN, not documented: the operation documents `maxResults` only as "The
+/// maximum number of results returned for each paginated request". It is the
+/// default this service's other paginated listings already use, so a client that
+/// pages without asking for a size sees one page size across the service.
+const DEFAULT_MAX_RESULTS: i32 = 50;
+
+/// Decode a `nextToken` back into the `executionId` it resumes from.
+fn decode_token(token: &str) -> Result<String, ListExecutionsError> {
+    ::hex::decode(token)
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .ok_or_else(invalid_token)
+}
+
+/// HTTP 400 `InvalidRequestException` for a `nextToken` this operation never
+/// issued.
+fn invalid_token() -> ListExecutionsError {
+    invalid_request("The nextToken is not a token this operation issued.")
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: &str) -> ListExecutionsError {
+    ListExecutionsError::Modeled(ListExecutionsErrorModeled::InvalidRequestException(
+        InvalidRequestException {
+            message: message.to_string(),
+        },
+    ))
+}
+
+/// HTTP 404 `ResourceNotFoundException` carrying `message`.
+fn not_found(message: String) -> ListExecutionsError {
+    ListExecutionsError::Modeled(ListExecutionsErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException { message },
+    ))
 }
