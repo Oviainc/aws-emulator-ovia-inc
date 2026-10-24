@@ -27,6 +27,8 @@ mod application_authentication_methods;
 mod application_provider_describe;
 #[path = "all/application_providers.rs"]
 mod application_providers;
+#[path = "all/customer_managed_policy_references.rs"]
+mod customer_managed_policy_references;
 #[path = "all/instance_create.rs"]
 mod instance_create;
 #[path = "all/instance_delete.rs"]
