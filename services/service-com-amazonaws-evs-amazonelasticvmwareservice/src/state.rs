@@ -772,8 +772,13 @@ pub struct StoredVlan {
     pub cidr: String,
     /// The VCF traffic type carried over the VLAN — the `initialVlans` member name.
     pub function_name: String,
-    /// The subnet this service minted for the VLAN.
+    /// The EC2 subnet this service provisioned for the VLAN, in the account's own
+    /// Amazon EC2 store ([`ec2_resources::provision_vlan_subnets`]).
     pub subnet_id: String,
+    /// The Availability Zone of that subnet — the single zone every subnet of the
+    /// environment's VPC is in. Absent only when no EC2 store was reachable to
+    /// provision the subnet in, and so none to read a zone from.
+    pub availability_zone: Option<String>,
     /// The `VlanState` of the VLAN subnet.
     pub vlan_state: String,
     /// Whether the VLAN is public. Only the HCX VLAN can be, via `isHcxPublic`.
@@ -791,14 +796,15 @@ pub struct StoredVlan {
 impl StoredVlan {
     /// This VLAN as the modelled `Vlan` shape.
     ///
-    /// `availabilityZone` is left absent: the AZ of a VLAN subnet is the AZ of the
-    /// EC2 subnet the VPC provides, and this emulator holds no EC2 state to read it
-    /// from — reporting a guess would be worse than reporting nothing.
+    /// `availabilityZone` is the zone of the EC2 subnet this service provisioned for
+    /// the VLAN, as that subnet reports it — not a value of this service's own. It is
+    /// absent only for a VLAN whose subnet could not be provisioned in an EC2 store at
+    /// all, because there is then no subnet to read a zone from.
     pub fn to_wire(&self) -> Vlan {
         Vlan {
             vlan_id: Some(self.vlan_id),
             cidr: Some(self.cidr.clone()),
-            availability_zone: None,
+            availability_zone: self.availability_zone.clone(),
             function_name: Some(self.function_name.clone()),
             subnet_id: Some(self.subnet_id.clone()),
             created_at: Some(timestamp(self.created_at_ms)),
@@ -1304,6 +1310,12 @@ impl ComAmazonawsEvsAmazonelasticvmwareserviceState {
 
     /// Mint a subnet id: `subnet-` + exactly 17 lowercase hex characters, the long
     /// form of the modelled `^subnet-[a-f0-9]{8}([a-f0-9]{9})?$`.
+    ///
+    /// The FALLBACK only. A VLAN subnet is a real subnet of the caller's VPC, so its
+    /// id is the one Amazon EC2's own minter gave the subnet
+    /// ([`ec2_resources::provision_vlan_subnets`]); this is what names a VLAN on an
+    /// engine that carries no readable EC2 store to provision the subnet in, where an
+    /// id of this service's own is all there is to report.
     pub fn mint_subnet_id(&mut self) -> String {
         let seed = u128::from(self.next_seed());
         let value = ((u128::from(self.id_salt) << 4) ^ seed) & ((1u128 << 68) - 1);
