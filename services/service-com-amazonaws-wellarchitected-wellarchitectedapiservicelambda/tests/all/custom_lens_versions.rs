@@ -72,8 +72,9 @@ async fn import_lens(client: &Client, case: &str, document: &str) -> String {
 }
 
 /// The versions a stored lens holds, by name, straight from the shared state — the lens
-/// record is where a published version lives, and nothing over the wire lists them yet
-/// (`ListLenses` and `GetLens` are stubs with their own issues).
+/// record is where a published version lives, and nothing over the wire enumerates every
+/// version of a lens yet (`GetLens` reports the version its CURRENT content is published
+/// as, and `ListLensVersions` is not an operation of this service).
 fn stored_versions(client: &Client, alias: &str) -> Vec<String> {
     let store = client.store();
     let store = store.lock();

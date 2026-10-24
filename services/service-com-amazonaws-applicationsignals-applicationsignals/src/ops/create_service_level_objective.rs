@@ -270,13 +270,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .request_based_sli_config
             .as_ref()
             .map(crate::state::request_based_sli_from_config);
-        let evaluation_type = if sli.is_some() {
-            Some(crate::state::EVALUATION_TYPE_PERIOD_BASED.to_string())
-        } else if request_based_sli.is_some() {
-            Some(crate::state::EVALUATION_TYPE_REQUEST_BASED.to_string())
-        } else {
-            None
-        };
+        let evaluation_type = crate::state::requested_evaluation_type(
+            input.sli_config.as_ref(),
+            input.request_based_sli_config.as_ref(),
+        )
+        .map(str::to_string);
         let metric_source_type =
             crate::state::derive_metric_source_type(sli.as_ref(), request_based_sli.as_ref());
 

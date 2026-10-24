@@ -150,9 +150,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ///
     /// Every member the request omits is left exactly as stored — including `Arn`, `Name`
     /// and `CreatedTime`, which no request can change — and `LastUpdatedTime` is advanced
-    /// to now. Supplying `SliConfig` switches the record to `PeriodBased` and supplying
-    /// `RequestBasedSliConfig` switches it to `RequestBased`, since the two indicators are
-    /// mutually exclusive, and `MetricSourceType` is re-derived from the new indicator.
+    /// to now. A supplied SLI config REPLACES the indicator of the same kind the record
+    /// already carries (`MetricSourceType` is re-derived from the new indicator); it can
+    /// never change which kind the record is, because an SLO's evaluation kind is fixed at
+    /// create: the operation's doc states "You cannot change from a period-based SLO to a
+    /// request-based SLO, or change from a request-based SLO to a period-based SLO", so a
+    /// request whose config is of the other kind is refused with `ValidationException` and
+    /// nothing of the record is written.
     ///
     /// A supplied `Goal` REPLACES the stored goal wholesale: each of its own members the
     /// request omits takes the default the model documents for it, not the value the stored
@@ -193,27 +197,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        // An SLO's evaluation kind is set at create and fixed thereafter (operation doc:
+        // "You cannot change from a period-based SLO to a request-based SLO, or change from
+        // a request-based SLO to a period-based SLO"). This is a DIFFERENT rule from the
+        // exclusion above: that one is about one request naming two configs, this one about
+        // a request whose single config is of the other kind than the stored record. The
+        // check runs before any member is written, so a refused update leaves the record
+        // exactly as it was. A record that carries no indicator at all is of no kind yet, so
+        // a config of either kind is an initial choice rather than a change.
+        let requested_kind = crate::state::requested_evaluation_type(
+            input.sli_config.as_ref(),
+            input.request_based_sli_config.as_ref(),
+        );
+        let stored_kind = crate::state::stored_evaluation_type(slo);
+        let switches_kind = matches!(
+            (stored_kind, requested_kind),
+            (Some(stored), Some(requested)) if stored != requested
+        );
+        if switches_kind {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "You cannot change from a period-based SLO to a request-based SLO, or change \
+                 from a request-based SLO to a period-based SLO.",
+            ));
+        }
+
         if let Some(description) = input.description.as_ref() {
             slo.description = Some(description.clone());
         }
         if let Some(config) = input.sli_config.as_ref() {
             slo.sli = Some(crate::state::sli_from_config(config));
-            slo.request_based_sli = None;
-            slo.evaluation_type =
-                Some(crate::state::EVALUATION_TYPE_PERIOD_BASED.to_string());
         }
         if let Some(config) = input.request_based_sli_config.as_ref() {
             slo.request_based_sli = Some(crate::state::request_based_sli_from_config(config));
-            slo.sli = None;
-            slo.evaluation_type =
-                Some(crate::state::EVALUATION_TYPE_REQUEST_BASED.to_string());
         }
-        if input.sli_config.is_some() || input.request_based_sli_config.is_some() {
-            let derived = crate::state::derive_metric_source_type(
+        if let Some(kind) = requested_kind {
+            // Only reached when the kind matches the stored one, or when the record had no
+            // indicator yet and this config is its first.
+            slo.evaluation_type = Some(kind.to_string());
+            slo.metric_source_type = crate::state::derive_metric_source_type(
                 slo.sli.as_ref(),
                 slo.request_based_sli.as_ref(),
             );
-            slo.metric_source_type = derived;
         }
         if let Some(goal) = input.goal.as_ref() {
             slo.goal = crate::state::goal_with_defaults(Some(goal));

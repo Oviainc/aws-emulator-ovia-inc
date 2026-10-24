@@ -34,12 +34,15 @@ fn is_modelled_volume_id(id: &str) -> bool {
 
 /// The smallest `CreateVolume` body the service accepts in `zone`: a volume needs a
 /// zone of the signed Region and a capacity source, and nothing else.
-fn simple_create(zone: &str) -> Value {
+///
+/// `pub(crate)` with [`create_volume`] below: the sibling `volume_attachment` suite
+/// creates its volumes through the same two helpers rather than rebuilding them.
+pub(crate) fn simple_create(zone: &str) -> Value {
     json!({ "AvailabilityZone": zone, "SizeInGB": 4 })
 }
 
 /// `CreateVolume`, returning the minted id.
-async fn create_volume(router: &MultiServiceRouter, body: Value) -> String {
+pub(crate) async fn create_volume(router: &MultiServiceRouter, body: Value) -> String {
     let payload = ok(router, "CreateVolume", body).await;
     let id = payload
         .get("VolumeId")

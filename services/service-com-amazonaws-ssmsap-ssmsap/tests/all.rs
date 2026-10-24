@@ -29,6 +29,8 @@ mod register_application_conditional_requirements;
 mod region_scoping;
 #[path = "all/resource_permissions.rs"]
 mod resource_permissions;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/validation_message_rendering.rs"]

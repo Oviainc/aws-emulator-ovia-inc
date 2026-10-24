@@ -29,5 +29,7 @@ mod response_members;
 mod rule_group_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/top_path_statistics.rs"]
+mod top_path_statistics;
 #[path = "all/web_acl_lifecycle.rs"]
 mod web_acl_lifecycle;

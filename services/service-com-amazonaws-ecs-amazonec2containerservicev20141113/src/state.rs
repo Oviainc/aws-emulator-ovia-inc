@@ -452,6 +452,13 @@ pub const TASK_DEFINITION_ACTIVE: &str = "ACTIVE";
 /// indefinitely."
 pub const TASK_DEFINITION_INACTIVE: &str = "INACTIVE";
 
+/// The `SortOrder` value that REVERSES a listing's documented default order — the
+/// `ListTaskDefinitions$sort` doc: "Setting this parameter to `DESC` reverses the sort
+/// order on family name and revision." One of the two values the model's enum carries
+/// ([`crate::ops::types::SORT_ORDER_VALUES`]); the other, `ASC`, is the order a request
+/// that names no sort already gets.
+pub const SORT_ORDER_DESC: &str = "DESC";
+
 /// `Failure$reason` for an id that names nothing in this account. The ECS "API failure
 /// reasons" list: `MISSING` — "the described resource could not be found".
 pub const FAILURE_MISSING: &str = "MISSING";
@@ -775,6 +782,14 @@ pub const TASK_DEFINITION_NOT_FOUND_MESSAGE: &str = "Unable to describe task def
 /// A condition that names no resource, so like its neighbours above it is ONE sentence
 /// whatever family and revision the request named.
 pub const TASK_DEFINITION_INACTIVE_MESSAGE: &str = "TaskDefinition is inactive.";
+
+/// `ClientException$message` for a `nextToken` a paginated read cannot resume from: a
+/// value the operation never minted. Like its neighbours above it is ONE fixed sentence
+/// naming the member and no value — the sentence Amazon ECS answers whatever the
+/// unusable token was, which is also why the member's own doc calls a token "an opaque
+/// identifier that is only used to retrieve the next items in a list and not for other
+/// programmatic purposes".
+pub const INVALID_NEXT_TOKEN_MESSAGE: &str = "Invalid nextToken.";
 
 /// `ClientException$message` for a `taskDefinition` that is not a task-definition
 /// reference at all — the condition [`parse_task_definition_reference`] answers `None`

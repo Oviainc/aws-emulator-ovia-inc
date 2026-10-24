@@ -167,7 +167,7 @@ fn insert_engagement(emulator: &Emulator, record: EngagementRecord) {
 ///
 /// AWS delivers it out of band and never returns it, so the store IS the channel's mailbox:
 /// this is the test standing in for the contact reading their email.
-fn delivered_code(emulator: &Emulator, channel_arn: &str) -> Option<String> {
+pub(crate) fn delivered_code(emulator: &Emulator, channel_arn: &str) -> Option<String> {
     let state = service_state(&*emulator.engine).expect("the engine holds this service's state");
     let state = state.lock();
     state
@@ -177,7 +177,7 @@ fn delivered_code(emulator: &Emulator, channel_arn: &str) -> Option<String> {
 }
 
 /// `CreateContactChannel`, asserting it answered 200.
-async fn create_channel(emulator: &Emulator, request: Value, case: &str) -> String {
+pub(crate) async fn create_channel(emulator: &Emulator, request: Value, case: &str) -> String {
     let (status, body) = emulator.call("CreateContactChannel", request).await;
     assert_eq!(
         status, 200,
@@ -203,7 +203,11 @@ async fn create_rotation(emulator: &Emulator, request: Value, case: &str) -> Str
 }
 
 /// The `ActivationStatus` `GetContactChannel` reports for `channel_arn`.
-async fn activation_status(emulator: &Emulator, channel_arn: &str, case: &str) -> String {
+pub(crate) async fn activation_status(
+    emulator: &Emulator,
+    channel_arn: &str,
+    case: &str,
+) -> String {
     let (status, body) = emulator
         .call("GetContactChannel", json!({"ContactChannelId": channel_arn}))
         .await;
@@ -235,6 +239,11 @@ const GATED_OPERATIONS: &[GatedOperation] = &[
     GatedOperation {
         operation: "ActivateContactChannel",
         body: |targets| json!({"ContactChannelId": targets.channel, "ActivationCode": "000000"}),
+        absent_status: 404,
+    },
+    GatedOperation {
+        operation: "DeactivateContactChannel",
+        body: |targets| json!({"ContactChannelId": targets.channel}),
         absent_status: 404,
     },
     GatedOperation {
@@ -508,7 +517,7 @@ const CHANNEL_ROWS: &[ChannelRow] = &[
 ];
 
 /// Create the contact every channel row hangs off, onboarded.
-async fn onboarded_contact(emulator: &Emulator, alias: &str) -> String {
+pub(crate) async fn onboarded_contact(emulator: &Emulator, alias: &str) -> String {
     onboard(emulator);
     emulator
         .create_contact(

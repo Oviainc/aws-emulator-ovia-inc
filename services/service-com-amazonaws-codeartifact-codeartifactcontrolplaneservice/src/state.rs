@@ -21,7 +21,7 @@ use std::time::SystemTime;
 use crate::ops::types::{
     AssetSummary, DomainDescription, DomainEntryPoint, DomainSummary, PackageGroupDescription,
     PackageGroupOriginConfiguration, PackageGroupOriginRestriction, PackageGroupReference,
-    PackageOriginConfiguration, PackageOriginRestrictions, PackageSummary,
+    PackageGroupSummary, PackageOriginConfiguration, PackageOriginRestrictions, PackageSummary,
     PackageVersionDescription, PackageVersionOrigin, RepositoryDescription,
     RepositoryExternalConnectionInfo, RepositorySummary, ResourcePolicy, Tag,
     UpstreamRepositoryInfo, ValidationException, PACKAGE_GROUP_ORIGIN_RESTRICTION_TYPE_VALUES,
@@ -769,23 +769,23 @@ impl Domain {
     /// The modelled `PackageGroupDescription` of the group this domain holds under
     /// `pattern`, or `None` when it holds no such group.
     ///
-    /// Everything derived — the parent reference and each restriction's effective mode —
-    /// is computed from the groups the domain holds AT THIS CALL, so a description can
-    /// never disagree with the hierarchy it is part of.
+    /// `PackageGroupDescription` and `PackageGroupSummary` declare the SAME members
+    /// (`smithy_query(query="shape",shape="PackageGroupSummary")`), so this is the one
+    /// projection — [`Domain::package_group_summary`] — carried across to the other
+    /// struct, rather than a second copy of it: a change to a derived member cannot land
+    /// in one of them only and let a listing disagree with a read.
     pub fn package_group_description(&self, pattern: &str) -> Option<PackageGroupDescription> {
-        let group = self.package_groups.get(pattern)?;
+        let summary = self.package_group_summary(self.package_groups.get(pattern)?);
         Some(PackageGroupDescription {
-            arn: Some(group.arn.clone()),
-            pattern: Some(group.pattern.clone()),
-            domain_name: Some(group.domain_name.clone()),
-            domain_owner: Some(group.domain_owner.clone()),
-            created_time: Some(group.created_time.into()),
-            contact_info: group.contact_info.clone(),
-            description: group.description.clone(),
-            origin_configuration: Some(PackageGroupOriginConfiguration {
-                restrictions: Some(self.origin_restrictions(group)),
-            }),
-            parent: self.package_group_parent(pattern).map(PackageGroup::reference),
+            arn: summary.arn,
+            pattern: summary.pattern,
+            domain_name: summary.domain_name,
+            domain_owner: summary.domain_owner,
+            created_time: summary.created_time,
+            contact_info: summary.contact_info,
+            description: summary.description,
+            origin_configuration: summary.origin_configuration,
+            parent: summary.parent,
         })
     }
 
@@ -800,6 +800,42 @@ impl Domain {
             .values()
             .filter(|candidate| covers_strictly(&candidate.pattern, &path))
             .max_by_key(|candidate| covered_path(&candidate.pattern).len())
+    }
+
+    /// Is the group under `pattern` a DIRECT child of the group under `parent_pattern`?
+    ///
+    /// The same relation [`Domain::package_group_parent`] reports as a group's `parent`,
+    /// read the other way round, so the children a listing answers with are exactly the
+    /// groups that name that listing's group as their parent. Derived from the patterns
+    /// held at this call, so a group inserted in between moves the child off this parent
+    /// with no rewrite.
+    pub fn is_direct_sub_package_group(&self, parent_pattern: &str, pattern: &str) -> bool {
+        self.package_group_parent(pattern)
+            .is_some_and(|parent| parent.pattern == parent_pattern)
+    }
+
+    /// The modelled `PackageGroupSummary` of one group this domain holds.
+    ///
+    /// `PackageGroupSummary` carries every member of `PackageGroupDescription`
+    /// (`smithy_query(query="shape",shape="PackageGroupSummary")`), so a listing reports
+    /// the same derived parent and origin configuration a read of the single group does —
+    /// computed here from the groups held AT THIS CALL rather than stored.
+    pub fn package_group_summary(&self, group: &PackageGroup) -> PackageGroupSummary {
+        PackageGroupSummary {
+            arn: Some(group.arn.clone()),
+            pattern: Some(group.pattern.clone()),
+            domain_name: Some(group.domain_name.clone()),
+            domain_owner: Some(group.domain_owner.clone()),
+            created_time: Some(group.created_time.into()),
+            contact_info: group.contact_info.clone(),
+            description: group.description.clone(),
+            origin_configuration: Some(PackageGroupOriginConfiguration {
+                restrictions: Some(self.origin_restrictions(group)),
+            }),
+            parent: self
+                .package_group_parent(&group.pattern)
+                .map(PackageGroup::reference),
+        }
     }
 
     /// One modelled restriction per `PackageGroupOriginRestrictionType`, which is the
@@ -2357,6 +2393,14 @@ pub const DOMAIN_CURSOR_SCOPE: &str = "domains";
 /// another domain's listing (or in the domain listing).
 pub fn repository_cursor_scope(domain: &str) -> String {
     format!("repositories/{domain}")
+}
+
+/// The cursor scope of `ListSubPackageGroups` for one domain's one package group. Scoped
+/// per domain AND per parent pattern, because each group has its own set of children: a
+/// cursor minted while listing one group's children must not resolve as a key in
+/// another's (or in any other listing).
+pub fn sub_package_group_cursor_scope(domain: &str, package_group: &str) -> String {
+    format!("sub-package-groups/{domain}/{package_group}")
 }
 
 /// Encode a pagination cursor: the key of the LAST item returned on this page, inside the

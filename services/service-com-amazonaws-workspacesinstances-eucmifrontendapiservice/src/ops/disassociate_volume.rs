@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateVolume
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateVolume`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateVolume::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +141,128 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateVolume` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateVolumeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `Device`'s modelled `len 0..32` admits the empty string, which names no
+        // device path at all; the member is optional, so "no device" is expressed by
+        // leaving it out rather than by sending an empty one. Refused the same way
+        // `CreateVolume` refuses an empty `KmsKeyId`, naming the member and the
+        // constraint and none of what the caller sent.
+        if input.device.as_deref().is_some_and(str::is_empty) {
+            return Err(DisassociateVolumeErrorModeled::ValidationException(
+                crate::state::field_validation_failed(
+                    "Device",
+                    "Device must name the device path the volume is attached at when it \
+                     is specified",
+                ),
+            )
+            .into());
+        }
+
+        // A regional resource is reachable only through the Region it was created in,
+        // which travels in the request's credential scope.
+        let region = crate::state::request_region(ctx.parts());
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DisassociateVolumeErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the WorkSpaces Instances store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        // Materialise what the clock already owed before anything is read: the instance
+        // transitions, the removal of a torn-down record past its retention, and the
+        // attachments a teardown has released. Each was due at its stored instant
+        // whether or not this call came — so a volume whose instance is tearing down is
+        // already detached here, and this call finds nothing left to detach.
+        let now = std::time::Instant::now();
+        state.settle_all(now);
+
+        // "Detaches a volume from a WorkSpace Instance": both resources are resolved
+        // against the store, in the Region this call was signed for, and an id that
+        // satisfies its modelled shape but names no record THIS REGION holds is
+        // `ResourceNotFoundException` — the instance first, since it is the resource the
+        // volume is being detached FROM. Both go through the shared not-found helpers,
+        // so this path answers the same (status, code) pair as every other not-found in
+        // this service.
+        if state
+            .settled(&region, &input.workspace_instance_id, now)
+            .is_none()
+        {
+            return Err(crate::state::instance_not_found_error(
+                &input.workspace_instance_id,
+                DisassociateVolumeErrorModeled::ResourceNotFoundException,
+            ));
+        }
+
+        let Some(volume) = state.volume_mut(&region, &input.volume_id) else {
+            return Err(crate::state::volume_not_found_error(
+                &input.volume_id,
+                DisassociateVolumeErrorModeled::ResourceNotFoundException,
+            ));
+        };
+
+        // A detach names the attachment it removes: the volume has to be attached, and
+        // attached to the instance the request names. A volume that carries no
+        // attachment, or one attached to a DIFFERENT instance, conflicts with the state
+        // the request assumes — the backing Amazon EBS `DetachVolume` refuses the same
+        // case ("the volume is not attached to that instance") rather than answering a
+        // success that detached nothing.
+        let Some(attachment) = volume.attachment.as_ref() else {
+            return Err(DisassociateVolumeErrorModeled::ConflictException(
+                crate::state::resource_conflict(
+                    &input.volume_id,
+                    crate::state::VOLUME_RESOURCE_TYPE,
+                    crate::state::VOLUME_NOT_ATTACHED_MESSAGE,
+                ),
+            )
+            .into());
+        };
+        if attachment.workspace_instance_id != input.workspace_instance_id {
+            return Err(DisassociateVolumeErrorModeled::ConflictException(
+                crate::state::resource_conflict(
+                    &input.volume_id,
+                    crate::state::VOLUME_RESOURCE_TYPE,
+                    crate::state::VOLUME_NOT_ATTACHED_MESSAGE,
+                ),
+            )
+            .into());
+        }
+
+        // `Device` is optional: "Device path of volume to detach". When the caller
+        // names one it identifies the attachment being removed, so a device the volume
+        // is not attached at names no attachment of this volume and is refused; when it
+        // is left out, the volume's one attachment is the one meant.
+        if input
+            .device
+            .as_deref()
+            .is_some_and(|device| device != attachment.device)
+        {
+            return Err(DisassociateVolumeErrorModeled::ConflictException(
+                crate::state::resource_conflict(
+                    &input.volume_id,
+                    crate::state::VOLUME_RESOURCE_TYPE,
+                    crate::state::VOLUME_DEVICE_MISMATCH_MESSAGE,
+                ),
+            )
+            .into());
+        }
+
+        // The attachment goes, which is this call's whole effect (the response models
+        // no members): the volume is free to be attached again — to this instance or
+        // another, at any device — and free to be deleted, the device path it held is
+        // free for another volume, and a second detach of the same volume is the
+        // "not attached" conflict above rather than a second success.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateVolume"))
+        // `DisassociateMode` (FORCE | NO_FORCE) chooses how the guest is asked to
+        // release the device before the volume is detached — a forced detach skips
+        // that and risks the data still buffered in the guest. Either way the volume
+        // ends up detached, and this service records no state the choice could show up
+        // in (no attachment status is modelled anywhere, and no guest file system
+        // exists here), so neither mode is given an invented effect of its own.
+        volume.attachment = None;
+
+        Ok(DisassociateVolumeOutput {})
     }
 }

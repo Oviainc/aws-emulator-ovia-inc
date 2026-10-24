@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tags held for the resource an ARN names — the registered SAP
+//! application, or one of the SAP HANA databases of that registration. The tag set
+//! comes from the one place this service keeps tags
+//! ([`crate::state::RegionState::tags_by_arn`]), so it is whatever the calls that write
+//! tags have left there; an ARN naming no resource of this account and Region is
+//! refused with the modelled `ResourceNotFoundException` rather than reported as an
+//! empty tag set.
 //!
 //! ## Shape of an operation
 //!
@@ -67,6 +66,9 @@
 //! * `ResourceNotFoundException` (HTTP 404) — The resource is not available.
 //! * `ValidationException` (HTTP 400) — The input fails to satisfy the constraints specified
 //!   by an AWS service.
+//! * `InternalServerException` (HTTP 500) — widened in through `extra_errors` (see below):
+//!   this SERVICE models it, so an unreachable store has a modelled server fault to answer
+//!   with rather than a client error.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -82,12 +84,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-ssmsap-ssmsap.json");
 // here — hence the `ListTagsForResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.ssmsap#ListTagsForResource")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.ssmsap#ListTagsForResource",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum ListTagsForResourceErrorModeled {
     ConflictException(ConflictException),
     ResourceNotFoundException(ResourceNotFoundException),
     ValidationException(ValidationException),
+    /// Declared on the SERVICE rather than on this operation: the store this emulator
+    /// keeps its registrations and their tags in could not be reached, which is a
+    /// server fault and not something the caller sent wrong.
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -141,18 +150,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        // The Region this request was signed for: a read reports what is held at THIS
+        // regional endpoint, and an ARN carrying another Region names nothing here.
+        let region = crate::state::request_region(ctx.parts());
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListTagsForResourceErrorModeled::InternalServerException(
+                crate::state::store_unavailable(),
+            )
+        })?;
+        // A plain read: no status is reported here and a tag is not something the clock
+        // changes, so this call has nothing to settle and writes NOTHING. Reading a
+        // Region that holds nothing mints no partition for it (`region`, not
+        // `region_entry`).
+        let state = state.lock();
+        let region_state = state.region(&region);
+
+        // `ResourceArn` is modelled `@required` with a `@pattern`, so reaching here means
+        // the reference is a well-formed ARN. It still has to NAME something: the
+        // resources this service holds are the registered SAP application and the SAP
+        // HANA databases of that registration, so an ARN naming neither is the
+        // `ResourceNotFoundException` this operation models rather than an empty tag set
+        // reported for a resource that does not exist.
+        if !region_state.holds_resource(&region, &input.resource_arn) {
+            return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::resource_not_found_message(
+                    &input.resource_arn,
+                )),
+            )
+            .into());
+        }
+
+        // The whole output is the tag set held for that resource, read from the one place
+        // every tag of this service is kept (`RegionState::tags_by_arn`, which
+        // `RegisterApplication` writes and `GetApplication` / `ListApplications` /
+        // `ListDatabases` join on). A resource nobody has tagged has the EMPTY tag set,
+        // which is what it is reported with — nothing is invented for it.
+        let tags = region_state
+            .tags_for(&input.resource_arn)
+            .unwrap_or_default();
+
+        Ok(ListTagsForResourceOutput { tags: Some(tags) })
     }
 }

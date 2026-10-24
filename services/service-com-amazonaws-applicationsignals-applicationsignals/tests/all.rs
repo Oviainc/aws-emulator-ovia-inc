@@ -47,6 +47,8 @@ mod resource_tags;
 mod service_dependency_metrics;
 #[path = "all/sli_metric_type.rs"]
 mod sli_metric_type;
+#[path = "all/slo_evaluation_kind.rs"]
+mod slo_evaluation_kind;
 #[path = "all/slo_lifecycle.rs"]
 mod slo_lifecycle;
 #[path = "all/state_roundtrip.rs"]

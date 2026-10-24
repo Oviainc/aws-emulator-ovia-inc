@@ -22,9 +22,10 @@
 //! experiment record, so every read of it reports the resolution that start computed.
 //!
 //! Besides those caller-owned records it holds the service's own data: the built-in FIS
-//! ACTION catalog ([`ACTION_CATALOG`]), which `GetAction` reports from. No API creates,
-//! updates or deletes an action, so that catalog is a constant table rather than a map a
-//! handler writes.
+//! ACTION catalog ([`ACTION_CATALOG`]), which `GetAction` reports from, and the TARGET
+//! RESOURCE TYPE catalog ([`TARGET_RESOURCE_TYPE_CATALOG`]) of the types those actions
+//! target, which `ListTargetResourceTypes` reports from. No API creates, updates or
+//! deletes either, so both are constant tables rather than maps a handler writes.
 //!
 //! Both records are the one copy every handler reads and writes, so a value a create
 //! call returns is the value a later read reports. An experiment also owes the clock a
@@ -100,7 +101,7 @@ use crate::ops::types::{
     ExperimentTemplateTargetInputFilter, ReportConfigurationCloudWatchDashboardInput,
     ReportConfigurationS3Output, ReportConfigurationS3OutputInput, ResolvedTarget,
     ResourceNotFoundException, ServiceQuotaExceededException, StartExperimentInput,
-    TargetAccountConfiguration, TargetAccountConfigurationSummary,
+    TargetAccountConfiguration, TargetAccountConfigurationSummary, TargetResourceTypeSummary,
     UpdateExperimentTemplateActionInputItem, UpdateExperimentTemplateInput,
     UpdateExperimentTemplateLogConfigurationInput, UpdateExperimentTemplateReportConfigurationInput,
     UpdateExperimentTemplateStopConditionInput, UpdateExperimentTemplateTargetInput,
@@ -369,6 +370,15 @@ pub const TARGET_INFORMATION_ARN_KEY: &str = "arn";
 /// as a `ValidationException` instead of being read as a resume point (the same shape as
 /// [`TARGET_ACCOUNT_PAGE_TOKEN_PREFIX`]).
 pub const RESOLVED_TARGET_PAGE_TOKEN_PREFIX: &str = "resolvedTarget.";
+
+/// The marker every `nextToken` `ListTargetResourceTypes` issues starts with.
+///
+/// A target resource type is named by its own published id rather than by an id this
+/// service mints, so the token carries the `resourceType` the next page resumes at behind
+/// this marker — self-describing, exactly as [`TARGET_ACCOUNT_PAGE_TOKEN_PREFIX`] is, so a
+/// value this operation never issued is refused as a `ValidationException` instead of
+/// being read as a resume point.
+pub const TARGET_RESOURCE_TYPE_PAGE_TOKEN_PREFIX: &str = "targetResourceType.";
 
 /// The two sources a stop condition may name.
 ///
@@ -1576,6 +1586,28 @@ pub fn resolved_target_page_token_index(token: &str) -> Option<usize> {
         return None;
     }
     index.parse().ok()
+}
+
+/// The `nextToken` a page of `ListTargetResourceTypes` hands back when resource types
+/// remain: the marker of [`TARGET_RESOURCE_TYPE_PAGE_TOKEN_PREFIX`] followed by the
+/// `resourceType` the next page resumes at.
+///
+/// `NextToken` is modelled `@length(min: 1, max: 1024)`, `pattern ^[\S]+$`: the marker
+/// carries no whitespace, a published resource type id carries none either, and the two
+/// together are far under the ceiling.
+pub fn target_resource_type_page_token(resource_type: &str) -> String {
+    format!("{TARGET_RESOURCE_TYPE_PAGE_TOKEN_PREFIX}{resource_type}")
+}
+
+/// The `resourceType` the page token `token` resumes at, or `None` when `token` is not one
+/// [`target_resource_type_page_token`] could have issued — the marker followed by a
+/// resource type the published catalog holds.
+///
+/// The catalog is the service's own constant data, so a token this operation issued always
+/// names an entry of it; anything else never was one of its tokens.
+pub fn target_resource_type_page_token_id(token: &str) -> Option<&str> {
+    let resource_type = token.strip_prefix(TARGET_RESOURCE_TYPE_PAGE_TOKEN_PREFIX)?;
+    target_resource_type_catalog_entry(resource_type).map(|entry| entry.id)
 }
 
 /// What `targets` RESOLVE to: one `ResolvedTarget` per resource a target identifies,
@@ -4175,6 +4207,138 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
 /// or abbreviated id names no action.
 pub fn action_catalog_entry(id: &str) -> Option<&'static ActionCatalogEntry> {
     ACTION_CATALOG.iter().find(|entry| entry.id == id)
+}
+
+/// One target resource type FIS publishes, as [`TARGET_RESOURCE_TYPE_CATALOG`] records it.
+///
+/// Like an action, a target resource type is SERVICE-owned: no API creates, updates or
+/// deletes one, so `ListTargetResourceTypes` reports from this table rather than from
+/// anything a caller stored.
+#[derive(Debug, Clone, Copy)]
+pub struct TargetResourceTypeCatalogEntry {
+    /// `TargetResourceTypeId` — the fully qualified resource type (`aws:<service>:<type>`),
+    /// the same value an experiment template's target and a catalogued action's
+    /// `ActionTarget$resourceType` name.
+    pub id: &'static str,
+    /// `TargetResourceTypeSummary$description`.
+    pub description: &'static str,
+}
+
+impl TargetResourceTypeCatalogEntry {
+    /// The `TargetResourceTypeSummary` a page of `ListTargetResourceTypes` reports for
+    /// this entry.
+    pub fn to_summary(&self) -> TargetResourceTypeSummary {
+        TargetResourceTypeSummary {
+            resource_type: Some(self.id.to_string()),
+            description: Some(self.description.to_string()),
+        }
+    }
+}
+
+/// The target resource types this emulator serves.
+///
+/// SOURCE: the resource types the AWS FIS actions reference
+/// (<https://docs.aws.amazon.com/fis/latest/userguide/fis-actions-reference.html>)
+/// publishes as the targets of its actions — the same reference [`ACTION_CATALOG`] is
+/// taken from, which is what makes the two tables agree: every resource type a catalogued
+/// action targets is published here, and nothing is published here that no action targets.
+/// A resource type is a TARGET of an action, so an entry with no action to target it would
+/// be a type no experiment template could use.
+///
+/// Each entry records the id the reference states and a one-line description of the
+/// resource it names.
+///
+/// Kept sorted by id, which is the order `ListTargetResourceTypes` enumerates in.
+pub const TARGET_RESOURCE_TYPE_CATALOG: &[TargetResourceTypeCatalogEntry] = &[
+    TargetResourceTypeCatalogEntry {
+        id: "aws:dynamodb:global-table",
+        description: "An Amazon DynamoDB global table.",
+    },
+    TargetResourceTypeCatalogEntry {
+        id: "aws:ec2:autoscaling-group",
+        description: "An Amazon EC2 Auto Scaling group.",
+    },
+    TargetResourceTypeCatalogEntry {
+        id: "aws:ec2:ebs-volume",
+        description: "An Amazon EBS volume.",
+    },
+    TargetResourceTypeCatalogEntry {
+        id: "aws:ec2:instance",
+        description: "An Amazon EC2 instance.",
+    },
+    TargetResourceTypeCatalogEntry {
+        id: "aws:ec2:route-table",
+        description: "A route table of an Amazon VPC.",
+    },
+    TargetResourceTypeCatalogEntry {
+        id: "aws:ec2:spot-instance",
+        description: "An Amazon EC2 Spot Instance.",
+    },
+    TargetResourceTypeCatalogEntry {
+        id: "aws:ec2:subnet",
+        description: "A subnet of an Amazon VPC.",
+    },
+    TargetResourceTypeCatalogEntry {
+        id: "aws:ec2:transit-gateway",
+        description: "A transit gateway.",
+    },
+    TargetResourceTypeCatalogEntry {
+        id: "aws:ecs:cluster",
+        description: "An Amazon ECS cluster.",
+    },
+    TargetResourceTypeCatalogEntry {
+        id: "aws:ecs:task",
+        description: "An Amazon ECS task.",
+    },
+    TargetResourceTypeCatalogEntry {
+        id: "aws:eks:cluster",
+        description: "An Amazon EKS cluster.",
+    },
+    TargetResourceTypeCatalogEntry {
+        id: "aws:eks:nodegroup",
+        description: "An Amazon EKS managed node group.",
+    },
+    TargetResourceTypeCatalogEntry {
+        id: "aws:eks:pod",
+        description: "A pod running on an Amazon EKS cluster.",
+    },
+    TargetResourceTypeCatalogEntry {
+        id: "aws:elasticache:replicationgroup",
+        description: "An Amazon ElastiCache replication group.",
+    },
+    TargetResourceTypeCatalogEntry {
+        id: "aws:iam:role",
+        description: "An AWS Identity and Access Management (IAM) role.",
+    },
+    TargetResourceTypeCatalogEntry {
+        id: "aws:lambda:function",
+        description: "An AWS Lambda function.",
+    },
+    TargetResourceTypeCatalogEntry {
+        id: "aws:rds:cluster",
+        description: "An Amazon Aurora DB cluster.",
+    },
+    TargetResourceTypeCatalogEntry {
+        id: "aws:rds:db",
+        description: "An Amazon RDS DB instance.",
+    },
+    TargetResourceTypeCatalogEntry {
+        id: "aws:s3:bucket",
+        description: "An Amazon S3 bucket.",
+    },
+];
+
+/// The catalog entry `id` names, or `None` when FIS publishes no such target resource
+/// type.
+///
+/// `TargetResourceTypeId` is matched exactly: a resource type id is case-sensitive, so a
+/// differently cased or abbreviated id names no resource type.
+pub fn target_resource_type_catalog_entry(
+    id: &str,
+) -> Option<&'static TargetResourceTypeCatalogEntry> {
+    TARGET_RESOURCE_TYPE_CATALOG
+        .iter()
+        .find(|entry| entry.id == id)
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

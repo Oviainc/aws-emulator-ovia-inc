@@ -150,6 +150,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut state = state.lock();
 
+        // Materialise what the clock already owed first: an instance teardown releases
+        // the attachments of the volumes that instance had, and that was due at the
+        // instant the delete was accepted — so a volume whose instance is tearing down
+        // is deletable here without a detach call of its own.
+        let now = std::time::Instant::now();
+        state.settle_all(now);
+
         // "Deletes a specified volume": the record goes, so a second delete of the same
         // id is not-found, and the volume quota — which is derived by counting the
         // Region's volumes (`has_volume_capacity`), not a separate counter — regains the
@@ -159,20 +166,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ResourceNotFoundException`, never a success; it goes through
         // `crate::state::volume_not_found_error` so this path answers the same
         // (status, code) pair as every other not-found in this service.
-        //
-        // The modelled `ConflictException` covers the real service's refusal to delete a
-        // volume that is in use; nothing can put a volume in use while `AssociateVolume`
-        // is still a scaffold (its own stub issue), so no attachment state exists to
-        // check here and the refusal is deliberately not invented.
-        // The removal also retires the creating `ClientToken` with the record (the
-        // token identifies that create call, and replaying it must not hand back an id
-        // that no longer exists), so nothing is left to clean up here.
-        if state.remove_volume(&region, &input.volume_id).is_none() {
+        let Some(volume) = state.volume(&region, &input.volume_id) else {
             return Err(crate::state::volume_not_found_error(
                 &input.volume_id,
                 DeleteVolumeErrorModeled::ResourceNotFoundException,
             ));
+        };
+
+        // The modelled `ConflictException` covers the real service's refusal to delete a
+        // volume that is in use: a volume still attached to a WorkSpace Instance is not
+        // deletable ("The volume must be in the `available` state (not attached to an
+        // instance)" — the backing Amazon EBS `DeleteVolume`), so the caller detaches it
+        // with `DisassociateVolume` first. Nothing is written for the refusal: the volume
+        // and its attachment are left exactly as they were.
+        if volume.attachment.is_some() {
+            return Err(DeleteVolumeErrorModeled::ConflictException(
+                crate::state::resource_conflict(
+                    &input.volume_id,
+                    crate::state::VOLUME_RESOURCE_TYPE,
+                    crate::state::VOLUME_IN_USE_MESSAGE,
+                ),
+            )
+            .into());
         }
+
+        // The removal also retires the creating `ClientToken` with the record (the
+        // token identifies that create call, and replaying it must not hand back an id
+        // that no longer exists), so nothing is left to clean up here. The lookup above
+        // already resolved the id in this Region, so the removal cannot miss.
+        let _ = state.remove_volume(&region, &input.volume_id);
 
         Ok(DeleteVolumeOutput {})
     }

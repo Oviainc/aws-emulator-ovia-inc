@@ -1,12 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end HTTP tests for `UntagResource`.
+//! End-to-end HTTP tests for `TagResource` and `UntagResource`.
 //!
 //! Every case drives the real wire path — the production `MultiServiceRouter`,
 //! restJson1 serialization, the modelled-constraint walk and the handlers — so what is
 //! asserted is what a signed AWS SDK request observes.
 //!
-//! The rule under test: `UntagResource` removes from the ONE resource `ResourceArn`
+//! The first rule under test: `TagResource` MERGES the request's key-value pairs into
+//! the tags of the ONE resource `ResourceArn` names — a named key takes the request's
+//! value whether or not the resource already carried it, and every key the request does
+//! not name is left as it was — so a later `GetConfigurationManager` reports the merged
+//! set and repeating the same request answers the same way (the operation is
+//! `@idempotent`). An ARN naming no stored resource is the modelled 404, and a request
+//! that would leave the resource carrying more tags than the service accepts is the
+//! modelled 400 with nothing stored.
+//!
+//! The second: `UntagResource` removes from the ONE resource `ResourceArn`
 //! names exactly the tag keys the request lists, matched whole and case-sensitively,
 //! leaves every other stored tag and every other resource as they were, and treats a
 //! key the resource does not carry as nothing to do — so a later
@@ -161,8 +170,29 @@ async fn untag<K: AsRef<str>>(
     call(router, "DELETE", &uri, None).await
 }
 
+/// `PUT /tags/{ResourceArn}` — `TagResource`. `Tags` is a body member, so the map
+/// travels in the restJson1 payload.
+async fn tag(
+    router: &MultiServiceRouter,
+    resource_arn: &str,
+    tags: &BTreeMap<String, String>,
+) -> (u16, Value) {
+    let mut tag_map = Map::new();
+    for (key, value) in tags {
+        tag_map.insert(key.clone(), Value::String(value.clone()));
+    }
+    let body = json!({ "Tags": Value::Object(tag_map) });
+    call(
+        router,
+        "PUT",
+        &format!("/tags/{}", label(resource_arn)),
+        Some(&body),
+    )
+    .await
+}
+
 /// `GET /configurationManager/{ManagerArn}` — the implemented reader this suite reads
-/// every removal back through.
+/// every assignment and every removal back through.
 async fn get_manager(router: &MultiServiceRouter, manager_arn: &str) -> (u16, Value) {
     call(
         router,
@@ -270,6 +300,353 @@ const PUNCTUATED_KEYS: &[&str] = &[
     "blue+green",
     "team/platform",
 ];
+
+/// One row of the assignment table: what the resource was created carrying, which pairs
+/// the request assigns, and what must be stored afterwards.
+struct TagRow {
+    name: &'static str,
+    created: BTreeMap<String, String>,
+    assign: BTreeMap<String, String>,
+    expected: BTreeMap<String, String>,
+}
+
+fn tag_rows() -> Vec<TagRow> {
+    let three = tags(&[("Env", "prod"), ("Team", "platform"), ("Owner", "ops")]);
+    // The longest key and the longest value `TagsMap`'s `@length(1, 128)` key and
+    // `@length(max 256)` value admit.
+    let longest_key = "k".repeat(128);
+    let longest_value = "v".repeat(256);
+    let punctuated: BTreeMap<String, String> = PUNCTUATED_KEYS
+        .iter()
+        .enumerate()
+        .map(|(index, key)| ((*key).to_string(), format!("value-{index}")))
+        .collect();
+    // The most tags one resource may carry, assigned in one request to an untagged one.
+    let full: BTreeMap<String, String> = (0..MAX_TAGS)
+        .map(|index| (format!("key-{index}"), format!("value-{index}")))
+        .collect();
+    let mut overwrite_and_add = three.clone();
+    overwrite_and_add.insert("Env".to_string(), "staging".to_string());
+    overwrite_and_add.insert("Tier".to_string(), "gold".to_string());
+    let mut case_distinct = tags(&[("Env", "prod")]);
+    case_distinct.insert("env".to_string(), "dev".to_string());
+    let mut punctuated_added = three.clone();
+    punctuated_added.extend(punctuated.clone());
+    vec![
+        TagRow {
+            name: "a key the resource does not carry",
+            created: tags(&[("Env", "prod")]),
+            assign: tags(&[("Team", "platform")]),
+            expected: tags(&[("Env", "prod"), ("Team", "platform")]),
+        },
+        TagRow {
+            name: "a key the resource already carries",
+            created: tags(&[("Env", "prod"), ("Team", "platform")]),
+            assign: tags(&[("Env", "staging")]),
+            expected: tags(&[("Env", "staging"), ("Team", "platform")]),
+        },
+        TagRow {
+            name: "an overwritten key beside a new one",
+            created: three.clone(),
+            assign: tags(&[("Env", "staging"), ("Tier", "gold")]),
+            expected: overwrite_and_add,
+        },
+        TagRow {
+            name: "re-assigning the value a key already holds",
+            created: three.clone(),
+            assign: tags(&[("Env", "prod")]),
+            expected: three.clone(),
+        },
+        TagRow {
+            name: "no pair at all (an empty map)",
+            created: three.clone(),
+            assign: BTreeMap::new(),
+            expected: three.clone(),
+        },
+        TagRow {
+            name: "a resource created with no tags at all",
+            created: BTreeMap::new(),
+            assign: tags(&[("Env", "prod")]),
+            expected: tags(&[("Env", "prod")]),
+        },
+        TagRow {
+            name: "a key differing from a stored one only in case",
+            created: tags(&[("Env", "prod")]),
+            assign: tags(&[("env", "dev")]),
+            expected: case_distinct,
+        },
+        TagRow {
+            name: "keys carrying every punctuation the tag-key form admits",
+            created: three.clone(),
+            assign: punctuated,
+            expected: punctuated_added,
+        },
+        TagRow {
+            name: "the longest key and value the published bounds admit",
+            created: tags(&[("Env", "prod")]),
+            assign: tags(&[(longest_key.as_str(), longest_value.as_str())]),
+            expected: tags(&[
+                ("Env", "prod"),
+                (longest_key.as_str(), longest_value.as_str()),
+            ]),
+        },
+        TagRow {
+            name: "as many pairs as one resource may carry",
+            created: BTreeMap::new(),
+            assign: full.clone(),
+            expected: full,
+        },
+    ]
+}
+
+/// Each row: the assignment answers 200 with an empty body, and the stored tags a later
+/// read reports are exactly the row's expectation.
+#[tokio::test]
+async fn tag_resource_merges_exactly_the_named_pairs() {
+    for row in tag_rows() {
+        let router = emulator();
+        let arn = create_manager(&router, row.name, &row.created).await;
+
+        let (status, answer) = tag(&router, &arn, &row.assign).await;
+        assert_eq!(
+            status, 200,
+            "case {:?}: TagResource must answer 200, got {status} / {answer:?}",
+            row.name
+        );
+        assert_eq!(
+            answer,
+            Value::Null,
+            "case {:?}: TagResource's modelled output is empty, got {answer:?}",
+            row.name
+        );
+
+        let stored = stored_tags(&router, row.name, &arn).await;
+        assert_eq!(
+            stored, row.expected,
+            "case {:?}: expected the stored tags {:?}, got {stored:?}",
+            row.name, row.expected
+        );
+    }
+}
+
+/// Repeating an assignment changes nothing further: the second call succeeds, the tags
+/// it leaves are the ones the first left, and the stamp a read reports does not move for
+/// a request that stored no new value.
+#[tokio::test]
+async fn tag_resource_is_idempotent() {
+    let case = "repeated assignment";
+    let router = emulator();
+    let arn = create_manager(&router, case, &tags(&[("Env", "prod")])).await;
+
+    let assign = tags(&[("Env", "staging"), ("Team", "platform")]);
+    let (first, answer) = tag(&router, &arn, &assign).await;
+    assert_eq!(
+        first, 200,
+        "case {case:?}: the first TagResource must answer 200, got {first} / {answer:?}"
+    );
+    let after_first = stored_tags(&router, case, &arn).await;
+    let stamp_after_first = last_modified_at(&router, case, &arn).await;
+
+    let (second, answer) = tag(&router, &arn, &assign).await;
+    assert_eq!(
+        second, 200,
+        "case {case:?}: repeating TagResource must answer 200, got {second} / {answer:?}"
+    );
+    let after_second = stored_tags(&router, case, &arn).await;
+    assert_eq!(
+        after_second, after_first,
+        "case {case:?}: expected the repeat to leave {after_first:?}, got {after_second:?}"
+    );
+    assert_eq!(
+        after_second, assign,
+        "case {case:?}: expected the assigned pairs {assign:?} to be what is stored, \
+         got {after_second:?}"
+    );
+    let stamp_after_second = last_modified_at(&router, case, &arn).await;
+    assert_eq!(
+        stamp_after_second, stamp_after_first,
+        "case {case:?}: an assignment that stored no new value must not move \
+         LastModifiedAt, expected {stamp_after_first:?}, got {stamp_after_second:?}"
+    );
+}
+
+/// An ARN naming no stored resource is the modelled 404, whatever form it takes, and an
+/// assignment against one stores nothing.
+#[tokio::test]
+async fn tag_resource_rejects_an_arn_naming_no_resource() {
+    let router = emulator();
+    // A manager that exists, so the 404s below are about the ARN rather than an empty
+    // store.
+    let live = create_manager(&router, "a live manager", &tags(&[("Env", "prod")])).await;
+    let deleted = create_manager(&router, "a deleted manager", &tags(&[("Env", "prod")])).await;
+    let (status, answer) = call(
+        &router,
+        "DELETE",
+        &format!("/configurationManager/{}", label(&deleted)),
+        None,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "DeleteConfigurationManager must succeed, got {status} / {answer:?}"
+    );
+
+    for (case, arn) in [
+        (
+            "a well-formed ARN no create minted",
+            UNKNOWN_MANAGER_ARN.to_string(),
+        ),
+        ("the ARN of a deleted manager", deleted),
+        ("a string that is no ARN at all", "not-an-arn".to_string()),
+        (
+            "an ARN of another service",
+            "arn:aws:ssm:us-west-2:000000000000:document/doc".to_string(),
+        ),
+    ] {
+        let (status, answer) = tag(&router, &arn, &tags(&[("Team", "platform")])).await;
+        assert_eq!(
+            status, 404,
+            "case {case:?}: expected 404, got {status} / {answer:?}"
+        );
+        assert_eq!(
+            error_code(&answer),
+            "ResourceNotFoundException",
+            "case {case:?}: expected ResourceNotFoundException, got {answer:?}"
+        );
+    }
+
+    let stored = stored_tags(&router, "a live manager", &live).await;
+    assert_eq!(
+        stored,
+        tags(&[("Env", "prod")]),
+        "the live manager's tags must be untouched by the refused assignments, got {stored:?}"
+    );
+}
+
+/// A `Tags` map this service cannot serve is the modelled 400, and nothing is stored for
+/// it — whether the request itself is too large or the merged result would be.
+#[tokio::test]
+async fn tag_resource_rejects_an_unservable_tags_map() {
+    let one_too_many: BTreeMap<String, String> = (0..=MAX_TAGS)
+        .map(|index| (format!("key-{index}"), format!("value-{index}")))
+        .collect();
+    let full: BTreeMap<String, String> = (0..MAX_TAGS)
+        .map(|index| (format!("key-{index}"), format!("value-{index}")))
+        .collect();
+    // Each refused row keeps the tags it was created with: `expected` is `created`.
+    let cases = vec![
+        TagRow {
+            name: "one pair more than the service accepts in a single request",
+            created: tags(&[("Env", "prod")]),
+            assign: one_too_many,
+            expected: tags(&[("Env", "prod")]),
+        },
+        TagRow {
+            name: "a new key beyond the most tags a resource may carry",
+            created: full.clone(),
+            assign: tags(&[("Env", "prod")]),
+            expected: full.clone(),
+        },
+    ];
+
+    for row in cases {
+        let case = row.name;
+        let router = emulator();
+        let arn = create_manager(&router, case, &row.created).await;
+
+        let (status, answer) = tag(&router, &arn, &row.assign).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected 400, got {status} / {answer:?}"
+        );
+        assert_eq!(
+            error_code(&answer),
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {answer:?}"
+        );
+
+        let stored = stored_tags(&router, case, &arn).await;
+        assert_eq!(
+            stored, row.expected,
+            "case {case:?}: a refused assignment must store nothing, expected {:?}, \
+             got {stored:?}",
+            row.expected
+        );
+    }
+
+    // A resource already holding the most tags it may carry still takes a value for a
+    // key it ALREADY carries: that assignment adds no entry.
+    let router = emulator();
+    let case = "overwriting a key on a resource already at the bound";
+    let arn = create_manager(&router, case, &full).await;
+    let (status, answer) = tag(&router, &arn, &tags(&[("key-0", "replaced")])).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected 200, got {status} / {answer:?}"
+    );
+    let stored = stored_tags(&router, case, &arn).await;
+    let mut expected = full;
+    expected.insert("key-0".to_string(), "replaced".to_string());
+    assert_eq!(
+        stored, expected,
+        "case {case:?}: expected the overwritten value to be stored, got {stored:?}"
+    );
+}
+
+/// An assignment reaches only the resource it names: another manager keeps its own tags.
+#[tokio::test]
+async fn tag_resource_touches_only_the_named_resource() {
+    let case = "two managers carrying the same keys";
+    let router = emulator();
+    let shared = tags(&[("Env", "prod"), ("Team", "platform")]);
+    let first = create_manager(&router, case, &shared).await;
+    let second = create_manager(&router, case, &shared).await;
+
+    let (status, answer) = tag(&router, &first, &tags(&[("Env", "staging"), ("Tier", "gold")])).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: TagResource must answer 200, got {status} / {answer:?}"
+    );
+
+    let stored_first = stored_tags(&router, case, &first).await;
+    assert_eq!(
+        stored_first,
+        tags(&[("Env", "staging"), ("Team", "platform"), ("Tier", "gold")]),
+        "case {case:?}: the named manager must carry the merged set, got {stored_first:?}"
+    );
+    let stored_second = stored_tags(&router, case, &second).await;
+    assert_eq!(
+        stored_second, shared,
+        "case {case:?}: the other manager must keep {shared:?}, got {stored_second:?}"
+    );
+}
+
+/// A tag this service stores is removable again: `TagResource` and `UntagResource` meet
+/// on the one stored record, so a key assigned by one is gone after the other names it.
+#[tokio::test]
+async fn an_assigned_tag_is_removable_again() {
+    let case = "assign then remove";
+    let router = emulator();
+    let arn = create_manager(&router, case, &BTreeMap::new()).await;
+
+    let (status, answer) = tag(&router, &arn, &tags(&[("Env", "prod"), ("Team", "platform")])).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: TagResource must answer 200, got {status} / {answer:?}"
+    );
+    let (status, answer) = untag(&router, &arn, &["Env"]).await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: UntagResource must answer 200, got {status} / {answer:?}"
+    );
+
+    let stored = stored_tags(&router, case, &arn).await;
+    assert_eq!(
+        stored,
+        tags(&[("Team", "platform")]),
+        "case {case:?}: expected only the untouched assigned tag to remain, got {stored:?}"
+    );
+}
 
 /// One row of the removal table: what the resource was created carrying, which keys the
 /// request names, and what must be left.

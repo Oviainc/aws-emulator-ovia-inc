@@ -828,3 +828,152 @@ async fn a_passcode_outside_the_modelled_pattern_is_refused() {
     let verified = emulator.verify_phone_number(json!({"Otp": passcode})).await;
     assert_status("the surviving passcode", &verified, VERIFIED);
 }
+
+/// A send reports `PENDING` — "a one-time passcode has been sent and is waiting
+/// to be submitted" — whatever the number last reached, and the passcode it
+/// mints becomes the only outstanding one: the rows differ along the status the
+/// number is in when the send arrives (never sent, already `PENDING`, already
+/// `VERIFIED`), and in each the passcode outstanding before the send stops
+/// verifying and the one minted by it does.
+#[tokio::test]
+async fn a_send_restarts_the_flow_whatever_the_number_last_reached() {
+    // (case, how many sends and verifications run before the send under test,
+    //  the status reported before it)
+    let cases: [(&str, u32, bool, &str); 3] = [
+        ("no passcode ever sent", 0, false, UNVERIFIED),
+        ("a passcode already outstanding", 1, false, PENDING),
+        ("the number already verified", 1, true, VERIFIED),
+    ];
+
+    for (case, sends_before, verify_before, status_before) in cases {
+        let emulator = Emulator::new();
+        let own = default_account_id().to_string();
+        let put = emulator
+            .put_contact_information(json!({"ContactInformation": contact_with("+12065550100")}))
+            .await;
+        assert_eq!(
+            put.status, 200,
+            "case {case:?}: PutContactInformation must answer 200, got {} with {:?}",
+            put.status, put.body
+        );
+
+        for round in 0..sends_before {
+            let sent = emulator.send_phone_number_verification(json!({})).await;
+            assert_status(&format!("{case}, the send before it #{round}"), &sent, PENDING);
+        }
+        let before = emulator.outstanding_passcode(&own);
+        if verify_before {
+            let passcode = before
+                .clone()
+                .unwrap_or_else(|| panic!("case {case:?}: a send stores a passcode to submit"));
+            let verified = emulator.verify_phone_number(json!({"Otp": passcode})).await;
+            assert_status(&format!("{case}, the verification before it"), &verified, VERIFIED);
+        }
+        assert_reported_status(case, &emulator, json!({}), status_before).await;
+
+        // The send under test: PENDING again, from whatever the number was in.
+        let sent = emulator.send_phone_number_verification(json!({})).await;
+        assert_status(case, &sent, PENDING);
+        assert_eq!(
+            sent.body.as_object().map(|body| body.keys().cloned().collect::<Vec<String>>()),
+            Some(vec!["Status".to_string()]),
+            "case {case:?}: the output carries only Status, got {:?}",
+            sent.body
+        );
+        assert_reported_status(&format!("{case}, after the send"), &emulator, json!({}), PENDING)
+            .await;
+
+        let passcode = emulator
+            .outstanding_passcode(&own)
+            .unwrap_or_else(|| panic!("case {case:?}: sending a passcode must store one"));
+        assert_well_formed_passcode(case, &passcode);
+        assert!(
+            !sent.text.contains(&passcode),
+            "case {case:?}: the passcode must not appear in the response, got {:?}",
+            sent.text
+        );
+        assert_ne!(
+            Some(passcode.as_str()),
+            before.as_deref(),
+            "case {case:?}: a send mints a passcode of its own, not the one outstanding before it"
+        );
+
+        // Whatever was outstanding before the send no longer verifies, and the
+        // number stays PENDING with the new passcode still outstanding.
+        if let Some(stale) = before {
+            let refused = emulator.verify_phone_number(json!({"Otp": stale})).await;
+            assert_refused(
+                &format!("{case}, the passcode outstanding before the send"),
+                &refused,
+                400,
+                "ValidationException",
+            );
+            assert_reported_status(
+                &format!("{case}, after the stale submission"),
+                &emulator,
+                json!({}),
+                PENDING,
+            )
+            .await;
+        }
+
+        let verified = emulator
+            .verify_phone_number(json!({"Otp": passcode}))
+            .await;
+        assert_status(&format!("{case}, the passcode the send minted"), &verified, VERIFIED);
+        assert_reported_status(&format!("{case}, verified"), &emulator, json!({}), VERIFIED).await;
+    }
+}
+
+/// An `AccountId` outside its modelled `^\d{12}$`
+/// (`smithy_query(query="operation", operation="SendPhoneNumberVerification")`)
+/// is refused at the boundary with HTTP 400 `ValidationException` and never
+/// reaches the flow: no passcode is minted, for the named id or for the caller's
+/// own account, and the reported status does not move.
+#[tokio::test]
+async fn a_send_naming_a_malformed_account_id_is_refused() {
+    let emulator = Emulator::new();
+    let own = default_account_id().to_string();
+    let put = emulator
+        .put_contact_information(json!({"ContactInformation": contact_with("+12065550100")}))
+        .await;
+    assert_eq!(
+        put.status, 200,
+        "case \"the stored contact\": expected 200, got {} with {:?}",
+        put.status, put.body
+    );
+
+    // (case, the AccountId value) — each row is outside `^\d{12}$`: one digit
+    // short of the length, one digit past it, and forms the pattern excludes.
+    let cases: [(&str, &str); 7] = [
+        ("one digit short of the length", "12345678901"),
+        ("one digit past the length", "1234567890123"),
+        ("empty", ""),
+        ("letters among the digits", "12345678901a"),
+        ("hyphens the pattern excludes", "1234-5678-901"),
+        ("spaces around a well-formed id", " 123456789012 "),
+        ("an account arn rather than an id", "arn:aws:::123456789012"),
+    ];
+
+    for (case, account_id) in cases {
+        let refused = emulator
+            .send_phone_number_verification(json!({"AccountId": account_id}))
+            .await;
+        assert_refused(case, &refused, 400, "ValidationException");
+        assert_eq!(
+            emulator.outstanding_passcode(account_id),
+            None,
+            "case {case:?}: a refusal at the boundary must mint no passcode"
+        );
+        assert_eq!(
+            emulator.outstanding_passcode(&own),
+            None,
+            "case {case:?}: a refused send must not touch the caller's own account"
+        );
+        assert_reported_status(case, &emulator, json!({}), UNVERIFIED).await;
+    }
+
+    // The flow still runs for a well-formed id after every refusal.
+    let sent = emulator.send_phone_number_verification(json!({})).await;
+    assert_status("a well-formed request after the refusals", &sent, PENDING);
+}

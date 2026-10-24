@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeactivateContactChannel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeactivateContactChannel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeactivateContactChannel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deactivates the contact channel `ContactChannelId` names, so Incident Manager no longer
+//! engages it: the stored channel's `ActivationStatus` moves to `NOT_ACTIVATED`, which is
+//! what `GetContactChannel`/`ListContactChannels` report for it afterwards.
+//!
+//! Two things happen before the write, in this order, exactly as in
+//! [`crate::ops::activate_contact_channel`] — the two are one operation in opposite
+//! directions:
+//!
+//! 1. The ACCOUNT-level Incident Manager precondition
+//!    ([`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set`]):
+//!    until the account has an active replication set the call is refused with the modelled
+//!    `ValidationException` (HTTP 400) WITHOUT resolving `ContactChannelId`.
+//! 2. The resource lookup: an onboarded account naming a channel the store does not hold
+//!    gets the modelled `ResourceNotFoundException` (HTTP 404).
+//!
+//! Deactivation is idempotent: the operation models no "already deactivated" error and its
+//! output carries no state, so deactivating a channel that is already `NOT_ACTIVATED`
+//! leaves it `NOT_ACTIVATED` and still answers 200.
+//!
+//! It delivers no activation code and supersedes none: the code last delivered to the
+//! channel ([`crate::state::ContactChannelRecord::activation_code`]) is untouched, so this
+//! call changes the channel's status and nothing else — a channel deactivated by mistake is
+//! re-activated with the code it already holds.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +161,74 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeactivateContactChannel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeactivateContactChannelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeactivateContactChannel"))
+        // The channel is addressed by ARN and nothing is read off the request envelope.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DeactivateContactChannelErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "this service is mounted on an engine that holds no state"
+                            .to_string(),
+                        retry_after_seconds: 0,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut state = state.lock();
+
+        // The account gate comes FIRST: it is evaluated before `ContactChannelId` is
+        // resolved, so a non-onboarded account is refused identically whether or not its
+        // channel exists.
+        state
+            .require_active_replication_set()
+            .map_err(account_precondition_failed)?;
+
+        let Some(channel) = state.contact_channels.get_mut(&input.contact_channel_id) else {
+            return Err(
+                DeactivateContactChannelErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "Contact channel {} not found",
+                            input.contact_channel_id
+                        ),
+                        resource_id: input.contact_channel_id.clone(),
+                        resource_type: CONTACT_CHANNEL_RESOURCE_TYPE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The only thing this call changes. An already-deactivated channel stays
+        // deactivated, which is what makes the operation idempotent.
+        channel.activation_status = NOT_ACTIVATED.to_string();
+
+        Ok(DeactivateContactChannelOutput {})
     }
+}
+
+/// The `ActivationStatus` a deactivated channel carries, from the model's own
+/// `ActivationStatus` value set ([`crate::ops::types::ACTIVATION_STATUS_VALUES`]) — the same value a freshly
+/// created channel starts at.
+const NOT_ACTIVATED: &str = "NOT_ACTIVATED";
+
+/// The `resourceType` this operation's not-found error names, spelled as the channel
+/// lifecycle's other handlers spell it.
+const CONTACT_CHANNEL_RESOURCE_TYPE: &str = "contact-channel";
+
+/// The account precondition's refusal: this operation's modelled `ValidationException`,
+/// which the model classifies `client` with `httpError` 400.
+///
+/// `reason` carries `OTHER` because the failure is not a member-level one, and `fields` is
+/// present but EMPTY for the same reason — no field of the request is at fault.
+fn account_precondition_failed(message: String) -> DeactivateContactChannelError {
+    DeactivateContactChannelErrorModeled::ValidationException(ValidationException {
+        message,
+        reason: Some("OTHER".to_string()),
+        fields: Some(Vec::new()),
+    })
+    .into()
 }

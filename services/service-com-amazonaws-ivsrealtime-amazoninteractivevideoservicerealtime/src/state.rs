@@ -4,10 +4,11 @@
 //!
 //! The stage lifecycle (`CreateStage`, `GetStage`, `ListStages`, `UpdateStage`,
 //! `DeleteStage`), the token issuance that makes a stage usable
-//! (`CreateParticipantToken`) and the stage sessions a stage's participants are
-//! grouped into (`ListParticipants`) all read and write the records below, so the
-//! records, the id minting they share and the modelled defaults they apply live here
-//! rather than in any one operation's file.
+//! (`CreateParticipantToken`), the stage sessions a stage's participants are
+//! grouped into (`ListParticipants`) and the compositions a stage is composed into
+//! (`StartComposition`, `GetComposition`, `StopComposition`) all read and write the
+//! records below, so the records, the id minting they share and the modelled defaults
+//! they apply live here rather than in any one operation's file.
 
 use std::collections::HashMap;
 use std::sync::LazyLock;
@@ -1075,17 +1076,33 @@ impl CompositionRecord {
     /// Materialise the transition the clock has already made due.
     ///
     /// A starting composition — and every destination of it — becomes `ACTIVE`
-    /// [`COMPOSITION_ACTIVATION_SPAN`] after the call that started it, whether or not
-    /// anybody calls again: this only writes down a change that was already owed at
-    /// `now`, so a reporting operation may call it.
+    /// [`COMPOSITION_ACTIVATION_SPAN`] after the call that started it, and a stopping one
+    /// becomes `STOPPED` [`COMPOSITION_STOP_SPAN`] after the call that stopped it,
+    /// whether or not anybody calls again: this only writes down a change that was
+    /// already owed at `now`, so a reporting operation may call it. The last step a
+    /// stopped composition owes — the deletion of the ephemeral resource — is not a state
+    /// to write but a record to drop, which is [`Self::is_reclaimed`]'s question and
+    /// `ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState::materialize_due_compositions`'s
+    /// to act on.
     pub fn materialize_due(&mut self, now: SystemTime) {
-        if self.state != COMPOSITION_STATE_STARTING || now < self.active_at {
+        if self.state == COMPOSITION_STATE_STARTING && now >= self.active_at {
+            self.state = COMPOSITION_STATE_ACTIVE.to_string();
+            for destination in &mut self.destinations {
+                if destination.state == DESTINATION_STATE_STARTING {
+                    destination.state = DESTINATION_STATE_ACTIVE.to_string();
+                }
+            }
             return;
         }
-        self.state = COMPOSITION_STATE_ACTIVE.to_string();
-        for destination in &mut self.destinations {
-            if destination.state == DESTINATION_STATE_STARTING {
-                destination.state = DESTINATION_STATE_ACTIVE.to_string();
+        let stopped_at = self.ended_at.map(|ended_at| ended_at + COMPOSITION_STOP_SPAN);
+        if self.state == COMPOSITION_STATE_STOPPING
+            && stopped_at.is_some_and(|stopped_at| now >= stopped_at)
+        {
+            self.state = COMPOSITION_STATE_STOPPED.to_string();
+            for destination in &mut self.destinations {
+                if destination.state == DESTINATION_STATE_STOPPING {
+                    destination.state = DESTINATION_STATE_STOPPED.to_string();
+                }
             }
         }
     }
@@ -1109,6 +1126,87 @@ impl CompositionRecord {
             start_time: Some(::aws_smithy_types::DateTime::from(self.started_at)),
             end_time: self.ended_at.map(::aws_smithy_types::DateTime::from),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stopping a composition
+//
+// `StopComposition` ends a composition `StartComposition` started. A composition is
+// EPHEMERAL: the model's `StartComposition` doc says it "is an ephemeral resource that
+// exists after this operation returns successfully" and that the "Composition stops and
+// the resource is deleted … When StopComposition is called". So a stop is the start of
+// the composition's end — the clock owes it `STOPPED` one span later and the deletion of
+// the resource one span after that, both materialised by
+// [`CompositionRecord::materialize_due`] beside the `STARTING` -> `ACTIVE` transition a
+// start owes, and neither ever slept on.
+// ---------------------------------------------------------------------------
+
+/// `CompositionState` a composition is in from the moment `StopComposition` returns until
+/// the clock owes it [`COMPOSITION_STOP_SPAN`] later, from `CompositionState`'s value
+/// list (`crate::ops::types::COMPOSITION_STATE_VALUES`).
+pub const COMPOSITION_STATE_STOPPING: &str = "STOPPING";
+
+/// `CompositionState` a stopping composition settles into, from the same value list.
+/// Terminal: the ephemeral resource is reclaimed from this state and reaches no other.
+pub const COMPOSITION_STATE_STOPPED: &str = "STOPPED";
+
+/// `DestinationState` a destination of a stopping composition is in, from
+/// `DestinationState`'s value list (`crate::ops::types::DESTINATION_STATE_VALUES`).
+pub const DESTINATION_STATE_STOPPING: &str = "STOPPING";
+
+/// `DestinationState` a destination settles into with the composition it belongs to.
+pub const DESTINATION_STATE_STOPPED: &str = "STOPPED";
+
+/// How long after `StopComposition` the clock owes a composition and its destinations
+/// the `STOPPING` -> `STOPPED` transition, and one span after that the deletion of the
+/// ephemeral resource.
+///
+/// AWS publishes no span for either step, so this is the emulator's own, inside the band
+/// this tree fixes for a transition the clock owes and set the same way
+/// [`COMPOSITION_ACTIVATION_SPAN`] is. It is deliberately NOT zero: a caller that reads
+/// the composition back straight after stopping it must still observe `STOPPING`, the way
+/// it would against AWS.
+pub const COMPOSITION_STOP_SPAN: Duration = Duration::from_millis(500);
+
+impl CompositionRecord {
+    /// Whether this composition is still composing, so a stop is the next thing that can
+    /// happen to it.
+    ///
+    /// The two states a composition reaches on its way up ([`COMPOSITION_STATE_STARTING`]
+    /// and [`COMPOSITION_STATE_ACTIVE`]); from any other one the broadcast is already
+    /// ending or has ended, which is what makes a second stop the modelled conflict.
+    pub fn is_running(&self) -> bool {
+        self.state == COMPOSITION_STATE_STARTING || self.state == COMPOSITION_STATE_ACTIVE
+    }
+
+    /// Begin the stop of this composition at `now`: the composition and every destination
+    /// it broadcasts to enter their stopping state and record when the broadcast ended.
+    ///
+    /// Everything after that is the clock's ([`Self::materialize_due`]): `STOPPED` one
+    /// [`COMPOSITION_STOP_SPAN`] later, and the deletion of the ephemeral resource one
+    /// span after that.
+    pub fn begin_stop(&mut self, now: SystemTime) {
+        self.state = COMPOSITION_STATE_STOPPING.to_string();
+        self.ended_at = Some(now);
+        for destination in &mut self.destinations {
+            destination.state = DESTINATION_STATE_STOPPING.to_string();
+            destination.ended_at = Some(now);
+        }
+    }
+
+    /// Whether the clock has reclaimed this composition's ephemeral resource by `now`, so
+    /// nothing may report it any more.
+    ///
+    /// Due one [`COMPOSITION_STOP_SPAN`] after the stop finished, which is two spans after
+    /// the stop began — computed from the recorded end time rather than stored, so a
+    /// reader that holds the record immutably reaches the same answer as one that can
+    /// write ([`Self::materialize_due`] is what removes it).
+    pub fn is_reclaimed(&self, now: SystemTime) -> bool {
+        self.state == COMPOSITION_STATE_STOPPED
+            && self
+                .ended_at
+                .is_some_and(|ended_at| now >= ended_at + COMPOSITION_STOP_SPAN * 2)
     }
 }
 
@@ -1538,7 +1636,9 @@ pub struct ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState {
     pub encoder_configurations: HashMap<String, EncoderConfigurationRecord>,
     /// Every live storage configuration, keyed by its ARN.
     pub storage_configurations: HashMap<String, StorageConfigurationRecord>,
-    /// Every composition that has been started and not stopped, keyed by its ARN.
+    /// Every composition that has been started and not yet reclaimed, keyed by its ARN.
+    /// Ephemeral: the clock drops the record once the stop `StopComposition` began has
+    /// finished (see [`ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState::materialize_due_compositions`]).
     pub compositions: HashMap<String, CompositionRecord>,
     /// The started replications of a stage's participants, keyed by that SOURCE stage's
     /// ARN and held in start order — the order `ListParticipantReplicas` pages over.
@@ -1600,15 +1700,22 @@ impl ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState {
             .find(|session| session.session_id == session_id)
     }
 
-    /// Write down every composition transition the clock has already made due.
+    /// Write down every composition transition the clock has already made due, and drop
+    /// the compositions whose ephemeral resource it has reclaimed.
     ///
-    /// Each one was owed at [`CompositionRecord::active_at`] whether or not anybody
-    /// called, so this changes no composition that a caller reading at the same instant
-    /// would have seen differently — which is why a reporting operation may call it.
+    /// Each one was owed at [`CompositionRecord::active_at`], or one
+    /// [`COMPOSITION_STOP_SPAN`] after a stop, whether or not anybody called, so this
+    /// changes no composition that a caller reading at the same instant would have seen
+    /// differently — which is why a reporting operation may call it. A stopped
+    /// composition's record goes the same way: the model says the "Composition stops and
+    /// the resource is deleted … When StopComposition is called", so the record is
+    /// reclaimed rather than kept in a terminal state forever.
     pub fn materialize_due_compositions(&mut self, now: SystemTime) {
         for composition in self.compositions.values_mut() {
             composition.materialize_due(now);
         }
+        self.compositions
+            .retain(|_, composition| !composition.is_reclaimed(now));
     }
 
     /// The composition started under the `@idempotencyToken` `token`, if this store
@@ -2430,6 +2537,17 @@ pub fn conflict<E>(
     )
 }
 
+/// How this service states a stop of a composition that is not composing: it names the
+/// composition and the state it is already in, so the caller can see why the stop is not
+/// the next thing that can happen to it.
+///
+/// AWS documents no text for `ConflictException` beyond what it means ("Updating or
+/// deleting a resource can cause an inconsistent state"), so the sentence is built from
+/// the request and the stored state, the way every other refusal of this service is.
+pub fn composition_not_running_message(arn: &str, state: &str) -> String {
+    format!("Resource: {arn} is already {state}")
+}
+
 /// How this service states a request to replicate a participant that is already
 /// replicated into the stage it names: it names the participant and both stages, so the
 /// caller can see which replication already holds.
@@ -2817,6 +2935,11 @@ pub fn resource_tags(
         "composition" => state
             .compositions
             .get(arn)
+            // This reader holds the store immutably, so a composition the clock has
+            // already reclaimed is skipped rather than dropped: a tag listing answers for
+            // exactly the compositions `GetComposition` answers for, and the next call
+            // that can write clears the record.
+            .filter(|composition| !composition.is_reclaimed(SystemTime::now()))
             .map(|composition| composition.tags.clone()),
         "ingest-configuration" => state
             .ingest_configurations
@@ -2840,6 +2963,9 @@ pub fn resource_tags_mut<'a>(
     state: &'a mut ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
     arn: &str,
 ) -> Option<&'a mut HashMap<String, String>> {
+    // A composition's own lifetime is the clock's: materialise what it already owed, so
+    // a tag cannot be written onto a composition that no longer exists.
+    state.materialize_due_compositions(SystemTime::now());
     match arn_resource_type(arn)? {
         "stage" => state.stages.get_mut(arn).map(|stage| &mut stage.tags),
         "composition" => state

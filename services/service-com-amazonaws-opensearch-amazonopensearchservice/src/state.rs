@@ -34,10 +34,12 @@ use crate::ops::types::{
     IdentityCenterOptionsInput, IdentityCenterOptionsStatus, JWTOptionsOutput, LogPublishingOption,
     LogPublishingOptionsStatus, NaturalLanguageQueryGenerationOptionsOutput,
     NodeToNodeEncryptionOptions, NodeToNodeEncryptionOptionsStatus, OffPeakWindowOptions,
-    OffPeakWindowOptionsStatus, OptionStatus, ResourceNotFoundException,
+    OffPeakWindowOptionsStatus, OptionStatus, RecurringCharge, ReservedInstanceOffering,
+    ResourceNotFoundException,
     RollbackServiceSoftwareOptions, SAMLOptionsOutput, ServiceSoftwareOptions, SnapshotOptions,
     SnapshotOptionsStatus, SoftwareUpdateOptions, SoftwareUpdateOptionsStatus, Tag, UseCaseStatus,
     VPCDerivedInfo, VPCDerivedInfoStatus, VPCOptions, ValidationException, VersionStatus,
+    OPEN_SEARCH_PARTITION_INSTANCE_TYPE_VALUES, RESERVED_INSTANCE_PAYMENT_OPTION_VALUES,
 };
 
 /// The engine version a domain runs when `CreateDomain` names none.
@@ -1113,8 +1115,274 @@ impl Domain {
 /// carries Auto-Tune options that name no desired state.
 pub const AUTO_TUNE_STATE_DISABLED: &str = "DISABLED";
 
+// ---------------------------------------------------------------------------
+// The Reserved Instance offering catalog
+// ---------------------------------------------------------------------------
+
+/// `ReservedInstancePaymentOption`'s `ALL_UPFRONT` value: the whole term is paid as
+/// one upfront charge, so the reservation carries no recurring charge at all.
+pub const PAYMENT_OPTION_ALL_UPFRONT: &str = "ALL_UPFRONT";
+
+/// `ReservedInstancePaymentOption`'s `PARTIAL_UPFRONT` value: part of the term is
+/// paid upfront and the rest as a recurring charge.
+pub const PAYMENT_OPTION_PARTIAL_UPFRONT: &str = "PARTIAL_UPFRONT";
+
+/// `ReservedInstancePaymentOption`'s `NO_UPFRONT` value: nothing is paid upfront and
+/// the whole term is billed as a recurring charge.
+pub const PAYMENT_OPTION_NO_UPFRONT: &str = "NO_UPFRONT";
+
+/// `ReservedInstanceOffering$Duration` for a one-year term, in seconds — the unit
+/// that member is documented in ("the duration, in seconds, for which the offering
+/// will reserve the OpenSearch instance").
+pub const TERM_ONE_YEAR: i32 = 365 * 24 * 60 * 60;
+
+/// `ReservedInstanceOffering$Duration` for a three-year term, in seconds.
+pub const TERM_THREE_YEARS: i32 = 3 * TERM_ONE_YEAR;
+
+/// The terms the offering catalog publishes, shortest first: OpenSearch Service
+/// reserves an instance for one year or for three.
+pub const RESERVED_INSTANCE_TERMS: [i32; 2] = [TERM_ONE_YEAR, TERM_THREE_YEARS];
+
+/// `ReservedInstanceOffering$CurrencyCode`: every price in the catalog is quoted in
+/// US dollars, the currency AWS publishes its price list in.
+pub const RESERVED_INSTANCE_CURRENCY_CODE: &str = "USD";
+
+/// `RecurringCharge$RecurringChargeFrequency` for a reservation's recurring charge:
+/// the charge is billed per hour of the term.
+pub const RECURRING_CHARGE_HOURLY: &str = "Hourly";
+
+/// How many seconds make an hour, for turning a term's `Duration` into the hours a
+/// recurring charge is billed over.
+const SECONDS_PER_HOUR: f64 = 3600.0;
+
+/// AWS's published instance-size normalization factors, keyed by the size token of an
+/// `OpenSearchPartitionInstanceType` (which is `<family>.<size>.search`). They are
+/// the factors AWS publishes for Reserved Instance size flexibility — one `large` is
+/// four units, one `xlarge` eight, and so on — and they are what makes a bigger size
+/// of one family cost proportionally more in [`on_demand_hourly_price`].
+const SIZE_NORMALIZATION_FACTORS: [(&str, f64); 15] = [
+    ("nano", 0.25),
+    ("micro", 0.5),
+    ("small", 1.0),
+    ("medium", 2.0),
+    ("large", 4.0),
+    ("xlarge", 8.0),
+    ("2xlarge", 16.0),
+    ("4xlarge", 32.0),
+    ("8xlarge", 64.0),
+    ("9xlarge", 72.0),
+    ("10xlarge", 80.0),
+    ("12xlarge", 96.0),
+    ("16xlarge", 128.0),
+    ("18xlarge", 144.0),
+    ("24xlarge", 192.0),
+];
+
+/// The hourly on-demand rate, in US dollars, of ONE normalization unit of an instance
+/// class, keyed by the first letter of the instance family (`c5`, `m6g`, `or1`,
+/// `ultrawarm1`, …).
+///
+/// This is the emulator's OWN price list: AWS's price list is not in the Smithy model
+/// and is not published as part of the API, so there is nothing to read it from. What
+/// the catalog therefore guarantees is the RELATION between its prices, not an AWS
+/// price: a compute-optimized unit costs less than a memory-optimized one, a burstable
+/// one less than either, and the size factor scales each. Every price the catalog
+/// reports is derived from this table, so the same offering costs the same on every
+/// call and in every run.
+const CLASS_HOURLY_RATE_PER_UNIT: [(char, f64); 8] = [
+    // Burstable (`t2`, `t3`, `t4g`).
+    ('t', 0.018),
+    // Compute optimized (`c4`, `c5`, `c6g`).
+    ('c', 0.034),
+    // General purpose (`m3`, `m4`, `m5`, `m6g`).
+    ('m', 0.036),
+    // OpenSearch optimized (`or1`).
+    ('o', 0.040),
+    // Memory optimized (`r3`, `r4`, `r5`, `r6g`, `r6gd`).
+    ('r', 0.047),
+    // Dense storage (`d2`).
+    ('d', 0.052),
+    // Storage optimized (`i2`, `i3`).
+    ('i', 0.055),
+    // UltraWarm (`ultrawarm1`).
+    ('u', 0.060),
+];
+
+/// The fraction of the on-demand rate a ONE-year reservation costs, before the
+/// payment-option discount. The emulator's own figure, like
+/// [`CLASS_HOURLY_RATE_PER_UNIT`]; what it fixes is that reserving is cheaper than
+/// paying on demand.
+const ONE_YEAR_RATE: f64 = 0.78;
+
+/// The same fraction for a THREE-year reservation: a longer commitment costs less per
+/// hour than a shorter one, so this is below [`ONE_YEAR_RATE`].
+const THREE_YEAR_RATE: f64 = 0.52;
+
+/// The further discount for paying the whole term upfront — the largest of the three,
+/// so `ALL_UPFRONT` is the cheapest payment option of a term.
+const ALL_UPFRONT_DISCOUNT: f64 = 0.92;
+
+/// The further discount for paying part of the term upfront: between
+/// [`ALL_UPFRONT_DISCOUNT`] and [`NO_UPFRONT_DISCOUNT`].
+const PARTIAL_UPFRONT_DISCOUNT: f64 = 0.96;
+
+/// Paying nothing upfront earns no further discount, so this payment option is the
+/// most expensive of a term.
+const NO_UPFRONT_DISCOUNT: f64 = 1.0;
+
+/// The hourly on-demand rate of one instance type: its class's rate per normalization
+/// unit times its size's factor.
+///
+/// `None` for a value that is not `<family>.<size>.search` with a known size token or
+/// instance class — which no value of `OpenSearchPartitionInstanceType` is, so the
+/// catalog spans the whole enum.
+fn on_demand_hourly_price(instance_type: &str) -> Option<f64> {
+    let mut parts = instance_type.split('.');
+    let family = parts.next()?;
+    let size = parts.next()?;
+    let factor = SIZE_NORMALIZATION_FACTORS
+        .iter()
+        .find(|(token, _)| *token == size)
+        .map(|(_, factor)| *factor)?;
+    let class = family.chars().next()?;
+    let rate = CLASS_HOURLY_RATE_PER_UNIT
+        .iter()
+        .find(|(letter, _)| *letter == class)
+        .map(|(_, rate)| *rate)?;
+    Some(rate * factor)
+}
+
+/// The fraction of the on-demand rate a reservation of this term and payment option
+/// costs: the term's rate times the payment option's discount.
+///
+/// `None` for a payment option outside `ReservedInstancePaymentOption`, so a value
+/// added to that enum is left out of the catalog rather than silently priced as one
+/// of the three it does know.
+fn reserved_rate(duration: i32, payment_option: &str) -> Option<f64> {
+    let term = if duration >= TERM_THREE_YEARS {
+        THREE_YEAR_RATE
+    } else {
+        ONE_YEAR_RATE
+    };
+    let upfront = match payment_option {
+        PAYMENT_OPTION_ALL_UPFRONT => ALL_UPFRONT_DISCOUNT,
+        PAYMENT_OPTION_PARTIAL_UPFRONT => PARTIAL_UPFRONT_DISCOUNT,
+        PAYMENT_OPTION_NO_UPFRONT => NO_UPFRONT_DISCOUNT,
+        _ => return None,
+    };
+    Some(term * upfront)
+}
+
+/// `value` rounded to whole cents, the precision an upfront charge is quoted at.
+fn cents(value: f64) -> f64 {
+    (value * 100.0).round() / 100.0
+}
+
+/// `value` rounded to the precision AWS quotes an hourly rate at — thousandths of a
+/// cent, so a small instance's hourly charge does not round away to zero.
+fn hourly(value: f64) -> f64 {
+    (value * 100_000.0).round() / 100_000.0
+}
+
+/// The `ReservedInstanceOfferingId` of one catalog entry.
+///
+/// DERIVED from what the entry IS (its instance type, term and payment option) as a
+/// name-based v5 UUID, so it satisfies `GUID`'s
+/// `^\p{XDigit}{8}-\p{XDigit}{4}-\p{XDigit}{4}-\p{XDigit}{4}-\p{XDigit}{12}$`, two
+/// entries can never share an id, and the id a caller read in one call is the id the
+/// next call reports — which a freshly generated id would not be.
+fn offering_id(instance_type: &str, duration: i32, payment_option: &str) -> String {
+    ::uuid::Uuid::new_v5(
+        &::uuid::Uuid::NAMESPACE_OID,
+        format!("opensearch/reservedInstanceOffering/{instance_type}/{duration}/{payment_option}")
+            .as_bytes(),
+    )
+    .to_string()
+}
+
+/// One catalog entry: what one instance type costs to reserve for one term under one
+/// payment option.
+///
+/// The three price members hold together the way a reservation is billed: the upfront
+/// charge is `FixedPrice`, the rest of the term is a recurring hourly charge, and
+/// `UsagePrice` — the rate charged for USING the reserved capacity — is zero, because
+/// the reservation has already paid for the hours. So `ALL_UPFRONT` carries a fixed
+/// price and no recurring charge, `NO_UPFRONT` a recurring charge and no fixed price,
+/// and `PARTIAL_UPFRONT` half the term each way.
+fn reserved_instance_offering(
+    instance_type: &str,
+    duration: i32,
+    payment_option: &str,
+) -> Option<ReservedInstanceOffering> {
+    let on_demand = on_demand_hourly_price(instance_type)?;
+    let effective_hourly = on_demand * reserved_rate(duration, payment_option)?;
+    let term_hours = f64::from(duration) / SECONDS_PER_HOUR;
+    let (fixed_price, recurring_hourly) = match payment_option {
+        PAYMENT_OPTION_ALL_UPFRONT => (effective_hourly * term_hours, 0.0),
+        PAYMENT_OPTION_PARTIAL_UPFRONT => {
+            (effective_hourly * term_hours / 2.0, effective_hourly / 2.0)
+        }
+        PAYMENT_OPTION_NO_UPFRONT => (0.0, effective_hourly),
+        _ => return None,
+    };
+    let recurring_charges = if recurring_hourly > 0.0 {
+        vec![RecurringCharge {
+            recurring_charge_amount: Some(hourly(recurring_hourly)),
+            recurring_charge_frequency: Some(RECURRING_CHARGE_HOURLY.to_string()),
+        }]
+    } else {
+        // An offering with nothing left to bill reports an EMPTY list rather than no
+        // member: the member is "the recurring charge to your account", and for this
+        // offering there is none.
+        Vec::new()
+    };
+    Some(ReservedInstanceOffering {
+        reserved_instance_offering_id: Some(offering_id(instance_type, duration, payment_option)),
+        instance_type: Some(instance_type.to_string()),
+        duration,
+        fixed_price: Some(cents(fixed_price)),
+        usage_price: Some(0.0),
+        currency_code: Some(RESERVED_INSTANCE_CURRENCY_CODE.to_string()),
+        payment_option: Some(payment_option.to_string()),
+        recurring_charges: Some(recurring_charges),
+    })
+}
+
+/// The whole offering catalog, keyed by `ReservedInstanceOfferingId`.
+///
+/// Reserved Instance offerings are published BY the service for a Region, not created
+/// by a caller, so the catalog is seeded with the state rather than grown by an
+/// operation: it is what `DescribeReservedInstanceOfferings` reports and what a
+/// purchase resolves an offering id against. It spans one entry per instance type the
+/// model's `OpenSearchPartitionInstanceType` enum declares — the only published record
+/// of which instance types exist — times each term in [`RESERVED_INSTANCE_TERMS`] and
+/// each value of `ReservedInstancePaymentOption`, so it is bounded and complete.
+fn seed_reserved_instance_offerings() -> BTreeMap<String, ReservedInstanceOffering> {
+    let mut catalog = BTreeMap::new();
+    for instance_type in OPEN_SEARCH_PARTITION_INSTANCE_TYPE_VALUES {
+        for duration in RESERVED_INSTANCE_TERMS {
+            for payment_option in RESERVED_INSTANCE_PAYMENT_OPTION_VALUES {
+                let Some(offering) =
+                    reserved_instance_offering(instance_type, duration, payment_option)
+                else {
+                    continue;
+                };
+                // The id the record CARRIES is the key it is stored under, so the id
+                // has one producer per entry and no stored entry can report an id
+                // other than the one a caller resolves it by — which is also the id
+                // paging resumes from.
+                let Some(id) = offering.reserved_instance_offering_id.clone() else {
+                    continue;
+                };
+                catalog.insert(id, offering);
+            }
+        }
+    }
+    catalog
+}
+
 /// Per-service state for com-amazonaws-opensearch-amazonopensearchservice. A handler reaches it through [`service_state`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ComAmazonawsOpensearchAmazonopensearchserviceState {
     /// Every created domain, keyed by its name — unique per account and Region, so
     /// the name IS the key. Iterating a `BTreeMap` is order-stable, which is what
@@ -1122,6 +1390,13 @@ pub struct ComAmazonawsOpensearchAmazonopensearchserviceState {
     pub domains: BTreeMap<String, Domain>,
     /// Drives [`ComAmazonawsOpensearchAmazonopensearchserviceState::mint_endpoint_suffix`].
     pub endpoint_suffix_seq: u64,
+    /// The Reserved Instance offering catalog this emulator publishes, keyed by
+    /// `ReservedInstanceOfferingId`. Seeded by [`seed_reserved_instance_offerings`]
+    /// and never written again: an offering is published by the service, so no
+    /// operation creates, changes or removes one, and iterating a `BTreeMap` is
+    /// order-stable, which is what lets a paged read of the catalog resume where the
+    /// previous page stopped.
+    pub reserved_instance_offerings: BTreeMap<String, ReservedInstanceOffering>,
     /// The default-application setting: the ARN of the application that is the
     /// account's default, or `None` while no default is set.
     ///
@@ -1130,6 +1405,17 @@ pub struct ComAmazonawsOpensearchAmazonopensearchserviceState {
     /// `GetDefaultApplicationSetting` reports it, so the two cannot disagree about
     /// which application is the default.
     pub default_application_arn: Option<String>,
+}
+
+impl Default for ComAmazonawsOpensearchAmazonopensearchserviceState {
+    fn default() -> Self {
+        Self {
+            domains: BTreeMap::new(),
+            endpoint_suffix_seq: 0,
+            reserved_instance_offerings: seed_reserved_instance_offerings(),
+            default_application_arn: None,
+        }
+    }
 }
 
 /// The characters a domain endpoint's opaque suffix is built from.
@@ -1428,6 +1714,43 @@ pub fn change_not_found(domain_name: &str, change_id: Option<&str>) -> ResourceN
             }
             None => format!("No configuration change found for domain {domain_name}"),
         }),
+    }
+}
+
+/// The `ValidationException` payload for a member that must be a `GUID` and is not.
+///
+/// It names the member and the shape the value had to have, so a caller can fix the
+/// request from the refusal alone.
+pub fn malformed_guid(member: &str, value: &str) -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "{member} must be a GUID of the form xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx: {value}"
+        )),
+    }
+}
+
+/// The `ResourceNotFoundException` payload for an offering id the catalog publishes
+/// no Reserved Instance offering for.
+pub fn offering_not_found(offering_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            "Reserved Instance offering not found: {offering_id}"
+        )),
+    }
+}
+
+/// The `ValidationException` payload for a pagination token that does not name a
+/// place in the listing it was sent to.
+///
+/// A token is only ever a value the service itself handed out, so one it cannot
+/// resolve is a malformed request rather than an empty page.
+pub fn invalid_next_token() -> ValidationException {
+    ValidationException {
+        message: Some(
+            "NextToken is not a pagination token this operation issued. Send the NextToken \
+             returned by the previous page, or omit it to start from the first page."
+                .to_string(),
+        ),
     }
 }
 

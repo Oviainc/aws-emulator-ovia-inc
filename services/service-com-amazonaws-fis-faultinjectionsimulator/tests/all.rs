@@ -35,6 +35,8 @@ mod list_experiment_resolved_targets;
 mod list_experiment_target_account_configurations;
 #[path = "all/list_target_account_configurations.rs"]
 mod list_target_account_configurations;
+#[path = "all/list_target_resource_types.rs"]
+mod list_target_resource_types;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/target_account_configuration_errors.rs"]
