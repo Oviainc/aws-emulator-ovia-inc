@@ -278,6 +278,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // has none and `GetPrivateConnectivityConfig` reports none.
                 private_connectivity: None,
                 active_at: Some(std::time::Instant::now() + crate::state::OUTPOST_PROVISIONING),
+                // A just-created Outpost is one nobody has asked to decommission;
+                // `StartOutpostDecommission` is what records that request.
+                decommission_requested_at: None,
                 // A renewal is priced against the contract an ORDER placed, so an
                 // Outpost nobody has ordered hardware for has no priced renewal
                 // option and `GetRenewalPricing` reports it cannot be priced.

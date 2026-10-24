@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateChannelPlacementGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateChannelPlacementGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateChannelPlacementGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Answers `201 Created`, the status the model declares for this create
+//! (`smithy_query(query="operation", operation="CreateChannelPlacementGroup")`:
+//! `POST /prod/clusters/{ClusterId}/channelplacementgroups`, code 201) and the
+//! status every other MediaLive create answers here.
+//!
+//! The group is stored in the channel placement group slice of this service's
+//! state (`crate::state::channel_placement_groups`), which owns the documented
+//! bounds; this handler turns a refusal from that slice into one of the
+//! operation's own modelled errors and reports the group by reading the stored
+//! record back.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +178,144 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateChannelPlacementGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateChannelPlacementGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateChannelPlacementGroup"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+        // Clock-owed work first, so this call answers from the same state a
+        // caller that had not called would have seen.
+        state.settle(now);
+
+        // A retried create (same `@idempotencyToken` `RequestId` for the same
+        // cluster) must answer with the group that one created, not a second
+        // group.
+        if let Some(existing) = input
+            .request_id
+            .as_deref()
+            .and_then(|token| {
+                state.channel_placement_group_for_token(&input.cluster_id, token)
+            })
+            .map(|group| group.id.clone())
+        {
+            let group = state
+                .channel_placement_group_description(&input.cluster_id, &existing)
+                .ok_or_else(unavailable)?;
+            return Ok(crate::state::channel_placement_group_output!(
+                CreateChannelPlacementGroupOutput,
+                group
+            ));
+        }
+
+        // Everything the request supplied is stored verbatim by the slice, which
+        // owns the documented node bound, the in-cluster name uniqueness and the
+        // store's ceiling; the response is then read back out of the stored
+        // record, never from `input`.
+        let id = state
+            .insert_channel_placement_group(
+                &region,
+                &input.cluster_id,
+                input.name,
+                input.nodes.unwrap_or_default(),
+                input.tags.unwrap_or_default(),
+                now,
+            )
+            .map_err(refused)?;
+
+        if let Some(token) = input.request_id {
+            // Bounded, evicting write: a caller-chosen token can neither
+            // accumulate past the cap nor name a group of another cluster.
+            state.record_channel_placement_group_token(&input.cluster_id, &token, &id);
+        }
+
+        let group = state
+            .channel_placement_group_description(&input.cluster_id, &id)
+            .ok_or_else(unavailable)?;
+        Ok(crate::state::channel_placement_group_output!(
+            CreateChannelPlacementGroupOutput,
+            group
+        ))
     }
+}
+
+/// The modelled error a [`crate::state::ChannelPlacementGroupRefusal`] is
+/// answered with.
+///
+/// A request the service cannot apply is `UnprocessableEntityException` (422),
+/// whose `ValidationErrors` is "A collection of validation error responses" —
+/// one entry naming the member the problem was found at, which is how this
+/// service already reports a semantically invalid request
+/// (`BatchUpdateSchedule`). A store that has reached this emulator's ceiling is
+/// `TooManyRequestsException` (429), as it is for every other create here.
+fn refused(refusal: crate::state::ChannelPlacementGroupRefusal) -> CreateChannelPlacementGroupError {
+    match refusal {
+        crate::state::ChannelPlacementGroupRefusal::NoSuchCluster => {
+            // A group lives inside one Cluster, and this operation models no
+            // `NotFoundException` to answer a path that names none with, so the
+            // request is the thing that cannot be processed: 422, naming the
+            // member the problem was found at.
+            let message = "No cluster with that ClusterId".to_string();
+            CreateChannelPlacementGroupErrorModeled::UnprocessableEntityException(
+                UnprocessableEntityException {
+                    message: Some(message.clone()),
+                    validation_errors: Some(vec![ValidationError {
+                        element_path: Some("clusterId".to_string()),
+                        error_message: Some(message),
+                    }]),
+                },
+            )
+        }
+        crate::state::ChannelPlacementGroupRefusal::TooManyNodes { count } => {
+            let message = format!(
+                "Nodes accepts at most {} node id, but {count} were supplied",
+                crate::state::MAX_CHANNEL_PLACEMENT_GROUP_NODES
+            );
+            CreateChannelPlacementGroupErrorModeled::UnprocessableEntityException(
+                UnprocessableEntityException {
+                    message: Some(message.clone()),
+                    validation_errors: Some(vec![ValidationError {
+                        element_path: Some("nodes".to_string()),
+                        error_message: Some(message),
+                    }]),
+                },
+            )
+        }
+        crate::state::ChannelPlacementGroupRefusal::NameTaken => {
+            CreateChannelPlacementGroupErrorModeled::UnprocessableEntityException(
+                UnprocessableEntityException {
+                    message: Some(crate::state::NAME_ALREADY_IN_USE_MESSAGE.to_string()),
+                    validation_errors: Some(vec![ValidationError {
+                        element_path: Some("name".to_string()),
+                        error_message: Some(
+                            crate::state::NAME_ALREADY_IN_USE_MESSAGE.to_string(),
+                        ),
+                    }]),
+                },
+            )
+        }
+        crate::state::ChannelPlacementGroupRefusal::StoreFull => {
+            CreateChannelPlacementGroupErrorModeled::TooManyRequestsException(
+                TooManyRequestsException {
+                    message: Some(format!(
+                        "This emulator stores at most {} channel placement groups; \
+                         delete one before creating another",
+                        crate::state::MAX_CHANNEL_PLACEMENT_GROUPS
+                    )),
+                },
+            )
+        }
+    }
+    .into()
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no store to create the group in. A modelled server error, never a
+/// fresh engine (which would drop the write when this request returns).
+fn unavailable() -> CreateChannelPlacementGroupError {
+    CreateChannelPlacementGroupErrorModeled::InternalServerErrorException(
+        InternalServerErrorException {
+            message: Some(crate::state::NO_STORE.to_string()),
+        },
+    )
+    .into()
 }

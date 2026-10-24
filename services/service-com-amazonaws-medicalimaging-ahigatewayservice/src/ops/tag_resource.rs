@@ -165,6 +165,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // The KEYS, against every constraint the model puts on a `TagKey` — the same
+        // check `CreateDatastore` applies, because what makes a tag map legal belongs
+        // to the map and not to the operation installing it. After the ARN parse, so a
+        // request that is both malformed and illegally tagged keeps answering for its
+        // label; before the store is touched, so an illegal map changes nothing.
+        if let Some(violation) = crate::state::tag_map_violation("tags", &input.tags) {
+            return Err(TagResourceErrorModeled::ValidationException(ValidationException {
+                message: crate::state::one_validation_error(&violation),
+            })
+            .into());
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             TagResourceErrorModeled::InternalServerException(InternalServerException {
                 message: "the medical-imaging state store is unavailable".to_string(),
@@ -188,10 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .count();
         if tags.len() + added > crate::state::MAX_TAGS_PER_RESOURCE {
             return Err(TagResourceErrorModeled::ValidationException(ValidationException {
-                message: format!(
-                    "this emulator holds at most {} tags per resource; remove one before adding another",
-                    crate::state::MAX_TAGS_PER_RESOURCE
-                ),
+                message: crate::state::too_many_tags_message(tags.len() + added),
             })
             .into());
         }

@@ -29,6 +29,8 @@ mod deletion_protection;
 mod deliveries;
 #[path = "all/delivery_destinations.rs"]
 mod delivery_destinations;
+#[path = "all/destinations.rs"]
+mod destinations;
 #[path = "all/harness.rs"]
 mod harness;
 #[path = "all/import_tasks.rs"]

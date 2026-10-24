@@ -1,15 +1,36 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartOutpostDecommission
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartOutpostDecommission`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: starts the decommission of the stored Outpost the `OutpostIdentifier`
+//! names — resolved from either the bare id or the full Outpost ARN — and answers the
+//! `DecommissionRequestStatus` the store supports:
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartOutpostDecommission::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! * `BLOCKED`, with every blocking resource type the store observes still associated
+//!   with the Outpost in `BlockingResourceTypes`, when there is one. See
+//!   [`crate::state::ComAmazonawsOutpostsOutpostsolafserviceState::blocking_resource_types`]
+//!   for which of the modelled types this service's store can observe, and why it
+//!   reports none of the others.
+//! * `REQUESTED` when this call STARTS the decommission: nothing blocks it, the caller
+//!   did not ask to validate only, and no decommission of this Outpost had been
+//!   requested yet. The request instant is persisted on the Outpost
+//!   ([`crate::state::OutpostRecord::decommission_requested_at`]), so a later call sees
+//!   it.
+//! * `SKIPPED` when nothing blocks but this call starts nothing: either `ValidateOnly`
+//!   was set ("Validates the request without starting the decommission process"), or
+//!   the Outpost's decommission had already been requested, so there is nothing left to
+//!   start. Neither case writes anything.
+//!
+//! An `OutpostIdentifier` the store holds no Outpost for is `NotFoundException` (404),
+//! worded as this service's identifier echo of the value as supplied; a value that is
+//! not an Outpost identifier at all is `ValidationException` (400).
+//!
+//! The other two modelled errors are NOT reachable here, so no test should read deny or
+//! conflict coverage into this operation: this handler makes no authorization decision
+//! (the emulator verifies request signatures at its boundary and models no principals or
+//! policies, so nothing can answer `AccessDeniedException`), and nothing in this slice
+//! puts an Outpost in a state where starting its decommission would leave the store
+//! inconsistent — a decommission already under way is reported as `SKIPPED` rather than
+//! refused with `ConflictException`.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +172,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartOutpostDecommission` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartOutpostDecommissionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartOutpostDecommission"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartOutpostDecommissionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Outposts store is unavailable".to_string()),
+                },
+            )
+        })?;
+        // `OutpostIdentifier` accepts the bare id or the full Outpost ARN; both name
+        // the same stored Outpost.
+        let outpost_id =
+            crate::state::resolve_outpost_id(&input.outpost_identifier).ok_or_else(|| {
+                StartOutpostDecommissionErrorModeled::ValidationException(ValidationException {
+                    message: Some(crate::state::outpost_identifier_pattern_report()),
+                })
+            })?;
+
+        let mut store = state.lock();
+        // Only the quote statuses matter to this call, and a quote expires on the
+        // clock, so settle them before reading what is still associated with the
+        // Outpost. That writes only the expiry that was already due at this same
+        // instant — nothing a later caller would not have seen anyway. The Outpost's
+        // own lifecycle status is not read here, so it is not settled.
+        store.settle_quotes();
+
+        // A decommission is of ONE Outpost, so an identifier the store holds no
+        // Outpost for is the not-found error this operation models, worded as the
+        // identifier echo of the value AS SUPPLIED — not of the bare id an ARN
+        // resolved to. Judged before anything else is looked at, so an identifier
+        // that names nothing costs nothing.
+        if !store.outposts.contains_key(&outpost_id) {
+            return Err(StartOutpostDecommissionErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::identifier_not_found(
+                        crate::state::OUTPOST_IDENTIFIER_MEMBER,
+                        &input.outpost_identifier,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Something still associated with the Outpost stops the decommission from
+        // starting, whether or not the caller asked to validate only: the blocking
+        // types are what the caller has to clear first, and nothing is persisted.
+        let blocking = store.blocking_resource_types(&outpost_id);
+        if !blocking.is_empty() {
+            return Ok(StartOutpostDecommissionOutput {
+                status: Some(crate::state::DECOMMISSION_STATUS_BLOCKED.to_string()),
+                blocking_resource_types: Some(blocking),
+            });
+        }
+
+        // Nothing blocks. Either this call starts the decommission — which is what
+        // gets recorded on the Outpost — or it starts nothing, because the caller
+        // asked for validation alone or the decommission is already under way. The
+        // `contains_key` above proved the record is there, so the `if let` can only
+        // take its `Some` arm; it is written as one rather than unwrapped so a
+        // handler never panics on a store it just read.
+        let mut status = crate::state::DECOMMISSION_STATUS_SKIPPED;
+        if let Some(record) = store.outposts.get_mut(&outpost_id) {
+            if !input.validate_only && record.decommission_requested_at.is_none() {
+                record.decommission_requested_at = Some(std::time::SystemTime::now());
+                status = crate::state::DECOMMISSION_STATUS_REQUESTED;
+            }
+        }
+        Ok(StartOutpostDecommissionOutput {
+            status: Some(status.to_string()),
+            // "The resources still associated with the Outpost that you are
+            // decommissioning": there are none to report, so the member is absent
+            // rather than an empty list.
+            blocking_resource_types: None,
+        })
     }
 }
