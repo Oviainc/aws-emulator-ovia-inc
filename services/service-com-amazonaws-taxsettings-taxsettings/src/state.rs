@@ -248,23 +248,44 @@ impl ComAmazonawsTaxsettingsTaxsettingsState {
     /// `PutTaxRegistration` and the per-account loop of
     /// `BatchPutTaxRegistration` cannot write one entry two different ways: the
     /// write replaces the account's record and bumps its revision, which the
-    /// document access tokens carry, and `accountId` is caller-supplied, so a
-    /// write that would ADD a record is refused once the store holds as many as
-    /// this emulator keeps resident ([`MAX_STORED_REGISTRATIONS`]) while
-    /// rewriting an account that already has one adds nothing and is always
-    /// allowed. Each caller renders the refusal on its own channel — a
-    /// `ConflictException` response, or a per-account row of the batch's `errors`
-    /// list.
+    /// document access tokens carry.
+    ///
+    /// Two refusals, both `ConflictException`s — each caller renders one on its
+    /// own channel, a `ConflictException` response or a per-account row of the
+    /// batch's `errors` list:
+    ///
+    /// * the account's stored TRN is still outstanding: both writers document
+    ///   "You can't set a TRN if there's a pending TRN. You'll need to delete the
+    ///   pending TRN first", so a record in [`STATUS_PENDING`] is NOT replaced —
+    ///   it is left exactly as it was and the write is refused
+    ///   ([`pending_registration_conflict`]). The validation the clock had
+    ///   already made due at `written_at` is materialised first, because it was
+    ///   owed at that instant whether or not anybody wrote: a TRN whose
+    ///   validation has run is not an outstanding one, so it may be rewritten.
+    /// * `accountId` is caller-supplied, so a write that would ADD a record is
+    ///   refused once the store holds as many as this emulator keeps resident
+    ///   ([`MAX_STORED_REGISTRATIONS`]) while rewriting an account that already
+    ///   has one adds nothing.
     pub fn store_registration(
         &mut self,
         account_id: &str,
         entry: &TaxRegistrationEntry,
         written_at: Instant,
     ) -> Result<String, ConflictException> {
-        let previous_revision = self
-            .registrations
-            .get(account_id)
-            .map(|stored| stored.revision);
+        let previous_revision = match self.registrations.get_mut(account_id) {
+            Some(stored) => {
+                // Settle what the clock owed at this instant before judging the
+                // record's status, so "pending" means a validation that is
+                // genuinely still outstanding rather than one nobody has read
+                // since it fell due.
+                stored.settle(written_at);
+                if stored.status == STATUS_PENDING {
+                    return Err(pending_registration_conflict());
+                }
+                Some(stored.revision)
+            }
+            None => None,
+        };
         if previous_revision.is_none() && self.registrations.len() >= MAX_STORED_REGISTRATIONS {
             return Err(registration_store_full());
         }
@@ -1446,6 +1467,24 @@ pub fn registration_store_full() -> ConflictException {
             "This emulator keeps at most {MAX_STORED_REGISTRATIONS} tax registrations resident. \
              Delete one before adding another."
         ),
+    }
+}
+
+/// This service's modelled `ConflictException` (HTTP 409) for a write aimed at
+/// an account whose stored TRN is still [`STATUS_PENDING`].
+///
+/// Both writers of a tax registration document the rule: "You can't set a TRN if
+/// there's a pending TRN. You'll need to delete the pending TRN first"
+/// (`smithy_query(query="doc",shape="com.amazonaws.taxsettings#PutTaxRegistration")`,
+/// and the same sentence on `BatchPutTaxRegistration`). The 409 class and the
+/// `ConflictException` shape are the contract; the wording below is this
+/// emulator's own statement of the rule — AWS publishes no message for it — and
+/// names no account, for the reason [`no_tax_registration`] gives.
+pub fn pending_registration_conflict() -> ConflictException {
+    ConflictException {
+        message: "You can't set a TRN while there's a pending TRN for this account. Delete the \
+                  pending TRN first."
+            .to_string(),
     }
 }
 

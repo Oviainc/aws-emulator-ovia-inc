@@ -318,9 +318,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::scaffolded::Scaffolded;
         use crate::state::{
             architecture_for, availability_zones_in_region, private_dns_name, request_region,
-            require_service_state, validate_tag_size, InstanceRecord, InstanceStateName,
+            require_service_state, validate_kernel_or_ramdisk_id, validate_tag_size,
+            InstanceRecord, InstanceStateName,
             MONITORING_STATE_DISABLED, MONITORING_STATE_ENABLED,
-            PendingTransition, ReservationRecord, DEFAULT_INSTANCE_TYPE, MAX_INSTANCES_PER_RUN,
+            PendingTransition, ReservationRecord, DEFAULT_INSTANCE_TYPE,
+            DEFAULT_SOURCE_DEST_CHECK, MAX_INSTANCES_PER_RUN,
             MAX_SECURITY_GROUPS_PER_INSTANCE, MAX_STORED_BYTES, MAX_STORED_INSTANCES,
             MAX_USER_DATA_BYTES, RUN_INSTANCES_TAGGABLE_RESOURCES,
         };
@@ -447,6 +449,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "User data accepts at most {MAX_USER_DATA_BYTES} bytes"
             )));
         }
+        // A kernel or RAM disk id is copied onto every instance the launch mints, exactly
+        // as its user data is, and neither member carries a modelled `@length`.
+        validate_kernel_or_ramdisk_id("kernelId", input.kernel_id.as_deref())?;
+        validate_kernel_or_ramdisk_id("ramdiskId", input.ramdisk_id.as_deref())?;
         let named_groups = input.security_group_ids.as_ref().map_or(0, Vec::len)
             + input.security_groups.as_ref().map_or(0, Vec::len);
         if named_groups > MAX_SECURITY_GROUPS_PER_INSTANCE {
@@ -548,6 +554,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             + instance_type.len()
             + input.subnet_id.as_ref().map_or(0, String::len)
             + input.key_name.as_ref().map_or(0, String::len)
+            + input.kernel_id.as_ref().map_or(0, String::len)
+            + input.ramdisk_id.as_ref().map_or(0, String::len)
             + availability_zone.len()
             + crate::state::tag_bytes(&tags)
             + security_groups
@@ -638,6 +646,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         });
 
         let launch_time = ::std::time::SystemTime::now();
+        // The kernel and RAM disk the AMI carries, which an instance runs when the launch
+        // names neither, read once for the whole batch.
+        let (image_kernel_id, image_ramdisk_id) = store.image_kernel_and_ramdisk(Some(&image_id));
         for (launch_index, private_ip) in addresses.into_iter().enumerate() {
             let instance_id = store.mint_instance_id();
             store.insert_instance(InstanceRecord {
@@ -665,6 +676,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 placement_az: availability_zone.clone(),
                 monitoring_state: monitoring_state.to_string(),
                 architecture: architecture_for(&instance_type),
+                // "The ID of the kernel" (`RunInstancesRequest$KernelId`) the launch
+                // named, or the one its image carries when it named none — the value
+                // `ResetInstanceAttribute` restores the attribute to.
+                kernel_id: input.kernel_id.clone().or_else(|| image_kernel_id.clone()),
+                ramdisk_id: input
+                    .ramdisk_id
+                    .clone()
+                    .or_else(|| image_ramdisk_id.clone()),
+                // Nothing in a launch sets source/destination checking: it starts at the
+                // documented default and only `ModifyInstanceAttribute` moves it.
+                source_dest_check: DEFAULT_SOURCE_DEST_CHECK,
                 ebs_optimized: input.ebs_optimized.unwrap_or(false),
                 hibernation_configured: input
                     .hibernation_options

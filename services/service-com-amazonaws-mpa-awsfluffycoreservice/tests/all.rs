@@ -17,6 +17,8 @@ mod approval_sessions;
 mod approval_team_lifecycle;
 #[path = "all/authorization_gate.rs"]
 mod authorization_gate;
+#[path = "all/identity_source_deletion.rs"]
+mod identity_source_deletion;
 #[path = "all/identity_sources.rs"]
 mod identity_sources;
 #[path = "all/inactive_team_version_deletion.rs"]

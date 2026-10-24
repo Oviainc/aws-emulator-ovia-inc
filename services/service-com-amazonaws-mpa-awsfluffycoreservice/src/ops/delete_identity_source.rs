@@ -1,15 +1,46 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteIdentitySource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteIdentitySource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteIdentitySource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes the identity source the request's `IdentitySourceArn` names out of
+//! [`crate::state`]: the stored record is put into `DELETING`
+//! ([`crate::state::IdentitySource::begin_deletion`]) and the clock removes it once that
+//! removal comes due ([`crate::state::IDENTITY_SOURCE_DELETION_DELAY`]), so
+//! `ListIdentitySources` reports the source `DELETING` straight after this call and omits
+//! it afterwards. `DELETING` is the non-terminal `IdentitySourceStatus` token the model
+//! declares for exactly this, and
+//! [`crate::state::ComAmazonawsMpaAwsfluffycoreserviceState::materialize_due`] is what
+//! materialises the removal for every later reader — nothing sleeps, and no read starts
+//! a deletion.
+//!
+//! * The account boundary is decided FIRST: an ARN outside the caller's own account is
+//!   refused with `AccessDeniedException` (403) before the source is resolved
+//!   ([`crate::state::authorize_resource_arn`]), so an unauthorized deletion is never
+//!   reported as a completed one. `IdentitySourceArn` carries no ARN `@pattern` of its
+//!   own here (`length(max: 1000)` only), so a value that is not a well-formed ARN is
+//!   refused by this handler with the one sentence this service answers that class with
+//!   ([`crate::state::invalid_arn`]): `ValidationException` (400).
+//! * An ARN under which this store holds no identity source is a success that changes
+//!   nothing: the operation is `@idempotent` and its model declares NO
+//!   `ResourceNotFoundException` (`smithy_query(query="operation",
+//!   operation="DeleteIdentitySource")`: `AccessDenied`, `Conflict`, `InternalServer`,
+//!   `Throttling`, `Validation`), so a source that is already gone leaves the caller in
+//!   the state it asked for — the same rule, and the same reason,
+//!   `delete_inactive_approval_team_version.rs` applies to a pair naming no stored
+//!   version. A repeat call on a source already `DELETING` is that same success and
+//!   keeps the recorded due instant, so asking twice does not postpone the removal.
+//! * An identity source a stored approval team's approvers authenticate through is IN
+//!   USE, and removing it would leave that team pointing at a source this store no
+//!   longer holds: `ConflictException` (409), the error this model declares for
+//!   `DeleteIdentitySource` and for none of the other identity-source operations
+//!   ([`crate::state::ComAmazonawsMpaAwsfluffycoreserviceState::team_arn_using_identity_source`]
+//!   resolves the reference).
+//!
+//! The management-account gate [`crate::service`] puts in front of the creates does not
+//! apply: this request identifies its resource BY ARN, so its authorization decision
+//! reads a value out of the request and belongs after the request is read — it is the
+//! cross-account check above, the same one `start_active_approval_team_deletion.rs` and
+//! the other ARN-addressed operations make.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +199,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteIdentitySource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteIdentitySourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteIdentitySource"))
+        let _ = ctx;
+        // `IdentitySourceArn` carries no ARN `@pattern` here, so the malformed-ARN class
+        // is refused by this handler with the one sentence this service answers it with
+        // (`crate::state::invalid_arn`, 400) rather than by the boundary.
+        if !crate::state::is_well_formed_arn(&input.identity_source_arn) {
+            return Err(DeleteIdentitySourceErrorModeled::ValidationException(
+                crate::state::invalid_arn(),
+            )
+            .into());
+        }
+        // The account boundary is evaluated BEFORE the resource is resolved: a
+        // destructive call on an ARN outside the caller's account is refused with the
+        // modelled `AccessDeniedException` (403) rather than reported as "already
+        // absent".
+        crate::state::authorize_resource_arn(Self::NAME, &input.identity_source_arn)
+            .map_err(DeleteIdentitySourceErrorModeled::AccessDeniedException)?;
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteIdentitySourceError::Modeled(
+                DeleteIdentitySourceErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the identity-source store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+
+        let mut state = store.lock();
+        let now = ::std::time::SystemTime::now();
+        state.materialize_due(now);
+
+        // An ARN under which nothing is stored leaves the caller in the state it asked
+        // for: the operation is `@idempotent` and models no not-found error, so an
+        // identity source that is already gone is a success that writes nothing.
+        if state.identity_source(&input.identity_source_arn).is_none() {
+            return Ok(DeleteIdentitySourceOutput);
+        }
+
+        // What the decision needs, read out of the store before anything is written: an
+        // identity source a team's approvers authenticate through cannot be removed
+        // without leaving that team pointing at a source this store no longer holds.
+        if let Some(team_arn) = state.team_arn_using_identity_source(&input.identity_source_arn) {
+            let message = format!(
+                "Identity source '{}' is used by approval team '{team_arn}', so it cannot be \
+                 deleted. Delete the approval teams that use it, and try again.",
+                input.identity_source_arn
+            );
+            return Err(
+                DeleteIdentitySourceErrorModeled::ConflictException(ConflictException { message })
+                    .into(),
+            );
+        }
+
+        // The deletion is recorded on the stored record, not performed here: the source
+        // is reported `DELETING` until its removal comes due, which `materialize_due`
+        // owes every later reader. A source already `DELETING` keeps the due instant the
+        // first call recorded.
+        let Some(source) = state.identity_source_mut(&input.identity_source_arn) else {
+            return Err(
+                DeleteIdentitySourceErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the identity source could not be read back for deletion"
+                            .to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+        source.begin_deletion(now);
+
+        Ok(DeleteIdentitySourceOutput)
     }
 }

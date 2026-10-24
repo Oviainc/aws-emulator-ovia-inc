@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePackagingGroup
-//! IMPLEMENTED: mints a PackagingGroup — persists it under its caller-chosen `Id`
+//! IMPLEMENTED: mints a PackagingGroup — reads the two ARN members of a CDN
+//! `Authorization` block it carries (a Secrets Manager secret and an IAM role),
+//! refusing a value that is not one with `UnprocessableEntityException` (422)
+//! attributed to that member, then persists the group under its caller-chosen `Id`
 //! in [`crate::state`] and answers with the record just stored, so the following
 //! `DescribePackagingGroup` returns the identical `Arn`, `DomainName` and
 //! `CreatedAt`. This is the ONLY file to touch for this operation.
@@ -180,6 +183,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "must not be empty",
             )
             .into());
+        }
+        // The CDN authorization block names a Secrets Manager secret and the IAM role
+        // MediaPackage reads it as, so both members are read as ARNs of those services
+        // before anything is stored — exactly as `UpdatePackagingGroup` reads the same
+        // block.
+        if let Some(authorization) = input.authorization.as_ref() {
+            crate::state::check_authorization_arns(authorization)?;
         }
         // Scoped to the Region this request was served in: the same `Id` in another
         // Region is another group, so it is not a duplicate of this one.

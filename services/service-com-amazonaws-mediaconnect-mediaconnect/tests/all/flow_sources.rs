@@ -66,6 +66,23 @@ pub(crate) fn failover_active() -> Value {
     json!({ "state": "ENABLED" })
 }
 
+/// Create the flow a case works on from the WHOLE CreateFlow body, and return its ARN.
+///
+/// The one place the source cases mint their fixture flow, for a case that needs flow
+/// members the helpers below do not take (an NDI-capable `FlowSize`, say).
+pub(crate) async fn create_flow_from(emulator: &Emulator, case: &str, body: Value) -> String {
+    let (status, code, created) = emulator.create_flow(body).await;
+    assert_eq!(
+        (status, code.as_deref()),
+        (201, None),
+        "case {case:?}: the flow under test must be created, got {status} {code:?}: {created}"
+    );
+    created["flow"]["flowArn"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
 /// Create the flow a case works on, with `initial` sources already on it and `failover` as
 /// its `SourceFailoverConfig`, and return its ARN.
 pub(crate) async fn create_flow_with_sources_and_failover(
@@ -79,16 +96,7 @@ pub(crate) async fn create_flow_with_sources_and_failover(
     if let Some(failover) = failover {
         body["sourceFailoverConfig"] = failover;
     }
-    let (status, code, created) = emulator.create_flow(body).await;
-    assert_eq!(
-        (status, code.as_deref()),
-        (201, None),
-        "case {case:?}: the flow under test must be created, got {status} {code:?}: {created}"
-    );
-    created["flow"]["flowArn"]
-        .as_str()
-        .unwrap_or_default()
-        .to_string()
+    create_flow_from(emulator, case, body).await
 }
 
 /// Create the flow a case works on, with `initial` sources already on it, and return its

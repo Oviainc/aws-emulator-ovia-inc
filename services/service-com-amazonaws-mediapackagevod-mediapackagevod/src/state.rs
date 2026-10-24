@@ -755,6 +755,176 @@ pub fn page_size(
     }
 }
 
+/// What an input member this model DOCUMENTS as an ARN has to name.
+///
+/// Every such member is a plain `__string` with no `@pattern`
+/// (`smithy_query(query="shape",shape="CreateAssetRequest")`,
+/// `shape="Authorization"`, `shape="SpekeKeyProvider"`), so the boundary validator
+/// admits any text at all and reading the ARN form is the handler's job. It has to be
+/// read: the service ASSUMES the role and READS the object those members name, and a
+/// value that is not an ARN of the documented service names neither — so the request
+/// is a parameter violation (422, attributed to the member) rather than a resource
+/// that happens to be missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArnRequirement {
+    /// The ARN's third field — the service namespace that says whose resource the
+    /// value names (`s3`, `iam`, `secretsmanager`).
+    pub vendor: &'static str,
+    /// The resource type the ARN's resource field must name, for a member whose
+    /// documentation names the KIND of resource as well as the service (an IAM
+    /// *role*, a Secrets Manager *secret*); `None` where it names only the service.
+    pub resource_type: Option<&'static str>,
+    /// What the refusal calls the resource this member must name, so the message
+    /// reads as the member's documentation does.
+    pub label: &'static str,
+}
+
+impl ArnRequirement {
+    /// Whether `value` is a well-formed resource ARN that satisfies this requirement.
+    ///
+    /// The six fields come from [`::service_common::arn::parse_of`] — this
+    /// repository's ONE caller-supplied-ARN parse — so `arn:aws:s3:::bucket/key`,
+    /// whose Region and account fields are empty, is as well formed here as
+    /// anywhere else, and a value that is not an ARN at all (the empty string
+    /// included) satisfies nothing.
+    #[must_use]
+    pub fn admits(self, value: &str) -> bool {
+        ::service_common::arn::parse_of(value, self.vendor)
+            .is_some_and(|arn| self.resource_type.is_none_or(|kind| arn.resource_type() == kind))
+    }
+
+    /// The constraint phrase a member violating this requirement is refused with —
+    /// a verb phrase about the member, with no trailing period, as
+    /// [`crate::scaffolded::UnprocessableEntity::member`] words every other one.
+    #[must_use]
+    pub fn phrase(self) -> String {
+        format!("must be the ARN of {}", self.label)
+    }
+}
+
+/// An object in Amazon S3: `CreateAssetRequest$SourceArn` is "ARN of the source
+/// object in S3".
+///
+/// Only the vendor is fixed — an S3 object ARN's resource field opens with the
+/// BUCKET name (`arn:aws:s3:::bucket/key`), which differs per bucket, so there is no
+/// fixed resource type to require.
+pub const S3_OBJECT_ARN: ArnRequirement = ArnRequirement {
+    vendor: "s3",
+    resource_type: None,
+    label: "an object in Amazon S3",
+};
+
+/// An IAM role: `CreateAssetRequest$SourceRoleArn` is "The IAM role ARN used to
+/// access the source S3 bucket", `Authorization$SecretsRoleArn` "the IAM role that
+/// allows MediaPackage to communicate with AWS Secrets Manager", and
+/// `SpekeKeyProvider$RoleArn` "an IAM role that AWS Elemental MediaPackage will
+/// assume when accessing the key provider service".
+///
+/// An IAM role ARN is `arn:aws:iam::<account>:role/<name>` — vendor `iam`, resource
+/// type `role` — so an ARN of an IAM user or policy names no role this service could
+/// assume.
+pub const IAM_ROLE_ARN: ArnRequirement = ArnRequirement {
+    vendor: "iam",
+    resource_type: Some("role"),
+    label: "an IAM role",
+};
+
+/// A secret in AWS Secrets Manager: `Authorization$CdnIdentifierSecret` is "The
+/// Amazon Resource Name (ARN) for the secret in AWS Secrets Manager that is used for
+/// CDN authorization".
+///
+/// Written `arn:aws:secretsmanager:<region>:<account>:secret:<name>`, so the resource
+/// type is `secret`.
+pub const SECRETS_MANAGER_SECRET_ARN: ArnRequirement = ArnRequirement {
+    vendor: "secretsmanager",
+    resource_type: Some("secret"),
+    label: "a secret in AWS Secrets Manager",
+};
+
+/// Read every listed `(wire member path, value, requirement)` as an ARN, refusing the
+/// request when any of them does not satisfy its requirement.
+///
+/// One refusal covers ALL of them — AWS validates a request's parameters together, and
+/// the `errors` map is per-attribute — so a caller that sent two junk ARNs is told
+/// about both rather than fixing one to discover the other. `Ok(())` when nothing is
+/// violated; the member path is the WIRE spelling, dotted for a nested member
+/// (`authorization.cdnIdentifierSecret`), which is what a client keys its per-field
+/// rendering on.
+pub fn check_arn_members(
+    members: &[(&str, &str, ArnRequirement)],
+) -> Result<(), crate::scaffolded::UnprocessableEntity> {
+    let violations: Vec<(String, String)> = members
+        .iter()
+        .filter(|(_, value, requirement)| !requirement.admits(value))
+        .map(|(member, _, requirement)| ((*member).to_string(), requirement.phrase()))
+        .collect();
+    match crate::scaffolded::UnprocessableEntity::members(violations) {
+        Some(refusal) => Err(refusal),
+        None => Ok(()),
+    }
+}
+
+/// Read the two ARN members of a CDN `Authorization` block, for the operations that
+/// accept one (`CreatePackagingGroup`, `UpdatePackagingGroup`).
+///
+/// Both are required members of the block, so a request that carries the block at all
+/// carries both; a request that carries no block has no ARN to read.
+pub fn check_authorization_arns(
+    authorization: &Authorization,
+) -> Result<(), crate::scaffolded::UnprocessableEntity> {
+    check_arn_members(&[
+        (
+            "authorization.cdnIdentifierSecret",
+            authorization.cdn_identifier_secret.as_str(),
+            SECRETS_MANAGER_SECRET_ARN,
+        ),
+        (
+            "authorization.secretsRoleArn",
+            authorization.secrets_role_arn.as_str(),
+            IAM_ROLE_ARN,
+        ),
+    ])
+}
+
+/// Read the `SpekeKeyProvider$RoleArn` of whichever package block a
+/// `CreatePackagingConfiguration` request carries an `Encryption` block in.
+///
+/// The role lives at the same place under all four packaging formats, so the same
+/// requirement is read under each one's own wire path; a format whose block names no
+/// encryption names no role.
+pub fn check_speke_role_arns(
+    hls: Option<&HlsPackage>,
+    dash: Option<&DashPackage>,
+    cmaf: Option<&CmafPackage>,
+    mss: Option<&MssPackage>,
+) -> Result<(), crate::scaffolded::UnprocessableEntity> {
+    let role_arns = [
+        hls.and_then(|package| package.encryption.as_ref())
+            .map(|encryption| ("hlsPackage", &encryption.speke_key_provider.role_arn)),
+        dash.and_then(|package| package.encryption.as_ref())
+            .map(|encryption| ("dashPackage", &encryption.speke_key_provider.role_arn)),
+        cmaf.and_then(|package| package.encryption.as_ref())
+            .map(|encryption| ("cmafPackage", &encryption.speke_key_provider.role_arn)),
+        mss.and_then(|package| package.encryption.as_ref())
+            .map(|encryption| ("mssPackage", &encryption.speke_key_provider.role_arn)),
+    ];
+    let paths: Vec<(String, &str)> = role_arns
+        .into_iter()
+        .flatten()
+        .map(|(block, role_arn)| {
+            (
+                format!("{block}.encryption.spekeKeyProvider.roleArn"),
+                role_arn.as_str(),
+            )
+        })
+        .collect();
+    let members: Vec<(&str, &str, ArnRequirement)> = paths
+        .iter()
+        .map(|(path, role_arn)| (path.as_str(), *role_arn, IAM_ROLE_ARN))
+        .collect();
+    check_arn_members(&members)
+}
+
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.

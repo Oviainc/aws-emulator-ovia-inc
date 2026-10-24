@@ -17,6 +17,11 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// What `ResetInstanceAttribute` resets, to what, from which instance states, and what it
+// refuses. Declared beside `prefix_lists` for the same reason: the sorted region is where
+// every new ec2 suite inserts its lines.
+#[path = "all/instance_attribute_reset.rs"]
+mod instance_attribute_reset;
 #[path = "all/address_transfers.rs"]
 mod address_transfers;
 #[path = "all/allowed_images_settings.rs"]

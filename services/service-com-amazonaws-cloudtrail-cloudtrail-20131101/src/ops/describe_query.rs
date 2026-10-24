@@ -5,9 +5,12 @@
 //! Reports the metadata of ONE Lake query, read from the query registry in
 //! [`crate::state`]: the query's SQL, its status, the statistics its run
 //! accumulated and — when results were delivered to S3 — the delivery URI and
-//! status. It writes nothing: `DescribeQuery` is a reporting operation, so the
-//! status it answers with is the status the run last persisted, never one this
-//! call moves.
+//! status. It moves nothing: `DescribeQuery` is a reporting operation, so the
+//! status it answers with is the status the run reached on its own, never one
+//! this call decides. Its one write is materialising the transition the clock
+//! already owed a run that was due to end before the call was made (see
+//! [`crate::state::QueryRecord::settle`]), which is what the run had already
+//! done whether or not anybody asked.
 //!
 //! Resolution order, which decides which refusal a caller sees:
 //!
@@ -208,6 +211,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DescribeQueryErrorModeled::UnsupportedOperationException(UnsupportedOperationException {
                 message: Some(
@@ -217,7 +221,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             })
         })?;
-        let store = state.lock();
+        let mut store = state.lock();
+        // The transition the clock owed each run is applied before any of them is
+        // reported, the way `GetEventDataStore` applies the federation transition
+        // it owed a store: a run that was due to end before this call was made
+        // had ended whether or not anybody asked, so the status this read answers
+        // with is the one the run was already in. It is the ONLY write this
+        // reporting operation makes.
+        store.settle_queries(now);
 
         // An event data store NAMED in the request is resolved first — the member
         // is deprecated here, but a store that cannot be read or found is still

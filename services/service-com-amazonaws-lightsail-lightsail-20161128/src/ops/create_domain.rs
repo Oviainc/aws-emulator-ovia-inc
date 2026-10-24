@@ -160,11 +160,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only, and nothing this operation stores
-        // comes from it: a domain recordset is not a zonal resource, so its
-        // location is this service's domain region rather than anything the
-        // request signed for.
-        let _ = ctx;
+        // Lightsail serves the domain APIs from the N. Virginia endpoint ALONE,
+        // so the Region the request was signed for decides whether this call is
+        // served at all — checked BEFORE anything is read or written, so a
+        // refused request creates nothing.
+        if let Some(message) = crate::state::domain_region_refusal(ctx.parts()) {
+            return Err(invalid(message));
+        }
 
         // `domainName` is a modelled `@required` member, so the centralized walk
         // refused an absent one before this body ran. The modelled `DomainName`

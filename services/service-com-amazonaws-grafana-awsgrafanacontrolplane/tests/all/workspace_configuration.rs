@@ -522,8 +522,9 @@ async fn the_published_length_bounds_are_enforced() {
             );
             assert_eq!(
                 answer.error_code(),
-                "ValidationException",
-                "case {case:?}: expected ValidationException, got {:?}",
+                "BadRequestException",
+                "case {case:?}: `configuration` travels in the request body, so the \
+                 service's request validator refuses it as a bad request, got {:?}",
                 answer.body
             );
         }

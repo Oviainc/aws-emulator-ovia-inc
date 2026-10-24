@@ -76,9 +76,12 @@ async fn call(
 /// CDN authorization blocks that differ in value, length and form.
 ///
 /// Both members come from the model: `smithy_query(query="shape",
-/// shape="Authorization")` gives `CdnIdentifierSecret` and `SecretsRoleArn`, both
-/// required plain `__string`s with no length or pattern constraint — so the rule
-/// generalises over the string, which is what these rows vary.
+/// shape="Authorization")` gives `CdnIdentifierSecret` — "the ARN for the secret in
+/// AWS Secrets Manager" — and `SecretsRoleArn` — "the ARN for the IAM role" — both
+/// required plain `__string`s with no length or pattern constraint. The documented
+/// ARN form is what the service requires of them (see
+/// `arn_documented_members.rs`), so these rows vary the account, Region, partition,
+/// name form and length WITHIN that form.
 fn authorizations() -> Vec<(&'static str, Value)> {
     vec![
         (
@@ -106,8 +109,11 @@ fn authorizations() -> Vec<(&'static str, Value)> {
             }),
         ),
         (
-            "one-character values",
-            json!({ "cdnIdentifierSecret": "a", "secretsRoleArn": "b" }),
+            "the shortest names, in other partitions",
+            json!({
+                "cdnIdentifierSecret": "arn:aws-cn:secretsmanager:cn-north-1:111122223333:secret:s",
+                "secretsRoleArn": "arn:aws-us-gov:iam::111122223333:role/r",
+            }),
         ),
         (
             "long values",

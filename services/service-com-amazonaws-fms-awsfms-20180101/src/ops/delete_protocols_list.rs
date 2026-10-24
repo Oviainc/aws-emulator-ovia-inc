@@ -12,7 +12,10 @@
 //! BEFORE the `ListId` is looked up, so a well-formed but nonexistent id gets
 //! the authorization refusal rather than `ResourceNotFoundException`. With an
 //! administrator associated, an id that names no stored list is
-//! `ResourceNotFoundException`.
+//! `ResourceNotFoundException` — and so is an id naming a Firewall Manager
+//! MANAGED (default) protocols list, which is AWS-owned and is not in the
+//! customer namespace this operation deletes from: such a list survives the
+//! call untouched.
 //!
 //! ## Shape of an operation
 //!
@@ -177,15 +180,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The authorization gate, BEFORE the ListId is looked up.
         crate::state::require_administrator(&store, &crate::state::request_region(ctx.parts()))?;
 
-        let Some(removed) = store.protocols_lists.remove(&input.list_id) else {
+        // Only a CUSTOMER list is in the namespace this operation addresses —
+        // its input models no `DefaultList` selector, unlike `GetProtocolsList`
+        // and `ListProtocolsLists`, whose `DefaultList` / `DefaultLists` members
+        // exist to choose between the managed and the customer namespace — so an
+        // id naming a Firewall Manager MANAGED list names nothing deletable and
+        // the managed list stays stored. The ARN-keyed tag index is maintained
+        // from the record, so a deleted list's tags go with it.
+        if !store.delete_customer_protocols_list(&input.list_id) {
             return Err(DeleteProtocolsListErrorModeled::ResourceNotFoundException(
                 crate::state::resource_not_found(),
             )
             .into());
-        };
-        // The ARN-keyed tag index is maintained from the record, so the deleted
-        // list's tags go with it.
-        store.tags_by_arn.remove(&removed.list_arn);
+        }
         Ok(DeleteProtocolsListOutput)
     }
 }

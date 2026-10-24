@@ -171,6 +171,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let tags = input.tags.unwrap_or_default();
 
+        // INPUT VALIDATION precedes resolution. The public model constrains
+        // `ConnectionArn` only as a generic ARN
+        // (`^arn:aws(-[\w]+)*:.+:.+:[0-9]{12}:.+$`), so a host or repository-link ARN
+        // passed where a connection ARN belongs reaches this handler; the
+        // repository-link surface holds the member to the connection-scoped expression
+        // and refuses anything else as an input-constraint violation, in the envelope
+        // the boundary validator renders. See `crate::service::validation`.
+        if !crate::service::validation::is_connection_arn(&input.connection_arn) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::service::validation::connection_arn_refusal(
+                    crate::service::validation::CONNECTION_ARN_MEMBER,
+                ),
+            ));
+        }
+
         let mut store = state.lock();
 
         // A repository link is an association with a connection this account holds, so

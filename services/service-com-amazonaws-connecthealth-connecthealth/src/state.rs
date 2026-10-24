@@ -76,11 +76,22 @@ pub const MAX_DOMAIN_ALLOCATION_HISTORY: usize = 1024;
 /// (domains x subscriptions) is bounded too.
 pub const MAX_SUBSCRIPTIONS_PER_DOMAIN: usize = 100;
 
-/// The most tag entries one resource ARN carries, and the longest key and value an
-/// entry may have — AWS's standard tagging limits (50 tags, key 128, value 256), which
-/// also bound what one request can add to the tag store.
+/// The most tag entries one resource ARN carries — AWS's standard tagging limit of 50,
+/// which also bounds what one request can add to the tag store. `TagMap` itself declares
+/// no `@length`, so this count is the SERVICE's own rule.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The MODELLED length bounds of one tag entry, both ends of each: `TagKey` is
+/// `@length 1..128` and `TagValue` is `@length 0..256`
+/// (`smithy_query(query="shape",shape="TagMap,TagKey,TagValue")`), which are also AWS's
+/// standard tagging limits. Measured in CHARACTERS, as `@length` on a string is defined.
+///
+/// Stated here, enforced in [`crate::service::tag_bounds`] — the one check every
+/// operation that accepts a `TagMap` runs, because a constraint on a map's key or value
+/// is not one the framework's boundary walk refuses.
+pub const MIN_TAG_KEY_LEN: usize = 1;
 pub const MAX_TAG_KEY_LEN: usize = 128;
+pub const MIN_TAG_VALUE_LEN: usize = 0;
 pub const MAX_TAG_VALUE_LEN: usize = 256;
 
 /// A `Domain`'s lifecycle, as the model's `DomainStatus` enum declares it.

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEncoderConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEncoderConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEncoderConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -86,6 +77,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The resource an encoder-configuration quota refusal names, as
+/// `crate::state::quota_exceeded_message` states it.
+const ENCODER_CONFIGURATION_QUOTA_RESOURCE: &str = "encoder-configuration";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -160,18 +155,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEncoderConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEncoderConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEncoderConfiguration"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::store_unavailable(
+                CreateEncoderConfigurationErrorModeled::InternalServerException,
+            )
+        })?;
+
+        // The settings the configuration will hold: what the request asked for, with the
+        // model's documented default for every member it left out, applied in the one
+        // place this service applies them (`crate::state::effective_video`).
+        let video = crate::state::effective_video(input.video);
+        // Each member's own `@range` is already refused by the framework's walk; the two
+        // rules the model documents on `Video$width`/`$height` and carries no trait for
+        // — an even resolution, and a bounded pixel product — are refused here, before
+        // anything is minted or persisted, so a refused request leaves no configuration.
+        for (member, value) in [("width", video.width), ("height", video.height)] {
+            let value = value.unwrap_or_default();
+            if value % 2 != 0 {
+                return Err(crate::state::validation_failed(
+                    CreateEncoderConfigurationErrorModeled::ValidationException,
+                    // Worded in the construction this service states every constraint
+                    // refusal with (`crate::state::violation_clause`): the operation, the
+                    // dotted member path and the requirement, with what the request sent.
+                    format!(
+                        "{}.video.{member} is required to be an even number, found {value}",
+                        Self::NAME,
+                    ),
+                ));
+            }
+        }
+        let pixels =
+            i64::from(video.width.unwrap_or_default()) * i64::from(video.height.unwrap_or_default());
+        if pixels > crate::state::MAX_VIDEO_PIXELS {
+            return Err(crate::state::validation_failed(
+                CreateEncoderConfigurationErrorModeled::ValidationException,
+                format!(
+                    "{}.video is required to have a maximum of {} total pixels, found {pixels}",
+                    Self::NAME,
+                    crate::state::MAX_VIDEO_PIXELS,
+                ),
+            ));
+        }
+
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+
+        // The store grows only here, and a record is reclaimed only by an explicit
+        // `DeleteEncoderConfiguration`, so the bound is checked before anything is
+        // minted or persisted.
+        if store.encoder_configurations.len() >= crate::state::MAX_ENCODER_CONFIGURATIONS {
+            return Err(crate::state::quota_exceeded(
+                CreateEncoderConfigurationErrorModeled::ServiceQuotaExceededException,
+                ENCODER_CONFIGURATION_QUOTA_RESOURCE,
+                crate::state::MAX_ENCODER_CONFIGURATIONS,
+            ));
+        }
+
+        // A fresh id per creation, re-minted on the (vanishingly unlikely) chance the
+        // digest already names a live configuration, so one ARN never denotes two of
+        // them — the uniqueness rule `CreateStage` applies to a minted stage ARN.
+        let sequence = store.next_sequence();
+        let mut arn = crate::state::encoder_configuration_arn(
+            &region,
+            &crate::state::mint_id(sequence, crate::state::ENCODER_CONFIGURATION_ID_LEN),
+        );
+        while store.encoder_configurations.contains_key(&arn) {
+            let retry = store.next_sequence();
+            arn = crate::state::encoder_configuration_arn(
+                &region,
+                &crate::state::mint_id(retry, crate::state::ENCODER_CONFIGURATION_ID_LEN),
+            );
+        }
+
+        let record = crate::state::EncoderConfigurationRecord {
+            arn: arn.clone(),
+            name: input.name,
+            video,
+            tags: input.tags.unwrap_or_default(),
+            sequence,
+        };
+
+        let encoder_configuration = record.to_encoder_configuration();
+        store.encoder_configurations.insert(arn, record);
+
+        Ok(CreateEncoderConfigurationOutput {
+            encoder_configuration: Some(encoder_configuration),
+        })
     }
 }
+

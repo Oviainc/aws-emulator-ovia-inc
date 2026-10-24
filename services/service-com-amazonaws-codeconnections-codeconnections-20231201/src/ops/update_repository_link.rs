@@ -165,6 +165,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // INPUT VALIDATION precedes resolution, so this runs before the link id is
+        // looked up. The public model constrains `ConnectionArn` only as a generic ARN,
+        // so a host or repository-link ARN passed where a connection ARN belongs reaches
+        // this handler; the repository-link surface holds the member to the
+        // connection-scoped expression and refuses anything else as an input-constraint
+        // violation, in the envelope the boundary validator renders. See
+        // `crate::service::validation`.
+        if input
+            .connection_arn
+            .as_deref()
+            .is_some_and(|connection_arn| {
+                !crate::service::validation::is_connection_arn(connection_arn)
+            })
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::service::validation::connection_arn_refusal(
+                    crate::service::validation::CONNECTION_ARN_MEMBER,
+                ),
+            ));
+        }
+
         let mut store = state.lock();
 
         // The resource this call addresses is resolved FIRST: an id naming no

@@ -38,13 +38,18 @@ fn matches_workspace_id_pattern(value: &str) -> bool {
 }
 
 /// A SigV4 credential scope naming this service. It is what routes a request to the
-/// grafana service, and its region is what a workspace endpoint is built for.
+/// grafana service.
 const SIGNED_FOR_EU_WEST_1: &str = "AWS4-HMAC-SHA256 \
      Credential=AKIDEXAMPLE/20260101/eu-west-1/grafana/aws4_request, \
      SignedHeaders=host, Signature=abc";
 
-/// The region [`SIGNED_FOR_EU_WEST_1`] signs for.
-const REGION: &str = "eu-west-1";
+/// The endpoint host every request below reaches this emulator on — and so the
+/// authority the workspace endpoint it announces has to name.
+const EMULATOR_HOST: &str = "127.0.0.1:9297";
+
+/// The path prefix a workspace endpoint carries under that host, spelled out here
+/// independently of the crate's own `WORKSPACE_API_PATH_PREFIX`.
+const ENDPOINT_PREFIX: &str = "/grafana-workspaces/";
 
 /// A create request with only the three required members, for a case that is about
 /// something other than the optional ones.
@@ -93,7 +98,7 @@ async fn call(router: &MultiServiceRouter, method: &str, uri: &str, body: Option
     let mut builder = ::http::Request::builder()
         .method(method)
         .uri(uri)
-        .header("host", "grafana.eu-west-1.amazonaws.com")
+        .header("host", EMULATOR_HOST)
         .header("authorization", SIGNED_FOR_EU_WEST_1);
     if !payload.is_empty() {
         builder = builder.header("content-type", "application/json");
@@ -278,8 +283,9 @@ async fn a_created_workspace_is_described_from_what_was_stored() {
         );
         assert_eq!(
             at(created.workspace(), "/endpoint"),
-            json!(format!("https://{id}.grafana-workspace.{REGION}.amazonaws.com")),
-            "case {case:?}: the endpoint must name the workspace and the signed region, got {:?}",
+            json!(format!("https://{EMULATOR_HOST}{ENDPOINT_PREFIX}{id}")),
+            "case {case:?}: the endpoint must name the address this emulator was reached at \
+             and the workspace, got {:?}",
             at(created.workspace(), "/endpoint")
         );
         assert_eq!(

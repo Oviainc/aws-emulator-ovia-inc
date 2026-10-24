@@ -33,7 +33,10 @@ const REGISTRATION_TYPES: &[&str] = &[
 
 /// Every value of the model's `TaxRegistrationStatus` enum
 /// (`smithy_query(query="shape", shape="TaxRegistrationStatus")`).
-const REGISTRATION_STATUSES: &[&str] = &[
+///
+/// `pub(crate)` because `tests/all/pending_trn_conflict.rs` asserts the
+/// pending-TRN rule against each of them.
+pub(crate) const REGISTRATION_STATUSES: &[&str] = &[
     STATUS_VERIFIED,
     STATUS_PENDING,
     STATUS_DELETED,

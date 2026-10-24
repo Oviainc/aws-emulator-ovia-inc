@@ -26,7 +26,15 @@ pub struct ListMarketplaceModelEndpointsOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrock#MarketplaceModelEndpointSummary")]
+/// `MarketplaceModelEndpointSummary`. Its schema and codec come from
+/// [`bedrock_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `createdAt` and `updatedAt` carry `@timestampFormat("date-time")`
+/// (`smithy_query(query="shape", shape="MarketplaceModelEndpointSummary")`), which the
+/// derive does not put on a member schema — see `types/date_time_wire.rs` for that whole
+/// story.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct MarketplaceModelEndpointSummary {
     pub endpoint_arn: String,
@@ -36,4 +44,32 @@ pub struct MarketplaceModelEndpointSummary {
     pub created_at: ::aws_smithy_types::DateTime,
     pub updated_at: ::aws_smithy_types::DateTime,
 }
+
+bedrock_schema_and_codec!(
+    MarketplaceModelEndpointSummary,
+    MARKETPLACE_MODEL_ENDPOINT_SUMMARY_SCHEMA,
+    "com.amazonaws.bedrock#MarketplaceModelEndpointSummary",
+    "com.amazonaws.bedrock",
+    "MarketplaceModelEndpointSummary",
+    (M_ENDPOINT_ARN, endpoint_arn, "endpointArn", 0, req, string),
+    (
+        M_MODEL_SOURCE_IDENTIFIER,
+        model_source_identifier,
+        "modelSourceIdentifier",
+        1,
+        req,
+        string
+    ),
+    (M_STATUS, status, "status", 2, opt, string),
+    (
+        M_STATUS_MESSAGE,
+        status_message,
+        "statusMessage",
+        3,
+        opt,
+        string
+    ),
+    (M_CREATED_AT, created_at, "createdAt", 4, req, date_time),
+    (M_UPDATED_AT, updated_at, "updatedAt", 5, req, date_time),
+);
 

@@ -1059,6 +1059,74 @@ impl ComAmazonawsFmsAwsfms20180101State {
         }
         accounts
     }
+
+    /// The stored applications list `list_id` names IN THE NAMESPACE
+    /// `default_list` selects — Firewall Manager MANAGED (default) lists when it
+    /// is true, customer-created ones when it is false — or `None` when that
+    /// namespace holds no list under that id.
+    ///
+    /// The two namespaces are separate: `GetAppsList` takes a `DefaultList`
+    /// member and `ListAppsLists` a `DefaultLists` member precisely to choose
+    /// between them, so an id is only ever resolved WITHIN the namespace the
+    /// request addresses and a list of the other kind is simply not there.
+    pub fn apps_list_in_namespace(
+        &self,
+        list_id: &str,
+        default_list: bool,
+    ) -> Option<&AppsListRecord> {
+        self.apps_lists
+            .get(list_id)
+            .filter(|record| record.default_list == default_list)
+    }
+
+    /// [`Self::apps_list_in_namespace`] for protocols lists, whose namespaces
+    /// `GetProtocolsList`'s `DefaultList` and `ListProtocolsLists`'
+    /// `DefaultLists` split the same way.
+    pub fn protocols_list_in_namespace(
+        &self,
+        list_id: &str,
+        default_list: bool,
+    ) -> Option<&ProtocolsListRecord> {
+        self.protocols_lists
+            .get(list_id)
+            .filter(|record| record.default_list == default_list)
+    }
+
+    /// Remove the CUSTOMER applications list `list_id` names, dropping its
+    /// entry in the ARN-keyed tag index with it, and answer whether there was
+    /// such a list — `false` leaves the store untouched.
+    ///
+    /// A Firewall Manager MANAGED (default) list is AWS's own and is not in the
+    /// namespace a customer delete addresses (that operation's input models no
+    /// `DefaultList` selector at all), so an id naming one removes nothing and
+    /// the caller is told the resource was not found — the same resolution
+    /// `PutAppsList` / `PutProtocolsList` do before they write.
+    pub fn delete_customer_apps_list(&mut self, list_id: &str) -> bool {
+        let Some(arn) = self
+            .apps_list_in_namespace(list_id, false)
+            .map(|record| record.list_arn.clone())
+        else {
+            return false;
+        };
+        self.apps_lists.remove(list_id);
+        self.tags_by_arn.remove(&arn);
+        true
+    }
+
+    /// [`Self::delete_customer_apps_list`] for protocols lists: the same
+    /// namespace rule, so the two deleters cannot disagree about what a
+    /// customer may remove.
+    pub fn delete_customer_protocols_list(&mut self, list_id: &str) -> bool {
+        let Some(arn) = self
+            .protocols_list_in_namespace(list_id, false)
+            .map(|record| record.list_arn.clone())
+        else {
+            return false;
+        };
+        self.protocols_lists.remove(list_id);
+        self.tags_by_arn.remove(&arn);
+        true
+    }
 }
 
 /// Merge `added` into `existing` the way a tag write does: a key already present

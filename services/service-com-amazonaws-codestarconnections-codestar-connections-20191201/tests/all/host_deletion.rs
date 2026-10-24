@@ -17,12 +17,12 @@
 //!   or connections still associated with it — is refused as UNAVAILABLE and stays;
 //! * a target whose prefix names another service deletes nothing here.
 //!
-//! Hosts are SEEDED into the shared engine's store rather than created through the API:
-//! `CreateHost` is still a scaffold (its own open issue,
-//! `20261023T110719Z-codestar-connections-createhost-stub.md`), so the store is the only
-//! place a host can come from today. That is the same store the handler reads — the
-//! engine is shared, as `state_roundtrip.rs` pins — so a seeded host is observed through
-//! the wire exactly as a created one would be.
+//! Hosts are SEEDED into the shared engine's store rather than created through the API,
+//! so each row starts from exactly the status it is about — including the two
+//! transitional VPC states no create produces. That is the same store the handler reads
+//! — the engine is shared, as `state_roundtrip.rs` pins — so a seeded host is observed
+//! through the wire exactly as a created one is; `host_lifecycle.rs` covers the hosts
+//! `CreateHost` itself mints.
 
 use std::sync::Arc;
 

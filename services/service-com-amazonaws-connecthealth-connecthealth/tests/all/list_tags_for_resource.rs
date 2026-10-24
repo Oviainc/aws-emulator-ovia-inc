@@ -48,7 +48,11 @@ use crate::resource_tagging::{
 ///
 /// An absent `tags` member is a failure rather than "no tags": the member is a map of the
 /// resource's tags, and a resource with none has an empty one.
-async fn list_tags(emulator: &Emulator, case: &str, arn: &str) -> BTreeMap<String, String> {
+pub(crate) async fn list_tags(
+    emulator: &Emulator,
+    case: &str,
+    arn: &str,
+) -> BTreeMap<String, String> {
     let (status, body) = emulator.send("GET", &tags_path(arn), None).await;
     assert_eq!(
         status, 200,

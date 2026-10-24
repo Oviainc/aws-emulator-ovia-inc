@@ -25,3 +25,5 @@ mod list_tags_for_resource;
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_map_bounds.rs"]
+mod tag_map_bounds;

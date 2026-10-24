@@ -149,9 +149,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let mut store = state.lock();
-        // Tags attach to a resource this service holds; an ARN naming no stored
-        // resource is not taggable.
-        if !store.connections.contains_key(&input.resource_arn) {
+        // Tags attach to a resource this service holds — any KIND of resource, since the
+        // modeled member is a `ResourceArn`; an ARN naming no stored resource is not
+        // taggable. See `state::holds_resource`.
+        if !store.holds_resource(&input.resource_arn) {
             return Err(TagResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(format!("Could not find resource {}", input.resource_arn)),

@@ -21,6 +21,8 @@ mod administrator_gated_operations;
 mod apps_list_reporting;
 #[path = "all/error_message_members.rs"]
 mod error_message_members;
+#[path = "all/managed_list_deletion.rs"]
+mod managed_list_deletion;
 #[path = "all/member_accounts.rs"]
 mod member_accounts;
 #[path = "all/policy_document_validation.rs"]

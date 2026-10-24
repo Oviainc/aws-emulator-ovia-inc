@@ -146,7 +146,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let mut store = state.lock();
-        if !store.connections.contains_key(&input.resource_arn) {
+        // Any KIND of resource this service holds is addressable by its ARN here (see
+        // `state::holds_resource`); an ARN naming none of them is absent.
+        if !store.holds_resource(&input.resource_arn) {
             return Err(UntagResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(format!("Could not find resource {}", input.resource_arn)),

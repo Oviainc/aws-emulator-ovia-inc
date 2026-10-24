@@ -17,6 +17,9 @@ mod list_versions;
 #[path = "all/list_workspace_service_accounts.rs"]
 mod list_workspace_service_accounts;
 
+#[path = "all/request_body_refusals.rs"]
+mod request_body_refusals;
+
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 
@@ -40,6 +43,9 @@ mod workspace_authentication;
 
 #[path = "all/workspace_configuration.rs"]
 mod workspace_configuration;
+
+#[path = "all/workspace_grafana_api.rs"]
+mod workspace_grafana_api;
 
 #[path = "all/workspace_lifecycle.rs"]
 mod workspace_lifecycle;

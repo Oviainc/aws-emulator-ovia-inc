@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetHost
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetHost`'s real behaviour. Implement it here — this is
+//! IMPLEMENTED: reports the host its `HostArn` names out of [`crate::state`]. This is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetHost::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -90,9 +83,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-codestarconnections-cod
 // here — hence the `GetHostError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.codestarconnections#GetHost")]
+// `InternalServerException` is widened in through `extra_errors`: the service models it
+// (see `types::shared_types`) but this operation does not list it, and it is the only
+// honest answer for "this service is mounted on an engine that holds no state" — a 400
+// would blame the caller's request and a 501 would claim the operation is unwritten.
+#[smithy_macros::operation_error(
+    "com.amazonaws.codestarconnections#GetHost",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum GetHostErrorModeled {
+    InternalServerException(InternalServerException),
     ResourceNotFoundException(ResourceNotFoundException),
     ResourceUnavailableException(ResourceUnavailableException),
 }
@@ -111,6 +112,19 @@ impl From<GetHostErrorModeled> for GetHostError {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
 }
+
+/// The status the LIVE service answers a host lookup whose `HostArn` names no host
+/// with.
+///
+/// The model puts `@httpError 404` on `ResourceNotFoundException`, but the recorded wire
+/// response for this exact call (corpus `simparity-wire-aws-v1`, fixture
+/// `codestar-connections-host-error-paths#task#1`: "status: expected 400", `__type`
+/// `com.amazonaws.codestar.connections#ResourceNotFoundException`, `Message` "No host
+/// exists with the ARN: …") is HTTP 400 — so the shape, its wire code and its message
+/// stay the model's while the STATUS is the one a client of the real service branches
+/// on. `DeleteHost` answers an absent host the same way, from the sibling step of the
+/// same fixture. See [`crate::scaffolded::Scaffolded::ModeledWithStatus`].
+const HOST_NOT_FOUND_STATUS: u16 = 400;
 
 /// The `GetHost` operation.
 ///
@@ -148,18 +162,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetHost` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetHostErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetHost"))
+        // A pure report: it resolves the ARN in state and renders the stored row. This
+        // operation writes NOTHING, so a get never moves a host's status or perturbs
+        // what a later caller sees.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetHostErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "CodeStar connections state is unavailable on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let store = state.lock();
+        // An ARN that resolves to no host this service holds names a resource that is
+        // ABSENT, which this operation reports with the modeled
+        // `ResourceNotFoundException` — the code `GetConnection` gives a connection ARN
+        // naming nothing, and the one `DeleteHost` gives an unresolvable `HostArn`. The
+        // operation's other modeled refusal, `ResourceUnavailableException`, is the "the
+        // host IS there but is not usable right now" signal, so it is reserved for an
+        // existing host and never used for an absence.
+        let Some(host) = store.hosts.get(&input.host_arn).map(crate::state::StoredHost::to_host)
+        else {
+            return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                GetHostErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(crate::state::host_not_found_message(&input.host_arn)),
+                }),
+                HOST_NOT_FOUND_STATUS,
+            ));
+        };
+
+        // This output shape carries neither `HostArn` (the caller supplied it) nor
+        // `StatusMessage`; every other member of the stored host is reported as stored.
+        Ok(GetHostOutput {
+            name: host.name,
+            status: host.status,
+            provider_type: host.provider_type,
+            provider_endpoint: host.provider_endpoint,
+            vpc_configuration: host.vpc_configuration,
+        })
     }
 }

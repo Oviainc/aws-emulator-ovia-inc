@@ -285,6 +285,35 @@ impl UnprocessableEntity {
         }
     }
 
+    /// Violations of SEVERAL input members in ONE refusal, or `None` when
+    /// `violations` is empty — nothing was violated, so there is nothing to refuse.
+    ///
+    /// A request's parameters are validated TOGETHER, and the `errors` map is
+    /// per-attribute, so a caller that sent two invalid members is told about both
+    /// rather than fixing one to discover the other. Each entry is a member's WIRE
+    /// name (dotted for a nested member, `authorization.secretsRoleArn`) and the
+    /// constraint phrase it violated, worded exactly as [`Self::member`] words a
+    /// single one; the message states each attribution in turn, separated by `, `.
+    /// With one violation this produces precisely what [`Self::member`] does, so a
+    /// client parses one form however many members were at fault.
+    pub fn members(violations: Vec<(String, String)>) -> Option<Self> {
+        if violations.is_empty() {
+            return None;
+        }
+        let mut message = String::new();
+        let mut errors: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (member, phrase) in violations {
+            if !message.is_empty() {
+                message.push_str(", ");
+            }
+            message.push_str(&snake_case(&member));
+            message.push(' ');
+            message.push_str(&phrase);
+            errors.entry(member).or_default().push(phrase);
+        }
+        Some(Self { message, errors })
+    }
+
     /// A violation of the request AS A WHOLE — no single member is at fault, so
     /// `errors` is keyed by [`BASE_ATTRIBUTE`] and the message names the resource
     /// type the request would have created instead of a member.

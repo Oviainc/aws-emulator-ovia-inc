@@ -74,10 +74,22 @@ pub const UPDATE_STATUS_SUCCESS: &str = "SUCCESS";
 /// names what drove the change, which here is the API call itself.
 pub const UPDATE_SOURCE_API: &str = "UpdateEnvironment";
 
+/// Every Apache Airflow version Amazon MWAA runs an environment on, oldest first.
+///
+/// The model constrains `AirflowVersion` only by `@length(1, 32)` and `^[0-9a-z.]+$`, so
+/// the VALUE SET is a business rule the handlers enforce rather than one the boundary
+/// validator can. The set is the member's own doc, in the order it lists them: "Valid
+/// values: 2.7.2, 2.8.1, 2.9.2, 2.10.1, 2.10.3, 2.11.0, and 3.0.6."
+/// (`smithy_query(query="doc", shape="UpdateEnvironmentInput", member="AirflowVersion")`).
+pub const SUPPORTED_AIRFLOW_VERSIONS: [&str; 7] = [
+    "2.7.2", "2.8.1", "2.9.2", "2.10.1", "2.10.3", "2.11.0", "3.0.6",
+];
+
 /// The Apache Airflow version a create that names none gets. The `AirflowVersion` doc:
-/// "If no value is specified, it defaults to the latest version. … Valid values: 2.7.2,
-/// 2.8.1, 2.9.2, 2.10.1, 2.10.3, 2.11.0, and 3.0.6." — the last of which is the latest.
-pub const LATEST_AIRFLOW_VERSION: &str = "3.0.6";
+/// "If no value is specified, it defaults to the latest version." — the latest being the
+/// last of [`SUPPORTED_AIRFLOW_VERSIONS`], which that same doc lists in order.
+pub const LATEST_AIRFLOW_VERSION: &str =
+    SUPPORTED_AIRFLOW_VERSIONS[SUPPORTED_AIRFLOW_VERSIONS.len() - 1];
 
 /// The one environment class whose default scheduler and web-server counts are 1 rather
 /// than 2; see [`default_unit_count`].
@@ -90,6 +102,22 @@ pub const MICRO_ENVIRONMENT_CLASS: &str = "mw1.micro";
 /// ("mw1.small" in the member's own valid-value list, the default the MWAA console and
 /// the *Amazon MWAA environment class* guide start a new environment on).
 pub const DEFAULT_ENVIRONMENT_CLASS: &str = "mw1.small";
+
+/// Every environment class Amazon MWAA runs an environment on, smallest first.
+///
+/// `EnvironmentClass` is modelled only as `@length(1, 1024)` text, so — exactly as for
+/// [`SUPPORTED_AIRFLOW_VERSIONS`] — the value set is a business rule the handlers enforce.
+/// The set is the member's own doc: "Valid values: mw1.micro, mw1.small, mw1.medium,
+/// mw1.large, mw1.xlarge, and mw1.2xlarge."
+/// (`smithy_query(query="doc", shape="UpdateEnvironmentInput", member="EnvironmentClass")`).
+pub const ENVIRONMENT_CLASSES: [&str; 6] = [
+    MICRO_ENVIRONMENT_CLASS,
+    DEFAULT_ENVIRONMENT_CLASS,
+    "mw1.medium",
+    "mw1.large",
+    "mw1.xlarge",
+    "mw1.2xlarge",
+];
 
 /// The worker floor an environment runs with when the create names no `MinWorkers`: one
 /// worker, the single worker "that is included with your environment" the `MaxWorkers`
@@ -311,6 +339,141 @@ pub struct EnvironmentSpec {
     pub logging_configuration: LoggingConfigurationRecord,
 }
 
+impl EnvironmentSpec {
+    /// Every rule the RESOLVED environment configuration must satisfy that the Smithy
+    /// model cannot state — a value set the member's doc fixes, and a bound one member
+    /// places on another — as one check both `CreateEnvironment` and `UpdateEnvironment`
+    /// run before anything is stored.
+    ///
+    /// It is run on the configuration the request WOULD store: for an update that is the
+    /// stored record with the request's members merged in, so a patch naming only one side
+    /// of a pair is judged against the value already stored for the other side.
+    ///
+    /// `Ok(())` or the sentence the refusal carries — the caller turns it into its own
+    /// operation's modelled `ValidationException` (HTTP 400).
+    pub fn validate(&self) -> Result<(), String> {
+        for (member, value, valid) in [
+            (
+                "AirflowVersion",
+                self.airflow_version.as_str(),
+                SUPPORTED_AIRFLOW_VERSIONS.as_slice(),
+            ),
+            (
+                "EnvironmentClass",
+                self.environment_class.as_str(),
+                ENVIRONMENT_CLASSES.as_slice(),
+            ),
+        ] {
+            if !valid.contains(&value) {
+                return Err(format!(
+                    "{value} is not a supported {member}. Valid values: {}.",
+                    valid.join(", ")
+                ));
+            }
+        }
+        // A floor above its own ceiling describes a fleet that cannot be provisioned. The
+        // wording states the violated rule, as the service's own refusal does.
+        for (floor_member, floor, ceiling_member, ceiling) in [
+            (
+                "MinWorkers",
+                self.min_workers,
+                "MaxWorkers",
+                self.max_workers,
+            ),
+            (
+                "MinWebservers",
+                self.min_webservers,
+                "MaxWebservers",
+                self.max_webservers,
+            ),
+        ] {
+            if floor > ceiling {
+                return Err(format!(
+                    "{floor_member} must be less than or equal to {ceiling_member}."
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The optional Amazon S3 objects an environment loads, exactly as ONE request named
+/// them: each object's relative path and the S3 object version beside it.
+///
+/// Built by `CreateEnvironment` and `UpdateEnvironment` from the request's own members —
+/// not from the stored record — because the version has to travel WITH the path: see
+/// [`RequestedS3Objects::validate`].
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RequestedS3Objects<'a> {
+    pub plugins_s3_path: Option<&'a str>,
+    pub plugins_s3_object_version: Option<&'a str>,
+    pub requirements_s3_path: Option<&'a str>,
+    pub requirements_s3_object_version: Option<&'a str>,
+    pub startup_script_s3_path: Option<&'a str>,
+    pub startup_script_s3_object_version: Option<&'a str>,
+}
+
+impl RequestedS3Objects<'_> {
+    /// Refuse a request that names an S3 object's path without that object's version.
+    ///
+    /// Each of these objects is identified by a PAIR of members, and the members' own docs
+    /// make the version mandatory whenever the path is given: `PluginsS3Path` — "If
+    /// specified, then the plugins.zip version is required"; `RequirementsS3Path` — "If
+    /// specified, then a version is required"; `StartupScriptS3ObjectVersion` — "You must
+    /// specify the version ID that Amazon S3 assigns to the file every time you update the
+    /// script". The pairing is judged per REQUEST rather than against the merged record,
+    /// because a version stored for the object a previous call named does not identify the
+    /// object this one names.
+    ///
+    /// `RelativePath` is `@length(0, 1024)`, so the empty string is a legal value that
+    /// names no object: it carries no version requirement.
+    pub fn validate(&self) -> Result<(), String> {
+        for (path_member, path, version_member, version) in [
+            (
+                "PluginsS3Path",
+                self.plugins_s3_path,
+                "PluginsS3ObjectVersion",
+                self.plugins_s3_object_version,
+            ),
+            (
+                "RequirementsS3Path",
+                self.requirements_s3_path,
+                "RequirementsS3ObjectVersion",
+                self.requirements_s3_object_version,
+            ),
+            (
+                "StartupScriptS3Path",
+                self.startup_script_s3_path,
+                "StartupScriptS3ObjectVersion",
+                self.startup_script_s3_object_version,
+            ),
+        ] {
+            let names_object = path.is_some_and(|path| !path.is_empty());
+            let names_version = version.is_some_and(|version| !version.is_empty());
+            if names_object && !names_version {
+                return Err(format!(
+                    "{version_member} is required when {path_member} is specified."
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Why an environment in this status cannot be updated.
+///
+/// An `UpdateEnvironment` reconfigures a RUNNING environment, so the environment has to
+/// have finished the transition it is in: a create that has not landed yet, or an update
+/// already in flight, is not something a second update can be applied on top of. The
+/// sentence is built from the request's own environment and the status it is actually in,
+/// and names the one status in which an update is accepted.
+pub fn update_not_allowed_message(name: &str, status: &str) -> String {
+    format!(
+        "Environment {name} is in status {status}. An environment can only be updated \
+         while its status is {STATUS_AVAILABLE}."
+    )
+}
+
 /// A status change the clock owes an environment: where it lands, and when.
 #[derive(Debug, Clone)]
 pub struct PendingTransition {
@@ -437,6 +600,13 @@ impl EnvironmentRecord {
             min_webservers: Some(self.spec.min_webservers),
             max_webservers: Some(self.spec.max_webservers),
         }
+    }
+
+    /// Whether this environment is in a status an `UpdateEnvironment` can be applied to:
+    /// it has settled into [`STATUS_AVAILABLE`], with no transition still owed. See
+    /// [`update_not_allowed_message`].
+    pub fn accepts_update(&self) -> bool {
+        self.status == STATUS_AVAILABLE && self.pending.is_none()
     }
 
     /// Enter `UPDATING` with a `PENDING` `LastUpdate`, and owe `AVAILABLE` with a

@@ -191,7 +191,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             invalid_subnet_id_not_found, request_region, require_service_state,
             require_visible_image, resource_count_exceeded,
             spot_instance_request_payload_bytes, system_time_to_date_time, tag_list,
-            validate_tag_size,
+            validate_kernel_or_ramdisk_id, validate_tag_size,
         };
 
         // The launch specification IS the request's description of the instance to launch,
@@ -312,6 +312,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "User data accepts at most {MAX_USER_DATA_BYTES} bytes"
             )));
         }
+        // The same bound the on-demand launch path puts on the kernel and RAM disk ids it
+        // copies onto every instance it mints: the Spot specification is copied onto the
+        // instance each fulfilled request launches.
+        validate_kernel_or_ramdisk_id("kernelId", launch.kernel_id.as_deref())?;
+        validate_kernel_or_ramdisk_id("ramdiskId", launch.ramdisk_id.as_deref())?;
         let named_groups = launch.security_group_ids.as_ref().map_or(0, Vec::len)
             + launch.security_groups.as_ref().map_or(0, Vec::len);
         if named_groups > MAX_SECURITY_GROUPS_PER_INSTANCE {

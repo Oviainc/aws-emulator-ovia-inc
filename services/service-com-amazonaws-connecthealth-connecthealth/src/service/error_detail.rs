@@ -32,11 +32,15 @@
 //! operation, a transport-level failure, a pre-dispatch authentication refusal — is not
 //! reached from here, because this layer is an operation wrapper.
 //!
-//! It also states, once, the text AWS gives a constraint violation
-//! ([`range_violation_message`]), so a page-size refusal a handler raises itself reads
-//! exactly like the one the boundary validator renders for the same violation.
+//! It also renders, once, the text AWS gives a constraint violation a handler enforces
+//! itself ([`range_violation_message`]) — through the framework's own
+//! `Violation`/`envelope` renderer, so a page size this service refuses rather than
+//! clamps reads exactly like the bound the boundary validator refuses. The bounds on a
+//! `TagMap`'s entries, which that walk cannot reach at all, are enforced in
+//! [`crate::service::tag_bounds`] by driving the walk itself.
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
+use aws_smithy_schema_server::{envelope, Violation, ViolationKind};
 use aws_smithy_types::body::SdkBody;
 use serde_json::Value;
 use smithy_server_runtime::{BoxFuture, ErasedOperation, OperationContext, Service};
@@ -94,26 +98,41 @@ pub fn with_service_detail_member(mut resp: RtResponse) -> RtResponse {
     resp
 }
 
+/// The text a constraint violation is reported with: the FRAMEWORK's own renderer.
+///
+/// `aws_smithy_schema_server` owns both halves of that sentence — [`Violation::message`]
+/// renders the clause (`Value '<value>' at '<member path>' failed to satisfy constraint:
+/// <requirement>`, with the requirement coming from the [`ViolationKind`]) and
+/// [`envelope`] wraps it (`1 validation error detected: <clause>`) — and it is what the
+/// boundary walk answers with when it refuses a request before a handler runs. A bound a
+/// HANDLER has to enforce itself therefore renders through the same code rather than
+/// restating the words, so the two cannot drift.
+///
+/// `violations` is never empty at a call site (a violation is what brought us here);
+/// `envelope` is the one place that decides what no violation reads as, and an empty
+/// slice could only mean the caller found nothing to refuse.
+fn rendered_violation(violations: &[Violation]) -> String {
+    envelope(violations).unwrap_or_default()
+}
+
 /// AWS's constraint-violation text for `value` outside the `@range` of the member at
 /// `member_path`.
 ///
-/// The rule is AWS's own, documented by every service that models `@range`: one violation
-/// renders as `1 validation error detected: Value '<value>' at '<member path>' failed to
-/// satisfy constraint: <requirement>`, with the requirement naming the bound that was
-/// violated. It is the SAME sentence the boundary validator renders when it refuses the
-/// request before a handler runs (`aws_smithy_schema_server`'s constraint renderer,
-/// `Violation::message`), restated here so a bound a handler enforces itself — a page size
-/// it refuses rather than clamps — cannot drift from it.
+/// Rendered by the framework (see [`rendered_violation`]), so a bound a handler enforces
+/// itself — a page size it refuses rather than clamps — reads exactly like the one the
+/// boundary validator refuses. `@range`'s bounds are held as the text they display with,
+/// which is why they are passed through as strings.
 pub fn range_violation_message(member_path: &str, value: i32, min: i32, max: i32) -> String {
-    let requirement = if value < min {
-        format!("Member must have value greater than or equal to {min}")
+    let kind = if value < min {
+        ViolationKind::MinValue(min.to_string())
     } else {
-        format!("Member must have value less than or equal to {max}")
+        ViolationKind::MaxValue(max.to_string())
     };
-    format!(
-        "1 validation error detected: Value '{value}' at '{member_path}' failed to satisfy \
-         constraint: {requirement}"
-    )
+    rendered_violation(&[Violation {
+        path: member_path.to_string(),
+        kind,
+        value: Some(value.to_string()),
+    }])
 }
 
 /// The detail text of the `ResourceNotFoundException` answered when a domain cannot be

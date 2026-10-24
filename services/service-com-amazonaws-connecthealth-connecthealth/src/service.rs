@@ -49,6 +49,7 @@
 //! framework.
 
 pub mod error_detail;
+pub mod tag_bounds;
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,

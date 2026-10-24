@@ -17,6 +17,12 @@
 //! `ops/get_prompt_router.rs` reads back, so a router created by one request is the
 //! router every later request sees.
 //!
+//! And it holds the Bedrock Marketplace model endpoints
+//! `ops/create_marketplace_model_endpoint.rs` mints,
+//! `ops/update_marketplace_model_endpoint.rs` reconfigures and
+//! `ops/get_marketplace_model_endpoint.rs` reads back, together with the instant each
+//! endpoint's non-terminal `endpointStatus` is owed its move to `InService`.
+//!
 //! The record shapes, and the conversions between the `*PolicyConfig` shapes a
 //! request carries and the `*Policy` shapes a response carries, live here rather
 //! than in one operation's file because six operations share them (a file under
@@ -24,10 +30,10 @@
 //! live there).
 
 use std::collections::{BTreeMap, HashMap};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    GuardrailAutomatedReasoningPolicy, GuardrailAutomatedReasoningPolicyConfig,
+    EndpointConfig, GuardrailAutomatedReasoningPolicy, GuardrailAutomatedReasoningPolicyConfig,
     GuardrailContentFilter, GuardrailContentFilterConfig, GuardrailContentFiltersTier,
     GuardrailContentFiltersTierConfig, GuardrailContentPolicy, GuardrailContentPolicyConfig,
     GuardrailContextualGroundingFilter, GuardrailContextualGroundingFilterConfig,
@@ -39,7 +45,8 @@ use crate::ops::types::{
     GuardrailSensitiveInformationPolicyConfig, GuardrailTopic, GuardrailTopicConfig,
     GuardrailTopicPolicy, GuardrailTopicPolicyConfig, GuardrailTopicsTier,
     GuardrailTopicsTierConfig, GuardrailWord, GuardrailWordConfig, GuardrailWordPolicy,
-    GuardrailWordPolicyConfig, LoggingConfig, PromptRouterTargetModel, RoutingCriteria, Tag,
+    GuardrailWordPolicyConfig, LoggingConfig, MarketplaceModelEndpoint, PromptRouterTargetModel,
+    RoutingCriteria, Tag,
 };
 
 /// The working version every guardrail always has, as `GuardrailDraftVersion`
@@ -128,6 +135,53 @@ pub const MAX_PROMPT_ROUTERS_PER_ACCOUNT: usize = 500;
 /// than can be associated with a resource (50 tags per resource)" — so a create carrying
 /// more is refused with that error rather than stored.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// `MarketplaceModelEndpoint$status` — an endpoint Amazon Bedrock Marketplace knows.
+///
+/// The `Status` enum is `[REGISTERED, INCOMPATIBLE_ENDPOINT]`
+/// (`smithy_query(query="shape",shape="Status")`) and the member documents it as "the
+/// overall status of the endpoint in Amazon Bedrock Marketplace". An endpoint that exists
+/// because `CreateMarketplaceModelEndpoint` was called was created by Bedrock from a
+/// Marketplace model, so it is registered with Bedrock from that call onwards;
+/// `INCOMPATIBLE_ENDPOINT` names an endpoint Bedrock cannot use, which no call here
+/// produces.
+pub const MARKETPLACE_ENDPOINT_REGISTERED: &str = "REGISTERED";
+
+/// `MarketplaceModelEndpoint$endpointStatus` while the underlying endpoint is still being
+/// brought up by the create call.
+///
+/// The member is a bare `String` documented as "the current status of the endpoint (e.g.,
+/// Creating, InService, Updating, Failed)"
+/// (`smithy_query(query="doc",shape="MarketplaceModelEndpoint",member="endpointStatus")`),
+/// so these three constants are that documented spelling.
+pub const ENDPOINT_STATUS_CREATING: &str = "Creating";
+
+/// `MarketplaceModelEndpoint$endpointStatus` while a configuration change is being rolled
+/// out by an update call. See [`ENDPOINT_STATUS_CREATING`] for the member's value list.
+pub const ENDPOINT_STATUS_UPDATING: &str = "Updating";
+
+/// `MarketplaceModelEndpoint$endpointStatus` once the endpoint is serving — the terminal
+/// status the two non-terminal ones above settle into. See [`ENDPOINT_STATUS_CREATING`]
+/// for the member's value list.
+pub const ENDPOINT_STATUS_IN_SERVICE: &str = "InService";
+
+/// How long after the call that starts it a marketplace endpoint's non-terminal
+/// `endpointStatus` is owed its move to [`ENDPOINT_STATUS_IN_SERVICE`].
+///
+/// CHOSEN, not documented: AWS publishes no duration for bringing a Bedrock Marketplace
+/// endpoint up, so this is the emulator's span. It is non-zero, so a caller that reads the
+/// endpoint straight after creating or updating it still observes the transient status the
+/// real service reports; and it is materialised from this stored due instant on the next
+/// read rather than waited on, so no handler sleeps.
+pub const ENDPOINT_SETTLE_AFTER: Duration = Duration::from_millis(500);
+
+/// The most Bedrock Marketplace model endpoints this account may hold at once, past which
+/// a create is refused with `ServiceQuotaExceededException`.
+///
+/// The emulator's own bound rather than a published quota (AWS documents none for this
+/// resource): without a server-side cap a caller could grow this part of the store with
+/// nothing but fresh endpoint names.
+pub const MAX_MARKETPLACE_MODEL_ENDPOINTS_PER_ACCOUNT: usize = 100;
 
 /// The number of base-36 digits each half of a minted resource id carries.
 ///
@@ -315,6 +369,78 @@ pub struct PromptRouter {
     pub updated_at: SystemTime,
 }
 
+/// One stored Bedrock Marketplace model endpoint: the identity
+/// `CreateMarketplaceModelEndpoint` minted, the configuration the latest call carried, the
+/// two instants a read reports, and the endpoint lifecycle status.
+///
+/// `status` is `&'static str` for the same reason [`PromptRouter::status`] is: it is the
+/// single value this emulator mints ([`MARKETPLACE_ENDPOINT_REGISTERED`]) rather than
+/// anything a request chooses.
+#[derive(Debug, Clone)]
+pub struct MarketplaceModelEndpointRecord {
+    /// The `endpointArn` this endpoint is addressed by, minted by
+    /// [`marketplace_model_endpoint_arn`].
+    pub arn: String,
+    /// `endpointName`, as the create request spelled it. The ARN's resource id, so it is
+    /// also what makes the name unique within the account and region.
+    pub name: String,
+    /// `modelSourceIdentifier` — the Marketplace model this endpoint serves.
+    pub model_source_identifier: String,
+    /// `endpointConfig` — the create request's configuration, REPLACED whole by each
+    /// `UpdateMarketplaceModelEndpoint`.
+    pub endpoint_config: EndpointConfig,
+    /// `acceptEula`, as the create request left it (the member defaults to `false`).
+    ///
+    /// Kept with the record because it is part of the request that minted the endpoint; no
+    /// response member of this service reports it, so nothing reads it back today.
+    pub accept_eula: bool,
+    pub tags: Vec<Tag>,
+    /// `MarketplaceModelEndpoint$status`; [`MARKETPLACE_ENDPOINT_REGISTERED`] for every
+    /// endpoint minted here.
+    pub status: &'static str,
+    /// `MarketplaceModelEndpoint$endpointStatus` — the endpoint's own lifecycle status.
+    pub endpoint_status: &'static str,
+    /// When [`Self::endpoint_status`] is owed its move to
+    /// [`ENDPOINT_STATUS_IN_SERVICE`], or `None` once it is terminal.
+    ///
+    /// The due INSTANT, not a timer: [`Self::settle`] materialises the move on the next
+    /// call that touches the endpoint, so the transition is owed at the same instant
+    /// whether or not anybody calls, and no handler sleeps for it.
+    pub in_service_due_at: Option<SystemTime>,
+    pub created_at: SystemTime,
+    /// When the endpoint's configuration last changed: the creation instant until an
+    /// `UpdateMarketplaceModelEndpoint` moves it.
+    pub updated_at: SystemTime,
+    /// The `clientRequestToken` of the most recent `UpdateMarketplaceModelEndpoint`
+    /// applied to this endpoint, so a RETRY of that same call — the request the
+    /// `@idempotencyToken` member is there for — applies nothing a second time.
+    ///
+    /// ONE token per endpoint rather than a map of every token ever seen, so this cannot
+    /// grow with the number of updates a caller issues.
+    pub last_update_token: Option<String>,
+}
+
+impl MarketplaceModelEndpointRecord {
+    /// Start a non-terminal `endpointStatus`, due to settle
+    /// [`ENDPOINT_SETTLE_AFTER`] from `now`.
+    pub fn begin(&mut self, status: &'static str, now: SystemTime) {
+        self.endpoint_status = status;
+        self.in_service_due_at = Some(now + ENDPOINT_SETTLE_AFTER);
+    }
+
+    /// Materialise the move to [`ENDPOINT_STATUS_IN_SERVICE`] the clock has already made
+    /// due at `now`, and report the status to report.
+    ///
+    /// The only write a reporting operation on this resource makes: it was owed at `now`
+    /// even if nobody had called.
+    pub fn settle(&mut self, now: SystemTime) {
+        if self.in_service_due_at.is_some_and(|due| now >= due) {
+            self.endpoint_status = ENDPOINT_STATUS_IN_SERVICE;
+            self.in_service_due_at = None;
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-bedrock-amazonbedrockcontrolplaneservice. A handler reaches it through [`service_state`].
 ///
 /// Every map here is bounded, and each bound holds by construction rather than by
@@ -339,6 +465,15 @@ pub struct PromptRouter {
 ///
 /// * `model_invocation_logging` is a single optional settings record, which a put
 ///   replaces rather than appends to.
+///
+/// * `marketplace_model_endpoints` holds one entry per live marketplace model endpoint,
+///   capped at [`MAX_MARKETPLACE_MODEL_ENDPOINTS_PER_ACCOUNT`] by the quota
+///   `CreateMarketplaceModelEndpoint` enforces (the entry is keyed by the endpoint ARN,
+///   which carries the endpoint name, so two creates of one name in one region cannot add
+///   two entries), `marketplace_endpoint_create_tokens` holds at most one entry per live
+///   endpoint for the same reason `create_tokens` does, and each endpoint's
+///   [`MarketplaceModelEndpointRecord::last_update_token`] is ONE token rather than a map,
+///   so repeated updates cannot grow the store either.
 ///
 /// So the whole store is bounded by the live resources the quotas admit, and no
 /// sequence of requests — including create/delete cycles with fresh idempotency
@@ -385,6 +520,18 @@ pub struct ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     /// How many prompt router ids this store has minted; the uniqueness half of a
     /// minted id.
     pub minted_prompt_routers: u64,
+    /// Every stored Bedrock Marketplace model endpoint, keyed by its `endpointArn` — the
+    /// one identifier `GetMarketplaceModelEndpoint`, `UpdateMarketplaceModelEndpoint` and
+    /// `DeleteMarketplaceModelEndpoint` address an endpoint by.
+    ///
+    /// The ARN carries both the region and the endpoint name
+    /// ([`marketplace_model_endpoint_arn`]), so this one map is also the per-region name
+    /// index: the same name in another region is another key.
+    pub marketplace_model_endpoints: HashMap<String, MarketplaceModelEndpointRecord>,
+    /// `CreateMarketplaceModelEndpoint` idempotency: `(region, clientRequestToken)` -> the
+    /// `endpointArn` that token minted. Scoped to that one operation, and to the region
+    /// the request addressed, the way the prompt router index is.
+    pub marketplace_endpoint_create_tokens: HashMap<(String, String), String>,
 }
 
 impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
@@ -424,6 +571,19 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
         self.minted_prompt_routers += 1;
         minted_id(self.minted_prompt_routers, now)
     }
+
+    /// The marketplace model endpoint an `endpointArn` names, with any status transition
+    /// the clock has made due at `now` materialised first — so every caller reads the
+    /// status the endpoint holds at `now`, whichever operation asked.
+    pub fn marketplace_model_endpoint(
+        &mut self,
+        arn: &str,
+        now: SystemTime,
+    ) -> Option<&mut MarketplaceModelEndpointRecord> {
+        let endpoint = self.marketplace_model_endpoints.get_mut(arn)?;
+        endpoint.settle(now);
+        Some(endpoint)
+    }
 }
 
 /// A minted resource id: `^[a-z0-9]+$`, the store's mint `ordinal` then the sub-second
@@ -436,6 +596,51 @@ fn minted_id(ordinal: u64, now: SystemTime) -> String {
         "{}{}",
         base36(ordinal, ID_HALF_WIDTH),
         base36(nanos, ID_HALF_WIDTH)
+    )
+}
+
+/// What `UpdateMarketplaceModelEndpoint` answers as the `ResourceNotFoundException` message
+/// for a Bedrock Marketplace model endpoint ARN it holds no endpoint for.
+///
+/// RECORDED behaviour, not a modelled sentence (the model's own doc for the error reads
+/// "The specified resource Amazon Resource Name (ARN) was not found. …"): the corpus
+/// `simparity-behavioral-ga-prod-v1` records Amazon Bedrock answering 404
+/// `ResourceNotFoundException` with exactly this sentence for an `endpointArn` that names
+/// no endpoint. A CONSTANT, interpolating no part of the request — it reports that the
+/// resource is not there and nothing about which ARN was asked for, so the message cannot
+/// be used to probe the store.
+///
+/// Scoped to the operation the corpus records it for. The same corpus records
+/// `GetMarketplaceModelEndpoint` refusing the SAME ARN with 400 `ValidationException`
+/// instead, so the code and the sentence are per-operation; and this service's guardrail
+/// and prompt router handlers keep the sentences they already word, because no recording
+/// here shows this one for those resources.
+pub const MARKETPLACE_ENDPOINT_NOT_FOUND_MESSAGE: &str = "Bedrock Resource not found.";
+
+/// The endpoint NAME inside an `endpointArn`: the resource id of a
+/// `.../endpoint/<name>` ARN, or the whole value when it is not one.
+///
+/// Built like [`guardrail_id_of`], and for the same reason: a member that carries a
+/// resource's ARN is read back to the id the resource is named by.
+pub fn marketplace_endpoint_name_of(endpoint_arn: &str) -> &str {
+    match endpoint_arn.rsplit_once(":endpoint/") {
+        Some((_, name)) => name,
+        None => endpoint_arn,
+    }
+}
+
+/// What `GetMarketplaceModelEndpoint` answers as its `ValidationException` message for an
+/// `endpointArn` this account holds no endpoint for: `Could not find endpoint "<name>".`
+///
+/// RECORDED behaviour, and a message BUILT FROM THE REQUEST rather than a constant: the
+/// corpus `simparity-behavioral-ga-prod-v1` records Amazon Bedrock naming the endpoint the
+/// request asked for — the resource id of the ARN the member carried
+/// ([`marketplace_endpoint_name_of`]) — in exactly this sentence, quoted and closed with a
+/// full stop. So the rule is "name the endpoint the ARN names", not one recorded name.
+pub fn marketplace_endpoint_not_found_for_read(endpoint_arn: &str) -> String {
+    format!(
+        "Could not find endpoint \"{}\".",
+        marketplace_endpoint_name_of(endpoint_arn)
     )
 }
 
@@ -467,6 +672,46 @@ pub fn guardrail_arn(region: &str, id: &str) -> String {
 /// base-36 digits so it satisfies the other spelling's id form too.
 pub fn prompt_router_arn(region: &str, id: &str) -> String {
     ::engine::emulator_arn("bedrock", region, &format!("default-prompt-router/{id}"))
+}
+
+/// The ARN of a Bedrock Marketplace model endpoint named `name` in `region`:
+/// `arn:aws:sagemaker:<region>:<account>:endpoint/<name>`.
+///
+/// A Bedrock Marketplace model endpoint IS a SageMaker endpoint — `EndpointConfig`'s only
+/// member is `sageMaker` (`smithy_query(query="shape",shape="EndpointConfig")`),
+/// `SageMakerEndpoint` carries the instance count, instance type and execution role
+/// SageMaker hosts it with, and `RegisterMarketplaceModelEndpoint` takes the ARN of an
+/// endpoint that already exists — so the `endpointArn` every marketplace endpoint
+/// operation carries is that SageMaker endpoint's ARN, whose resource id is the endpoint
+/// name. `Arn` declares no pattern (`@length(max: 2048)` only), so nothing in the model
+/// narrows it further.
+pub fn marketplace_model_endpoint_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn("sagemaker", region, &format!("endpoint/{name}"))
+}
+
+/// The `MarketplaceModelEndpoint` a response reports for a stored endpoint.
+///
+/// Lives here rather than in one operation's file because
+/// `Create`/`Get`/`UpdateMarketplaceModelEndpoint` all report this shape, and they must
+/// report it alike: what a create or update answers is exactly what the next read finds.
+pub fn marketplace_model_endpoint_view(
+    endpoint: &MarketplaceModelEndpointRecord,
+) -> MarketplaceModelEndpoint {
+    MarketplaceModelEndpoint {
+        endpoint_arn: endpoint.arn.clone(),
+        model_source_identifier: endpoint.model_source_identifier.clone(),
+        status: Some(endpoint.status.to_string()),
+        // `statusMessage` is "additional information about the overall status, if
+        // available"; a registered endpoint has none to add.
+        status_message: None,
+        created_at: date_time(endpoint.created_at),
+        updated_at: date_time(endpoint.updated_at),
+        endpoint_config: endpoint.endpoint_config.clone(),
+        endpoint_status: endpoint.endpoint_status.to_string(),
+        // `endpointStatusMessage` likewise: no failure or detail to report for an endpoint
+        // that is coming up or serving.
+        endpoint_status_message: None,
+    }
 }
 
 /// Whether `value` is a `responseQualityDifference` Amazon Bedrock accepts: a multiple

@@ -21,5 +21,7 @@ mod connection_proposal;
 mod emulator;
 #[path = "all/refusals_and_gateway_attach_points.rs"]
 mod refusals_and_gateway_attach_points;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

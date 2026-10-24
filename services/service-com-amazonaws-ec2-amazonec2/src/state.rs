@@ -885,6 +885,16 @@ pub const MAX_FILTER_VALUE_BYTES: usize = MAX_TAG_VALUE_CHARS * 4;
 /// user data is otherwise cloned into every instance the request mints.
 pub const MAX_USER_DATA_BYTES: usize = 16 * 1024;
 
+/// The most characters a kernel or RAM disk image id a launch may name can carry.
+///
+/// An EC2 image id is service-minted — an `aki-`/`ari-` prefix, a hyphen and the 17 hex
+/// characters of a long id — so 21 characters is the longest a value that is an id at all
+/// can be. The model declares no `@length` on `RunInstancesRequest$KernelId` or
+/// `$RamdiskId`, and both are cloned onto EVERY instance the launch mints, so a byte
+/// bound (which a count bound cannot give) lives here. Enforced by
+/// [`validate_kernel_or_ramdisk_id`].
+pub const MAX_KERNEL_OR_RAMDISK_ID_CHARS: usize = 21;
+
 /// The most security groups one instance may be launched with.
 ///
 /// AWS documents a maximum of 16 security groups per network interface; the model
@@ -1060,6 +1070,37 @@ impl PendingTransition {
     }
 }
 
+/// The `InstanceAttributeName` enum's `kernel` member.
+///
+/// Named here so every handler spells one attribute one way; the generated catalog of
+/// every member is `crate::ops::types::INSTANCE_ATTRIBUTE_NAME_VALUES`, which the
+/// instance-attribute handlers validate their `Attribute` against.
+pub const INSTANCE_ATTRIBUTE_KERNEL: &str = "kernel";
+
+/// The `InstanceAttributeName` enum's `ramdisk` member (see
+/// [`INSTANCE_ATTRIBUTE_KERNEL`] for the generated catalog these come from).
+pub const INSTANCE_ATTRIBUTE_RAMDISK: &str = "ramdisk";
+
+/// The `InstanceAttributeName` enum's `sourceDestCheck` member (see
+/// [`INSTANCE_ATTRIBUTE_KERNEL`]).
+pub const INSTANCE_ATTRIBUTE_SOURCE_DEST_CHECK: &str = "sourceDestCheck";
+
+/// The attributes of an instance a caller may RESET: "You can only reset the following
+/// attributes: kernel | ramdisk | sourceDestCheck"
+/// (`ResetInstanceAttributeRequest$Attribute`). Every other `InstanceAttributeName` is a
+/// value `ResetInstanceAttribute` refuses, however well formed — only
+/// `ModifyInstanceAttribute` reaches those.
+pub const RESETTABLE_INSTANCE_ATTRIBUTES: &[&str] = &[
+    INSTANCE_ATTRIBUTE_KERNEL,
+    INSTANCE_ATTRIBUTE_RAMDISK,
+    INSTANCE_ATTRIBUTE_SOURCE_DEST_CHECK,
+];
+
+/// The `sourceDestCheck` an instance nobody has modified carries: "The default value is
+/// true, which means checking is enabled" (`ResetInstanceAttribute`) — so resetting the
+/// attribute enables checking again.
+pub const DEFAULT_SOURCE_DEST_CHECK: bool = true;
+
 /// One stored EC2 instance.
 #[derive(Debug, Clone)]
 pub struct InstanceRecord {
@@ -1090,6 +1131,19 @@ pub struct InstanceRecord {
     pub placement_az: String,
     pub monitoring_state: String,
     pub architecture: String,
+    /// "The kernel associated with this instance, if applicable" (`Instance$KernelId`):
+    /// the kernel the launch named, or the one its AMI carries when it named none. This
+    /// is the EFFECTIVE value, so `ResetInstanceAttribute` restores it to the image's own
+    /// [`ComAmazonawsEc2Amazonec2State::image_kernel_and_ramdisk`] rather than to a
+    /// second notion of "unset".
+    pub kernel_id: Option<String>,
+    /// "The RAM disk associated with this instance, if applicable"
+    /// (`Instance$RamdiskId`), held the same way as [`InstanceRecord::kernel_id`].
+    pub ramdisk_id: Option<String>,
+    /// "Indicates whether source/destination checking is enabled"
+    /// (`Instance$SourceDestCheck`). Starts at [`DEFAULT_SOURCE_DEST_CHECK`], which is
+    /// also what `ResetInstanceAttribute` restores it to.
+    pub source_dest_check: bool,
     pub ebs_optimized: bool,
     pub hibernation_configured: bool,
     pub disable_api_termination: bool,
@@ -3689,6 +3743,24 @@ impl ComAmazonawsEc2Amazonec2State {
         self.materialize_due_spot_instance_requests(now);
     }
 
+    /// The kernel and RAM disk an instance launched from `image_id` runs when its launch
+    /// named neither: `Image$KernelId` and `Image$RamdiskId` of the AMI itself.
+    ///
+    /// That pair is also the DEFAULT `ResetInstanceAttribute` restores — "Resets an
+    /// attribute of an instance to its default value" — so the launch path and the reset
+    /// path read one definition of it. An image this store does not hold contributes
+    /// neither, the way an HVM image carries neither.
+    pub fn image_kernel_and_ramdisk(
+        &self,
+        image_id: Option<&str>,
+    ) -> (Option<String>, Option<String>) {
+        let image = image_id.and_then(|id| self.images.get(id));
+        (
+            image.and_then(|image| image.kernel_id.clone()),
+            image.and_then(|image| image.ramdisk_id.clone()),
+        )
+    }
+
     /// The modelled `Instance` for one stored instance.
     pub fn instance_view(&self, instance: &InstanceRecord) -> Instance {
         Instance {
@@ -3721,6 +3793,12 @@ impl ComAmazonawsEc2Amazonec2State {
             launch_time: Some(system_time_to_date_time(instance.launch_time)),
             ami_launch_index: Some(instance.ami_launch_index),
             architecture: Some(instance.architecture.clone()),
+            // The three instance attributes stored on the record, reported off it so a
+            // caller that modifies or resets one reads the same value back here as
+            // `DescribeInstanceAttribute` reports for it.
+            kernel_id: instance.kernel_id.clone(),
+            ramdisk_id: instance.ramdisk_id.clone(),
+            source_dest_check: Some(instance.source_dest_check),
             ebs_optimized: Some(instance.ebs_optimized),
             monitoring: Some(Monitoring {
                 state: Some(instance.monitoring_state.clone()),
@@ -3911,7 +3989,8 @@ pub fn filter_name_supported(name: &str) -> bool {
 ///
 /// Only the members whose length the REQUEST chose count: an id, a state or a
 /// timestamp this emulator mints is a fixed size. EVERY such member counts, though —
-/// the image id, the instance type, the subnet, the key pair name and the zone are
+/// the image id, the instance type, the subnet, the key pair name, the zone and the
+/// kernel and RAM disk ids are
 /// cloned onto every instance a launch mints just as its user data is, so leaving them
 /// out would let one request retain bytes the store's ceiling never saw.
 pub fn instance_payload_bytes(record: &InstanceRecord) -> usize {
@@ -3921,6 +4000,8 @@ pub fn instance_payload_bytes(record: &InstanceRecord) -> usize {
         + record.instance_type.len()
         + record.subnet_id.as_ref().map_or(0, String::len)
         + record.key_name.as_ref().map_or(0, String::len)
+        + record.kernel_id.as_ref().map_or(0, String::len)
+        + record.ramdisk_id.as_ref().map_or(0, String::len)
         + record.placement_az.len()
         + tag_bytes(&record.tags)
         + record
@@ -3931,6 +4012,31 @@ pub fn instance_payload_bytes(record: &InstanceRecord) -> usize {
                     + group_name.as_ref().map_or(0, String::len)
             })
             .sum::<usize>()
+}
+
+/// Refuse a kernel or RAM disk image id that is longer than an EC2 image id can be.
+///
+/// `member` names the request member in the refusal, so the caller can fix the request
+/// from the message alone. The one definition both launch paths call, so a launch and a
+/// Spot Instance request bound the same member the same way; the bound itself is
+/// [`MAX_KERNEL_OR_RAMDISK_ID_CHARS`].
+///
+/// The code is `InvalidParameterValue`: this is the emulator's RETENTION bound on a member
+/// AWS models no length for, not a claim about the shape of an image id (a value that is
+/// not an id at all is the business of whatever resolves kernel images, which this slice
+/// does not model), so it is answered as a value the service will not accept rather than as
+/// one of the `InvalidAMIID.*` codes a recorded response has not shown here.
+pub fn validate_kernel_or_ramdisk_id<E>(
+    member: &str,
+    value: Option<&str>,
+) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+    if value.is_some_and(|id| id.chars().count() > MAX_KERNEL_OR_RAMDISK_ID_CHARS) {
+        return Err(invalid_parameter_value(format!(
+            "{member} accepts at most {MAX_KERNEL_OR_RAMDISK_ID_CHARS} characters, \
+             the length of an EC2 image id"
+        )));
+    }
+    Ok(())
 }
 
 /// The bytes a tag map holds.
@@ -17234,6 +17340,8 @@ impl ComAmazonawsEc2Amazonec2State {
             instance_ids: Vec::new(),
         });
         let instance_id = self.mint_instance_id();
+        let (image_kernel_id, image_ramdisk_id) =
+            self.image_kernel_and_ramdisk(launch.image_id.as_deref());
         let instance_type = launch
             .instance_type
             .clone()
@@ -17278,6 +17386,13 @@ impl ComAmazonawsEc2Amazonec2State {
                 MONITORING_STATE_DISABLED.to_string()
             },
             architecture: architecture_for(&instance_type),
+            // The launch specification's kernel and RAM disk, falling back to the ones the
+            // AMI carries — the same resolution `RunInstances` makes.
+            kernel_id: launch.kernel_id.clone().or(image_kernel_id),
+            ramdisk_id: launch.ramdisk_id.clone().or(image_ramdisk_id),
+            // Nothing in a Spot launch specification sets source/destination checking, so
+            // the instance starts at the documented default.
+            source_dest_check: DEFAULT_SOURCE_DEST_CHECK,
             ebs_optimized: launch.ebs_optimized.unwrap_or(false),
             // Hibernation is `InstanceInterruptionBehavior`'s business for a Spot
             // Instance, and the launch specification carries no hibernation member.

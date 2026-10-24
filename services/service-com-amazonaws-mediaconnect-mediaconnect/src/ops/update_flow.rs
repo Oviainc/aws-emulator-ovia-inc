@@ -114,14 +114,6 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// The `FlowSize` enum values that ARE large enough for NDI® (`smithy_query(query="shape",
-/// shape="FlowSize")`: MEDIUM | LARGE | LARGE_4X). The capable sizes are named as an
-/// ALLOW-list, so a flow whose size was never set to one of them is not NDI-capable
-/// either: this operation's own doc says a MEDIUM flow must be upgraded to LARGE before
-/// its source can become NDI, and `CreateFlow$FlowSize` says "set this optional parameter
-/// to LARGE if you want to enable NDI sources or outputs on the flow".
-const NDI_CAPABLE_FLOW_SIZES: [&str; 2] = ["LARGE", "LARGE_4X"];
-
 /// `NdiState` / `State` enum value (`smithy_query(query="shape",shape="NdiState")`:
 /// ENABLED | DISABLED). `NdiConfig$NdiState` is "a setting that controls whether NDI®
 /// sources or outputs can be used in the flow… This value must be set as ENABLED for your
@@ -381,40 +373,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and the one that changes the size are checked, against the size and NDI state the
         // flow ends up with, because either member alone can break the pair.
         if input.ndi_config.is_some() || input.flow_size.is_some() {
-            let ndi_enabled = ndi_config
-                .as_ref()
-                .and_then(|config| config.ndi_state.as_deref())
-                == Some(STATE_ENABLED);
-            let ndi_capable = flow_size
-                .as_deref()
-                .is_some_and(|size| NDI_CAPABLE_FLOW_SIZES.contains(&size));
-            if ndi_enabled && !ndi_capable {
-                return Err(bad_request(format!(
-                    "NdiConfig.NdiState {STATE_ENABLED} needs a flow of size {}; this flow's \
-                     size is {}. Upgrade the flow size first.",
-                    NDI_CAPABLE_FLOW_SIZES.join(" or "),
-                    flow_size.as_deref().unwrap_or("unset")
-                )));
-            }
-            // The source type is the other half of the same pair: "if you're switching
-            // from an NDI source to a transport stream (TS) source and want to downgrade
-            // the flow size: first, use the UpdateFlowSource operation to change the flow
-            // source type" (this operation's own documentation). Only a request that
-            // changes the size is refused for it.
-            if input.flow_size.is_some()
-                && !ndi_capable
-                && flow.sources.iter().any(|source| {
-                    source
-                        .transport
-                        .as_ref()
-                        .is_some_and(|transport| transport.ndi_source_settings.is_some())
-                })
-            {
-                return Err(bad_request(format!(
-                    "A flow with an NDI source needs a flow of size {}; change the source \
-                     type with UpdateFlowSource before downgrading the flow size.",
-                    NDI_CAPABLE_FLOW_SIZES.join(" or ")
-                )));
+            // What uses NDI on the flow this request leaves behind, worded for the refusal
+            // `crate::state::ndi_flow_size_rejection` states — the same markers CreateFlow
+            // and the add paths read.
+            let ndi_feature = if crate::state::ndi_is_enabled(ndi_config.as_ref()) {
+                Some(format!("NdiConfig.NdiState {STATE_ENABLED}"))
+            } else if input.flow_size.is_some() {
+                // The source type is the other half of the same pair: "if you're switching
+                // from an NDI source to a transport stream (TS) source and want to
+                // downgrade the flow size: first, use the UpdateFlowSource operation to
+                // change the flow source type" (this operation's own documentation). Only a
+                // request that changes the size is refused for it.
+                flow.sources
+                    .iter()
+                    .find(|source| crate::state::stored_source_uses_ndi(source))
+                    .map(|source| format!("The NDI source {:?}", source.name))
+            } else {
+                None
+            };
+            if let Some(rejection) = ndi_feature.as_deref().and_then(|feature| {
+                crate::state::ndi_flow_size_rejection(feature, flow_size.as_deref())
+            }) {
+                return Err(bad_request(rejection));
             }
         }
 
