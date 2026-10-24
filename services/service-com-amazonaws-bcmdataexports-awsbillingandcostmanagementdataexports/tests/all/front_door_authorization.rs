@@ -9,7 +9,11 @@
 //! `TagResource`, `UntagResource` and `ListTagsForResource` (smithy_query: the only ones
 //! whose error list carries `AccessDeniedException`); an operation whose model declares no
 //! 403 is not judged, because answering a caller with an error its operation does not
-//! model would be a different divergence.
+//! model would be a different divergence. The tables below drive `CreateExport`,
+//! `TagResource` and `ListTagsForResource`; `UntagResource` is driven through this same
+//! harness by `tests/all/untagging_authorization.rs`, which asserts the same rule over its
+//! own tables — including where the documents in force on the principal LIVE, through the
+//! `managed_policy` and `attach_role_policy` helpers below.
 //!
 //! The decision is the real one: the principals below are made with IAM's and STS's OWN
 //! operations over the same engine — `CreateRole` + `PutRolePolicy` + `AssumeRole`,
@@ -263,6 +267,48 @@ impl Emulator {
         xml_element(&body, "AccessKeyId")
             .unwrap_or_else(|| panic!("CreateAccessKey must answer an AccessKeyId, got {body}"))
     }
+
+    /// Create a customer-managed policy carrying `document` and answer the ARN IAM minted
+    /// for it — the handle a role's attachment names.
+    pub(crate) async fn managed_policy(&self, policy_name: &str, document: &str) -> String {
+        let (status, body) = self
+            .query(
+                "iam",
+                "2010-05-08",
+                "CreatePolicy",
+                &[
+                    ("PolicyName", policy_name.to_string()),
+                    ("PolicyDocument", document.to_string()),
+                ],
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "creating the managed policy {policy_name:?} must succeed, got {status} {body}"
+        );
+        xml_element(&body, "Arn")
+            .unwrap_or_else(|| panic!("CreatePolicy must answer the policy's Arn, got {body}"))
+    }
+
+    /// Attach the managed policy `policy_arn` to the role `role_name`, so the policy's
+    /// document is in force on every session of that role.
+    pub(crate) async fn attach_role_policy(&self, role_name: &str, policy_arn: &str) {
+        let (status, body) = self
+            .query(
+                "iam",
+                "2010-05-08",
+                "AttachRolePolicy",
+                &[
+                    ("RoleName", role_name.to_string()),
+                    ("PolicyArn", policy_arn.to_string()),
+                ],
+            )
+            .await;
+        assert_eq!(
+            status, 200,
+            "attaching {policy_arn} to {role_name:?} must succeed, got {status} {body}"
+        );
+    }
 }
 
 /// Percent-encode one `application/x-www-form-urlencoded` component, leaving only RFC
@@ -293,6 +339,15 @@ fn xml_element(body: &str, name: &str) -> Option<String> {
 pub(crate) fn allow(action: &str, resource: &str) -> String {
     format!(
         "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Allow\",\
+         \"Action\":\"{action}\",\"Resource\":\"{resource}\"}}]}}"
+    )
+}
+
+/// A policy document that only DENIES `action` on `resource`, with no `Allow` of its own —
+/// so a principal carrying it alongside a grant is still refused.
+pub(crate) fn deny(action: &str, resource: &str) -> String {
+    format!(
+        "{{\"Version\":\"2012-10-17\",\"Statement\":[{{\"Effect\":\"Deny\",\
          \"Action\":\"{action}\",\"Resource\":\"{resource}\"}}]}}"
     )
 }
