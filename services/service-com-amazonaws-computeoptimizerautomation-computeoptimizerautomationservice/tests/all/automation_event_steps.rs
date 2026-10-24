@@ -115,7 +115,9 @@ fn stored_event(index: usize, event_type: &str, created_secs: i64, steps: Vec<St
         completed_timestamp: None,
         estimated_monthly_savings: None,
         steps,
-        settles_at: None,
+        // A seeded event is already in the status it names, so the clock owes it
+        // no transition.
+        pending: None,
     }
 }
 

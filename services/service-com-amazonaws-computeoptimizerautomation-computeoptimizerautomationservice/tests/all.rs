@@ -17,6 +17,8 @@ mod account_association;
 mod automation_event_and_tagging;
 #[path = "all/automation_event_completion.rs"]
 mod automation_event_completion;
+#[path = "all/automation_event_rollback.rs"]
+mod automation_event_rollback;
 #[path = "all/automation_event_steps.rs"]
 mod automation_event_steps;
 #[path = "all/automation_events.rs"]

@@ -179,7 +179,7 @@ fn stored_event(
         steps: Vec::new(),
         // A seeded event is already in the status it names, so the clock owes it
         // no transition.
-        settles_at: None,
+        pending: None,
     }
 }
 
