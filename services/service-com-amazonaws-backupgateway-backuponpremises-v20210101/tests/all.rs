@@ -25,6 +25,8 @@ mod hypervisor_listing;
 mod hypervisor_property_mappings;
 #[path = "all/hypervisor_reads.rs"]
 mod hypervisor_reads;
+#[path = "all/hypervisor_update.rs"]
+mod hypervisor_update;
 #[path = "all/maintenance_start_time.rs"]
 mod maintenance_start_time;
 #[path = "all/metadata_sync.rs"]
