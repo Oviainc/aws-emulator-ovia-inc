@@ -211,6 +211,10 @@ mod transit_gateway_policy_table_associations;
 mod transit_gateway_rejection;
 #[path = "all/transit_gateway_route_table_propagation.rs"]
 mod transit_gateway_route_table_propagation;
+// The Verified Access ENDPOINT slice: create an endpoint on a stored group, then read it
+// back through the describe.
+#[path = "all/verified_access_endpoints.rs"]
+mod verified_access_endpoints;
 // The Verified Access trust provider slice: create, then read it back.
 #[path = "all/verified_access_trust_providers.rs"]
 mod verified_access_trust_providers;
