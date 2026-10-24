@@ -124,6 +124,11 @@ fn rows() -> Vec<Row> {
             |id| json!({"AccountId": id}),
         ),
         (
+            "GetPrimaryEmail".to_string(),
+            "/getPrimaryEmail",
+            |id| json!({"AccountId": id}),
+        ),
+        (
             "GetPrimaryEmailUpdateStatus".to_string(),
             "/getPrimaryEmailUpdateStatus",
             |id| json!({"AccountId": id}),
