@@ -328,14 +328,14 @@ async fn an_outpost_reports_both_availability_zone_identities() {
     }
 }
 
-/// Rule B's other side: a zone value no second identity can be resolved from leaves
-/// the other member ABSENT rather than carrying an invented value — a zone letter past
-/// the highest index the modelled id can name, and a zone index no letter names.
+/// Rule B's other side: a zone value the OTHER identity cannot be resolved from
+/// leaves that member ABSENT rather than carrying an invented value.
 ///
-/// Both rows name a zone of the region the request is addressed to: a zone of ANOTHER
-/// region is refused outright (`CreateOutpost`'s region check, covered in
-/// [`crate::error_classification`]), so it never reaches the resolution this rule is
-/// about.
+/// Every identifier that names no zone of the request's region is refused outright
+/// (covered in [`crate::availability_zone_identity`]), so the only accepted value the
+/// second identity cannot be resolved from is a zone of a region whose zone-ID
+/// abbreviation does not follow the published `<area><word initials><number>` form —
+/// the rows below are addressed to such a region, naming the zone each way round.
 #[tokio::test]
 async fn an_unresolvable_zone_leaves_the_other_identity_absent() {
     let outposts = Outposts::new();
@@ -343,19 +343,21 @@ async fn an_unresolvable_zone_leaves_the_other_identity_absent() {
         .create_site(&json!({ "Name": "unresolvable zone site" }))
         .await;
     let site_id = text(&site, "SiteId");
-    // The region every row below is addressed to, and whose zones they name.
-    let region = "us-west-2";
+    // The region every row below is addressed to, and whose zones they name: its
+    // final segment is not the single digit an `AvailabilityZoneId` abbreviation ends
+    // in, so the name <-> id mapping has nothing to map it through.
+    let region = "zz-testing-12";
 
     let cases: Vec<(&str, &str, &str)> = vec![
         (
-            "a zone letter one past the highest index the id can name",
+            "a zone of a region with no zone-ID abbreviation, named by name",
             "AvailabilityZone",
-            "us-west-2j",
+            "zz-testing-12a",
         ),
         (
-            "a zone index below the first letter the name can carry",
+            "a zone of a region with no zone-ID abbreviation, named by id",
             "AvailabilityZoneId",
-            "usw2-az0",
+            "zzt1-az1",
         ),
     ];
     for (case, member, value) in &cases {

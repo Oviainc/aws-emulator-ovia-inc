@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateOutpost
-//! IMPLEMENTED: validates the Availability Zone the caller named against the region
-//! the request is addressed to, resolves the `SiteId` against this service's store,
+//! IMPLEMENTED: validates the Availability Zone identity (or pair of identities) the
+//! caller named against the zones of the region the request is addressed to,
+//! resolves the `SiteId` against this service's store,
 //! mints an `OutpostId` / `OutpostArn`, persists the Outpost against that site and
 //! answers the stored record. `GetOutpost`, `ListOutposts` and `DeleteOutpost` read
 //! that same store, and `DeleteSite` refuses a site this still references.
@@ -162,15 +163,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let region = crate::state::request_region(ctx.parts());
 
-        // An Availability Zone belongs to exactly one region, so a request
-        // addressed to this region cannot place an Outpost in another region's
-        // zone. Checked BEFORE anything the request references is looked up:
-        // resolving the site first would answer a cross-region zone with the
-        // site's own error and hide the zone entirely. The region is the one the
-        // request's SigV4 credential scope names — `request_region` falls back to
-        // `DEFAULT_REGION` for an unsigned call, exactly as the ARNs this handler
-        // mints do, so an unsigned request is judged against that region.
-        if let Some(message) = crate::state::availability_zone_region_refusal(
+        // An Availability Zone identifier has to name a zone of the region the
+        // request is addressed to, and a request naming BOTH identities has to name
+        // the same zone with them — so neither a zone of another region, nor an
+        // identifier that names no zone at all, nor a self-contradicting pair places
+        // an Outpost. Checked BEFORE anything the request references is looked up:
+        // resolving the site first would answer a bad zone with the site's own error
+        // and hide the zone entirely. The region is the one the request's SigV4
+        // credential scope names — `request_region` falls back to `DEFAULT_REGION`
+        // for an unsigned call, exactly as the ARNs this handler mints do, so an
+        // unsigned request is judged against that region.
+        if let Some(message) = crate::state::availability_zone_refusal(
             &region,
             input.availability_zone.as_deref(),
             input.availability_zone_id.as_deref(),
@@ -227,9 +230,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // AWS resolves the Availability Zone identity the caller did not name from
         // the one they did ("You can specify either an Availability one or an AZ
         // ID"), so the stored Outpost carries BOTH forms and every later read of it
-        // reports both. A zone the pair cannot be resolved from — a name with no
-        // zone letter, an id whose region abbreviation names no region — leaves the
-        // other member absent rather than carrying a made-up value.
+        // reports both. The identifiers the check above let through name a zone of
+        // this region, so the only value the other identity cannot be resolved from
+        // is one in a region whose abbreviation this service cannot map — and that
+        // leaves the other member absent rather than carrying a made-up value.
         let availability_zone = crate::state::non_empty(input.availability_zone);
         let availability_zone_id = crate::state::non_empty(input.availability_zone_id)
             .or_else(|| {
