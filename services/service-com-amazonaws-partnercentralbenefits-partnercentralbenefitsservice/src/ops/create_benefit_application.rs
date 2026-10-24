@@ -9,6 +9,11 @@
 //! application it created, so a retry of the same request answers with that first call's
 //! id, ARN and revision instead of creating a second application.
 //!
+//! The create's own `Tags` are caller-supplied tag keys, so they go through the same
+//! reserved-namespace rule the tagging operations apply: a key in the AWS-reserved `aws:`
+//! namespace is refused with the modelled `ValidationException` (HTTP 400) and no
+//! application is created — see [`crate::state::reserved_tag_key_refusal`].
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -212,6 +217,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        }
+
+        // A create carrying its own `Tags` supplies tag keys exactly as `TagResource` does,
+        // so it applies the same rule: a key in the AWS-reserved `aws:` namespace is
+        // refused and no application is created.
+        if let Some(refusal) = crate::state::reserved_tag_key_refusal(
+            "Tags",
+            input
+                .tags
+                .iter()
+                .flatten()
+                .map(|tag| tag.key.as_str()),
+        ) {
+            return Err(
+                CreateBenefitApplicationErrorModeled::ValidationException(refusal).into(),
+            );
         }
 
         let region = crate::state::request_region(ctx);

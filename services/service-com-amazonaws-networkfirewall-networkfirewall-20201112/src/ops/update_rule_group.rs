@@ -294,11 +294,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`CreateRuleGroupRequest$Capacity`).
         let consumed = crate::state::required_capacity(&record.rule_group_type, &record.rule_group);
         if consumed > record.capacity {
-            return Err(invalid_request(&format!(
-                "The rules in RulesSource.{} require {consumed} capacity units, which exceeds \
-                 the rule group's capacity of {}.",
-                crate::state::rules_source_member(&record.rule_group),
-                record.capacity
+            // The same built refusal `CreateRuleGroup` answers, from the same
+            // helper: the capacity the rules require is what a client reads back
+            // here, since it cannot raise a stored rule group's `Capacity` and
+            // must decide whether to split the rules.
+            return Err(invalid_request(&crate::state::capacity_exceeded_message(
+                &record.rule_group,
+                consumed,
             )));
         }
 

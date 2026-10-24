@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeNode
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeNode`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeNode::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one stored node of one cluster. A REPORTING operation: it reads the
+//! node slice of the store and writes nothing of its own — the only write on
+//! this path is `settle`, which materialises the transitions the clock had
+//! already made due at that instant whether or not anybody called (a node whose
+//! `DeleteNode` deregistration has come due), so it never changes what a later
+//! caller would otherwise have seen.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +169,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeNode` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeNodeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeNode"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+        state.settle(now);
+
+        // A node is addressed by its cluster AND its id, and both have to match:
+        // `Id` is "Unique in the Cluster", so a node id presented under a cluster
+        // it does not belong to names no node. A node whose delete has been
+        // accepted is still REPORTED here, in the state the deregistration left
+        // it: the record stays in the account rather than vanishing.
+        let node = state
+            .node_description(&input.cluster_id, &input.node_id)
+            .ok_or_else(|| {
+                DescribeNodeError::from(DescribeNodeErrorModeled::NotFoundException(
+                    NotFoundException {
+                        message: Some(crate::state::not_found_message("Node", &input.node_id)),
+                    },
+                ))
+            })?;
+
+        Ok(crate::state::node_description_output!(DescribeNodeOutput, node))
     }
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no node store to read. A modelled server error, never a fresh
+/// engine (which would report an empty store as the account's).
+fn unavailable() -> DescribeNodeError {
+    DescribeNodeErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
 }

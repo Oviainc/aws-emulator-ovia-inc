@@ -37,6 +37,8 @@ mod fixture_search;
 mod harness;
 #[path = "all/refusals_from_state.rs"]
 mod refusals_from_state;
+#[path = "all/resource_tagging.rs"]
+mod resource_tagging;
 #[path = "all/response_members.rs"]
 mod response_members;
 #[path = "all/state_roundtrip.rs"]

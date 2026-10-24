@@ -2870,8 +2870,23 @@ pub const FIS_ACTION_ID_CONDITION_KEY: &str = "ec2:FisActionId";
 /// lists for each action), which the experiment's execution role has to be allowed to
 /// perform for the action to run.
 ///
-/// It is a SUBSET of the published catalog, not the whole of it: an id this table does
-/// not hold answers `ResourceNotFoundException` rather than a fabricated action.
+/// It holds the catalog that reference PUBLISHES, not a sample of one: a client that reads
+/// an action's parameter and target contract before it builds an experiment template gets
+/// that contract for every action FIS documents, rather than a 404 for the ones this table
+/// happened to leave out. An id the reference publishes NO action for is not an action at
+/// all, and answers `ResourceNotFoundException` rather than a fabricated one.
+///
+/// Two conventions the rows follow, both taken from the reference itself:
+///
+/// * an action FIS performs through another service's agent carries that service's own
+///   call as its permission — the `aws:ecs:task-*` actions run through SSM on the task, so
+///   `ssm:SendCommand` is what their execution role needs, and the `aws:eks:*` actions
+///   reach the cluster's Kubernetes API, so `eks:DescribeCluster` is;
+/// * a row records a permission only where the reference states ONE call for the action.
+///   An action whose entry records none is never failed for privileges (see
+///   [`ActionCatalogEntry::permissions`]), which is the same reading
+///   [`action_permissions`] takes everywhere else: this emulator refuses only what it can
+///   SHOW, and a guessed permission would refuse what it cannot.
 ///
 /// Kept sorted by id, which is the order `ListActions` enumerates in.
 pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
@@ -2894,6 +2909,20 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
         permissions: &["cloudwatch:DescribeAlarms"],
     },
     ActionCatalogEntry {
+        id: "aws:dynamodb:global-table-pause-replication",
+        description: "Pause replication of the target DynamoDB global tables in this Region.",
+        parameters: &[ActionCatalogParameter {
+            name: "duration",
+            description: "The duration of the action, in ISO 8601 format.",
+            required: true,
+        }],
+        targets: &[ActionCatalogTarget {
+            name: "Tables",
+            resource_type: "aws:dynamodb:global-table",
+        }],
+        permissions: &["dynamodb:PauseReplication"],
+    },
+    ActionCatalogEntry {
         id: "aws:ebs:pause-volume-io",
         description: "Pause I/O operations on the target EBS volumes.",
         parameters: &[ActionCatalogParameter {
@@ -2906,6 +2935,38 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             resource_type: "aws:ec2:ebs-volume",
         }],
         permissions: &["ec2:PauseVolumeIO"],
+    },
+    ActionCatalogEntry {
+        id: "aws:ec2:api-error",
+        description: "Cause EC2 API requests made with the target IAM roles to fail with the \
+                      specified error.",
+        parameters: &[
+            ActionCatalogParameter {
+                name: "duration",
+                description: "The duration of the action, in ISO 8601 format.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "errorCode",
+                description: "The error code of the error to return.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "operations",
+                description: "The API operations to affect, separated by commas.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "percentage",
+                description: "The percentage of calls to affect.",
+                required: false,
+            },
+        ],
+        targets: &[ActionCatalogTarget {
+            name: "Roles",
+            resource_type: "aws:iam:role",
+        }],
+        permissions: &[EC2_INJECT_API_ERROR],
     },
     ActionCatalogEntry {
         id: "aws:ec2:api-insufficient-instance-capacity-error",
@@ -3051,6 +3112,458 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
         permissions: &["ecs:StopTask"],
     },
     ActionCatalogEntry {
+        id: "aws:ecs:task-cpu-stress",
+        description: "Generate CPU load on the target Amazon ECS tasks.",
+        parameters: &[
+            ActionCatalogParameter {
+                name: "duration",
+                description: "The duration of the action, in ISO 8601 format.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "installDependencies",
+                description: "Whether to install the dependencies the action needs on the target \
+                              tasks.",
+                required: false,
+            },
+            ActionCatalogParameter {
+                name: "percent",
+                description: "The percentage of CPU load to generate.",
+                required: false,
+            },
+            ActionCatalogParameter {
+                name: "workers",
+                description: "The number of stress workers to run.",
+                required: false,
+            },
+        ],
+        targets: &[ActionCatalogTarget {
+            name: "Tasks",
+            resource_type: "aws:ecs:task",
+        }],
+        permissions: &["ssm:SendCommand"],
+    },
+    ActionCatalogEntry {
+        id: "aws:ecs:task-io-stress",
+        description: "Generate I/O load on the target Amazon ECS tasks.",
+        parameters: &[
+            ActionCatalogParameter {
+                name: "duration",
+                description: "The duration of the action, in ISO 8601 format.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "installDependencies",
+                description: "Whether to install the dependencies the action needs on the target \
+                              tasks.",
+                required: false,
+            },
+            ActionCatalogParameter {
+                name: "percent",
+                description: "The percentage of the file system to use.",
+                required: false,
+            },
+            ActionCatalogParameter {
+                name: "workers",
+                description: "The number of stress workers to run.",
+                required: false,
+            },
+        ],
+        targets: &[ActionCatalogTarget {
+            name: "Tasks",
+            resource_type: "aws:ecs:task",
+        }],
+        permissions: &["ssm:SendCommand"],
+    },
+    ActionCatalogEntry {
+        id: "aws:ecs:task-kill-process",
+        description: "Kill the specified process in the target Amazon ECS tasks.",
+        parameters: &[
+            ActionCatalogParameter {
+                name: "installDependencies",
+                description: "Whether to install the dependencies the action needs on the target \
+                              tasks.",
+                required: false,
+            },
+            ActionCatalogParameter {
+                name: "processName",
+                description: "The name of the process to kill.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "signal",
+                description: "The signal to send to the process.",
+                required: false,
+            },
+        ],
+        targets: &[ActionCatalogTarget {
+            name: "Tasks",
+            resource_type: "aws:ecs:task",
+        }],
+        permissions: &["ssm:SendCommand"],
+    },
+    ActionCatalogEntry {
+        id: "aws:ecs:task-network-blackhole-port",
+        description: "Drop traffic to or from the specified port in the target Amazon ECS tasks.",
+        parameters: &[
+            ActionCatalogParameter {
+                name: "duration",
+                description: "The duration of the action, in ISO 8601 format.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "installDependencies",
+                description: "Whether to install the dependencies the action needs on the target \
+                              tasks.",
+                required: false,
+            },
+            ActionCatalogParameter {
+                name: "port",
+                description: "The port number of the traffic to drop.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "protocol",
+                description: "The protocol of the traffic to drop.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "trafficType",
+                description: "The type of traffic to drop, ingress or egress.",
+                required: true,
+            },
+        ],
+        targets: &[ActionCatalogTarget {
+            name: "Tasks",
+            resource_type: "aws:ecs:task",
+        }],
+        permissions: &["ssm:SendCommand"],
+    },
+    ActionCatalogEntry {
+        id: "aws:ecs:task-network-latency",
+        description: "Add latency to the traffic of the target Amazon ECS tasks.",
+        parameters: &[
+            ActionCatalogParameter {
+                name: "delayMilliseconds",
+                description: "The delay to add to the traffic, in milliseconds.",
+                required: false,
+            },
+            ActionCatalogParameter {
+                name: "duration",
+                description: "The duration of the action, in ISO 8601 format.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "installDependencies",
+                description: "Whether to install the dependencies the action needs on the target \
+                              tasks.",
+                required: false,
+            },
+            ActionCatalogParameter {
+                name: "jitterMilliseconds",
+                description: "The variation of the delay, in milliseconds.",
+                required: false,
+            },
+            ActionCatalogParameter {
+                name: "sources",
+                description: "The hosts whose traffic is delayed, separated by commas.",
+                required: true,
+            },
+        ],
+        targets: &[ActionCatalogTarget {
+            name: "Tasks",
+            resource_type: "aws:ecs:task",
+        }],
+        permissions: &["ssm:SendCommand"],
+    },
+    ActionCatalogEntry {
+        id: "aws:ecs:task-network-packet-loss",
+        description: "Drop a percentage of the packets of the target Amazon ECS tasks.",
+        parameters: &[
+            ActionCatalogParameter {
+                name: "duration",
+                description: "The duration of the action, in ISO 8601 format.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "installDependencies",
+                description: "Whether to install the dependencies the action needs on the target \
+                              tasks.",
+                required: false,
+            },
+            ActionCatalogParameter {
+                name: "lossPercent",
+                description: "The percentage of packets to drop.",
+                required: false,
+            },
+            ActionCatalogParameter {
+                name: "sources",
+                description: "The hosts whose packets are dropped, separated by commas.",
+                required: true,
+            },
+        ],
+        targets: &[ActionCatalogTarget {
+            name: "Tasks",
+            resource_type: "aws:ecs:task",
+        }],
+        permissions: &["ssm:SendCommand"],
+    },
+    ActionCatalogEntry {
+        id: "aws:eks:inject-kubernetes-custom-resource",
+        description: "Apply the specified Kubernetes custom resource to the target Amazon EKS \
+                      cluster.",
+        parameters: &[
+            ActionCatalogParameter {
+                name: "kubernetesApiVersion",
+                description: "The API version of the Kubernetes custom resource.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "kubernetesKind",
+                description: "The kind of the Kubernetes custom resource.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "kubernetesNamespace",
+                description: "The namespace of the Kubernetes custom resource.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "kubernetesSpec",
+                description: "The spec of the Kubernetes custom resource, as a JSON object.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "maxDuration",
+                description: "The longest the action waits for the custom resource to finish, in \
+                              ISO 8601 format.",
+                required: true,
+            },
+        ],
+        targets: &[ActionCatalogTarget {
+            name: "Cluster",
+            resource_type: "aws:eks:cluster",
+        }],
+        permissions: &["eks:DescribeCluster"],
+    },
+    ActionCatalogEntry {
+        id: "aws:eks:pod-cpu-stress",
+        description: "Generate CPU load on the target Amazon EKS pods.",
+        parameters: &[
+            ActionCatalogParameter {
+                name: "duration",
+                description: "The duration of the action, in ISO 8601 format.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "kubernetesServiceAccount",
+                description: "The Kubernetes service account the action runs under.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "percent",
+                description: "The percentage of CPU load to generate.",
+                required: false,
+            },
+            ActionCatalogParameter {
+                name: "workers",
+                description: "The number of stress workers to run.",
+                required: false,
+            },
+        ],
+        targets: &[ActionCatalogTarget {
+            name: "Pods",
+            resource_type: "aws:eks:pod",
+        }],
+        permissions: &["eks:DescribeCluster"],
+    },
+    ActionCatalogEntry {
+        id: "aws:eks:pod-delete",
+        description: "Delete the target Amazon EKS pods.",
+        parameters: &[
+            ActionCatalogParameter {
+                name: "gracePeriodSeconds",
+                description: "The time to wait for a pod to terminate, in seconds.",
+                required: false,
+            },
+            ActionCatalogParameter {
+                name: "kubernetesServiceAccount",
+                description: "The Kubernetes service account the action runs under.",
+                required: true,
+            },
+        ],
+        targets: &[ActionCatalogTarget {
+            name: "Pods",
+            resource_type: "aws:eks:pod",
+        }],
+        permissions: &["eks:DescribeCluster"],
+    },
+    ActionCatalogEntry {
+        id: "aws:eks:pod-io-stress",
+        description: "Generate I/O load on the target Amazon EKS pods.",
+        parameters: &[
+            ActionCatalogParameter {
+                name: "duration",
+                description: "The duration of the action, in ISO 8601 format.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "kubernetesServiceAccount",
+                description: "The Kubernetes service account the action runs under.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "percent",
+                description: "The percentage of the file system to use.",
+                required: false,
+            },
+            ActionCatalogParameter {
+                name: "workers",
+                description: "The number of stress workers to run.",
+                required: false,
+            },
+        ],
+        targets: &[ActionCatalogTarget {
+            name: "Pods",
+            resource_type: "aws:eks:pod",
+        }],
+        permissions: &["eks:DescribeCluster"],
+    },
+    ActionCatalogEntry {
+        id: "aws:eks:pod-memory-stress",
+        description: "Generate memory load on the target Amazon EKS pods.",
+        parameters: &[
+            ActionCatalogParameter {
+                name: "duration",
+                description: "The duration of the action, in ISO 8601 format.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "kubernetesServiceAccount",
+                description: "The Kubernetes service account the action runs under.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "percent",
+                description: "The percentage of memory to use.",
+                required: false,
+            },
+            ActionCatalogParameter {
+                name: "workers",
+                description: "The number of stress workers to run.",
+                required: false,
+            },
+        ],
+        targets: &[ActionCatalogTarget {
+            name: "Pods",
+            resource_type: "aws:eks:pod",
+        }],
+        permissions: &["eks:DescribeCluster"],
+    },
+    ActionCatalogEntry {
+        id: "aws:eks:pod-network-blackhole-port",
+        description: "Drop traffic to or from the specified port in the target Amazon EKS pods.",
+        parameters: &[
+            ActionCatalogParameter {
+                name: "duration",
+                description: "The duration of the action, in ISO 8601 format.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "kubernetesServiceAccount",
+                description: "The Kubernetes service account the action runs under.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "port",
+                description: "The port number of the traffic to drop.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "protocol",
+                description: "The protocol of the traffic to drop.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "trafficType",
+                description: "The type of traffic to drop, ingress or egress.",
+                required: true,
+            },
+        ],
+        targets: &[ActionCatalogTarget {
+            name: "Pods",
+            resource_type: "aws:eks:pod",
+        }],
+        permissions: &["eks:DescribeCluster"],
+    },
+    ActionCatalogEntry {
+        id: "aws:eks:pod-network-latency",
+        description: "Add latency to the traffic of the target Amazon EKS pods.",
+        parameters: &[
+            ActionCatalogParameter {
+                name: "delayMilliseconds",
+                description: "The delay to add to the traffic, in milliseconds.",
+                required: false,
+            },
+            ActionCatalogParameter {
+                name: "duration",
+                description: "The duration of the action, in ISO 8601 format.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "jitterMilliseconds",
+                description: "The variation of the delay, in milliseconds.",
+                required: false,
+            },
+            ActionCatalogParameter {
+                name: "kubernetesServiceAccount",
+                description: "The Kubernetes service account the action runs under.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "sources",
+                description: "The hosts whose traffic is delayed, separated by commas.",
+                required: true,
+            },
+        ],
+        targets: &[ActionCatalogTarget {
+            name: "Pods",
+            resource_type: "aws:eks:pod",
+        }],
+        permissions: &["eks:DescribeCluster"],
+    },
+    ActionCatalogEntry {
+        id: "aws:eks:pod-network-packet-loss",
+        description: "Drop a percentage of the packets of the target Amazon EKS pods.",
+        parameters: &[
+            ActionCatalogParameter {
+                name: "duration",
+                description: "The duration of the action, in ISO 8601 format.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "kubernetesServiceAccount",
+                description: "The Kubernetes service account the action runs under.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "lossPercent",
+                description: "The percentage of packets to drop.",
+                required: false,
+            },
+            ActionCatalogParameter {
+                name: "sources",
+                description: "The hosts whose packets are dropped, separated by commas.",
+                required: true,
+            },
+        ],
+        targets: &[ActionCatalogTarget {
+            name: "Pods",
+            resource_type: "aws:eks:pod",
+        }],
+        permissions: &["eks:DescribeCluster"],
+    },
+    ActionCatalogEntry {
         id: "aws:eks:terminate-nodegroup-instances",
         description: "Terminate instances in the target Amazon EKS node groups.",
         parameters: &[ActionCatalogParameter {
@@ -3063,6 +3576,21 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             resource_type: "aws:eks:nodegroup",
         }],
         permissions: &["ec2:TerminateInstances"],
+    },
+    ActionCatalogEntry {
+        id: "aws:elasticache:replicationgroup-interrupt-az-power",
+        description: "Interrupt power in one Availability Zone of the target ElastiCache \
+                      replication groups.",
+        parameters: &[ActionCatalogParameter {
+            name: "duration",
+            description: "The duration of the action, in ISO 8601 format.",
+            required: true,
+        }],
+        targets: &[ActionCatalogTarget {
+            name: "ReplicationGroups",
+            resource_type: "aws:elasticache:replicationgroup",
+        }],
+        permissions: &["elasticache:InterruptClusterAZPower"],
     },
     ActionCatalogEntry {
         id: "aws:fis:inject-api-internal-error",
@@ -3173,6 +3701,105 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
         permissions: &[],
     },
     ActionCatalogEntry {
+        id: "aws:lambda:invocation-add-delay",
+        description: "Add delay to the invocations of the target Lambda functions.",
+        parameters: &[
+            ActionCatalogParameter {
+                name: "duration",
+                description: "The duration of the action, in ISO 8601 format.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "invocationPercentage",
+                description: "The percentage of invocations to affect.",
+                required: false,
+            },
+            ActionCatalogParameter {
+                name: "preventExecution",
+                description: "Whether to prevent the function's handler from running.",
+                required: false,
+            },
+            ActionCatalogParameter {
+                name: "startupDelayMilliseconds",
+                description: "The delay to add before the invocation, in milliseconds.",
+                required: true,
+            },
+        ],
+        targets: &[ActionCatalogTarget {
+            name: "Functions",
+            resource_type: "aws:lambda:function",
+        }],
+        // The reference states no single API call for the Lambda actions: FIS performs them
+        // through its Lambda extension, reading the fault configuration the experiment wrote,
+        // so this table records no permission rather than one it would guess.
+        permissions: &[],
+    },
+    ActionCatalogEntry {
+        id: "aws:lambda:invocation-error",
+        description: "Cause the invocations of the target Lambda functions to return an error.",
+        parameters: &[
+            ActionCatalogParameter {
+                name: "duration",
+                description: "The duration of the action, in ISO 8601 format.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "invocationPercentage",
+                description: "The percentage of invocations to affect.",
+                required: false,
+            },
+            ActionCatalogParameter {
+                name: "preventExecution",
+                description: "Whether to prevent the function's handler from running.",
+                required: false,
+            },
+        ],
+        targets: &[ActionCatalogTarget {
+            name: "Functions",
+            resource_type: "aws:lambda:function",
+        }],
+        // See `aws:lambda:invocation-add-delay` for why no permission is recorded.
+        permissions: &[],
+    },
+    ActionCatalogEntry {
+        id: "aws:lambda:invocation-http-integration-response",
+        description: "Cause the invocations of the target Lambda functions to return the \
+                      specified HTTP integration response.",
+        parameters: &[
+            ActionCatalogParameter {
+                name: "contentTypeHeader",
+                description: "The value of the response's Content-Type header.",
+                required: false,
+            },
+            ActionCatalogParameter {
+                name: "duration",
+                description: "The duration of the action, in ISO 8601 format.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "invocationPercentage",
+                description: "The percentage of invocations to affect.",
+                required: false,
+            },
+            ActionCatalogParameter {
+                name: "preventExecution",
+                description: "Whether to prevent the function's handler from running.",
+                required: false,
+            },
+            ActionCatalogParameter {
+                name: "statusCode",
+                description: "The HTTP status code of the response.",
+                required: true,
+            },
+        ],
+        targets: &[ActionCatalogTarget {
+            name: "Functions",
+            resource_type: "aws:lambda:function",
+        }],
+        // See `aws:lambda:invocation-add-delay` for why no permission is recorded.
+        permissions: &[],
+    },
+    ActionCatalogEntry {
         id: "aws:network:disrupt-connectivity",
         description: "Disrupt network connectivity for the target subnets.",
         parameters: &[
@@ -3192,6 +3819,54 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             resource_type: "aws:ec2:subnet",
         }],
         permissions: &["ec2:CreateNetworkAcl"],
+    },
+    ActionCatalogEntry {
+        id: "aws:network:route-table-disrupt-connectivity",
+        description: "Disrupt connectivity to the specified service for the subnets the target \
+                      route tables serve.",
+        parameters: &[
+            ActionCatalogParameter {
+                name: "duration",
+                description: "The duration of the action, in ISO 8601 format.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "service",
+                description: "The service to disrupt connectivity to.",
+                required: true,
+            },
+        ],
+        targets: &[ActionCatalogTarget {
+            name: "RouteTables",
+            resource_type: "aws:ec2:route-table",
+        }],
+        // The reference lists several route-mutating EC2 calls for this action rather than one
+        // primary call, so this table records none rather than one it would guess: the
+        // privileges gate shows nothing about an action whose entry records no permission.
+        permissions: &[],
+    },
+    ActionCatalogEntry {
+        id: "aws:network:transit-gateway-disrupt-cross-region-connectivity",
+        description: "Disrupt traffic between the target transit gateways and the specified \
+                      Region.",
+        parameters: &[
+            ActionCatalogParameter {
+                name: "duration",
+                description: "The duration of the action, in ISO 8601 format.",
+                required: true,
+            },
+            ActionCatalogParameter {
+                name: "region",
+                description: "The Region whose traffic is disrupted.",
+                required: true,
+            },
+        ],
+        targets: &[ActionCatalogTarget {
+            name: "TransitGateways",
+            resource_type: "aws:ec2:transit-gateway",
+        }],
+        // See `aws:network:route-table-disrupt-connectivity` for why no permission is recorded.
+        permissions: &[],
     },
     ActionCatalogEntry {
         id: "aws:rds:failover-db-cluster",
@@ -3216,6 +3891,20 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             resource_type: "aws:rds:db",
         }],
         permissions: &["rds:RebootDBInstance"],
+    },
+    ActionCatalogEntry {
+        id: "aws:s3:bucket-pause-replication",
+        description: "Pause replication from the target S3 buckets.",
+        parameters: &[ActionCatalogParameter {
+            name: "duration",
+            description: "The duration of the action, in ISO 8601 format.",
+            required: true,
+        }],
+        targets: &[ActionCatalogTarget {
+            name: "Buckets",
+            resource_type: "aws:s3:bucket",
+        }],
+        permissions: &["s3:PauseReplication"],
     },
     ActionCatalogEntry {
         id: "aws:ssm:send-command",

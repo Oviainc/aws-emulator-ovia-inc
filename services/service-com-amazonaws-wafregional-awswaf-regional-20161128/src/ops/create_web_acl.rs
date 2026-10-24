@@ -2,9 +2,18 @@
 
 //! @op CreateWebACL
 //!
-//! Mints a `WebACL` record in this service's state and answers the projection of what
-//! was stored, so `GetWebACL` reads back the same web ACL. The change token the request
-//! carries is consumed here, as it is by every mutating AWS WAF Classic call.
+//! Refuses every request to create a new AWS WAF Classic web ACL: that service reached
+//! END OF SUPPORT on 2025-09-30, and its control plane answers a `CreateWebACL` —
+//! however well formed — with `WAFBadRequestException` (HTTP 400). The refusal is a
+//! property of the SERVICE rather than of the request, so it is answered after this
+//! request's own per-parameter validation (a disallowed `MetricName`, a `DefaultAction`
+//! of the one value a default action may not carry) and before anything else: nothing
+//! is stored, and the change token the request carries is left unconsumed, so a client
+//! that retries sees the same refusal rather than a stale-token one.
+//!
+//! The web ACLs this service still holds are the ones that existed before that date;
+//! `GetWebACL`, `ListWebACLs`, `UpdateWebACL` and `DeleteWebACL` go on reading and
+//! writing them.
 //!
 //! ## Shape of an operation
 //!
@@ -226,16 +235,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The region the minted `WebACLArn` names comes from the caller's SigV4
-        // credential scope; it is read before the store is locked.
-        let region = crate::state::region_of(ctx.parts());
-
-        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
-            CreateWebACLErrorModeled::WAFInternalErrorException(WAFInternalErrorException {
-                message: Some(crate::state::MESSAGE_INTERNAL_ERROR.to_string()),
-            })
-        })?;
-        let mut state = state.lock();
+        // This operation answers out of the SERVICE's lifecycle, not out of stored
+        // state: no web ACL can be created, so nothing here reads or writes the store.
+        // The engine and the request metadata are bound so the constructor seam (and
+        // the `ctx` every other handler reads) stays exactly as it is for the handlers
+        // beside this one.
+        let _ = (ctx, &self.engine);
 
         // `MetricName` "can contain only alphanumeric characters (A-Z, a-z, 0-9) ... It
         // can't contain whitespace or metric names reserved for AWS WAF, including
@@ -258,6 +263,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // an invalid value" is one of the cases `WAFInvalidParameterException`
         // documents, and refusing here leaves the request's change token unused:
         // nothing was changed.
+        //
+        // This per-parameter refusal comes BEFORE the lifecycle refusal below, which is
+        // the order AWS WAF Classic answers in: a request carrying this value is
+        // refused as an invalid parameter, and only a request whose parameters are all
+        // acceptable reaches the end-of-support refusal.
         if input.default_action.r#type == DEFAULT_ACTION_EXCLUDED {
             return Err(invalid_parameter(
                 FIELD_WAF_ACTION,
@@ -266,66 +276,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // Two resource limits bound the state one caller can grow: how many WebACL
-        // records the account holds, and how many tags one record retains. Both are
-        // checked while the same guard is held, before anything is stored.
-        let requested_tags = input.tags.as_ref().map_or(0, Vec::len);
-        if state.web_acls.len() >= crate::state::MAX_WEB_ACLS
-            || requested_tags > crate::state::MAX_TAGS_PER_RESOURCE
-        {
-            return Err(CreateWebACLErrorModeled::WAFLimitsExceededException(
-                WAFLimitsExceededException {
-                    message: Some(crate::state::MESSAGE_LIMITS_EXCEEDED.to_string()),
-                },
-            )
-            .into());
-        }
-
-        // The change-token protocol every mutating AWS WAF Classic call follows: the
-        // token must be one `GetChangeToken` minted and no other mutating call has
-        // used, since "each create, update, or delete request must use a unique change
-        // token".
-        if !state.consume_change_token(&input.change_token) {
-            return Err(CreateWebACLErrorModeled::WAFStaleDataException(
-                WAFStaleDataException {
-                    message: Some(crate::state::MESSAGE_STALE_DATA.to_string()),
-                },
-            )
-            .into());
-        }
-
-        // A fresh id per call: `ResourceName` carries no uniqueness constraint, so two
-        // WebACLs created with the same `Name` are two distinct resources, each stored
-        // under its own `WebACLId`.
-        let web_acl_id = state.mint_id();
-        let web_acl_arn = crate::state::web_acl_arn(&region, &web_acl_id);
-        // Tags are a key→value set, so a repeated key is one tag whose value is the
-        // last the request gave for it. The count was bounded above, and the modelled
-        // `TagKey`/`TagValue` lengths bound each entry, so the retained tag state per
-        // record is bounded.
-        let tags: std::collections::BTreeMap<String, String> = input
-            .tags
-            .unwrap_or_default()
-            .into_iter()
-            .map(|tag| (tag.key, tag.value))
-            .collect();
-        // A new WebACL activates no rules: they arrive through `UpdateWebACL`.
-        let entry = crate::state::WebACLEntry::new(
-            web_acl_id.clone(),
-            input.name,
-            input.metric_name,
-            input.default_action.r#type,
-            web_acl_arn,
-            tags,
-        );
-        // The response is the projection of the record that was STORED, not of the
-        // request.
-        let web_acl = entry.to_modelled();
-        state.web_acls.insert(web_acl_id, entry);
-
-        Ok(CreateWebACLOutput {
-            web_acl: Some(web_acl),
-            change_token: Some(input.change_token),
-        })
+        // AWS WAF Classic is past its end of support, so its control plane admits no
+        // NEW web ACL: every request that gets this far is refused with
+        // `WAFBadRequestException` (HTTP 400), whatever `Name`, `MetricName`,
+        // `DefaultAction` or `Tags` it carries and however often it is retried — see
+        // [`crate::state::MESSAGE_END_OF_SUPPORT`].
+        //
+        // The refusal is answered BEFORE any state is touched, so the request leaves no
+        // WebACL behind, spends no id and consumes no change token: `ListWebACLs` and
+        // `GetWebACL` report exactly the web ACLs that existed before the call, and the
+        // token stays usable by the mutating call the caller minted it for.
+        Err(
+            CreateWebACLErrorModeled::WAFBadRequestException(WAFBadRequestException {
+                message: Some(crate::state::MESSAGE_END_OF_SUPPORT.to_string()),
+            })
+            .into(),
+        )
     }
 }

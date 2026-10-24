@@ -346,7 +346,7 @@ pub fn rule_group_document_breach(group_type: &str, group: &RuleGroup) -> Option
 /// specify the following operations in the Actions section of the statement").
 ///
 /// It is a PERMITTED set, not a required one: a statement may grant any non-empty
-/// subset of it (see [`resource_policy_breach`]).
+/// subset of it (see [`resource_policy_matches_permissions`]).
 pub const RULE_GROUP_POLICY_ACTIONS: [&str; 3] = [
     "network-firewall:ListRuleGroups",
     "network-firewall:CreateFirewallPolicy",
@@ -464,8 +464,8 @@ pub enum TagWriteBreach {
     TooManyTags(usize),
 }
 
-/// Why `document` is not a resource policy this service accepts for a resource of
-/// `kind`, or `None` when it validates.
+/// Whether `document` is a resource policy this service accepts for a resource of
+/// `kind`.
 ///
 /// A Network Firewall resource policy is validated against the actions the shared
 /// resource's TYPE admits ([`SharedResource::permitted_actions`]), and the rule is
@@ -478,35 +478,33 @@ pub enum TagWriteBreach {
 /// (`InvalidResourcePolicyException`, "The policy statement failed validation.").
 /// The document itself must also be a policy: a JSON object with at least one
 /// `Allow` statement that names a principal and an action.
-pub fn resource_policy_breach(document: &str, kind: SharedResource) -> Option<String> {
-    let parsed: ::serde_json::Value = match ::serde_json::from_str(document) {
-        Ok(parsed) => parsed,
-        Err(error) => return Some(format!("The policy is not valid JSON: {error}")),
+///
+/// The answer is a yes/no on purpose: every way of failing is answered with the
+/// one [`INVALID_RESOURCE_POLICY_MESSAGE`], so no detail of the submitted
+/// document — an offending action, a parse position — can reach the wire.
+pub fn resource_policy_matches_permissions(document: &str, kind: SharedResource) -> bool {
+    let Ok(parsed) = ::serde_json::from_str::<::serde_json::Value>(document) else {
+        return false;
     };
     if !parsed.is_object() {
-        return Some("The policy must be a JSON object.".to_string());
+        return false;
     }
     let statements: Vec<&::serde_json::Value> = match parsed.get("Statement") {
         Some(::serde_json::Value::Array(statements)) => statements.iter().collect(),
         Some(statement) if statement.is_object() => vec![statement],
-        _ => return Some("The policy must carry a Statement.".to_string()),
+        _ => return false,
     };
     if statements.is_empty() {
-        return Some("The policy's Statement must carry at least one statement.".to_string());
+        return false;
     }
 
     let mut granted: ::std::collections::BTreeSet<String> = ::std::collections::BTreeSet::new();
     for statement in statements {
-        match statement.get("Effect").and_then(::serde_json::Value::as_str) {
-            Some("Allow") => {}
-            _ => {
-                return Some(
-                    "Every statement in the policy must have the Effect Allow.".to_string(),
-                )
-            }
+        if statement.get("Effect").and_then(::serde_json::Value::as_str) != Some("Allow") {
+            return false;
         }
         if statement.get("Principal").is_none() {
-            return Some("Every statement in the policy must name a Principal.".to_string());
+            return false;
         }
         match statement.get("Action") {
             Some(::serde_json::Value::String(action)) => {
@@ -518,33 +516,18 @@ pub fn resource_policy_breach(document: &str, kind: SharedResource) -> Option<St
                         Some(action) => {
                             granted.insert(action.to_string());
                         }
-                        None => {
-                            return Some(
-                                "Every entry of a statement's Action must be a string.".to_string(),
-                            )
-                        }
+                        None => return false,
                     }
                 }
             }
-            _ => return Some("Every statement in the policy must name an Action.".to_string()),
+            _ => return false,
         }
     }
 
     let permitted = kind.permitted_actions();
-    let unexpected: Vec<&str> = granted
+    granted
         .iter()
-        .map(String::as_str)
-        .filter(|action| !permitted.contains(action))
-        .collect();
-    if unexpected.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "The policy statement failed validation. These actions cannot be granted on this \
-         resource: [{}]; a statement for this resource may grant only [{}].",
-        unexpected.join(", "),
-        permitted.join(", ")
-    ))
+        .all(|action| permitted.contains(&action.as_str()))
 }
 
 /// Sixteen bytes nothing else in this process will produce again: the first half
@@ -1107,6 +1090,39 @@ pub const INVALID_TOKEN_MESSAGE: &str = "Update token isn't valid.";
 pub const ZONE_AMBIGUOUS_MESSAGE: &str =
     "Specify either AvailabilityZone or AvailabilityZoneId, not both.";
 
+/// What a delete refused because the object is protected against deletion
+/// carries.
+///
+/// Resource-agnostic in the same way [`RESOURCE_NOT_FOUND_MESSAGE`] is: the
+/// refusal is a property of the protection setting, not of the request, so it
+/// names "the object" and neither the resource, nor its type, nor its name. The
+/// model fixes the classification and the status only
+/// (`smithy_query(query="shape",shape="InvalidOperationException")`: client
+/// error, HTTP 400, member `Message`), so the text is the recorded one.
+pub const DELETE_PROTECTED_MESSAGE: &str =
+    "Unable to delete the object because delete protection is enabled";
+
+/// What a delete refused because another resource still references the object
+/// carries — the same resource-agnostic family as [`DELETE_PROTECTED_MESSAGE`],
+/// naming neither the referencing resources nor how many there are.
+pub const DELETE_IN_USE_MESSAGE: &str = "Unable to delete the object because it is still in use";
+
+/// What EVERY `InvalidResourcePolicyException` this service answers carries.
+///
+/// Network Firewall shares a rule group or a firewall policy through Resource
+/// Access Manager, so a submitted document is accepted only when it matches the
+/// RAM managed permission for that resource type
+/// ([`SharedResource::permitted_actions`]); one that does not — whether it is not
+/// a policy document at all or grants an action the permission does not carry —
+/// is refused with this one constant. It carries nothing from the request: not
+/// the offending actions, not the ones the permission allows, not the resource.
+/// The model fixes the classification and the status only
+/// (`smithy_query(query="shape",shape="InvalidResourcePolicyException")`: client
+/// error, HTTP 400, "The policy statement failed validation."), so the text is
+/// the recorded one.
+pub const INVALID_RESOURCE_POLICY_MESSAGE: &str =
+    "The supplied policy does not match RAM managed permissions.";
+
 /// A refusal whose message IS built from the request: a fixed stem, then the
 /// offending value in parameter brackets.
 ///
@@ -1115,6 +1131,37 @@ pub const ZONE_AMBIGUOUS_MESSAGE: &str =
 /// check failed and reads the bracketed value to learn which input tripped it.
 pub fn parameter_message(stem: &str, parameter: &str) -> String {
     format!("{stem}, parameter: [{parameter}]")
+}
+
+/// The same built shape with the request path the offending value arrived on
+/// appended as context: `<stem>, parameter: [<value>], context: <path>`.
+///
+/// A check that reads one member of a nested input document reports WHERE it
+/// looked as well as what it found, so a client can tell which part of a
+/// submitted document tripped the check without parsing prose. Everything before
+/// the brackets is fixed per check; only the bracketed value and the path vary.
+pub fn parameter_context_message(stem: &str, parameter: &str, context: &str) -> String {
+    format!("{}, context: {context}", parameter_message(stem, parameter))
+}
+
+/// What a rule group whose rules need more capacity than is available to them is
+/// refused with, on the create path and on the update path alike.
+///
+/// The refusal is one of the few this service builds FROM the request, and it
+/// takes the built shape with a context ([`parameter_context_message`]): the stem
+/// names the `RulesSource` member the rules were given in and the check that
+/// failed, the brackets carry the capacity those rules REQUIRE (what a client
+/// needs in order to retry with a sufficient `Capacity`, or to decide to split
+/// the rules when the capacity is fixed), and the context is the input path that
+/// member sits on. The capacity the rule group declares is not in the message:
+/// the caller sent it, and `RuleGroupResponse$Capacity` reports it back.
+pub fn capacity_exceeded_message(group: &RuleGroup, required: i32) -> String {
+    let member = rules_source_member(group);
+    parameter_context_message(
+        &format!("{member} capacity exceeded"),
+        &required.to_string(),
+        &format!("RulesSource.{member}"),
+    )
 }
 
 /// The refusal for a reference naming an ARN no stored resource of `kind`

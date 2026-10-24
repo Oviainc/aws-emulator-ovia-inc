@@ -27,6 +27,31 @@ pub const ARN_NAMESPACE: &str = "neptune-graph";
 /// ever sleeps for it — the due instant is stored and compared on read.
 pub const PROVISIONING_SPAN: Duration = Duration::from_millis(500);
 
+/// How long after the `CancelQuery` that starts it a query's cancellation is owed: the
+/// query answers `CANCELLING` until this span has passed, then the next read finds it
+/// terminated and no longer reports it.
+///
+/// The real service stops a query as soon as its engine notices the cancel; this
+/// emulator picks a span inside the emulator-wide 250ms..750ms band for a transition
+/// the clock owes, so a caller that reads the query straight after cancelling it still
+/// observes the transient `CANCELLING` state. No handler ever sleeps for it — the due
+/// instant is stored and compared on read.
+pub const CANCELLATION_SPAN: Duration = Duration::from_millis(500);
+
+/// How long after its admission a query is over on its own: the span after which an
+/// admitted query has finished, so the store stops reporting it even if nobody ever
+/// cancels it.
+///
+/// An in-flight query is a transient record, not a resource a caller deletes: without
+/// a due end instant a query admitted by a request would sit in the store for the life
+/// of the process. The real service's queries run for as long as their work takes;
+/// this emulator picks a span inside the emulator-wide 250ms..750ms band for a
+/// transition the clock owes, so a caller that reads a query straight after admitting
+/// it still sees it in flight. It is a bound on how long a RECORD is kept, not a claim
+/// about work: nothing executes a query here, and no result is ever reported for one.
+/// No handler sleeps for it — the due instant is stored and compared on read.
+pub const QUERY_RUN_SPAN: Duration = Duration::from_millis(750);
+
 /// The lifecycle statuses this slice of the emulator puts a graph into.
 ///
 /// Every variant's wire form is one of the modelled `GraphStatus` values
@@ -218,6 +243,151 @@ impl Snapshot {
     }
 }
 
+/// The states this slice of the emulator puts an in-flight query into.
+///
+/// Every variant's wire form is one of the modelled `QueryState` values
+/// (`crate::ops::types::QUERY_STATE_VALUES`), which is the whole set: the model names
+/// no terminal state, because a query that has finished — on its own or through
+/// `CancelQuery` — stops being a reportable query at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueryState {
+    /// The query has been accepted but has not started executing yet.
+    Waiting,
+    /// The query is executing.
+    Running,
+    /// `CancelQuery` has accepted a cancel; the query is stopping.
+    Cancelling,
+}
+
+impl QueryState {
+    /// This state as the modelled `QueryState` enum value.
+    pub const fn as_wire(self) -> &'static str {
+        match self {
+            Self::Waiting => "WAITING",
+            Self::Running => "RUNNING",
+            Self::Cancelling => "CANCELLING",
+        }
+    }
+}
+
+/// One in-flight query on a graph: what `GetQuery` reports about it, plus the
+/// termination the clock owes it once a cancel has been accepted.
+///
+/// A query is not a resource that outlives its graph: it exists only while it is
+/// waiting, running or stopping, so the record carries the graph it runs on — which is
+/// also where the store files it — and is dropped both when that graph goes and when
+/// the query terminates.
+#[derive(Debug, Clone)]
+pub struct Query {
+    /// The id the query is addressed by. The model puts no pattern on `queryId`
+    /// (`smithy_query(query="operation",operation="GetQuery")`: `String`), so whatever
+    /// the operation that admitted the query minted is what identifies it here.
+    pub id: String,
+    /// The graph the query runs on, kept as that graph's id so a query is only ever
+    /// found through the graph the request named.
+    pub graph_id: String,
+    /// The query text, as `GetQuery`'s `queryString` reports it.
+    pub query_string: String,
+    pub state: QueryState,
+    /// When the query was accepted: the start of the span `waited` measures.
+    pub submitted_at: Instant,
+    /// When the query started executing: the end of the span `waited` measures and the
+    /// start of the span `elapsed` measures. `None` while the query is still waiting.
+    pub started_at: Option<Instant>,
+    /// When the accepted cancellation falls due, after which the query has terminated
+    /// and is no longer reported. `None` while nothing has been cancelled.
+    pub terminates_at: Option<Instant>,
+    /// When the query is over on its own ([`QUERY_RUN_SPAN`] after its admission),
+    /// whether or not it is ever cancelled. A query terminates at the EARLIER of this
+    /// instant and [`Self::terminates_at`], so no admitted query stays in the store
+    /// indefinitely and a cancel can only shorten its life, never extend it.
+    pub completes_at: Instant,
+}
+
+impl Query {
+    /// A query accepted at `now` and executing from `now`: the state a query admitted
+    /// on a graph with capacity for it is in.
+    pub fn running(
+        id: impl Into<String>,
+        graph_id: impl Into<String>,
+        query_string: impl Into<String>,
+        now: Instant,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            graph_id: graph_id.into(),
+            query_string: query_string.into(),
+            state: QueryState::Running,
+            submitted_at: now,
+            started_at: Some(now),
+            terminates_at: None,
+            completes_at: now + QUERY_RUN_SPAN,
+        }
+    }
+
+    /// A query accepted at `now` that has not started executing yet.
+    pub fn waiting(
+        id: impl Into<String>,
+        graph_id: impl Into<String>,
+        query_string: impl Into<String>,
+        now: Instant,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            graph_id: graph_id.into(),
+            query_string: query_string.into(),
+            state: QueryState::Waiting,
+            submitted_at: now,
+            started_at: None,
+            terminates_at: None,
+            completes_at: now + QUERY_RUN_SPAN,
+        }
+    }
+
+    /// Accept a cancel at `now`: the query reports `CANCELLING` and terminates
+    /// [`CANCELLATION_SPAN`] later.
+    ///
+    /// IDEMPOTENT, because `CancelQuery` is (`smithy_query(query="operation",
+    /// operation="CancelQuery")`: `@idempotent`): a cancel of a query already stopping
+    /// leaves the termination it is already owed where it is, so repeating the request
+    /// cannot keep the query alive.
+    pub fn begin_cancellation(&mut self, now: Instant) {
+        if self.state == QueryState::Cancelling {
+            return;
+        }
+        self.state = QueryState::Cancelling;
+        self.terminates_at = Some(now + CANCELLATION_SPAN);
+    }
+
+    /// Whether this query is over: either the cancellation the clock owes it has fallen
+    /// due, or it has run out its own [`QUERY_RUN_SPAN`]. Once it is, the query has
+    /// stopped and is no longer a query the service reports.
+    pub fn has_terminated(&self, now: Instant) -> bool {
+        now >= self.completes_at || self.terminates_at.is_some_and(|due| now >= due)
+    }
+
+    /// How long the query waited before executing, in milliseconds: the span from its
+    /// acceptance to its start, or to `now` while it is still waiting.
+    pub fn waited_millis(&self, now: Instant) -> i32 {
+        millis_between(self.submitted_at, self.started_at.unwrap_or(now))
+    }
+
+    /// How long the query has been executing, in milliseconds. Zero while it is still
+    /// waiting: nothing has run yet.
+    pub fn elapsed_millis(&self, now: Instant) -> i32 {
+        self.started_at
+            .map_or(0, |started| millis_between(started, now))
+    }
+}
+
+/// The milliseconds from `from` to `to`, saturating into the `Integer` the model
+/// reports `waited` and `elapsed` as. Zero when `to` precedes `from`, which
+/// [`Instant`] arithmetic makes unreachable here but which no caller has to reason
+/// about.
+fn millis_between(from: Instant, to: Instant) -> i32 {
+    i32::try_from(to.saturating_duration_since(from).as_millis()).unwrap_or(i32::MAX)
+}
+
 /// Per-service state for com-amazonaws-neptunegraph-amazonneptunegraph. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsNeptunegraphAmazonneptunegraphState {
@@ -233,6 +403,14 @@ pub struct ComAmazonawsNeptunegraphAmazonneptunegraphState {
     /// `snapshotName` -> snapshot id: the uniqueness index behind
     /// `CreateGraphSnapshot`'s `ConflictException`.
     pub snapshot_names: HashMap<String, String>,
+    /// Every in-flight query, keyed by the graph it runs on and then by its own id. A
+    /// `BTreeMap` of `BTreeMap`s so `ListQueries` — which lists the queries of ONE
+    /// graph — has one stable total order to report, and so a query id is resolved
+    /// within the graph that admitted it: the query namespace is per graph, and the
+    /// same id on another graph names nothing. A query is admitted by the operation
+    /// that runs it and leaves this map when it terminates, so the map holds exactly
+    /// the queries `GetQuery`, `ListQueries` and `CancelQuery` can still name.
+    pub queries: BTreeMap<String, BTreeMap<String, Query>>,
     /// Feeds the graph-id generator, so ids are unique within a store.
     pub id_counter: u64,
     /// Feeds the snapshot-id generator, so ids are unique within a store.
@@ -277,11 +455,94 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
         self.snapshots.insert(snapshot.id.clone(), snapshot);
     }
 
-    /// Drop a graph and its name index entry.
+    /// Drop a graph, its name index entry and every query that was running on it.
+    ///
+    /// A query exists only while the graph it runs on does, so a deleted graph takes
+    /// its in-flight queries with it rather than leaving entries a later `GetQuery` on
+    /// a re-minted id could find.
     pub fn remove_graph(&mut self, id: &str) -> Option<Graph> {
         let graph = self.graphs.remove(id)?;
         self.graph_names.remove(&graph.name);
+        self.queries.remove(id);
         Some(graph)
+    }
+
+    /// Store a newly accepted query, under the graph it runs on.
+    ///
+    /// Fallible at the GROWTH SITE, the way the graph and snapshot caps are enforced by
+    /// the operations that mint those: the query map grows by one entry per admitted
+    /// query in a store shared process-wide, so an admitting operation has to be told
+    /// when the store is full ([`MAX_QUERIES`]) or the text is longer than one record
+    /// may carry ([`MAX_QUERY_STRING_CHARS`]) rather than growing the emulator's memory
+    /// without bound. `Err` carries the message, naming the bound it broke.
+    ///
+    /// Replacing a query already filed under the same id on the same graph is not
+    /// growth, so it is not refused by the count bound.
+    pub fn insert_query(&mut self, query: Query) -> Result<(), String> {
+        if query.query_string.chars().count() > MAX_QUERY_STRING_CHARS {
+            return Err(format!(
+                "queryString may carry at most {MAX_QUERY_STRING_CHARS} characters, got {}",
+                query.query_string.chars().count()
+            ));
+        }
+        let replaces_an_entry = self
+            .queries
+            .get(&query.graph_id)
+            .is_some_and(|queries| queries.contains_key(&query.id));
+        if !replaces_an_entry && self.query_count() >= MAX_QUERIES {
+            return Err(format!(
+                "this emulator holds at most {MAX_QUERIES} queries in flight"
+            ));
+        }
+        self.queries
+            .entry(query.graph_id.clone())
+            .or_default()
+            .insert(query.id.clone(), query);
+        Ok(())
+    }
+
+    /// How many queries this store holds in flight, across every graph.
+    pub fn query_count(&self) -> usize {
+        self.queries.values().map(BTreeMap::len).sum()
+    }
+
+    /// Drop every query the clock has made due: each one whose accepted cancellation
+    /// has fallen due, and each one that has run out its own [`QUERY_RUN_SPAN`].
+    ///
+    /// The same one write a reporting operation may make as [`Graph::settle`]: each of
+    /// those queries was over at that instant whether or not anybody called, so
+    /// reclaiming it on read is bookkeeping rather than a state change caused by the
+    /// read. It is also what keeps the query map from growing with queries nobody
+    /// cancels.
+    pub fn reap_terminated_queries(&mut self, now: Instant) {
+        for queries in self.queries.values_mut() {
+            queries.retain(|_, query| !query.has_terminated(now));
+        }
+        // A graph with no queries left holds no entry, so the outer map does not grow
+        // one bucket per graph that ever ran a query.
+        self.queries.retain(|_, queries| !queries.is_empty());
+    }
+
+    /// Apply every query termination the clock has made due, then borrow the one query
+    /// `query_id` names ON the graph `graph_id` names.
+    ///
+    /// The lookup is scoped to the graph because a query is addressed as a query of one
+    /// graph: the same id against another graph names nothing.
+    pub fn live_query(&mut self, graph_id: &str, query_id: &str, now: Instant) -> Option<&Query> {
+        self.reap_terminated_queries(now);
+        self.queries.get(graph_id)?.get(query_id)
+    }
+
+    /// [`Self::live_query`], mutably: what `CancelQuery` writes the accepted
+    /// cancellation through.
+    pub fn live_query_mut(
+        &mut self,
+        graph_id: &str,
+        query_id: &str,
+        now: Instant,
+    ) -> Option<&mut Query> {
+        self.reap_terminated_queries(now);
+        self.queries.get_mut(graph_id)?.get_mut(query_id)
     }
 
     /// Apply every provisioning transition the clock has made due, then borrow one
@@ -369,7 +630,10 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
 // the growth site carries a cap and nothing caller-sized reaches the store unchecked.
 // The product is finite: at most `MAX_GRAPHS` graphs, each holding a `graphName` of at
 // most 63 characters, a `kmsKeyIdentifier` of at most 1024, and at most `MAX_TAGS` tags
-// of at most `MAX_TAG_KEY_CHARS` / `MAX_TAG_VALUE_CHARS` characters.
+// of at most `MAX_TAG_KEY_CHARS` / `MAX_TAG_VALUE_CHARS` characters. A query is the one
+// record no caller has to reclaim: it is capped at `MAX_QUERIES` entries of at most
+// `MAX_QUERY_STRING_CHARS` characters AND every entry carries a due end instant, so the
+// query map shrinks on its own as well.
 // ---------------------------------------------------------------------------
 
 /// The most graphs one store holds.
@@ -390,6 +654,26 @@ pub const MAX_GRAPHS: usize = 100;
 /// with the `ServiceQuotaExceededException` (402) the model declares for exactly
 /// this condition. Set well above any realistic use of a local emulator.
 pub const MAX_SNAPSHOTS: usize = 100;
+
+/// The most queries one store holds in flight, across every graph.
+///
+/// Emulator resource guard, NOT a quota AWS publishes, and the same bound
+/// [`MAX_GRAPHS`] puts on the graph map: the store is shared process-wide and grows by
+/// one entry per admitted query, so without a ceiling repeated query requests grow the
+/// emulator's memory without bound. Reaching it is reported by the operation that
+/// admits a query, from the message [`ComAmazonawsNeptunegraphAmazonneptunegraphState::insert_query`]
+/// hands back. Set well above any realistic use of a local emulator, and queries also
+/// leave the store on their own as the clock makes their end due.
+pub const MAX_QUERIES: usize = 100;
+
+/// The most characters one stored query's text may carry.
+///
+/// Emulator resource guard, NOT a quota AWS publishes: `queryString` is modelled as an
+/// unconstrained `String` (`smithy_query(query="operation",operation="ExecuteQuery")`),
+/// so without a ceiling one request could store an arbitrarily large text that
+/// `GetQuery` then keeps reporting. Set well above any query a local emulator is asked
+/// to run.
+pub const MAX_QUERY_STRING_CHARS: usize = 65_536;
 
 /// AWS's tagging limit of 50 tags per resource, which this service models as
 /// `TagMap`'s `@length(0..50)`.
@@ -521,6 +805,21 @@ pub fn snapshot_not_found(snapshot_identifier: &str) -> ResourceNotFoundExceptio
             "No snapshot found for customer [{}] with snapshot id [{snapshot_identifier}]",
             caller_account_id()
         ),
+    }
+}
+
+/// The modelled `ResourceNotFoundException` for a `queryId` that names no query in
+/// flight on the graph the request named.
+///
+/// A query is addressed as a query of one graph, so the failure names the graph the
+/// lookup was resolved against beside the query id the request asked for — which is
+/// what lets a caller tell a query that has already finished apart from one running on
+/// another graph. The modelled shape carries only `message`
+/// (`smithy_query(query="shape",shape="ResourceNotFoundException")`), so the message is
+/// the only place either fact can go.
+pub fn query_not_found(graph_identifier: &str, query_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: format!("No query found on graph [{graph_identifier}] with query id [{query_id}]"),
     }
 }
 
@@ -788,6 +1087,113 @@ mod tests {
             );
             assert!(seen.insert(id.clone()), "id {id:?}: minted twice");
         }
+    }
+
+    /// The query store is BOUNDED at its growth site: it refuses a query beyond
+    /// [`MAX_QUERIES`] and a text longer than [`MAX_QUERY_STRING_CHARS`], and it
+    /// reclaims a query the clock has made due even when nobody cancels it.
+    #[test]
+    fn the_query_store_is_bounded_at_its_growth_site() {
+        let mut state = ComAmazonawsNeptunegraphAmazonneptunegraphState::default();
+        let now = Instant::now();
+
+        // Filling the store to the cap is accepted, spread over two graphs so the
+        // bound is on the store rather than on one graph's bucket.
+        for index in 0..MAX_QUERIES {
+            let graph = if index % 2 == 0 { "g-0000000000" } else { "g-0000000001" };
+            let result = state.insert_query(Query::running(
+                format!("q-{index}"),
+                graph,
+                "MATCH (n) RETURN n",
+                now,
+            ));
+            assert!(
+                result.is_ok(),
+                "case query {index}: expected the store to accept it, got {result:?}"
+            );
+        }
+        assert_eq!(
+            state.query_count(),
+            MAX_QUERIES,
+            "case filled to the cap: expected {MAX_QUERIES} queries, got {}",
+            state.query_count()
+        );
+
+        // One more is refused, and replacing an entry already filed is not growth.
+        let over = state.insert_query(Query::running("q-one-too-many", "g-0000000000", "RETURN 1", now));
+        assert!(
+            over.is_err(),
+            "case one past the cap: expected a refusal, got {over:?}"
+        );
+        let replacement = state.insert_query(Query::running("q-0", "g-0000000000", "RETURN 2", now));
+        assert!(
+            replacement.is_ok(),
+            "case replacing an entry at the cap: expected acceptance, got {replacement:?}"
+        );
+        assert_eq!(
+            state.query_count(),
+            MAX_QUERIES,
+            "case replacing an entry at the cap: the count must not grow, got {}",
+            state.query_count()
+        );
+
+        // A text at the bound is accepted and one past it is refused.
+        let mut empty = ComAmazonawsNeptunegraphAmazonneptunegraphState::default();
+        for (case, chars, accepted) in [
+            ("one character", 1, true),
+            ("at the bound", MAX_QUERY_STRING_CHARS, true),
+            ("one past the bound", MAX_QUERY_STRING_CHARS + 1, false),
+        ] {
+            let text = "x".repeat(chars);
+            let result = empty.insert_query(Query::running("q-sized", "g-0000000000", text, now));
+            assert_eq!(
+                result.is_ok(),
+                accepted,
+                "case {case:?}: expected accepted={accepted}, got {result:?}"
+            );
+        }
+
+        // And the clock reclaims what nobody cancels: every query admitted at `now` is
+        // over a run span later, with no handler having to sleep for it.
+        state.reap_terminated_queries(now + QUERY_RUN_SPAN);
+        assert_eq!(
+            state.query_count(),
+            0,
+            "case run span out: expected an empty store, got {}",
+            state.query_count()
+        );
+        assert!(
+            state.queries.is_empty(),
+            "case run span out: the per-graph buckets must go too, got {:?}",
+            state.queries.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// A cancel can only SHORTEN a query's life: it brings the end forward when it is
+    /// accepted early, and a late cancel cannot carry the query past the run span it
+    /// was already going to end at.
+    #[test]
+    fn a_cancel_only_shortens_a_querys_life() {
+        let now = Instant::now();
+        let tick = Duration::from_millis(1);
+
+        let mut early = Query::running("q-early", "g-0000000000", "RETURN 1", now);
+        early.begin_cancellation(now);
+        assert!(
+            !early.has_terminated(now + CANCELLATION_SPAN - tick),
+            "case cancelled at once: the span is never zero, so the query is still stopping"
+        );
+        assert!(
+            early.has_terminated(now + CANCELLATION_SPAN),
+            "case cancelled at once: expected the cancellation to end it a span later"
+        );
+
+        let mut late = Query::running("q-late", "g-0000000000", "RETURN 1", now);
+        late.begin_cancellation(now + QUERY_RUN_SPAN - tick);
+        assert!(
+            late.has_terminated(now + QUERY_RUN_SPAN),
+            "case cancelled late: a cancel must not carry the query past its run span"
+        );
     }
 
     /// The id shape test, over values that break each clause of the pattern.

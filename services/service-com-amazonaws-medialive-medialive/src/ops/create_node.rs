@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateNode
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateNode`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateNode::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates one MediaLive Anywhere node in the cluster the request is addressed
+//! to — a cluster the account must already hold, since the node goes "in the
+//! specified Cluster": the node slice of the store mints its `Id`, builds its
+//! `Arn` from the signed region and that id, records the cluster, the name, the
+//! role and the interface mappings the request carried, and starts it in
+//! `CREATED` — the state the real service answers a create with, and the one a
+//! node stays in here, because what moves it on is the registration script run
+//! on the node's own hardware (see `crate::state::nodes`).
 //!
 //! ## Shape of an operation
 //!
@@ -181,18 +181,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateNode` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateNodeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateNode"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+        state.settle(now);
+
+        // A retried create (the same `@idempotencyToken` `RequestId`, presented
+        // to the same cluster's endpoint) must answer with the node that one
+        // created, not a second node.
+        if let Some(existing) = input
+            .request_id
+            .as_deref()
+            .and_then(|token| state.node_for_token(&input.cluster_id, token))
+            .map(str::to_string)
+        {
+            let node = state
+                .node_description(&input.cluster_id, &existing)
+                .ok_or_else(unavailable)?;
+            return Ok(crate::state::node_description_output!(CreateNodeOutput, node));
+        }
+
+        // The cluster the node goes in, the store, the mint and the bound on the
+        // caller-chosen mapping list all live in the node slice, so this handler
+        // only turns its refusal into one of this operation's own modelled
+        // errors.
+        let id = state
+            .insert_node(
+                &region,
+                &input.cluster_id,
+                input.name,
+                input.role,
+                input.node_interface_mappings.unwrap_or_default(),
+                input.tags.unwrap_or_default(),
+            )
+            .map_err(|refused| refusal(refused, &input.cluster_id))?;
+        if let Some(token) = input.request_id {
+            // Bounded, evicting write: a caller-chosen token can neither
+            // accumulate past the cap nor outlive the node it created.
+            state.record_node_token(&input.cluster_id, token, &id);
+        }
+
+        // Read back out of the store, so the response reports the node that was
+        // written rather than one assembled from this request.
+        let node = state
+            .node_description(&input.cluster_id, &id)
+            .ok_or_else(unavailable)?;
+        Ok(crate::state::node_description_output!(CreateNodeOutput, node))
     }
+}
+
+/// One [`crate::state::NodeRefusal`] as this operation's own modelled error.
+///
+/// `CreateNode` models NO `NotFoundException` (`smithy_query(query="operation",
+/// operation="CreateNode")`), so a `ClusterId` naming no stored cluster is
+/// answered with the modelled client error for a request that cannot be
+/// satisfied, carrying the same wording every reader of this service uses for a
+/// resource that is not there — which is what `CreateMultiplexProgram` does with
+/// a `MultiplexId` nothing holds. A request that carries more interface mappings
+/// than the emulator stores is a bad request too (the request itself is out of
+/// bounds), while a full store is the throttle every other create in this
+/// service answers with once it can hold no more.
+fn refusal(refusal: crate::state::NodeRefusal, cluster_id: &str) -> CreateNodeError {
+    match refusal {
+        crate::state::NodeRefusal::ClusterNotFound => {
+            CreateNodeErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::not_found_message("Cluster", cluster_id)),
+            })
+            .into()
+        }
+        crate::state::NodeRefusal::TooManyInterfaceMappings(count) => {
+            CreateNodeErrorModeled::BadRequestException(BadRequestException {
+                message: Some(format!(
+                    "nodeInterfaceMappings carries {count} mappings; at most {} are accepted",
+                    crate::state::MAX_NODE_INTERFACE_MAPPINGS
+                )),
+            })
+            .into()
+        }
+        crate::state::NodeRefusal::StoreFull => {
+            CreateNodeErrorModeled::TooManyRequestsException(TooManyRequestsException {
+                message: Some(format!(
+                    "This emulator stores at most {} nodes; delete one before creating another",
+                    crate::state::MAX_NODES
+                )),
+            })
+            .into()
+        }
+    }
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no store to create the node in. A modelled server error, never a
+/// fresh engine (which would drop the write when this request returns).
+fn unavailable() -> CreateNodeError {
+    CreateNodeErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
 }

@@ -199,9 +199,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 state.firewalls.insert(key.clone(), record);
                 return Err(DeleteFirewallErrorModeled::InvalidOperationException(
                     InvalidOperationException {
-                        message: Some(format!(
-                            "Firewall {key} has DeleteProtection enabled and cannot be deleted."
-                        )),
+                        // The refusal is a property of the protection setting,
+                        // not of the request: one constant naming "the object",
+                        // with no firewall name or ARN in it.
+                        message: Some(crate::state::DELETE_PROTECTED_MESSAGE.to_string()),
                     },
                 )
                 .into());

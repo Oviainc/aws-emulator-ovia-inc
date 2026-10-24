@@ -64,14 +64,15 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::SystemTime;
 
 use service_common::iot_job_executions::{
-    is_modeled_thing_name, JobExecutionRecord, JobExecutionStore,
+    is_modeled_thing_name, JobExecutionRecord, JobExecutionStore, MAX_THING_NAME_LEN,
 };
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    Action, AuthorizerDescription, CommandParameter, CommandPayload, CommandPreprocessor,
-    GetCommandOutput, JobExecution, JobExecutionStatusDetails, ThingGroupIndexingConfiguration,
-    ThingIndexingConfiguration, TopicRule, TopicRulePayload,
+    Action, AuthorizerDescription, CommandParameter, CommandParameterValue, CommandPayload,
+    CommandPreprocessor, GetCommandExecutionOutput, GetCommandOutput, JobExecution,
+    JobExecutionStatusDetails, ThingGroupIndexingConfiguration, ThingIndexingConfiguration,
+    TopicRule, TopicRulePayload,
 };
 
 /// The shared index of which IoT COMMANDS exist, which the IoT Jobs data plane's
@@ -1655,6 +1656,189 @@ pub fn to_job_execution(record: &JobExecutionRecord, region: &str, now: i64) -> 
         version_number: record.version_number,
         approximate_seconds_before_timed_out: record.approximate_seconds_before_timed_out(now),
     }
+}
+
+/// How long a command execution is retained, in seconds, counted from the instant it
+/// was created.
+///
+/// `GetCommandExecution$timeToLive` is "The time to live (TTL) parameter that
+/// indicates the duration for which executions will be retained in your account. The
+/// default value is six months." No operation of either IoT plane carries a per-execution
+/// TTL, so every execution carries that documented default; the six months are counted
+/// as 30-day months, which is this emulator's reading of "six months" and the only part
+/// of the constant the documentation does not fix.
+pub const COMMAND_EXECUTION_RETENTION_SECONDS: i64 = 6 * 30 * 24 * 60 * 60;
+
+/// The DEVICE a command-execution request names, or the reason the supplied value
+/// names none — the message the caller reports with its modelled
+/// `ValidationException`.
+///
+/// `GetCommandExecution$targetArn` and `DeleteCommandExecution$targetArn` are "the
+/// ARN of the device on which the command execution is being performed" / "of the
+/// target device", i.e. `arn:<partition>:iot:<region>:<account>:thing/<name>`. A
+/// thing GROUP, any other IoT resource type, and a value that is no IoT resource ARN
+/// at all name no device, so the request is refused rather than answered from some
+/// other resource's executions. The parse is [`parse_job_target`], the one rule this
+/// service reads a caller-supplied IoT target ARN with, and the wording is the one the
+/// IoT Jobs data plane refuses `StartCommandExecution$targetArn` with, so the two
+/// planes read one ARN the same way and say the same thing about it.
+pub fn command_execution_target(target_arn: &str) -> Result<String, String> {
+    let unsupported = |reading: String| format!("{reading} not supported as a target");
+    let invalid_arn = || unsupported(format!("Invalid target arn {target_arn}"));
+    match parse_job_target(target_arn) {
+        Ok(JobTarget::Thing(thing_name)) => Ok(thing_name),
+        Ok(JobTarget::ThingGroup(_)) => Err(unsupported("Resource type thinggroup".to_string())),
+        Err(JobTargetRejection::UnsupportedResourceType(resource_type)) => {
+            Err(unsupported(format!("Resource type {resource_type}")))
+        }
+        Err(JobTargetRejection::NotAnIotResourceArn) => Err(invalid_arn()),
+        Err(JobTargetRejection::UnaddressableName(_)) => Err(format!(
+            "targetArn names a thing whose name is not 1..{MAX_THING_NAME_LEN} characters matching ^[a-zA-Z0-9:_-]+$"
+        )),
+    }
+}
+
+/// Index of the COMMAND execution `execution_id` names among `thing_name`'s
+/// executions, or `None` when the device holds none.
+///
+/// A command execution is keyed in the shared store by the `executionId` the start
+/// minted (its `job_id`), so the lookup is the store's own; what this adds is that only
+/// a record a command-execution reader may REPORT answers it. An execution a JOB
+/// created is reached through `/things/{thingName}/jobs/{jobId}` and is not a command
+/// execution of the device, however its `jobId` happens to be spelled; nor is one whose
+/// stored status this model cannot name ([`command_execution_status`]) — the same two
+/// exclusions `to_command_execution_summary` makes, so the single reader, the lister and
+/// the deleter all see one set of command executions.
+pub fn command_execution_index(
+    store: &JobExecutionStore,
+    thing_name: &str,
+    execution_id: &str,
+) -> Option<usize> {
+    let index = store.execution_index(thing_name, execution_id, None)?;
+    store
+        .record(thing_name, index)
+        .is_some_and(|record| {
+            record.is_command_execution() && command_execution_status(&record.status).is_some()
+        })
+        .then_some(index)
+}
+
+/// One command parameter value, read back out of the job document the start persisted.
+///
+/// `CommandParameterValue` carries one member per parameter type (`S`, `B`, `I`, `L`,
+/// `D`, `BIN`, `UL`) and the document holds them under exactly those names, a blob as
+/// the base64 restJson1 renders it as, so this is the inverse of what the start wrote.
+fn command_parameter_value(value: &serde_json::Value) -> CommandParameterValue {
+    CommandParameterValue {
+        s: value
+            .get("S")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+        b: value.get("B").and_then(serde_json::Value::as_bool),
+        i: value
+            .get("I")
+            .and_then(serde_json::Value::as_i64)
+            .and_then(|number| i32::try_from(number).ok()),
+        l: value.get("L").and_then(serde_json::Value::as_i64),
+        d: value.get("D").and_then(serde_json::Value::as_f64),
+        bin: value
+            .get("BIN")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|encoded| ::aws_smithy_types::base64::decode(encoded).ok()),
+        ul: value
+            .get("UL")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
+    }
+}
+
+/// The `parameters` a command execution was started with — "The list of parameters
+/// that the StartCommandExecution API used when performing the command on the device"
+/// (`GetCommandExecution$parameters`).
+///
+/// They are read back out of the JOB DOCUMENT the start persisted on the record
+/// (`{"commandArn": …, "parameters": {…}}`, the document the device fetches), so the
+/// reader reports the very parameters the device was handed and the two cannot drift —
+/// there is no second copy to disagree with. `None` — never an empty map — when the
+/// execution was started with no parameters: `CommandExecutionParameterMap` is modelled
+/// `len 1..`, so an empty map is not a value a response may carry.
+pub fn command_execution_parameters(
+    record: &JobExecutionRecord,
+) -> Option<HashMap<String, CommandParameterValue>> {
+    let document: serde_json::Value = serde_json::from_str(record.job_document.as_deref()?).ok()?;
+    let parameters: HashMap<String, CommandParameterValue> = document
+        .get("parameters")?
+        .as_object()?
+        .iter()
+        .map(|(name, value)| (name.clone(), command_parameter_value(value)))
+        .collect();
+    (!parameters.is_empty()).then_some(parameters)
+}
+
+/// A stored COMMAND execution as the modelled `GetCommandExecutionResponse` the
+/// control plane reports.
+///
+/// The shared store holds the execution; this is the only place that projects one onto
+/// the command shapes THIS model declares, so every reader of a command execution here
+/// reports one value for one record.
+///
+/// * `targetArn` is the device the execution is queued on, built from the thing NAME
+///   the record is keyed by and the region the request is signed for ([`thing_arn`]) —
+///   an execution may be queued on a thing that is not in the registry, so the ARN
+///   comes from the execution and not from a registry lookup.
+/// * `createdAt` is when the execution was created for its device and `lastUpdatedAt`
+///   when the record was last written.
+/// * `startedAt` is when the execution started on that device
+///   ([`command_execution_started_at`]) and `completedAt` only once it finished
+///   ([`command_execution_completed_at`]) — the same two instants the lister reports
+///   for the same record, so `GetCommandExecution` and `ListCommandExecutions` cannot
+///   disagree about one execution.
+/// * `status` is the record's status on the command surface
+///   ([`command_execution_status`]); `None` for a stored status this model cannot name,
+///   which is a record a command-execution reader reports nothing for (the lister makes
+///   the same exclusion).
+/// * `statusReason` and `result` are DEVICE-reported ("Your devices can use this
+///   parameter to provide additional context", "The device can use the result field to
+///   share additional details"), and the device-side `UpdateCommandExecution` MQTT API
+///   is not served by this emulator, so nothing persists either one and neither member
+///   is reported. `includeResult` therefore selects nothing: a caller that asks for the
+///   result gets the same answer as one that does not, rather than a result nothing
+///   produced.
+/// * `executionTimeoutSeconds` is the duration the start gave the device, which the
+///   record keeps for the life of the execution
+///   ([`JobExecutionRecord::command_execution_timeout_seconds`]).
+/// * `timeToLive` is the retention the member documents, counted from creation
+///   ([`COMMAND_EXECUTION_RETENTION_SECONDS`]).
+pub fn to_command_execution(
+    record: &JobExecutionRecord,
+    region: &str,
+) -> Option<GetCommandExecutionOutput> {
+    let command_arn = record.command_arn.clone()?;
+    let status = command_execution_status(&record.status)?;
+    Some(GetCommandExecutionOutput {
+        execution_id: Some(record.job_id.clone()),
+        command_arn: Some(command_arn),
+        target_arn: Some(thing_arn(region, &record.thing_name)),
+        status: Some(status.to_string()),
+        status_reason: None,
+        result: None,
+        parameters: command_execution_parameters(record),
+        execution_timeout_seconds: record.command_execution_timeout_seconds,
+        created_at: Some(::aws_smithy_types::DateTime::from_secs(record.queued_at)),
+        last_updated_at: Some(::aws_smithy_types::DateTime::from_secs(
+            record.last_updated_at,
+        )),
+        started_at: Some(::aws_smithy_types::DateTime::from_secs(
+            command_execution_started_at(record),
+        )),
+        completed_at: command_execution_completed_at(record)
+            .map(::aws_smithy_types::DateTime::from_secs),
+        time_to_live: Some(::aws_smithy_types::DateTime::from_secs(
+            record
+                .queued_at
+                .saturating_add(COMMAND_EXECUTION_RETENTION_SECONDS),
+        )),
+    })
 }
 
 /// The SHARED index of which IoT commands exist, in the shared engine: call it with a

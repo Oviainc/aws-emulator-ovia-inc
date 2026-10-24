@@ -280,6 +280,19 @@ pub struct JobExecutionRecord {
     /// [`JobExecutionStore::concurrent_command_executions`]), which a job execution
     /// does not consume.
     pub command_arn: Option<String>,
+    /// The DURATION a command execution's start gave its device, in seconds, when the
+    /// start set one (`StartCommandExecution$executionTimeoutSeconds`: "Specifies the
+    /// amount of time in second the device has to finish the command execution").
+    ///
+    /// It is kept BESIDE [`Self::execution_timeout_expires_at`], which is the deadline
+    /// that duration armed, because the two answer different questions and only one of
+    /// them survives the timer firing: [`Self::time_out_if_due`] consumes the deadline
+    /// when it materialises `TIMED_OUT`, while the duration stays part of what the
+    /// execution was created with and is what a reader of the command surface reports
+    /// for the whole life of the execution (`iot`:
+    /// `GetCommandExecution$executionTimeoutSeconds`). `None` for an execution started
+    /// without a timeout and for every execution a JOB created.
+    pub command_execution_timeout_seconds: Option<i64>,
     /// The store-wide position this execution was enqueued at, stamped by
     /// [`JobExecutionStore::try_insert_execution`] from the store's monotonic
     /// counter: strictly increasing over every execution the store holds, whatever
@@ -320,6 +333,7 @@ impl JobExecutionRecord {
             in_progress_timeout_minutes: None,
             job_document,
             command_arn: None,
+            command_execution_timeout_seconds: None,
             // Stamped by the store when it accepts the record; see the field.
             enqueue_sequence: 0,
         }

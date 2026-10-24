@@ -18,6 +18,11 @@
 //! `GetBaselineOperation` resolves. The two logs are separate: an identifier a landing
 //! zone call returned is not a baseline operation and vice versa.
 //!
+//! The baseline CATALOG is a third kind of data: the baselines themselves are AWS-managed
+//! and identical in every account, so they live in the constant [`BASELINE_CATALOG`] that
+//! `GetBaseline` resolves an identifier against, not in the per-account store. No call
+//! creates, changes or deletes a baseline, so nothing a caller does can grow it.
+//!
 //! RETENTION: every store a caller can grow by repeating calls is BOUNDED, so ordinary
 //! request traffic cannot grow this process's heap, or the per-request scan [`settle`]
 //! runs under the state lock, without limit:
@@ -1132,6 +1137,109 @@ pub fn enabled_baseline_arn(region: &str, enabled_baseline_id: &str) -> String {
 /// keeps the minted ARN inside `Arn`'s `^arn:aws[0-9a-zA-Z_\-:\/]+$` pattern.
 pub fn new_enabled_baseline_id() -> String {
     new_operation_identifier()
+}
+
+/// One entry of this service's BASELINE CATALOG: an AWS-managed baseline a caller may
+/// enable on a target, as `GetBaseline` reports it.
+///
+/// A baseline is NOT an account resource — no call creates, changes or deletes one — so
+/// the catalog is service-managed data ([`BASELINE_CATALOG`]) rather than a map in the
+/// per-account store, the same way the landing zone version catalog is the constant
+/// [`CATALOG_LANDING_ZONE_VERSION`] rather than something a caller writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CatalogBaseline {
+    /// The ARN's resource segment, which is the baseline's identity: 16 characters of
+    /// `[A-Z0-9]`, from `BaselineArn`'s pattern
+    /// `^arn:[a-z-]+:controltower:[a-z0-9-]*:[0-9]{0,12}:baseline/[A-Z0-9]{16}$`.
+    pub id: &'static str,
+    /// `GetBaselineOutput$name` / `BaselineSummary$name` — "The human-readable name of a
+    /// Baseline."
+    pub name: &'static str,
+    /// `GetBaselineOutput$description` / `BaselineSummary$description` — "A summary
+    /// description of a Baseline."
+    pub description: &'static str,
+}
+
+/// The baselines this emulator publishes, in a stable order.
+///
+/// The NAMES are the baseline types the AWS Control Tower User Guide documents
+/// (`AWSControlTowerBaseline` and its prerequisite `IdentityCenterBaseline`, the
+/// `AuditBaseline`/`LogArchiveBaseline` of the shared accounts, and the three AWS Backup
+/// baselines), and each description summarises that documented purpose; the model
+/// declares `description` free-form text, so it is a summary rather than AWS's wording
+/// character for character.
+///
+/// The IDs are opaque in AWS — nothing published derives one — so the two that appear in
+/// AWS's own API examples (`AWSControlTowerBaseline`, `IdentityCenterBaseline`) are kept
+/// and the rest are this emulator's own, chosen once and never minted per request: a
+/// baseline ARN a caller stores keeps resolving for the life of this emulator.
+pub const BASELINE_CATALOG: &[CatalogBaseline] = &[
+    CatalogBaseline {
+        id: "17BSJV3IGJ2QSGA2",
+        name: "AWSControlTowerBaseline",
+        description: "Sets up the resources and permissions AWS Control Tower requires \
+                      to govern the accounts of a target organizational unit.",
+    },
+    CatalogBaseline {
+        id: "4T4HA1KMO10S6311",
+        name: "AuditBaseline",
+        description: "Sets up the cross-account audit resources AWS Control Tower \
+                      requires in the audit account.",
+    },
+    CatalogBaseline {
+        id: "TR7NC4VPG9DH2KLM",
+        name: "BackupAdminBaseline",
+        description: "Sets up the backup administration resources AWS Control Tower \
+                      requires in the backup administration account.",
+    },
+    CatalogBaseline {
+        id: "QXK3R9ZB7PN5TD2H",
+        name: "BackupBaseline",
+        description: "Sets up the backup plans and roles AWS Control Tower applies to \
+                      the accounts of a target organizational unit.",
+    },
+    CatalogBaseline {
+        id: "WM8FJ6YHL3QS5XKB",
+        name: "BackupCentralVaultBaseline",
+        description: "Sets up the central backup vault AWS Control Tower requires in \
+                      the backup central vault account.",
+    },
+    CatalogBaseline {
+        id: "LN25R72TTG6IGPTQ",
+        name: "IdentityCenterBaseline",
+        description: "Sets up the AWS IAM Identity Center resources that are a \
+                      prerequisite for the AWSControlTowerBaseline.",
+    },
+    CatalogBaseline {
+        id: "2V6DZ8QKR4JT7MWN",
+        name: "LogArchiveBaseline",
+        description: "Sets up the centralized log storage AWS Control Tower requires in \
+                      the log archive account.",
+    },
+];
+
+/// `arn:aws:controltower:<region>:<account>:baseline/<id>` — the ARN this endpoint
+/// serves a catalog baseline under.
+///
+/// Built through `engine::emulator_arn`, so the account segment is the emulator's
+/// canonical account id rather than a literal, which `BaselineArn`'s `[0-9]{0,12}`
+/// account segment admits.
+pub fn baseline_arn(region: &str, baseline_id: &str) -> String {
+    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("baseline/{baseline_id}"))
+}
+
+/// The catalog entry a `baselineIdentifier` names, or `None` when the catalog holds no
+/// baseline with that resource id.
+///
+/// A baseline's identity is the 16-character resource id after `baseline/`: the same
+/// catalog is published in every partition, region and account, so the segments before
+/// it select nothing and are not compared. The id itself is matched exactly, so a value
+/// differing from a catalog id in one character names no baseline.
+pub fn resolve_baseline(baseline_identifier: &str) -> Option<&'static CatalogBaseline> {
+    let (_, baseline_id) = baseline_identifier.rsplit_once(":baseline/")?;
+    BASELINE_CATALOG
+        .iter()
+        .find(|baseline| baseline.id == baseline_id)
 }
 
 /// A fresh landing zone resource id, used as the ARN's resource segment.

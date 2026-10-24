@@ -672,6 +672,39 @@ impl ComAmazonawsElementalinferenceElementalinferenceState {
         self.earliest_due = Some(self.earliest_due.map_or(due, |earliest| earliest.min(due)));
     }
 
+    /// The resource a `resourceArn` names, if this store holds it.
+    ///
+    /// An ARN identifies a resource WHOLE: the kind of resource (`feed` or
+    /// `dictionary`), its id, and the region and account it was minted in. So an ARN
+    /// resolves only when it is exactly the ARN the stored record carries, and every
+    /// other well-formed value — another kind, another id, another region, another
+    /// account — names no resource of this store and so resolves to nothing. That is
+    /// what makes the resource "the resource identified by the specified resourceArn in
+    /// the current region" (`TagResource`) rather than whichever record happens to share
+    /// its id.
+    ///
+    /// One resolution shared by every operation that reaches a resource by its
+    /// `resourceArn`, so none of them can disagree about what an ARN names.
+    pub fn tagged_resource_mut(&mut self, resource_arn: &str) -> Option<TaggedResourceMut<'_>> {
+        // `arn:<partition>:<service>:<region>:<account>:<kind>/<id>` — field 5 is the
+        // resource segment, which the modelled `resourceArn` pattern spells
+        // `(feed|dictionary)/[a-zA-Z0-9]{1,19}`.
+        let (kind, id) = resource_arn.split(':').nth(5)?.split_once('/')?;
+        match kind {
+            "feed" => self
+                .feeds
+                .get_mut(id)
+                .filter(|feed| feed.arn == resource_arn)
+                .map(TaggedResourceMut::Feed),
+            "dictionary" => self
+                .dictionaries
+                .get_mut(id)
+                .filter(|dictionary| dictionary.arn == resource_arn)
+                .map(TaggedResourceMut::Dictionary),
+            _ => None,
+        }
+    }
+
     /// The ids of the feeds that reference `dictionary_id`, in feed-id order — the
     /// `FeedReferences` list every dictionary response carries.
     ///
@@ -776,6 +809,112 @@ impl ComAmazonawsElementalinferenceElementalinferenceState {
             )
             .min();
     }
+}
+
+/// A resource one of this service's tagging operations has reached by its
+/// `resourceArn`, borrowed mutably out of the store it lives in
+/// ([`ComAmazonawsElementalinferenceElementalinferenceState::tagged_resource_mut`]).
+///
+/// Tags are a property of the RESOURCE, stored on the one record every other handler
+/// reads ([`Feed::tags`], [`Dictionary::tags`]) — there is no second tag store — so a
+/// tag written through `TagResource` is the tag `GetFeed`/`GetDictionary` reports. This
+/// enum is what lets the tagging operations work on either kind of resource without
+/// either of them holding its own copy of which kinds exist or where a kind keeps its
+/// tags.
+#[derive(Debug)]
+pub enum TaggedResourceMut<'a> {
+    Feed(&'a mut Feed),
+    Dictionary(&'a mut Dictionary),
+}
+
+impl TaggedResourceMut<'_> {
+    /// Whether this resource's deletion has already been accepted, so it is on its way
+    /// out of the store.
+    pub fn is_being_deleted(&self) -> bool {
+        match self {
+            Self::Feed(feed) => feed.status == FeedStatus::Deleting,
+            Self::Dictionary(dictionary) => dictionary.status == DictionaryStatus::Deleting,
+        }
+    }
+
+    /// The sentence a mutation of this resource earns while its deletion is pending —
+    /// the same rule, and the same wording, that `UpdateFeed` and `UpdateDictionary`
+    /// already refuse with ([`FEED_BEING_DELETED_MESSAGE`],
+    /// [`DICTIONARY_BEING_DELETED_MESSAGE`]).
+    pub fn being_deleted_message(&self) -> &'static str {
+        match self {
+            Self::Feed(_) => FEED_BEING_DELETED_MESSAGE,
+            Self::Dictionary(_) => DICTIONARY_BEING_DELETED_MESSAGE,
+        }
+    }
+
+    /// The tags stored on this resource, for a caller that writes them.
+    pub fn tags_mut(&mut self) -> &mut BTreeMap<String, String> {
+        match self {
+            Self::Feed(feed) => &mut feed.tags,
+            Self::Dictionary(dictionary) => &mut dictionary.tags,
+        }
+    }
+}
+
+/// The `@length` bounds `TagMap`'s KEY carries: a `TagKey` of length 1..128
+/// (`smithy_query(query="shape",shape="TagMap")`).
+///
+/// A map's key is the one constrained value the framework's boundary walk does not
+/// reach — it captures an entry's key as the path segment the entry's VALUE is reported
+/// under rather than checking it ("the key itself is not a constrained leaf",
+/// `ValidatingSerializer::write_leaf`) — so an operation that takes a `TagMap` enforces
+/// the key's own bounds itself, with the modelled `ValidationException` the boundary
+/// would have answered with. The value's bounds need no such copy: the boundary already
+/// refuses a `TagValue` past its maximum.
+pub const TAG_KEY_MIN_LENGTH: usize = 1;
+
+/// The longest `TagKey` the model admits; see [`TAG_KEY_MIN_LENGTH`].
+pub const TAG_KEY_MAX_LENGTH: usize = 128;
+
+/// The refusal a tag key outside [`TAG_KEY_MIN_LENGTH`]..[`TAG_KEY_MAX_LENGTH`] earns.
+///
+/// The rule is about ONE value's own validity, so the message states the constraint the
+/// value failed and the length the request's key actually had — built from the request,
+/// as a constraint refusal is. The key itself is NOT echoed: its length is what is at
+/// fault and a caller controls it, so echoing it would turn an arbitrarily long key into
+/// an arbitrarily long message.
+pub fn invalid_tag_key_message(length: usize) -> String {
+    format!(
+        "A tag key must have length greater than or equal to {TAG_KEY_MIN_LENGTH} and less \
+         than or equal to {TAG_KEY_MAX_LENGTH}; this request carries a key of length {length}."
+    )
+}
+
+/// The most tags one resource may carry.
+///
+/// AWS's tag restrictions, which apply to every taggable resource, cap a resource at
+/// 50 tags ("Maximum number of tags per resource: 50", *Tagging AWS resources*), and
+/// this service's model states no figure of its own, so that published cap is the
+/// bound here. It is also what BOUNDS the tag map on a stored record, which
+/// `TagResource` would otherwise grow by one entry per request forever: past it the
+/// request is refused with the modelled `ValidationException` (HTTP 400), the answer a
+/// request that "fails to satisfy the constraints specified by the service" earns.
+///
+/// `TagResource` is where the bound bites because it ACCUMULATES: the tag map a create
+/// carries is bounded by the single request that carried it, exactly as
+/// [`MAX_OUTPUTS_PER_FEED`] is needed only by the appending `AssociateFeed` and not by
+/// the creates that replace an output list wholesale.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The refusal a `TagResource` whose tags would take a resource past
+/// [`MAX_TAGS_PER_RESOURCE`] earns.
+///
+/// The rule is about ONE value's own validity — how many tags the request asks the
+/// resource to carry — so the message names that count and the cap it exceeds, which is
+/// what a caller has to know to fix the request. `resulting` is the size of the tag set
+/// the request would leave behind, so a request that only re-sets keys the resource
+/// already holds is never reported as adding to it.
+pub fn too_many_tags_message(resulting: usize) -> String {
+    format!(
+        "These tags would leave the resource with {resulting} tags, more than the \
+         {MAX_TAGS_PER_RESOURCE} tags a resource can have. Remove tags before adding more."
+    )
 }
 
 /// The ARN of a feed in `region`: `arn:aws:elemental-inference:<region>:<account>:feed/<id>`.

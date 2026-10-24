@@ -25,6 +25,8 @@ mod invite_principal;
 mod list_accessors;
 #[path = "all/list_members.rs"]
 mod list_members;
+#[path = "all/list_proposal_votes.rs"]
+mod list_proposal_votes;
 #[path = "all/modelled_error_payloads.rs"]
 mod modelled_error_payloads;
 #[path = "all/network_and_node_lifecycle.rs"]

@@ -235,14 +235,10 @@ pub const MAX_SIZE_CONSTRAINT_SET_UPDATES_PER_REQUEST: usize = 2 * MAX_SIZE_CONS
 /// repeats — "Valid values for size are 0 - 21474836480 bytes (0 - 20 GB)".
 pub const MAX_SIZE_CONSTRAINT_SIZE: i64 = 21_474_836_480;
 
-/// The most `WebACL`s this emulator stores for the account before `CreateWebACL`
-/// answers its modelled `WAFLimitsExceededException`.
-///
-/// The model states no quota — only that `WAFLimitsExceededException` covers "the
-/// maximum number of `WebACL` objects that you can create for an AWS account" — so
-/// this bound is the one AWS WAF Classic publishes for an account (50 web ACLs). It
-/// keeps the web ACL state a caller can grow bounded.
-pub const MAX_WEB_ACLS: usize = 50;
+// No `MAX_WEB_ACLS` bound lives here: nothing grows the web ACL state any more. AWS WAF
+// Classic is past its end of support (`END_OF_SUPPORT_DATE`), so `CreateWebACL` refuses
+// every request and the web ACLs this service holds are the ones that already existed. A
+// per-account quota would be a constant no code could reach.
 
 /// The ARN service segment of every ARN this service mints: its SigV4 signing name,
 /// as `WebACLArn` carries it.
@@ -450,6 +446,28 @@ pub const MESSAGE_INVALID_OPERATION: &str = "The operation is not valid.";
 /// [`MESSAGE_DISALLOWED_NAME`].
 pub const MESSAGE_INVALID_PERMISSION_POLICY: &str =
     "The specific permission policy is not valid.";
+
+/// The date AWS WAF Classic (AWS WAF v1, of which this regional endpoint is the
+/// regional half) reached END OF SUPPORT, after which its control plane admits no new
+/// web ACL.
+///
+/// Recorded behaviour: a well-formed `CreateWebACL` is refused with HTTP 400 and the
+/// modelled `WAFBadRequestException`, identically on every attempt, whatever the
+/// request carries. The date is stated here because it is WHY that refusal exists;
+/// nothing compares a clock against it, since the emulator serves the service as it is
+/// now.
+pub const END_OF_SUPPORT_DATE: &str = "2025-09-30";
+
+/// The fixed sentence for `WAFBadRequestException`, the refusal of a request to create a
+/// resource AWS WAF Classic no longer admits now that it is past
+/// [`END_OF_SUPPORT_DATE`] — see [`MESSAGE_DISALLOWED_NAME`].
+///
+/// The requirements of that refusal are its status (400) and its code; the recorded
+/// end-of-support sentence is an example of its message, so this is one fixed sentence
+/// for the class that states the cause and carries nothing of the request.
+pub const MESSAGE_END_OF_SUPPORT: &str =
+    "AWS WAF Classic is no longer supported. Use the latest version of AWS WAF (AWS \
+     WAFV2) instead.";
 
 /// The `MatchFieldType` whose `FieldToMatch.Data` names a request header.
 pub const MATCH_FIELD_TYPE_HEADER: &str = "HEADER";

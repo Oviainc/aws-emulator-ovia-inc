@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateVirtualCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateVirtualCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Replaces a stored virtual cluster's `schedulerConfiguration` and answers with the
+//! cluster as the update left it, read back out of
+//! [`crate::state::ComAmazonawsEmrcontainersAwschicagowebserviceState`].
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateVirtualCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A REPLACEMENT, not a merge: the new configuration "fully replaces the existing one",
+//! and "if you omit a field, the corresponding limit is removed" — so a request carrying
+//! no `schedulerConfiguration` at all leaves the cluster with no scheduler limits, and a
+//! cluster with none reports no `schedulerConfiguration` member at all.
+//!
+//! Changing `maxConcurrentJobRuns` changes how many of the cluster's job runs may be
+//! `RUNNING`, so a run the clock has already made due but that was waiting for a slot
+//! starts as soon as the new limit leaves one free ("as running slots free up, queued job
+//! runs start automatically"); `settle` is what materialises that, and the
+//! `schedulerStatus` this operation answers with is counted after it.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +155,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateVirtualCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateVirtualClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateVirtualCluster"))
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateVirtualClusterError::Modeled(
+                UpdateVirtualClusterErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the virtual cluster store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let _ = ctx;
+        let mut state = store.lock();
+        state.settle();
+
+        // The cluster is resolved out of state, never assumed: an id that names no stored
+        // cluster is the modelled not-found.
+        let Some(record) = state.virtual_clusters.get(&input.id) else {
+            return Err(UpdateVirtualClusterErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Virtual cluster {} was not found", input.id)),
+                },
+            )
+            .into());
+        };
+        // A cluster whose teardown has started is still DESCRIBABLE (EMR on EKS keeps a
+        // TERMINATED cluster readable), so it is not missing — but it takes no further
+        // work, and a scheduler limit on it would govern nothing. It is the request that
+        // is invalid, so it is refused with the modelled `ValidationException`, on the
+        // same terms as `DeleteVirtualCluster` refuses a cluster that is not RUNNING.
+        let current_state = record.state.clone();
+        if current_state != crate::state::CLUSTER_RUNNING {
+            return Err(UpdateVirtualClusterErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "Virtual cluster {} is in state {current_state} and cannot be updated",
+                        input.id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `clientToken` is `@idempotencyToken`: "if this token matches a previous request,
+        // the service ignores the request, but does not return an error". An update mints
+        // no resource for a token to name, so the token is remembered ON the cluster it
+        // updated and a replay leaves that cluster exactly as the first call left it.
+        // Checked AFTER the two refusals above, so which requests this operation refuses
+        // does not depend on whether one of them was retried.
+        let replayed = record.has_applied_update_token(&input.client_token);
+        if !replayed {
+            state.apply_scheduler_configuration(
+                &input.id,
+                input.scheduler_configuration,
+                &input.client_token,
+            );
+            // The concurrency this cluster allows may just have grown, and a queued run
+            // whose start the clock already made due was held back only by the old limit.
+            // Settling again materialises what is owed under the new one, so the
+            // `schedulerStatus` below reports the cluster as this call leaves it.
+            state.settle();
+        }
+
+        let virtual_cluster = state.virtual_cluster_view(&input.id).ok_or_else(|| {
+            UpdateVirtualClusterError::Modeled(
+                UpdateVirtualClusterErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(format!(
+                            "Virtual cluster {} could not be read back after the update",
+                            input.id
+                        )),
+                    },
+                ),
+            )
+        })?;
+
+        Ok(UpdateVirtualClusterOutput {
+            virtual_cluster: Some(virtual_cluster),
+        })
     }
 }

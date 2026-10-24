@@ -23,6 +23,8 @@ mod error_contract;
 mod harness;
 #[path = "all/modeled_validation_exception.rs"]
 mod modeled_validation_exception;
+#[path = "all/multi_region_witness.rs"]
+mod multi_region_witness;
 #[path = "all/policy_document_class.rs"]
 mod policy_document_class;
 #[path = "all/policy_version_conflict_and_lockout.rs"]

@@ -109,6 +109,8 @@ mod iam_and_signer_signing_name_routing;
 mod iam_role_id_agrees_with_sts;
 #[path = "all/iam_signing_name_routing.rs"]
 mod iam_signing_name_routing;
+#[path = "all/iot_command_execution_lifecycle.rs"]
+mod iot_command_execution_lifecycle;
 #[path = "all/iot_job_execution_reaches_the_device.rs"]
 mod iot_job_execution_reaches_the_device;
 #[path = "all/iot_jobs_data_endpoint_discovery.rs"]
