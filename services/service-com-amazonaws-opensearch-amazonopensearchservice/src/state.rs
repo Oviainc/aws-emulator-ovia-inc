@@ -52,14 +52,131 @@ use crate::ops::types::{
     OPEN_SEARCH_PARTITION_INSTANCE_TYPE_VALUES, RESERVED_INSTANCE_PAYMENT_OPTION_VALUES,
 };
 
+/// Every engine version this emulator publishes as supported, in UPGRADE ORDER
+/// (oldest first): the legacy Elasticsearch line, then the OpenSearch line that
+/// succeeds it.
+///
+/// Which versions a Region supports is published BY the service, not created by a
+/// caller, so this is a catalog rather than state an operation writes — the same
+/// shape as [`seed_reserved_instance_offerings`]'s offering catalog. The Smithy model
+/// carries no list of them (only `VersionString`'s own pattern
+/// `^Elasticsearch_[0-9]{1}\.[0-9]{1,2}$|^OpenSearch_[0-9]{1,2}\.[0-9]{1,2}$`, which
+/// every entry below satisfies), so this is the emulator's OWN published set and the
+/// ONE statement of it: what it guarantees is the RELATION between its entries —
+/// both engines, several majors of each, and several minors of a major — so a caller
+/// can tell an upgrade forwards from one that goes nowhere.
+///
+/// Order is the order of [`upgrade_rank`], and the list is iterated in place, which
+/// is what lets two reads report the same versions in the same order.
+pub const SUPPORTED_ENGINE_VERSIONS: [&str; 32] = [
+    "Elasticsearch_1.5",
+    "Elasticsearch_2.3",
+    "Elasticsearch_5.1",
+    "Elasticsearch_5.3",
+    "Elasticsearch_5.5",
+    "Elasticsearch_5.6",
+    "Elasticsearch_6.0",
+    "Elasticsearch_6.2",
+    "Elasticsearch_6.3",
+    "Elasticsearch_6.4",
+    "Elasticsearch_6.5",
+    "Elasticsearch_6.7",
+    "Elasticsearch_6.8",
+    "Elasticsearch_7.1",
+    "Elasticsearch_7.4",
+    "Elasticsearch_7.7",
+    "Elasticsearch_7.8",
+    "Elasticsearch_7.9",
+    "Elasticsearch_7.10",
+    "OpenSearch_1.0",
+    "OpenSearch_1.1",
+    "OpenSearch_1.2",
+    "OpenSearch_1.3",
+    "OpenSearch_2.3",
+    "OpenSearch_2.5",
+    "OpenSearch_2.7",
+    "OpenSearch_2.9",
+    "OpenSearch_2.11",
+    "OpenSearch_2.13",
+    "OpenSearch_2.15",
+    "OpenSearch_2.17",
+    "OpenSearch_2.19",
+];
+
 /// The engine version a domain runs when `CreateDomain` names none.
 ///
 /// `EngineVersion` is optional and the service picks a current OpenSearch version
-/// when it is omitted. `ListVersions`, which publishes the supported set, is still
-/// a stub, so this constant is the emulator's single statement of what that is. It
-/// satisfies `VersionString`'s own pattern
-/// `^Elasticsearch_[0-9]{1}\.[0-9]{1,2}$|^OpenSearch_[0-9]{1,2}\.[0-9]{1,2}$`.
+/// when it is omitted. It is one of [`SUPPORTED_ENGINE_VERSIONS`], so a domain
+/// created without one runs a version the service publishes.
 pub const DEFAULT_ENGINE_VERSION: &str = "OpenSearch_2.11";
+
+/// How far along the upgrade path a version sits: its engine generation (the
+/// OpenSearch line succeeds the Elasticsearch one, OpenSearch 1.0 being the fork of
+/// Elasticsearch 7.10), then its major and minor numbers compared as NUMBERS, so
+/// `7.10` sits after `7.9` rather than before it.
+///
+/// Comparing two ranks is what "later than" means for an engine version, and it is
+/// defined for every value `VersionString`'s pattern allows — in or out of
+/// [`SUPPORTED_ENGINE_VERSIONS`]. `None` only for a value matching neither prefix or
+/// carrying no `<major>.<minor>`, which that pattern does not allow.
+pub fn upgrade_rank(engine_version: &str) -> Option<(u8, u32, u32)> {
+    // Which engine a version names is [`engine_type_of`]'s answer, not a second
+    // reading of the same prefix: the two cannot drift about what `OpenSearch_` means.
+    let generation = match engine_type_of(engine_version)? {
+        ENGINE_TYPE_ELASTICSEARCH => 0_u8,
+        ENGINE_TYPE_OPENSEARCH => 1_u8,
+        // An engine neither constant names has no place in the order rather than
+        // sharing the newest line's.
+        _ => return None,
+    };
+    let (major, minor) = engine_version.split_once('_')?.1.split_once('.')?;
+    Some((generation, major.parse().ok()?, minor.parse().ok()?))
+}
+
+/// The newest published version of the engine line `generation` names, or `None`
+/// when [`SUPPORTED_ENGINE_VERSIONS`] publishes none for it.
+///
+/// Crossing from one engine line to the next starts HERE: the OpenSearch line forked
+/// from the LAST Elasticsearch release, so that release is the version a domain has
+/// to reach before it can cross.
+fn last_published_of(generation: u8) -> Option<(u8, u32, u32)> {
+    SUPPORTED_ENGINE_VERSIONS
+        .iter()
+        .filter_map(|version| upgrade_rank(version))
+        .filter(|rank| rank.0 == generation)
+        .max()
+}
+
+/// The versions a domain running `source_version` can be upgraded to, oldest first:
+/// every published version of the SAME engine line strictly LATER than it, plus —
+/// only once the domain has reached the last published version of its line — every
+/// published version of the line that succeeds it.
+///
+/// An upgrade only ever goes forwards, so a version is never among its own targets
+/// and the newest published version has none. The answer is derived from
+/// [`upgrade_rank`]'s comparison rather than from the source being published, so a
+/// domain running a version this emulator does not publish still reports the
+/// published versions ahead of it on its line.
+///
+/// This is the whole of the relation: within one line every later version is a
+/// target, because no published table of single hops exists to read a narrower
+/// within-line rule from. A narrower one belongs HERE when one does.
+pub fn compatible_target_versions(source_version: &str) -> Vec<String> {
+    let Some(source) = upgrade_rank(source_version) else {
+        return Vec::new();
+    };
+    // A source at or past the last published version of its own line is as far along
+    // that line as the service goes, so the next line opens up.
+    let crosses_lines = last_published_of(source.0).is_none_or(|last| source >= last);
+    SUPPORTED_ENGINE_VERSIONS
+        .iter()
+        .filter(|candidate| {
+            upgrade_rank(candidate)
+                .is_some_and(|rank| rank > source && (rank.0 == source.0 || crosses_lines))
+        })
+        .map(|candidate| (*candidate).to_string())
+        .collect()
+}
 
 /// The use case a domain is created with when the request names none.
 ///
