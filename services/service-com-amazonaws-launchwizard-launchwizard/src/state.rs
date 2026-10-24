@@ -341,6 +341,13 @@ pub struct DeploymentPattern {
     pub display_name: String,
     /// `WorkloadDeploymentPatternData$description`.
     pub description: String,
+    /// `DeploymentPatternVersionDataSummary$documentationUrl`: where the catalogue
+    /// publishes the deployment document a version of this pattern is documented by.
+    /// Seeded from the document of the workload this pattern belongs to (see
+    /// [`Workload::documentation_url`]), because the catalogue publishes one deployment
+    /// document per application rather than one per pattern. Never empty for a
+    /// catalogue entry.
+    pub documentation_url: String,
     /// One of `WORKLOAD_DEPLOYMENT_PATTERN_STATUS_VALUES`.
     pub status: String,
     /// `WorkloadDeploymentPatternData$statusMessage`: present only when the status
@@ -384,9 +391,8 @@ impl DeploymentPattern {
     ///
     /// `workloadName` and `deploymentPatternName` are read off THIS record rather than
     /// off the request, so the reported version is always stated as a version of the
-    /// pattern it was found in. `documentationUrl` is absent for the reason
-    /// [`Workload::to_data`] gives: this emulator hosts no document for a catalogue
-    /// entry, so there is no URL to report.
+    /// pattern it was found in, and `documentationUrl` is the document the catalogue
+    /// publishes for it, read off the same record.
     pub fn version_summary(
         &self,
         version_name: &str,
@@ -395,7 +401,7 @@ impl DeploymentPattern {
         Some(DeploymentPatternVersionDataSummary {
             deployment_pattern_version_name: Some(version.version_name.clone()),
             description: Some(version.description.clone()),
-            documentation_url: None,
+            documentation_url: Some(self.documentation_url.clone()),
             workload_name: Some(self.workload_name.clone()),
             deployment_pattern_name: Some(self.pattern_name.clone()),
         })
@@ -463,6 +469,13 @@ pub struct Workload {
     pub description: String,
     /// `WorkloadDataSummary$status`, one of `WORKLOAD_STATUS_VALUES`.
     pub status: String,
+    /// `WorkloadData$documentationUrl`: the document the catalogue publishes for this
+    /// workload — the page of [`DOCUMENTATION_BASE`] that documents deploying this
+    /// application. Never empty for a catalogue entry (see [`seeded_workloads`]).
+    pub documentation_url: String,
+    /// `WorkloadData$iconUrl`: the icon the catalogue publishes for this workload,
+    /// under [`ICON_BASE`]. Never empty for a catalogue entry.
+    pub icon_url: String,
     /// The `DeploymentPatternName`s this workload supports (len 1..256,
     /// `^[A-Za-z0-9][a-zA-Z0-9-]*$`), each with its catalogue record.
     pub patterns: BTreeMap<String, DeploymentPattern>,
@@ -490,9 +503,9 @@ impl Workload {
     /// operations cannot disagree about one workload.
     ///
     /// `accountConstraints` is absent for the reason [`Workload::to_summary`] gives.
-    /// `documentationUrl` and `iconUrl` are absent because this emulator hosts no
-    /// workload document and no icon, so there is no URL to report; `statusMessage` is
-    /// absent because an `ACTIVE` catalogue entry has nothing to say about its status.
+    /// `documentationUrl` and `iconUrl` are the catalogue metadata the entry carries,
+    /// read off it like every other member; `statusMessage` is absent because an
+    /// `ACTIVE` catalogue entry has nothing to say about its status.
     pub fn to_data(&self) -> WorkloadData {
         WorkloadData {
             workload_name: Some(self.workload_name.clone()),
@@ -500,8 +513,8 @@ impl Workload {
             status: Some(self.status.clone()),
             account_constraints: None,
             description: Some(self.description.clone()),
-            documentation_url: None,
-            icon_url: None,
+            documentation_url: Some(self.documentation_url.clone()),
+            icon_url: Some(self.icon_url.clone()),
             status_message: None,
         }
     }
@@ -1424,14 +1437,39 @@ struct SeededPattern {
     own_required: &'static [&'static str],
 }
 
-/// One workload of the seeded catalogue: its `WorkloadName`, its display name, the
-/// description `GetWorkload` reports and the patterns it offers.
-type SeededWorkload = (
-    &'static str,
-    &'static str,
-    &'static str,
-    &'static [SeededPattern],
-);
+/// Where the document a catalogue entry publishes lives: the Launch Wizard user guide,
+/// which carries one deployment page per application the service deploys (its index is
+/// `<https://docs.aws.amazon.com/launchwizard/latest/userguide/what-is-launch-wizard.html>`).
+/// A workload's own page is named by its catalogue row's `documentation_page`.
+const DOCUMENTATION_BASE: &str = "https://docs.aws.amazon.com/launchwizard/latest/userguide";
+
+/// Where the icon a catalogue entry publishes lives: a static asset host under this
+/// service's own prefix. The host, the prefix and the `.png` file name are the
+/// EMULATOR's convention rather than a URL AWS documents — the catalogue is
+/// service-owned, so the emulator seeds this metadata the way it seeds an entry's
+/// display name. The file is named after the entry's `workloadName`, so an entry's icon
+/// is DERIVED from the catalogue key rather than listed a second time, and no two
+/// entries can share one.
+const ICON_BASE: &str = "https://d1.awsstatic.com/launchwizard/workloads";
+
+/// One workload of the seeded catalogue, as the table in [`seeded_workloads`] spells it.
+///
+/// Everything the catalogue states about a workload is in ONE row, like
+/// [`SeededPattern`]: an entry cannot be seeded with the document of another, and one
+/// added here cannot be forgotten in a second list keyed by its name.
+struct SeededWorkload {
+    /// `WorkloadName`: len 1..100, `^[A-Za-z][a-zA-Z0-9-_]*$`.
+    name: &'static str,
+    /// `WorkloadDataSummary$displayName`.
+    display_name: &'static str,
+    /// `WorkloadData$description`: what the workload deploys.
+    description: &'static str,
+    /// The page of [`DOCUMENTATION_BASE`] that documents deploying this application,
+    /// without its `.html` extension — what `WorkloadData$documentationUrl` points at.
+    documentation_page: &'static str,
+    /// The deployment patterns this workload offers.
+    patterns: &'static [SeededPattern],
+}
 
 /// The workload catalogue the emulator seeds at first touch.
 ///
@@ -1444,16 +1482,19 @@ type SeededWorkload = (
 /// (len 1..100) and `DeploymentPatternName` is `^[A-Za-z0-9][a-zA-Z0-9-]*$` (len
 /// 1..256).
 ///
-/// `description` is the per-workload metadata `WorkloadData` (and therefore
-/// `GetWorkload`) reports: what the entry's application deploys; each pattern carries
-/// its own display name, description, specification schema and version.
+/// `description`, `documentation_page` and the entry's name are the per-workload
+/// metadata `WorkloadData` (and therefore `GetWorkload`) reports: what the entry's
+/// application deploys, the document that describes deploying it and the icon the
+/// catalogue publishes for it; each pattern carries its own display name, description,
+/// specification schema and version.
 fn seeded_workloads() -> BTreeMap<String, Workload> {
     let catalogue: [SeededWorkload; 3] = [
-        (
-            "SAP",
-            "SAP",
-            "Deploy SAP HANA and SAP NetWeaver applications on Amazon Web Services.",
-            &[
+        SeededWorkload {
+            name: "SAP",
+            display_name: "SAP",
+            description: "Deploy SAP HANA and SAP NetWeaver applications on Amazon Web Services.",
+            documentation_page: "launch-wizard-sap",
+            patterns: &[
                 SeededPattern {
                     name: "SapHanaSingle",
                     display_name: "SAP HANA on a single instance",
@@ -1478,12 +1519,14 @@ fn seeded_workloads() -> BTreeMap<String, Workload> {
                     own_required: SAP_NW_ON_HANA_HA_REQUIRED,
                 },
             ][..],
-        ),
-        (
-            "SQLServer",
-            "Microsoft SQL Server",
-            "Deploy Microsoft SQL Server, standalone or highly available, on Amazon Web Services.",
-            &[
+        },
+        SeededWorkload {
+            name: "SQLServer",
+            display_name: "Microsoft SQL Server",
+            description: "Deploy Microsoft SQL Server, standalone or highly available, on Amazon \
+                           Web Services.",
+            documentation_page: "launch-wizard-sql",
+            patterns: &[
                 SeededPattern {
                     name: "SqlServerSingle",
                     display_name: "Microsoft SQL Server on a single instance",
@@ -1500,13 +1543,14 @@ fn seeded_workloads() -> BTreeMap<String, Workload> {
                     own_required: SQL_SERVER_HA_REQUIRED,
                 },
             ][..],
-        ),
-        (
-            "ActiveDirectory",
-            "Microsoft Active Directory",
-            "Deploy AWS Managed Microsoft AD or self-managed Active Directory on Amazon Web \
-             Services.",
-            &[
+        },
+        SeededWorkload {
+            name: "ActiveDirectory",
+            display_name: "Microsoft Active Directory",
+            description: "Deploy AWS Managed Microsoft AD or self-managed Active Directory on \
+                           Amazon Web Services.",
+            documentation_page: "launch-wizard-ad",
+            patterns: &[
                 SeededPattern {
                     name: "AWSManagedAD",
                     display_name: "AWS Managed Microsoft AD",
@@ -1524,12 +1568,19 @@ fn seeded_workloads() -> BTreeMap<String, Workload> {
                     own_required: SELF_MANAGED_AD_REQUIRED,
                 },
             ][..],
-        ),
+        },
     ];
     catalogue
         .into_iter()
-        .map(|(workload_name, display_name, description, patterns)| {
-            let patterns = patterns
+        .map(|workload| {
+            let workload_name = workload.name;
+            // The two URLs a catalogue entry publishes, built once per entry so the
+            // workload and every pattern of it name the SAME document.
+            let documentation_url =
+                format!("{DOCUMENTATION_BASE}/{}.html", workload.documentation_page);
+            let icon_url = format!("{ICON_BASE}/{workload_name}.png");
+            let patterns = workload
+                .patterns
                 .iter()
                 .map(|pattern| {
                     (
@@ -1539,6 +1590,7 @@ fn seeded_workloads() -> BTreeMap<String, Workload> {
                             pattern_name: pattern.name.to_string(),
                             display_name: pattern.display_name.to_string(),
                             description: pattern.description.to_string(),
+                            documentation_url: documentation_url.clone(),
                             status: PATTERN_ACTIVE.to_string(),
                             status_message: None,
                             workload_version_name: CATALOGUE_VERSION.to_string(),
@@ -1552,9 +1604,11 @@ fn seeded_workloads() -> BTreeMap<String, Workload> {
                 workload_name.to_string(),
                 Workload {
                     workload_name: workload_name.to_string(),
-                    display_name: display_name.to_string(),
-                    description: description.to_string(),
+                    display_name: workload.display_name.to_string(),
+                    description: workload.description.to_string(),
                     status: WORKLOAD_ACTIVE.to_string(),
+                    documentation_url,
+                    icon_url,
                     patterns,
                 },
             )

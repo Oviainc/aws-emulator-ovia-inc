@@ -69,9 +69,10 @@ async fn a_reported_workload_carries_only_members_read_off_the_stored_entry() {
             "case {name:?}: status {status:?} is not a WorkloadStatus value"
         );
 
-        // The two members `WorkloadData` adds over `WorkloadDataSummary` that the
-        // stored entry carries.
-        for member in ["displayName", "description"] {
+        // The members the stored entry carries beyond the catalogue key: the display
+        // name and description, and the document and icon the catalogue publishes for
+        // the entry (whose own rule is `catalogue_published_urls.rs`).
+        for member in ["displayName", "description", "documentationUrl", "iconUrl"] {
             assert!(
                 workload[member]
                     .as_str()
@@ -81,16 +82,10 @@ async fn a_reported_workload_carries_only_members_read_off_the_stored_entry() {
             );
         }
 
-        // And the members the emulator holds nothing for: it hosts no workload
-        // document and no icon, models no account constraints, and an entry in a
-        // steady status has nothing to say about it. An absent member is the honest
-        // answer; a fabricated URL would name a resource that does not exist.
-        for member in [
-            "documentationUrl",
-            "iconUrl",
-            "statusMessage",
-            "accountConstraints",
-        ] {
+        // And the members the emulator holds nothing for: it models no account
+        // constraints, and an entry in a steady status has nothing to say about it. An
+        // absent member is the honest answer there.
+        for member in ["statusMessage", "accountConstraints"] {
             assert!(
                 absent(&workload, member),
                 "case {name:?}: {member} must be absent while the emulator holds no value \
