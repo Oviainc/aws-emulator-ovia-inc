@@ -264,6 +264,17 @@ impl Emulator {
         .await
     }
 
+    /// `DeleteScene`: DELETE on the scene's own path, with both ids as
+    /// `@httpLabel`s and no body.
+    pub(crate) async fn delete_scene(&self, workspace_id: &str, scene_id: &str) -> Resp {
+        self.call(
+            "DELETE",
+            &format!("/workspaces/{workspace_id}/scenes/{scene_id}"),
+            None,
+        )
+        .await
+    }
+
     /// `CreateMetadataTransferJob`: POST /metadata-transfer-jobs, with every
     /// member (including the optional `metadataTransferJobId`) in the body.
     pub(crate) async fn create_metadata_transfer_job(&self, body: Value) -> Resp {
