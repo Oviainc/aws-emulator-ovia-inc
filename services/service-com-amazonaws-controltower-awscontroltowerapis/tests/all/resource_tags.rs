@@ -45,7 +45,7 @@ fn tags_path(arn: &str) -> String {
 }
 
 /// `TagResource`: POST the tag map for `arn`.
-async fn apply_tags(
+pub(crate) async fn apply_tags(
     router: &MultiServiceRouter,
     arn: &str,
     tags: &BTreeMap<String, String>,
@@ -96,10 +96,10 @@ pub(crate) fn tags(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
 
 /// One row of the resource table: a resource kind this service mints ARNs for, the ARN
 /// one call minted, and the tags that call created it with.
-struct Resource {
-    case: &'static str,
-    arn: String,
-    created_with: BTreeMap<String, String>,
+pub(crate) struct Resource {
+    pub(crate) case: &'static str,
+    pub(crate) arn: String,
+    pub(crate) created_with: BTreeMap<String, String>,
 }
 
 /// Every resource kind this service tags, created on `router`: a landing zone (created
@@ -107,7 +107,7 @@ struct Resource {
 /// no `tags` member at all) and an enabled baseline (created with an EMPTY tag map).
 ///
 /// The account holds at most one landing zone, so there is one of those per router.
-async fn resources(router: &MultiServiceRouter) -> Vec<Resource> {
+pub(crate) async fn resources(router: &MultiServiceRouter) -> Vec<Resource> {
     let created_with = tags(&[("Owner", "platform")]);
     let landing_zone = call(
         router,
