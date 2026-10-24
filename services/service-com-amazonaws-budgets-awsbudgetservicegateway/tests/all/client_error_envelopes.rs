@@ -208,16 +208,9 @@ async fn a_scaffolded_operation_still_answers_501() {
             }),
         ),
         (
-            // `DescribeBudgetAction` is implemented now (it reads the action
-            // `CreateBudgetAction` / `ExecuteBudgetAction` write), so the stub row
-            // here is the LIST side of the same resource, still under its own issue.
-            "DescribeBudgetActionsForBudget",
-            json!({
-                "AccountId": &account_id,
-                "BudgetName": "stub"
-            }),
-        ),
-        (
+            // `DescribeBudgetActionsForBudget` is implemented now (it lists the actions
+            // `CreateBudgetAction` writes onto a budget), so the account-wide list is
+            // the stub row here, still under its own issue.
             "DescribeBudgetActionsForAccount",
             json!({"AccountId": &account_id}),
         ),

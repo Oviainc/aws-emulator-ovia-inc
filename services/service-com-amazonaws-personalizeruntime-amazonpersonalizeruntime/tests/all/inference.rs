@@ -645,7 +645,10 @@ async fn a_filter_expression_removes_exactly_the_items_it_names() {
             )
             .await;
         let mut returned = ids(&response, "itemList", "itemId");
-        assert_sums_to_one(case, &scores(&response, "itemList"));
+        // The filter decides WHICH items come back, never what one of them scores, so
+        // a filtered response carries only the share of the certainty its surviving
+        // items hold out of the whole scored catalog.
+        assert_descending_and_bounded(case, &scores(&response, "itemList"));
         returned.sort();
         let mut expected_sorted = expected.clone();
         expected_sorted.sort();
@@ -1139,7 +1142,13 @@ async fn an_action_score_does_not_change_with_the_requested_number_of_results() 
             candidates,
             "case {group}: expected {candidates} scored candidates, got {reference:?}"
         );
-        assert_sums_to_one(group, &scores(&whole, "actionList"));
+        if filter_arn.is_none() {
+            assert_sums_to_one(group, &scores(&whole, "actionList"));
+        } else {
+            // A filtered response reports only part of the scored catalog, so it
+            // carries only part of the certainty.
+            assert_descending_and_bounded(group, &scores(&whole, "actionList"));
+        }
 
         for num_results in rows {
             let case = format!("{group} numResults {num_results:?}");
@@ -1158,9 +1167,9 @@ async fn an_action_score_does_not_change_with_the_requested_number_of_results() 
             assert_descending_and_bounded(&case, &scores(&response, "actionList"));
 
             let total: f64 = reported.values().sum();
-            if expected_len < candidates {
-                // The certainty the unreported candidates carry stays with them: a
-                // short response reports a share of 1.0, not 1.0 renormalized.
+            if expected_len < candidates || filter_arn.is_some() {
+                // The certainty the unreported actions carry stays with them: a short
+                // or filtered response reports a share of 1.0, not 1.0 renormalized.
                 assert!(
                     total < 1.0 - 1e-9,
                     "case {case}: a response reporting {expected_len} of {candidates} \
@@ -1186,12 +1195,15 @@ async fn an_item_score_does_not_change_with_the_requested_number_of_results() {
 
     // One group per candidate set, across both resource kinds and both personalization
     // inputs `GetRecommendations` serves; a `RELATED_ITEMS` candidate set excludes the
-    // queried item.
-    let groups: [(&str, Value, usize); 4] = [
+    // queried item. The flag says whether the group's reported items are the WHOLE
+    // scored catalog — a filtered group reports only part of it, and so carries only
+    // part of the certainty.
+    let groups: [(&str, Value, usize, bool); 4] = [
         (
             "campaign, no filter",
             json!({ "campaignArn": CAMPAIGN_USER, "userId": "user-3" }),
             CATALOG_SIZE,
+            true,
         ),
         (
             "campaign, YEAR >= 2010",
@@ -1201,22 +1213,25 @@ async fn an_item_score_does_not_change_with_the_requested_number_of_results() {
                 "filterArn": FILTER_RECENT,
             }),
             recent_candidates,
+            false,
         ),
         (
             "recommender, no filter",
             json!({ "recommenderArn": RECOMMENDER_TOP_PICKS, "userId": "user-8" }),
             CATALOG_SIZE,
+            true,
         ),
         (
             "related items",
             json!({ "campaignArn": CAMPAIGN_RELATED, "itemId": "item-4" }),
             CATALOG_SIZE - 1,
+            true,
         ),
     ];
     // "The number of results to return. The default is 25."
     let rows: [Option<i32>; 5] = [Some(1), Some(3), Some(10), None, Some(CATALOG_SIZE as i32)];
 
-    for (group, base, candidates) in groups {
+    for (group, base, candidates, whole_catalog) in groups {
         let request = |num_results: Option<i32>| {
             let mut body = base.clone();
             if let Some(num_results) = num_results {
@@ -1234,7 +1249,11 @@ async fn an_item_score_does_not_change_with_the_requested_number_of_results() {
             candidates,
             "case {group}: expected {candidates} scored candidates, got {reference:?}"
         );
-        assert_sums_to_one(group, &scores(&whole, "itemList"));
+        if whole_catalog {
+            assert_sums_to_one(group, &scores(&whole, "itemList"));
+        } else {
+            assert_descending_and_bounded(group, &scores(&whole, "itemList"));
+        }
 
         for num_results in rows {
             let case = format!("{group} numResults {num_results:?}");
