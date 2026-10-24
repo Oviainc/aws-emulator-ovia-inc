@@ -1238,17 +1238,28 @@ async fn a_reserved_contact_settles_into_scheduled_and_reads_back_from_state() {
         "case list-cancelled: the contact must list under its new status, got {now_cancelled:?}"
     );
 
-    // @idempotent: cancelling again lands on the same state and answers the same way.
+    // @idempotent, but a cancel RELEASES a reservation: a contact that no longer holds
+    // one has nothing left to cancel, so the second DELETE is refused with the
+    // operation's modelled InvalidParameterException instead of answering 200.
     let again = send(&router, "DELETE", &format!("/contact/{contact_id}"), None).await;
     assert_eq!(
-        again.status, 200,
-        "case cancel-again: expected 200, got {} {}",
+        again.status, 431,
+        "case cancel-again: expected the modelled InvalidParameterException status 431, \
+         got {} {}",
         again.status, again.body
     );
     assert_eq!(
-        again.string("contactId"),
-        contact_id,
-        "case cancel-again: another contactId came back"
+        again.error_code(),
+        "InvalidParameterException",
+        "case cancel-again: wrong error shape, got {}",
+        again.body
+    );
+    let still_cancelled = send(&router, "GET", &format!("/contact/{contact_id}"), None).await;
+    assert_eq!(
+        still_cancelled.field("contactStatus"),
+        &json!("CANCELLED"),
+        "case cancel-again: a refused cancel leaves the status untouched, got {}",
+        still_cancelled.field("contactStatus")
     );
 
     for (case, path) in [

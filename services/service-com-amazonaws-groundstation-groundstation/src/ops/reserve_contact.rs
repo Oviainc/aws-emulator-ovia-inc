@@ -251,6 +251,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             scheduling_settles_at: Some(
                 ::std::time::SystemTime::now() + crate::state::SCHEDULING_SETTLES_AFTER,
             ),
+            // No release is under way, and the pass has not begun, so no antenna time has
+            // been spent yet: a cancel before the pass gives the whole window back.
+            cancellation_settles_at: None,
+            antenna_time_spent: false,
         };
 
         // A contact has an ARN even though no operation in this slice returns one: it is

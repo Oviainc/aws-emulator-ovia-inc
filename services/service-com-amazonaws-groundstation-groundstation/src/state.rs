@@ -62,6 +62,13 @@ pub const ENDPOINT_CREATION_SETTLES_AFTER: Duration = Duration::from_millis(300)
 /// being applied and the configuration still in force.
 pub const VERSION_ACTIVATES_AFTER: Duration = Duration::from_millis(300);
 
+/// `CancelContact` on a contact whose pass is already under way STOPS it: the contact
+/// reports `CANCELLING` while the stop is being carried out and reaches `CANCELLED` on its
+/// own. CHOSEN span (AWS documents no duration for it), inside the 250–750 ms band this
+/// project gives a clock-owed transition, so a caller that reads the contact straight after
+/// stopping it still observes the release under way.
+pub const CANCELLATION_SETTLES_AFTER: Duration = Duration::from_millis(300);
+
 /// `CreateEphemeris` admits an ephemeris in `VALIDATING`; the service validates the
 /// supplied data and the ephemeris reaches `ENABLED`, `DISABLED` or `INVALID` on its own.
 /// CHOSEN span (AWS documents no duration for it — the real service takes up to minutes to
@@ -878,6 +885,15 @@ pub struct Contact {
     /// move; `None` once the move has been materialised or the contact left
     /// `SCHEDULING`.
     pub scheduling_settles_at: Option<SystemTime>,
+    /// The instant the service owes this contact its `CANCELLING` -> `CANCELLED` move —
+    /// the end of the stop a cancel of a pass already under way started; `None` when no
+    /// stop is being carried out.
+    pub cancellation_settles_at: Option<SystemTime>,
+    /// Whether this contact's pass has already held the antenna on the account's behalf,
+    /// so those minutes stay spent however the status moves on afterwards: stopping a
+    /// pass under way lands the contact on `CANCELLED`, and a release cannot give back
+    /// antenna time the pass has already used (see [`Contact::holds_antenna_time`]).
+    pub antenna_time_spent: bool,
 }
 
 /// The model's `VersionStatus` values, whose full set is `UPDATING`, `ACTIVE`,
@@ -926,6 +942,42 @@ pub const MAX_CONTACT_VERSIONS: i32 = 128;
 /// which statuses still take an update is this emulator's rule, stated once here rather
 /// than per operation.
 pub const STATUSES_OPEN_TO_UPDATE: &[&str] = &["SCHEDULED", "SCHEDULING"];
+
+/// The `ContactStatus` a released contact holds, and the one it reports while a release
+/// of a pass already under way is being carried out — both the model's own
+/// (`smithy_query(query="shape", shape="ContactStatus")`).
+pub const CONTACT_CANCELLED: &str = "CANCELLED";
+
+/// See [`CONTACT_CANCELLED`].
+pub const CONTACT_CANCELLING: &str = "CANCELLING";
+
+/// The `ContactStatus` values in which a cancel releases a reservation whose pass has not
+/// begun, so the contact is `CANCELLED` outright.
+///
+/// `CancelContact` "cancels or stops a contact with a specified contact ID based on its
+/// position in the contact lifecycle. For contacts that: Have yet to start, the contact
+/// will be cancelled" (`smithy_query(query="operation", operation="CancelContact")`).
+/// These are the statuses of a contact whose pass has yet to start: the reservation is
+/// held and the ground station has not begun working it.
+pub const STATUSES_CANCELLABLE_BEFORE_PASS: &[&str] = &["SCHEDULING", "SCHEDULED"];
+
+/// The `ContactStatus` values in which a cancel STOPS a contact whose pass is under way:
+/// "[for contacts that] have started but have yet to finish, the contact will be stopped"
+/// (same doc as [`STATUSES_CANCELLABLE_BEFORE_PASS`]). From `PREPASS` on the ground
+/// station is already working the contact, and through `POSTPASS` it has not finished, so
+/// a cancel here is a stop — reported as [`CONTACT_CANCELLING`] while it is carried out.
+pub const STATUSES_CANCELLABLE_DURING_PASS: &[&str] = &["PREPASS", "PASS", "POSTPASS"];
+
+/// Every `ContactStatus` in which a cancel still has a reservation to release, in
+/// lifecycle order, as a refusal naming them spells them.
+pub fn cancellable_statuses() -> String {
+    STATUSES_CANCELLABLE_BEFORE_PASS
+        .iter()
+        .chain(STATUSES_CANCELLABLE_DURING_PASS)
+        .copied()
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 /// One version of a contact: the configuration that version carries, and where the
 /// version stands in the contact's history.
@@ -1003,6 +1055,11 @@ impl ContactVersionRecord {
 /// account holds or held the antenna for — including `CANCELLING`, whose release has not
 /// completed, and `FAILED`, whose antenna time was still reserved.
 ///
+/// A status in this list releases the minutes only when the antenna was never actually
+/// held: a contact STOPPED mid-pass lands on `CANCELLED` with its antenna time already
+/// spent, which [`Contact::antenna_time_spent`] records and [`Contact::holds_antenna_time`]
+/// honours.
+///
 /// CHOSEN classification: the API documents the member only as "total scheduled minutes",
 /// so which statuses release their minutes is this emulator's rule, applied in one place
 /// rather than per operation.
@@ -1016,10 +1073,52 @@ pub const STATUSES_WITHOUT_ANTENNA_TIME: &[&str] = &[
 
 impl Contact {
     /// Whether this contact holds (or held) antenna time for the account, so its minutes
-    /// count against the usage of the month it starts in. See
-    /// [`STATUSES_WITHOUT_ANTENNA_TIME`].
+    /// count against the usage of the month it starts in: its status is not one of
+    /// [`STATUSES_WITHOUT_ANTENNA_TIME`], or its pass already spent the antenna time
+    /// ([`Contact::antenna_time_spent`]) and no later status move gives it back.
     pub fn holds_antenna_time(&self) -> bool {
-        !STATUSES_WITHOUT_ANTENNA_TIME.contains(&self.contact_status.as_str())
+        self.antenna_time_spent
+            || !STATUSES_WITHOUT_ANTENNA_TIME.contains(&self.contact_status.as_str())
+    }
+
+    /// Whether a cancel still has something to release here: the reservation is live and
+    /// the pass has not finished, so the contact is either cancelled before its pass or
+    /// stopped during it.
+    ///
+    /// Everything else holds no reservation a cancel could release — a contact already
+    /// released (`CANCELLED`, `AWS_CANCELLED`), one whose pass is over or will never be
+    /// flown (`COMPLETED`, `FAILED`, `FAILED_TO_SCHEDULE`, `AWS_FAILED`) and a window
+    /// merely offered (`AVAILABLE`). `CANCELLING` is not here either, but for the
+    /// opposite reason: a release is already under way, which `CancelContact` answers
+    /// without starting a second one.
+    pub fn is_cancellable(&self) -> bool {
+        let status = self.contact_status.as_str();
+        STATUSES_CANCELLABLE_BEFORE_PASS.contains(&status)
+            || STATUSES_CANCELLABLE_DURING_PASS.contains(&status)
+    }
+
+    /// Release this contact's reservation, from whichever side of its pass the cancel
+    /// arrived on. Only called for a contact [`Contact::is_cancellable`] admits.
+    ///
+    /// A contact whose pass has yet to start is `CANCELLED` outright: there is nothing to
+    /// stop, and the scheduler no longer owes it its `SCHEDULING` -> `SCHEDULED` move.
+    /// One whose pass is under way is STOPPED instead — it reports [`CONTACT_CANCELLING`]
+    /// while the stop is carried out and the service owes it its move to
+    /// [`CONTACT_CANCELLED`] [`CANCELLATION_SETTLES_AFTER`] from now (materialised by
+    /// `settle_due_contacts`). That pass already had the antenna on the account's behalf,
+    /// so the stop also records the antenna time as spent: a release cannot give back
+    /// time the pass has already used.
+    pub fn begin_cancellation(&mut self, now: DateTime) {
+        if STATUSES_CANCELLABLE_DURING_PASS.contains(&self.contact_status.as_str()) {
+            self.antenna_time_spent = true;
+            self.contact_status = CONTACT_CANCELLING.to_string();
+            self.cancellation_settles_at = Some(SystemTime::now() + CANCELLATION_SETTLES_AFTER);
+        } else {
+            self.contact_status = CONTACT_CANCELLED.to_string();
+            self.cancellation_settles_at = None;
+        }
+        self.scheduling_settles_at = None;
+        self.last_updated = now;
     }
 
     /// The whole minutes of antenna time this contact is scheduled for: its own window,
@@ -2475,15 +2574,25 @@ impl ComAmazonawsGroundstationGroundstationState {
         }
     }
 
-    /// Materialise every `SCHEDULING` -> `SCHEDULED` move and every `UPDATING` ->
-    /// `ACTIVE` contact-version move the clock has already made due. A reporting
-    /// operation calls this before reading: the moves were owed at this instant whether
-    /// or not anybody called, so applying them changes nothing a later caller could
-    /// otherwise have seen.
+    /// Materialise every `SCHEDULING` -> `SCHEDULED` move, every `CANCELLING` ->
+    /// `CANCELLED` move and every `UPDATING` -> `ACTIVE` contact-version move the clock
+    /// has already made due. A reporting operation calls this before reading: the moves
+    /// were owed at this instant whether or not anybody called, so applying them changes
+    /// nothing a later caller could otherwise have seen.
     pub fn settle_due_contacts(&mut self) {
         let now = SystemTime::now();
         for contact in self.contacts.values_mut() {
             contact.apply_due_versions();
+            if contact
+                .cancellation_settles_at
+                .is_some_and(|due| due <= now)
+            {
+                if contact.contact_status == CONTACT_CANCELLING {
+                    contact.contact_status = CONTACT_CANCELLED.to_string();
+                    contact.last_updated = now_timestamp();
+                }
+                contact.cancellation_settles_at = None;
+            }
             let Some(due) = contact.scheduling_settles_at else {
                 continue;
             };

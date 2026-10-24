@@ -19,6 +19,8 @@ mod agent_lifecycle;
 mod config_defaults_and_references;
 #[path = "all/config_listing.rs"]
 mod config_listing;
+#[path = "all/contact_cancellation.rs"]
+mod contact_cancellation;
 #[path = "all/contact_version_listing.rs"]
 mod contact_version_listing;
 #[path = "all/contact_versions.rs"]
