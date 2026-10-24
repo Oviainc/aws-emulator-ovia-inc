@@ -152,12 +152,40 @@ pub struct Palette {
 /// template a client follows to `GetTile` for it.
 #[derive(Debug, Clone)]
 pub struct StyleSource {
-    /// The source name inside the style document (`basemap`, `satellite`, ...).
+    /// The source name inside the style document (`aws`, `satellite`, ...).
     pub name: String,
     /// The `Tileset` path label `GetTile` takes.
     pub tileset: String,
     /// The `{z}/{x}/{y}` template a client expands to reach `GetTile`.
     pub tile_url_template: String,
+}
+
+/// The directional light a style's 3D layers are lit by, as the MapLibre
+/// `light` block states it: an anchor the position is measured against and a
+/// `[radial, azimuthal, polar]` position.
+#[derive(Debug, Clone)]
+pub struct LightRecord {
+    /// `map` or `viewport`: what the light's position is measured against.
+    pub anchor: String,
+    /// How strongly the light is cast, `0..=1`.
+    pub intensity: f64,
+    /// `[radial distance, azimuthal angle, polar angle]`.
+    pub position: [f64; 3],
+}
+
+/// The sky and atmosphere a style paints above the horizon, as the MapLibre
+/// `sky` block states it. The colours come from the style's own palette, so a
+/// scheme's sky belongs to the scheme; the blends are how far each band fades
+/// into the next, `0..=1`.
+#[derive(Debug, Clone)]
+pub struct SkyRecord {
+    pub sky_color: Rgba,
+    pub horizon_color: Rgba,
+    pub fog_color: Rgba,
+    pub sky_horizon_blend: f64,
+    pub horizon_fog_blend: f64,
+    pub fog_ground_blend: f64,
+    pub atmosphere_blend: f64,
 }
 
 /// The stored half of a style descriptor: everything that does not depend on
@@ -166,8 +194,26 @@ pub struct StyleSource {
 pub struct StyleRecord {
     pub style: MapStyleKind,
     pub color_scheme: ColorSchemeKind,
-    /// Human name the style document reports.
+    /// The style's canonical identifier, which is what the document reports as
+    /// its `name` (see [`canonical_style_name`]).
     pub name: String,
+    /// The identifier of this published style document: the canonical name's
+    /// scope, lowercased, with the published version appended.
+    pub id: String,
+    /// The version of the style this catalog publishes, reported in the
+    /// document's metadata and carried in [`Self::id`].
+    pub version: String,
+    /// When this style version was first published, RFC 3339. Catalog data, so
+    /// every read of the style reports the same instant.
+    pub created: String,
+    /// When this style version last changed, RFC 3339.
+    pub modified: String,
+    /// The light the style's 3D layers are lit by.
+    pub light: LightRecord,
+    /// The sky the style paints above the horizon.
+    pub sky: SkyRecord,
+    /// The projection the style is rendered in (`globe`, `mercator`, ...).
+    pub projection: String,
     pub palette: Palette,
     /// The always-on sources, in draw order.
     pub sources: Vec<StyleSource>,
@@ -205,6 +251,9 @@ pub struct TilesetRecord {
     pub id: String,
     pub format: TileFormat,
     pub content_type: String,
+    /// The credit line a client must display for this tileset's data, which a
+    /// style document reports on every source that reads it.
+    pub attribution: String,
     /// Lowest zoom this tileset has tiles for; a lower `Z` is out of range.
     pub min_zoom: u32,
     /// Highest zoom this tileset has tiles for; a higher `Z` is out of range.
@@ -212,6 +261,12 @@ pub struct TilesetRecord {
     /// The layer names a vector tile from this tileset carries. Empty for a
     /// raster tileset.
     pub layers: Vec<String>,
+    /// Which of [`Self::layers`] carry INCIDENT events — an individual
+    /// obstruction of the network rather than its continuous state. A client
+    /// can ask for the continuous state alone, which is every other layer, so
+    /// the catalog states which layers these are rather than leaving it to a
+    /// layer name's spelling.
+    pub incident_layers: Vec<String>,
     /// Colours a raster tile from this tileset is drawn with.
     pub palette: Palette,
     /// The bucket `GetTile` reports; `None` falls back to
@@ -511,16 +566,18 @@ fn seed_tilesets() -> Vec<TilesetRecord> {
             id: "vector.basemap".to_string(),
             format: TileFormat::VectorMvt,
             content_type: "application/vnd.mapbox-vector-tile".to_string(),
+            attribution: ATTRIBUTION.to_string(),
             min_zoom: 0,
-            max_zoom: 16,
+            max_zoom: VECTOR_MAX_ZOOM,
             layers: vec![
-                "land".to_string(),
+                GROUND_LAYER.to_string(),
                 "water".to_string(),
                 "roads".to_string(),
-                "buildings".to_string(),
-                "places".to_string(),
+                BUILDING_LAYER.to_string(),
+                POI_LAYER.to_string(),
                 "borders".to_string(),
             ],
+            incident_layers: Vec::new(),
             palette: basemap_palette.clone(),
             pricing_bucket: Some("MapTiles".to_string()),
             cache_control: "max-age=86400".to_string(),
@@ -529,12 +586,14 @@ fn seed_tilesets() -> Vec<TilesetRecord> {
             id: "vector.traffic".to_string(),
             format: TileFormat::VectorMvt,
             content_type: "application/vnd.mapbox-vector-tile".to_string(),
+            attribution: ATTRIBUTION.to_string(),
             min_zoom: 0,
-            max_zoom: 16,
+            max_zoom: VECTOR_MAX_ZOOM,
             layers: vec![
                 "traffic_flow".to_string(),
-                "traffic_incidents".to_string(),
+                TRAFFIC_INCIDENT_LAYER.to_string(),
             ],
+            incident_layers: vec![TRAFFIC_INCIDENT_LAYER.to_string()],
             palette: basemap_palette,
             pricing_bucket: Some("TrafficTiles".to_string()),
             cache_control: "max-age=60".to_string(),
@@ -543,9 +602,11 @@ fn seed_tilesets() -> Vec<TilesetRecord> {
             id: "raster.satellite".to_string(),
             format: TileFormat::RasterJpeg,
             content_type: "image/jpeg".to_string(),
+            attribution: ATTRIBUTION.to_string(),
             min_zoom: 0,
             max_zoom: 19,
             layers: Vec::new(),
+            incident_layers: Vec::new(),
             palette: satellite_palette,
             pricing_bucket: Some("SatelliteTiles".to_string()),
             cache_control: "max-age=86400".to_string(),
@@ -554,9 +615,11 @@ fn seed_tilesets() -> Vec<TilesetRecord> {
             id: "raster.dem".to_string(),
             format: TileFormat::RasterDemPng,
             content_type: "image/png".to_string(),
+            attribution: ATTRIBUTION.to_string(),
             min_zoom: 0,
             max_zoom: 14,
             layers: Vec::new(),
+            incident_layers: Vec::new(),
             // A DEM tile's pixels are elevation, not colour; the palette is
             // carried for uniformity and is unused by the Terrarium encoding.
             palette: palette(MapStyleKind::Monochrome, ColorSchemeKind::Light),
@@ -570,20 +633,49 @@ fn seed_tilesets() -> Vec<TilesetRecord> {
 
 /// The style record for one (style, colour scheme) pair.
 fn seed_style(style: MapStyleKind, scheme: ColorSchemeKind) -> StyleRecord {
+    let variant = VariantKind::Default;
     let mut sources = Vec::new();
     if matches!(style, MapStyleKind::Hybrid | MapStyleKind::Satellite) {
-        sources.push(style_source("satellite", "raster.satellite"));
+        sources.push(style_source(SATELLITE_SOURCE, "raster.satellite"));
     }
     if !matches!(style, MapStyleKind::Satellite) {
-        sources.push(style_source("basemap", "vector.basemap"));
+        sources.push(style_source(BASEMAP_SOURCE, "vector.basemap"));
     }
+    let palette = palette(style, scheme);
+    let scope = style_scope(style, scheme, variant);
     StyleRecord {
         style,
         color_scheme: scheme,
-        name: format!("{} {}", style.as_wire(), scheme.as_wire()),
-        palette: palette(style, scheme),
+        name: canonical_style_name(style, scheme, variant),
+        id: format!("{}-{STYLE_VERSION}", scope.to_lowercase()),
+        version: STYLE_VERSION.to_string(),
+        created: STYLE_CREATED.to_string(),
+        modified: STYLE_MODIFIED.to_string(),
+        light: LightRecord {
+            anchor: LIGHT_ANCHOR.to_string(),
+            // A dark scheme is lit lower than a light one: the same light cast
+            // at the light scheme's strength washes a dark basemap out.
+            intensity: match scheme {
+                ColorSchemeKind::Light => 0.3,
+                ColorSchemeKind::Dark => 0.15,
+            },
+            position: LIGHT_POSITION,
+        },
+        sky: SkyRecord {
+            // The sky is painted from the style's own palette, so a scheme's
+            // sky belongs to the scheme rather than to a constant here.
+            sky_color: palette.water,
+            horizon_color: palette.graticule,
+            fog_color: palette.land,
+            sky_horizon_blend: 0.8,
+            horizon_fog_blend: 0.6,
+            fog_ground_blend: 0.5,
+            atmosphere_blend: 0.8,
+        },
+        projection: PROJECTION.to_string(),
+        palette,
         sources,
-        sprite_url_template: assets::sprite_url_template(style, scheme, VariantKind::Default),
+        sprite_url_template: assets::sprite_url_template(style, scheme, variant),
         glyph_url_template: assets::GLYPH_URL_TEMPLATE.to_string(),
         font_stack: match style {
             MapStyleKind::Monochrome => vec!["Amazon Ember Condensed RC Regular".to_string()],
@@ -592,6 +684,85 @@ fn seed_style(style: MapStyleKind, scheme: ColorSchemeKind) -> StyleRecord {
         content_type: "application/json".to_string(),
         cache_control: "max-age=3600".to_string(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// The published style catalog's own identity
+// ---------------------------------------------------------------------------
+
+/// The prefix every published style's canonical name carries.
+pub const STYLE_NAME_PREFIX: &str = "AmazonLocation";
+
+/// The geographic coverage of the styles this catalog publishes: one worldwide
+/// map rather than a per-region cut, which is the middle term of a style's
+/// canonical name.
+pub const STYLE_COVERAGE: &str = "Global";
+
+/// The version of the style documents this catalog publishes. It is reported in
+/// a document's metadata and is the suffix of its `id`, so a client can tell
+/// two published versions apart.
+pub const STYLE_VERSION: &str = "4.1.0";
+
+/// When [`STYLE_VERSION`] was published, and when it last changed. Catalog data
+/// rather than a clock reading: a style document is published content, so every
+/// read of it reports the same two instants.
+pub const STYLE_CREATED: &str = "2025-02-03T00:00:00Z";
+pub const STYLE_MODIFIED: &str = "2025-02-03T00:00:00Z";
+
+/// What a style's `light` position is measured against, and the
+/// `[radial, azimuthal, polar]` position itself.
+const LIGHT_ANCHOR: &str = "viewport";
+const LIGHT_POSITION: [f64; 3] = [1.5, 235.0, 30.0];
+
+/// The projection every published style is rendered in.
+const PROJECTION: &str = "globe";
+
+/// The credit line this catalog's map data is served under.
+pub const ATTRIBUTION: &str = "\u{a9} AWS";
+
+/// The highest zoom the vector tilesets have tiles for.
+pub const VECTOR_MAX_ZOOM: u32 = 17;
+
+/// The style-document source name of the vector basemap, and of the satellite
+/// imagery. The basemap is the source a client reads the map itself from.
+pub const BASEMAP_SOURCE: &str = "aws";
+pub const SATELLITE_SOURCE: &str = "satellite";
+
+/// The basemap layer that carries the ground. A style paints it as the
+/// document's `background` layer, which is what lies under everything else.
+pub const GROUND_LAYER: &str = "land";
+
+/// The basemap layer that carries points of interest, which `PoiDensity` and
+/// `PoiCategories` project onto.
+pub const POI_LAYER: &str = "places";
+
+/// The basemap layer that carries building footprints, which `Buildings`
+/// projects onto.
+pub const BUILDING_LAYER: &str = "buildings";
+
+/// The traffic layer that carries incident events, as opposed to the flow of
+/// traffic the rest of that tileset's layers carry.
+pub const TRAFFIC_INCIDENT_LAYER: &str = "traffic_incidents";
+
+/// The scope part of a published style's identity: the style, its coverage, its
+/// colour scheme and its variant, in the order the canonical name writes them.
+pub fn style_scope(style: MapStyleKind, scheme: ColorSchemeKind, variant: VariantKind) -> String {
+    format!(
+        "{}-{STYLE_COVERAGE}-{}-{}",
+        style.as_wire(),
+        scheme.as_wire(),
+        variant.as_wire()
+    )
+}
+
+/// The canonical name a published style document reports: the prefix every
+/// published style carries, followed by its scope.
+pub fn canonical_style_name(
+    style: MapStyleKind,
+    scheme: ColorSchemeKind,
+    variant: VariantKind,
+) -> String {
+    format!("{STYLE_NAME_PREFIX}-{}", style_scope(style, scheme, variant))
 }
 
 fn style_source(name: &str, tileset: &str) -> StyleSource {
