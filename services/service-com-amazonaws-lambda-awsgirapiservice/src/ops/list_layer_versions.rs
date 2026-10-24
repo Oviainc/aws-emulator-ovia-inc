@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListLayerVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListLayerVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListLayerVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the versions one layer still holds, newest first, each entry built out of what
+//! `PublishLayerVersion` persisted for that version. A version `DeleteLayerVersion` took
+//! out of the store is not listed, because the store no longer holds it. A pure report —
+//! this operation writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +156,126 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListLayerVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListLayerVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListLayerVersionsErrorModeled::ServiceException(ServiceException {
+                r#type: None,
+                message: Some("Lambda state is not reachable on this engine".to_string()),
+            })
+            .into());
+        };
+
+        // "The name or Amazon Resource Name (ARN) of the layer": both forms name the
+        // same record, exactly as every other operation on a layer resolves it.
+        let name = crate::state::parse_layer_name(&input.layer_name).ok_or_else(|| {
+            invalid_parameter(format!(
+                "1 validation error detected: Value '{}' at 'layerName' failed to satisfy \
+                 constraint: Member must satisfy one of the documented layer name formats \
+                 (name or layer ARN)",
+                input.layer_name
+            ))
+        })?;
+
+        // The model declares `MaxItems` as `@range(min: 1, max: 50)`, so the boundary
+        // validator has already refused anything outside it; this handler enforces the
+        // same floor itself rather than letting a page size of zero reach the pagination
+        // arithmetic below.
+        if let Some(requested) = input.max_items.filter(|requested| *requested < 1) {
+            return Err(invalid_parameter(format!(
+                "1 validation error detected: Value '{requested}' at 'maxItems' failed to \
+                 satisfy constraint: Member must have value greater than or equal to 1"
+            )));
+        }
+        let page_size = input
+            .max_items
+            .and_then(|requested| usize::try_from(requested).ok())
+            .unwrap_or(crate::state::MAX_PAGE_SIZE)
+            .clamp(1, crate::state::MAX_PAGE_SIZE);
+
+        // The marker is the version number of the last entry the previous page reported,
+        // so the next page continues at the first version ordered after it in the order
+        // this operation reports versions in. A value that is no version number at all
+        // names no place in that order.
+        let start_after = match input.marker.as_deref() {
+            Some(marker) => Some(marker.trim().parse::<i64>().map_err(|_| {
+                invalid_parameter(format!(
+                    "1 validation error detected: Value '{marker}' at 'marker' failed to \
+                     satisfy constraint: Member must be the version number of a previous \
+                     page's last entry"
+                ))
+            })?),
+            None => None,
+        };
+
+        // A layer is a REGIONAL resource: it is published into one Region and its ARNs
+        // carry that Region, so the versions this call can enumerate are the ones
+        // published in the Region the caller addressed. The Region of the call comes from
+        // its own SigV4 credential scope and the comparison is against the Region stored
+        // on the record.
+        let region = crate::state::request_region(ctx);
+
+        // "Specify a runtime identifier to list only versions that indicate that they're
+        // compatible with that runtime. Specify a compatible architecture to include only
+        // layer versions that are compatible with that architecture." Both filters are
+        // per VERSION here, because every version of the layer is a candidate entry.
+        let runtime = input.compatible_runtime.as_deref();
+        let architecture = input.compatible_architecture.as_deref();
+
+        let store = state.lock();
+        // A layer name nobody has published under holds no version, so there is nothing
+        // to report for it: the listing is empty rather than refused, exactly as a layer
+        // whose every version has been deleted reports nothing.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListLayerVersions"))
+        // "Lists the versions of an Lambda layer" with the newest first, so the store's
+        // ascending version keys are walked backwards; "Versions that have been deleted
+        // aren't listed", which is why the entries come from the versions the store still
+        // holds rather than from the layer's version counter.
+        let entries: Vec<LayerVersionsListItem> = store
+            .layers
+            .get(&name)
+            .filter(|record| record.region == region)
+            .map(|record| {
+                record
+                    .versions
+                    .values()
+                    .rev()
+                    .filter(|version| version.is_compatible_with(runtime, architecture))
+                    .map(|version| record.version_summary(version))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let start = match start_after {
+            Some(after) => entries
+                .iter()
+                .position(|entry| entry.version < after)
+                .unwrap_or(entries.len()),
+            None => 0,
+        };
+        let page = match entries.get(start..) {
+            Some(remaining) => &remaining[..page_size.min(remaining.len())],
+            None => &[][..],
+        };
+        let truncated = start + page.len() < entries.len();
+
+        Ok(ListLayerVersionsOutput {
+            layer_versions: Some(page.to_vec()),
+            // "A pagination token returned when the response doesn't contain all
+            // versions" — so it is absent on the last page, and it is the version number
+            // of the last entry THIS page reported, which is what the next page continues
+            // after.
+            next_marker: page
+                .last()
+                .filter(|_| truncated)
+                .map(|entry| entry.version.to_string()),
+        })
     }
+}
+
+/// The modelled 400 this operation answers a request it cannot satisfy with.
+fn invalid_parameter(message: String) -> ListLayerVersionsError {
+    ListLayerVersionsErrorModeled::InvalidParameterValueException(InvalidParameterValueException {
+        r#type: None,
+        message: Some(message),
+    })
+    .into()
 }
