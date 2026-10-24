@@ -37,3 +37,5 @@ mod traffic_policies;
 mod vpc_association_authorizations;
 #[path = "all/vpc_associations.rs"]
 mod vpc_associations;
+#[path = "all/vpc_authorization_deletion.rs"]
+mod vpc_authorization_deletion;

@@ -33,12 +33,20 @@ pub(crate) fn emulator() -> MultiServiceRouter {
 /// move a clock-owed transition rather than wait for it.
 pub(crate) fn emulator_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let router = mount_on(&engine);
+    (router, engine)
+}
+
+/// Mount this service on an engine the caller already holds — the one place a
+/// test builds a router, so a test that mounts the service a second time on an
+/// engine that already holds state mounts it exactly as the first was.
+pub(crate) fn mount_on(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(
         service_com_amazonaws_taxsettings_taxsettings::EmulatedService::new(engine.clone()),
     );
-    (router, engine)
+    router
 }
 
 /// Hold every stored TRN's validation open, so a read reports the status its

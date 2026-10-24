@@ -31,6 +31,8 @@ mod insight_feedback;
 mod insight_listing;
 #[path = "all/insight_reads.rs"]
 mod insight_reads;
+#[path = "all/insight_search.rs"]
+mod insight_search;
 #[path = "all/monitored_resources.rs"]
 mod monitored_resources;
 #[path = "all/mutation_idempotency_and_tenancy.rs"]

@@ -15,6 +15,8 @@
 mod create_graph_using_import_task;
 #[path = "all/error_message_rendering.rs"]
 mod error_message_rendering;
+#[path = "all/export_task_cancellation.rs"]
+mod export_task_cancellation;
 #[path = "all/export_task_lifecycle.rs"]
 mod export_task_lifecycle;
 #[path = "all/graph_deletion.rs"]

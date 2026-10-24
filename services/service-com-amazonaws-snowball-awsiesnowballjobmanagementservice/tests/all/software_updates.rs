@@ -38,26 +38,28 @@ use super::job_lifecycle::{
     call_in_region, complete_order, create_address, deliverable_address, ok, refused, string,
 };
 
-/// `UpdatesURI` is modelled `len 1..1024`
-/// (`smithy_query(query="operation", operation="GetSoftwareUpdates")`).
-const UPDATES_URI_MAX_LEN: usize = 1024;
+/// `UpdatesURI` and `ManifestURI` are both modelled `len 1..1024`
+/// (`smithy_query(query="operation", operation="GetSoftwareUpdates")`,
+/// `operation="GetJobManifest"`).
+pub(crate) const PUBLISHED_URI_MAX_LEN: usize = 1024;
 
 /// The Region `job_lifecycle`'s `ok`/`refused` helpers sign for.
-const DEFAULT_REGION: &str = "us-west-2";
+pub(crate) const DEFAULT_REGION: &str = "us-west-2";
 
-/// One update URL, split into the parts a client reads it as.
+/// One URL this service published for a job's file, split into the parts a client reads
+/// it as.
 #[derive(Debug)]
-struct UpdateUrl {
-    host: String,
-    path: String,
-    query: BTreeMap<String, String>,
+pub(crate) struct PublishedUrl {
+    pub(crate) host: String,
+    pub(crate) path: String,
+    pub(crate) query: BTreeMap<String, String>,
 }
 
 /// Split `uri` into host, path and query parameters, asserting it is an `https` URL.
-fn parse_update_url(uri: &str, case: &str) -> UpdateUrl {
+pub(crate) fn parse_published_url(uri: &str, case: &str) -> PublishedUrl {
     assert!(
-        uri.len() <= UPDATES_URI_MAX_LEN && !uri.is_empty(),
-        "case {case:?}: expected an UpdatesURI within the modelled 1..{UPDATES_URI_MAX_LEN} \
+        uri.len() <= PUBLISHED_URI_MAX_LEN && !uri.is_empty(),
+        "case {case:?}: expected a URI within the modelled 1..{PUBLISHED_URI_MAX_LEN} \
          characters, got {} characters: {uri:?}",
         uri.len()
     );
@@ -78,7 +80,7 @@ fn parse_update_url(uri: &str, case: &str) -> UpdateUrl {
             (name.to_string(), value.to_string())
         })
         .collect();
-    UpdateUrl {
+    PublishedUrl {
         host: host.to_string(),
         path: path.to_string(),
         query: parameters,
@@ -86,7 +88,7 @@ fn parse_update_url(uri: &str, case: &str) -> UpdateUrl {
 }
 
 /// A query parameter the URL must carry.
-fn parameter(url: &UpdateUrl, name: &str, case: &str) -> String {
+pub(crate) fn parameter(url: &PublishedUrl, name: &str, case: &str) -> String {
     url.query
         .get(name)
         .unwrap_or_else(|| panic!("case {case:?}: expected a {name} parameter, got {url:?}"))
@@ -94,7 +96,7 @@ fn parameter(url: &UpdateUrl, name: &str, case: &str) -> String {
 }
 
 /// Whole seconds since the UNIX epoch, as the URL's `Expires` parameter spells an instant.
-fn now_epoch_seconds() -> u64 {
+pub(crate) fn now_epoch_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("the clock is after the UNIX epoch")
@@ -126,7 +128,7 @@ async fn assert_update_url(
     );
 
     let uri = string(&body, "UpdatesURI", case);
-    let url = parse_update_url(&uri, case);
+    let url = parse_published_url(&uri, case);
     assert_eq!(
         url.host, expected_host,
         "case {case:?}: expected the update file under {expected_host}, got {uri:?}"

@@ -237,8 +237,10 @@ fn cases() -> Vec<Case> {
             label: "a query, no supportMode",
             body: text_body("Data residency", "Where is customer data stored?", None),
             queries: vec!["Where is customer data stored?"],
-            // `supportMode`'s `FULL_SUPPORT` is "only supported for file upload mode", so
-            // a query read off submitted text is AI-reviewed whatever was asked for.
+            // Every query read off submitted text is AI-reviewed: `supportMode`'s
+            // `FULL_SUPPORT` is "only supported for file upload mode", so a text
+            // submission cannot be created under it at all (see
+            // `compliance_inquiry_support_mode.rs`).
             review_type: Some("AI"),
             terminal_pair: QUERY_TERMINAL,
         },
@@ -254,11 +256,11 @@ fn cases() -> Vec<Case> {
             terminal_pair: QUERY_TERMINAL,
         },
         Case {
-            label: "a query, FULL_SUPPORT",
+            label: "a query, AI_ONLY, other text",
             body: text_body(
                 "Subprocessors",
                 "Which subprocessors handle customer content?",
-                Some("FULL_SUPPORT"),
+                Some("AI_ONLY"),
             ),
             queries: vec!["Which subprocessors handle customer content?"],
             review_type: Some("AI"),

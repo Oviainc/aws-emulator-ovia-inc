@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAccessPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAccessPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAccessPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +167,116 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAccessPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAccessPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAccessPolicy"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateAccessPolicyError::Modeled(
+                CreateAccessPolicyErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: "the IoT SiteWise store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // `TagMap`'s KEYS target `TagKey` (@length 1..128), which the framework's
+        // constraint walk does not reach — it validates a map's values only — so the
+        // bound is enforced here, in the same wording `TagResource` uses.
+        if let Some(tags) = input.tags.as_ref() {
+            for key in tags.keys() {
+                if let Err(message) = crate::state::check_tag_key(key) {
+                    return Err(crate::scaffolded::Scaffolded::validation(message));
+                }
+            }
+        }
+
+        // An access policy is about ONE identity and ONE Monitor resource, and both
+        // are stated as a structure of optional alternatives, so the choice is the
+        // handler's to enforce — the model cannot. One rule, in one place, shared
+        // with `UpdateAccessPolicy`.
+        if let Err(message) = crate::state::check_access_policy_identity(&input.access_policy_identity)
+        {
+            return Err(invalid_request(message));
+        }
+        if let Err(message) = crate::state::check_access_policy_resource(&input.access_policy_resource)
+        {
+            return Err(invalid_request(message));
+        }
+
+        // `clientToken` is NOT honoured for idempotent replay: this change stores no
+        // token -> created-id mapping, so a retry with the same token mints a second
+        // access policy rather than replaying the first answer. Left to the
+        // idempotency issue, exactly as `CreatePortal` leaves it; nothing is
+        // fabricated for it.
+        let mut store = state.lock();
+
+        // The policy is about a Monitor resource, so a resource this store does not
+        // hold is the absence this operation's modelled 404 states. Checked for the
+        // portal form, which this store holds; a project is accepted unchecked
+        // because no operation of this crate stores one yet (`CreateProject` is
+        // still a scaffold), so there is nothing a check could consult.
+        if let Some(portal) = input.access_policy_resource.portal.as_ref() {
+            if !store.portals.contains_key(&portal.id) {
+                return Err(portal_not_found(&portal.id));
+            }
+        }
+
+        // The store is bounded: a create is the only thing that adds an access
+        // policy and only `DeleteAccessPolicy` removes one, so past the cap this is a
+        // quota refusal.
+        if store.access_policies.len() >= crate::state::MAX_ACCESS_POLICIES {
+            return Err(CreateAccessPolicyError::Modeled(
+                CreateAccessPolicyErrorModeled::LimitExceededException(LimitExceededException {
+                    message: format!(
+                        "This emulator holds at most {} access policies.",
+                        crate::state::MAX_ACCESS_POLICIES
+                    ),
+                }),
+            ));
+        }
+
+        let access_policy_id = loop {
+            let candidate = crate::state::new_id();
+            if !store.access_policies.contains_key(&candidate) {
+                break candidate;
+            }
+        };
+
+        let record = crate::state::AccessPolicyRecord {
+            id: access_policy_id.clone(),
+            arn: crate::state::access_policy_arn(&region, &access_policy_id),
+            identity: input.access_policy_identity,
+            resource: input.access_policy_resource,
+            permission: input.access_policy_permission,
+            creation_date: now,
+            last_update_date: now,
+            tags: input.tags.unwrap_or_default(),
+        };
+
+        let output = CreateAccessPolicyOutput {
+            access_policy_id: record.id.clone(),
+            access_policy_arn: record.arn.clone(),
+        };
+
+        store.access_policies.insert(record.id.clone(), record);
+
+        Ok(output)
     }
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> CreateAccessPolicyError {
+    CreateAccessPolicyError::Modeled(CreateAccessPolicyErrorModeled::InvalidRequestException(
+        InvalidRequestException { message },
+    ))
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the portal the policy would have
+/// been about, in the one wording every not-found refusal in this service carries.
+fn portal_not_found(portal_id: &str) -> CreateAccessPolicyError {
+    CreateAccessPolicyError::Modeled(CreateAccessPolicyErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: crate::state::not_found_message(crate::state::RESOURCE_PORTAL, portal_id),
+        },
+    ))
 }

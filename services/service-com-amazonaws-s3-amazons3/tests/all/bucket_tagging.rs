@@ -14,8 +14,9 @@
 //!   will overwrite any current tags the bucket already has. You cannot use this operation
 //!   to add tags to an existing list of tags" (the operation's own documentation).
 //! * `GetBucketTagging` reports exactly that tag set, and when a bucket has none it
-//!   answers the error the model's documentation names for exactly that case: "Error code:
-//!   NoSuchTagSet Description: There is no tag set associated with the bucket", HTTP 404.
+//!   answers the error the model's documentation names for exactly that case —
+//!   `NoSuchTagSet`, HTTP 404 — carrying the fixed message the service publishes for that
+//!   code, which [`super::bucket_subresource_absent_messages`] pins beside its siblings.
 //! * `DeleteBucketTagging` removes the tag set and answers the modelled 204, whether or
 //!   not the bucket carried tags.
 //! * A tagging call naming a bucket this emulator does not hold answers the service's

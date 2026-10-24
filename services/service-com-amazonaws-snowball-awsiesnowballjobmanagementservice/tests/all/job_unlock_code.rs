@@ -38,8 +38,8 @@ use serde_json::{json, Value};
 // crate rather than restated, so a case cannot drift from the rule it asserts.
 use service_com_amazonaws_snowball_awsiesnowballjobmanagementservice::ops::types::JOB_STATE_VALUES;
 use service_com_amazonaws_snowball_awsiesnowballjobmanagementservice::state::{
-    service_state, JobState, UNLOCK_CODE_GROUPS, UNLOCK_CODE_GROUP_LEN, UNLOCK_CODE_LEN,
-    UNLOCK_CODE_VALIDITY,
+    service_state, DEVICE_CREDENTIAL_VALIDITY, JobState, UNLOCK_CODE_GROUPS,
+    UNLOCK_CODE_GROUP_LEN, UNLOCK_CODE_LEN,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -67,7 +67,7 @@ pub(crate) fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryE
 }
 
 /// Put `job_id` into the state `wire` names, which must be one the model declares.
-fn set_job_state(engine: &Arc<engine::InMemoryEngine>, job_id: &str, wire: &str) {
+pub(crate) fn set_job_state(engine: &Arc<engine::InMemoryEngine>, job_id: &str, wire: &str) {
     let state = JobState::from_wire(wire)
         .unwrap_or_else(|| panic!("{wire:?} is not a JobState this service models"));
     let store = service_state(&**engine).expect("the service's store is on this engine");
@@ -79,9 +79,9 @@ fn set_job_state(engine: &Arc<engine::InMemoryEngine>, job_id: &str, wire: &str)
     job.job_state = state;
 }
 
-/// Make `job_id` `age` old, so a row can stand on either side of the window the unlock
-/// code is readable for without waiting for it.
-fn age_job(engine: &Arc<engine::InMemoryEngine>, job_id: &str, age: Duration) {
+/// Make `job_id` `age` old, so a row can stand on either side of the window the job's
+/// device credentials are readable for without waiting for it.
+pub(crate) fn age_job(engine: &Arc<engine::InMemoryEngine>, job_id: &str, age: Duration) {
     let store = service_state(&**engine).expect("the service's store is on this engine");
     let mut store = store.lock();
     let job = store
@@ -324,18 +324,22 @@ async fn the_unlock_code_is_readable_only_inside_the_published_window() {
         ("a job created just now", Duration::ZERO, true),
         (
             "a job an hour short of the window's end",
-            UNLOCK_CODE_VALIDITY - hour,
+            DEVICE_CREDENTIAL_VALIDITY - hour,
             true,
         ),
-        ("a job exactly at the window's end", UNLOCK_CODE_VALIDITY, false),
+        (
+            "a job exactly at the window's end",
+            DEVICE_CREDENTIAL_VALIDITY,
+            false,
+        ),
         (
             "a job an hour past the window's end",
-            UNLOCK_CODE_VALIDITY + hour,
+            DEVICE_CREDENTIAL_VALIDITY + hour,
             false,
         ),
         (
             "a job twice the window old",
-            UNLOCK_CODE_VALIDITY * 2,
+            DEVICE_CREDENTIAL_VALIDITY * 2,
             false,
         ),
     ];

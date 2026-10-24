@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutIndexPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutIndexPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutIndexPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The field index policy of ONE log group: `PutIndexPolicy` stores it on the group its
+//! `logGroupIdentifier` names (a log-group level policy is named by nothing but that
+//! group, so a later put REPLACES it), `DescribeIndexPolicies` reports it back ahead of
+//! any account-wide `FIELD_INDEX_POLICY`, and `DeleteIndexPolicy` removes it. The record
+//! is [`crate::state::IndexPolicyRecord`], stored on
+//! [`crate::state::LogGroupRecord::index_policy`].
 //!
 //! ## Shape of an operation
 //!
@@ -189,18 +187,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutIndexPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutIndexPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutIndexPolicy"))
+        // `ctx` carries only request metadata; the group this policy attaches to comes
+        // from the request's `logGroupIdentifier`, not from its headers.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutIndexPolicyError::from(PutIndexPolicyErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("the log store is unavailable".to_string()),
+                },
+            ))
+        })?;
+        let mut store = state.lock();
+
+        let invalid = |message: String| {
+            PutIndexPolicyError::from(PutIndexPolicyErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            ))
+        };
+
+        // "The index policy document, in JSON format" — what such a document must say is
+        // that member's own contract, shared with the account-level `FIELD_INDEX_POLICY`
+        // a put of the same document creates, so the check and the sentences it refuses
+        // with live beside the stored record in `crate::state`. What it hands back is the
+        // field indexes the document names.
+        let fields = crate::state::check_field_index_policy_document(&input.policy_document)
+            .map_err(invalid)?;
+
+        // "Each index policy has the following quotas and restrictions: As many as 20
+        // fields can be included in the policy. Each field name can include as many as 100
+        // characters." An over-long field name is one value of the document being wrong; a
+        // policy naming more fields than the quota admits is a count of the indexes it
+        // would create, which is what this service's limit error reports.
+        if let Err(breach) = crate::state::check_index_policy_quotas(&fields) {
+            return Err(match breach {
+                crate::state::IndexPolicyQuotaBreach::FieldNameTooLong(message) => {
+                    invalid(message)
+                }
+                crate::state::IndexPolicyQuotaBreach::TooManyFields(message) => {
+                    PutIndexPolicyErrorModeled::LimitExceededException(LimitExceededException {
+                        message: Some(message),
+                    })
+                    .into()
+                }
+            });
+        }
+
+        // `logGroupIdentifier` is "either the log group name or log group ARN", so an ARN
+        // resolves to the name the store is keyed by.
+        let log_group_name =
+            crate::state::log_group_name_from_identifier(&input.log_group_identifier).to_string();
+        let Some(group) = store.log_groups.get_mut(&log_group_name) else {
+            return Err(PutIndexPolicyErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::resource_not_found_message("log group")),
+                },
+            )
+            .into());
+        };
+
+        // "Only log groups in the Standard log class support field index policies": a group
+        // in any other class cannot carry one, and this operation models no error for an
+        // operation invalid on a resource, so the identifier naming such a group is the
+        // parameter that is wrong.
+        if group.log_group_class != crate::state::INDEX_POLICY_LOG_GROUP_CLASS {
+            return Err(invalid(format!(
+                "a field index policy is supported only for a log group in the {} log class, and this log group is in the {} log class",
+                crate::state::INDEX_POLICY_LOG_GROUP_CLASS,
+                group.log_group_class
+            )));
+        }
+
+        // "Creates or updates a field index policy for the specified log group": the put
+        // replaces whatever log-group level policy the group holds, and the document is
+        // stored exactly as it arrived, because the service reports a stored policy
+        // document back unchanged.
+        let now = crate::state::now_ms();
+        group.index_policy = Some(crate::state::IndexPolicyRecord {
+            policy_document: input.policy_document.clone(),
+            last_update_time_ms: now,
+        });
+
+        Ok(PutIndexPolicyOutput {
+            // "The index policy that you just created or updated", which is what
+            // `DescribeIndexPolicies` reports for this group: the group's ARN whichever
+            // identifier form the request named it by, no `policyName` ("Responses about
+            // log group-level field index policies don't have this field, because those
+            // policies don't have names") and the source of a policy stored on one group.
+            index_policy: Some(IndexPolicy {
+                log_group_identifier: Some(group.log_group_arn.clone()),
+                last_update_time: Some(now),
+                policy_document: Some(input.policy_document),
+                policy_name: None,
+                source: Some(crate::state::INDEX_SOURCE_LOG_GROUP.to_string()),
+            }),
+        })
     }
 }

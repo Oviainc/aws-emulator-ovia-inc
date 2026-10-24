@@ -371,9 +371,10 @@ fn cases() -> Vec<Case> {
             terminal: ("FAILED", INQUIRY_INTERNAL_ERROR),
             query_terminal: None,
         },
-        // The contrast rows: a text submission owns the one query it carries, and
-        // `FULL_SUPPORT` is "[o]nly supported for file upload mode", so it selects no
-        // human review here.
+        // The contrast rows: a text submission owns the one query it carries, and it is
+        // AI-reviewed — `FULL_SUPPORT` is "[o]nly supported for file upload mode", so a
+        // text submission cannot be created under it at all (see
+        // `compliance_inquiry_support_mode.rs`).
         Case {
             label: "a submitted query",
             body: text_body("Data residency", "Where is customer data stored?", None),
@@ -383,11 +384,11 @@ fn cases() -> Vec<Case> {
             query_terminal: Some(("COMPLETED", QUERY_COMPLETE)),
         },
         Case {
-            label: "a submitted query under FULL_SUPPORT",
+            label: "a submitted query under AI_ONLY",
             body: text_body(
                 "Subprocessors",
                 "Which subprocessors handle customer content?",
-                Some("FULL_SUPPORT"),
+                Some("AI_ONLY"),
             ),
             owned: vec!["Which subprocessors handle customer content?".to_string()],
             review_type: "AI",

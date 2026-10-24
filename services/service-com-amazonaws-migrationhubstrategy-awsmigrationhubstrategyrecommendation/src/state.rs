@@ -1400,7 +1400,8 @@ pub const INVALID_RESOURCE_ID: &str = "Invalid resourceId: ";
 
 /// This service's message for a report it cannot produce because the resource it would
 /// name does not exist yet, as `GetLatestAssessmentId` answers it in an account where no
-/// assessment has ever been started.
+/// assessment has ever been started and `GetPortfolioPreferences` in one where no
+/// preferences have ever been saved.
 pub const NOTHING_TO_REPORT: &str = "Something went wrong, please try again later.";
 
 /// The prefix every S3 bucket name this service can use has to begin with.
@@ -1574,13 +1575,21 @@ pub fn application_component_not_found() -> ResourceNotFoundException {
 }
 
 /// `GetLatestAssessmentId`'s answer in an account where no assessment has ever been
-/// started: there is no assessment to name, so the absent resource is reported with
-/// `ResourceNotFoundException`, HTTP 404.
+/// started: `ValidationException`, HTTP 400.
 ///
-/// The operation takes no input, so an invalid-request refusal is not a reachable
-/// outcome — there is nothing a caller could have sent wrongly.
-pub fn no_latest_assessment() -> ResourceNotFoundException {
-    ResourceNotFoundException {
+/// The operation's own error list declares no not-found at all (`AccessDeniedException`
+/// 403, `DependencyException` 500, `InternalServerException` 500, `ValidationException`
+/// 400), so the client-side refusal it can answer is that 400 — reporting the condition
+/// as a 404 would put a status and an error code on the wire that the operation never
+/// declares, and this service already answers the neighbouring condition "the assessment
+/// you asked about is not one of this account's" with the same 400 (see
+/// [`assessment_id_not_accepted`]).
+///
+/// The status and the error code are the requirement; the message is this service's
+/// sentence for a report it cannot produce because the resource it would name does not
+/// exist yet ([`NOTHING_TO_REPORT`]), and the operation has no input to echo into it.
+pub fn no_latest_assessment() -> ValidationException {
+    ValidationException {
         message: Some(NOTHING_TO_REPORT.to_string()),
     }
 }

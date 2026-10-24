@@ -466,9 +466,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A restore that also exchanges a reserved node, or that joins an IAM
         // Identity Center application, needs a record this service does not
-        // hold: nothing creates a reserved node, a reserved node offering or an
-        // IDC application here, so any id names none of them. Each is refused
-        // with the modelled not-found fault rather than quietly ignored.
+        // hold: nothing creates a reserved node or an IDC application here, so
+        // any id names none of them. Each is refused with the modelled
+        // not-found fault rather than quietly ignored.
         if let Some(reserved_node_id) = input.reserved_node_id.as_deref() {
             return Err(
                 RestoreFromClusterSnapshotErrorModeled::ReservedNodeNotFoundFault(
@@ -479,12 +479,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
+        // An exchange target, on the other hand, is a PUBLISHED offering: an id
+        // the catalog `DescribeReservedNodeOfferings` reports does exist, so only
+        // an id outside that catalog is refused as not found. A published one
+        // still names no exchange this service can perform, because the
+        // exchange's source — a reserved node — is a record nothing here mints.
         if let Some(offering_id) = input.target_reserved_node_offering_id.as_deref() {
+            let published = state.lock().reserved_node_offering(offering_id).is_some();
+            if !published {
+                return Err(
+                    RestoreFromClusterSnapshotErrorModeled::ReservedNodeOfferingNotFoundFault(
+                        ReservedNodeOfferingNotFoundFault {
+                            message: Some(format!(
+                                "Reserved node offering {offering_id} does not exist."
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
             return Err(
-                RestoreFromClusterSnapshotErrorModeled::ReservedNodeOfferingNotFoundFault(
-                    ReservedNodeOfferingNotFoundFault {
+                RestoreFromClusterSnapshotErrorModeled::ReservedNodeNotFoundFault(
+                    ReservedNodeNotFoundFault {
                         message: Some(format!(
-                            "Reserved node offering {offering_id} does not exist."
+                            "Reserved node offering {offering_id} cannot be exchanged into: this account holds no reserved node."
                         )),
                     },
                 )

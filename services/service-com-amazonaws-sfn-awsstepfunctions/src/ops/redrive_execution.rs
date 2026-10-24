@@ -293,8 +293,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 state_machine_name: machine.name.clone(),
                 role_arn: machine.role_arn.clone(),
             };
+            // "Redriven executions use the same state machine definition" — which for
+            // an execution started through a version ARN, or through an alias that
+            // routed to a version, is that version's immutable snapshot and not what
+            // the state machine has been updated to since.
+            let definition = execution
+                .state_machine_version_arn
+                .as_deref()
+                .and_then(|version_arn| store.state_machine_versions.get(version_arn))
+                .map_or_else(|| machine.definition.clone(), |version| version.definition.clone());
             (
-                machine.definition.clone(),
+                definition,
                 execution.input.clone(),
                 execution.last_event_id(),
                 context,

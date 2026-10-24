@@ -192,6 +192,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // "Any provided logins will be validated against supported login providers"
+        // (`GetCredentialsForIdentity` in this service's model): a `Logins` entry that
+        // names an Amazon Cognito user pool carries its issuer in the provider name, so
+        // this pool's stored configuration decides it — a token minted by a user pool
+        // that is none of this pool's `CognitoIdentityProviders` authorizes nobody here.
+        if logins
+            .keys()
+            .any(|provider| !pool.accepts_login_provider(provider))
+        {
+            return Err(GetIdErrorModeled::NotAuthorizedException(NotAuthorizedException {
+                message: Some(crate::state::UNSUPPORTED_LOGIN_PROVIDER_MESSAGE.to_string()),
+            })
+            .into());
+        }
+
         // An unauthenticated call is one with no `Logins`; the pool decides whether it
         // may have an identity at all.
         if logins.is_empty() && !pool.allow_unauthenticated_identities {

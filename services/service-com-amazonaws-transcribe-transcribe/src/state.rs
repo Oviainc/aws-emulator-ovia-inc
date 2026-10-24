@@ -50,7 +50,12 @@
 //! exactly the same (see [`MedicalVocabularyRecord`]). Either way this emulator reads
 //! no object store and makes no outbound request, so it has nothing to build a
 //! vocabulary's terms from and never reports a vocabulary built from a file as
-//! `READY`. A Call Analytics category is the same kind of record: its
+//! `READY`. A vocabulary FILTER whose words would have come from such a file is
+//! RECORDED the same way ([`VocabularyFilterRecord`]), and that is all there is to
+//! report for it: the filter family models no processing state and no operation of it
+//! reports a filter's words, so the only thing a filter nothing read a file for does
+//! not report is its own `DownloadUri`, the file this service would have built.
+//! A Call Analytics category is the same kind of record: its
 //! rules are held here, where a Call Analytics job that applies the category would
 //! read them from, and nothing evaluates a rule against a call, because no audio is
 //! analysed. A Call Analytics JOB is the job record again
@@ -1458,13 +1463,22 @@ pub fn language_model_failure_reason(s3_uri: &str) -> String {
     )
 }
 
-/// One stored custom vocabulary filter: the words it holds and when it was last
-/// modified.
+/// One stored custom vocabulary filter: where its words come from and when it was
+/// last modified.
 ///
 /// A filter has no `VocabularyState` anywhere in the model — neither
 /// `CreateVocabularyFilter`'s output nor `VocabularyFilterInfo` carries one
 /// (`smithy_query(query="operation", operation="CreateVocabularyFilter")`) — so it
 /// is usable from the moment it is created and has no clock-owed transition.
+///
+/// The two content members `CreateVocabularyFilter` and `UpdateVocabularyFilter`
+/// publish are alternatives — the words in `Words`, or the file at
+/// `VocabularyFilterFileUri` — and BOTH are recorded here, exactly as in the
+/// vocabulary family ([`VocabularyRecord`]): the resource is the same control-plane
+/// record either way. Which alternative the request chose decides only what this
+/// record can report: a filter whose words would have had to be READ from a file has
+/// none loaded and no file of its own to download ([`Self::download_uri`]), because
+/// this emulator reads no object store and makes no outbound request.
 #[derive(Debug, Clone)]
 pub struct VocabularyFilterRecord {
     /// `VocabularyFilterName`, also this record's key in the store.
@@ -1473,8 +1487,14 @@ pub struct VocabularyFilterRecord {
     /// pages with.
     pub sequence: u64,
     pub language_code: String,
-    /// The words this filter masks, deletes or flags, as the request listed them.
+    /// The words this filter masks, deletes or flags, as the request listed them in
+    /// `Words` — EMPTY for one whose words would have come from a file, which nothing
+    /// loaded.
     pub words: Vec<String>,
+    /// `VocabularyFilterFileUri` when the request named a file as the source of its
+    /// words, and `None` when it listed them inline. Held so an update can replace it
+    /// and so this record knows it holds no words of its own; never fetched.
+    pub file_uri: Option<String>,
     pub last_modified_time: SystemTime,
     /// The region the request that created or last updated it was signed for.
     pub region: String,
@@ -1494,10 +1514,15 @@ impl VocabularyFilterRecord {
         }
     }
 
-    /// Where this filter's own file is reported to live. See
-    /// [`vocabulary_download_uri`].
-    pub fn download_uri(&self) -> String {
-        vocabulary_download_uri(RESOURCE_TYPE_VOCABULARY_FILTER, &self.name, &self.region)
+    /// Where this filter's own file is reported to live, for one built from the words
+    /// the request listed — and `None` for one whose words would have come from a
+    /// file, which nothing read: a filter no words were loaded for has no file to
+    /// download, exactly as in the vocabulary family
+    /// ([`VocabularyRecord::download_uri`]). See [`vocabulary_download_uri`].
+    pub fn download_uri(&self) -> Option<String> {
+        self.file_uri.is_none().then(|| {
+            vocabulary_download_uri(RESOURCE_TYPE_VOCABULARY_FILTER, &self.name, &self.region)
+        })
     }
 }
 

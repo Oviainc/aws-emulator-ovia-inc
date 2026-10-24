@@ -20,6 +20,11 @@
 //!
 //! `CaseId` stays absent either way: this emulator opens no support case.
 //!
+//! A `ContextId` names the resource the increase is asked for, on a quota AWS
+//! publishes as adjustable per resource: the request is recorded at the `RESOURCE`
+//! level and, once approved, its value is in force for THAT resource alone, leaving
+//! every other resource and the account-wide value where they were.
+//!
 //! Refusals:
 //!
 //! * an unknown `(ServiceCode, QuotaCode)` pair -> `NoSuchResourceException` (404);
@@ -27,9 +32,12 @@
 //! * a `DesiredValue` that is not above the value in force -> `IllegalArgumentException`
 //!   (400): this operation requests an INCREASE;
 //! * a `ContextId` for a quota that is adjustable at the account level only ->
+//!   `IllegalArgumentException` (400), and the other half of the same rule: NO
+//!   `ContextId` for a quota that is adjustable for an individual resource only ->
 //!   `IllegalArgumentException` (400);
-//! * a second open request for the same quota -> `ResourceAlreadyExistsException`
-//!   (400): one quota has at most one request awaiting a decision;
+//! * a second open request for the same quota AND the same context ->
+//!   `ResourceAlreadyExistsException` (400): one quota plane has at most one request
+//!   awaiting a decision;
 //! * a region already holding [`crate::state::MAX_REQUESTS_PER_REGION`] stored
 //!   requests -> `QuotaExceededException` (409): the request store is append-only, so
 //!   it has a ceiling.
@@ -153,10 +161,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
         let adjustable = default.adjustable;
-        let account_level_only = default.adjustable_at_level == crate::state::LEVEL_ACCOUNT;
+        let resource_adjustable = default.resource_adjustable();
+        let account_adjustable = default.account_adjustable();
 
-        if let Some(context_id) = input.context_id.as_deref() {
-            if account_level_only {
+        match input.context_id.as_deref() {
+            Some(context_id) if !resource_adjustable => {
                 return Err(
                     RequestServiceQuotaIncreaseErrorModeled::IllegalArgumentException(
                         IllegalArgumentException {
@@ -170,6 +179,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into(),
                 );
             }
+            // The other half of the same rule: a quota with no account-wide plane can
+            // only be increased for one resource, so a request that names none has no
+            // plane to land on. It holds for any row the catalog publishes as
+            // `PER_RESOURCE`; today every row it publishes is either account-only or
+            // adjustable at both levels, so this arm guards the rule rather than a
+            // seeded quota, and keeps the refusal from depending on which rows exist.
+            None if !account_adjustable => {
+                return Err(
+                    RequestServiceQuotaIncreaseErrorModeled::IllegalArgumentException(
+                        IllegalArgumentException {
+                            message: Some(format!(
+                                "QuotaCode '{}' is adjustable for an individual resource only, so \
+                                 a ContextId is required",
+                                input.quota_code
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            _ => {}
         }
 
         if !adjustable {
@@ -187,7 +217,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let in_force = quotas_state
-            .applied_value(&region, &input.service_code, &input.quota_code)
+            .applied_value(
+                &region,
+                &input.service_code,
+                &input.quota_code,
+                input.context_id.as_deref(),
+            )
             .unwrap_or(default.value);
         if input.desired_value <= in_force {
             return Err(
@@ -207,7 +242,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let open = quotas_state
             .requests_for_quota(&region, &input.service_code, &input.quota_code)
             .into_iter()
-            .find(|request| request.status == crate::state::STATUS_PENDING);
+            .find(|request| {
+                request.status == crate::state::STATUS_PENDING
+                    // One PLANE of a quota has at most one open request: a pending
+                    // increase for one resource does not block another resource's.
+                    && request.context_id.as_deref() == input.context_id.as_deref()
+            });
         if let Some(open) = open {
             return Err(
                 RequestServiceQuotaIncreaseErrorModeled::ResourceAlreadyExistsException(
@@ -233,6 +273,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .support_case_allowed
                 .unwrap_or(crate::state::SUPPORT_CASE_ALLOWED_BY_DEFAULT),
             crate::state::requester_identity(),
+            input.context_id.clone(),
             now,
         );
         let Some(request) = request else {

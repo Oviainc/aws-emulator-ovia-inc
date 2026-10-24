@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AssociateCustomerGateway
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AssociateCustomerGateway`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AssociateCustomerGateway::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -162,17 +153,173 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AssociateCustomerGateway` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AssociateCustomerGatewayErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AssociateCustomerGateway"))
+        // request metadata.
+        let _ = ctx;
+
+        // `CustomerGatewayArn` is modelled free-form, so the form of the ARN is judged
+        // here — before the store is locked, since nothing stored bears on it. A string
+        // that names no customer gateway at all is a field failure on the member that
+        // carried it, a different answer from a well-formed ARN whose association already
+        // exists.
+        if crate::state::parse_customer_gateway_arn(&input.customer_gateway_arn).is_none() {
+            return Err(AssociateCustomerGatewayErrorModeled::ValidationException(
+                crate::state::malformed_customer_gateway_arn(
+                    crate::state::FIELD_CUSTOMER_GATEWAY_ARN,
+                ),
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            AssociateCustomerGatewayErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the networkmanager store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The association ties a customer gateway of Amazon VPC to resources that already
+        // exist rather than minting a resource of its own, so a reference that names
+        // nothing is the missing-resource answer (404). The global network the path
+        // addresses is checked first, then the resources inside it — one stored under a
+        // DIFFERENT global network is not addressable here either.
+        if !store.global_networks.contains_key(&input.global_network_id) {
+            return Err(AssociateCustomerGatewayErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(
+                    crate::state::GLOBAL_NETWORK_KIND,
+                    &input.global_network_id,
+                ),
+            )
+            .into());
+        }
+        let device_resolves = store
+            .devices
+            .get(&input.device_id)
+            .is_some_and(|device| device.global_network_id == input.global_network_id);
+        if !device_resolves {
+            return Err(AssociateCustomerGatewayErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(crate::state::DEVICE_KIND, &input.device_id),
+            )
+            .into());
+        }
+        if let Some(link_id) = input.link_id.as_deref() {
+            let link_resolves = store
+                .links
+                .get(link_id)
+                .is_some_and(|link| link.global_network_id == input.global_network_id);
+            if !link_resolves {
+                return Err(AssociateCustomerGatewayErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(crate::state::LINK_KIND, link_id),
+                )
+                .into());
+            }
+
+            // "If you specify a link, it must be associated with the specified device."
+            // (`smithy_query query="doc" shape="AssociateCustomerGateway"`) — that
+            // association is the device/link pair `AssociateLink` stores, so the request is
+            // refused while the pair holds none. The refusal is about the request against
+            // stored state rather than one input field, so it carries no `Fields` entry and
+            // the catch-all `Reason`, like every other state-level refusal of this service.
+            let pair = crate::state::link_association_key(&input.device_id, link_id);
+            if !store.link_associations.contains_key(&pair) {
+                return Err(AssociateCustomerGatewayErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "link {link_id} must be associated with device {} before a customer gateway can be associated with both",
+                            input.device_id
+                        ),
+                        reason: Some(crate::state::VALIDATION_REASON_OTHER.to_string()),
+                        fields: None,
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The association's identity is the global network / customer gateway pair, so a
+        // repeat of the same request has nothing left to create: it reports the stored
+        // association as of now and writes nothing, which keeps a retried call from
+        // restarting the settle span of an association that is already AVAILABLE. "You
+        // cannot associate a customer gateway with more than one device and link." (same
+        // doc), so the same gateway asked for under a DIFFERENT device or link is the
+        // conflict this operation models — "Updating or deleting the resource can cause an
+        // inconsistent state" — rather than a silent rewrite of the stored association.
+        let key = crate::state::customer_gateway_association_key(
+            &input.global_network_id,
+            &input.customer_gateway_arn,
+        );
+        if let Some(existing) = store.customer_gateway_associations.get(&key) {
+            if existing.device_id == input.device_id && existing.link_id == input.link_id {
+                return Ok(AssociateCustomerGatewayOutput {
+                    customer_gateway_association: Some(existing.to_shape(now)),
+                });
+            }
+            return Err(AssociateCustomerGatewayErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "customer gateway {} is already associated with device {}{}",
+                        existing.customer_gateway_arn,
+                        existing.device_id,
+                        existing
+                            .link_id
+                            .as_deref()
+                            .map_or_else(String::new, |link| format!(" and link {link}"))
+                    ),
+                    resource_id: key,
+                    resource_type: crate::state::CUSTOMER_GATEWAY_ASSOCIATION_KIND.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // A global network holds at most so many customer gateway associations, so an
+        // associate past that bound is refused with the modelled quota error and stores
+        // nothing.
+        if store.customer_gateway_association_count_of(&input.global_network_id)
+            >= crate::state::MAX_CUSTOMER_GATEWAY_ASSOCIATIONS_PER_GLOBAL_NETWORK
+        {
+            return Err(
+                AssociateCustomerGatewayErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "global network {} is already associated with the maximum of {} customer gateway(s)",
+                            input.global_network_id,
+                            crate::state::MAX_CUSTOMER_GATEWAY_ASSOCIATIONS_PER_GLOBAL_NETWORK
+                        ),
+                        resource_id: Some(input.global_network_id.clone()),
+                        resource_type: Some(
+                            crate::state::CUSTOMER_GATEWAY_ASSOCIATION_KIND.to_string(),
+                        ),
+                        limit_code:
+                            crate::state::LIMIT_CUSTOMER_GATEWAY_ASSOCIATIONS_PER_GLOBAL_NETWORK
+                                .to_string(),
+                        service_code: crate::state::SERVICE_CODE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Like every other resource this service stores, the association waits out the
+        // transition the clock owes: it reads `PENDING` until `available_at` falls due and
+        // `AVAILABLE` after it, with no handler sleeping for it.
+        let record = crate::state::CustomerGatewayAssociationRecord {
+            global_network_id: input.global_network_id,
+            customer_gateway_arn: input.customer_gateway_arn,
+            device_id: input.device_id,
+            link_id: input.link_id,
+            available_at: now + crate::state::SETTLE_DELAY,
+        };
+        let association = record.to_shape(now);
+        store.customer_gateway_associations.insert(key, record);
+
+        Ok(AssociateCustomerGatewayOutput {
+            customer_gateway_association: Some(association),
+        })
     }
 }
+

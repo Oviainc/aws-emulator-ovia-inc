@@ -2,9 +2,12 @@
 
 //! @op DeregisterApplication
 //!
-//! Removes the application from state — the record itself, the tags held for its ARN
-//! and the operation records filed against it — so a later `GetApplication` no longer
-//! returns it and `ListApplications` no longer lists it.
+//! Starts the asynchronous deregistration of an application: the call returns at once
+//! and the application reports `DELETING` — resolvable by `GetApplication` and listed by
+//! `ListApplications` — until the removal the clock owes it falls due, when the record,
+//! the tags held for its ARN and the configuration check runs that inspected it stop
+//! resolving. The operation records of calls already made survive, since they are the
+//! history `GetOperation` resolves by id.
 //!
 //! ## Shape of an operation
 //!
@@ -141,13 +144,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         let mut state = state.lock();
-        state.settle(::std::time::SystemTime::now());
+        let now = ::std::time::SystemTime::now();
+        state.settle(now);
 
-        if !state
+        let Some(mut application) = state
             .region(&region)
             .applications
-            .contains_key(&input.application_id)
-        {
+            .get(&input.application_id)
+            .cloned()
+        else {
             // This operation models no `ResourceNotFoundException`, so an id naming no
             // application registered in this account and Region is refused as a
             // validation failure — the same construction `GetApplication` answers that
@@ -157,24 +162,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::no_registered_application(&input.application_id),
             )
             .into());
+        };
+
+        // A deregistration already running against this application needs no second
+        // one: the application is already DELETING with its removal due, so asking
+        // again neither restarts the deletion, moves its due instant nor files another
+        // record for the same work — and the call is still served, since the state the
+        // caller asked for is the state the application is in.
+        if application.is_deregistering() {
+            return Ok(DeregisterApplicationOutput {});
         }
+
+        // Deregistration is ASYNCHRONOUS: the call returns at once and the application
+        // reports DELETING, resolvable by every reader, until the removal the clock owes
+        // it falls due one `TRANSITION_SPAN` from now — materialised by the first
+        // request at or after that instant
+        // (`crate::state::RegionState::settle`). Nothing sleeps, and a caller polling
+        // straight after this call still observes the transient status.
+        application.status = crate::state::APPLICATION_STATUS_DELETING.to_string();
+        // The deregistration undoes the discovery the registration made, so the
+        // application's latest discovery result is the deletion that is running.
+        application.discovery_status = crate::state::DISCOVERY_STATUS_DELETING.to_string();
+        application.last_updated = now;
+        application.pending = Some(crate::state::PendingTransition {
+            due_at: now + crate::state::TRANSITION_SPAN,
+            change: crate::state::PendingChange::Removal,
+        });
 
         // The application was just found in this Region, so reaching for the partition
         // to write mints nothing.
         let region_state = state.region_entry(&region);
-        let application = region_state
+        // Every call that changes an application files an operation record for the work
+        // it started, so the deregistration is recorded like the registration, start and
+        // stop before it. `DeregisterApplicationOutput` carries no `OperationId`, so the
+        // id is not handed back to the caller — the record is what `ListOperations`
+        // reports and what `GetOperation` resolves.
+        region_state.record_operation(
+            crate::state::OPERATION_TYPE_DEREGISTER_APPLICATION,
+            &application,
+            // `DeregisterApplication` carries no parameter beyond the application it
+            // names, which the record already reports as `ResourceId`/`ResourceArn`.
+            ::std::collections::HashMap::new(),
+            now,
+        );
+        region_state
             .applications
-            .remove(&input.application_id)
-            .expect("the application was found in this region just above");
-
-        // Everything held for the application goes with it: its tags, keyed by its ARN,
-        // and every operation record filed against it — nothing else would ever reclaim
-        // them, and the resource they describe no longer exists.
-        region_state.tags_by_arn.remove(&application.arn);
-        region_state.forget_operations_for(&application.id);
-        // A Region that no longer holds anything is not a Region this store has to keep
-        // a partition for.
-        state.forget_region_if_empty(&region);
+            .insert(input.application_id, application);
 
         Ok(DeregisterApplicationOutput {})
     }

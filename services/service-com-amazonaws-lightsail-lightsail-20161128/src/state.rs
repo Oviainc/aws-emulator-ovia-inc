@@ -606,6 +606,8 @@ pub const OPERATION_TYPE_EXPORT_SNAPSHOT: &str = "ExportSnapshot";
 pub const OPERATION_TYPE_PEER_VPC: &str = "PeerVpc";
 /// See [`OPERATION_TYPE_PEER_VPC`].
 pub const OPERATION_TYPE_UNPEER_VPC: &str = "UnpeerVpc";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_DISABLE_ADD_ON: &str = "DisableAddOn";
 
 // ---------------------------------------------------------------------------
 // Store bounds
@@ -9955,6 +9957,92 @@ impl ComAmazonawsLightsailLightsail20161128State {
         }
         None
     }
+
+    /// Run `body` against the add-on-carrying record `name` names — whichever
+    /// kind of resource that turns out to be — together with the `ResourceType`
+    /// that kind reports. `None` when this account holds no add-on-carrying
+    /// resource of that name.
+    ///
+    /// ONE name addresses one resource (the reasoning is spelled out on
+    /// [`Self::with_tagged_record`]), and the resources whose modelled shape
+    /// carries an `addOns` member are the virtual private server and the block
+    /// storage disk, each of which every operation of theirs addresses by name
+    /// alone. The one place an add-on change resolves a resource, so every
+    /// operation that edits add-ons admits exactly the same set of them.
+    pub fn with_add_on_record<R>(
+        &mut self,
+        name: &str,
+        body: impl FnOnce(&mut dyn AddOnRecord, &'static str) -> R,
+    ) -> Option<R> {
+        if let Some(record) = self.instances.get_mut(name) {
+            return Some(body(record, RESOURCE_TYPE_INSTANCE));
+        }
+        if let Some(record) = self.disks.get_mut(name) {
+            return Some(body(record, RESOURCE_TYPE_DISK));
+        }
+        None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Resource add-ons
+//
+// An add-on is held on the stored record of the resource it is enabled for,
+// beside the rest of what that resource is. The trait below is what lets one
+// add-on operation reach them all without knowing which kind of resource it was
+// handed: see
+// [`ComAmazonawsLightsailLightsail20161128State::with_add_on_record`].
+// ---------------------------------------------------------------------------
+
+/// What a stored record must expose for an add-on operation to work on it: where
+/// it is, and the add-ons it has enabled.
+pub trait AddOnRecord {
+    /// Where the resource is, for the operation-log entry an add-on change
+    /// writes.
+    fn location(&self) -> &StoredLocation;
+    /// The add-ons the resource has enabled now.
+    fn add_ons(&self) -> &[AddOn];
+    /// Replace the add-ons the resource has enabled.
+    fn set_add_ons(&mut self, add_ons: Vec<AddOn>);
+}
+
+/// Implement [`AddOnRecord`] for each stored record that holds `location` and
+/// `add_ons` — which every add-on-carrying Lightsail resource's record does, so
+/// the implementation is the same for all of them.
+macro_rules! add_on_records {
+    ($($record:ident),+ $(,)?) => {
+        $(impl AddOnRecord for $record {
+            fn location(&self) -> &StoredLocation {
+                &self.location
+            }
+
+            fn add_ons(&self) -> &[AddOn] {
+                &self.add_ons
+            }
+
+            fn set_add_ons(&mut self, add_ons: Vec<AddOn>) {
+                self.add_ons = add_ons;
+            }
+        })+
+    };
+}
+
+add_on_records!(StoredInstance, StoredDisk);
+
+/// The add-ons of `record` with the one of type `add_on_type` removed.
+///
+/// A stored add-on is named by its type (the modelled `AddOnType` value the
+/// request that enabled it carried), and a resource holds at most one add-on of
+/// a type, so this removes the one the request named and leaves every other
+/// add-on alone. A type the resource has not enabled removes nothing — the
+/// result depends only on which type the request named.
+pub fn add_ons_without(record: &dyn AddOnRecord, add_on_type: &str) -> Vec<AddOn> {
+    record
+        .add_ons()
+        .iter()
+        .filter(|add_on| add_on.name.as_deref() != Some(add_on_type))
+        .cloned()
+        .collect()
 }
 
 // ---------------------------------------------------------------------------

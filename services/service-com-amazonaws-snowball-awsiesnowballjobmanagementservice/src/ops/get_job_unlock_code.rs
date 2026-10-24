@@ -217,7 +217,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // expired, so there is no code left to report — a resource no record answers to,
         // rather than a state the job is in, since the job itself is unchanged and the
         // window is fixed by its creation instant.
-        if !job.unlock_code_is_readable(::std::time::SystemTime::now()) {
+        if !job.device_credentials_are_readable(::std::time::SystemTime::now()) {
             return Err(GetJobUnlockCodeErrorModeled::InvalidResourceException(
                 InvalidResourceException {
                     message: Some(format!(
@@ -225,7 +225,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                          accessed for up to {} days after the job was created, and that window \
                          has closed.",
                         job.job_id,
-                        crate::state::UNLOCK_CODE_VALIDITY.as_secs() / (24 * 60 * 60)
+                        crate::state::DEVICE_CREDENTIAL_VALIDITY.as_secs() / (24 * 60 * 60)
                     )),
                     resource_type: Some("job".to_string()),
                 },
