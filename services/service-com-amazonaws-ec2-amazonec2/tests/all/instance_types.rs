@@ -1361,3 +1361,52 @@ async fn the_describe_is_a_read() {
         }
     }
 }
+
+/// The size ladder reader answers a size in sixteenths of a `large` for every size AWS's
+/// naming conventions define, and NOTHING for a size component that is not one of them —
+/// including a multiple so large that no size could carry it, which is a name a request
+/// can supply and so must be refused rather than wrapped or panicked on.
+///
+/// The ladder itself: `large` is the unit, it doubles at each `Nxlarge` step, and the
+/// sizes below it are fractions of it (`medium` a half, `small` a quarter, `micro` an
+/// eighth, `nano` a sixteenth) — "Amazon EC2 instance type naming conventions", the source
+/// the catalog's own per-family ratios are read against.
+#[test]
+fn the_size_ladder_reader_refuses_a_size_no_name_could_carry() {
+    /// One row: the size component, and the sixteenths it names, if any.
+    const CASES: [(&str, Option<u32>); 15] = [
+        // The fractions of a `large`, each half of the one above it.
+        ("nano", Some(1)),
+        ("micro", Some(2)),
+        ("small", Some(4)),
+        ("medium", Some(8)),
+        ("large", Some(16)),
+        // The doubling ladder, at its first step, a middle step and the largest step the
+        // published naming conventions use.
+        ("xlarge", Some(32)),
+        ("2xlarge", Some(64)),
+        ("48xlarge", Some(1_536)),
+        // A bare metal size that names its virtualized equivalent is on the ladder; a
+        // plain `metal` names the whole host, whose size the NAME does not give.
+        ("metal-48xl", Some(1_536)),
+        ("metal", None),
+        // Not sizes: a word off the ladder, an empty component, and a multiple with no
+        // digits.
+        ("enormous", None),
+        ("", None),
+        ("xxlarge", None),
+        // A multiple no size carries: one past what a u32 product of the ladder admits,
+        // and one past u32 altogether. Both are "not a size", the same answer any other
+        // unrecognised component gets.
+        ("134217728xlarge", None),
+        ("99999999999999999999xlarge", None),
+    ];
+
+    for (size, expected) in CASES {
+        let actual = ec2::state::instance_size_sixteenths(size);
+        assert_eq!(
+            actual, expected,
+            "case {size:?}: expected {expected:?} sixteenths of a large, got {actual:?}"
+        );
+    }
+}

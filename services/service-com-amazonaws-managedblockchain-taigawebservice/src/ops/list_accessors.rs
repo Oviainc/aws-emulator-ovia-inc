@@ -156,7 +156,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // makes is materialising the status transitions the clock already owed elsewhere
         // in the store. An accessor itself has none — `AccessorStatus` declares no
         // creating state — so every summary is exactly what the create persisted.
-        let _ = ctx;
+        //
+        // The Region this request is addressed to, read off its own credential scope: an
+        // accessor belongs to the Region its `CreateAccessor` was signed for, so a listing
+        // reports only the accessors of the Region it is addressed to.
+        let region = crate::state::request_region(ctx);
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListAccessorsErrorModeled::InternalServiceErrorException(
@@ -184,13 +188,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         guard.settle(::std::time::SystemTime::now());
 
         // "Returns a list of the accessors and their properties": every accessor this
-        // account holds, in the id ordering the store keeps them in, so a page cursor
-        // keys on the ordering itself. `NetworkType` names "the blockchain network that
-        // the Accessor token is created for", so it selects on each record's stored
-        // network type; an absent filter selects every accessor.
+        // account holds in this Region, in the id ordering the store keeps them in, so a
+        // page cursor keys on the ordering itself. `NetworkType` names "the blockchain
+        // network that the Accessor token is created for", so it selects on each record's
+        // stored network type; an absent filter selects every accessor.
         let selected: Vec<(String, AccessorSummary)> = guard
-            .accessors
-            .values()
+            .accessors_in(&region)
             .filter(|accessor| {
                 input
                     .network_type

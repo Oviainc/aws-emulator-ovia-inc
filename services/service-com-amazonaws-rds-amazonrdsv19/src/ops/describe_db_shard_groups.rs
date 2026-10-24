@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDBShardGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDBShardGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDBShardGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +143,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDBShardGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDBShardGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDBShardGroups"))
+        let region =
+            crate::state::request_region(ctx).map_err(DescribeDBShardGroupsError::validation)?;
+        let page_size = crate::state::check_max_records(input.max_records)
+            .map_err(DescribeDBShardGroupsError::validation)?;
+        let filters = input.filters.unwrap_or_default();
+        check_filter_names(&filters)
+            .map_err(DescribeDBShardGroupsError::invalid_parameter_value)?;
+        // Reached only with no filter at all, since the check above refuses every name
+        // this report has no meaning for; it stays so the filter-term bound still holds
+        // the day a filter name becomes supported.
+        crate::state::check_filter_terms(&filters)
+            .map_err(DescribeDBShardGroupsError::validation)?;
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated empty list.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // A report materialises the transitions the clock already made due: the ones owed
+        // at this instant whether or not anybody called.
+        store.settle_due_transitions(&region);
+
+        // RDS is regional: a request sees only the DB shard groups of the region it was
+        // signed for. `DBClusterNotFoundFault` is modelled for this operation but
+        // unreachable from it — no member of its input names a DB cluster, so there is no
+        // cluster reference that could fail to resolve.
+        let candidates: Vec<&crate::state::DbShardGroupRecord> =
+            match &input.db_shard_group_identifier {
+                // "If this parameter is specified, information for only the specific DB
+                // shard group is returned ... Constraints: If supplied, must match an
+                // existing DB shard group identifier."
+                Some(requested) => {
+                    let record = store.resolve_db_shard_group(&region, requested).ok_or_else(
+                        || {
+                            DescribeDBShardGroupsErrorModeled::DBShardGroupNotFoundFault(
+                                DBShardGroupNotFoundFault {
+                                    message: Some(format!("DBShardGroup {requested} not found.")),
+                                },
+                            )
+                        },
+                    )?;
+                    vec![record]
+                }
+                None => store.shard_groups_in(&region),
+            };
+
+        let reported: Vec<(String, CreateDBShardGroupOutput)> = candidates
+            .into_iter()
+            .map(|record| {
+                (
+                    crate::state::db_shard_group_key(&record.identifier),
+                    record.to_wire(),
+                )
+            })
+            .collect();
+
+        // A `Marker` no prior page issued is refused rather than resynchronised: see
+        // `crate::state::paginate`.
+        let page = crate::state::paginate(reported, input.marker.as_deref(), page_size)
+            .map_err(DescribeDBShardGroupsError::invalid_parameter_value)?;
+        Ok(DescribeDBShardGroupsOutput {
+            marker: page.next_marker,
+            db_shard_groups: Some(page.items),
+        })
+    }
+}
+
+/// Refuse a filter this operation does not support.
+///
+/// Its `Filters` member documents no filter name at all — "a filter that specifies one or
+/// more DB shard groups to describe", with no supported-name list, unlike the describe
+/// operations of this service that publish one — so there is no name whose meaning this
+/// report could implement. A filter is refused rather than ignored, because ignoring it
+/// would report DB shard groups the caller excluded.
+fn check_filter_names(filters: &[Filter]) -> Result<(), String> {
+    match filters.first() {
+        None => Ok(()),
+        Some(filter) => Err(format!(
+            "unrecognized filter name: {}; DescribeDBShardGroups documents no supported \
+             filter name",
+            filter.name
+        )),
     }
 }

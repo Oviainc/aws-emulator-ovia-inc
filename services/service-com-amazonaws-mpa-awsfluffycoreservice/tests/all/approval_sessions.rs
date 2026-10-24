@@ -52,7 +52,7 @@ pub(crate) const MAX_TEAM_NAME: usize = 64;
 /// The message of an error envelope, whichever case the renderer used: a handler-raised
 /// modelled error carries the modelled `Message` member, while a refusal the framework
 /// boundary rendered (this service's malformed-ARN rewording, say) carries `message`.
-fn message(body: &Value) -> String {
+pub(crate) fn message(body: &Value) -> String {
     body.get("Message")
         .or_else(|| body.get("message"))
         .and_then(Value::as_str)
@@ -123,12 +123,12 @@ pub(crate) async fn get_session(harness: &Harness, session_arn: &str) -> (u16, V
 }
 
 /// `GET /approval-teams/{Arn}` — `GetApprovalTeam`.
-async fn get_team(harness: &Harness, team_arn: &str) -> (u16, Value) {
+pub(crate) async fn get_team(harness: &Harness, team_arn: &str) -> (u16, Value) {
     harness.get(team_arn).await
 }
 
 /// Wait out a clock-owed transition of `delay`.
-fn wait_for_the_clock(delay: Duration) {
+pub(crate) fn wait_for_the_clock(delay: Duration) {
     std::thread::sleep(delay + CLOCK_SLACK);
 }
 
@@ -163,7 +163,7 @@ pub(crate) fn stored_approver_ids(harness: &Harness, team_arn: &str) -> Vec<Stri
 /// Force a stored session's expiration to have already passed, so the clock-owed
 /// `FAILED` / `EXPIRED` outcome is due on the next call. Only the DUE INSTANT is moved;
 /// the outcome itself is the service's own.
-fn expire_session(harness: &Harness, session_arn: &str, expiration: SystemTime) {
+pub(crate) fn expire_session(harness: &Harness, session_arn: &str, expiration: SystemTime) {
     let store = state::service_state(&*harness.engine).expect("the service store");
     let mut guard = store.lock();
     let session = guard

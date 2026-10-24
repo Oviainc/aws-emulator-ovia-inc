@@ -1667,9 +1667,12 @@ struct TokenInputs {
 // with SHA-256, RFC 7518 §3.4) because the only maintained pure-Rust RSA
 // implementation carries two unfixable timing advisories (RUSTSEC-2023-0071 /
 // CVE-2023-49092 and GHSA-4grx-2x9w-596c, both "no fixed version") that this
-// repository's dependency audit blocks, and every other RSA option needs a C
-// toolchain this image does not build. Nothing a verifier does changes: the
-// algorithm is named in the token header AND in the published JWK, which is
+// repository's dependency audit blocks. ES256 comes from `ring`, the
+// cryptography library this workspace already signs and encrypts with
+// elsewhere, rather than from the `p256`/`elliptic-curve` stack, whose
+// `crypto-bigint` 0.5 dependency carries a timing advisory (RUSTSEC-2026-0387)
+// with no release in that line that fixes it. Nothing a verifier does changes:
+// the algorithm is named in the token header AND in the published JWK, which is
 // where a JOSE library reads it from, so the token verifies by the same
 // `kid`-lookup-then-check-signature path. Both algorithms are JOSE registered
 // (RFC 7518 §3.1), and the signature segment is a non-empty base64url run

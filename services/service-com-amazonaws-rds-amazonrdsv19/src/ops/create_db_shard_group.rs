@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDBShardGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDBShardGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDBShardGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -208,18 +199,171 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDBShardGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDBShardGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDBShardGroup"))
+        let region =
+            crate::state::request_region(ctx).map_err(CreateDBShardGroupError::validation)?;
+
+        // `DBShardGroupIdentifier` is "the name of the DB shard group". The INPUT member
+        // targets a plain string, so the boundary validator enforces nothing for it; the
+        // constraints the modelled `DBShardGroupIdentifier` publishes (1 to 63 characters,
+        // first character a letter, no trailing or doubled hyphen) are the ones the
+        // identifier is reported back under, so they are checked here rather than left to
+        // produce a record no read could render.
+        let identifier = input.db_shard_group_identifier;
+        crate::state::check_identifier(
+            "DBShardGroupIdentifier",
+            &identifier,
+            MAX_DB_SHARD_GROUP_IDENTIFIER_LEN,
+        )
+        .map_err(CreateDBShardGroupError::validation)?;
+
+        // The capacity the shard group scales between, and how many standby DB data access
+        // shards it carries: `ComputeRedundancy` has a published value list, and a capacity
+        // in ACUs is a positive quantity.
+        let compute_redundancy = input
+            .compute_redundancy
+            .unwrap_or(crate::state::DEFAULT_COMPUTE_REDUNDANCY);
+        crate::state::check_compute_redundancy(compute_redundancy)
+            .map_err(CreateDBShardGroupError::invalid_parameter_value)?;
+        crate::state::check_capacity_units("MaxACU", input.max_acu)
+            .map_err(CreateDBShardGroupError::invalid_parameter_value)?;
+        if let Some(min_acu) = input.min_acu {
+            crate::state::check_capacity_units("MinACU", min_acu)
+                .map_err(CreateDBShardGroupError::invalid_parameter_value)?;
+            if min_acu > input.max_acu {
+                return Err(CreateDBShardGroupError::invalid_parameter_combination(
+                    format!(
+                        "MinACU ({min_acu}) must not exceed MaxACU ({}): the minimum \
+                         capacity of a DB shard group cannot be above its maximum",
+                        input.max_acu
+                    ),
+                ));
+            }
+        }
+        // The tags are stored request data, so the list and each entry are bounded before
+        // any of it is kept.
+        let tags = input.tags.unwrap_or_default();
+        crate::state::check_tags(&tags)
+            .map_err(CreateDBShardGroupError::invalid_parameter_value)?;
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated shard group.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        store.settle_due_transitions(&region);
+
+        // "The name of the primary DB cluster for the DB shard group": the shard group
+        // belongs to a cluster, so a name that resolves to no cluster in this region is the
+        // modelled not-found fault rather than a shard group pointing at nothing.
+        let Some(cluster) = store.resolve_db_cluster(&region, &input.db_cluster_identifier) else {
+            return Err(CreateDBShardGroupErrorModeled::DBClusterNotFoundFault(
+                DBClusterNotFoundFault {
+                    message: Some(format!(
+                        "DBCluster {} not found.",
+                        input.db_cluster_identifier
+                    )),
+                },
+            )
+            .into());
+        };
+        let db_cluster_identifier = cluster.identifier.clone();
+        // A cluster on its way out cannot take a new shard group: a delete "can't be
+        // canceled or reverted after it begins", so the cluster is not in a state this
+        // operation can act on, which is the modelled `InvalidDBClusterStateFault`. Every
+        // other status accepts it — a provisioning status this emulator's clock has yet to
+        // settle included, as the other operations that reference a cluster do.
+        if cluster.is_deleting() {
+            return Err(CreateDBShardGroupErrorModeled::InvalidDBClusterStateFault(
+                InvalidDBClusterStateFault {
+                    message: Some(format!(
+                        "DB cluster {db_cluster_identifier} is being deleted, so no DB shard \
+                         group can be created for it"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The identifier names one DB shard group in the region, case-insensitively: a
+        // second create under the same name is the modelled already-exists fault rather
+        // than a silent overwrite of the first.
+        let key = (region.clone(), crate::state::db_shard_group_key(&identifier));
+        if let Some(stored) = store.db_shard_groups.get(&key) {
+            return Err(
+                CreateDBShardGroupErrorModeled::DBShardGroupAlreadyExistsFault(
+                    DBShardGroupAlreadyExistsFault {
+                        message: Some(format!(
+                            "DB shard group already exists: {}",
+                            stored.identifier
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // The region's DB shard group allowance: a store that grows without bound is not
+        // what the real service does, and the modelled fault says exactly this.
+        if store.shard_groups_in(&region).len() >= crate::state::DB_SHARD_GROUP_QUOTA_PER_REGION {
+            return Err(CreateDBShardGroupErrorModeled::MaxDBShardGroupLimitReached(
+                MaxDBShardGroupLimitReached {
+                    message: Some(format!(
+                        "the request would exceed the allowed number of DB shard groups ({} \
+                         per region)",
+                        crate::state::DB_SHARD_GROUP_QUOTA_PER_REGION
+                    )),
+                },
+            )
+            .into());
+        }
+        // And the number of regions this store keeps records for at all — this emulator's
+        // own resource guard rather than a shard group allowance, so the message says which
+        // bound was reached.
+        if !store.has_room_for_region(&region) {
+            return Err(CreateDBShardGroupErrorModeled::MaxDBShardGroupLimitReached(
+                MaxDBShardGroupLimitReached {
+                    message: Some(format!(
+                        "this emulator holds records for at most {} regions, and {region} is \
+                         not one of them yet",
+                        crate::state::MAX_REGIONS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mint = store.next_mint();
+        let record = crate::state::DbShardGroupRecord {
+            identifier,
+            region: region.clone(),
+            db_cluster_identifier,
+            resource_id: crate::state::mint_db_shard_group_resource_id(mint),
+            endpoint_host: crate::state::mint_endpoint_host(mint),
+            max_acu: input.max_acu,
+            min_acu: input.min_acu,
+            compute_redundancy,
+            // The create is accepted and the shard group is still being provisioned: it
+            // reports `creating` until the transition the clock owes it comes due, which
+            // the next call materialises. Nothing sleeps.
+            status: crate::state::DB_SHARD_GROUP_STATUS_CREATING.to_string(),
+            pending_status: Some(crate::state::PendingStatus::in_a_moment(
+                crate::state::DB_SHARD_GROUP_STATUS_AVAILABLE,
+            )),
+            // "Default: The default behavior varies depending on whether DBSubnetGroupName
+            // is specified": in every branch the member documents, the shard group is
+            // public only when the VPC its subnets are in has an internet gateway attached
+            // to it. This emulator attaches none to the VPC it presents, so a request that
+            // names no setting gets a private shard group.
+            publicly_accessible: input.publicly_accessible.unwrap_or(false),
+            tags,
+        };
+        let created = record.to_wire();
+        store.db_shard_groups.insert(key, record);
+        Ok(created)
     }
 }
+
+/// The longest `DBShardGroupIdentifier` the model publishes: the `@length(min: 1, max: 63)`
+/// on the `DBShardGroupIdentifier` shape this operation reports the name back as.
+const MAX_DB_SHARD_GROUP_IDENTIFIER_LEN: usize = 63;

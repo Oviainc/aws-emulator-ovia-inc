@@ -1883,16 +1883,17 @@ pub fn export_task_not_found(task_identifier: &str) -> ResourceNotFoundException
 /// names no stored private graph endpoint.
 ///
 /// A private graph endpoint is addressed as the endpoint of one graph in one VPC, so
-/// the failure names both halves of that pair — which is what lets a caller tell an
-/// endpoint that has already been deleted apart from one created in another VPC. The
-/// modelled shape carries only `message`
+/// the failure names both halves of that pair, in the order the request carries them —
+/// which is what lets a caller tell an endpoint that has already been deleted apart
+/// from one created in another VPC. The modelled shape carries only `message`
 /// (`smithy_query(query="shape",shape="ResourceNotFoundException")`), so the message is
-/// the only place either fact can go.
+/// the only place either fact can go, and it is rendered the way the service renders
+/// it: the graph the endpoint would reach, then the VPC it would be reached from.
 pub fn private_endpoint_not_found(graph_identifier: &str, vpc_id: &str) -> ResourceNotFoundException
 {
     ResourceNotFoundException {
         message: format!(
-            "No private graph endpoint found on graph [{graph_identifier}] in vpc [{vpc_id}]"
+            "Private Graph Endpoint to Graph: {graph_identifier} from VPC: {vpc_id} does not exist"
         ),
     }
 }
@@ -2722,6 +2723,25 @@ mod tests {
             assert_eq!(
                 actual, expected,
                 "case {id:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// A missing private graph endpoint is reported from the addressing pair the
+    /// request carried, for every well-formed pair.
+    #[test]
+    fn private_endpoint_not_found_names_the_graph_then_the_vpc() {
+        for (graph_id, vpc_id) in [
+            ("g-0000000000", "vpc-1"),
+            ("g-a1b2c3d4e5", "vpc-0000000000000001e"),
+            ("g-zzzzzzzzzz", "vpc-abcdef0123456789"),
+        ] {
+            let actual = private_endpoint_not_found(graph_id, vpc_id).message;
+            let expected =
+                format!("Private Graph Endpoint to Graph: {graph_id} from VPC: {vpc_id} does not exist");
+            assert_eq!(
+                actual, expected,
+                "case {graph_id}/{vpc_id}: expected {expected:?}, got {actual:?}"
             );
         }
     }
