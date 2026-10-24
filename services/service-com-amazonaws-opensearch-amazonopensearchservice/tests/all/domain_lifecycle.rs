@@ -23,7 +23,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
-use service_com_amazonaws_opensearch_amazonopensearchservice::EmulatedService;
+use service_com_amazonaws_opensearch_amazonopensearchservice::{
+    ComAmazonawsOpensearchAmazonopensearchserviceState, EmulatedService,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The API version every path of this service is prefixed with.
@@ -36,6 +38,9 @@ pub(crate) const SETTLE_WAIT: Duration = Duration::from_millis(700);
 /// One emulator with this service mounted on a fresh shared engine.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
+    /// The SAME engine the mounted service holds, so a suite can read or set a
+    /// precondition in this service's store directly — the way a handler reaches it.
+    engine: std::sync::Arc<engine::InMemoryEngine>,
 }
 
 /// One answered request: the HTTP status, the `x-amzn-errortype` error code when the
@@ -54,8 +59,19 @@ impl Emulator {
         // The tests exercise the service, not SigV4: requests carry a credential scope
         // so the router can name the target service, but no real signature.
         router.set_request_authentication(false);
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
+        router.register_service(EmulatedService::new(std::sync::Arc::clone(&engine)));
+        Self { router, engine }
+    }
+
+    /// This emulator's store, reached exactly as a handler reaches it. A suite uses it
+    /// to put the record into a state no implemented operation can reach yet — the
+    /// service software a landed deployment leaves behind, say, whose deploying
+    /// operation is still a stub.
+    pub(crate) fn store(
+        &self,
+    ) -> engine::ServiceState<ComAmazonawsOpensearchAmazonopensearchserviceState> {
+        service_com_amazonaws_opensearch_amazonopensearchservice::state::service_state(&*self.engine)
+            .expect("the shared engine holds this service's store")
     }
 
     pub(crate) async fn call(&self, method: &str, uri: &str, body: Option<Value>) -> Answer {

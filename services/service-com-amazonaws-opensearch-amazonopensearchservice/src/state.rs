@@ -34,10 +34,10 @@ use crate::ops::types::{
     IdentityCenterOptionsInput, IdentityCenterOptionsStatus, JWTOptionsOutput, LogPublishingOption,
     LogPublishingOptionsStatus, NaturalLanguageQueryGenerationOptionsOutput,
     NodeToNodeEncryptionOptions, NodeToNodeEncryptionOptionsStatus, OffPeakWindowOptions,
-    OffPeakWindowOptionsStatus, OptionStatus, ResourceNotFoundException, SAMLOptionsOutput,
-    SnapshotOptions, SnapshotOptionsStatus, SoftwareUpdateOptions, SoftwareUpdateOptionsStatus,
-    Tag, UseCaseStatus, VPCDerivedInfo, VPCDerivedInfoStatus, VPCOptions, ValidationException,
-    VersionStatus,
+    OffPeakWindowOptionsStatus, OptionStatus, ResourceNotFoundException,
+    RollbackServiceSoftwareOptions, SAMLOptionsOutput, ServiceSoftwareOptions, SnapshotOptions,
+    SnapshotOptionsStatus, SoftwareUpdateOptions, SoftwareUpdateOptionsStatus, Tag, UseCaseStatus,
+    VPCDerivedInfo, VPCDerivedInfoStatus, VPCOptions, ValidationException, VersionStatus,
 };
 
 /// The engine version a domain runs when `CreateDomain` names none.
@@ -100,6 +100,25 @@ pub const DATA_SOURCE_QUOTA: usize = 20;
 /// call reads it — nothing sleeps.
 pub const PROVISIONING: Duration = Duration::from_millis(500);
 
+/// The service software release a domain runs when it is created.
+///
+/// A service software release is labelled `R<date>`, optionally with a patch suffix
+/// (`ServiceUrl`-style opaque values aside, that is the only form the service
+/// publishes). A newly created domain runs the current release, so this is the
+/// emulator's single statement of what that is — `ListVersions`, which publishes the
+/// supported set, is still a stub.
+pub const DEFAULT_SERVICE_SOFTWARE_VERSION: &str = "R20250101";
+
+/// How long after a service software deployment lands the domain can still be rolled
+/// back onto the release it came off.
+///
+/// The service publishes no machine-readable value for this window, so the span is
+/// the emulator's OWN choice: long enough that a caller who deploys and then rolls
+/// back in the same session is inside it, and finite, so a window that has closed is
+/// observable. Stored as the instant the window shuts on the record it belongs to —
+/// nothing sleeps for it.
+pub const ROLLBACK_WINDOW: Duration = Duration::from_secs(72 * 60 * 60);
+
 /// `EngineType`'s `OpenSearch` value, and the `EngineVersion` prefix that implies it.
 pub const ENGINE_TYPE_OPENSEARCH: &str = "OpenSearch";
 
@@ -124,6 +143,22 @@ pub const PROCESSING_STATUS_ACTIVE: &str = "Active";
 
 /// `DomainProcessingStatusType`'s `Deleting`.
 pub const PROCESSING_STATUS_DELETING: &str = "Deleting";
+
+/// `DomainProcessingStatusType`'s `UpdatingServiceSoftware`: a service software
+/// deployment is being applied to the domain.
+pub const PROCESSING_STATUS_UPDATING_SERVICE_SOFTWARE: &str = "UpdatingServiceSoftware";
+
+/// `DeploymentStatus`'s `COMPLETED` value: no service software deployment is in
+/// flight on the domain.
+pub const DEPLOYMENT_STATUS_COMPLETED: &str = "COMPLETED";
+
+/// `DeploymentStatus`'s `IN_PROGRESS` value: a service software deployment is being
+/// applied.
+pub const DEPLOYMENT_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
+
+/// `DeploymentStatus`'s `ELIGIBLE` value: a service software release the domain can
+/// be moved onto is available.
+pub const DEPLOYMENT_STATUS_ELIGIBLE: &str = "ELIGIBLE";
 
 /// `OverallChangeStatus`'s `PROCESSING` value: the configuration change is being
 /// applied to the domain.
@@ -394,6 +429,233 @@ impl ConfigChange {
     }
 }
 
+/// A service software deployment in flight on a domain: the release it is moving the
+/// domain onto, and when the clock owes it completion.
+///
+/// A deployment is started by a service-software call and completes when the span the
+/// clock owes it has passed ([`PROVISIONING`], the same span a configuration change
+/// takes) — materialised by whichever later call reads the record, so nothing sleeps.
+#[derive(Debug, Clone)]
+pub struct SoftwareDeployment {
+    /// The release the domain is being moved onto, reported as
+    /// `ServiceSoftwareOptions$NewVersion` while the deployment is in flight.
+    pub target_version: String,
+    /// When the clock owes this deployment completion.
+    pub completes_at: SystemTime,
+    /// Whether this deployment moves the domain BACK onto an earlier release. A
+    /// landed rollback leaves the release it came off available to update to again,
+    /// never available to roll back to — so which direction a deployment ran decides
+    /// what the domain can do next.
+    pub rollback: bool,
+}
+
+/// The service software of one domain: the release it runs, the deployment in flight
+/// on it, and whether the release it last came off is still within its rollback
+/// window.
+///
+/// This is the ONE record behind `ServiceSoftwareOptions` (reported by every full
+/// descriptor of a domain) and `RollbackServiceSoftwareOptions` (reported by
+/// `RollbackServiceSoftwareUpdate`), so the two projections can never disagree about
+/// which release a domain runs.
+#[derive(Debug, Clone)]
+pub struct ServiceSoftware {
+    /// `ServiceSoftwareOptions$CurrentVersion`: the release the domain is running.
+    pub current_version: String,
+    /// A release the domain can be moved onto, when one is available and no
+    /// deployment is in flight.
+    pub available_version: Option<String>,
+    /// The deployment in flight, if any.
+    pub deployment: Option<SoftwareDeployment>,
+    /// The release a rollback would return the domain to: the one it ran before the
+    /// deployment that last landed. `None` on a domain no deployment has landed on,
+    /// and on one whose last deployment was itself a rollback.
+    pub rollback_to: Option<String>,
+    /// When the rollback window of the deployment that last landed closes; see
+    /// [`ROLLBACK_WINDOW`]. A rollback is available only strictly before it.
+    pub rollback_until: Option<SystemTime>,
+    /// `ServiceSoftwareOptions$OptionalDeployment`: "True if a service software is
+    /// never automatically updated."
+    pub optional_deployment: bool,
+}
+
+impl ServiceSoftware {
+    /// The service software of a domain that has just been created: it runs the
+    /// current release, nothing is deploying, and there is no earlier release to roll
+    /// back to.
+    pub fn initial() -> Self {
+        Self {
+            current_version: DEFAULT_SERVICE_SOFTWARE_VERSION.to_string(),
+            available_version: None,
+            deployment: None,
+            rollback_to: None,
+            rollback_until: None,
+            // No automated deployment is scheduled on a domain this emulator holds,
+            // so no release of it is ever updated without a caller asking.
+            optional_deployment: true,
+        }
+    }
+
+    /// Whether a deployment is being applied right now.
+    pub fn deploying(&self) -> bool {
+        self.deployment.is_some()
+    }
+
+    /// Materialise the deployment completion the clock owes this record, if `now` is
+    /// past its due instant: the release it was moving onto becomes the one running,
+    /// and what the domain can do next follows from which direction it ran.
+    ///
+    /// The landing is dated at the DUE instant rather than at `now`, so the rollback
+    /// window a caller reads does not move with the moment it happened to look.
+    fn settle(&mut self, now: SystemTime) {
+        let Some(deployment) = self.deployment.as_ref() else {
+            return;
+        };
+        if now < deployment.completes_at {
+            return;
+        }
+        let Some(deployment) = self.deployment.take() else {
+            return;
+        };
+        let came_off = ::std::mem::replace(&mut self.current_version, deployment.target_version);
+        if deployment.rollback {
+            // Rolling back does not open a window to roll forward again: the release
+            // the domain came off is simply an update it can take once more.
+            self.available_version = Some(came_off);
+            self.rollback_to = None;
+            self.rollback_until = None;
+        } else {
+            // The update that just landed is the one a rollback would undo, for as
+            // long as its window stays open.
+            self.available_version = None;
+            self.rollback_to = Some(came_off);
+            self.rollback_until = Some(deployment.completes_at + ROLLBACK_WINDOW);
+        }
+    }
+
+    /// Whether a service software rollback is available on this domain at `now`: a
+    /// deployment has landed leaving an earlier release to return to, its window is
+    /// still open, and no deployment is in flight to interrupt.
+    pub fn rollback_available(&self, now: SystemTime) -> bool {
+        !self.deploying()
+            && self.rollback_to.is_some()
+            && self.rollback_until.is_some_and(|until| now < until)
+    }
+
+    /// Start the rollback a call at `now` asked for, or answer `None` when no rollback
+    /// is available — which is the whole eligibility test, so a caller cannot start one
+    /// the record does not allow.
+    ///
+    /// The rollback is a deployment like any other: the domain keeps running its
+    /// current release until the clock makes the deployment due, and the release it is
+    /// returning to is the deployment's target.
+    pub fn begin_rollback(&mut self, now: SystemTime) -> Option<RollbackServiceSoftwareOptions> {
+        if !self.rollback_available(now) {
+            return None;
+        }
+        let target = self.rollback_to.take()?;
+        // The window belonged to the deployment being undone; undoing it consumes it.
+        self.rollback_until = None;
+        self.deployment = Some(SoftwareDeployment {
+            target_version: target.clone(),
+            completes_at: now + PROVISIONING,
+            rollback: true,
+        });
+        Some(RollbackServiceSoftwareOptions {
+            current_version: Some(self.current_version.clone()),
+            new_version: Some(target),
+            rollback_available: Some(true),
+            description: Some(self.description()),
+        })
+    }
+
+    /// This record's rollback options when no rollback is available: the release the
+    /// domain runs, no release to return to, and `RollbackAvailable` false — the
+    /// modelled member for "whether a service software rollback is available for the
+    /// domain".
+    ///
+    /// `Description` is "a description of the rollback status", so it names which part
+    /// of the rule the record fails: a deployment already running, a window that has
+    /// closed, or no landed deployment to undo at all.
+    pub fn rollback_unavailable(&self) -> RollbackServiceSoftwareOptions {
+        let description = if self.deploying() {
+            "A service software deployment is already in progress on this domain.".to_string()
+        } else if self.rollback_to.is_some() {
+            "The rollback window of this domain's last service software update has closed."
+                .to_string()
+        } else {
+            "No service software rollback is available for this domain.".to_string()
+        };
+        RollbackServiceSoftwareOptions {
+            current_version: Some(self.current_version.clone()),
+            // "The service software version that the domain will roll back to": it
+            // will roll back to none.
+            new_version: None,
+            rollback_available: Some(false),
+            description: Some(description),
+        }
+    }
+
+    /// `ServiceSoftwareOptions$UpdateStatus`, one of `DeploymentStatus`'s values:
+    /// `IN_PROGRESS` while a deployment is being applied, `ELIGIBLE` when a release
+    /// the domain can take is available, and `COMPLETED` when the domain is settled on
+    /// the release it runs.
+    pub fn update_status(&self) -> &'static str {
+        if self.deploying() {
+            DEPLOYMENT_STATUS_IN_PROGRESS
+        } else if self.available_version.is_some() {
+            DEPLOYMENT_STATUS_ELIGIBLE
+        } else {
+            DEPLOYMENT_STATUS_COMPLETED
+        }
+    }
+
+    /// "A description of the service software update status" — derived from the record
+    /// rather than stored, so it cannot disagree with the status beside it.
+    fn description(&self) -> String {
+        match (&self.deployment, &self.available_version) {
+            (Some(deployment), _) if deployment.rollback => format!(
+                "Service software rollback to {} is in progress.",
+                deployment.target_version
+            ),
+            (Some(deployment), _) => format!(
+                "Service software update to {} is in progress.",
+                deployment.target_version
+            ),
+            (None, Some(available)) => {
+                format!("Service software update {available} is available.")
+            }
+            (None, None) => "There is no software update available for this domain.".to_string(),
+        }
+    }
+
+    /// This record as `ServiceSoftwareOptions` — what every full descriptor of a
+    /// domain reports and what the service-software operations answer with.
+    pub fn to_options(&self) -> ServiceSoftwareOptions {
+        ServiceSoftwareOptions {
+            current_version: Some(self.current_version.clone()),
+            new_version: self
+                .deployment
+                .as_ref()
+                .map(|deployment| deployment.target_version.clone())
+                .or_else(|| self.available_version.clone()),
+            update_available: Some(!self.deploying() && self.available_version.is_some()),
+            // "True if you're able to cancel your service software version update":
+            // only a deployment that has been requested and not yet begun can be
+            // cancelled, and a deployment here begins with the call that asks for it,
+            // so there is never one waiting.
+            cancellable: Some(false),
+            update_status: Some(self.update_status().to_string()),
+            description: Some(self.description()),
+            // "The timestamp ... until which you can manually request a service
+            // software update. After this date, we automatically update your service
+            // software." No deployment on a domain this emulator holds is automatic,
+            // so there is no such date to report.
+            automated_update_date: None,
+            optional_deployment: Some(self.optional_deployment),
+        }
+    }
+}
+
 /// One OpenSearch Service domain, as this emulator persists it.
 #[derive(Debug, Clone)]
 pub struct Domain {
@@ -444,6 +706,9 @@ pub struct Domain {
     pub auto_tune_options: Option<AutoTuneOptions>,
     pub off_peak_window_options: Option<OffPeakWindowOptions>,
     pub software_update_options: Option<SoftwareUpdateOptions>,
+    /// The service software this domain runs, and the deployment history the
+    /// service-software operations read and write. See [`ServiceSoftware`].
+    pub service_software: ServiceSoftware,
     pub aiml_options: Option<AIMLOptionsOutput>,
     pub deployment_strategy_options: Option<DeploymentStrategyOptions>,
     pub automated_snapshot_pause_options: Option<AutomatedSnapshotPauseOptions>,
@@ -544,6 +809,9 @@ impl Domain {
         for change in &mut self.changes {
             change.settle(now);
         }
+        // A service software deployment is owed its completion by the same clock, and
+        // on its own span: it is not one of the domain's configuration changes.
+        self.service_software.settle(now);
         let Some(due) = self.processing_until else {
             return;
         };
@@ -600,7 +868,9 @@ impl Domain {
             // `CreateVpcEndpoint` would mint; it is still a stub.
             endpoints: None,
             domain_endpoint_v2_hosted_zone_id: None,
-            processing: Some(self.processing),
+            // A domain applying a service software deployment is processing too, even
+            // when no configuration change is in flight.
+            processing: Some(self.processing || self.service_software.deploying()),
             // No version upgrade is in flight: `UpgradeDomain` is still a stub.
             upgrade_processing: Some(false),
             engine_version: Some(self.engine_version.clone()),
@@ -625,10 +895,9 @@ impl Domain {
                     .map(|(key, value)| (key.clone(), value.clone()))
                     .collect(),
             ),
-            // The service software a domain runs, and whether an update is
-            // available, is reported by the service-software operations — all still
-            // stubs, so there is no record to report.
-            service_software_options: None,
+            // The same record `RollbackServiceSoftwareUpdate` answers about, read
+            // through its own projection.
+            service_software_options: Some(self.service_software.to_options()),
             domain_endpoint_options: self.domain_endpoint_options.clone(),
             advanced_security_options: self.advanced_security_options.clone(),
             identity_center_options: self.identity_center_options.clone(),
@@ -645,7 +914,11 @@ impl Domain {
             change_progress_details: self.latest_change().map(ConfigChange::to_details),
             off_peak_window_options: self.off_peak_window_options.clone(),
             software_update_options: self.software_update_options.clone(),
-            domain_processing_status: Some(self.processing_status.clone()),
+            domain_processing_status: Some(if self.service_software.deploying() {
+                PROCESSING_STATUS_UPDATING_SERVICE_SOFTWARE.to_string()
+            } else {
+                self.processing_status.clone()
+            }),
             // Nothing is reported as modifying: this emulator applies an update in
             // one step and then settles it.
             modifying_properties: None,

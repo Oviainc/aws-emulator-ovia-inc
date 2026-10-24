@@ -145,9 +145,9 @@ use std::collections::{BTreeMap, VecDeque};
 use crate::state::{
     domain_arn, domain_endpoint, domain_id, stored_advanced_security_options, stored_aiml_options,
     stored_auto_tune_options, stored_automated_snapshot_pause_options,
-    stored_identity_center_options, stored_vpc_options, Domain, DEFAULT_ENGINE_MODE,
-    DEFAULT_ENGINE_VERSION, DEFAULT_USE_CASE, DOMAIN_QUOTA, OPT_ACCESS_POLICIES,
-    OPT_ADVANCED_OPTIONS, OPT_ADVANCED_SECURITY_OPTIONS, OPT_AIML_OPTIONS,
+    stored_identity_center_options, stored_vpc_options, Domain, ServiceSoftware,
+    DEFAULT_ENGINE_MODE, DEFAULT_ENGINE_VERSION, DEFAULT_USE_CASE, DOMAIN_QUOTA,
+    OPT_ACCESS_POLICIES, OPT_ADVANCED_OPTIONS, OPT_ADVANCED_SECURITY_OPTIONS, OPT_AIML_OPTIONS,
     OPT_AUTOMATED_SNAPSHOT_PAUSE_OPTIONS, OPT_AUTO_TUNE_OPTIONS, OPT_CLUSTER_CONFIG,
     OPT_COGNITO_OPTIONS, OPT_DEPLOYMENT_STRATEGY_OPTIONS, OPT_DOMAIN_ENDPOINT_OPTIONS,
     OPT_EBS_OPTIONS, OPT_ENCRYPTION_AT_REST_OPTIONS, OPT_ENGINE_MODE, OPT_ENGINE_VERSION,
@@ -320,6 +320,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             auto_tune_options: input.auto_tune_options.map(stored_auto_tune_options),
             off_peak_window_options: input.off_peak_window_options,
             software_update_options: input.software_update_options,
+            // A new domain runs the current service software with nothing deploying
+            // and no earlier release behind it; the service-software operations move
+            // this record from there.
+            service_software: ServiceSoftware::initial(),
             aiml_options: input.aiml_options.map(stored_aiml_options),
             deployment_strategy_options: input.deployment_strategy_options,
             automated_snapshot_pause_options: input
