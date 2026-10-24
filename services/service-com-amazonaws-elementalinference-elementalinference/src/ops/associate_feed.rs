@@ -225,13 +225,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "You can't modify an existing output (for example to change its name).
         // Instead, use UpdateFeed" — so two outputs named alike in one request cannot
         // both be appended. Caught here as a conflicting output.
-        if let Some(duplicate) = first_duplicate_name(input.outputs.iter().map(|o| o.name.as_str()))
-        {
+        if let Some(duplicate) = crate::state::first_duplicate_output_name(
+            input.outputs.iter().map(|o| o.name.as_str()),
+        ) {
             return Err(AssociateFeedErrorModeled::ConflictException(ConflictException {
-                message: format!(
-                    "The request lists more than one output named {duplicate}. \
-                     Output names must be unique within a feed."
-                ),
+                message: crate::state::duplicate_output_name_message(duplicate),
             })
             .into());
         }
@@ -329,9 +327,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A feed's output list is BOUNDED: an append that would carry it past the
         // quota is refused rather than grown, which is also what the real service
         // answers once a quota is exhausted. A call that appends NOTHING grows nothing,
-        // so it is never refused for the quota — a feed whose own outputs already
-        // exceed the bound (CreateFeed and UpdateFeed replace the list outright, so one
-        // request can put it there) can still be claimed.
+        // so it is never refused for the quota — a feed already AT the bound can still
+        // be claimed. Every operation that sets a feed's output list holds the same
+        // bound (`CreateFeed`, `UpdateFeed`), so the stored list is never past it.
         if !input.outputs.is_empty()
             && feed.outputs.len() + input.outputs.len() > crate::state::MAX_OUTPUTS_PER_FEED
         {
@@ -398,10 +396,4 @@ fn resembles_an_arn(name: &str) -> bool {
     name.as_bytes()
         .get(..4)
         .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"arn:"))
-}
-
-/// The first name `names` yields twice, if any.
-fn first_duplicate_name<'a>(mut names: impl Iterator<Item = &'a str>) -> Option<&'a str> {
-    let mut seen = std::collections::BTreeSet::new();
-    names.find(|name| !seen.insert(*name))
 }
