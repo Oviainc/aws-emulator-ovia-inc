@@ -21,6 +21,8 @@ mod delete_access_point;
 mod error_document_message;
 #[path = "all/error_message_construction.rs"]
 mod error_message_construction;
+#[path = "all/file_system_description.rs"]
+mod file_system_description;
 #[path = "all/file_system_lifecycle.rs"]
 mod file_system_lifecycle;
 #[path = "all/harness.rs"]
