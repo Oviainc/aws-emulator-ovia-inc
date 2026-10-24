@@ -2285,6 +2285,26 @@ impl Detector {
             .count()
     }
 
+    /// Apply the status change the CLOCK already owes each of this detector's
+    /// investigations, so a report answers what the service owed at `now` whether
+    /// or not anybody polled. The counterpart of
+    /// [`ComAmazonawsGuarddutyGuarddutyapiserviceState::settle_malware_scans`] for
+    /// the investigations one detector holds; every move goes through
+    /// [`InvestigationRecord::settle`], so a read and a list cannot disagree about
+    /// when an investigation left `RUNNING`.
+    pub fn settle_investigations(&mut self, now: i64) {
+        for investigation in self.investigations.values_mut() {
+            investigation.settle(now);
+        }
+    }
+
+    /// Every investigation this detector holds, in investigation-id order — the
+    /// total order the map is keyed by, which a sort then re-orders and a page
+    /// token stays meaningful against.
+    pub fn investigation_records(&self) -> Vec<&InvestigationRecord> {
+        self.investigations.values().collect()
+    }
+
     /// The trusted entity set a create already minted for `token`, if any — the
     /// seam that makes `CreateTrustedEntitySet` idempotent under a replayed
     /// `ClientToken`.
@@ -2854,6 +2874,88 @@ impl InvestigationRecord {
         self.ended_at_millis = Some(self.terminal_due_millis);
         self.error = Some(INVESTIGATION_ENGINE_UNAVAILABLE.to_string());
     }
+}
+
+/// `OrderBy`, the order a sort runs in: the enum is `ASC | DESC`
+/// (`smithy_query(shape="OrderBy")`), the two values the generated
+/// [`crate::ops::types::shared_types::ORDER_BY_VALUES`] list carries. Every sort
+/// in this service reads the member through these two constants, so none of them
+/// can spell the order differently.
+pub const ORDER_BY_ASCENDING: &str = "ASC";
+
+/// The other `OrderBy` member — see [`ORDER_BY_ASCENDING`].
+pub const ORDER_BY_DESCENDING: &str = "DESC";
+
+/// The attributes a `ListInvestigations` sort may name: the
+/// `InvestigationSortField` members, which the model lists as `START_TIME |
+/// END_TIME | STATUS | RISK_LEVEL | CONFIDENCE`
+/// (`smithy_query(shape="InvestigationSortField")`) and the generated enum carries
+/// as [`crate::ops::types::shared_types::INVESTIGATION_SORT_FIELD_VALUES`]. Read
+/// from the generated list so the two can never drift.
+pub fn investigation_sort_fields() -> &'static [&'static str] {
+    crate::ops::types::shared_types::INVESTIGATION_SORT_FIELD_VALUES
+}
+
+/// The attribute a `ListInvestigations` sort orders by when the request names
+/// none: when the investigation started, which with [`DESCENDING_BY_DEFAULT`] puts
+/// the newest investigation first — the order the other reporting operations of
+/// this service answer an unordered request in.
+pub const INVESTIGATION_DEFAULT_SORT_FIELD: &str = "START_TIME";
+
+/// Resolve one investigation attribute by its `InvestigationSortField` name, or
+/// `None` when that is not a member of the enum.
+///
+/// `RISK_LEVEL` and `CONFIDENCE` are produced by the analysis
+/// ([`INVESTIGATION_ENGINE_UNAVAILABLE`]), which this emulator does not run, so
+/// they resolve to the neutral text key rather than to a synthesised assessment:
+/// ordering by an absent value is ordering by the empty string, exactly as
+/// [`malware_scan_attribute`] treats a scan result nothing produced.
+pub fn investigation_attribute(investigation: &InvestigationRecord, field: &str) -> Option<Attribute> {
+    let value = match field {
+        "START_TIME" => Attribute::Number(investigation.started_at_millis as f64),
+        "END_TIME" => Attribute::Number(investigation.ended_at_millis.unwrap_or(0) as f64),
+        "STATUS" => Attribute::Text(investigation.status.clone()),
+        "RISK_LEVEL" | "CONFIDENCE" => Attribute::Text(String::new()),
+        _ => return None,
+    };
+    Some(value)
+}
+
+/// Order `investigations` for `ListInvestigations`.
+///
+/// With no `SortCriteria` the newest investigation comes first, with the
+/// investigation id breaking ties so the order is TOTAL and a page token means the
+/// same thing on the call that hands it back. `Err(attribute)` means the request
+/// named something that is not an `InvestigationSortField` member.
+pub fn sort_investigations(
+    investigations: &mut [&InvestigationRecord],
+    sort: Option<&crate::ops::types::InvestigationSortCriteria>,
+) -> Result<(), String> {
+    let attribute = sort
+        .and_then(|s| s.attribute_name.as_deref())
+        .filter(|a| !a.is_empty());
+    let descending = match sort.and_then(|s| s.order_by.as_deref()) {
+        Some(ORDER_BY_ASCENDING) => false,
+        Some(ORDER_BY_DESCENDING) => true,
+        // No explicit order: newest-first for the default attribute, ascending for
+        // an attribute the caller named — the rule `sort_malware_scans` follows.
+        _ => attribute.is_none() && DESCENDING_BY_DEFAULT,
+    };
+    let attribute = attribute.unwrap_or(INVESTIGATION_DEFAULT_SORT_FIELD);
+    if !investigation_sort_fields().contains(&attribute) {
+        return Err(attribute.to_string());
+    }
+
+    investigations.sort_by(|a, b| {
+        compare_by_attribute(
+            *a,
+            *b,
+            descending,
+            |investigation| investigation_attribute(investigation, attribute),
+            |investigation| investigation.id.clone(),
+        )
+    });
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -4122,8 +4224,8 @@ pub fn sort_findings(
         .and_then(|s| s.attribute_name.as_deref())
         .filter(|a| !a.is_empty());
     let descending = match sort.and_then(|s| s.order_by.as_deref()) {
-        Some("ASC") => false,
-        Some("DESC") => true,
+        Some(ORDER_BY_ASCENDING) => false,
+        Some(ORDER_BY_DESCENDING) => true,
         // No explicit order: newest-first for the default attribute, ascending for
         // an attribute the caller named.
         _ => attribute.is_none(),
@@ -4740,8 +4842,8 @@ pub fn sort_malware_scans(
         .and_then(|s| s.attribute_name.as_deref())
         .filter(|a| !a.is_empty());
     let descending = match sort.and_then(|s| s.order_by.as_deref()) {
-        Some("ASC") => false,
-        Some("DESC") => true,
+        Some(ORDER_BY_ASCENDING) => false,
+        Some(ORDER_BY_DESCENDING) => true,
         // No explicit order: newest-first for the default attribute, ascending for
         // an attribute the caller named.
         _ => attribute.is_none() && DESCENDING_BY_DEFAULT,

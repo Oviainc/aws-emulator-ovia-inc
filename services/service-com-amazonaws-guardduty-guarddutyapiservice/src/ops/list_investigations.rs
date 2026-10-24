@@ -1,15 +1,30 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListInvestigations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListInvestigations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the investigations the caller's detector holds, out of
+//! [`crate::state`], where `CreateInvestigation` persisted them and
+//! `GetInvestigation` reads one back.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListInvestigations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The rules, all from this operation's own documentation:
+//!
+//! * the feature is available only through the Regions the doc lists
+//!   ([`crate::state::INVESTIGATION_REGIONS`]), the same catalogue
+//!   `CreateInvestigation` and `GetInvestigation` are gated on;
+//! * `DetectorId` must name a detector this account/Region holds, so a list over a
+//!   detector the store does not resolve is a refusal rather than an empty page;
+//! * `SortCriteria` orders the answer by an `InvestigationSortField` member, newest
+//!   first when the request names no criterion;
+//! * `MaxResults`/`NextToken` page that ORDERED list, one page carrying at most
+//!   [`INVESTIGATION_SUMMARIES_MAX`] summaries.
+//!
+//! This is a REPORT: the only write is the status change the CLOCK already owed each
+//! investigation ([`crate::state::InvestigationRecord::settle`]), the same transition
+//! `GetInvestigation` materialises, so a list and a read never disagree. The assessment
+//! members (`RiskLevel`, `Confidence`, `Title`) are produced by the analysis this
+//! emulator does not run ([`crate::state::INVESTIGATION_ENGINE_UNAVAILABLE`]) and stay
+//! absent rather than synthesised.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +172,133 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListInvestigations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListInvestigationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListInvestigations"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListInvestigationsErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx);
+        // "This feature is available in the following Amazon Web Services Regions:
+        // …" (`smithy_query(query="doc",shape="ListInvestigations")`) — the same
+        // catalogue `CreateInvestigation` and `GetInvestigation` list, so an endpoint
+        // outside it does not serve this operation either.
+        if !crate::state::investigations_available_in(&region) {
+            return Err(bad_request(crate::state::INVESTIGATION_REGION_MESSAGE));
+        }
+
+        // The lock is taken MUTABLY only to materialise the clock-owed status changes
+        // below; nothing here depends on the caller.
+        let mut state = state.lock();
+        let now = crate::state::now_millis();
+        let Some(detector) = state.detector_in_mut(&region, &input.detector_id) else {
+            return Err(detector_rejection(&input.detector_id));
+        };
+        // The one write a report may make: a status that was owed before this call is
+        // applied before it is reported, so the answer is the one the service owed at
+        // this instant whether or not anybody listed.
+        detector.settle_investigations(now);
+
+        let mut ordered = detector.investigation_records();
+        crate::state::sort_investigations(&mut ordered, input.sort_criteria.as_ref())
+            .map_err(|attribute| unsupported_attribute(&attribute))?;
+
+        let (window, next_token) = crate::state::paginate_window(
+            ordered.len(),
+            input.max_results,
+            input.next_token.as_deref(),
+            INVESTIGATION_SUMMARIES_MAX,
+        )
+        .map_err(|_| {
+            // Under the error CLASS, naming the parameter at fault and not quoting
+            // the token back.
+            bad_request(crate::state::invalid_parameter_message(
+                crate::state::NEXT_TOKEN_MEMBER,
+            ))
+        })?;
+
+        let investigations: Vec<InvestigationSummary> = ordered[window]
+            .iter()
+            .map(|investigation| investigation_summary(investigation))
+            .collect();
+
+        Ok(ListInvestigationsOutput {
+            investigations,
+            next_token,
+        })
     }
+}
+
+/// `InvestigationSummaries` is `len 0..50` and `MaxResults` is `range 1..50` with "The
+/// default value is 50" (`smithy_query(operation="ListInvestigations")`), so one page
+/// carries at most 50 summaries whatever the request asks for.
+const INVESTIGATION_SUMMARIES_MAX: usize = 50;
+
+/// The modelled `InvestigationSummary` view of a stored investigation: every member of
+/// that shape, read off the record [`crate::state::InvestigationRecord`] holds rather
+/// than recomputed here.
+fn investigation_summary(
+    investigation: &crate::state::InvestigationRecord,
+) -> InvestigationSummary {
+    InvestigationSummary {
+        investigation_id: Some(investigation.id.clone()),
+        status: Some(investigation.status.clone()),
+        trigger_prompt: Some(investigation.trigger_prompt.clone()),
+        // `RiskLevel`, `Confidence` and `Title` are the ANALYSIS's conclusions, and
+        // this emulator runs no analysis
+        // ([`crate::state::INVESTIGATION_ENGINE_UNAVAILABLE`]): the members stay
+        // absent rather than carrying an assessment nothing produced.
+        // `GetInvestigation` reports the same investigation the same way.
+        risk_level: None,
+        confidence: None,
+        title: None,
+        // "The Amazon Web Services account ID associated with the investigation"
+        // (`smithy_query(shape="InvestigationSummary")`) — the account that initiated
+        // it, which is what `Investigation.TriggeredBy` reports.
+        account_id: Some(investigation.triggered_by.clone()),
+        start_time: Some(::aws_smithy_types::DateTime::from_millis(
+            investigation.started_at_millis,
+        )),
+        end_time: investigation
+            .ended_at_millis
+            .map(::aws_smithy_types::DateTime::from_millis),
+    }
+}
+
+/// Refuse a `DetectorId` the store does not resolve, the way this operation's own
+/// error set classifies it: the caller's PERMISSION on the detector is decided before
+/// the detector is resolved, so a well-formed id the account/Region does not hold is
+/// denied with HTTP 403 `AccessDeniedException` and discloses nothing about whether it
+/// names anything, while a value that cannot be a `DetectorId` at all stays the HTTP
+/// 400 parameter failure — the classification `GetInvestigation` also answers with.
+fn detector_rejection(detector_id: &str) -> ListInvestigationsError {
+    if crate::state::is_detector_id(detector_id) {
+        ListInvestigationsErrorModeled::AccessDeniedException(AccessDeniedException {
+            message: Some(crate::state::not_authorized_message(
+                crate::state::DETECTOR_ID_MEMBER,
+            )),
+            r#type: Some("AccessDeniedException".to_string()),
+        })
+        .into()
+    } else {
+        bad_request(crate::state::invalid_parameter_message(
+            crate::state::DETECTOR_ID_MEMBER,
+        ))
+    }
+}
+
+/// Refuse a sort attribute that is not an `InvestigationSortField` member, naming the
+/// member at fault and the attributes the enum does carry.
+fn unsupported_attribute(attribute: &str) -> ListInvestigationsError {
+    bad_request(format!(
+        "sortCriteria.attributeName: '{attribute}' is not an investigation attribute this service can sort on. Supported attributes are {}.",
+        crate::state::investigation_sort_fields().join(", ")
+    ))
+}
+
+/// Refuse the request the way GuardDuty does: HTTP 400 under the
+/// `InvalidInputException` class, in both the body's `__type` and its `type` member.
+fn bad_request(message: impl Into<String>) -> ListInvestigationsError {
+    crate::scaffolded::Scaffolded::invalid_input(message)
 }

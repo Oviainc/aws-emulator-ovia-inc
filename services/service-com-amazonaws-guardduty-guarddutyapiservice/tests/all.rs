@@ -37,6 +37,8 @@ mod findings_feedback;
 mod findings_statistics;
 #[path = "all/investigation_lifecycle.rs"]
 mod investigation_lifecycle;
+#[path = "all/investigation_listing.rs"]
+mod investigation_listing;
 #[path = "all/ip_set_lifecycle.rs"]
 mod ip_set_lifecycle;
 #[path = "all/ip_set_listing.rs"]
