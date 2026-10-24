@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PublishBatch
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PublishBatch`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PublishBatch::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -130,6 +121,53 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{self, MessageRequest, PublishedMessage};
+
+/// "Publishes up to 10 messages to the specified topic in a single batch. … If you
+/// attempt to send more than 10 messages in one request, you will encounter a
+/// TooManyEntriesInBatchRequest exception" (the `PublishBatch` doc).
+const MAX_BATCH_ENTRIES: usize = 10;
+
+/// "This identifier can have up to 80 characters. The following characters are
+/// accepted: alphanumeric characters, hyphens(-), and underscores (_)"
+/// (`PublishBatchRequestEntry$Id` doc).
+const MAX_ENTRY_ID_CHARS: usize = 80;
+
+/// The awsQuery error code of `InvalidParameterException`, which is the code a
+/// per-entry failure carries: an entry SNS would have refused a single `Publish` for
+/// fails on its own, inside a request the batch still answers 200 for.
+const INVALID_PARAMETER_CODE: &str = "InvalidParameter";
+
+/// Whether a batch entry's `Id` abides by the rule its doc states: 1 to 80
+/// characters, each an ASCII alphanumeric, a hyphen or an underscore.
+fn entry_id_is_valid(id: &str) -> bool {
+    let length = id.chars().count();
+    length > 0
+        && length <= MAX_ENTRY_ID_CHARS
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// The bytes one entry contributes to the batch's combined size: "The combined size of
+/// all messages in the batch, including each message's body and attributes, must not
+/// exceed the topic's MaximumMessageSize" (the `PublishBatch` doc).
+fn entry_bytes(entry: &PublishBatchRequestEntry) -> usize {
+    entry.message.len()
+        + entry
+            .message_attributes
+            .as_ref()
+            .map_or(0, state::message_attribute_bytes)
+}
+
+/// Refuse the whole request with `InvalidParameterException`, the error SNS uses for a
+/// parameter that "does not comply with the associated constraints".
+fn invalid_parameter(message: String) -> PublishBatchError {
+    PublishBatchErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+    })
+    .into()
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -216,20 +254,189 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PublishBatch` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PublishBatchErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Argument validation first: a destination that is not an SNS topic ARN at all
+        // is bad input, not a topic that does not exist.
+        if let Some(message) = state::arn_refusal("TopicArn", &input.topic_arn) {
+            return Err(invalid_parameter(message));
+        }
+        if state::topic_name_from_arn(&input.topic_arn).is_none() {
+            return Err(invalid_parameter(
+                "Invalid parameter: TopicArn Reason: not an SNS topic ARN".to_string(),
+            ));
+        }
+
+        let entries = input.publish_batch_request_entries;
+        if entries.is_empty() {
+            return Err(PublishBatchErrorModeled::EmptyBatchRequestException(
+                EmptyBatchRequestException {
+                    message: Some(
+                        "The batch request doesn't contain any entries.".to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+        if entries.len() > MAX_BATCH_ENTRIES {
+            return Err(
+                PublishBatchErrorModeled::TooManyEntriesInBatchRequestException(
+                    TooManyEntriesInBatchRequestException {
+                        message: Some(format!(
+                            "The batch request contains more entries than permissible: \
+                             {} entries were sent, and the maximum is {MAX_BATCH_ENTRIES}.",
+                            entries.len()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // Every entry is identified before any of them is published: the id is how the
+        // response reports an entry's own result, so a batch SNS could not report on
+        // fails as a whole rather than entry by entry.
+        if let Some(entry) = entries.iter().find(|entry| !entry_id_is_valid(&entry.id)) {
+            return Err(PublishBatchErrorModeled::InvalidBatchEntryIdException(
+                InvalidBatchEntryIdException {
+                    message: Some(format!(
+                        "The Id of a batch entry in a batch request doesn't abide by the \
+                         specification: an Id has 1 to {MAX_ENTRY_ID_CHARS} alphanumeric, \
+                         hyphen or underscore characters, and this one has {}.",
+                        entry.id.chars().count()
+                    )),
+                },
+            )
+            .into());
+        }
+        let mut seen: std::collections::HashSet<&str> =
+            std::collections::HashSet::with_capacity(entries.len());
+        if entries.iter().any(|entry| !seen.insert(entry.id.as_str())) {
+            return Err(PublishBatchErrorModeled::BatchEntryIdsNotDistinctException(
+                BatchEntryIdsNotDistinctException {
+                    message: Some(
+                        "Two or more batch entries in the request have the same Id."
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let Some(store) = state::service_state(&*self.engine) else {
+            return Err(PublishBatchErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the SNS store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let mut store = store.lock();
+
+        let Some(topic) = store.topics.get(&input.topic_arn).cloned() else {
+            return Err(PublishBatchErrorModeled::NotFoundException(NotFoundException {
+                message: Some(state::TOPIC_DOES_NOT_EXIST.to_string()),
+            })
+            .into());
+        };
+
+        // The batch's own ceiling: the combined size of every message in it, against
+        // the ceiling the topic sets for one message.
+        let ceiling = state::max_message_size(&topic);
+        let combined: usize = entries.iter().map(entry_bytes).sum();
+        if combined > ceiling {
+            return Err(PublishBatchErrorModeled::BatchRequestTooLongException(
+                BatchRequestTooLongException {
+                    message: Some(format!(
+                        "The length of all the batch messages put together is more than the \
+                         limit: {combined} bytes exceeds the topic's limit of {ceiling} bytes."
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // SNS "delivers the message to each endpoint that is subscribed to the topic"
+        // (Publish doc) — an unconfirmed subscription has no confirmed endpoint yet, so
+        // it receives nothing. The recipients are the same for every entry of the
+        // batch, so they are resolved once.
+        let recipients: Vec<String> = store
+            .subscriptions_of(&topic.arn)
+            .into_iter()
+            .filter(|sub| !sub.pending_confirmation)
+            .map(|sub| sub.arn.clone())
+            .collect();
+
+        // "The result of publishing each message is reported individually in the
+        // response. Because the batch request can result in a combination of successful
+        // and unsuccessful actions, you should check for batch errors even when the call
+        // returns an HTTP status code of 200" (the `PublishBatch` doc): an entry that
+        // breaks a per-message rule fails on its own, and the rest are still published.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PublishBatch"))
+        // The entries are walked in request order, which is the order "multiple messages
+        // within a single batch are published in" for a FIFO topic.
+        let mut successful: Vec<PublishBatchResultEntry> = Vec::with_capacity(entries.len());
+        let mut failed: Vec<BatchResultErrorEntry> = Vec::new();
+        for entry in entries {
+            let judgement = {
+                let request = MessageRequest {
+                    message: &entry.message,
+                    subject: entry.subject.as_deref(),
+                    message_structure: entry.message_structure.as_deref(),
+                    message_group_id: entry.message_group_id.as_deref(),
+                    message_deduplication_id: entry.message_deduplication_id.as_deref(),
+                };
+                match state::message_refusal(request) {
+                    Some(reason) => Err(reason),
+                    None => state::topic_message_refusal(&topic, request),
+                }
+            };
+            let message_deduplication_id = match judgement {
+                Ok(deduplication_id) => deduplication_id,
+                Err(reason) => {
+                    failed.push(BatchResultErrorEntry {
+                        id: entry.id,
+                        code: INVALID_PARAMETER_CODE.to_string(),
+                        message: Some(reason),
+                        // "Specifies whether the error happened due to the caller of the
+                        // batch API action" — a per-message rule is the caller's to
+                        // satisfy.
+                        sender_fault: true,
+                    });
+                    continue;
+                }
+            };
+
+            // Only a FIFO topic is sequenced: "This parameter applies only to FIFO
+            // (first-in-first-out) topics" (`PublishBatchResultEntry$SequenceNumber`
+            // doc).
+            let sequence_number = topic.is_fifo.then(|| store.next_sequence_number());
+            let message_id = store.next_unique_id();
+            let published = PublishedMessage {
+                message_id: message_id.clone(),
+                topic_arn: topic.arn.clone(),
+                message: entry.message,
+                subject: entry.subject,
+                message_structure: entry.message_structure,
+                message_attributes: entry.message_attributes.unwrap_or_default(),
+                message_group_id: entry.message_group_id,
+                message_deduplication_id,
+                sequence_number: sequence_number.clone(),
+                published_at: std::time::SystemTime::now(),
+            };
+            for recipient in &recipients {
+                store.record_delivery(recipient, published.clone());
+            }
+
+            successful.push(PublishBatchResultEntry {
+                id: Some(entry.id),
+                message_id: Some(message_id),
+                sequence_number,
+            });
+        }
+
+        Ok(PublishBatchOutput {
+            successful: Some(successful),
+            failed: Some(failed),
+        })
     }
 }

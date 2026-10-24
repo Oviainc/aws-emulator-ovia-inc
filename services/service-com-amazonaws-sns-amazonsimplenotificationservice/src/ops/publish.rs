@@ -148,50 +148,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-use crate::state::{self, PublishedMessage};
-use sha2::{Digest, Sha256};
-
-/// The only value `MessageStructure` accepts ("Valid value: json" —
-/// `PublishInput$MessageStructure` doc).
-const JSON_MESSAGE_STRUCTURE: &str = "json";
-
-/// The key a JSON-structured message must carry: "contain at least a top-level JSON
-/// key of \"default\" with a value that is a string" (`PublishInput$MessageStructure`
-/// doc).
-const DEFAULT_JSON_KEY: &str = "default";
-
-/// "By default, a message can be at most 256 KiB in size (262,144 bytes)"
-/// (`PublishInput$Message` doc); a topic's `MaximumMessageSize` attribute overrides it.
-const DEFAULT_MAX_MESSAGE_SIZE: usize = 262_144;
-
-/// The topic attribute that overrides [`DEFAULT_MAX_MESSAGE_SIZE`].
-const MAX_MESSAGE_SIZE_ATTRIBUTE: &str = "MaximumMessageSize";
-
-/// The FIFO attribute that makes SNS derive the `MessageDeduplicationId` from the
-/// message body instead of requiring the caller to supply one
-/// (`GetTopicAttributesResponse$Attributes` doc).
-const CONTENT_BASED_DEDUPLICATION_ATTRIBUTE: &str = "ContentBasedDeduplication";
-
-/// "Subjects must be UTF-8 text with no line breaks or control characters, and less
-/// than 100 characters long" (`PublishInput$Subject` doc).
-const MAX_SUBJECT_CHARS: usize = 100;
-
-/// "The MessageGroupId can contain up to 128 alphanumeric characters (a-z, A-Z, 0-9)
-/// and punctuation" — the same rule the doc states for `MessageDeduplicationId`
-/// ("When provided, the same validation rules apply").
-const MAX_ORDERING_ID_CHARS: usize = 128;
-
-/// Whether an ordering id (`MessageGroupId`, `MessageDeduplicationId`) satisfies the
-/// rule above: 1 to 128 characters of ASCII alphanumerics and ASCII punctuation,
-/// which is exactly the set the doc lists.
-fn ordering_id_is_valid(value: &str) -> bool {
-    let length = value.chars().count();
-    length > 0
-        && length <= MAX_ORDERING_ID_CHARS
-        && value
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c.is_ascii_punctuation())
-}
+use crate::state::{self, MessageRequest, PublishedMessage};
 
 /// Refuse the request with `InvalidParameterException`, the error SNS uses for a
 /// parameter that "does not comply with the associated constraints".
@@ -200,29 +157,6 @@ fn invalid_parameter(message: String) -> PublishError {
         message: Some(message),
     })
     .into()
-}
-
-/// Whether `subject` satisfies the rule SNS documents for it.
-fn subject_is_valid(subject: &str) -> bool {
-    subject.chars().count() < MAX_SUBJECT_CHARS && !subject.chars().any(char::is_control)
-}
-
-/// Check a `MessageStructure: json` body: a JSON object with a string `default`
-/// member, every other member a string too. Returns the reason it is not.
-fn json_message_error(message: &str) -> Option<&'static str> {
-    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(message) else {
-        return Some("message must be a syntactically valid JSON object");
-    };
-    let Some(members) = parsed.as_object() else {
-        return Some("message must be a syntactically valid JSON object");
-    };
-    if !members.get(DEFAULT_JSON_KEY).is_some_and(|v| v.is_string()) {
-        return Some("message must carry a top-level \"default\" key whose value is a string");
-    }
-    if members.values().any(|value| !value.is_string()) {
-        return Some("every top-level value of the message must be a string");
-    }
-    None
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -374,52 +308,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        if let Some(structure) = input.message_structure.as_deref() {
-            if structure != JSON_MESSAGE_STRUCTURE {
-                return Err(invalid_parameter(format!(
-                    "Invalid parameter: MessageStructure Reason: the only valid value is \
-                     {JSON_MESSAGE_STRUCTURE}"
-                )));
-            }
-            if let Some(reason) = json_message_error(&input.message) {
-                return Err(invalid_parameter(format!(
-                    "Invalid parameter: Message - {reason}"
-                )));
-            }
-        }
-
-        if input.message.is_empty() {
-            return Err(invalid_parameter(
-                "Invalid parameter: Message - must not be empty".to_string(),
-            ));
-        }
-
-        if let Some(subject) = input.subject.as_deref() {
-            if !subject_is_valid(subject) {
-                return Err(invalid_parameter(format!(
-                    "Invalid parameter: Subject - must be text with no control characters and \
-                     fewer than {MAX_SUBJECT_CHARS} characters long"
-                )));
-            }
-        }
-
-        // The ordering ids follow one rule, whatever the topic type, and it is also
-        // what keeps a retained delivery's own size bounded.
-        for (member, value) in [
-            ("MessageGroupId", input.message_group_id.as_deref()),
-            (
-                "MessageDeduplicationId",
-                input.message_deduplication_id.as_deref(),
-            ),
-        ] {
-            if let Some(value) = value {
-                if !ordering_id_is_valid(value) {
-                    return Err(invalid_parameter(format!(
-                        "Invalid parameter: {member} - must be 1 to {MAX_ORDERING_ID_CHARS} \
-                         alphanumeric or punctuation characters"
-                    )));
-                }
-            }
+        // Every per-message rule, judged before any record is read — the same rules
+        // `PublishBatch` applies to each of its entries.
+        let request = MessageRequest {
+            message: &input.message,
+            subject: input.subject.as_deref(),
+            message_structure: input.message_structure.as_deref(),
+            message_group_id: input.message_group_id.as_deref(),
+            message_deduplication_id: input.message_deduplication_id.as_deref(),
+        };
+        if let Some(reason) = state::message_refusal(request) {
+            return Err(invalid_parameter(reason));
         }
 
         let Some(store) = crate::state::service_state(&*self.engine) else {
@@ -439,71 +338,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let max_message_size = topic
-            .attributes
-            .get(MAX_MESSAGE_SIZE_ATTRIBUTE)
-            .and_then(|value| value.parse::<usize>().ok())
-            // The attribute may only LOWER the ceiling: a caller-raised cap would let
-            // one request buy more memory per subscription than the documented
-            // default, so the emulator keeps the default as its hard limit.
-            .map_or(DEFAULT_MAX_MESSAGE_SIZE, |configured| {
-                configured.min(DEFAULT_MAX_MESSAGE_SIZE)
-            });
-        if input.message.len() > max_message_size {
-            return Err(invalid_parameter(format!(
-                "Invalid parameter: Message - too long: {} bytes exceeds the topic's limit of \
-                 {max_message_size} bytes",
-                input.message.len()
-            )));
-        }
-
-        // The FIFO ordering parameters belong to a FIFO topic and only to one.
-        let sequence_number;
-        let message_deduplication_id;
-        if topic.is_fifo {
-            if input.message_group_id.is_none() {
-                return Err(invalid_parameter(
-                    // The sentence SNS states for the ordering parameter a FIFO
-                    // publish must carry.
-                    "Invalid parameter: The MessageGroupId parameter is required for FIFO topics"
-                        .to_string(),
-                ));
-            }
-            let content_based = topic
-                .attributes
-                .get(CONTENT_BASED_DEDUPLICATION_ATTRIBUTE)
-                .is_some_and(|value| value.eq_ignore_ascii_case("true"));
-            message_deduplication_id = match input.message_deduplication_id.clone() {
-                Some(id) => Some(id),
-                None if content_based => {
-                    // "Amazon SNS uses a SHA-256 hash to generate the
-                    // MessageDeduplicationId using the body of the message (but not the
-                    // attributes of the message)" (GetTopicAttributes Attributes doc).
-                    Some(hex::encode(Sha256::digest(input.message.as_bytes())))
-                }
-                None => {
-                    return Err(invalid_parameter(
-                        "Invalid parameter: MessageDeduplicationId - required for a FIFO topic \
-                         whose ContentBasedDeduplication is not enabled"
-                            .to_string(),
-                    ))
-                }
-            };
-            sequence_number = Some(store.next_sequence_number());
-        } else {
-            if input.message_deduplication_id.is_some() {
-                return Err(invalid_parameter(
-                    "Invalid parameter: MessageDeduplicationId - applies only to FIFO topics"
-                        .to_string(),
-                ));
-            }
-            // A MessageGroupId is NOT refused here: for a standard topic "the
-            // MessageGroupId is optional and is forwarded only to Amazon SQS standard
-            // subscriptions to activate fair queues" (`PublishInput$MessageGroupId`
-            // doc), so it is stored with the delivery rather than rejected.
-            message_deduplication_id = None;
-            sequence_number = None;
-        }
+        // The rules that need the topic as well as the message: its size ceiling and
+        // the FIFO ordering parameters, which also decide the stored deduplication id.
+        let message_deduplication_id = match state::topic_message_refusal(&topic, request) {
+            Ok(deduplication_id) => deduplication_id,
+            Err(reason) => return Err(invalid_parameter(reason)),
+        };
+        // Only a FIFO topic is sequenced: "This response element applies only to FIFO
+        // (first-in-first-out) topics" (`PublishResponse$SequenceNumber` doc).
+        let sequence_number = topic.is_fifo.then(|| store.next_sequence_number());
 
         let message_id = store.next_unique_id();
         let published = PublishedMessage {

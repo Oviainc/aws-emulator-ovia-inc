@@ -8,7 +8,8 @@
 //! modelled `AddressType` and keeping the `Site` projection of the operating one in
 //! step with it, materialising the Outpost lifecycle transition,
 //! the quote expiry and the capacity-task progression the clock owes, cutting an
-//! ordered list into pages with the modelled `Token` the next page resumes from, and
+//! ordered list into pages with the modelled `Token` the next page resumes from, the
+//! orderable-instance-type catalog this service publishes, and
 //! the two rules this service words its refusals by — the `NotFoundException`
 //! identifier echo and the value-omitting `ValidationException` report.
 
@@ -18,8 +19,9 @@ use sha2::{Digest, Sha256};
 use smithy_server_runtime::{Violation, ViolationKind};
 
 use crate::ops::types::{
-    Address, AssetInfo, CapacityTaskFailure, InstanceTypeCapacity, InstancesToExclude, Outpost,
-    PricingOption, PrivateConnectivityConfig, Quote, Site,
+    Address, AssetInfo, CapacityTaskFailure, DetailedInstanceTypeItem, FormFactorConfig,
+    InstanceTypeCapacity, InstancesToExclude, Outpost, PricingOption, PrivateConnectivityConfig,
+    Quote, Site,
 };
 
 /// The region every minted ARN falls back to when the request carries no SigV4
@@ -521,8 +523,306 @@ pub struct QuoteRecord {
     pub quote: Quote,
 }
 
+/// How many MiB of memory one GiB is, which turns a family's documented
+/// GiB-per-vCPU ratio into the `MemoryInMib` the model reports.
+const MIB_PER_GIB: i32 = 1024;
+
+/// One EC2 instance FAMILY in the orderable-instance-type catalog: the sizes it is
+/// offered in, the hardware every size carries, and where an Outpost can be ordered
+/// with it.
+///
+/// A family is the unit because EC2 publishes a family's specifications as one rule
+/// — every size in it carries the same memory per vCPU and the name is
+/// `<family>.<size>` — so one row here expands to every size of that family and no
+/// size can drift from its family's ratio.
+struct OrderableFamily {
+    /// The family prefix an instance type in it carries: `c5` in `c5.xlarge`.
+    family: &'static str,
+    /// GiB of memory per vCPU every size in this family carries.
+    ///
+    /// Source: the EC2 instance-type specifications AWS publishes — the compute
+    /// families (`c5`, `c6gd`, `c6id`) carry 2 GiB per vCPU, the general-purpose
+    /// ones (`m5`, `m6id`, `g4dn`) 4, and the memory- and storage-optimized ones
+    /// (`r5`, `r6id`, `i3en`) 8.
+    memory_gib_per_vcpu: i32,
+    /// Every size the family is offered in, as (size suffix, vCPUs, network
+    /// performance).
+    ///
+    /// Source: the same EC2 instance-type specifications — `VCPUs` and
+    /// `NetworkPerformance` are per-size figures, so each is spelled out per row
+    /// rather than derived.
+    sizes: &'static [(&'static str, i32, &'static str)],
+    /// The `(FormFactor, OutpostGeneration)` pairs an Outpost carrying this family
+    /// can be ordered as — the modelled `FormFactorConfig` list, which is a LIST
+    /// because one instance type can be orderable in more than one of them.
+    form_factors: &'static [(&'static str, &'static str)],
+}
+
+/// The orderable-instance-type catalog this service publishes, by family.
+///
+/// Two different sources meet in each row. The hardware figures (the sizes, their
+/// vCPU counts, the memory ratio and the network performance) are the EC2
+/// instance-type specifications AWS publishes. WHICH generation and form factor a
+/// family can be ordered in is this emulator's own catalog assignment: AWS publishes
+/// the orderable set per order rather than as a machine-readable list, so the
+/// families that have been on Outposts racks since launch are assigned to
+/// `GENERATION_1` racks, the later-generation families to `GENERATION_2` racks, and
+/// the two families AWS Outposts SERVERS are built on (the Graviton2 `c6gd` and the
+/// Intel `c6id`) to the `SERVER` form factor. The modelled value sets these name are
+/// [`crate::ops::types::FORM_FACTOR_VALUES`] (`RACK` | `SERVER`) and
+/// [`crate::ops::types::OUTPOST_GENERATION_VALUES`] (`GENERATION_1` |
+/// `GENERATION_2`).
+const ORDERABLE_FAMILIES: &[OrderableFamily] = &[
+    OrderableFamily {
+        family: "c5",
+        memory_gib_per_vcpu: 2,
+        sizes: &[
+            ("large", 2, "Up to 10 Gigabit"),
+            ("xlarge", 4, "Up to 10 Gigabit"),
+            ("2xlarge", 8, "Up to 10 Gigabit"),
+            ("4xlarge", 16, "Up to 10 Gigabit"),
+            ("9xlarge", 36, "10 Gigabit"),
+            ("12xlarge", 48, "12 Gigabit"),
+            ("18xlarge", 72, "25 Gigabit"),
+            ("24xlarge", 96, "25 Gigabit"),
+        ],
+        form_factors: &[(FORM_FACTOR_RACK, OUTPOST_GENERATION_1)],
+    },
+    OrderableFamily {
+        family: "m5",
+        memory_gib_per_vcpu: 4,
+        sizes: &[
+            ("large", 2, "Up to 10 Gigabit"),
+            ("xlarge", 4, "Up to 10 Gigabit"),
+            ("2xlarge", 8, "Up to 10 Gigabit"),
+            ("4xlarge", 16, "Up to 10 Gigabit"),
+            ("8xlarge", 32, "10 Gigabit"),
+            ("12xlarge", 48, "12 Gigabit"),
+            ("16xlarge", 64, "20 Gigabit"),
+            ("24xlarge", 96, "25 Gigabit"),
+        ],
+        form_factors: &[(FORM_FACTOR_RACK, OUTPOST_GENERATION_1)],
+    },
+    OrderableFamily {
+        family: "r5",
+        memory_gib_per_vcpu: 8,
+        sizes: &[
+            ("large", 2, "Up to 10 Gigabit"),
+            ("xlarge", 4, "Up to 10 Gigabit"),
+            ("2xlarge", 8, "Up to 10 Gigabit"),
+            ("4xlarge", 16, "Up to 10 Gigabit"),
+            ("8xlarge", 32, "10 Gigabit"),
+            ("12xlarge", 48, "12 Gigabit"),
+            ("16xlarge", 64, "20 Gigabit"),
+            ("24xlarge", 96, "25 Gigabit"),
+        ],
+        form_factors: &[(FORM_FACTOR_RACK, OUTPOST_GENERATION_1)],
+    },
+    OrderableFamily {
+        family: "i3en",
+        memory_gib_per_vcpu: 8,
+        sizes: &[
+            ("large", 2, "Up to 25 Gigabit"),
+            ("xlarge", 4, "Up to 25 Gigabit"),
+            ("2xlarge", 8, "Up to 25 Gigabit"),
+            ("3xlarge", 12, "Up to 25 Gigabit"),
+            ("6xlarge", 24, "25 Gigabit"),
+            ("12xlarge", 48, "50 Gigabit"),
+            ("24xlarge", 96, "100 Gigabit"),
+        ],
+        form_factors: &[(FORM_FACTOR_RACK, OUTPOST_GENERATION_1)],
+    },
+    OrderableFamily {
+        family: "g4dn",
+        memory_gib_per_vcpu: 4,
+        sizes: &[
+            ("xlarge", 4, "Up to 25 Gigabit"),
+            ("2xlarge", 8, "Up to 25 Gigabit"),
+            ("4xlarge", 16, "Up to 25 Gigabit"),
+            ("8xlarge", 32, "50 Gigabit"),
+            ("12xlarge", 48, "50 Gigabit"),
+            ("16xlarge", 64, "50 Gigabit"),
+        ],
+        form_factors: &[(FORM_FACTOR_RACK, OUTPOST_GENERATION_1)],
+    },
+    OrderableFamily {
+        family: "c6gd",
+        memory_gib_per_vcpu: 2,
+        sizes: &[
+            ("medium", 1, "Up to 10 Gigabit"),
+            ("large", 2, "Up to 10 Gigabit"),
+            ("xlarge", 4, "Up to 10 Gigabit"),
+            ("2xlarge", 8, "Up to 10 Gigabit"),
+            ("4xlarge", 16, "Up to 10 Gigabit"),
+            ("8xlarge", 32, "12 Gigabit"),
+            ("12xlarge", 48, "20 Gigabit"),
+            ("16xlarge", 64, "25 Gigabit"),
+        ],
+        form_factors: &[(FORM_FACTOR_SERVER, OUTPOST_GENERATION_1)],
+    },
+    OrderableFamily {
+        family: "c6id",
+        memory_gib_per_vcpu: 2,
+        sizes: &[
+            ("large", 2, "Up to 12.5 Gigabit"),
+            ("xlarge", 4, "Up to 12.5 Gigabit"),
+            ("2xlarge", 8, "Up to 12.5 Gigabit"),
+            ("4xlarge", 16, "Up to 12.5 Gigabit"),
+            ("8xlarge", 32, "12.5 Gigabit"),
+            ("12xlarge", 48, "18.75 Gigabit"),
+            ("16xlarge", 64, "25 Gigabit"),
+            ("24xlarge", 96, "37.5 Gigabit"),
+            ("32xlarge", 128, "50 Gigabit"),
+        ],
+        form_factors: &[
+            (FORM_FACTOR_SERVER, OUTPOST_GENERATION_1),
+            (FORM_FACTOR_RACK, OUTPOST_GENERATION_2),
+        ],
+    },
+    OrderableFamily {
+        family: "m6id",
+        memory_gib_per_vcpu: 4,
+        sizes: &[
+            ("large", 2, "Up to 12.5 Gigabit"),
+            ("xlarge", 4, "Up to 12.5 Gigabit"),
+            ("2xlarge", 8, "Up to 12.5 Gigabit"),
+            ("4xlarge", 16, "Up to 12.5 Gigabit"),
+            ("8xlarge", 32, "12.5 Gigabit"),
+            ("12xlarge", 48, "18.75 Gigabit"),
+            ("16xlarge", 64, "25 Gigabit"),
+            ("24xlarge", 96, "37.5 Gigabit"),
+            ("32xlarge", 128, "50 Gigabit"),
+        ],
+        form_factors: &[(FORM_FACTOR_RACK, OUTPOST_GENERATION_2)],
+    },
+    OrderableFamily {
+        family: "r6id",
+        memory_gib_per_vcpu: 8,
+        sizes: &[
+            ("large", 2, "Up to 12.5 Gigabit"),
+            ("xlarge", 4, "Up to 12.5 Gigabit"),
+            ("2xlarge", 8, "Up to 12.5 Gigabit"),
+            ("4xlarge", 16, "Up to 12.5 Gigabit"),
+            ("8xlarge", 32, "12.5 Gigabit"),
+            ("12xlarge", 48, "18.75 Gigabit"),
+            ("16xlarge", 64, "25 Gigabit"),
+            ("24xlarge", 96, "37.5 Gigabit"),
+            ("32xlarge", 128, "50 Gigabit"),
+        ],
+        form_factors: &[(FORM_FACTOR_RACK, OUTPOST_GENERATION_2)],
+    },
+];
+
+/// The `FormFactor` an Outposts RACK carries, from the modelled value set
+/// [`crate::ops::types::FORM_FACTOR_VALUES`].
+pub const FORM_FACTOR_RACK: &str = "RACK";
+
+/// The `FormFactor` an Outposts SERVER carries. See [`FORM_FACTOR_RACK`].
+pub const FORM_FACTOR_SERVER: &str = "SERVER";
+
+/// The first-generation `OutpostGeneration`, from the modelled value set
+/// [`crate::ops::types::OUTPOST_GENERATION_VALUES`] — "`GENERATION_1` for
+/// first-generation rack deployments", as
+/// `ListOrderableInstanceTypes$OutpostGenerationFilter` documents it.
+pub const OUTPOST_GENERATION_1: &str = "GENERATION_1";
+
+/// The second-generation `OutpostGeneration`. See [`OUTPOST_GENERATION_1`].
+pub const OUTPOST_GENERATION_2: &str = "GENERATION_2";
+
+/// One catalog entry: the modelled [`DetailedInstanceTypeItem`] plus its position in
+/// the catalog's stable order.
+///
+/// The catalog is REFERENCE data, not a resource a caller creates, so the sequence is
+/// the entry's position in that order rather than a creation counter — it is what
+/// [`page`] cuts pages at and what a `NextToken` names, exactly as a created
+/// resource's [`SiteRecord::sequence`] is.
+#[derive(Debug, Clone)]
+pub struct OrderableInstanceTypeRecord {
+    /// Position in the catalog's stable order. See [`SiteRecord::sequence`].
+    pub sequence: u64,
+    /// The entry as `ListOrderableInstanceTypes` reports it.
+    pub instance_type: DetailedInstanceTypeItem,
+}
+
+impl OrderableInstanceTypeRecord {
+    /// Whether an Outpost of `generation` can be ordered with this instance type:
+    /// whether ANY of its `FormFactorConfigs` names that generation.
+    ///
+    /// `FormFactorConfigs` is a list of the (form factor, generation) combinations
+    /// the instance type is offered in, so one entry naming the generation is what
+    /// makes the entry orderable in it — the same "matches any of the values" rule
+    /// every filter in this API follows.
+    pub fn is_orderable_in(&self, generation: &str) -> bool {
+        self.instance_type
+            .form_factor_configs
+            .iter()
+            .flatten()
+            .any(|config| config.outpost_generation.as_deref() == Some(generation))
+    }
+}
+
+/// The whole orderable-instance-type catalog, expanded from [`ORDERABLE_FAMILIES`]
+/// and ordered by instance type name.
+///
+/// Expanding the families here is what keeps every entry consistent with its
+/// family's published ratio: `MemoryInMib` is the size's vCPU count times the
+/// family's GiB per vCPU times [`MIB_PER_GIB`], never a per-size figure that could
+/// disagree with it. The order is by instance type name so it is stable across
+/// processes — a page token names a position in it, so the order a caller pages
+/// through must not depend on how the table happens to be written.
+pub fn orderable_instance_type_catalog() -> Vec<OrderableInstanceTypeRecord> {
+    // The catalog may only ever name values the model declares, so the table is
+    // checked against the GENERATED value sets rather than trusted to agree with
+    // them: a model that renames a `FormFactor` or an `OutpostGeneration` trips this
+    // in every debug build instead of letting the catalog report an unmodelled
+    // member.
+    debug_assert!(
+        ORDERABLE_FAMILIES
+            .iter()
+            .flat_map(|family| family.form_factors)
+            .all(|(form_factor, generation)| {
+                crate::ops::types::FORM_FACTOR_VALUES.contains(form_factor)
+                    && crate::ops::types::OUTPOST_GENERATION_VALUES.contains(generation)
+            }),
+        "every catalog configuration names a modelled FormFactor and OutpostGeneration"
+    );
+    let mut items: Vec<DetailedInstanceTypeItem> = ORDERABLE_FAMILIES
+        .iter()
+        .flat_map(|family| {
+            family
+                .sizes
+                .iter()
+                .map(move |(size, vcpus, network_performance)| DetailedInstanceTypeItem {
+                    instance_type: Some(format!("{}.{size}", family.family)),
+                    vcp_us: Some(*vcpus),
+                    memory_in_mib: vcpus * family.memory_gib_per_vcpu * MIB_PER_GIB,
+                    network_performance: Some((*network_performance).to_string()),
+                    form_factor_configs: Some(
+                        family
+                            .form_factors
+                            .iter()
+                            .map(|(form_factor, generation)| FormFactorConfig {
+                                form_factor: Some((*form_factor).to_string()),
+                                outpost_generation: Some((*generation).to_string()),
+                            })
+                            .collect(),
+                    ),
+                })
+        })
+        .collect();
+    items.sort_by(|left, right| left.instance_type.cmp(&right.instance_type));
+    items
+        .into_iter()
+        .enumerate()
+        .map(|(index, instance_type)| OrderableInstanceTypeRecord {
+            sequence: u64::try_from(index).unwrap_or_default() + 1,
+            instance_type,
+        })
+        .collect()
+}
+
 /// Per-service state for com-amazonaws-outposts-outpostsolafservice. A handler reaches it through [`service_state`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ComAmazonawsOutpostsOutpostsolafserviceState {
     /// Every persisted site, keyed by its bare `SiteId` (`os-…`), which is how
     /// `GetSite`, `CreateOutpost` and `DeleteSite` resolve one.
@@ -535,10 +835,34 @@ pub struct ComAmazonawsOutpostsOutpostsolafserviceState {
     /// Every persisted quote, keyed by its bare `QuoteId` (`oq-…`), which is how
     /// `GetQuote` resolves one.
     pub quotes: BTreeMap<String, QuoteRecord>,
+    /// The orderable-instance-type catalog `ListOrderableInstanceTypes` reports, in
+    /// its stable order.
+    ///
+    /// Reference data rather than a caller's resource: it is seeded in
+    /// [`ComAmazonawsOutpostsOutpostsolafserviceState::default`] from
+    /// [`orderable_instance_type_catalog`] and no operation mutates it, so every
+    /// read of it answers the same catalog.
+    pub orderable_instance_types: Vec<OrderableInstanceTypeRecord>,
     /// How many resources this store has created. Doubles as the monotonically
     /// increasing creation order every record records and every page token names,
     /// and as part of each minted id's seed so no two ids collide.
     pub created: u64,
+}
+
+/// The store a fresh engine hands a handler: no resources at all, and the
+/// orderable-instance-type catalog already seeded, because that catalog is what the
+/// service publishes rather than something a caller creates.
+impl Default for ComAmazonawsOutpostsOutpostsolafserviceState {
+    fn default() -> Self {
+        Self {
+            sites: BTreeMap::new(),
+            outposts: BTreeMap::new(),
+            capacity_tasks: BTreeMap::new(),
+            quotes: BTreeMap::new(),
+            orderable_instance_types: orderable_instance_type_catalog(),
+            created: 0,
+        }
+    }
 }
 
 impl ComAmazonawsOutpostsOutpostsolafserviceState {
@@ -1462,6 +1786,9 @@ pub const OUTPOST_PAGE: &str = "outposts";
 
 /// The stamp a `ListSites` page token carries. See [`OUTPOST_PAGE`].
 pub const SITE_PAGE: &str = "sites";
+
+/// The stamp a `ListOrderableInstanceTypes` page token carries. See [`OUTPOST_PAGE`].
+pub const ORDERABLE_INSTANCE_TYPE_PAGE: &str = "instanceTypes";
 
 /// The stamp a `ListAssets` page token carries.
 ///

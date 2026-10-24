@@ -57,6 +57,8 @@ mod queue_pause_gating;
 mod queue_update;
 #[path = "all/resource_projection_defaults.rs"]
 mod resource_projection_defaults;
+#[path = "all/resource_share.rs"]
+mod resource_share;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]
