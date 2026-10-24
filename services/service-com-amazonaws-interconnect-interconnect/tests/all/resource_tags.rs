@@ -22,7 +22,9 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 
-use crate::emulator::{code, create_with_tags, message, placements, tags_of, text, Emulator};
+use crate::emulator::{
+    code, create_with_tags, message, placements, tags_of, text, without_tags, Emulator,
+};
 
 /// The account id every emulator ARN carries.
 const ACCOUNT_ID: &str = engine::EMULATOR_ACCOUNT_ID;
@@ -43,16 +45,6 @@ const TAG_VALUE_MAX: usize = 256;
 // ---------------------------------------------------------------------------
 // Harness helpers
 // ---------------------------------------------------------------------------
-
-/// A `Connection` with its tag set projected out, so two records can be compared
-/// on everything a tag change must NOT touch.
-fn without_tags(connection: &Value) -> Value {
-    let mut copy = connection.clone();
-    if let Some(map) = copy.as_object_mut() {
-        map.remove("tags");
-    }
-    copy
-}
 
 /// `UntagResource` for `arn`, removing `keys`.
 async fn untag(emulator: &Emulator, arn: &str, keys: &[String]) -> (u16, Value) {

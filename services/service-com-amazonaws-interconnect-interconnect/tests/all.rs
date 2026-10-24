@@ -27,3 +27,5 @@ mod refusals_and_gateway_attach_points;
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_resource.rs"]
+mod tag_resource;

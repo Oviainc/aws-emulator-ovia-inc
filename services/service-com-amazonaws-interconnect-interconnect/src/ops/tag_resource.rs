@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -72,9 +63,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-interconnect-interconne
 // here — hence the `TagResourceError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.interconnect#TagResource")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.interconnect#TagResource",
+    extra_errors = [
+        "ResourceNotFoundException",
+        "InterconnectValidationException",
+        "InterconnectServerException",
+    ]
+)]
 #[derive(Debug)]
 pub enum TagResourceErrorModeled {
+    ResourceNotFoundException(ResourceNotFoundException),
+    InterconnectValidationException(InterconnectValidationException),
+    InterconnectServerException(InterconnectServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -123,23 +124,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// "Add new tags to the specified resource."
+    ///
+    /// The tag set of the resource the `arn` names gains every key the request
+    /// carries with the value the request gives it — a key the resource already
+    /// holds takes the new value, and every key the request does not name keeps the
+    /// value it had. Writing the same tags again therefore changes nothing, so the
+    /// call is idempotent, and a request carrying no tag adds nothing. An `arn` that
+    /// names no resource of this service is a 404: tagging never brings a resource
+    /// into existence.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InterconnectServerException(
+                InterconnectServerException {
+                    message: "the Interconnect connection store is not mounted on this engine"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        // "Currently this supports Connection resources" (the tagging operations'
+        // own documentation), which is also what `AmazonResourceName`'s pattern
+        // allows: the ARN carries the `ConnectionId` of the connection whose tags
+        // these are. An ARN the boundary validator let through that still does not
+        // parse as one is refused as invalid INPUT, never with a 501.
+        if crate::state::connection_id_from_arn(&input.arn).is_none() {
+            return Err(TagResourceErrorModeled::InterconnectValidationException(
+                InterconnectValidationException {
+                    message: crate::state::not_a_connection_arn_message(&input.arn),
+                },
+            )
+            .into());
+        }
+
+        // What the request itself carries is judged before any resource is looked up:
+        // a tag key or value outside the modelled lengths, or more tags in one
+        // request than a resource can hold, is a fault in the INPUT whatever the
+        // `arn` names, and judging it first keeps a 404 from masking it. (The
+        // boundary validator holds a LIST's members to their target's constraints
+        // but not a MAP's keys, so a tag map is checked here.) The merged set is
+        // judged again once the resource is resolved, below.
+        if let Some(message) = crate::state::tag_write_violation(None, &input.tags) {
+            return Err(TagResourceErrorModeled::InterconnectValidationException(
+                InterconnectValidationException { message },
+            )
+            .into());
+        }
+
+        let mut guard = state.lock();
+        // The one clock-driven write every connection operation makes first: it
+        // settles transitions that were already due at this instant, so a connection
+        // whose delete has completed is seen as `deleted` here.
+        guard.materialise_due_transitions(::std::time::Instant::now());
+
+        // The same ARN resolution every tagging operation uses: full-ARN match, and
+        // a connection in the terminal deleted state no longer has a tag set.
+        let Some(stored) = guard.connection_by_arn_mut(&input.arn) else {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::connection_not_retrievable_message(&input.arn)),
+                },
+            )
+            .into());
+        };
+
+        // What the resource would be LEFT holding is judged once it is resolved: the
+        // merged tag set is the one that has to stay within what a resource holds, so
+        // rewriting keys the resource already carries is accepted at the bound while
+        // adding fresh ones past it is refused. The same rule judges tag-on-create,
+        // so a stored tag set is bounded however it was reached, and a refused write
+        // leaves the resource exactly as it was.
+        if let Some(message) =
+            crate::state::tag_write_violation(stored.connection.tags.as_ref(), &input.tags)
+        {
+            return Err(TagResourceErrorModeled::InterconnectValidationException(
+                InterconnectValidationException { message },
+            )
+            .into());
+        }
+
+        // Merge, never replace: each key the request carries is written over
+        // whatever the resource held for it, and every key the request does not name
+        // keeps the value it had. "No tags" has ONE representation in the store
+        // (`None` — how a connection created without tags is held, and what
+        // `UntagResource` leaves once the last key goes), so a request carrying no
+        // tag leaves that representation alone instead of turning it into an empty
+        // map.
+        if !input.tags.is_empty() {
+            stored
+                .connection
+                .tags
+                .get_or_insert_with(::std::collections::HashMap::new)
+                .extend(
+                    input
+                        .tags
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone())),
+                );
+        }
+
+        Ok(TagResourceOutput {})
     }
 }
