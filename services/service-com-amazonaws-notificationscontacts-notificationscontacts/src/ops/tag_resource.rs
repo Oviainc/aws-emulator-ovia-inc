@@ -148,11 +148,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `arn`'s pattern and the `tags` map's own 0..200 length, key pattern and value
-        // length are modelled, so the centralized walk has already refused anything
-        // outside them with a 400 before this body runs. What is left for this handler
-        // is whether the contact exists and whether the MERGED set still fits the bound.
+        // `arn`'s pattern and the `tags` map's own 0..200 length and value length are
+        // modelled in a form the centralized walk applies, so anything outside them is
+        // already a 400 before this body runs. The KEY pattern is not: the walk captures
+        // no map-key constraints and could not compile this one anyway, so this handler
+        // applies it (see `crate::state::tag_key_rejection`) before anything else — an
+        // input the shape refuses is a 400 whatever resource the request names.
         let _ = ctx;
+        crate::state::check_tag_keys("tags", input.tags.keys().map(String::as_str))
+            .map_err(TagResourceErrorModeled::ValidationException)?;
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             TagResourceErrorModeled::InternalServerException(InternalServerException {
                 message: "the email contact store is unavailable".to_string(),

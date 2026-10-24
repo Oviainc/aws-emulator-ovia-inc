@@ -46,8 +46,9 @@ fn query_value(value: &str) -> String {
         .collect()
 }
 
-/// `POST /tags/{arn}` with the tag map in the body — `TagResource`.
-async fn tag(em: &Emulator, arn: &str, tags: &BTreeMap<String, String>) -> (u16, Value) {
+/// `POST /tags/{arn}` with the tag map in the body — `TagResource`. `pub(crate)` so
+/// the sibling suite that owns the `TagKey` rule drives the same wire path.
+pub(crate) async fn tag(em: &Emulator, arn: &str, tags: &BTreeMap<String, String>) -> (u16, Value) {
     let body = json!({
         "tags": Value::Object(
             tags.iter()
@@ -59,8 +60,9 @@ async fn tag(em: &Emulator, arn: &str, tags: &BTreeMap<String, String>) -> (u16,
 }
 
 /// `DELETE /tags/{arn}?tagKeys=…` — `UntagResource`. `tagKeys` is an `@httpQuery`
-/// list, so each key travels as its own repeated `tagKeys=` parameter.
-async fn untag(em: &Emulator, arn: &str, keys: &[String]) -> (u16, Value) {
+/// list, so each key travels as its own repeated `tagKeys=` parameter. `pub(crate)`
+/// for the same reason as [`tag`].
+pub(crate) async fn untag(em: &Emulator, arn: &str, keys: &[String]) -> (u16, Value) {
     let query: Vec<String> = keys
         .iter()
         .map(|key| format!("tagKeys={}", query_value(key)))
