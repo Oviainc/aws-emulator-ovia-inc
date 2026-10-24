@@ -250,6 +250,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // An entitlement carries a tag member of its own
+        // (`GrantEntitlementRequest$EntitlementTags`) and an ARN of its own, so it is a
+        // resource the tagging operations address: its tag map is bounded by the same rules
+        // a tag write is (see `crate::state::tag_set_rejection`), checked before anything is
+        // stored.
+        for (index, entitlement) in input.entitlements.iter().enumerate() {
+            if let Some(rejection) = crate::state::tag_set_rejection(
+                &format!("Entitlements[{index}]"),
+                entitlement.entitlement_tags.as_ref(),
+            ) {
+                return Err(bad_request(rejection));
+            }
+        }
+
         // An entitlement's name is unique within its flow, so each new entitlement is
         // named against the flow's existing entitlements AND against the ones earlier in
         // this request.
@@ -300,7 +314,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The entitlements that were just granted" — read back out of the STORED flow,
         // not from the request, and only the entitlements this call appended.
         Ok(GrantFlowEntitlementsOutput {
-            entitlements: Some(flow.entitlements[first_granted..].to_vec()),
+            entitlements: Some(
+                flow.entitlements[first_granted..]
+                    .iter()
+                    .map(crate::state::StoredEntitlement::to_entitlement)
+                    .collect(),
+            ),
             flow_arn: Some(flow.flow_arn.clone()),
         })
     }

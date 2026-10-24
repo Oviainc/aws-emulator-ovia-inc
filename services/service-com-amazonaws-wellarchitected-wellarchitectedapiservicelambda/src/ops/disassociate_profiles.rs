@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateProfiles
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateProfiles`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateProfiles::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: removes the profiles the request names from the stored workload's
+//! `Profiles`, or answers `ResourceNotFoundException` when the workload is not stored or
+//! an ARN names no profile associated with it. Mutating: the association list and the
+//! workload's `UpdatedAt` are what it writes.
 //!
 //! ## Shape of an operation
 //!
@@ -168,20 +163,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateProfiles` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateProfilesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateProfiles"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DisassociateProfilesErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool workload store is unavailable".to_string(),
+            })
+        })?;
+
+        // The instant this request is served at: what the workload's `UpdatedAt` records
+        // below, read once so the record carries one reading of the clock.
+        let now = std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        // "Disassociate a profile from a workload": the profiles are a member OF the
+        // workload, so the workload has to exist to hold any — resolved here, before any
+        // ARN the request named, so a caller whose workload is gone is not told its
+        // profile is.
+        let workload = store.workloads.get_mut(&input.workload_id).ok_or_else(|| {
+            DisassociateProfilesErrorModeled::ResourceNotFoundException(
+                crate::state::workload_not_found(&input.workload_id),
+            )
+        })?;
+
+        // Every ARN the request names is resolved against the workload's associations
+        // BEFORE the first one is removed, so a request naming one profile the workload
+        // holds and one it does not changes nothing: a half-applied disassociation would
+        // leave the caller unable to tell which half landed. The walk stops at the first
+        // ARN it refuses and costs one scan of a list that is at most one entry long per
+        // ARN, so nothing here grows with the request beyond its own length.
+        if let Some(unassociated) = input
+            .profile_arns
+            .iter()
+            .find(|arn| !workload.associates_profile(arn))
+        {
+            return Err(DisassociateProfilesErrorModeled::ResourceNotFoundException(
+                crate::state::workload_profile_not_found(&input.workload_id, unassociated),
+            )
+            .into());
+        }
+
+        // `ProfileArns` is `@length(min: 1)`, so the boundary validator has already
+        // refused a request that names none and at least one association is dropped here.
+        // A list naming the same ARN twice drops it once, because every entry was
+        // resolved above against the associations as they stood before any removal.
+        for arn in &input.profile_arns {
+            workload.disassociate_profile(arn);
+        }
+        // The profiles are a member of the workload (`Workload$Profiles`), so removing one
+        // changes the workload, and `Workload$UpdatedAt` — "the date and time recorded" —
+        // is what every read of the workload reports that change by.
+        workload.updated_at = now;
+
+        Ok(DisassociateProfilesOutput)
     }
 }

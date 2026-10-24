@@ -1502,6 +1502,9 @@ async fn modify_writes_every_supplied_setting_through_to_the_store() {
     );
 
     // A deferred modification is refused nowhere: it is applied, so the store changes.
+    // The size is one the storage type the rows above left the instance on takes —
+    // Provisioned IOPS SSD starts at 100 GiB, and `DescribeValidDBInstanceModifications`
+    // reports exactly that, which is the bound this operation enforces.
     let deferred = expect_ok(
         "deferred modification",
         call(
@@ -1510,14 +1513,14 @@ async fn modify_writes_every_supplied_setting_through_to_the_store() {
             &params![
                 "DBInstanceIdentifier" => "emu-mod",
                 "ApplyImmediately" => false,
-                "AllocatedStorage" => 75,
+                "AllocatedStorage" => 150,
             ],
         )
         .await,
     );
     assert_eq!(
         text(&the_instance("deferred modification", &deferred), "AllocatedStorage"),
-        "75",
+        "150",
         "a deferred modification must still change the stored record"
     );
 }

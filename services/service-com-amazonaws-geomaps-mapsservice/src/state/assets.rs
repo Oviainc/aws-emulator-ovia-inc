@@ -26,7 +26,7 @@ use crate::ops::types::{
 use super::{
     boundaries, labels, ColorSchemeKind, ComAmazonawsGeomapsMapsserviceState, FontRecord,
     IconShape, MapStyleKind, Palette, Rgba, SpriteSheetRecord, StyleRecord, TileFormat,
-    TilesetRecord, VariantKind,
+    TilesetRecord, VariantKind, BUILDING_LAYER, GROUND_LAYER, POI_LAYER, TRAFFIC_INCIDENT_LAYER,
 };
 
 /// Earth's equatorial circumference in metres, the constant that turns a
@@ -361,6 +361,40 @@ pub struct StyleOptions {
     pub poi_categories: Vec<String>,
 }
 
+/// The attribute every vector-tile feature carries saying which KIND of
+/// geometry it is, and the three values it takes. A style layer filters on it,
+/// and [`vector_tile_bytes`] writes it, so the two cannot drift apart.
+pub const ROLE_ATTRIBUTE: &str = "role";
+pub const AREA_ROLE: &str = "area";
+pub const WAY_ROLE: &str = "way";
+pub const POINT_ROLE: &str = "point";
+
+/// The traffic tileset and the style-document source name it is declared
+/// under. Which of its layers carry incident events is the tileset record's
+/// own `incident_layers`, because `Traffic: Congestion` asks for the flow of
+/// traffic without them.
+const TRAFFIC_TILESET: &str = "vector.traffic";
+const TRAFFIC_SOURCE: &str = "traffic";
+
+/// The `TileAdditionalFeature` members whose layers a request knob changes the
+/// drawing of: the contour lines a `ContourDensity` sets the weight of, and
+/// the hillshade shading drawn over the ground.
+const CONTOUR_FEATURE: &str = "ContourLines";
+const HILLSHADE_FEATURE: &str = "Hillshade";
+
+/// Whether `name` is the tile layer that the additional feature `feature`
+/// adds. Asked through [`additional_feature_layer`] rather than against a
+/// second spelling of the layer name, so the style layer and the tile layer
+/// cannot drift apart.
+fn is_feature_layer(feature: &str, name: &str) -> bool {
+    additional_feature_layer(feature).as_deref() == Some(name)
+}
+
+/// The elevation tileset a `Terrain3D` request reads, and the source name it is
+/// declared under.
+const DEM_TILESET: &str = "raster.dem";
+const TERRAIN_SOURCE: &str = "terrain";
+
 /// The vector-tile layer each `TileAdditionalFeature` adds to a tile, so a
 /// style layer and the tile it reads always name the same layer.
 ///
@@ -399,10 +433,10 @@ fn snake_case(value: &str) -> String {
 fn requested_features(options: &StyleOptions) -> Vec<&'static str> {
     let mut features = Vec::new();
     if options.contour_density.is_some() {
-        features.push("ContourLines");
+        features.push(CONTOUR_FEATURE);
     }
-    if options.terrain.as_deref() == Some("Hillshade") {
-        features.push("Hillshade");
+    if options.terrain.as_deref() == Some(HILLSHADE_FEATURE) {
+        features.push(HILLSHADE_FEATURE);
     }
     if options.travel_modes.iter().any(|mode| mode == "Transit") {
         features.push("Transit");
@@ -431,19 +465,22 @@ pub fn style_descriptor(
     let features = requested_features(options);
 
     let mut sources = serde_json::Map::new();
-    let mut layers: Vec<serde_json::Value> = Vec::new();
-    layers.push(serde_json::json!({
-        "id": "background",
+    // The ground is painted before anything else and has no geometry of its
+    // own, which is exactly what a MapLibre `background` layer is: the
+    // basemap's ground layer IS this document's background, not a polygon fill
+    // drawn over one.
+    let mut layers: Vec<serde_json::Value> = vec![serde_json::json!({
+        "id": GROUND_LAYER,
         "type": "background",
         "paint": { "background-color": css_color(record.palette.land) },
-    }));
+    })];
 
-    let mut basemap_source: Option<String> = None;
     for source in &record.sources {
         let Some(tileset) = state.tilesets.get(&source.tileset) else {
             continue;
         };
         let mut url = absolute(&source.tile_url_template);
+        let mut tile_layers = tileset.layers.clone();
         if tileset.format == TileFormat::VectorMvt && !features.is_empty() {
             // A Smithy `@httpQuery` list is REPEATED parameters, not one
             // comma-joined value, so the template a client follows must repeat
@@ -455,11 +492,20 @@ pub fn style_descriptor(
                 .collect();
             url.push('?');
             url.push_str(&query.join("&"));
+            // Each requested feature is another layer in the tiles THIS
+            // template fetches, so the document draws it.
+            for feature in &features {
+                if let Some(layer) = additional_feature_layer(feature) {
+                    if !tile_layers.contains(&layer) {
+                        tile_layers.push(layer);
+                    }
+                }
+            }
         }
         sources.insert(source.name.clone(), source_entry(tileset, &url));
         match tileset.format {
             TileFormat::VectorMvt => {
-                basemap_source = Some(source.name.clone());
+                layers.extend(vector_layers(record, options, &source.name, &tile_layers));
             }
             TileFormat::RasterJpeg | TileFormat::RasterDemPng => layers.push(serde_json::json!({
                 "id": format!("{}-imagery", source.name),
@@ -469,51 +515,41 @@ pub fn style_descriptor(
         }
     }
 
-    if let Some(basemap) = basemap_source.clone() {
-        layers.extend(basemap_layers(record, options, &basemap, &features));
-    }
-
-    // Traffic is its own tileset, so asking for it adds a source as well as a
-    // layer.
+    // Traffic is its own tileset, so asking for it adds a source as well as
+    // layers. `Congestion` asks for the flow of traffic only, which is every
+    // layer the tileset does not declare an incident layer; `All` draws the
+    // incident layers too.
     if let (Some(traffic), Some(tileset)) = (
         options.traffic.as_deref(),
-        state.tilesets.get("vector.traffic"),
+        state.tilesets.get(TRAFFIC_TILESET),
     ) {
         let url = absolute(&tile_url_template(&tileset.id));
-        sources.insert("traffic".to_string(), source_entry(tileset, &url));
-        layers.push(serde_json::json!({
-            "id": "traffic-flow",
-            "type": "line",
-            "source": "traffic",
-            "source-layer": "traffic_flow",
-            "paint": { "line-color": css_color(record.palette.road), "line-width": 2 },
-        }));
-        if traffic == "All" {
-            layers.push(serde_json::json!({
-                "id": "traffic-incidents",
-                "type": "line",
-                "source": "traffic",
-                "source-layer": "traffic_incidents",
-                "paint": { "line-color": css_color(record.palette.marker), "line-width": 3 },
-            }));
-        }
+        sources.insert(TRAFFIC_SOURCE.to_string(), source_entry(tileset, &url));
+        let tile_layers: Vec<String> = tileset
+            .layers
+            .iter()
+            .filter(|name| traffic == "All" || !tileset.incident_layers.contains(name))
+            .cloned()
+            .collect();
+        layers.extend(vector_layers(record, options, TRAFFIC_SOURCE, &tile_layers));
     }
 
     // 3D terrain is elevation data, which is the DEM tileset rather than a
     // layer of the basemap.
     let mut terrain_property = None;
     if options.terrain.as_deref() == Some("Terrain3D") {
-        if let Some(tileset) = state.tilesets.get("raster.dem") {
+        if let Some(tileset) = state.tilesets.get(DEM_TILESET) {
             let url = absolute(&tile_url_template(&tileset.id));
-            sources.insert("terrain".to_string(), source_entry(tileset, &url));
+            sources.insert(TERRAIN_SOURCE.to_string(), source_entry(tileset, &url));
             terrain_property = Some(serde_json::json!({
-                "source": "terrain",
+                "source": TERRAIN_SOURCE,
                 "exaggeration": 1.0,
             }));
         }
     }
 
     let mut metadata = serde_json::Map::new();
+    metadata.insert("version".to_string(), record.version.clone().into());
     metadata.insert(
         "aws:style".to_string(),
         record.style.as_wire().to_string().into(),
@@ -546,10 +582,22 @@ pub fn style_descriptor(
             options.poi_categories.clone().into(),
         );
     }
+    if let Some(variant) = terrain_variant(options.terrain.as_deref()) {
+        // A terrain request is served by a virtual variant of the published
+        // style rather than by a style of its own, and the document records
+        // which variant it was built from.
+        metadata.insert(
+            "aws:virtual-variant".to_string(),
+            serde_json::json!([{ "key": "terrain", "variants": [{ "id": variant }] }]),
+        );
+    }
 
     let mut document = serde_json::Map::new();
     document.insert("version".to_string(), 8.into());
+    document.insert("id".to_string(), record.id.clone().into());
     document.insert("name".to_string(), record.name.clone().into());
+    document.insert("created".to_string(), record.created.clone().into());
+    document.insert("modified".to_string(), record.modified.clone().into());
     document.insert("metadata".to_string(), metadata.into());
     document.insert("sources".to_string(), sources.into());
     document.insert(
@@ -560,6 +608,30 @@ pub fn style_descriptor(
         "glyphs".to_string(),
         absolute(&record.glyph_url_template).into(),
     );
+    document.insert(
+        "light".to_string(),
+        serde_json::json!({
+            "anchor": record.light.anchor,
+            "intensity": record.light.intensity,
+            "position": record.light.position,
+        }),
+    );
+    document.insert(
+        "sky".to_string(),
+        serde_json::json!({
+            "sky-color": css_color(record.sky.sky_color),
+            "sky-horizon-blend": record.sky.sky_horizon_blend,
+            "horizon-color": css_color(record.sky.horizon_color),
+            "horizon-fog-blend": record.sky.horizon_fog_blend,
+            "fog-color": css_color(record.sky.fog_color),
+            "fog-ground-blend": record.sky.fog_ground_blend,
+            "atmosphere-blend": record.sky.atmosphere_blend,
+        }),
+    );
+    document.insert(
+        "projection".to_string(),
+        serde_json::json!({ "type": record.projection }),
+    );
     if let Some(terrain) = terrain_property {
         document.insert("terrain".to_string(), terrain);
     }
@@ -568,8 +640,21 @@ pub fn style_descriptor(
     to_json_bytes(&serde_json::Value::Object(document))
 }
 
-/// A style-document source entry for one tileset: its type, its tile template
-/// and the zoom range the tileset actually has tiles for.
+/// The id of the virtual style variant a `Terrain` request is served by, or
+/// `None` when the request asked for no terrain rendering.
+fn terrain_variant(terrain: Option<&str>) -> Option<&'static str> {
+    // The two values `Terrain` declares, as the variant ids the published
+    // style catalog names them with.
+    match terrain? {
+        "Terrain3D" => Some("3d_terrain"),
+        "Hillshade" => Some("hillshade"),
+        _ => None,
+    }
+}
+
+/// A style-document source entry for one tileset: its type, its tile template,
+/// the credit line its data is served under and the zoom range the tileset
+/// actually has tiles for.
 fn source_entry(tileset: &TilesetRecord, url: &str) -> serde_json::Value {
     let mut entry = serde_json::Map::new();
     entry.insert(
@@ -585,6 +670,10 @@ fn source_entry(tileset: &TilesetRecord, url: &str) -> serde_json::Value {
         "tiles".to_string(),
         serde_json::Value::Array(vec![url.to_string().into()]),
     );
+    entry.insert(
+        "attribution".to_string(),
+        tileset.attribution.clone().into(),
+    );
     entry.insert("minzoom".to_string(), tileset.min_zoom.into());
     entry.insert("maxzoom".to_string(), tileset.max_zoom.into());
     if tileset.format != TileFormat::VectorMvt {
@@ -596,148 +685,154 @@ fn source_entry(tileset: &TilesetRecord, url: &str) -> serde_json::Value {
     serde_json::Value::Object(entry)
 }
 
-/// The layers a vector basemap source contributes, after the request's knobs.
-fn basemap_layers(
+/// The style layers one vector source contributes: for every layer its tiles
+/// carry, the fill, line and label layers that draw that layer's polygon, line
+/// and point features.
+///
+/// A layer is drawn because the tiles behind it carry it, so a tileset record
+/// that gains a layer — or a request that asks for an additional feature —
+/// gains the layers that draw it without this function changing. Each one
+/// filters on the `role` attribute the tiles tag every feature with, so no
+/// layer tries to paint geometry of a kind it cannot.
+fn vector_layers(
     record: &StyleRecord,
     options: &StyleOptions,
     source: &str,
-    features: &[&'static str],
+    tile_layers: &[String],
 ) -> Vec<serde_json::Value> {
     let palette = &record.palette;
-    let mut layers = vec![
-        serde_json::json!({
-            "id": "land",
-            "type": "fill",
-            "source": source,
-            "source-layer": "land",
-            "paint": { "fill-color": css_color(palette.land) },
-        }),
-        serde_json::json!({
-            "id": "water",
-            "type": "fill",
-            "source": source,
-            "source-layer": "water",
-            "paint": { "fill-color": css_color(palette.water) },
-        }),
-        serde_json::json!({
-            "id": "roads",
-            "type": "line",
-            "source": source,
-            "source-layer": "roads",
-            "paint": { "line-color": css_color(palette.road), "line-width": 1.5 },
-        }),
-    ];
-
-    // `Buildings3D` is the one value the model declares, and it is what turns
-    // the footprint fill into an extrusion.
-    layers.push(if options.buildings.as_deref() == Some("Buildings3D") {
-        serde_json::json!({
-            "id": "buildings",
-            "type": "fill-extrusion",
-            "source": source,
-            "source-layer": "buildings",
-            "paint": {
-                "fill-extrusion-color": css_color(palette.building),
-                "fill-extrusion-height": ["get", "height"],
-            },
-        })
-    } else {
-        serde_json::json!({
-            "id": "buildings",
-            "type": "fill",
-            "source": source,
-            "source-layer": "buildings",
-            "paint": { "fill-color": css_color(palette.building) },
-        })
-    });
-
-    if options.political_view.is_some() {
-        layers.push(serde_json::json!({
-            "id": "borders",
-            "type": "line",
-            "source": source,
-            "source-layer": "borders",
-            "paint": { "line-color": css_color(palette.label), "line-width": 1 },
-        }));
-    }
-
-    if features.contains(&"Hillshade") {
-        layers.push(serde_json::json!({
-            "id": "hillshade",
-            "type": "fill",
-            "source": source,
-            "source-layer": "hillshade",
-            "paint": { "fill-color": css_color(palette.graticule), "fill-opacity": 0.4 },
-        }));
-    }
-
-    if let Some(density) = options.contour_density.as_deref() {
-        let width = match density {
-            "High" => 1.5,
-            "Medium" => 1.0,
-            _ => 0.5,
-        };
-        layers.push(serde_json::json!({
-            "id": "contours",
-            "type": "line",
-            "source": source,
-            "source-layer": "contour_lines",
-            "paint": { "line-color": css_color(palette.graticule), "line-width": width },
-        }));
-    }
-
-    for mode in &options.travel_modes {
-        let Some(layer) = additional_feature_layer(match mode.as_str() {
-            "Transit" => "Transit",
-            "Truck" => "Logistics",
-            other => other,
-        }) else {
+    let mut layers = Vec::with_capacity(tile_layers.len() * 3);
+    for name in tile_layers {
+        // The ground is the document's `background` layer (see
+        // `style_descriptor`), not a fill drawn over it.
+        if name == GROUND_LAYER {
             continue;
-        };
+        }
+        // `Off` is the one POI density that hides points of interest
+        // altogether; every other value only changes how far apart their
+        // labels are placed.
+        if name == POI_LAYER && options.poi_density.as_deref() == Some("Off") {
+            continue;
+        }
+        let color = css_color(layer_color(palette, name));
+
+        let mut fill = serde_json::json!({
+            "id": name,
+            "type": "fill",
+            "source": source,
+            "source-layer": name,
+            "filter": role_filter(AREA_ROLE),
+            "paint": { "fill-color": color },
+        });
+        // `Buildings3D` is the one value the model declares, and it is what
+        // turns the footprint fill into an extrusion.
+        if name == BUILDING_LAYER && options.buildings.as_deref() == Some("Buildings3D") {
+            fill["type"] = "fill-extrusion".into();
+            fill["paint"] = serde_json::json!({
+                "fill-extrusion-color": color,
+                "fill-extrusion-height": ["get", "height"],
+            });
+        }
+        if let Some(opacity) = fill_opacity(name) {
+            fill["paint"]["fill-opacity"] = opacity.into();
+        }
+        layers.push(fill);
+
         layers.push(serde_json::json!({
-            "id": format!("travel-mode-{}", mode.to_lowercase()),
+            "id": format!("{name}-line"),
             "type": "line",
             "source": source,
-            "source-layer": layer,
-            "paint": { "line-color": css_color(palette.marker), "line-width": 2 },
+            "source-layer": name,
+            "filter": role_filter(WAY_ROLE),
+            "paint": { "line-color": color, "line-width": line_width(name, options) },
         }));
-    }
 
-    // `Off` is the one POI density that removes the symbol layer; every other
-    // value scales how far apart its labels are placed.
-    if options.poi_density.as_deref() != Some("Off") {
-        let spacing = match options.poi_density.as_deref() {
-            Some("VerySparse") => 500,
-            Some("Sparse") => 350,
-            Some("Dense") => 150,
-            Some("VeryDense") => 80,
-            _ => 250,
-        };
-        let mut places = serde_json::json!({
-            "id": "places",
+        let mut label = serde_json::json!({
+            "id": format!("{name}-label"),
             "type": "symbol",
             "source": source,
-            "source-layer": "places",
+            "source-layer": name,
+            "filter": role_filter(POINT_ROLE),
             "layout": {
-                "icon-image": "poi-dot",
-                "symbol-spacing": spacing,
                 "text-field": ["get", "name"],
                 "text-font": record.font_stack.clone(),
                 "text-size": 12,
             },
             "paint": { "text-color": css_color(palette.label) },
         });
-        if !options.poi_categories.is_empty() {
-            places["filter"] = serde_json::json!([
-                "in",
-                ["get", "category"],
-                ["literal", options.poi_categories.clone()],
-            ]);
+        if name == POI_LAYER {
+            label["layout"]["icon-image"] = "poi-dot".into();
+            label["layout"]["symbol-spacing"] = poi_spacing(options.poi_density.as_deref()).into();
+            if !options.poi_categories.is_empty() {
+                // Only the requested categories are rendered, filtered on the
+                // `category` attribute a point feature carries.
+                label["filter"] = serde_json::json!([
+                    "all",
+                    role_filter(POINT_ROLE),
+                    ["in", ["get", "category"], ["literal", options.poi_categories.clone()]],
+                ]);
+            }
         }
-        layers.push(places);
+        layers.push(label);
     }
 
     layers
+}
+
+/// A style filter selecting the features of one geometry role.
+fn role_filter(role: &str) -> serde_json::Value {
+    serde_json::json!(["==", ["get", ROLE_ATTRIBUTE], role])
+}
+
+/// The palette entry a basemap layer is painted from. A layer with no entry of
+/// its own is drawn in the palette's detail colour, which is what the thin
+/// derived families (contours, hillshade, travel-mode networks) are.
+fn layer_color(palette: &Palette, name: &str) -> Rgba {
+    match name {
+        "water" => palette.water,
+        "roads" | "traffic_flow" => palette.road,
+        BUILDING_LAYER => palette.building,
+        POI_LAYER | TRAFFIC_INCIDENT_LAYER => palette.marker,
+        "borders" => palette.label,
+        _ => palette.graticule,
+    }
+}
+
+/// How wide a layer's line features are drawn, in style pixels.
+fn line_width(name: &str, options: &StyleOptions) -> f64 {
+    // Contour lines are the one family whose width a request knob sets: the
+    // density asked for is how densely the available lines are rendered.
+    if is_feature_layer(CONTOUR_FEATURE, name) {
+        return match options.contour_density.as_deref() {
+            Some("High") => 1.5,
+            Some("Medium") => 1.0,
+            _ => 0.5,
+        };
+    }
+    if name == "roads" {
+        1.5
+    } else {
+        1.0
+    }
+}
+
+/// The opacity a layer's polygons are filled at, when it is not opaque.
+/// Hillshade is shading OVER the ground rather than a surface of its own, so it
+/// is drawn translucent and everything under it stays visible.
+fn fill_opacity(name: &str) -> Option<f64> {
+    is_feature_layer(HILLSHADE_FEATURE, name).then_some(0.4)
+}
+
+/// How far apart point-of-interest labels are placed, in style pixels, for one
+/// `PoiDensity`: a denser value places more of them, so they sit closer.
+fn poi_spacing(density: Option<&str>) -> u32 {
+    match density {
+        Some("VerySparse") => 500,
+        Some("Sparse") => 350,
+        Some("Dense") => 150,
+        Some("VeryDense") => 80,
+        _ => 250,
+    }
 }
 
 /// Serialize a JSON document built in memory.
@@ -812,7 +907,7 @@ fn vector_tile_bytes(tileset: &TilesetRecord, coord: TileCoord, additional: &[St
             vec![
                 ("layer", TagValue::Str(name.clone())),
                 ("tileset", TagValue::Str(tileset.id.clone())),
-                ("role", TagValue::Str(role.to_string())),
+                (ROLE_ATTRIBUTE, TagValue::Str(role.to_string())),
                 ("z", TagValue::Int(i64::from(coord.z))),
                 ("x", TagValue::Int(i64::from(coord.x))),
                 ("y", TagValue::Int(i64::from(coord.y))),
@@ -838,7 +933,7 @@ fn vector_tile_bytes(tileset: &TilesetRecord, coord: TileCoord, additional: &[St
             feature_id(coord, index, 0),
             GeomType::Polygon,
             ring.finish(),
-            &attributes("area"),
+            &attributes(AREA_ROLE),
         );
 
         // A line across the tile.
@@ -849,13 +944,13 @@ fn vector_tile_bytes(tileset: &TilesetRecord, coord: TileCoord, additional: &[St
             feature_id(coord, index, 1),
             GeomType::LineString,
             line.finish(),
-            &attributes("way"),
+            &attributes(WAY_ROLE),
         );
 
         // A point at the tile's centre.
         let mut point = GeometryWriter::new();
         point.move_to(extent / 2, extent / 2);
-        let mut point_attributes = attributes("point");
+        let mut point_attributes = attributes(POINT_ROLE);
         point_attributes.push((
             "category",
             // The `category` attribute of a `places` feature, so a style's

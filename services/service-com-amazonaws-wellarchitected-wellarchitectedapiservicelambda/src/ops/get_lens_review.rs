@@ -249,10 +249,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // `GetLensReview` is not `@paginated` and reports every pillar of the
                 // lens in one answer, so there is never a further page to fetch.
                 next_token: None,
-                // As on the workload itself: a review carries profiles, and risk counts
-                // restricted to the questions they prioritise, only once a profile is
-                // associated, and profiles are still a stub.
-                profiles: None,
+                // "The profiles associated with the workload" — the same list the workload
+                // itself reports, projected from the one place
+                // (`WorkloadRecord::profiles_projection`), so a review and a read of the
+                // workload cannot disagree about which profile it is reviewed against. The
+                // risk counts restricted to the questions a profile prioritises are NOT
+                // projected: which questions those are is decided by the profile template
+                // this emulator does not carry (`GetProfileTemplate` is a stub with its own
+                // issue), so no question of any workload is prioritized.
+                profiles: workload.profiles_projection(),
                 prioritized_risk_counts: None,
             }),
         })

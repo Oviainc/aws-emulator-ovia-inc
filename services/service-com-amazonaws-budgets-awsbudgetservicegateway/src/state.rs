@@ -782,6 +782,11 @@ pub const MAX_NOTIFICATIONS_PER_BUDGET: usize = 10;
 /// `@length(min: 1, max: 11)` on `Subscribers`, refused at request validation before a
 /// handler runs; the PER-TYPE halves are these two, which no constraint trait can
 /// express — [`subscriber_limit_violation`] enforces them.
+///
+/// The split is a property of a SUBSCRIBER SET, not of notifications alone: every set
+/// this service stores — a notification's and a budget action's — is the one modelled
+/// `Subscribers` shape with the same `@length(1..11)` total, so the same two halves add
+/// up to it wherever a write establishes one.
 pub const MAX_SNS_SUBSCRIBERS_PER_NOTIFICATION: usize = 1;
 
 /// See [`MAX_SNS_SUBSCRIBERS_PER_NOTIFICATION`].
@@ -794,10 +799,10 @@ const SUBSCRIPTION_TYPE_SNS: &str = "SNS";
 /// `SubscriptionType$EMAIL` — a subscriber that is an email address.
 const SUBSCRIPTION_TYPE_EMAIL: &str = "EMAIL";
 
-/// The per-type subscriber limits of one notification, checked over the subscribers it
-/// would end up with. `Err` carries the sentence that goes in
-/// `CreationLimitExceededException$Message`; `Ok` means the set is within both halves
-/// of [`MAX_SNS_SUBSCRIBERS_PER_NOTIFICATION`] /
+/// The per-type subscriber limits of ONE subscriber set — a notification's or a budget
+/// action's — checked over the subscribers it would end up with. `Err` carries the
+/// sentence that goes in the refusal's `Message`; `Ok` means the set is within both
+/// halves of [`MAX_SNS_SUBSCRIBERS_PER_NOTIFICATION`] /
 /// [`MAX_EMAIL_SUBSCRIBERS_PER_NOTIFICATION`].
 pub fn subscriber_limit_violation(subscribers: &[Subscriber]) -> Result<(), String> {
     let count = |kind: &str| {
@@ -813,10 +818,11 @@ pub fn subscriber_limit_violation(subscribers: &[Subscriber]) -> Result<(), Stri
             MAX_EMAIL_SUBSCRIBERS_PER_NOTIFICATION,
         ),
     ] {
-        if count(kind) > limit {
+        let supplied = count(kind);
+        if supplied > limit {
             return Err(format!(
-                "Unable to create notification: a notification can have at most {limit} \
-                 {kind} subscriber(s)."
+                "A set of subscribers can have at most {limit} {kind} subscriber(s), and \
+                 {supplied} were supplied."
             ));
         }
     }

@@ -306,6 +306,68 @@ pub fn tag_key_is_valid(key: &str) -> bool {
     })
 }
 
+/// The tag-key namespace that belongs to the provider, not to the caller: a key
+/// opening with this prefix labels a provider-managed tag.
+///
+/// The model cannot express it — `TagKey`'s pattern `^[\w\s\.\-\:\/\=\+\@]+$`
+/// admits a colon (`smithy_query(query="shape",shape="TagKey")`) — so a key in
+/// this namespace reaches the handler and is refused there.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Is `key` in the namespace [`RESERVED_TAG_KEY_PREFIX`] names?
+///
+/// The prefix is compared without regard to case, because the namespace is the
+/// one the prefix NAMES and not one spelling of it: a key differing only in the
+/// case of the prefix is a key in the same namespace.
+pub fn tag_key_is_reserved(key: &str) -> bool {
+    key.get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
+}
+
+/// The message a tag key whose FORM the service refuses carries.
+///
+/// FIXED text: the requirement a tag rejection has to meet is its modelled code
+/// and its HTTP 400, and this body echoes no caller-supplied key.
+pub const TAG_VALIDATION_FAILED_MESSAGE: &str = "Tag validation failed";
+
+/// The message a tag key in the reserved namespace carries. States the PREFIX
+/// the caller may not use, which is the one fact it needs, and echoes no key the
+/// request carried.
+pub fn reserved_tag_key_message() -> String {
+    format!(
+        "Tag keys beginning with {RESERVED_TAG_KEY_PREFIX} are reserved for Amazon Web Services \
+         use and cannot be specified"
+    )
+}
+
+/// Why these caller-supplied tag keys may not be used, as the service's own
+/// validation message, if they may not.
+///
+/// The ONE place a tag key a request carries is judged, so every operation that
+/// takes tag keys — the tags a rule create carries, the tags an addition carries
+/// and the keys a removal names — refuses the same keys the same way, and a
+/// request carrying one such key is refused before any tag is written:
+///
+/// * a key outside the form the model's `TagKey` declares
+///   ([`tag_key_is_valid`]), which the protocol boundary checks only where a
+///   member targets `TagKey` and not where it targets a plain `String`;
+/// * a key in the provider's reserved namespace ([`tag_key_is_reserved`]), which
+///   is a caller's to neither set nor remove.
+pub fn tag_keys_violation<'a, I>(keys: I) -> Option<String>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    for key in keys {
+        if !tag_key_is_valid(key) {
+            return Some(TAG_VALIDATION_FAILED_MESSAGE.to_string());
+        }
+        if tag_key_is_reserved(key) {
+            return Some(reserved_tag_key_message());
+        }
+    }
+    None
+}
+
 /// Now, as the wire timestamp type. The ONE clock the handlers read, so a stored
 /// timestamp is always the real store time.
 pub fn now() -> ::aws_smithy_types::DateTime {

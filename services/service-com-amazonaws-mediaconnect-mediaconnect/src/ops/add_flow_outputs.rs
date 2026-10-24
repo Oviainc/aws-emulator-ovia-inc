@@ -256,6 +256,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // An output carries a tag member of its own (`AddOutputRequest$OutputTags`) and an
+        // ARN of its own, so it is a resource the tagging operations address: its tag map
+        // is bounded by the same rules a tag write is (see
+        // `crate::state::tag_set_rejection`), checked before anything is stored.
+        for (index, output) in input.outputs.iter().enumerate() {
+            if let Some(rejection) = crate::state::tag_set_rejection(
+                &format!("Outputs[{index}]"),
+                output.output_tags.as_ref(),
+            ) {
+                return Err(bad_request(rejection));
+            }
+        }
+
         // An output's name is unique within its flow, so each new output is named
         // against the flow's existing outputs AND against the ones earlier in this
         // request.

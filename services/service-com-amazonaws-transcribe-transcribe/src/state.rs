@@ -84,7 +84,8 @@ use crate::ops::types::{
     JobExecutionSettings, LanguageIdSettings, LanguageModel, Media,
     MedicalScribeChannelDefinition, MedicalScribeJob, MedicalScribeOutput,
     MedicalScribeSettings, MedicalTranscript, MedicalTranscriptionJob,
-    MedicalTranscriptionSetting, ModelSettings, Rule, Settings, SubtitlesOutput, Tag,
+    MedicalTranscriptionJobSummary, MedicalTranscriptionSetting, ModelSettings, Rule, Settings,
+    SubtitlesOutput, Tag,
     ToxicityDetectionSettings, Transcript, TranscriptionJob, TranscriptionJobSummary,
     VocabularyFilterInfo, VocabularyInfo, MEDICAL_SCRIBE_LANGUAGE_CODE_VALUES,
 };
@@ -655,6 +656,22 @@ impl ComAmazonawsTranscribeTranscribeState {
         let record = self.medical_transcription_jobs.get_mut(name)?;
         record.advance_clock(now);
         Some(record)
+    }
+
+    /// Materialise every clock-owed MEDICAL transcription job transition, then the
+    /// stored jobs newest first — the order `ListMedicalTranscriptionJobs` documents
+    /// ("Jobs are ordered by creation date, with the newest job first").
+    pub fn medical_transcription_jobs_newest_first(
+        &mut self,
+        now: SystemTime,
+    ) -> Vec<&MedicalTranscriptionJobRecord> {
+        for record in self.medical_transcription_jobs.values_mut() {
+            record.advance_clock(now);
+        }
+        let mut records: Vec<&MedicalTranscriptionJobRecord> =
+            self.medical_transcription_jobs.values().collect();
+        records.sort_by_key(|record| std::cmp::Reverse(record.sequence));
+        records
     }
 
     /// The Medical Scribe job named `name`, with every clock-owed transition of it
@@ -1784,6 +1801,31 @@ impl MedicalTranscriptionJobRecord {
             specialty: Some(self.specialty.clone()),
             r#type: Some(self.job_type.clone()),
             tags: (!self.tags.is_empty()).then(|| self.tags.clone()),
+        }
+    }
+
+    /// This record as the modelled `MedicalTranscriptionJobSummary` shape, which is
+    /// what `ListMedicalTranscriptionJobs` reports one stored job as.
+    ///
+    /// `OutputLocationType` is always [`OUTPUT_LOCATION_CUSTOMER_BUCKET`] for this
+    /// family: `OutputBucketName` is a REQUIRED member of the start request
+    /// (`smithy_query(query="operation", operation="StartMedicalTranscriptionJob")`),
+    /// so a job of this family never writes to a service-managed bucket. The summary
+    /// carries no `Media`, `Transcript` or `Tags` member at all — those are read
+    /// through `GetMedicalTranscriptionJob`.
+    pub fn to_summary(&self) -> MedicalTranscriptionJobSummary {
+        MedicalTranscriptionJobSummary {
+            medical_transcription_job_name: Some(self.name.clone()),
+            creation_time: Some(to_date_time(self.creation_time)),
+            start_time: self.start_time.map(to_date_time),
+            completion_time: self.completion_time.map(to_date_time),
+            language_code: Some(self.language_code.clone()),
+            transcription_job_status: Some(self.status.clone()),
+            failure_reason: self.failure_reason.clone(),
+            output_location_type: Some(OUTPUT_LOCATION_CUSTOMER_BUCKET.to_string()),
+            specialty: Some(self.specialty.clone()),
+            content_identification_type: self.content_identification_type.clone(),
+            r#type: Some(self.job_type.clone()),
         }
     }
 }

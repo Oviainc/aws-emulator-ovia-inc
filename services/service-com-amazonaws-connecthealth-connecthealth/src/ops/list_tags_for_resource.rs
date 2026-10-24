@@ -7,8 +7,10 @@
 //! reader and through no other store. A resource that carries no tags reports an EMPTY
 //! `tags` map rather than an absent one, and an ARN that names no resource this service
 //! holds is a 404 `ResourceNotFoundException`, exactly as `TagResource` answers the same
-//! ARN. Reporting only: nothing is written beyond the deletions the CLOCK already made
-//! due.
+//! ARN. A resource the service still HOLDS is addressable whatever lifecycle status its
+//! record reports, so a domain whose deletion is in flight keeps reporting its tags for
+//! as long as its own reader keeps reporting the record. Reporting only: nothing is
+//! written beyond the deletions the CLOCK already made due.
 //!
 //! ## Shape of an operation
 //!
@@ -163,10 +165,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // exactly as it does for every other handler.
         store.purge_due_deletions(now);
 
-        // The ARN has to name a resource this service holds — the same liveness
-        // `TagResource` requires to attach tags at all. Reporting an empty map instead
-        // would answer "this resource exists and carries no tags" for a resource that
-        // does not exist.
+        // The ARN has to name a resource this service HOLDS — the same resolution
+        // `TagResource` applies to the same label. Reporting an empty map instead would
+        // answer "this resource exists and carries no tags" for a resource that does not
+        // exist. Holding the record is the whole test: a resource whose deletion is in
+        // flight is still one the service holds and still reports its tags, exactly as
+        // its own reader still reports the record, until the purge drops both.
         if !store.holds_resource_arn(&input.resource_arn) {
             return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {

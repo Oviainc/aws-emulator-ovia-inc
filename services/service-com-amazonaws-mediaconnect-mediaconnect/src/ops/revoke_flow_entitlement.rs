@@ -201,7 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(position) = flow
             .entitlements
             .iter()
-            .position(|entitlement| entitlement.entitlement_arn == input.entitlement_arn)
+            .position(|entitlement| entitlement.arn() == input.entitlement_arn)
         else {
             return Err(not_found(&input.entitlement_arn));
         };
@@ -223,7 +223,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Revoking moves nothing else about the flow: its status is left as it was, because
         // no clock owes a change for a revoked entitlement.
         Ok(RevokeFlowEntitlementOutput {
-            entitlement_arn: Some(revoked.entitlement_arn),
+            entitlement_arn: Some(revoked.entitlement.entitlement_arn),
             flow_arn: Some(flow.flow_arn.clone()),
         })
     }

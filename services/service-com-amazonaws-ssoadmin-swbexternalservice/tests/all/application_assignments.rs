@@ -33,8 +33,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ssoadmin_permission_sets::{
-    call, call_in_region, error_code, router, router_over, seeded_instance_arn, with_store,
-    TEST_REGION,
+    call, call_in_region, error_code, hold_deletion, router, router_over, seeded_instance_arn,
+    with_store, TEST_REGION,
 };
 
 /// The AWS-owned provider a customer managed OAuth 2.0 application is created under. Its
@@ -1022,14 +1022,10 @@ async fn an_application_and_its_assignments_stop_existing_with_their_instance() 
     );
     // The deletion falls due a span after the call; a test moves the stored due instant
     // rather than sleeping for it.
-    with_store(&engine, |store| {
-        for instance in store.instances.values_mut() {
-            if instance.deleted_due.is_some() {
-                instance.deleted_due =
-                    Some(std::time::SystemTime::now() - std::time::Duration::from_secs(60));
-            }
-        }
-    });
+    hold_deletion(
+        &engine,
+        std::time::SystemTime::now() - std::time::Duration::from_secs(60),
+    );
 
     let (status, body) = describe_application(&router, &application_arn).await;
     assert_eq!(

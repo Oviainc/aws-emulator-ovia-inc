@@ -20,13 +20,19 @@ pub(crate) const REGION: &str = "us-east-1";
 /// A router with only this service mounted, over one shared engine — the same
 /// assembly `core/router` performs, minus the other services.
 pub(crate) fn router() -> MultiServiceRouter {
+    router_with_engine().0
+}
+
+/// [`router`], together with the engine it was assembled over, for a case that has
+/// to seed a record no implemented operation creates yet.
+pub(crate) fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // In-process tests sign with a placeholder key; signature verification is a
     // front-door setting, not part of what these tests are about.
     router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
-    router
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    (router, engine)
 }
 
 /// Call one operation in `region` and return its HTTP status and JSON body.

@@ -5,7 +5,10 @@
 //! Updates the members a caller supplied on one stored budget action, leaving the
 //! members it did not name as they were, and records the `UPDATE_ACTION` event in the
 //! action's history. Reports the action as it was before the call (`OldAction`) and as
-//! it is after it (`NewAction`).
+//! it is after it (`NewAction`). A replacement `Definition` must match the type the
+//! action was created with, and a replacement `Subscribers` set is held to the same
+//! per-type split as a create's ([`crate::state::subscriber_limit_violation`]); either
+//! is refused with `InvalidParameterException`, the client-error this operation models.
 //!
 //! ## Shape of an operation
 //!
@@ -221,6 +224,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                 },
             )?;
+        }
+
+        // A replacement subscriber set is held to the same per-type split as the set a
+        // create establishes ("one SNS subscriber and up to 10 email subscribers, for a
+        // total of 11"), so an update cannot leave an action holding a set a create
+        // would have been refused. This operation models no
+        // `CreationLimitExceededException`, so the refusal is the client-error it does
+        // model — "the cause is an invalid input value"
+        // (`InvalidParameterException`). Checked before anything is written, so a
+        // refused update leaves the stored action exactly as it was.
+        if let Some(subscribers) = &input.subscribers {
+            crate::state::subscriber_limit_violation(subscribers).map_err(|message| {
+                UpdateBudgetActionErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+            })?;
         }
 
         // Every member this operation takes is optional: one the caller named replaces

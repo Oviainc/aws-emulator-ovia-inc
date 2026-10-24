@@ -16,10 +16,10 @@
 //!    back through `GetRegisteredSubscriptionProvider`,
 //!    `ListRegisteredSubscriptionProviders` and `ListTagsForResource`;
 //! 2. the status the clock owes the registration lands WITHOUT any caller doing anything:
-//!    a registration this emulator cannot validate settles into the modelled failure
-//!    status `INVALID` with a `SubscriptionProviderStatusMessage` that says so, never into
-//!    `ACTIVE` (nothing here accepted a token), and a read before it falls due reports
-//!    `PENDING` twice — reading does not move it;
+//!    a registration the account asked for and the service took becomes USABLE — `ACTIVE`,
+//!    with no `SubscriptionProviderStatusMessage` and with the
+//!    `LastSuccessfulDataRetrievalTime` that status reports on — and a read before it falls
+//!    due reports `PENDING` twice, because reading does not move it;
 //! 3. `RegisterSubscriptionProvider` is `@idempotent`: a repeat naming a (source, secret)
 //!    pair the account already registered answers THAT registration rather than minting a
 //!    second resource, while a different secret is a registration of its own;
@@ -39,9 +39,9 @@
 use serde_json::{json, Value};
 
 use crate::harness::{
-    call_in_region, deregister, get_provider, harness, list_providers, list_tags, listed, member,
-    provider_arn, register, stored_provider_count, tag, wait_for_token_validation, Harness, Reply,
-    ACCOUNT, ACTIVE, INVALID, PENDING, RED_HAT, REGION, SIGNING_NAME,
+    call_in_region, deregister, get_provider, harness, is_iso8601_utc, list_providers, list_tags,
+    listed, member, provider_arn, register, stored_provider_count, tag, wait_for_token_validation,
+    Harness, Reply, ACCOUNT, ACTIVE, INVALID, PENDING, RED_HAT, REGION, SIGNING_NAME,
 };
 use service_com_amazonaws_licensemanagerlinuxsubscriptions_licensemanagerlinuxsubscriptions::state::MAX_REGISTERED_PROVIDERS;
 
@@ -262,10 +262,10 @@ async fn the_minted_arn_carries_the_signed_region() {
     }
 }
 
-/// Rule 2: the transition the clock owes lands on its own, settles into the modelled
-/// failure status with a reason, and is terminal.
+/// Rule 2: the transition the clock owes lands on its own, makes the registration usable,
+/// and is terminal.
 #[tokio::test]
-async fn the_registration_settles_into_the_modelled_failure_status() {
+async fn the_registration_becomes_usable_on_the_clock() {
     let h = harness();
 
     // One registration per `SecretArn` row: the rule holds for every registration, not
@@ -291,55 +291,88 @@ async fn the_registration_settles_into_the_modelled_failure_status() {
     // Nothing is called while the clock passes the span; the transition is owed anyway.
     wait_for_token_validation();
 
+    let mut retrieval_times = Vec::new();
     for arn in &arns {
+        let mut seen: Option<String> = None;
         for attempt in 0..2 {
             let case = format!("{arn} settled, read {attempt}");
             let got = get_provider(&h, arn).await;
             assert_eq!(
                 member(&got, &case, "SubscriptionProviderStatus"),
-                Some(INVALID),
-                "case {case:?}: a registration nothing could validate must settle {INVALID}, \
-                 got {:?}",
+                Some(ACTIVE),
+                "case {case:?}: a registration the service took must become {ACTIVE}, got {:?}",
                 got.body
             );
             assert_ne!(
                 member(&got, &case, "SubscriptionProviderStatus"),
-                Some(ACTIVE),
-                "case {case:?}: nothing accepted a token, so {ACTIVE} must never be reported"
-            );
-            let message = member(&got, &case, "SubscriptionProviderStatusMessage")
-                .unwrap_or_else(|| {
-                    panic!(
-                        "case {case:?}: an {INVALID} registration must carry a \
-                         SubscriptionProviderStatusMessage, got {:?}",
-                        got.body
-                    )
-                });
-            assert!(
-                !message.is_empty() && !message.contains(arn.as_str()),
-                "case {case:?}: the status message must say why the token was not \
-                 validated and carry nothing from the request, got {message:?}"
-            );
-            // Still nothing retrieved from the provider, so the member stays absent.
-            assert!(
-                got.ok(&case)
-                    .get("LastSuccessfulDataRetrievalTime")
-                    .is_none_or(Value::is_null),
-                "case {case:?}: expected no LastSuccessfulDataRetrievalTime, got {:?}",
+                Some(INVALID),
+                "case {case:?}: nothing rejected this registration, so {INVALID} must not be \
+                 reported, got {:?}",
                 got.body
             );
+            // A healthy registration has nothing to report about its token.
+            assert!(
+                got.ok(&case)
+                    .get("SubscriptionProviderStatusMessage")
+                    .is_none_or(Value::is_null),
+                "case {case:?}: expected no SubscriptionProviderStatusMessage while {ACTIVE}, \
+                 got {:?}",
+                got.body
+            );
+            // And it reports the retrieval its status is about, in ISO-8601 UTC, the same
+            // value on every read.
+            let retrieved = member(&got, &case, "LastSuccessfulDataRetrievalTime")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "case {case:?}: an {ACTIVE} registration must report a \
+                         LastSuccessfulDataRetrievalTime, got {:?}",
+                        got.body
+                    )
+                })
+                .to_string();
+            assert!(
+                is_iso8601_utc(&retrieved),
+                "case {case:?}: expected an ISO-8601 UTC timestamp, got {retrieved:?}"
+            );
+            if let Some(first) = &seen {
+                assert_eq!(
+                    &retrieved, first,
+                    "case {case:?}: the retrieval time must not move between reads"
+                );
+            }
+            seen = Some(retrieved);
         }
+        retrieval_times.push(seen.expect("each registration was read"));
     }
 
-    // The list agrees with the reads: the status is a property of the stored record, not
-    // of the operation that reports it.
-    let case = "list after the registrations settled";
-    for (arn, _, _, status) in listed(&list_providers(&h, &json!({})).await, case) {
+    // The list agrees with the reads: the status and the retrieval time are properties of
+    // the stored record, not of the operation that reports it.
+    let case = "list after the registrations became usable";
+    let listing = list_providers(&h, &json!({})).await;
+    for (arn, _, _, status) in listed(&listing, case) {
         assert_eq!(
-            status, INVALID,
-            "case {case:?}: expected {INVALID} for {arn} from the list, got {status:?}"
+            status, ACTIVE,
+            "case {case:?}: expected {ACTIVE} for {arn} from the list, got {status:?}"
         );
     }
+    let listed_times: Vec<String> = listing
+        .ok(case)
+        .get("RegisteredSubscriptionProviders")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("case {case:?}: no providers in {:?}", listing.body))
+        .iter()
+        .map(|entry| {
+            entry
+                .get("LastSuccessfulDataRetrievalTime")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("case {case:?}: no retrieval time in {entry:?}"))
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        listed_times, retrieval_times,
+        "case {case:?}: the list must report the same retrieval times the reads did"
+    );
 }
 
 /// Rule 3: `@idempotent` — a repeat of the same registration is the same resource.

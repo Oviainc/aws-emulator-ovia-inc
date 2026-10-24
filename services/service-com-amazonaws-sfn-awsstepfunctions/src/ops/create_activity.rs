@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateActivity
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateActivity`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: registers an activity under its own ARN — a total function of the
+//! region and the name — and answers that ARN and the instant it was created. The
+//! record is what `DescribeActivity` reports and what the tagging calls write to;
+//! this is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateActivity::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A request this operation cannot serve is refused with one of its own modelled
+//! errors; it never answers 501.
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +176,132 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateActivity` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateActivityErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `name` (1..80) and the members of `encryptionConfiguration` (the
+        // `EncryptionType` enum, `kmsKeyId`'s length, `kmsDataKeyReusePeriodSeconds`'
+        // range) are modelled, so the centralized walk has already refused anything
+        // outside them. What the model does NOT carry is checked here, each with this
+        // operation's own modelled error: the character rule on `name`, which members
+        // each encryption type needs, and the tag count.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // The same name rule a state machine name is read by: `name`'s own
+        // documentation lists the characters a name "must not contain", and the
+        // modelled `InvalidName` is what reports one that carries them.
+        if !crate::state::is_valid_name(&input.name) {
+            return Err(CreateActivityErrorModeled::InvalidName(InvalidName {
+                message: Some(crate::state::resource_error_message(
+                    crate::state::INVALID_NAME,
+                    &input.name,
+                )),
+            })
+            .into());
+        }
+
+        // Which members each encryption type needs is not modelled, so that rule
+        // lives in `crate::state` and every operation accepting the structure reads
+        // it.
+        if let Some(configuration) = input.encryption_configuration.as_ref() {
+            if let Some(why) = crate::state::invalid_encryption_reason(configuration) {
+                return Err(CreateActivityErrorModeled::InvalidEncryptionConfiguration(
+                    InvalidEncryptionConfiguration { message: Some(why) },
+                )
+                .into());
+            }
+        }
+
+        let tags = input.tags.clone().unwrap_or_default();
+        if tags.len() > crate::state::MAX_TAGS {
+            return Err(CreateActivityErrorModeled::TooManyTags(TooManyTags {
+                // The fixed service text every `TooManyTags` here carries: the
+                // refusal reports no request value.
+                message: Some(crate::state::TOO_MANY_TAGS_MESSAGE.to_string()),
+                resource_name: Some(input.name.clone()),
+            })
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let arn = crate::state::activity_arn(&region, &input.name);
+        let created = crate::state::now();
+        // The configuration a repeat is compared against: an activity's whole
+        // configuration is its encryption settings, at their EFFECTIVE values, so a
+        // repeat that spells the default out explicitly is the same request.
+        let encryption = crate::state::effective_encryption_configuration(
+            input.encryption_configuration.as_ref(),
+        );
+
+        let mut store = state.lock();
+        store.settle(created);
+
+        // "CreateActivity is an idempotent API. Subsequent requests won't create a
+        // duplicate resource if it was already created. CreateActivity's idempotency
+        // check is based on the activity name. If a following request has different
+        // tags values, Step Functions will ignore these differences and treat it as
+        // an idempotent request of the previous. In this case, tags will not be
+        // updated, even if they are different." The ARN is a total function of the
+        // region and the name, so the ARN this request would mint IS that name
+        // lookup, and a name is in use only within the same region and account.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateActivity"))
+        // `ActivityAlreadyExists` is "Activity already exists. EncryptionConfiguration
+        // may not be updated": a repeat asking for DIFFERENT encryption settings is
+        // refused rather than treated as the same request, because serving it would
+        // have to update them.
+        if let Some(existing) = store.activities.get(&arn) {
+            if crate::state::effective_encryption_configuration(
+                existing.encryption_configuration.as_ref(),
+            ) == encryption
+            {
+                return Ok(CreateActivityOutput {
+                    activity_arn: existing.arn.clone(),
+                    creation_date: crate::state::to_date_time(existing.creation_date),
+                });
+            }
+            return Err(
+                CreateActivityErrorModeled::ActivityAlreadyExists(ActivityAlreadyExists {
+                    // The service words this condition as its own name followed by
+                    // the colliding ARN in single quotes, built from the request
+                    // rather than from this emulator's prose.
+                    message: Some(crate::state::resource_error_message(
+                        crate::state::ACTIVITY_ALREADY_EXISTS,
+                        &existing.arn,
+                    )),
+                })
+                .into(),
+            );
+        }
+
+        let candidate = crate::state::Activity {
+            arn: arn.clone(),
+            name: input.name,
+            creation_date: created,
+            encryption_configuration: input.encryption_configuration,
+            tags,
+            // Measured and counted by `insert_activity`.
+            retained_bytes: 0,
+        };
+
+        // The store's caps are on the WHOLE store, in records AND in bytes, and every
+        // growth site is admitted before it grows: an activity carries caller-sized
+        // text (its name and its tag set), so a record count alone would not bound
+        // the memory.
+        if let Some(why) = store.activity_rejection(candidate.measure()) {
+            return Err(
+                CreateActivityErrorModeled::ActivityLimitExceeded(ActivityLimitExceeded {
+                    message: Some(why),
+                })
+                .into(),
+            );
+        }
+
+        store.insert_activity(candidate);
+
+        Ok(CreateActivityOutput {
+            activity_arn: arn,
+            creation_date: crate::state::to_date_time(created),
+        })
     }
 }

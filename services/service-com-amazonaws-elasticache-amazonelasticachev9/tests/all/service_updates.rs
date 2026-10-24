@@ -168,27 +168,24 @@ async fn the_published_catalog_is_reported_with_every_member_of_the_shape() {
     let now = now_secs();
     for update in &updates {
         let name = &update.name;
-        // AWS names an ElastiCache service update after its release date and a
-        // sequence number within that date: `elasticache-<YYYYMMDD>-<NNN>`.
-        let parts: Vec<&str> = name.split('-').collect();
-        assert_eq!(
-            parts.len(),
-            3,
-            "case {case}: {name} must be named elasticache-<YYYYMMDD>-<NNN>"
-        );
-        assert_eq!(
-            parts[0], "elasticache",
+        // A published update's name is part of what the service publishes: it
+        // names the service and the engine the update applies to, and carries
+        // nothing taken from the clock, so the same name is resolvable on every
+        // store this build brings up (pinned against a differently anchored
+        // catalog by the `catalog_publication` suite).
+        assert!(
+            name.starts_with("elasticache-"),
             "case {case}: {name} must be named for the service"
         );
         assert!(
-            parts[1].len() == 8 && parts[1].chars().all(|c| c.is_ascii_digit()),
-            "case {case}: {name} must carry an 8-digit release date, got {:?}",
-            parts[1]
+            name.contains(&update.engine),
+            "case {case}: {name} must name the engine it applies to, got {:?}",
+            update.engine
         );
         assert!(
-            parts[2].len() == 3 && parts[2].chars().all(|c| c.is_ascii_digit()),
-            "case {case}: {name} must carry a 3-digit sequence number, got {:?}",
-            parts[2]
+            name.split('-')
+                .all(|part| !(part.len() == 8 && part.chars().all(|c| c.is_ascii_digit()))),
+            "case {case}: {name} must not be named after a date the clock supplied"
         );
 
         // `Engine` is "the Elasticache engine to which the update applies" and

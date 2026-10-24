@@ -635,6 +635,7 @@ fn assert_reported_session(
     label: &str,
     reply: &Reply,
     expected: &SessionCase,
+    inherited_agents: &Value,
     assistant_id: &str,
     session_id: &str,
     region: &str,
@@ -688,11 +689,27 @@ fn assert_reported_session(
         "case {label:?}: expected the stored tagFilter {:?}, got {reported_filter:?}",
         expected.tag_filter
     );
+    // A session runs inside its assistant, so its bindings are the assistant's, overlaid
+    // per AI agent type by whatever the create configured for the session itself.
+    let mut expected_agents = inherited_agents
+        .as_object()
+        .cloned()
+        .unwrap_or_else(|| panic!("case {label:?}: the parent assistant reported no bindings"));
+    if let Some(configured) = expected
+        .ai_agent_configuration
+        .as_ref()
+        .and_then(Value::as_object)
+    {
+        for (agent_type, binding) in configured {
+            expected_agents.insert(agent_type.clone(), binding.clone());
+        }
+    }
     let reported_agents = reply.field("/session/aiAgentConfiguration").cloned();
     assert_eq!(
-        reported_agents, expected.ai_agent_configuration,
+        reported_agents,
+        Some(Value::Object(expected_agents.clone())),
         "case {label:?}: expected the stored aiAgentConfiguration {:?}, got {reported_agents:?}",
-        expected.ai_agent_configuration
+        Value::Object(expected_agents)
     );
 }
 
@@ -707,6 +724,11 @@ async fn a_session_round_trips_under_its_parent_assistant() {
     let assistant_id = created_assistant
         .string("/assistant/assistantId")
         .unwrap_or_else(|| panic!("no assistantId in {}", created_assistant.body));
+    // The assistant's own bindings, which every session of it starts from.
+    let inherited_agents = created_assistant
+        .field("/assistant/aiAgentConfiguration")
+        .cloned()
+        .unwrap_or_else(|| panic!("no aiAgentConfiguration in {}", created_assistant.body));
 
     for case in session_cases() {
         let label = case.label;
@@ -724,6 +746,7 @@ async fn a_session_round_trips_under_its_parent_assistant() {
             label,
             &created,
             &case,
+            &inherited_agents,
             &assistant_id,
             &session_id,
             REGION,
@@ -732,7 +755,15 @@ async fn a_session_round_trips_under_its_parent_assistant() {
         let read = emulator
             .get_session(REGION, &assistant_id, &session_id)
             .await;
-        assert_reported_session(label, &read, &case, &assistant_id, &session_id, REGION);
+        assert_reported_session(
+            label,
+            &read,
+            &case,
+            &inherited_agents,
+            &assistant_id,
+            &session_id,
+            REGION,
+        );
 
         let by_arn = emulator
             .get_session(
@@ -741,7 +772,15 @@ async fn a_session_round_trips_under_its_parent_assistant() {
                 &expected_session_arn(REGION, &assistant_id, &session_id),
             )
             .await;
-        assert_reported_session(label, &by_arn, &case, &assistant_id, &session_id, REGION);
+        assert_reported_session(
+            label,
+            &by_arn,
+            &case,
+            &inherited_agents,
+            &assistant_id,
+            &session_id,
+            REGION,
+        );
     }
 }
 

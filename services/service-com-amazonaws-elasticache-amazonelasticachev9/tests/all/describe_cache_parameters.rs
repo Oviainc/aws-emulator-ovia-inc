@@ -40,18 +40,22 @@ const CUSTOM_GROUP: &str = "fixer-params";
 
 /// One parameter as the response reports it: the list it was reported in, its
 /// name, and the fields that followed it.
+///
+/// `pub(crate)` for the reason the shared harness is: the `catalog_publication`
+/// suite reads a parameter out of a `DescribeCacheParameters` answer too, and a
+/// second copy of this reader would be a second thing to keep correct.
 #[derive(Debug)]
-struct Reported {
-    name: String,
-    node_type_specific: bool,
-    fields: Vec<(String, String)>,
+pub(crate) struct Reported {
+    pub(crate) name: String,
+    pub(crate) node_type_specific: bool,
+    pub(crate) fields: Vec<(String, String)>,
 }
 
 impl Reported {
     /// The text of `field` on this parameter, or `None` when the reply reports
     /// no such element for it (an absent element reads as `None` too: a value
     /// that is the empty string carries no text).
-    fn field(&self, field: &str) -> Option<&str> {
+    pub(crate) fn field(&self, field: &str) -> Option<&str> {
         self.fields
             .iter()
             .find(|(name, _)| name == field)
@@ -65,7 +69,7 @@ impl Reported {
 /// A parameter's fields are the elements BETWEEN its `ParameterName` and the
 /// next one's, so a parameter that reports no value cannot borrow the next
 /// parameter's.
-fn reported(reply: &Reply) -> Vec<Reported> {
+pub(crate) fn reported(reply: &Reply) -> Vec<Reported> {
     const SPECIFIC: &str = "/CacheNodeTypeSpecificParameters/CacheNodeTypeSpecificParameter/";
     const PLAIN: &str = "/Parameters/Parameter/";
     let mut out: Vec<Reported> = Vec::new();
@@ -99,7 +103,7 @@ fn names(reply: &Reply) -> Vec<String> {
 }
 
 /// The parameter `name` as `reply` reports it.
-fn one(reply: &Reply, case: &str, name: &str) -> Reported {
+pub(crate) fn one(reply: &Reply, case: &str, name: &str) -> Reported {
     reported(reply)
         .into_iter()
         .find(|parameter| parameter.name == name)
@@ -119,7 +123,7 @@ async fn describe(emulator: &Emulator, group: &str, extra: &[(&str, &str)]) -> R
 }
 
 /// [`describe`], asserting the call succeeded.
-async fn describe_ok(emulator: &Emulator, group: &str, extra: &[(&str, &str)]) -> Reply {
+pub(crate) async fn describe_ok(emulator: &Emulator, group: &str, extra: &[(&str, &str)]) -> Reply {
     let reply = describe(emulator, group, extra).await;
     assert_eq!(
         reply.status, 200,

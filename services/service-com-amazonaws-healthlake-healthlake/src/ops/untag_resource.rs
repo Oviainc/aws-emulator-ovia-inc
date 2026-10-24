@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes tag keys from a data store or a data transformation profile.
 //!
 //! ## Shape of an operation
 //!
@@ -137,18 +129,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        let _ = ctx;
+        // `UntagResource` models only `ResourceNotFoundException` and
+        // `ValidationException`, so a refusal is the only channel it has for a
+        // condition no modelled error names. This one is unreachable in the
+        // emulator — the engine is construction-time, not per request.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UntagResourceErrorModeled::ValidationException(ValidationException {
+                message: Some("the HealthLake data store registry is unavailable".to_string()),
+            })
+            .into());
+        };
+
+        // The modelled `AmazonResourceName` pattern admits BOTH of this
+        // service's resource forms, and both carry tags, so the ARN is resolved
+        // to whichever resource it names; an ARN of neither form names nothing,
+        // and this service's not-found texts name no identifier.
+        let resolved = crate::state::tagged_resource_from_arn(&input.resource_arn);
+
+        let mut store = state.lock();
+        store.settle_lifecycle();
+        // Whichever resource it is, the stored record's own ARN must equal the
+        // one the caller handed in, so an ARN naming another partition, region
+        // or account resolves to nothing even when its id segment happens to
+        // match a local one.
+        let (tags, not_found) = match resolved {
+            Some(crate::state::TaggedResource::Datastore(id)) => (
+                store
+                    .datastores
+                    .get_mut(id)
+                    .filter(|datastore| datastore.arn == input.resource_arn)
+                    .map(|datastore| &mut datastore.tags),
+                crate::state::DATASTORE_NOT_FOUND_MESSAGE,
+            ),
+            Some(crate::state::TaggedResource::Profile(id)) => (
+                store
+                    .profiles
+                    .get_mut(id)
+                    .filter(|profile| profile.arn == input.resource_arn)
+                    .map(|profile| &mut profile.tags),
+                crate::state::PROFILE_NOT_FOUND_MESSAGE,
+            ),
+            // Unreachable through the wire — the modelled pattern is enforced
+            // before this handler runs — but an ARN of neither form names no
+            // resource, so it is answered the same way a missing one is.
+            None => (None, crate::state::DATASTORE_NOT_FOUND_MESSAGE),
+        };
+        let Some(tags) = tags else {
+            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(not_found.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // Removal is BY KEY and idempotent: only the keys named go, a key the
+        // resource does not carry leaves the stored set as it was, and nothing
+        // else about the record changes — so repeating a request answers the
+        // same way and reports the same set.
+        for key in &input.tag_keys {
+            tags.remove(key);
+        }
+        Ok(UntagResourceOutput {})
     }
 }

@@ -30,6 +30,10 @@
 //! `ops/get_marketplace_model_endpoint.rs` reads back, together with the instant each
 //! endpoint's non-terminal `endpointStatus` is owed its move to `InService`.
 //!
+//! And it holds the published foundation model catalog — the base models
+//! `ops/list_foundation_models.rs` reports — which is seeded with the store and never
+//! written, because no operation of this service creates a foundation model.
+//!
 //! The record shapes, and the conversions between the `*PolicyConfig` shapes a
 //! request carries and the `*Policy` shapes a response carries, live here rather
 //! than in one operation's file because six operations share them (a file under
@@ -682,6 +686,9 @@ pub struct EvaluationJobRecord {
 ///   [`MarketplaceModelEndpointRecord::last_update_token`] is ONE token rather than a map,
 ///   so repeated updates cannot grow the store either.
 ///
+/// * `foundation_models` is the PUBLISHED catalog, seeded once per store and never
+///   written: no operation here creates or deletes a foundation model.
+///
 /// So the whole store is bounded by the live resources the quotas admit, and no
 /// sequence of requests — including create/delete cycles with fresh idempotency
 /// tokens — can grow it past them.
@@ -776,6 +783,12 @@ pub struct ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     /// How many evaluation job ids this store has minted; the uniqueness half of a minted
     /// id.
     pub minted_evaluation_jobs: u64,
+    /// The foundation models this service offers, seeded from [`FOUNDATION_MODELS`] by
+    /// [`FoundationModelCatalog::default`].
+    ///
+    /// A FIXED set, not a resource a caller creates: no operation of this service adds a
+    /// row to it or takes one away, so it cannot grow the store either.
+    pub foundation_models: FoundationModelCatalog,
 }
 
 impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
@@ -1487,6 +1500,434 @@ fn cross_region_details_of(
             &format!("guardrail-profile/{profile_id}"),
         )),
     })
+}
+
+// =============================================================================
+// The published foundation model catalog
+// =============================================================================
+
+/// One foundation model Amazon Bedrock offers, as this control plane reports it.
+///
+/// Every field is `&'static` because the catalog is PUBLISHED data rather than anything a
+/// request brings into being: this service has no operation that creates a foundation
+/// model, so these rows are the same for every account and no handler writes one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FoundationModel {
+    /// `BedrockModelId` — the id every operation that names a base model names it by.
+    pub model_id: &'static str,
+    /// `BrandedName` (len 1..20) — the model's own name.
+    pub model_name: &'static str,
+    /// `BrandedName` (len 1..20) — the provider that publishes the model.
+    pub provider_name: &'static str,
+    /// `ModelModalityList` — what the model takes, each value out of `ModelModality`
+    /// (`crate::ops::types::MODEL_MODALITY_VALUES`).
+    pub input_modalities: &'static [&'static str],
+    /// `ModelModalityList` — what the model produces, from the same value set.
+    pub output_modalities: &'static [&'static str],
+    /// Whether the model streams its response.
+    pub response_streaming_supported: bool,
+    /// `ModelCustomizationList` — the customizations the model supports, each value out of
+    /// `ModelCustomization` (`crate::ops::types::MODEL_CUSTOMIZATION_VALUES`); empty for a
+    /// model that supports none.
+    pub customizations_supported: &'static [&'static str],
+    /// `InferenceTypeList` — the inference types the model is offered under, each value out
+    /// of `InferenceType` (`crate::ops::types::INFERENCE_TYPE_VALUES`).
+    pub inference_types_supported: &'static [&'static str],
+    /// `FoundationModelLifecycleStatus` — `ACTIVE` for a model that is available, `LEGACY`
+    /// for one that is deprecated
+    /// (`crate::ops::types::FOUNDATION_MODEL_LIFECYCLE_STATUS_VALUES`).
+    pub lifecycle_status: &'static str,
+}
+
+/// `ModelModality` — a model that takes text only.
+const IN_TEXT: &[&str] = &["TEXT"];
+/// `ModelModality` — a model that takes text or an image.
+const IN_TEXT_AND_IMAGE: &[&str] = &["TEXT", "IMAGE"];
+/// `ModelModality` — a model that generates text.
+const OUT_TEXT: &[&str] = &["TEXT"];
+/// `ModelModality` — a model that generates an image.
+const OUT_IMAGE: &[&str] = &["IMAGE"];
+/// `ModelModality` — a model that produces an embedding vector.
+const OUT_EMBEDDING: &[&str] = &["EMBEDDING"];
+/// `InferenceType` — a model offered on demand only.
+const ON_DEMAND: &[&str] = &["ON_DEMAND"];
+/// `InferenceType` — a model offered both on demand and with Provisioned Throughput.
+const ON_DEMAND_AND_PROVISIONED: &[&str] = &["ON_DEMAND", "PROVISIONED"];
+/// `ModelCustomizationList` — a model no customization job accepts.
+const NO_CUSTOMIZATION: &[&str] = &[];
+/// `ModelCustomization` — a model that can be fine-tuned on labelled data.
+const FINE_TUNING: &[&str] = &["FINE_TUNING"];
+/// `ModelCustomization` — a model that accepts both fine-tuning and continued
+/// pre-training.
+const FINE_TUNING_AND_PRE_TRAINING: &[&str] = &["FINE_TUNING", "CONTINUED_PRE_TRAINING"];
+/// `ModelCustomization` — a model that accepts both fine-tuning and distillation.
+const FINE_TUNING_AND_DISTILLATION: &[&str] = &["FINE_TUNING", "DISTILLATION"];
+/// `FoundationModelLifecycleStatus` — the model is available.
+const LIFECYCLE_ACTIVE: &str = "ACTIVE";
+/// `FoundationModelLifecycleStatus` — the model is deprecated: its id still resolves, and
+/// callers are expected to move off it.
+const LIFECYCLE_LEGACY: &str = "LEGACY";
+
+/// Every foundation model this emulator's Amazon Bedrock offers, in `modelId` order.
+///
+/// Amazon Bedrock publishes its base models rather than letting a caller create one —
+/// there is no `CreateFoundationModel` — so this is the published catalog itself: the set
+/// `ListFoundationModels` reports and `GetFoundationModel` resolves one row of, not
+/// anything a request can add to or remove from.
+///
+/// The ids are the base model ids AWS publishes in "Amazon Bedrock base model IDs
+/// (on-demand throughput)" and "Supported foundation models in Amazon Bedrock", and the
+/// rows past their end of life carry the ids "Model lifecycle" lists; this emulator's
+/// bedrock-runtime plane recognises the same ids, so the two planes agree about which
+/// models exist. Each row's provider, modalities, streaming support, customizations and
+/// inference types are as those pages publish them for that model; a per-model attribute
+/// no page publishes is left out of the row rather than invented (the lifecycle's
+/// `startOfLifeTime`, `endOfLifeTime`, `legacyTime` and `publicExtendedAccessTime` are
+/// such instants, so a listed model reports its `status` and no dates).
+///
+/// It is a SUBSET of what AWS offers, spanning every value of each member a caller can
+/// filter on, because the filter rule — not the catalog's size — is what this emulator
+/// has to get right.
+pub const FOUNDATION_MODELS: &[FoundationModel] = &[
+    FoundationModel {
+        model_id: "ai21.j2-ultra-v1",
+        model_name: "Jurassic-2 Ultra",
+        provider_name: "AI21 Labs",
+        input_modalities: IN_TEXT,
+        output_modalities: OUT_TEXT,
+        response_streaming_supported: false,
+        customizations_supported: NO_CUSTOMIZATION,
+        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        lifecycle_status: LIFECYCLE_LEGACY,
+    },
+    FoundationModel {
+        model_id: "ai21.jamba-1-5-mini-v1:0",
+        model_name: "Jamba 1.5 Mini",
+        provider_name: "AI21 Labs",
+        input_modalities: IN_TEXT,
+        output_modalities: OUT_TEXT,
+        response_streaming_supported: true,
+        customizations_supported: NO_CUSTOMIZATION,
+        inference_types_supported: ON_DEMAND,
+        lifecycle_status: LIFECYCLE_ACTIVE,
+    },
+    FoundationModel {
+        model_id: "amazon.nova-canvas-v1:0",
+        model_name: "Nova Canvas",
+        provider_name: "Amazon",
+        input_modalities: IN_TEXT_AND_IMAGE,
+        output_modalities: OUT_IMAGE,
+        response_streaming_supported: false,
+        customizations_supported: NO_CUSTOMIZATION,
+        inference_types_supported: ON_DEMAND,
+        lifecycle_status: LIFECYCLE_ACTIVE,
+    },
+    FoundationModel {
+        model_id: "amazon.nova-lite-v1:0",
+        model_name: "Nova Lite",
+        provider_name: "Amazon",
+        input_modalities: IN_TEXT_AND_IMAGE,
+        output_modalities: OUT_TEXT,
+        response_streaming_supported: true,
+        customizations_supported: FINE_TUNING_AND_DISTILLATION,
+        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        lifecycle_status: LIFECYCLE_ACTIVE,
+    },
+    FoundationModel {
+        model_id: "amazon.nova-micro-v1:0",
+        model_name: "Nova Micro",
+        provider_name: "Amazon",
+        input_modalities: IN_TEXT,
+        output_modalities: OUT_TEXT,
+        response_streaming_supported: true,
+        customizations_supported: FINE_TUNING_AND_DISTILLATION,
+        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        lifecycle_status: LIFECYCLE_ACTIVE,
+    },
+    FoundationModel {
+        model_id: "amazon.nova-pro-v1:0",
+        model_name: "Nova Pro",
+        provider_name: "Amazon",
+        input_modalities: IN_TEXT_AND_IMAGE,
+        output_modalities: OUT_TEXT,
+        response_streaming_supported: true,
+        customizations_supported: FINE_TUNING_AND_DISTILLATION,
+        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        lifecycle_status: LIFECYCLE_ACTIVE,
+    },
+    FoundationModel {
+        model_id: "amazon.titan-embed-image-v1",
+        model_name: "Titan Embed Image",
+        provider_name: "Amazon",
+        input_modalities: IN_TEXT_AND_IMAGE,
+        output_modalities: OUT_EMBEDDING,
+        response_streaming_supported: false,
+        customizations_supported: FINE_TUNING,
+        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        lifecycle_status: LIFECYCLE_ACTIVE,
+    },
+    FoundationModel {
+        model_id: "amazon.titan-embed-text-v2:0",
+        model_name: "Titan Embed Text V2",
+        provider_name: "Amazon",
+        input_modalities: IN_TEXT,
+        output_modalities: OUT_EMBEDDING,
+        response_streaming_supported: false,
+        customizations_supported: NO_CUSTOMIZATION,
+        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        lifecycle_status: LIFECYCLE_ACTIVE,
+    },
+    FoundationModel {
+        model_id: "amazon.titan-image-generator-v1",
+        model_name: "Titan Image Gen G1",
+        provider_name: "Amazon",
+        input_modalities: IN_TEXT_AND_IMAGE,
+        output_modalities: OUT_IMAGE,
+        response_streaming_supported: false,
+        customizations_supported: FINE_TUNING,
+        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        lifecycle_status: LIFECYCLE_ACTIVE,
+    },
+    FoundationModel {
+        model_id: "amazon.titan-text-express-v1",
+        model_name: "Titan Text Express",
+        provider_name: "Amazon",
+        input_modalities: IN_TEXT,
+        output_modalities: OUT_TEXT,
+        response_streaming_supported: true,
+        customizations_supported: FINE_TUNING_AND_PRE_TRAINING,
+        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        lifecycle_status: LIFECYCLE_LEGACY,
+    },
+    FoundationModel {
+        model_id: "amazon.titan-text-lite-v1",
+        model_name: "Titan Text Lite",
+        provider_name: "Amazon",
+        input_modalities: IN_TEXT,
+        output_modalities: OUT_TEXT,
+        response_streaming_supported: true,
+        customizations_supported: FINE_TUNING_AND_PRE_TRAINING,
+        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        lifecycle_status: LIFECYCLE_ACTIVE,
+    },
+    FoundationModel {
+        model_id: "amazon.titan-text-premier-v1:0",
+        model_name: "Titan Text Premier",
+        provider_name: "Amazon",
+        input_modalities: IN_TEXT,
+        output_modalities: OUT_TEXT,
+        response_streaming_supported: true,
+        customizations_supported: FINE_TUNING,
+        inference_types_supported: ON_DEMAND,
+        lifecycle_status: LIFECYCLE_ACTIVE,
+    },
+    FoundationModel {
+        model_id: "anthropic.claude-3-5-sonnet-20241022-v2:0",
+        model_name: "Claude 3.5 Sonnet",
+        provider_name: "Anthropic",
+        input_modalities: IN_TEXT_AND_IMAGE,
+        output_modalities: OUT_TEXT,
+        response_streaming_supported: true,
+        customizations_supported: NO_CUSTOMIZATION,
+        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        lifecycle_status: LIFECYCLE_ACTIVE,
+    },
+    FoundationModel {
+        model_id: "anthropic.claude-3-haiku-20240307-v1:0",
+        model_name: "Claude 3 Haiku",
+        provider_name: "Anthropic",
+        input_modalities: IN_TEXT_AND_IMAGE,
+        output_modalities: OUT_TEXT,
+        response_streaming_supported: true,
+        customizations_supported: FINE_TUNING,
+        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        lifecycle_status: LIFECYCLE_ACTIVE,
+    },
+    FoundationModel {
+        model_id: "anthropic.claude-3-sonnet-20240229-v1:0",
+        model_name: "Claude 3 Sonnet",
+        provider_name: "Anthropic",
+        input_modalities: IN_TEXT_AND_IMAGE,
+        output_modalities: OUT_TEXT,
+        response_streaming_supported: true,
+        customizations_supported: NO_CUSTOMIZATION,
+        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        lifecycle_status: LIFECYCLE_ACTIVE,
+    },
+    FoundationModel {
+        model_id: "anthropic.claude-v2",
+        model_name: "Claude",
+        provider_name: "Anthropic",
+        input_modalities: IN_TEXT,
+        output_modalities: OUT_TEXT,
+        response_streaming_supported: true,
+        customizations_supported: NO_CUSTOMIZATION,
+        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        lifecycle_status: LIFECYCLE_LEGACY,
+    },
+    FoundationModel {
+        model_id: "cohere.command-light-text-v14",
+        model_name: "Command Light",
+        provider_name: "Cohere",
+        input_modalities: IN_TEXT,
+        output_modalities: OUT_TEXT,
+        response_streaming_supported: true,
+        customizations_supported: FINE_TUNING,
+        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        lifecycle_status: LIFECYCLE_ACTIVE,
+    },
+    FoundationModel {
+        model_id: "cohere.command-text-v14",
+        model_name: "Command",
+        provider_name: "Cohere",
+        input_modalities: IN_TEXT,
+        output_modalities: OUT_TEXT,
+        response_streaming_supported: true,
+        customizations_supported: FINE_TUNING,
+        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        lifecycle_status: LIFECYCLE_ACTIVE,
+    },
+    FoundationModel {
+        model_id: "cohere.embed-english-v3",
+        model_name: "Embed English",
+        provider_name: "Cohere",
+        input_modalities: IN_TEXT,
+        output_modalities: OUT_EMBEDDING,
+        response_streaming_supported: false,
+        customizations_supported: NO_CUSTOMIZATION,
+        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        lifecycle_status: LIFECYCLE_ACTIVE,
+    },
+    FoundationModel {
+        model_id: "meta.llama2-70b-chat-v1",
+        model_name: "Llama 2 Chat 70B",
+        provider_name: "Meta",
+        input_modalities: IN_TEXT,
+        output_modalities: OUT_TEXT,
+        response_streaming_supported: true,
+        customizations_supported: FINE_TUNING,
+        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        lifecycle_status: LIFECYCLE_LEGACY,
+    },
+    FoundationModel {
+        model_id: "meta.llama3-1-8b-instruct-v1:0",
+        model_name: "Llama 3.1 8B",
+        provider_name: "Meta",
+        input_modalities: IN_TEXT,
+        output_modalities: OUT_TEXT,
+        response_streaming_supported: true,
+        customizations_supported: FINE_TUNING,
+        inference_types_supported: ON_DEMAND,
+        lifecycle_status: LIFECYCLE_ACTIVE,
+    },
+    FoundationModel {
+        model_id: "meta.llama3-70b-instruct-v1:0",
+        model_name: "Llama 3 70B Instruct",
+        provider_name: "Meta",
+        input_modalities: IN_TEXT,
+        output_modalities: OUT_TEXT,
+        response_streaming_supported: true,
+        customizations_supported: NO_CUSTOMIZATION,
+        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        lifecycle_status: LIFECYCLE_ACTIVE,
+    },
+    FoundationModel {
+        model_id: "mistral.mistral-large-2402-v1:0",
+        model_name: "Mistral Large",
+        provider_name: "Mistral AI",
+        input_modalities: IN_TEXT,
+        output_modalities: OUT_TEXT,
+        response_streaming_supported: true,
+        customizations_supported: NO_CUSTOMIZATION,
+        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        lifecycle_status: LIFECYCLE_ACTIVE,
+    },
+    FoundationModel {
+        model_id: "mistral.mixtral-8x7b-instruct-v0:1",
+        model_name: "Mixtral 8x7B",
+        provider_name: "Mistral AI",
+        input_modalities: IN_TEXT,
+        output_modalities: OUT_TEXT,
+        response_streaming_supported: true,
+        customizations_supported: NO_CUSTOMIZATION,
+        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        lifecycle_status: LIFECYCLE_ACTIVE,
+    },
+    FoundationModel {
+        model_id: "stability.stable-diffusion-xl-v1",
+        model_name: "SDXL 1.0",
+        provider_name: "Stability AI",
+        input_modalities: IN_TEXT_AND_IMAGE,
+        output_modalities: OUT_IMAGE,
+        response_streaming_supported: false,
+        customizations_supported: NO_CUSTOMIZATION,
+        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        lifecycle_status: LIFECYCLE_ACTIVE,
+    },
+];
+
+/// The catalog as the per-service store holds it: one entry per `modelId`, keyed by it, so
+/// iteration is in `modelId` order and a lookup by id is one map probe.
+///
+/// A newtype so it SEEDS ITSELF ([`Default`]) out of [`FOUNDATION_MODELS`]: the store
+/// around it keeps its derived `Default`, and every handler that reports or resolves a
+/// base model reads the catalog through the engine like any other part of this service's
+/// state rather than reaching for the constant.
+#[derive(Debug, Clone)]
+pub struct FoundationModelCatalog(BTreeMap<&'static str, FoundationModel>);
+
+impl Default for FoundationModelCatalog {
+    fn default() -> Self {
+        Self(
+            FOUNDATION_MODELS
+                .iter()
+                .map(|model| (model.model_id, *model))
+                .collect(),
+        )
+    }
+}
+
+impl FoundationModelCatalog {
+    /// Every model in the catalog, in `modelId` order.
+    pub fn models(&self) -> impl Iterator<Item = &FoundationModel> {
+        self.0.values()
+    }
+
+    /// The model a `modelId` names, or `None` when the catalog carries no such model.
+    #[must_use]
+    pub fn model(&self, model_id: &str) -> Option<&FoundationModel> {
+        self.0.get(model_id)
+    }
+}
+
+/// The `foundation-model` ARN of `model_id` in `region`:
+/// `arn:aws:bedrock:<region>::foundation-model/<modelId>`.
+///
+/// Built here rather than through `::engine::emulator_arn` because `FoundationModelArn` is
+/// `^arn:aws(-[^:]+)?:bedrock:[a-z0-9-]{1,20}::foundation-model/…$` — an EMPTY account
+/// field, since a foundation model is published by AWS rather than owned by the account
+/// reading it, so the canonical account id that helper interpolates would put this ARN
+/// outside the pattern the model declares for it.
+#[must_use]
+pub fn foundation_model_arn(region: &str, model_id: &str) -> String {
+    format!("arn:aws:{ARN_NAMESPACE}:{region}::foundation-model/{model_id}")
+}
+
+/// Whether `by_provider` — a `ListFoundationModels` `byProvider` filter — names `model`'s
+/// provider.
+///
+/// Accepted spellings: the provider's own `providerName` as the catalog reports it, and the
+/// provider segment of the `modelId` (everything before its first `.`), which is the
+/// lowercase spelling the AWS CLI's own examples pass. Compared case-insensitively,
+/// because `Provider` declares a pattern (`^[A-Za-z0-9- ]{1,63}$`) and no case.
+#[must_use]
+pub fn provider_matches(model: &FoundationModel, by_provider: &str) -> bool {
+    let id_provider = model
+        .model_id
+        .split_once('.')
+        .map_or(model.model_id, |(provider, _)| provider);
+    by_provider.eq_ignore_ascii_case(model.provider_name)
+        || by_provider.eq_ignore_ascii_case(id_provider)
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

@@ -210,9 +210,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .transit_gateway_attachments
             .contains_key(attachment_id)
         {
-            return Err(state::id_not_found(
-                state::INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_NOT_FOUND,
-                "transit gateway attachment ID",
+            return Err(state::invalid_transit_gateway_attachment_id_not_found(
                 attachment_id,
             ));
         }
@@ -239,9 +237,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .filter(|association| association.transit_gateway_attachment_id == attachment_id)
         };
         if of_attachment().next().is_none() {
-            return Err(state::id_not_found(
-                state::INVALID_TRANSIT_GATEWAY_ATTACHMENT_ID_NOT_FOUND,
-                "transit gateway attachment ID",
+            return Err(state::invalid_transit_gateway_attachment_id_not_found(
                 attachment_id,
             ));
         }

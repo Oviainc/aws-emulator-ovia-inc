@@ -2,7 +2,7 @@
 
 //! Engine state for the com-amazonaws-sfn-awsstepfunctions service.
 //!
-//! Three resources live here, and every operation answers from them:
+//! Four resources live here, and every operation answers from them:
 //!
 //! * a **state machine**, keyed by its own ARN
 //!   (`arn:aws:states:<region>:<account>:stateMachine:<name>`). That ARN is a total
@@ -14,6 +14,11 @@
 //!   configuration taken when `publish` was set, keyed by its own qualified ARN
 //!   (`<stateMachineArn>:<version>`), so one state machine's versions sit
 //!   contiguously under its ARN and go with it when it is deleted;
+//! * an **activity**, keyed by its own ARN
+//!   (`arn:aws:states:<region>:<account>:activity:<name>`). That ARN is the same total
+//!   function of the region and the name, so the ARN-keyed map IS the name index
+//!   `CreateActivity`'s idempotency check needs, and an activity name is scoped per
+//!   region and account exactly as a state machine name is;
 //! * an **execution**, keyed by its own ARN
 //!   (`arn:aws:states:<region>:<account>:execution:<stateMachineName>:<executionName>`),
 //!   with `executions_by_sm` listing one state machine's executions in start order so
@@ -40,7 +45,8 @@
 //! ## ARNs are validated before anything is looked up
 //!
 //! Every operation reads its ARN members through [`read_state_machine_arn`],
-//! [`read_execution_arn`], [`read_taggable_arn`] or [`read_map_run_arn`], each of
+//! [`read_execution_arn`], [`read_activity_arn`], [`read_taggable_arn`] or
+//! [`read_map_run_arn`], each of
 //! which judges the ARN itself — its syntax, its service and the region the
 //! request's endpoint serves — BEFORE the store is consulted, and answers the
 //! message the modelled `InvalidArn` carries. A defect in the ARN is therefore
@@ -83,10 +89,9 @@ pub const EXPRESS_EXECUTION_RESOURCE: &str = "express";
 /// The resource type an activity ARN carries.
 ///
 /// A Step Functions tagging call takes "the ARN for the Step Functions state
-/// machine or activity", so this is the second resource type those calls accept —
-/// even though no activity can exist in this emulator yet (`CreateActivity` still
-/// answers 501), which is why an activity ARN is a resource that cannot be found
-/// rather than an ARN that cannot be read.
+/// machine or activity", so this is the second resource type those calls accept,
+/// and `CreateActivity`/`DescribeActivity` read it through
+/// [`read_activity_arn`].
 pub const ACTIVITY_RESOURCE: &str = "activity";
 
 /// The resource type a Map Run ARN carries (`ListExecutions`' `mapRunArn`).
@@ -368,6 +373,14 @@ pub const MAX_EXECUTIONS_PER_STATE_MACHINE: usize = 1_000;
 /// number of state machines.
 pub const MAX_EXECUTIONS: usize = 10_000;
 
+/// The most activities the WHOLE store holds, refused with the modelled
+/// `ActivityLimitExceeded`.
+///
+/// Emulator resource guard, NOT an AWS quota, and set for the same reason as
+/// [`MAX_STATE_MACHINES`]: it counts across every region, so a caller that varies
+/// the region it signs for cannot mint a fresh quota.
+pub const MAX_ACTIVITIES: usize = 1_000;
+
 /// The most versions one state machine keeps, refused with the modelled
 /// `ServiceQuotaExceededException`.
 ///
@@ -384,7 +397,7 @@ pub const MAX_VERSIONS_PER_STATE_MACHINE: usize = 1_000;
 /// for the revisionId parameter."
 pub const INITIAL_REVISION_ID: &str = "INITIAL";
 
-/// The most tags one state machine may carry, refused with the modelled
+/// The most tags one state machine or activity may carry, refused with the modelled
 /// `TooManyTags`. The AWS-wide per-resource tag limit.
 pub const MAX_TAGS: usize = 50;
 
@@ -466,7 +479,7 @@ pub struct StateMachine {
     /// Set by [`ComAmazonawsSfnAwsstepfunctionsState::insert_state_machine`] from
     /// [`StateMachine::measure`], and moved by the one operation that changes what a
     /// stored state machine holds:
-    /// [`ComAmazonawsSfnAwsstepfunctionsState::merge_state_machine_tags`] re-counts
+    /// [`ComAmazonawsSfnAwsstepfunctionsState::merge_tags`] re-counts
     /// the tag set it wrote. A constructor may leave it `0`.
     pub retained_bytes: usize,
 }
@@ -551,6 +564,33 @@ impl StateMachineVersion {
             + self.sm_type.len()
             + self.revision_id.as_ref().map_or(0, String::len)
             + self.description.as_ref().map_or(0, String::len)
+    }
+}
+
+/// One stored activity: every member `DescribeActivity` reports, plus the tag set
+/// the tagging calls read and write.
+///
+/// An activity is "a task that you write in any programming language and host on any
+/// machine": the service holds its identity alone — no definition, no status and no
+/// transition the clock owes — so this record never changes after it is stored,
+/// except for its tags.
+#[derive(Debug, Clone)]
+pub struct Activity {
+    pub arn: String,
+    pub name: String,
+    pub creation_date: SystemTime,
+    pub encryption_configuration: Option<EncryptionConfiguration>,
+    pub tags: Vec<Tag>,
+    /// The bytes the store counts for this record against [`MAX_STORE_BYTES`], set
+    /// by [`ComAmazonawsSfnAwsstepfunctionsState::insert_activity`] and moved by a
+    /// tag write. A constructor may leave it `0`.
+    pub retained_bytes: usize,
+}
+
+impl Activity {
+    /// The bytes this record would retain; see [`StateMachine::measure`].
+    pub fn measure(&self) -> usize {
+        std::mem::size_of::<Self>() + self.arn.len() + self.name.len() + tags_bytes(&self.tags)
     }
 }
 
@@ -850,6 +890,10 @@ pub struct ComAmazonawsSfnAwsstepfunctionsState {
     /// is one lookup, and `ListStateMachines` — which reports state machines, not
     /// versions — still walks `state_machines` alone.
     pub state_machine_versions: BTreeMap<String, StateMachineVersion>,
+    /// Every activity, keyed by its ARN. A `BTreeMap` for the same reasons the state
+    /// machines are in one: one stable, total order for a paged list, and the ARN
+    /// key doubling as the name index `CreateActivity`'s idempotency check reads.
+    pub activities: BTreeMap<String, Activity>,
     /// Every execution, keyed by its ARN.
     pub executions: BTreeMap<String, Execution>,
     /// One state machine's execution ARNs in start order.
@@ -976,21 +1020,79 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         self.state_machines.insert(machine.arn.clone(), machine);
     }
 
+    /// Store a newly created activity under its own ARN, counting what it retains.
+    pub fn insert_activity(&mut self, mut activity: Activity) {
+        activity.retained_bytes = activity.measure();
+        self.retained_bytes = self.retained_bytes.saturating_add(activity.retained_bytes);
+        self.activities.insert(activity.arn.clone(), activity);
+    }
+
+    /// Remove the activity `arn` names, giving back what its record retained, and
+    /// report the record that was removed.
+    ///
+    /// `None` when the store held no activity under that ARN, which `DeleteActivity`
+    /// — whose model declares no does-not-exist error — treats as the state the call
+    /// asked for rather than as a failure.
+    pub fn remove_activity(&mut self, arn: &str) -> Option<Activity> {
+        let activity = self.activities.remove(arn)?;
+        self.retained_bytes = self.retained_bytes.saturating_sub(activity.retained_bytes);
+        Some(activity)
+    }
+
+    /// Why the store cannot take one more activity of `bytes`, or `None` when it
+    /// can. The caps are on the WHOLE store, like every other cap here.
+    pub fn activity_rejection(&self, bytes: usize) -> Option<String> {
+        if self.activities.len() >= MAX_ACTIVITIES {
+            return Some(format!(
+                "this emulator already holds the maximum of {MAX_ACTIVITIES} activities"
+            ));
+        }
+        if !self.has_room_for(bytes) {
+            return Some(format!(
+                "this activity would take the store past the {MAX_STORE_BYTES} bytes this \
+                 emulator retains"
+            ));
+        }
+        None
+    }
+
     /// The tags recorded under a taggable ARN — an EMPTY list when none are.
     ///
     /// This is a read of the tag set, not a resolution of the resource: a tagging
     /// read reports "an array of tags associated with the resource", and the array
     /// of an ARN nothing is tagged under is empty, whether the resource carries no
     /// tags or the store holds no resource under that ARN at all. The write path
-    /// ([`Self::merge_state_machine_tags`]) is where a resource has to exist.
+    /// ([`Self::merge_tags`]) is where a resource has to exist.
+    ///
+    /// Both taggable resource types answer here: a tagging call takes "the ARN for
+    /// the Step Functions state machine or activity", and one ARN names at most one
+    /// of them, since the resource type is a field of the ARN itself.
     pub fn tags_of(&self, arn: &str) -> Vec<Tag> {
-        self.state_machines
-            .get(arn)
-            .map(|machine| machine.tags.clone())
-            .unwrap_or_default()
+        self.tags_at(arn).cloned().unwrap_or_default()
     }
 
-    /// Merge `incoming` into the tags of the state machine `arn` names.
+    /// The tag set stored under `arn`, whichever taggable resource type holds it, or
+    /// `None` when the store holds no resource under that ARN.
+    fn tags_at(&self, arn: &str) -> Option<&Vec<Tag>> {
+        if let Some(machine) = self.state_machines.get(arn) {
+            return Some(&machine.tags);
+        }
+        self.activities.get(arn).map(|activity| &activity.tags)
+    }
+
+    /// The tag set and the record measurement of the taggable resource `arn` names,
+    /// for the two writes below, so each of them states the merge rule ONCE rather
+    /// than once per resource type.
+    fn taggable_record_mut(&mut self, arn: &str) -> Option<(&mut Vec<Tag>, &mut usize)> {
+        if let Some(machine) = self.state_machines.get_mut(arn) {
+            return Some((&mut machine.tags, &mut machine.retained_bytes));
+        }
+        self.activities
+            .get_mut(arn)
+            .map(|activity| (&mut activity.tags, &mut activity.retained_bytes))
+    }
+
+    /// Merge `incoming` into the tags of the taggable resource `arn` names.
     ///
     /// A resource's tags are a MAP keyed by tag key: a key the resource already
     /// carries takes the incoming value in place, and a key it does not carry is
@@ -1004,19 +1106,16 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
     /// could only ever be refused — is refused up front, leaving at most
     /// `MAX_TAGS` iterations over at most `2 * MAX_TAGS` entries however long the
     /// request's list is.
-    pub fn merge_state_machine_tags(
-        &mut self,
-        arn: &str,
-        incoming: &[Tag],
-    ) -> Result<(), TagWriteRejection> {
-        let Some(machine) = self.state_machines.get(arn) else {
+    pub fn merge_tags(&mut self, arn: &str, incoming: &[Tag]) -> Result<(), TagWriteRejection> {
+        let Some(current) = self.tags_at(arn) else {
             return Err(TagWriteRejection::NotFound);
         };
         if incoming.len() > MAX_TAGS {
             return Err(TagWriteRejection::TooManyTags(incoming.len()));
         }
 
-        let mut merged = machine.tags.clone();
+        let tags_before = tags_bytes(current);
+        let mut merged = current.clone();
         for tag in incoming {
             match merged.iter_mut().find(|existing| existing.key == tag.key) {
                 Some(existing) => existing.value = tag.value.clone(),
@@ -1030,31 +1129,28 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         // The tags are caller-sized, so the record's measurement moves by what the
         // write changed and a write that would take the store past
         // [`MAX_STORE_BYTES`] is refused instead of growing it.
-        let before = machine.retained_bytes;
-        let after = before
-            .saturating_sub(tags_bytes(&machine.tags))
-            .saturating_add(tags_bytes(&merged));
-        if after > before && !self.has_room_for(after - before) {
+        let tags_after = tags_bytes(&merged);
+        if tags_after > tags_before && !self.has_room_for(tags_after - tags_before) {
             return Err(TagWriteRejection::NoRoom);
         }
 
-        let Some(machine) = self.state_machines.get_mut(arn) else {
+        let Some((tags, retained)) = self.taggable_record_mut(arn) else {
             return Err(TagWriteRejection::NotFound);
         };
-        machine.tags = merged;
-        machine.retained_bytes = after;
+        *tags = merged;
+        *retained = retained.saturating_sub(tags_before).saturating_add(tags_after);
         self.retained_bytes = self
             .retained_bytes
-            .saturating_add(after)
-            .saturating_sub(before);
+            .saturating_sub(tags_before)
+            .saturating_add(tags_after);
         Ok(())
     }
 
-    /// Remove the tags `keys` names from the state machine `arn` names.
+    /// Remove the tags `keys` names from the taggable resource `arn` names.
     ///
     /// Keyed by tag key, like the merge: a key the resource does not carry is
     /// nothing to remove, which is not a failure, and a key removed twice is
-    /// removed once. `false` when the store holds no state machine under `arn` —
+    /// removed once. `false` when the store holds no resource under `arn` —
     /// the modelled `ResourceNotFound` of the write path.
     ///
     /// `keys` is caller-sized, so the WORK is bounded by what the resource holds
@@ -1062,15 +1158,12 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
     /// into a set, the request's list is walked ONCE against it, and only the keys
     /// that actually match are kept — so the allocation is at most `MAX_TAGS`
     /// entries however long the request's list is.
-    pub fn remove_state_machine_tags(&mut self, arn: &str, keys: &[String]) -> bool {
-        let Some(machine) = self.state_machines.get(arn) else {
+    pub fn remove_tags(&mut self, arn: &str, keys: &[String]) -> bool {
+        let Some(current) = self.tags_at(arn) else {
             return false;
         };
-        let present: std::collections::HashSet<&str> = machine
-            .tags
-            .iter()
-            .filter_map(|tag| tag.key.as_deref())
-            .collect();
+        let present: std::collections::HashSet<&str> =
+            current.iter().filter_map(|tag| tag.key.as_deref()).collect();
         let removing: std::collections::HashSet<String> = keys
             .iter()
             .filter(|key| present.contains(key.as_str()))
@@ -1081,25 +1174,20 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             // and the record's measurement cannot have moved.
             return true;
         }
-        let before = machine.retained_bytes;
-        let tags_before = tags_bytes(&machine.tags);
+        let tags_before = tags_bytes(current);
 
-        let Some(machine) = self.state_machines.get_mut(arn) else {
+        let Some((tags, retained)) = self.taggable_record_mut(arn) else {
             return false;
         };
-        machine
-            .tags
-            .retain(|tag| tag.key.as_deref().is_none_or(|key| !removing.contains(key)));
+        tags.retain(|tag| tag.key.as_deref().is_none_or(|key| !removing.contains(key)));
         // The record's measurement moves by what the write changed; a removal can
         // only shrink it, so it can never take the store past [`MAX_STORE_BYTES`].
-        let after = before
-            .saturating_sub(tags_before)
-            .saturating_add(tags_bytes(&machine.tags));
-        machine.retained_bytes = after;
+        let tags_after = tags_bytes(tags);
+        *retained = retained.saturating_sub(tags_before).saturating_add(tags_after);
         self.retained_bytes = self
             .retained_bytes
-            .saturating_add(after)
-            .saturating_sub(before);
+            .saturating_sub(tags_before)
+            .saturating_add(tags_after);
         true
     }
 
@@ -1658,6 +1746,17 @@ pub fn read_taggable_arn(arn: &str, endpoint_region: &str) -> Result<TaggableRes
              {ACTIVITY_RESOURCE}"
         )));
     }
+    Ok(TaggableResource::Activity(activity_resource(
+        resource, &mut parts,
+    )?))
+}
+
+/// The activity NAME the remaining resource fields name, shared by the readers that
+/// accept an activity ARN.
+fn activity_resource<'a>(
+    resource: &str,
+    parts: &mut impl Iterator<Item = &'a str>,
+) -> Result<String, String> {
     let name = parts.next().unwrap_or_default();
     // An activity ARN carries no qualifier: only versions and aliases of a state
     // machine do.
@@ -1666,7 +1765,21 @@ pub fn read_taggable_arn(arn: &str, endpoint_region: &str) -> Result<TaggableRes
             "Invalid ARN {ACTIVITY_RESOURCE} resource: {resource}"
         )));
     }
-    Ok(TaggableResource::Activity(name.to_string()))
+    Ok(name.to_string())
+}
+
+/// The activity NAME `arn` names, read as an activity ARN of this service in
+/// `endpoint_region`, or the message the modelled `InvalidArn` carries.
+pub fn read_activity_arn(arn: &str, endpoint_region: &str) -> Result<String, String> {
+    let resource = states_arn_resource(arn, endpoint_region)?;
+    let mut parts = resource.splitn(3, ':');
+    let kind = parts.next().unwrap_or_default();
+    if kind != ACTIVITY_RESOURCE {
+        return Err(invalid_arn_message(format!(
+            "Invalid ARN resource type: {kind}, expected {ACTIVITY_RESOURCE}"
+        )));
+    }
+    activity_resource(resource, &mut parts)
 }
 
 /// What the modelled `ResourceNotFound` says about a taggable ARN the store holds no
@@ -1742,6 +1855,14 @@ pub const EXECUTION_ALREADY_EXISTS: &str = "Execution Already Exists";
 /// `StateMachineAlreadyExists`'s, for [`resource_error_message`]. RECORDED text.
 pub const STATE_MACHINE_ALREADY_EXISTS: &str = "State Machine Already Exists";
 
+/// `ActivityDoesNotExist`'s, for [`resource_error_message`]. The error's own name
+/// under the rule above — the condition in spaced Title Case, then the ARN the
+/// request named — not a recorded message.
+pub const ACTIVITY_DOES_NOT_EXIST: &str = "Activity Does Not Exist";
+
+/// `ActivityAlreadyExists`'s, for [`resource_error_message`], under the same rule.
+pub const ACTIVITY_ALREADY_EXISTS: &str = "Activity Already Exists";
+
 /// `InvalidName`'s, for [`resource_error_message`]. RECORDED text
 /// (`states-creation-input-validation-errors#task#8` records
 /// `Invalid Name: '<name>'`): the quoted value is the NAME the caller sent, not
@@ -1811,7 +1932,7 @@ pub enum RedriveRejection {
 }
 
 /// Why a tag write was not applied; see
-/// [`ComAmazonawsSfnAwsstepfunctionsState::merge_state_machine_tags`].
+/// [`ComAmazonawsSfnAwsstepfunctionsState::merge_tags`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TagWriteRejection {
     /// The store holds no resource under that ARN — the modelled `ResourceNotFound`.
@@ -1856,6 +1977,16 @@ pub fn state_machine_arn(region: &str, name: &str) -> String {
         region,
         &format!("{STATE_MACHINE_RESOURCE}:{name}"),
     )
+}
+
+/// The ARN of the activity `name` in `region`.
+///
+/// An activity ARN is the same total function of the region and the name a state
+/// machine ARN is ([`state_machine_arn`]), with the activity resource type: that is
+/// what makes the ARN-keyed store the name index `CreateActivity`'s idempotency
+/// check reads.
+pub fn activity_arn(region: &str, name: &str) -> String {
+    ::engine::emulator_arn(ARN_SERVICE, region, &format!("{ACTIVITY_RESOURCE}:{name}"))
 }
 
 /// The prefix every state machine ARN of `region` begins with: the ARN of the empty

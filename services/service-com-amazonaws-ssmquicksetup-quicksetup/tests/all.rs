@@ -15,6 +15,8 @@
 mod configuration_definitions;
 #[path = "all/configuration_managers.rs"]
 mod configuration_managers;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/service_settings_and_types.rs"]
 mod service_settings_and_types;
 #[path = "all/state_roundtrip.rs"]

@@ -313,8 +313,14 @@ fn limit_exceeded(result: &Value) -> bool {
 async fn list_compliance_status_is_refused_until_an_administrator_is_associated() {
     let (router, engine) = emulator_with_engine();
     // A stored policy, so the gate is shown to run before the id is looked up:
-    // the known and the unknown id are refused identically.
+    // the known and the unknown id are refused identically. Writing a policy is
+    // organisation-scoped too, so it is created with an administrator associated
+    // and the association is then removed through the store seam — which is the
+    // precondition rule 1 is about: a store that holds policies but no
+    // administrator.
+    associate(&router, ADMIN).await;
     let policy_id = put_policy(&router, "gated", None, None).await;
+    with_store(&engine, |store| store.admin_account = None);
 
     // Request shapes spanning everything the operation accepts: a known id, an id
     // naming nothing, each published `MaxResults` bound, and a `NextToken` this

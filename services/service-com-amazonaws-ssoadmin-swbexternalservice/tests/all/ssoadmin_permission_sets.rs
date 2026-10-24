@@ -67,6 +67,23 @@ pub(crate) fn with_store<R>(
     change(&mut store)
 }
 
+/// Move the stored deletion instant of every instance whose removal a `DeleteInstance`
+/// owes to `due_at`, so both sides of that instant can be observed without the test
+/// sleeping.
+///
+/// The transition itself is still applied by the service's own `materialize_due`, exactly
+/// as in production: this moves only the CLOCK's instant, which is the clock's business
+/// and not the wire's.
+pub(crate) fn hold_deletion(engine: &Arc<engine::InMemoryEngine>, due_at: std::time::SystemTime) {
+    with_store(engine, |store| {
+        for instance in store.instances.values_mut() {
+            if instance.deleted_due.is_some() {
+                instance.deleted_due = Some(due_at);
+            }
+        }
+    });
+}
+
 /// The same router, over an engine the caller already holds (so a test can seed state
 /// through [`service_com_amazonaws_ssoadmin_swbexternalservice::state`] the way the
 /// service's own `Default` does).

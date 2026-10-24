@@ -388,10 +388,12 @@ async fn a_client_token_makes_a_start_idempotent() {
 async fn untag_judges_every_key_against_the_modelled_tag_key_form() {
     // Keys the `TagKey` pattern `^[\w\s\.\-\:\/\=\+\@]+$` with `@length(1, 128)`
     // ADMITS (`smithy_query(query="shape",shape="TagKey")`): a word, every
-    // punctuation character of the class, whitespace, and the length bound.
+    // punctuation character of the class, whitespace, and the length bound. A key
+    // in the provider's reserved namespace is refused whatever its form, which
+    // [`super::reserved_tag_keys`] covers.
     let valid_keys = [
         ("word", "team".to_string()),
-        ("punctuation", "aws:cost/center=1+2@x.y-z_0".to_string()),
+        ("punctuation", "ops:cost/center=1+2@x.y-z_0".to_string()),
         ("whitespace", "cost center".to_string()),
         ("at-max-length", "k".repeat(128)),
     ];
