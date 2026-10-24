@@ -24,6 +24,9 @@ tracing = { workspace = true }
 # Opaque pagination tokens: the cursor payload is hex-encoded so a client only
 # round-trips it.
 hex = { workspace = true }
+# Reads a lookup table's CSV body (`CreateLookupTable$tableBody`) to its header row and
+# data rows, as CSV defines quoting and embedded separators.
+csv = "1.3"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

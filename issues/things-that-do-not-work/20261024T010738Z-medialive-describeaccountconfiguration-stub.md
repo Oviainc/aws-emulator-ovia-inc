@@ -23,3 +23,15 @@ The handler carries the scaffold marker `//! SCAFFOLDED, NOT IMPLEMENTED:` at th
 
 1. Boot the medialive emulator
 2. Call DescribeAccountConfiguration and observe HTTP 501 with no state persisted
+
+## Update
+
+`DescribeAccountConfiguration` is NO LONGER A STUB: it was implemented, and its
+`//! SCAFFOLDED, NOT IMPLEMENTED:` census line deleted, as the round-trip reader
+of the fix for
+`issues/things-that-now-work/20261024T010738Z-medialive-updateaccountconfiguration-stub.md`
+— it reads the per-region account configuration out of the
+`crate::state::account_configuration` slice and writes nothing, and
+`services/service-com-amazonaws-medialive-medialive/tests/all/account_configuration.rs`
+exercises it end to end. This report is left here only so its own session can
+confirm that and close it; there is no scaffold left to replace.

@@ -58,7 +58,10 @@ async fn source_metadata(emulator: &Emulator, flow_arn: &str) -> (u16, Option<St
 }
 
 /// Create a flow and return `(FlowArn, the source names DescribeFlow reports for it)`.
-async fn create(emulator: &Emulator, case: &str, body: Value) -> (String, Vec<String>) {
+///
+/// `pub(crate)` because the source-thumbnail suite reports on the same fixture flows
+/// (`tests/all/flow_source_thumbnail.rs`), so there is one way to set one up.
+pub(crate) async fn create(emulator: &Emulator, case: &str, body: Value) -> (String, Vec<String>) {
     let (status, code, created) = emulator.create_flow(body).await;
     assert_eq!(
         (status, code.as_deref()),
@@ -86,7 +89,10 @@ async fn create(emulator: &Emulator, case: &str, body: Value) -> (String, Vec<St
 }
 
 /// The `(code, resourceName)` pairs of a `messages` list, in the order it reports them.
-fn coded(messages: &Value) -> Vec<(String, String)> {
+///
+/// `pub(crate)`: `ThumbnailDetails$ThumbnailMessages` is the same `__listOfMessageDetail`,
+/// read the same way by `tests/all/flow_source_thumbnail.rs`.
+pub(crate) fn coded(messages: &Value) -> Vec<(String, String)> {
     messages
         .as_array()
         .cloned()
@@ -105,8 +111,9 @@ fn coded(messages: &Value) -> Vec<(String, String)> {
 }
 
 /// Assert that every message of `messages` carries a non-empty `message` string, so the
-/// list is a status report rather than bare codes.
-fn assert_messages_are_worded(case: &str, messages: &Value) {
+/// list is a status report rather than bare codes. `pub(crate)` for the same reason as
+/// [`coded`].
+pub(crate) fn assert_messages_are_worded(case: &str, messages: &Value) {
     for message in messages.as_array().cloned().unwrap_or_default() {
         assert!(
             message["message"]

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteQev2IdcApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteQev2IdcApplication`'s real behaviour. Implement it here — this is
+//! IMPLEMENTED: removes one registered Query Editor (QEV2) IAM Identity Center
+//! application. This is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteQev2IdcApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -160,20 +154,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteQev2IdcApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteQev2IdcApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteQev2IdcApplication"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                DeleteQev2IdcApplicationErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+
+        let Some(position) = store.qev2_idc_application_position(&input.qev2_idc_application_arn)
+        else {
+            return Err(
+                DeleteQev2IdcApplicationErrorModeled::Qev2IdcApplicationNotExistsFault(
+                    Qev2IdcApplicationNotExistsFault {
+                        message: Some(format!(
+                            "Amazon Redshift Query Editor (QEV2) IAM Identity Center application not found: {}",
+                            input.qev2_idc_application_arn
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The operation answers no record, and the application has no status for
+        // a later read to report, so the deletion is complete when this returns:
+        // the application is gone from every later read, and its name is free for
+        // a new one.
+        store.qev2_idc_applications.remove(position);
+
+        Ok(DeleteQev2IdcApplicationOutput)
     }
 }

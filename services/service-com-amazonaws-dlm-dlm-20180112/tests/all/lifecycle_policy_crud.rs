@@ -288,11 +288,16 @@ fn custom_image_details() -> Value {
 async fn a_created_policy_is_read_back_from_what_was_stored() {
     let mut cases = vec![
         (
-            "only the required members",
+            // The smallest create the service accepts: the three `@required`
+            // members plus the one parameter that says what the policy would
+            // do. `DefaultPolicy` is the shortest way to say it — a custom
+            // policy's configuration is a whole `PolicyDetails` structure.
+            "only the required members and the smallest configuration",
             json!({
                 "ExecutionRoleArn": ROLE_ARN,
                 "Description": "nightly ebs",
                 "State": "ENABLED",
+                "DefaultPolicy": "VOLUME",
             }),
         ),
         (
@@ -301,6 +306,7 @@ async fn a_created_policy_is_read_back_from_what_was_stored() {
                 "ExecutionRoleArn": ROLE_ARN,
                 "Description": "paused ebs",
                 "State": "DISABLED",
+                "DefaultPolicy": "INSTANCE",
                 "Tags": {"team": "backups", "env": "prod", "cost-centre": "42"},
             }),
         ),
@@ -532,6 +538,7 @@ async fn two_creates_make_two_distinct_policies() {
         "ExecutionRoleArn": ROLE_ARN,
         "Description": "identical requests",
         "State": "ENABLED",
+        "DefaultPolicy": "VOLUME",
     });
 
     let first = create(&router, request.clone()).await.policy_id();
@@ -580,6 +587,7 @@ async fn a_policy_arn_names_the_signed_region() {
                 "ExecutionRoleArn": ROLE_ARN,
                 "Description": "region scoped",
                 "State": "ENABLED",
+                "DefaultPolicy": "VOLUME",
             })),
         )
         .await;
@@ -1078,6 +1086,7 @@ async fn an_update_advances_date_modified_and_leaves_date_created() {
             "ExecutionRoleArn": ROLE_ARN,
             "Description": "nightly ebs",
             "State": "ENABLED",
+            "PolicyDetails": custom_snapshot_details(),
         }),
     )
     .await
@@ -1175,6 +1184,7 @@ async fn an_unknown_policy_id_is_not_found_everywhere() {
             "ExecutionRoleArn": ROLE_ARN,
             "Description": "a policy that does exist",
             "State": "ENABLED",
+            "PolicyDetails": custom_snapshot_details(),
         }),
     )
     .await
@@ -1250,6 +1260,7 @@ async fn tag_operations_read_and_write_the_stored_tags() {
             "ExecutionRoleArn": ROLE_ARN,
             "Description": "tagged policy",
             "State": "ENABLED",
+            "PolicyDetails": custom_snapshot_details(),
             "Tags": {"team": "backups", "env": "prod"},
         }),
     )
@@ -1261,6 +1272,7 @@ async fn tag_operations_read_and_write_the_stored_tags() {
             "ExecutionRoleArn": ROLE_ARN,
             "Description": "untagged policy",
             "State": "ENABLED",
+            "PolicyDetails": custom_snapshot_details(),
         }),
     )
     .await

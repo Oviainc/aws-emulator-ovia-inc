@@ -38,6 +38,9 @@ mod harness;
 #[path = "all/metadata_transfer_job.rs"]
 mod metadata_transfer_job;
 
+#[path = "all/metadata_transfer_job_cancel.rs"]
+mod metadata_transfer_job_cancel;
+
 #[path = "all/metadata_transfer_job_read.rs"]
 mod metadata_transfer_job_read;
 

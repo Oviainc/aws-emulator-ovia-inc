@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutMaintenanceStartTime
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutMaintenanceStartTime`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Sets the maintenance start time of the gateway an ARN names, in place in
+//! [`crate::state`]. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutMaintenanceStartTime::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The window is one resource, so a put REPLACES whatever the gateway carried
+//! ([`crate::state::ComAmazonawsBackupgatewayBackuponpremisesV20210101State::set_maintenance_start_time`]):
+//! every member the request states is persisted and a day member it does not state is not
+//! on the record afterwards either. `GetGateway` then reports that record's window, so
+//! what a later reader sees is what this call wrote and nothing is recomputed from the
+//! request on the way out — the ARN the response carries is read back off the stored
+//! record.
 //!
 //! ## Shape of an operation
 //!
@@ -75,9 +76,20 @@
 //! ## Errors
 //!
 //! * `ConflictException` (HTTP 409) — The operation cannot proceed because it is not
-//!   supported.
+//!   supported. No fact of this store establishes it: setting the window is supported for
+//!   every gateway the store holds, so this operation never answers it.
 //! * `ResourceNotFoundException` (HTTP 404) — A resource that is required for the action
-//!   wasn't found.
+//!   wasn't found: the refusal for a well-formed `GatewayArn` the store holds no gateway
+//!   under, whether it was never created or has been deleted — the same answer, and the
+//!   same status and absent `ErrorCode`, every other gateway operation of this service
+//!   gives (`get_gateway`, `delete_gateway`, `update_gateway_information`).
+//! * `ValidationException` (HTTP 400) — the refusal for a request naming BOTH `DayOfWeek`
+//!   and `DayOfMonth`, `ErrorCode`
+//!   [`crate::state::MAINTENANCE_START_TIME_INVALID`]: a maintenance start time is weekly
+//!   or monthly, never both. One of the errors this SERVICE models for every operation,
+//!   which `smithy_query(query="operation",operation="PutMaintenanceStartTime")` therefore
+//!   lists for this one (beside `InternalServerException` and `ThrottlingException`) even
+//!   though the operation shape itself does not — hence `extra_errors` below.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -93,11 +105,21 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-backupgateway-backuponp
 // here — hence the `PutMaintenanceStartTimeError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.backupgateway#PutMaintenanceStartTime")]
+// `extra_errors` widens the set with the two errors this SERVICE models for every
+// operation — the ones `smithy_query(query="operation")` reports for this operation by
+// merging the service-common errors in, and which the OPERATION shape in the model does
+// not list itself, so `#[operation_error]` does not generate them. The same widening
+// `put_hypervisor_property_mappings` and `update_gateway_information` do.
+#[smithy_macros::operation_error(
+    "com.amazonaws.backupgateway#PutMaintenanceStartTime",
+    extra_errors = ["ValidationException", "InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum PutMaintenanceStartTimeErrorModeled {
     ConflictException(ConflictException),
     ResourceNotFoundException(ResourceNotFoundException),
+    ValidationException(ValidationException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -151,18 +173,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutMaintenanceStartTime` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutMaintenanceStartTimeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutMaintenanceStartTime"))
+        // Request metadata only; the store is reached through `self.engine`.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutMaintenanceStartTimeErrorModeled::InternalServerException(
+                InternalServerException {
+                    error_code: None,
+                    message: Some(
+                        "Backup gateway state is unavailable on this engine.".to_string(),
+                    ),
+                },
+            )
+        })?;
+
+        // One guard spans the gate and the write, so the record the gate passed is the
+        // record the window is written to.
+        let mut store = state.lock();
+
+        // `GatewayArn`'s length and pattern and the range of every time member are refused
+        // by the boundary validator before `handle` runs, so reaching here means each one
+        // is inside the constraints the model declares. What the model cannot express is
+        // that the two DAY members are alternatives: a window is weekly (`DayOfWeek`) or
+        // monthly (`DayOfMonth`), so a request carrying both states no window this service
+        // can keep and is refused before anything is written.
+        if input.day_of_week.is_some() && input.day_of_month.is_some() {
+            return Err(PutMaintenanceStartTimeErrorModeled::ValidationException(
+                ValidationException {
+                    error_code: Some(crate::state::MAINTENANCE_START_TIME_INVALID.to_string()),
+                    message: Some(
+                        crate::state::MAINTENANCE_START_TIME_INVALID_MESSAGE.to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The MODELLED shape is what is persisted, so a member cannot drift between what
+        // this call stored and what `GetGateway` serialises. Each member is taken from the
+        // request as it stands: `DayOfMonth` is kept over the whole
+        // `@range(min: 1, max: 31)` the model declares for it, which is the wire contract,
+        // even though the stored shape's own member doc describes an ordinal 1 to 28 — AWS
+        // publishes no refusal for the gap, so nothing here narrows the modelled range.
+        let window = MaintenanceStartTime {
+            hour_of_day: input.hour_of_day,
+            minute_of_hour: input.minute_of_hour,
+            day_of_week: input.day_of_week,
+            day_of_month: input.day_of_month,
+        };
+
+        // A gateway that was never created, and one already deleted, are both simply
+        // absent from the store — the same refusal for both, and nothing is written for
+        // either. The member asked for is a `GatewayArn`, so the resource that is missing
+        // is the GATEWAY whatever the ARN's resource type reads: the refusal is the one
+        // every other gateway operation of this service gives — the 404 the shape's
+        // `@httpError` declares, and no `ErrorCode`.
+        let Some(updated) = store.set_maintenance_start_time(&input.gateway_arn, window) else {
+            return Err(
+                PutMaintenanceStartTimeErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        error_code: None,
+                        message: Some(format!(
+                            "The gateway '{}' was not found.",
+                            input.gateway_arn
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The ARN comes back off the record the store now holds, not off the request.
+        Ok(PutMaintenanceStartTimeOutput {
+            gateway_arn: Some(updated.arn),
+        })
     }
 }
