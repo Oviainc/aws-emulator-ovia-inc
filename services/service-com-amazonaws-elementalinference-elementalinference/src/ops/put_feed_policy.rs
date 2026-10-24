@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutFeedPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutFeedPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutFeedPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: attaches the supplied resource-based policy document to the stored
+//! feed, replacing whatever document the feed already held, so `GetFeedPolicy` reports
+//! exactly what the last call stored. Refuses an id no live feed has with
+//! `ResourceNotFoundException` (HTTP 404), a feed whose deletion has been accepted with
+//! `ConflictException` (HTTP 409) and a `policy` that is not a policy document with
+//! `ValidationException` (HTTP 400).
 //!
 //! ## Shape of an operation
 //!
@@ -153,17 +150,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutFeedPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutFeedPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutFeedPolicy"))
+        // request metadata.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(PutFeedPolicyErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: "the com.amazonaws.elementalinference state store is unavailable"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+        let now = std::time::Instant::now();
+
+        // A resource-based policy is a JSON policy document, so a `policy` that does
+        // not parse as one is refused with the modelled ValidationException (HTTP 400)
+        // rather than stored — a document `GetFeedPolicy` could hand back but no policy
+        // evaluator could read is not a policy. This is a property of the REQUEST's own
+        // member, so it is decided before the feed is resolved and before anything is
+        // written: a refused put leaves the feed's policy as it was.
+        if !crate::state::is_policy_document(&input.policy) {
+            return Err(PutFeedPolicyErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::INVALID_POLICY_DOCUMENT_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        let mut state = state.lock();
+        state.settle_due_transitions(now);
+
+        let Some(feed) = state.feeds.get_mut(&input.id) else {
+            return Err(PutFeedPolicyErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::NOT_FOUND_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // A feed whose deletion has been accepted is on its way out of the store, so
+        // attaching a policy to it would grant access to a resource the clock is about
+        // to remove. Refused with the modelled ConflictException (HTTP 409), exactly as
+        // `UpdateFeed` refuses a write to the same feed, and with that rule's invariant
+        // sentence, which reports neither the feed nor its status.
+        if feed.status == crate::state::FeedStatus::Deleting {
+            return Err(PutFeedPolicyErrorModeled::ConflictException(
+                ConflictException {
+                    message: crate::state::FEED_BEING_DELETED_MESSAGE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // "Attaches or replaces": a feed holds at most one policy, so this SETS the
+        // stored document whether or not the feed already had one, which is what makes
+        // the operation idempotent (as the model marks it) — the same put twice leaves
+        // the same single document. The policy is the only thing a put touches: the
+        // feed's own status, outputs and association are not a policy's to move.
+        feed.policy = Some(input.policy);
+
+        Ok(PutFeedPolicyOutput {})
     }
 }

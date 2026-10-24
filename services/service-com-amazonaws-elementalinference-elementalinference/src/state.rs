@@ -5,7 +5,11 @@
 //! The feed is this service's primary resource: `CreateFeed` mints one, `GetFeed` /
 //! `ListFeeds` report it, `UpdateFeed` mutates it and `DeleteFeed` retires it. The
 //! record below is the single copy every one of those handlers reads and writes, so
-//! the shapes the handlers hand back are all built from it.
+//! the shapes the handlers hand back are all built from it. A feed's resource-based
+//! policy is part of that record ([`Feed::policy`]) rather than a store of its own:
+//! `PutFeedPolicy` attaches or replaces it and `GetFeedPolicy` reports it, so the
+//! document a client reads back is the one the last put stored, and a feed that leaves
+//! the store takes its policy with it.
 //!
 //! The dictionary is this service's other resource — a named, language-tagged payload
 //! of custom words a subtitling output can reference. `CreateDictionary` mints one,
@@ -242,6 +246,24 @@ pub fn dictionary_referenced_message(feed_count: usize) -> String {
          all references by delete or disable related feed output(s) before deleting \
          dictionary."
     )
+}
+
+/// `PutFeedPolicy` with a `policy` that is not a policy document.
+///
+/// A resource-based policy is a JSON policy document (`PutFeedPolicyRequest$policy`:
+/// "The resource-based policy document to attach to the feed"), so a body that does not
+/// parse as a single JSON object is not one. The rule is about the member's own value,
+/// so the message names the member and the form it must take and echoes nothing the
+/// request supplied.
+pub const INVALID_POLICY_DOCUMENT_MESSAGE: &str =
+    "The policy member must be a resource-based policy document: supply one JSON object.";
+
+/// Whether `policy` is a policy document, i.e. parses as a single JSON object.
+///
+/// One scan shared by every operation that is handed a policy document, so no two of
+/// them can disagree about what the service accepts as one.
+pub fn is_policy_document(policy: &str) -> bool {
+    ::serde_json::from_str::<::serde_json::Value>(policy).is_ok_and(|parsed| parsed.is_object())
 }
 
 /// `SearchFixtures` with `endDate` before `startDate`: the rule is the ORDER of the two
@@ -503,6 +525,16 @@ pub struct Feed {
     pub status: FeedStatus,
     /// The resource associated with the feed; `None` until `AssociateFeed` runs.
     pub association: Option<FeedAssociation>,
+    /// The resource-based policy document attached to the feed, or `None` while the
+    /// feed carries no policy.
+    ///
+    /// A feed holds AT MOST ONE policy: `PutFeedPolicy` "attaches or replaces" it, so
+    /// a second put overwrites this member rather than adding beside it, and
+    /// `GetFeedPolicy` reports exactly the document the last put stored. It lives on
+    /// the feed record, so a policy is reachable only for as long as the feed it is
+    /// attached to is, and the feed's removal takes its policy with it — there is no
+    /// second map that could outlive the resource or disagree with it.
+    pub policy: Option<String>,
     pub tags: BTreeMap<String, String>,
     /// When the clock owes this feed's transient status its next move, if any.
     pub transition_due_at: Option<Instant>,

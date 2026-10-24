@@ -10,9 +10,11 @@
 //! recommendations this service holds ([`crate::state::IdleRecommendationStore`]) and
 //! writes nothing. Compute Optimizer's own analysis of an observed workload is what
 //! produces an idle recommendation, so no request to this API creates one and this handler
-//! never invents one: a resource the store holds no recommendation for is reported in the
-//! response's `errors` list, which is what the model says that list is ("Returns of list of
-//! resources that doesn't have idle recommendations").
+//! never invents one: every member it reports is computed from the stored analysis
+//! ([`crate::state::IdleResourceAnalysis::to_recommendation`]), and a resource the store
+//! holds no analysis for is reported in the response's `errors` list, which is what the
+//! model says that list is ("Returns of list of resources that doesn't have idle
+//! recommendations").
 //!
 //! It reports for exactly ONE account, the one this emulator presents: a request that asks
 //! about any other account — in `accountIds`, or through a `resourceArns` entry whose
@@ -183,7 +185,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetIdleRecommendationsErrorModeled::InternalServerException(
                 InternalServerException {
@@ -282,13 +283,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The Region this request addressed: Compute Optimizer is regional, so the ARNs in
+        // its answer name the Region its SigV4 credential scope does.
+        let region = crate::state::request_region(ctx);
+
+        // When these recommendations were last generated: the analysis the account's
+        // enrollment started, which came due one analysis span after the enrollment record
+        // was written. Derived from the store, so every read reports the same instant — the
+        // same rule the other recommendation readers of this service report their refresh
+        // with.
+        let last_refresh_timestamp = guard.enrollment.last_updated_timestamp.map(|written| {
+            ::aws_smithy_types::DateTime::from_secs_f64(
+                written.as_secs_f64() + crate::state::ANALYSIS_DELAY.as_secs_f64(),
+            )
+        });
+
+        // Every idle resource recommendation this endpoint has to report: the analysis the
+        // store holds, as the endpoint in this Region reports it — which a caller sees only
+        // once the analysis its enrollment started is due.
+        //
+        // The look-back period in force is the service's documented default for every idle
+        // resource: `PutRecommendationPreferences$lookBackPeriod` "can only be set for the
+        // Amazon EC2 instance, Auto Scaling group, Amazon EBS volume, Amazon ECS service on
+        // Fargate, Amazon RDS DB instance, and Aurora DB cluster storage resource types", so
+        // no stored preference can apply to an idle resource. What a recommendation reports as
+        // analysed is still that period capped by how long the resource has been observed.
+        let look_back_period = crate::state::DEFAULT_LOOK_BACK_PERIOD;
+        let analysed: Vec<IdleRecommendation> = guard
+            .visible_idle_recommendations()
+            .map(|analysis| {
+                analysis.to_recommendation(&region, look_back_period, last_refresh_timestamp)
+            })
+            .collect();
+
+        // "Returns of list of resources that doesn't have idle recommendations": every ARN
+        // the request named that this endpoint reports no recommendation for, whatever the
+        // filters select. Reported with each page, because it describes the request rather
+        // than the page.
+        let errors: Vec<IdleRecommendationError> = resource_arns
+            .iter()
+            .filter(|requested| {
+                !analysed.iter().any(|recommendation| {
+                    recommendation.resource_arn.as_deref() == Some(requested.as_str())
+                })
+            })
+            .map(|arn| IdleRecommendationError {
+                identifier: Some(arn.clone()),
+                code: Some(crate::state::NO_RECOMMENDATION_CODE.to_string()),
+                message: Some(
+                    "Compute Optimizer has no idle resource recommendation for the resource this \
+                     identifier names."
+                        .to_string(),
+                ),
+                resource_type: crate::state::idle_resource_type_of_arn(arn)
+                    .map(ToString::to_string),
+            })
+            .collect();
+
         // The recommendations the request selects: those of the named resources, of the
         // account this request asks about, that satisfy every filter. A member the request
         // omits selects nothing away — except the account, which is always the one account
         // this service answers for.
-        let mut selected: Vec<IdleRecommendation> = guard
-            .idle_recommendations
-            .iter_in_order()
+        //
+        // Each recommendation is COMPUTED from the stored analysis first and selected second,
+        // so a `Finding` or `ResourceType` filter selects on what this service derived for the
+        // resource and never on anything the request supplied.
+        let mut selected: Vec<IdleRecommendation> = analysed
+            .into_iter()
             .filter(|recommendation| {
                 resource_arns.is_empty()
                     || recommendation
@@ -310,7 +371,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|recommendation| {
                 crate::state::idle_recommendation_matches_filters(recommendation, &filters)
             })
-            .cloned()
             .collect();
 
         // "The order to sort the idle resource recommendations": the dimension names the
@@ -340,25 +400,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
-        // "Returns of list of resources that doesn't have idle recommendations": every ARN
-        // the request named that the service holds no recommendation for, whatever the
-        // filters select. Reported with each page, because it describes the request rather
-        // than the page.
-        let errors: Vec<IdleRecommendationError> = resource_arns
-            .iter()
-            .filter(|arn| guard.idle_recommendations.get(arn).is_none())
-            .map(|arn| IdleRecommendationError {
-                identifier: Some(arn.clone()),
-                code: Some(crate::state::NO_RECOMMENDATION_CODE.to_string()),
-                message: Some(
-                    "Compute Optimizer has no idle resource recommendation for the resource this \
-                     identifier names."
-                        .to_string(),
-                ),
-                resource_type: crate::state::idle_resource_type_of_arn(arn)
-                    .map(ToString::to_string),
-            })
-            .collect();
+        // "Returns of list of resources that doesn't have idle recommendations": see the
+        // `errors` list built above, which is computed before the page because it describes
+        // the request rather than the page.
 
         // One page of the selected sequence. A next token is handed out only when the
         // sequence continues past this page, and it resumes exactly where this page stopped.

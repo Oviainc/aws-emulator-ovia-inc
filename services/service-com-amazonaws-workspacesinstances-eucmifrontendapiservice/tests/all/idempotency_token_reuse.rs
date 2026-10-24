@@ -32,7 +32,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_workspacesinstances_eucmifrontendapiservice as wsinst;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::workspace_instance_lifecycle::{call, error_code, harness, ok};
+use crate::workspace_instance_lifecycle::{call, error_code, harness, ok, DEFAULT_TEST_REGION};
 
 /// The HTTP status the model gives `ConflictException`
 /// (`smithy_query(query="shape",shape="ConflictException")` → `httpError 409`).
@@ -60,10 +60,12 @@ fn stored_volumes(
     volumes
 }
 
-/// The volume idempotency claims the store holds, keyed by token.
+/// The volume idempotency claims the store holds, keyed by (Region, token): a claim is
+/// scoped to the Region the create that spent the token was signed for, since the
+/// volume it created belongs to that Region.
 fn stored_volume_claims(
     engine: &Arc<engine::InMemoryEngine>,
-) -> BTreeMap<String, wsinst::state::IdempotencyClaim> {
+) -> BTreeMap<(String, String), wsinst::state::IdempotencyClaim> {
     let state = wsinst::state::service_state(&**engine)
         .expect("the service store must be reachable from the engine the router was built from");
     let claims = state.lock().volume_client_tokens.clone();
@@ -357,7 +359,9 @@ async fn a_volume_token_reused_with_different_parameters_is_a_conflict() {
             row.case
         );
         assert_eq!(
-            claims.get(&token).map(|claim| claim.resource_id.as_str()),
+            claims
+                .get(&(DEFAULT_TEST_REGION.to_string(), token.clone()))
+                .map(|claim| claim.resource_id.as_str()),
             Some(created.as_str()),
             "case {:?}: expected the claim to still name {created:?}, got {claims:?}",
             row.case

@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeBlueGreenDeployments
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeBlueGreenDeployments`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeBlueGreenDeployments::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the blue/green deployments this service holds in the region the request is
+//! signed for. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +153,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeBlueGreenDeployments` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeBlueGreenDeploymentsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeBlueGreenDeployments"))
+        let region = crate::state::request_region(ctx)
+            .map_err(DescribeBlueGreenDeploymentsError::validation)?;
+        let page_size = crate::state::check_max_records(input.max_records)
+            .map_err(DescribeBlueGreenDeploymentsError::invalid_parameter_value)?;
+        let filters = input.filters.unwrap_or_default();
+        check_filter_names(&filters)
+            .map_err(DescribeBlueGreenDeploymentsError::invalid_parameter_value)?;
+        crate::state::check_filter_terms(&filters)
+            .map_err(DescribeBlueGreenDeploymentsError::invalid_parameter_value)?;
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated empty list.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // A report materialises the transitions the clock already made due: the ones owed
+        // at this instant whether or not anybody called.
+        store.settle_due_transitions(&region);
+
+        // RDS is regional: a request sees only the deployments of the region it was signed
+        // for.
+        let candidates: Vec<&crate::state::BlueGreenDeploymentRecord> =
+            match &input.blue_green_deployment_identifier {
+                Some(requested) => {
+                    crate::state::check_blue_green_deployment_identifier(
+                        "BlueGreenDeploymentIdentifier",
+                        requested,
+                    )
+                    .map_err(DescribeBlueGreenDeploymentsError::invalid_parameter_value)?;
+                    let record = store
+                        .resolve_blue_green_deployment(&region, requested)
+                        .ok_or_else(|| {
+                            DescribeBlueGreenDeploymentsError::from(
+                            DescribeBlueGreenDeploymentsErrorModeled::BlueGreenDeploymentNotFoundFault(
+                                BlueGreenDeploymentNotFoundFault {
+                                    message: Some(format!(
+                                        "BlueGreenDeployment {requested} not found."
+                                    )),
+                                },
+                            ),
+                        )
+                        })?;
+                    vec![record]
+                }
+                None => store.blue_green_deployments_in(&region),
+            };
+
+        let matching: Vec<(String, BlueGreenDeployment)> = candidates
+            .into_iter()
+            .filter(|record| filters.iter().all(|filter| matches_filter(record, filter)))
+            .map(|record| (record.identifier.clone(), record.to_wire()))
+            .collect();
+
+        // A `Marker` no prior page issued is refused rather than resynchronised: see
+        // `crate::state::paginate`.
+        let page = crate::state::paginate(matching, input.marker.as_deref(), page_size)
+            .map_err(DescribeBlueGreenDeploymentsError::invalid_parameter_value)?;
+        Ok(DescribeBlueGreenDeploymentsOutput {
+            blue_green_deployments: Some(page.items),
+            marker: page.next_marker,
+        })
     }
+}
+
+/// The filter names this operation's `Filters` member documents:
+/// "`blue-green-deployment-identifier`", "`blue-green-deployment-name`", "`source`" and
+/// "`target`". RDS refuses any other name, and so does this operation — with a 400,
+/// because quietly ignoring a filter would report deployments the caller excluded.
+const SUPPORTED_FILTER_NAMES: [&str; 4] = [
+    "blue-green-deployment-identifier",
+    "blue-green-deployment-name",
+    "source",
+    "target",
+];
+
+/// Refuse a filter this operation does not support. "Filter names are case-sensitive."
+fn check_filter_names(filters: &[Filter]) -> Result<(), String> {
+    for filter in filters {
+        if !SUPPORTED_FILTER_NAMES.contains(&filter.name.as_str()) {
+            return Err(format!(
+                "unrecognized filter name: {}; supported filters are {}",
+                filter.name,
+                SUPPORTED_FILTER_NAMES.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `record` matches one filter: true when any of the filter's values matches the
+/// member that filter names. "Filter values are case-sensitive."
+fn matches_filter(record: &crate::state::BlueGreenDeploymentRecord, filter: &Filter) -> bool {
+    filter.values.iter().any(|wanted| match filter.name.as_str() {
+        // "Accepts system-generated identifiers for blue/green deployments."
+        "blue-green-deployment-identifier" => *wanted == record.identifier,
+        // "Accepts user-supplied names for blue/green deployments."
+        "blue-green-deployment-name" => *wanted == record.name,
+        // "Accepts source databases" / "Accepts target databases for a blue/green
+        // deployment", which a deployment names by their ARNs.
+        "source" => *wanted == record.source_arn,
+        "target" => *wanted == record.target_arn,
+        // Unreachable: `check_filter_names` has already refused every name outside
+        // `SUPPORTED_FILTER_NAMES`. A `&str` match needs the arm all the same.
+        _ => false,
+    })
 }

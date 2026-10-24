@@ -21,6 +21,8 @@ mod instance_deletion_lifecycle;
 mod instance_type_catalog;
 #[path = "all/region_catalog.rs"]
 mod region_catalog;
+#[path = "all/regional_scoping.rs"]
+mod regional_scoping;
 #[path = "all/reserved_tag_keys.rs"]
 mod reserved_tag_keys;
 #[path = "all/state_roundtrip.rs"]

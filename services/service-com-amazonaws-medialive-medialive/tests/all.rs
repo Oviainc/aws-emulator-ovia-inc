@@ -149,6 +149,9 @@ mod networks;
 #[path = "all/node_lifecycle.rs"]
 mod node_lifecycle;
 
+#[path = "all/offering_catalog.rs"]
+mod offering_catalog;
+
 #[path = "all/rejection_messages.rs"]
 mod rejection_messages;
 
