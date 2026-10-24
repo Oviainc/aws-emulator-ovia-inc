@@ -21,6 +21,8 @@ mod job_template_lifecycle;
 mod security_configuration;
 #[path = "all/security_configuration_delete.rs"]
 mod security_configuration_delete;
+#[path = "all/security_configuration_list.rs"]
+mod security_configuration_list;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/virtual_cluster_job_run_loop.rs"]

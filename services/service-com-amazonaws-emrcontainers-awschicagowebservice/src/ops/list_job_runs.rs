@@ -74,12 +74,15 @@
 use super::types::*;
 
 /// The opaque `nextToken` for the run the next page starts at: the virtual cluster it
-/// pages, plus that run's place in the newest-first order (the pair the order is built
-/// from). A client must not read it; the service only has to be able to resume from it.
+/// pages — the cursor's scope — plus that run's place in the newest-first order.
+///
+/// The format and the scope check both live in [`crate::state::encode_list_cursor`], the
+/// one encoder every paginated list in this service shares.
 fn encode_cursor(virtual_cluster_id: &str, record: &crate::state::JobRunRecord) -> String {
-    format!(
-        "{virtual_cluster_id}-{}-{}",
-        record.created_at_millis, record.sequence
+    crate::state::encode_list_cursor(
+        virtual_cluster_id,
+        record.created_at_millis,
+        record.sequence,
     )
 }
 
@@ -89,16 +92,7 @@ fn encode_cursor(virtual_cluster_id: &str, record: &crate::state::JobRunRecord) 
 /// cursors or belongs to another virtual cluster's listing, so a token cannot be carried
 /// from one cluster's pagination to another's.
 fn decode_cursor(virtual_cluster_id: &str, token: &str) -> Option<(i64, u64)> {
-    let mut parts = token.split('-');
-    let (Some(cluster), Some(created_at_millis), Some(sequence), None) =
-        (parts.next(), parts.next(), parts.next(), parts.next())
-    else {
-        return None;
-    };
-    if cluster != virtual_cluster_id {
-        return None;
-    }
-    Some((created_at_millis.parse().ok()?, sequence.parse().ok()?))
+    crate::state::decode_list_cursor(virtual_cluster_id, token)
 }
 
 /// Whether one stored job run satisfies every filter the request carried. A filter the

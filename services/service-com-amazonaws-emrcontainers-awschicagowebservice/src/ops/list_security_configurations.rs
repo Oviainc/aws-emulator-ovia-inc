@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSecurityConfigurations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSecurityConfigurations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSecurityConfigurations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the security configurations this service stores, newest first, after applying
+//! the `createdBefore` / `createdAfter` query filters and the `@paginated` page of
+//! `maxResults` + `nextToken`.
 //!
 //! ## Shape of an operation
 //!
@@ -81,6 +75,54 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The opaque `nextToken` for the configuration the next page starts at: that
+/// configuration's place in the newest-first order, under this operation's cursor scope.
+///
+/// The format and the scope check both live in [`crate::state::encode_list_cursor`], the
+/// one encoder every paginated list in this service shares.
+fn encode_cursor(record: &crate::state::SecurityConfigurationRecord) -> String {
+    crate::state::encode_list_cursor(
+        crate::state::LIST_SECURITY_CONFIGURATIONS_SCOPE,
+        record.created_at_millis,
+        record.sequence,
+    )
+}
+
+/// The place in the newest-first order a `nextToken` names.
+///
+/// `None` — refused as an invalid request — when the token is not one of THIS operation's
+/// cursors: a cursor another listing minted does not carry this scope.
+fn decode_cursor(token: &str) -> Option<(i64, u64)> {
+    crate::state::decode_list_cursor(crate::state::LIST_SECURITY_CONFIGURATIONS_SCOPE, token)
+}
+
+/// Whether one stored configuration satisfies every filter the request carried. A filter
+/// the request omitted constrains nothing.
+///
+/// `createdBefore` / `createdAfter` bound `createdAt` strictly, the same way
+/// `ListJobTemplates` and `ListJobRuns` bound theirs, so the two together name an open
+/// interval and neither ever returns the configuration created exactly at a bound.
+fn matches_filters(
+    record: &crate::state::SecurityConfigurationRecord,
+    input: &ListSecurityConfigurationsInput,
+) -> bool {
+    if input
+        .created_before
+        .as_ref()
+        .is_some_and(|bound| record.created_at_millis >= crate::state::millis_of(bound))
+    {
+        return false;
+    }
+    if input
+        .created_after
+        .as_ref()
+        .is_some_and(|bound| record.created_at_millis <= crate::state::millis_of(bound))
+    {
+        return false;
+    }
+    true
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -150,18 +192,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSecurityConfigurations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSecurityConfigurationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSecurityConfigurations"))
+        // Nothing this listing reports comes from the request metadata: every filter and
+        // the page itself are members of `input`, and the records come from state.
+        let _ = ctx;
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListSecurityConfigurationsError::Modeled(
+                ListSecurityConfigurationsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the security configuration store is unavailable".to_string(),
+                        ),
+                    },
+                ),
+            )
+        })?;
+        let mut state = store.lock();
+        // Materialise whatever the clock already owes, so this read reports the same store
+        // every other handler sees. A security configuration has no status of its own, so
+        // nothing listed here depends on it; it is called because every handler does.
+        state.settle();
+
+        // `maxResults` is the page size. The model declares no range for it, but a page
+        // of fewer than one item is not a page, so it is refused rather than silently
+        // read as "no limit".
+        let page_size = match input.max_results {
+            Some(limit) if limit < 1 => {
+                return Err(ListSecurityConfigurationsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "maxResults must be at least 1, but {limit} was requested"
+                        )),
+                    },
+                )
+                .into());
+            }
+            Some(limit) => Some(usize::try_from(limit).unwrap_or(usize::MAX)),
+            None => None,
+        };
+
+        // Newest first. The creation sequence breaks a tie between two configurations
+        // created in the same millisecond, so the order is total and a page boundary never
+        // depends on hash order.
+        let mut matching: Vec<&crate::state::SecurityConfigurationRecord> = state
+            .security_configurations
+            .values()
+            .filter(|record| matches_filters(record, &input))
+            .collect();
+        matching.sort_by(|left, right| {
+            (right.created_at_millis, right.sequence).cmp(&(left.created_at_millis, left.sequence))
+        });
+
+        // `nextToken` is the POSITION in the newest-first order the next page starts at,
+        // not the identity of a row, so resuming reports everything ordered after the
+        // cursor with no repeats and no gaps.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let Some(cursor) = decode_cursor(token) else {
+                    return Err(ListSecurityConfigurationsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some("nextToken is not a valid pagination token".to_string()),
+                        },
+                    )
+                    .into());
+                };
+                matching
+                    .iter()
+                    .position(|record| (record.created_at_millis, record.sequence) <= cursor)
+                    .unwrap_or(matching.len())
+            }
+        };
+
+        let end = page_size.map_or(matching.len(), |size| {
+            start.saturating_add(size).min(matching.len())
+        });
+        let security_configurations: Vec<SecurityConfiguration> = matching[start..end]
+            .iter()
+            .map(|record| record.to_security_configuration())
+            .collect();
+        // A `nextToken` only when configurations remain after this page.
+        let next_token = matching.get(end).map(|record| encode_cursor(record));
+
+        Ok(ListSecurityConfigurationsOutput {
+            security_configurations: Some(security_configurations),
+            next_token,
+        })
     }
 }
