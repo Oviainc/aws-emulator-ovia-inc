@@ -51,6 +51,8 @@ mod pricing_rules_associated_to_pricing_plan;
 mod state_roundtrip;
 #[path = "all/tagging_surface.rs"]
 mod tagging_surface;
+#[path = "all/update_custom_line_item.rs"]
+mod update_custom_line_item;
 #[path = "all/validation_exception_message.rs"]
 mod validation_exception_message;
 #[path = "all/validation_messages.rs"]

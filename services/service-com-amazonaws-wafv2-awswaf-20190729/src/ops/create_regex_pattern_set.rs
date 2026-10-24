@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRegexPatternSet
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRegexPatternSet`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mints a RegexPatternSet under `(Scope, Name)` and persists it in `crate::state`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRegexPatternSet::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Input: `Name`, `Scope` and `RegularExpressionList` (required), plus `Description`
+//! and `Tags`. Output: the `RegexPatternSetSummary` of what was stored, whose `ARN`
+//! is what a `RegexPatternSetReferenceStatement` names.
 //!
 //! ## Shape of an operation
 //!
@@ -181,17 +177,118 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRegexPatternSet` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRegexPatternSetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRegexPatternSet"))
+        // request metadata (the region the ARN is minted in).
+        if !crate::state::is_known_scope(&input.scope) {
+            return Err(CreateRegexPatternSetErrorModeled::WAFInvalidParameterException(
+                crate::state::invalid_parameter_exception(
+                    crate::state::FIELD_SCOPE_VALUE,
+                    &input.scope,
+                    "the scope names the namespace the regex pattern set lives in, and is one of CLOUDFRONT or REGIONAL",
+                ),
+            )
+            .into());
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateRegexPatternSetErrorModeled::WAFInternalErrorException(
+                WAFInternalErrorException {
+                    message: Some("the wafv2 store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let mut state = state.lock();
+
+        // `Name` is the set's identity within its scope ("You cannot change the name
+        // after you create the set"), so a second create under a name the scope
+        // already holds is the duplicate the modelled exception describes.
+        let name_key = (input.scope.clone(), input.name.clone());
+        if state.regex_pattern_set_names.contains_key(&name_key) {
+            crate::state::audit(
+                "CreateRegexPatternSet",
+                &input.scope,
+                &input.name,
+                "",
+                "WAFDuplicateItemException",
+            );
+            return Err(CreateRegexPatternSetErrorModeled::WAFDuplicateItemException(
+                crate::state::duplicate_item_exception(),
+            )
+            .into());
+        }
+
+        if state.regex_pattern_sets_in_scope(&input.scope)
+            >= crate::state::MAX_REGEX_PATTERN_SETS_PER_SCOPE
+        {
+            crate::state::audit(
+                "CreateRegexPatternSet",
+                &input.scope,
+                &input.name,
+                "",
+                "WAFLimitsExceededException",
+            );
+            return Err(CreateRegexPatternSetErrorModeled::WAFLimitsExceededException(
+                crate::state::limits_exceeded_exception(),
+            )
+            .into());
+        }
+
+        let id = crate::state::new_uuid();
+        let lock_token = crate::state::new_uuid();
+        let arn = crate::state::resource_arn(
+            &input.scope,
+            &region,
+            crate::state::REGEX_PATTERN_SET_ARN_KIND,
+            &input.name,
+            &id,
+        );
+        // The patterns are stored exactly as submitted, in the submitted order:
+        // `RegexPatternSet$RegularExpressionList` is "the regular expression patterns
+        // in the set", so a later read hands back the list this call carried, byte
+        // for byte.
+        let regex_pattern_set = RegexPatternSet {
+            name: Some(input.name.clone()),
+            id: Some(id.clone()),
+            arn: Some(arn.clone()),
+            description: crate::state::stored_description(input.description.clone()),
+            regular_expression_list: Some(input.regular_expression_list.clone()),
+        };
+        let summary = RegexPatternSetSummary {
+            name: regex_pattern_set.name.clone(),
+            id: regex_pattern_set.id.clone(),
+            description: regex_pattern_set.description.clone(),
+            lock_token: Some(lock_token.clone()),
+            arn: regex_pattern_set.arn.clone(),
+        };
+
+        state.arn_index.insert(
+            arn,
+            crate::state::ResourceRef::RegexPatternSet {
+                scope: input.scope.clone(),
+                id: id.clone(),
+            },
+        );
+        state.regex_pattern_set_names.insert(name_key, id.clone());
+        state.regex_pattern_sets.insert(
+            (input.scope.clone(), id.clone()),
+            crate::state::RegexPatternSetEntry {
+                scope: input.scope.clone(),
+                regex_pattern_set,
+                lock_token,
+                tags: input.tags.unwrap_or_default(),
+            },
+        );
+        crate::state::audit(
+            "CreateRegexPatternSet",
+            &input.scope,
+            &input.name,
+            &id,
+            "created",
+        );
+
+        Ok(CreateRegexPatternSetOutput {
+            summary: Some(summary),
+        })
     }
 }

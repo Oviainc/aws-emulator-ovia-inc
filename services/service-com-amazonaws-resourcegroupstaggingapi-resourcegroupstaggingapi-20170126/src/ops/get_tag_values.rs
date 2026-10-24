@@ -1,10 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTagValues
-//! Reports the distinct values recorded for one tag key across every stored
-//! resource, in value order — a pure projection of what `TagResources` wrote and
-//! `UntagResources` removed. A key no resource carries answers HTTP 200 with an
-//! empty `TagValues` list, not an error.
+//! Reports the distinct values recorded for one tag key across every tagged
+//! resource of the Region this request is scoped to, in value order — a pure
+//! projection of the tag sets the owning services hold
+//! (`crate::state::owners`) and of what `TagResources` wrote and
+//! `UntagResources` removed for the resources this service is the tag home for.
+//! A key no resource carries answers HTTP 200 with an empty `TagValues` list,
+//! not an error.
 //!
 //! ## Shape of an operation
 //!
@@ -161,22 +164,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
-
         // `Key` is required and 1..128 characters: both are refused at the
         // boundary before this runs.
         let token = input.pagination_token.as_deref().unwrap_or_default();
-        let fingerprint = crate::state::page_fingerprint(&[Self::NAME, input.key.as_str()]);
+        let region = crate::state::request_region(ctx.parts());
+        let scope = [Self::NAME, region.as_str(), input.key.as_str()];
         let after = if token.is_empty() {
             None
         } else {
-            match crate::state::decode_pagination_token(token, &fingerprint) {
-                Some(after) => Some(after),
-                None => {
+            match crate::state::decode_pagination_token(token, &scope) {
+                Ok(after) => Some(after),
+                // A token this service never minted for this query is a
+                // malformed parameter; one it DID mint, past its 15-minute
+                // window, is the separately modelled expiry.
+                Err(crate::state::TokenRejection::NotMinted) => {
+                    return Err(GetTagValuesErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(crate::state::invalid_token_message(token)),
+                        },
+                    )
+                    .into())
+                }
+                Err(crate::state::TokenRejection::Expired) => {
                     return Err(GetTagValuesErrorModeled::PaginationTokenExpiredException(
                         PaginationTokenExpiredException {
                             message: Some(
-                                "the specified PaginationToken is not valid for this request"
+                                "The specified PaginationToken has expired. A PaginationToken is \
+                                 valid for a maximum of 15 minutes."
                                     .to_string(),
                             ),
                         },
@@ -185,6 +199,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
         };
+
+        // What the owning services themselves hold tags for, read BEFORE this
+        // service's own store is locked, so the two are never locked in two
+        // orders.
+        let owned = crate::state::owners::tagged_resources(&*self.engine, &region);
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetTagValuesErrorModeled::InternalServiceException(
@@ -198,14 +217,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A `BTreeSet` both de-duplicates across resources and orders the values,
         // which is what makes the cursor below resumable.
-        let values: std::collections::BTreeSet<&String> = state
-            .resources
-            .values()
-            .filter_map(|entry| entry.tags.get(&input.key))
+        let values: std::collections::BTreeSet<String> = state
+            .resources_in_region(owned, &region)
+            .into_iter()
+            .filter_map(|mut entry| entry.tags.remove(&input.key))
             .collect();
         let values: Vec<(String, String)> = values
             .into_iter()
-            .map(|value| (value.clone(), value.clone()))
+            .map(|value| (value.clone(), value))
             .collect();
 
         let (page, next) = crate::state::page(
@@ -214,7 +233,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::KEYS_PER_PAGE,
             None,
             |_| 0,
-            &fingerprint,
+            &scope,
         );
 
         Ok(GetTagValuesOutput {

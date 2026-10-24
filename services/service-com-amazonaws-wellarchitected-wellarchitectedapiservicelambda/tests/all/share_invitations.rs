@@ -356,9 +356,10 @@ async fn invitations_narrow_by_resource_type_and_by_the_matching_name_prefix() {
     const SEEDED: usize = 3;
 
     for resource_type in SHARE_RESOURCE_TYPES {
-        // Only workload shares can exist in this emulator: `CreateLensShare`,
-        // `CreateProfileShare` and `CreateTemplateShare` are still stubs with their own
-        // issues, so no invitation of those kinds has been offered.
+        // This suite seeds WORKLOAD shares only, so an invitation of another kind has
+        // never been offered here: a lens share raises its own `LENS` invitation (see
+        // `super::lens_shares`), while `CreateProfileShare` and `CreateTemplateShare` are
+        // still stubs with their own issues.
         let expected = if resource_type == "WORKLOAD" { SEEDED } else { 0 };
         let listed = client
             .list_share_invitations(&format!("ShareResourceType={resource_type}"))

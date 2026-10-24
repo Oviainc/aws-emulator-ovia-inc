@@ -539,6 +539,31 @@ impl CustomLineItemRecord {
             .iter()
             .find(|association| association.arn == arn)
     }
+
+    /// `ChargeDetails` as this service's surface REPORTS a stored item
+    /// (`ListCustomLineItemChargeDetails`).
+    ///
+    /// "It should contain only one of `Flat` or `Percentage`", so the one the item
+    /// holds is reported and the other is absent; the `@required Type` is the one the
+    /// item carries; and the filter list is omitted entirely when the item holds none,
+    /// because an absent list and an empty one are the same membership.
+    ///
+    /// It lives on the record so that every operation reporting a custom line item —
+    /// `ListCustomLineItems`, `UpdateCustomLineItem` — reports ONE projection and the
+    /// two views cannot drift.
+    pub fn charge_details(&self) -> crate::ops::types::ListCustomLineItemChargeDetails {
+        crate::ops::types::ListCustomLineItemChargeDetails {
+            flat: self.flat_charge_value.map(|charge_value| {
+                crate::ops::types::ListCustomLineItemFlatChargeDetails { charge_value }
+            }),
+            percentage: self.percentage_value.map(|percentage_value| {
+                crate::ops::types::ListCustomLineItemPercentageChargeDetails { percentage_value }
+            }),
+            r#type: self.charge_type.clone(),
+            line_item_filters: (!self.line_item_filters.is_empty())
+                .then(|| self.line_item_filters.clone()),
+        }
+    }
 }
 
 /// Per-service state for com-amazonaws-billingconductor-awsbillingconductor. A handler reaches it through [`service_state`].

@@ -18,8 +18,10 @@
 //!    before any resource is resolved or written — including for a resource the account
 //!    holds nothing for;
 //! 3. A RESOURCE ID IS RESOLVED MALFORMED BEFORE NOT FOUND: something that is not an id of
-//!    that kind at all is `Invalid<Resource>ID.Malformed`, and a well-formed id the account
-//!    holds nothing for is `Invalid<Resource>.NotFound`;
+//!    that kind at all is `Invalid<Resource>ID.Malformed` — or plain `InvalidID`, the code EC2
+//!    answers for an id it cannot parse as any resource id, for a kind that publishes no
+//!    `.Malformed` code of its own — and a well-formed id the account holds nothing for is
+//!    `Invalid<Resource>.NotFound`;
 //! 4. A REQUEST THE RESOURCE'S STATE DOES NOT ADMIT IS REFUSED with `IncorrectState` —
 //!    enabling I/O that is already enabled, detaching a volume nothing holds, cancelling an
 //!    export task that is not active;
@@ -38,10 +40,12 @@ use ec2::ops::types::{
     AttachVolumeOutput, ExportTask, ExportToS3Task, ImageUsageReport, InstanceExportDetails,
     LoadPermission,
 };
+use ec2::ops::cancel_export_task::INSTANCE_EXPORT_TASK_ID_PREFIX;
 use ec2::state::{
     ComAmazonawsEc2Amazonec2State as Ec2State, EXPORT_TASK_STATE_ACTIVE,
     EXPORT_TASK_STATE_CANCELLED, EXPORT_TASK_STATE_CANCELLING, EXPORT_TASK_STATE_COMPLETED,
-    FPGA_IMAGE_STATE_FAILED, FPGA_IMAGE_STATE_PENDING, ImageSpec, MAX_S3_BUCKET_NAME_CHARS,
+    FPGA_IMAGE_STATE_FAILED, FPGA_IMAGE_STATE_PENDING, ImageSpec,
+    MAX_S3_BUCKET_NAME_CHARS,
     MIN_S3_BUCKET_NAME_CHARS, RECYCLE_BIN_PAGE_SIZE_RANGE, VOLUME_ATTACHMENT_STATE_ATTACHED,
     VOLUME_ATTACHMENT_STATE_DETACHING, VOLUME_STATE_AVAILABLE, VOLUME_STATE_DELETED,
     VOLUME_STATE_IN_USE, WATERMARK_NAME_PUNCTUATION, ExportTaskRecord, system_time_to_date_time,
@@ -1645,10 +1649,14 @@ async fn detaching_a_volume_frees_it_on_the_clock() {
 // ---------------------------------------------------------------------------
 
 /// Store one instance export task in `state`, and answer its `ExportTaskId`.
+///
+/// Minted under the same prefix the handler accepts
+/// (`ec2::ops::cancel_export_task::INSTANCE_EXPORT_TASK_ID_PREFIX`), so the seeded form and
+/// the accepted form cannot drift apart.
 fn seed_export_task(engine: &engine::InMemoryEngine, state: &str) -> String {
     let store = engine.state::<Ec2State>();
     let mut guard = store.lock();
-    let export_task_id = guard.next_id("export-i");
+    let export_task_id = guard.next_id(INSTANCE_EXPORT_TASK_ID_PREFIX);
     guard.export_tasks.insert(
         export_task_id.clone(),
         ExportTaskRecord {
@@ -1675,21 +1683,66 @@ fn seed_export_task(engine: &engine::InMemoryEngine, state: &str) -> String {
     export_task_id
 }
 
-/// An export task id the account holds no task for is refused with
-/// `InvalidExportTaskID.NotFound`, whatever shape the id has — the model publishes no pattern
-/// for one, so there is no second answer to give.
+/// An export task id EC2 could have ISSUED but the account holds no task for is refused with
+/// `InvalidExportTaskID.NotFound`, while an id outside that form is not an EC2 resource id at
+/// all and is refused `InvalidID` before any lookup.
+///
+/// The form is `export-i-<hex>` / `export-ami-<hex>` with 8 or 17 lowercase hex digits: the
+/// ids `CreateInstanceExportTask` and `ExportImage` issue, which
+/// `CancelExportTaskRequest$ExportTaskId` documents as the two sources of the ids it takes
+/// (`ExportVmTaskId` itself publishes no `@pattern`).
 #[tokio::test]
-async fn cancel_export_task_refuses_an_id_the_account_holds_no_task_for() {
+async fn cancel_export_task_separates_an_unknown_id_from_one_that_is_no_id() {
     let (router, _engine) = emulator();
 
-    let id_rows: [(&str, &str); 5] = [
-        ("an instance export task id", "export-i-0123456789abcdef0"),
-        ("an image export task id", "export-ami-0123456789abcdef0"),
-        ("the short id form", "export-i-01234567"),
-        ("a value of no particular shape", "not-an-export-task"),
-        ("another resource's id", UNKNOWN_VOLUME_ID),
+    // `(case, the id sent, the code EC2 answers)`.
+    let id_rows: [(&str, &str, &str); 11] = [
+        (
+            "an instance export task id",
+            "export-i-0123456789abcdef0",
+            "InvalidExportTaskID.NotFound",
+        ),
+        (
+            "an image export task id",
+            "export-ami-0123456789abcdef0",
+            "InvalidExportTaskID.NotFound",
+        ),
+        (
+            "the short instance id form",
+            "export-i-01234567",
+            "InvalidExportTaskID.NotFound",
+        ),
+        (
+            "the short image id form",
+            "export-ami-89abcdef",
+            "InvalidExportTaskID.NotFound",
+        ),
+        // The prefix alone, with no `i-`/`ami-` kind: not a form EC2 ever issued.
+        ("the bare prefix, short hex", "export-00000000", "InvalidID"),
+        (
+            "the bare prefix, long hex",
+            "export-0123456789abcdef0",
+            "InvalidID",
+        ),
+        (
+            "a hex suffix of neither length",
+            "export-i-0123456789abcde",
+            "InvalidID",
+        ),
+        (
+            "a suffix that is not hexadecimal",
+            "export-i-0123456789abcdefg",
+            "InvalidID",
+        ),
+        (
+            "an uppercase suffix",
+            "export-i-0123456789ABCDEF0",
+            "InvalidID",
+        ),
+        ("a value of no particular shape", "not-an-export-task", "InvalidID"),
+        ("another resource's id", UNKNOWN_VOLUME_ID, "InvalidID"),
     ];
-    for (case, export_task_id) in id_rows {
+    for (case, export_task_id, expected_code) in id_rows {
         let (status, body) = op(
             &router,
             "CancelExportTask",
@@ -1702,9 +1755,18 @@ async fn cancel_export_task_refuses_an_id_the_account_holds_no_task_for() {
         );
         assert_eq!(
             error_code(&body),
-            "InvalidExportTaskID.NotFound",
-            "case {case:?}: expected InvalidExportTaskID.NotFound, got {body}"
+            expected_code,
+            "case {case:?}: expected {expected_code}, got {body}"
         );
+        if expected_code == "InvalidID" {
+            // The message EC2 builds for an id it cannot parse names the id it was sent.
+            // The XML body escapes the quotes around it (`&apos;`), so compare the text.
+            assert_eq!(
+                element(&body, "Message").map(|message| unescaped(&message)),
+                Some(format!("The ID '{export_task_id}' is not valid")),
+                "case {case:?}: expected the InvalidID message to name the id, got {body}"
+            );
+        }
     }
 }
 

@@ -178,8 +178,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        agreement.status = crate::state::STATUS_CANCELLED.to_string();
-        agreement.updated_at = now;
+        // The guard above refused every status but ACTIVE, so this call is the
+        // one that cancels it; the answer matters only to a caller that did not
+        // check first (`AcceptAgreementCancellationRequest`).
+        let _ = agreement.cancel(now);
         crate::state::audit(
             "CancelAgreement",
             "cancelled",

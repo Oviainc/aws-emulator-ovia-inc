@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutApplicationAuthenticationMethod
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutApplicationAuthenticationMethod`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: adds or updates the authentication method of one
+//! `AuthenticationMethodType` on an application stored in this service's state
+//! (`crate::state`), and answers an empty 200. This is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutApplicationAuthenticationMethod::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The methods live ON the application record
+//! ([`crate::state::ApplicationRecord::authentication_methods`]), keyed by
+//! `AuthenticationMethodType`: a put of a type the application already carries REPLACES
+//! that method, one of a type it does not carry adds it, and every other type is left
+//! alone. The operation is `@idempotent`, so repeating the same request leaves the same
+//! method stored.
+//!
+//! Two refusals the model cannot express, both the modelled `ValidationException`: an
+//! `AuthenticationMethod` whose union variant disagrees with the
+//! `AuthenticationMethodType` the request declares (the type is a property OF the
+//! method — see [`crate::state::authentication_method_type_of`]), and an
+//! `IamAuthenticationMethod$ActorPolicy` that is not a JSON object, which "An IAM policy
+//! document in JSON" is not. An `ApplicationArn` this account holds no application for is
+//! refused the modelled `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +185,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutApplicationAuthenticationMethod` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutApplicationAuthenticationMethodErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutApplicationAuthenticationMethod"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutApplicationAuthenticationMethodErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the SSO Admin state store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // The `AuthenticationMethodType` is a property OF the method the request carries
+        // (`AuthenticationMethodItem$AuthenticationMethod`: "The contents of this
+        // structure is determined by the AuthenticationMethodType"), so a request whose
+        // two halves disagree names no method this service could store under either of
+        // them. The model declares both members independently and cannot tie them
+        // together, so the refusal is the handler's.
+        let carried_type =
+            crate::state::authentication_method_type_of(&input.authentication_method);
+        if carried_type != input.authentication_method_type {
+            return Err(
+                PutApplicationAuthenticationMethodErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(
+                            crate::state::authentication_method_type_mismatch_message(
+                                &input.authentication_method_type,
+                                carried_type,
+                            ),
+                        ),
+                        reason: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // `ActorPolicy` is an `@document` member, so EVERY JSON value deserializes into
+        // it and the boundary validator passes a scalar, a list or a null. Its own
+        // documentation — "An IAM policy document in JSON" — is what makes those not a
+        // value this operation can store: an IAM policy document is a JSON object. What
+        // is INSIDE that object is stored as the caller sent it; the emulator does not
+        // judge the policy language.
+        match &input.authentication_method {
+            AuthenticationMethod::Iam(iam) => {
+                if !matches!(iam.actor_policy, ::aws_smithy_types::Document::Object(_)) {
+                    return Err(
+                        PutApplicationAuthenticationMethodErrorModeled::ValidationException(
+                            ValidationException {
+                                message: Some(
+                                    crate::state::ACTOR_POLICY_NOT_AN_OBJECT_MESSAGE.to_string(),
+                                ),
+                                reason: None,
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            }
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // What the CLOCK already owes every instance, so this write resolves the same
+        // application a read at this instant would resolve (an application whose instance
+        // the clock has already removed no longer exists).
+        store.on_request(&region, ::std::time::SystemTime::now());
+
+        // The application whose authentication method this sets must exist: the methods
+        // live ON the application record, so an `ApplicationArn` nothing holds is the
+        // modelled `ResourceNotFoundException` rather than a method stored under an ARN
+        // no read resolves.
+        let application = store
+            .application_mut(&input.application_arn)
+            .ok_or_else(|| {
+                PutApplicationAuthenticationMethodErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::application_not_found_message(
+                            &input.application_arn,
+                        )),
+                        // The model's `ResourceNotFoundExceptionReason` enum carries only
+                        // `KMS_NotFoundException`, which this is not.
+                        reason: None,
+                    },
+                )
+            })?;
+
+        // "Adds or updates an authentication method for an application": the method is
+        // keyed by its TYPE, so a put of a type the application already carries REPLACES
+        // that method instead of adding a second one, and every other type is left
+        // alone. The operation is `@idempotent`, so repeating the same request leaves the
+        // same method stored. No memory ceiling is needed beside
+        // `state::MAX_SCOPES_PER_APPLICATION`: `AuthenticationMethodType` admits exactly
+        // one value, so this map holds at most one entry per application.
+        application
+            .authentication_methods
+            .insert(input.authentication_method_type, input.authentication_method);
+        Ok(PutApplicationAuthenticationMethodOutput)
     }
 }

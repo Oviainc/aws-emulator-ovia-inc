@@ -198,6 +198,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // An ARN that resolves to something else is not a rule group ARN.
                 Some(crate::state::ResourceRef::WebAcl { .. })
                 | Some(crate::state::ResourceRef::IpSet { .. })
+                | Some(crate::state::ResourceRef::RegexPatternSet { .. })
                 | None => None,
             }
         } else {

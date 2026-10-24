@@ -22,8 +22,8 @@ use ::aws_smithy_schema_server::constraints::{
 };
 
 use crate::ops::types::{
-    IPSet, LabelSummary, OnSourceDDoSProtectionConfig, Rule, RuleGroup, Statement, Tag,
-    WAFAssociatedItemException, WAFDuplicateItemException, WAFInvalidParameterException,
+    IPSet, LabelSummary, OnSourceDDoSProtectionConfig, RegexPatternSet, Rule, RuleGroup, Statement,
+    Tag, WAFAssociatedItemException, WAFDuplicateItemException, WAFInvalidParameterException,
     WAFLimitsExceededException, WAFNonexistentItemException, WAFOptimisticLockException, WebACL,
 };
 
@@ -166,6 +166,20 @@ pub struct IpSetEntry {
     pub tags: Vec<Tag>,
 }
 
+/// A RegexPatternSet as stored: the modelled shape plus its scope, lock token and
+/// tags.
+#[derive(Debug, Clone)]
+pub struct RegexPatternSetEntry {
+    /// The scope the regex pattern set was created in.
+    pub scope: String,
+    /// Exactly what `GetRegexPatternSet` answers with.
+    pub regex_pattern_set: RegexPatternSet,
+    /// The current optimistic-lock token, rotated on every successful mutation.
+    pub lock_token: String,
+    /// Tags given at create time (`ListTagsForResource` is a separate gap issue).
+    pub tags: Vec<Tag>,
+}
+
 /// A RuleGroup as stored: the modelled shape plus its scope, lock token and tags.
 #[derive(Debug, Clone)]
 pub struct RuleGroupEntry {
@@ -196,6 +210,18 @@ pub enum ResourceRef {
         /// The IP set's id.
         id: String,
     },
+    /// A regex pattern set, by `(Scope, Id)`.
+    ///
+    /// `CreateRegexPatternSet` indexes every set it mints under this variant, so a
+    /// `regexpatternset` ARN resolves to the pattern set it names and to nothing
+    /// else — the same stance the other variants take (see
+    /// [`Self::RuleGroup`]).
+    RegexPatternSet {
+        /// The scope the regex pattern set lives in.
+        scope: String,
+        /// The regex pattern set's id.
+        id: String,
+    },
     /// A rule group, by `(Scope, Id)`.
     ///
     /// `CreateRuleGroup` indexes every rule group it mints under this variant, so a
@@ -222,6 +248,10 @@ pub struct ComAmazonawsWafv2Awswaf20190729State {
     pub ip_sets: HashMap<(String, String), IpSetEntry>,
     /// `(Scope, Name)` → `Id`: duplicate-name detection and Name+Id lookup.
     pub ip_set_names: HashMap<(String, String), String>,
+    /// Regex pattern sets by `(Scope, Id)`.
+    pub regex_pattern_sets: HashMap<(String, String), RegexPatternSetEntry>,
+    /// `(Scope, Name)` → `Id`: duplicate-name detection and Name+Id lookup.
+    pub regex_pattern_set_names: HashMap<(String, String), String>,
     /// Rule groups by `(Scope, Id)`.
     pub rule_groups: HashMap<(String, String), RuleGroupEntry>,
     /// `(Scope, Name)` to `Id`, for rule groups: duplicate-name detection and
@@ -295,6 +325,29 @@ impl ComAmazonawsWafv2Awswaf20190729State {
             .count()
     }
 
+    /// The regex pattern set stored under `(scope, id)` when it is also the one
+    /// called `name`. See [`Self::web_acl`].
+    pub fn regex_pattern_set(
+        &self,
+        scope: &str,
+        name: &str,
+        id: &str,
+    ) -> Option<&RegexPatternSetEntry> {
+        let entry = self
+            .regex_pattern_sets
+            .get(&(scope.to_string(), id.to_string()))?;
+        (entry.regex_pattern_set.name.as_deref() == Some(name)).then_some(entry)
+    }
+
+    /// How many regex pattern sets this scope already holds. See
+    /// [`MAX_REGEX_PATTERN_SETS_PER_SCOPE`].
+    pub fn regex_pattern_sets_in_scope(&self, scope: &str) -> usize {
+        self.regex_pattern_sets
+            .keys()
+            .filter(|(stored_scope, _)| stored_scope == scope)
+            .count()
+    }
+
     /// The rule group stored under `(scope, id)` when it is also the one called
     /// `name`. See [`Self::web_acl`].
     pub fn rule_group(&self, scope: &str, name: &str, id: &str) -> Option<&RuleGroupEntry> {
@@ -341,25 +394,22 @@ impl ComAmazonawsWafv2Awswaf20190729State {
     /// being deleted and keeps a rule that names a missing one from being stored.
     ///
     /// Each of the model's four reference-bearing statements is resolved against
-    /// the entities that KIND of reference names. An `IPSetReferenceStatement` and a
-    /// `RuleGroupReferenceStatement` name resources of this account, so they resolve
+    /// the entities that KIND of reference names. An `IPSetReferenceStatement`, a
+    /// `RuleGroupReferenceStatement` and a `RegexPatternSetReferenceStatement` name
+    /// resources of this account, so they resolve
     /// through [`Self::arn_index`], each only to a resource of its own kind in the
     /// SAME scope, because a scope is a namespace. A `ManagedRuleGroupStatement`
     /// names no resource of this account at all — it names a group its VENDOR
     /// publishes, identified by `(VendorName, Name)` — so it resolves against
     /// [`MANAGED_RULE_GROUP_CATALOGUE`], the catalogue this service publishes, and a
-    /// pair the catalogue does not list names nothing that exists. A
-    /// `RegexPatternSetReferenceStatement` names an entity kind this emulator has no
-    /// store for yet (`CreateRegexPatternSet` is still a scaffolded 501, tracked as a
-    /// separate gap issue), so every reference to one names nothing that exists and
-    /// is refused here. The `Some` it answers is the DIAGNOSTIC for the refusal's
+    /// pair the catalogue does not list names nothing that exists.
+    /// The `Some` it answers is the DIAGNOSTIC for the refusal's
     /// audit record — the response itself carries [`NONEXISTENT_ITEM_MESSAGE`], the
     /// constant sentence that exception type always carries. That is also what keeps
     /// [`web_acl_capacity`] from pricing a statement whose cost it cannot know: a
     /// stored rule list can only carry a reference to a rule group this service
     /// holds, whose declared `Capacity` is exactly that statement's cost, or to a
-    /// catalogued managed rule group, whose published capacity is its cost, and never
-    /// a regex-pattern-set reference.
+    /// catalogued managed rule group, whose published capacity is its cost.
     ///
     /// Walked with an explicit worklist, like [`validate_statement_nesting`]: the
     /// tree is supplied by the request.
@@ -397,10 +447,19 @@ impl ComAmazonawsWafv2Awswaf20190729State {
                 }
             }
             if let Some(reference) = statement.regex_pattern_set_reference_statement.as_ref() {
-                return Some(format!(
-                    "No RegexPatternSet with the ARN {} exists in scope {scope}",
-                    reference.arn
-                ));
+                let resolved = matches!(
+                    self.arn_index.get(&reference.arn),
+                    Some(ResourceRef::RegexPatternSet {
+                        scope: stored_scope,
+                        ..
+                    }) if stored_scope == scope
+                );
+                if !resolved {
+                    return Some(format!(
+                        "No RegexPatternSet with the ARN {} exists in scope {scope}",
+                        reference.arn
+                    ));
+                }
             }
             if let Some(managed) = statement
                 .managed_rule_group_statement
@@ -489,6 +548,20 @@ pub const MAX_IP_SETS_PER_SCOPE: usize = 100;
 /// [`MAX_WEB_ACLS_PER_SCOPE`]. WAF's published quota is 100 rule groups per Region
 /// per scope.
 pub const MAX_RULE_GROUPS_PER_SCOPE: usize = 100;
+
+/// The most regex pattern sets this service stores per scope before
+/// `CreateRegexPatternSet` answers its modelled `WAFLimitsExceededException`.
+///
+/// Unlike [`MAX_WEB_ACLS_PER_SCOPE`], [`MAX_IP_SETS_PER_SCOPE`] and
+/// [`MAX_RULE_GROUPS_PER_SCOPE`], which carry WAF's published per-Region figure of
+/// 100, no figure is cited here, so this bound is CHOSEN — on the same reasoning
+/// the sibling waf-regional service states for its own pattern-set bound: every
+/// created set is a stored record, so the number a caller can create has to be
+/// bounded, and the bound is well above the handful of pattern sets a rule's
+/// `RegexPatternSetReferenceStatement`s name while staying small enough for a test
+/// to reach it. It is per scope because a scope is a namespace, like every other
+/// bound in this module.
+pub const MAX_REGEX_PATTERN_SETS_PER_SCOPE: usize = 10;
 
 /// The most addresses one IP set holds: WAF's published quota is 10,000 IP
 /// addresses or ranges per IP set. It bounds how large a single stored entry can
@@ -1435,6 +1508,10 @@ pub const WEB_ACL_ARN_KIND: &str = "webacl";
 /// The resource-kind segment an IP set's ARN carries. See
 /// [`RULE_GROUP_ARN_KIND`].
 pub const IP_SET_ARN_KIND: &str = "ipset";
+
+/// The resource-kind segment a regex pattern set's ARN carries. See
+/// [`RULE_GROUP_ARN_KIND`].
+pub const REGEX_PATTERN_SET_ARN_KIND: &str = "regexpatternset";
 
 /// `WAFInvalidParameterException` as WAF returns it: the structured `Field`,
 /// `Parameter` and `Reason` the model gives this one exception, and the message

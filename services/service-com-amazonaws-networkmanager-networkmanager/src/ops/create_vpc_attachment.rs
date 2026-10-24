@@ -202,6 +202,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let core_network_arn = core_network.arn.clone();
 
+        // What the policy in force on that core network decides about this attachment: the
+        // `attachment-policies` rule that claims it, the segment or network function group
+        // that rule puts it in, and whether the attachment request has to be ACCEPTED before
+        // the attachment is created. The decision is taken here, once, and stored on the
+        // record, so a later read reports what the policy in force at create time decided.
+        let claim = core_network
+            .topology
+            .attachment_claim(&crate::state::AttachmentCandidate {
+                attachment_type: crate::state::ATTACHMENT_TYPE_VPC,
+                edge_location: &edge_location,
+                resource_arn: &input.vpc_arn,
+                account_id: ::engine::emulator_account_id(),
+                tags: input.tags.as_deref().unwrap_or_default(),
+            });
+
         // A VPC attachment reaches the VPC through subnets OF that VPC, so the request has
         // to name at least one and every one of them has to lie in the VPC's own Region.
         // The modelled `SubnetArnList` carries neither rule (`smithy_query
@@ -342,7 +357,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             resource_arn: input.vpc_arn,
             routing_policy_label: input.routing_policy_label,
             created_at: now,
-            available_at: now + crate::state::SETTLE_DELAY,
+            // An attachment the policy asked acceptance for is not being created yet, so no
+            // transition is owed on it: `AcceptAttachment` is what starts the settle span.
+            available_at: (!claim.require_acceptance).then(|| now + crate::state::SETTLE_DELAY),
+            accepted_at: None,
+            attachment_policy_rule_number: claim.rule_number,
+            segment_name: claim.segment_name,
+            network_function_group_name: claim.network_function_group_name,
             client_token: input.client_token.filter(|token| !token.is_empty()),
             tags: input.tags.unwrap_or_default(),
             detail: crate::state::AttachmentDetail::Vpc {
@@ -352,8 +373,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 options: input.options,
             },
         };
-        // The attachment is `CREATING` until the settle span the clock owes elapses, so the
-        // response reports the state the stored record is in now.
+        // The attachment waits for its acceptance where the policy asked for one, and is
+        // otherwise `CREATING` until the settle span the clock owes elapses, so the response
+        // reports the state the stored record is in now.
         let vpc_attachment = record.to_vpc_attachment(now);
         store.attachments.insert(id, record);
 

@@ -14,8 +14,8 @@
 //!
 //! * the FORM of the unresolvable id (a minted-shaped id, free-form text, one character,
 //!   `ExperimentTemplateId`'s published 64-character ceiling, punctuation);
-//! * WHICH operation resolved it (`GetExperimentTemplate`, `DeleteExperimentTemplate`,
-//!   `StartExperiment`, `CreateTargetAccountConfiguration`,
+//! * WHICH operation resolved it (`GetExperimentTemplate`, `UpdateExperimentTemplate`,
+//!   `DeleteExperimentTemplate`, `StartExperiment`, `CreateTargetAccountConfiguration`,
 //!   `ListTargetAccountConfigurations` — every operation whose input carries an
 //!   `experimentTemplateId`, per
 //!   `smithy_query(query="operation",operation="…")`).
@@ -153,6 +153,15 @@ fn resolvers() -> Vec<Resolver> {
             method: "GET",
             uri: |id| format!("/experimentTemplates/{id}"),
             body: |_| None,
+        },
+        Resolver {
+            name: "UpdateExperimentTemplate",
+            method: "PATCH",
+            uri: |id| format!("/experimentTemplates/{id}"),
+            // Only `description`: the rules this request would be refused by BEFORE the
+            // lookup (a `roleArn` that is no IAM role ARN) must not stand in for the
+            // not-found refusal under test.
+            body: |id| Some(json!({ "description": format!("update {id}") })),
         },
         Resolver {
             name: "DeleteExperimentTemplate",

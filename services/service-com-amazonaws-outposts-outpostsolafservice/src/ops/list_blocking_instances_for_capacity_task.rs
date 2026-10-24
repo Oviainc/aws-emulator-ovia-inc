@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListBlockingInstancesForCapacityTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListBlockingInstancesForCapacityTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the Amazon EC2 instances recorded as running on the Outpost the
+//! `OutpostIdentifier` names — resolved from either the bare id or the full ARN the
+//! modelled label pattern accepts — that the capacity task the route names would need
+//! stopped: the ones belonging to the account that initiated the task, less every
+//! instance that task's `InstancesToExclude` names, in the Outpost's own recorded
+//! order, cut into pages of at most `MaxResults` with the modelled `NextToken` the next
+//! page resumes from.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListBlockingInstancesForCapacityTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A read, and one that writes NOTHING: it answers from
+//! [`crate::state::OutpostRecord::instances`], so a caller that lists a task's blocking
+//! instances sees exactly what the next caller does. An instance is launched through
+//! Amazon EC2 against the Outpost and by no call in THIS API, so this operation invents
+//! none: an Outpost nobody has launched an instance on is answered with no blocking
+//! instance, exactly as `ListAssets` answers an Outpost with no installed hardware.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +157,160 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListBlockingInstancesForCapacityTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListBlockingInstancesForCapacityTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListBlockingInstancesForCapacityTask"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListBlockingInstancesForCapacityTaskErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Outposts store is unavailable".to_string()),
+                },
+            )
+        })?;
+        // `OutpostIdentifier` accepts the bare id or the full Outpost ARN; both name
+        // the same stored Outpost.
+        let outpost_id =
+            crate::state::resolve_outpost_id(&input.outpost_identifier).ok_or_else(|| {
+                ListBlockingInstancesForCapacityTaskErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(crate::state::outpost_identifier_pattern_report()),
+                    },
+                )
+            })?;
+        // The resume point the caller's token names. A token this service did not
+        // issue for THIS list is a bad request, not an empty page.
+        let after = match input.next_token.as_deref().filter(|token| !token.is_empty()) {
+            Some(token) => Some(
+                crate::state::decode_page_token(crate::state::BLOCKING_INSTANCE_PAGE, token)
+                    .ok_or_else(|| {
+                        ListBlockingInstancesForCapacityTaskErrorModeled::ValidationException(
+                            ValidationException {
+                                message: Some(crate::state::page_token_report(Self::NAME)),
+                            },
+                        )
+                    })?,
+            ),
+            None => None,
+        };
+        let size = crate::state::page_size(input.max_results);
+
+        // A read, so the guard is taken immutably: which instances are running on the
+        // Outpost and which the task excludes are both facts already recorded, not a
+        // transition the clock owes, so there is nothing here for this call to
+        // materialise and nothing for it to write. The task's STATUS is not part of
+        // this answer, so an unsettled progression cannot change what it reports.
+        let store = state.lock();
+        // The list is nested under an Outpost
+        // (`/outposts/{OutpostIdentifier}/capacity/{CapacityTaskId}/blockingInstances`),
+        // so the parent is resolved first: an Outpost the store does not hold cannot be
+        // asked about the instances running on it. The refusal is the identifier echo of
+        // the value AS SUPPLIED — not of the bare id an ARN resolved to.
+        let record = store.outposts.get(&outpost_id).ok_or_else(|| {
+            ListBlockingInstancesForCapacityTaskErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::identifier_not_found(
+                        crate::state::OUTPOST_IDENTIFIER_MEMBER,
+                        &input.outpost_identifier,
+                    )),
+                },
+            )
+        })?;
+        // A capacity task belongs to exactly one Outpost, so one named under another
+        // Outpost's route names nothing: the task identifier is what is not found.
+        let task = store
+            .capacity_tasks
+            .get(&input.capacity_task_id)
+            .filter(|task| task.outpost_id == outpost_id)
+            .ok_or_else(|| {
+                ListBlockingInstancesForCapacityTaskErrorModeled::NotFoundException(
+                    NotFoundException {
+                        message: Some(crate::state::identifier_not_found(
+                            crate::state::CAPACITY_TASK_ID_MEMBER,
+                            &input.capacity_task_id,
+                        )),
+                    },
+                )
+            })?;
+
+        // The boundary this list pages on is an instance's POSITION in the Outpost's
+        // recorded order: an instance carries no creation sequence of its own, and that
+        // order is the one stable order the whole list is reported in — the same rule
+        // `ListAssets` pages an Outpost's assets by.
+        let (blocking_instances, next_token) = crate::state::page(
+            crate::state::BLOCKING_INSTANCE_PAGE,
+            record
+                .instances
+                .iter()
+                .enumerate()
+                .filter(|(_, instance)| blocks(instance, task))
+                .map(|(position, instance)| (position as u64, projection(instance))),
+            after,
+            size,
+        );
+
+        Ok(ListBlockingInstancesForCapacityTaskOutput {
+            // "A list of all running Amazon EC2 instances on the Outpost. Stopping one
+            // or more of these instances can free up the capacity needed to run the
+            // capacity task": the ones recorded for this Outpost that this task would
+            // need stopped, which may be none at all.
+            blocking_instances: Some(blocking_instances),
+            next_token,
+        })
+    }
+}
+
+/// Whether a recorded instance is one `task` would need stopped.
+///
+/// Two conditions, both from what AWS documents for this list:
+///
+/// * it belongs to "the account that initiated the capacity task". A capacity task is
+///   started by the caller of `StartCapacityTask`, and every request this emulator
+///   serves is the one emulator account's (`engine::emulator_account_id`, the account id
+///   `Outpost$OwnerId` and `Site$AccountId` carry), so that is the account a task was
+///   initiated by. An instance recorded as another account's — one the Outpost is shared
+///   with — is on the Outpost but not this caller's to stop, so it is not reported here;
+///   `ListAssetInstances`, the list "belonging to all accounts", is the one that reports
+///   it. An instance whose owning account was never recorded matches no account, so it is
+///   narrowed out the same way a `ListAssets` filter narrows out an asset with no value
+///   for the filtered member.
+/// * the task does not exclude it. `InstancesToExclude` is "user-specified instances
+///   that must not be stopped. These instances will not appear in the list of instances
+///   that Amazon Web Services recommends to stop in order to free up capacity" — so an
+///   excluded instance is absent from this list however it was named.
+fn blocks(instance: &AssetInstance, task: &crate::state::CapacityTaskRecord) -> bool {
+    instance.account_id.as_deref() == Some(::engine::emulator_account_id())
+        && !excluded(instance, task.instances_to_exclude.as_ref())
+}
+
+/// Whether `exclude` names `instance` through ANY of its three sub-lists.
+///
+/// The model gives `InstancesToExclude` three of them, each naming instances that must
+/// not be stopped by a different attribute: `Instances` by instance id, `AccountIds` by
+/// "IDs of the accounts that own each instance that must not be stopped", and `Services`
+/// by "names of the services that own each instance that must not be stopped". They are
+/// alternatives, so an instance any one of them names is excluded; a sub-list that is
+/// absent (or empty) excludes nothing, and a member an instance has no recorded value
+/// for is named by no list.
+fn excluded(instance: &AssetInstance, exclude: Option<&InstancesToExclude>) -> bool {
+    let Some(exclude) = exclude else {
+        return false;
+    };
+    let names = |excluded: Option<&Vec<String>>, value: Option<&String>| {
+        excluded.is_some_and(|excluded| value.is_some_and(|value| excluded.contains(value)))
+    };
+    names(exclude.instances.as_ref(), instance.instance_id.as_ref())
+        || names(exclude.account_ids.as_ref(), instance.account_id.as_ref())
+        || names(exclude.services.as_ref(), instance.aws_service_name.as_ref())
+}
+
+/// The `BlockingInstance` projection of a recorded instance.
+///
+/// `BlockingInstance` is the narrower of the two shapes this service reports an instance
+/// as: it carries the three members of [`AssetInstance`] that identify the instance and
+/// who owns it, and neither the instance type nor the asset the instance runs on. A
+/// member the record does not hold is reported by no member.
+fn projection(instance: &AssetInstance) -> BlockingInstance {
+    BlockingInstance {
+        instance_id: instance.instance_id.clone(),
+        account_id: instance.account_id.clone(),
+        aws_service_name: instance.aws_service_name.clone(),
     }
 }

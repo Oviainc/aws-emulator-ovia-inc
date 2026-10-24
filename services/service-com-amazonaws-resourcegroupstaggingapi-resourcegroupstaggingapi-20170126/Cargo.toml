@@ -26,6 +26,16 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 # Renders that digest as the hex half of the pagination token.
 hex = { workspace = true }
+# The services that OWN the resources this API tags: a tag written here is
+# written to the owning service's own tag set, and an ARN that service holds no
+# resource for is reported with ITS not-found code. Reached through the shared
+# engine, which needs the owning service's state TYPE. See `src/state/owners.rs`.
+service-com-amazonaws-sqs-amazonsqs = { workspace = true }
+service-com-amazonaws-ecs-amazonec2containerservicev20141113 = { workspace = true }
+service-com-amazonaws-eventbridge-awsevents = { workspace = true }
+service-com-amazonaws-kms-trentservice = { workspace = true }
+service-com-amazonaws-secretsmanager-secretsmanager = { workspace = true }
+service-com-amazonaws-sfn-awsstepfunctions = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

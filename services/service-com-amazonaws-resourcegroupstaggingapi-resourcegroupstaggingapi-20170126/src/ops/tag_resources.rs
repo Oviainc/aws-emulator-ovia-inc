@@ -1,13 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResources
-//! Upserts the request's tags into the stored tag map of every ARN in
+//! Upserts the request's tags into the tag map of every ARN in
 //! `ResourceARNList`: a key already on the resource is overwritten, every other
-//! key it carries is left alone. An ARN that cannot be parsed is reported in
-//! `FailedResourcesMap` — HTTP 200 overall, because the well-formed ARNs in the
-//! same request were tagged. So is a write that would push one resource past the
-//! service's documented 50-tag limit, or a NEW ARN once the store is already
-//! holding this emulator's maximum (see `crate::state::MAX_TAGGED_RESOURCES`).
+//! key it carries is left alone. The map is the OWNING service's own
+//! (`crate::state::owners`) wherever this emulator models it, so a tag written
+//! here is the tag that service reports.
+//!
+//! Two failure levels, which must stay distinguishable:
+//!
+//! * A REQUEST-level parameter fault refuses the whole call with
+//!   `InvalidParameterException` (HTTP 400) and writes nothing — a value that is
+//!   not an ARN, an ARN outside this endpoint's partition or Region, or a tag key
+//!   in the reserved `aws:` namespace.
+//! * A PER-RESOURCE failure is an entry in `FailedResourcesMap` with HTTP 200
+//!   overall, because the other ARNs in the same request were tagged: a
+//!   well-formed ARN the owning service holds no resource for (carrying that
+//!   service's own not-found code), a write that would push one resource past the
+//!   documented 50-tag limit, or a NEW ARN once the store is already holding this
+//!   emulator's maximum (see `crate::state::MAX_TAGGED_RESOURCES`).
+//!
+//! Resolution reaches as far as this crate links: an ARN in a namespace
+//! `crate::state::owners` does not own is neither confirmed nor denied, and its
+//! tags are kept in this service's own store instead. That is the emulator's
+//! linkage boundary, not an AWS rule — see that module.
 //!
 //! ## Shape of an operation
 //!
@@ -181,43 +197,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
-        let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(TagResourcesErrorModeled::InternalServiceException(
-                InternalServiceException {
-                    message: Some("the tagging store is unavailable".to_string()),
-                },
-            )
-            .into());
-        };
-        let mut state = state.lock();
+        use crate::state::owners;
 
-        // The modelled bounds (1..20 ARNs, 1..50 tags, each key 1..128 and each
-        // value 0..256 characters) are refused at the boundary before this runs.
-        // They cap ONE request; the two store bounds below cap what repeated
-        // requests can accumulate, and each is reported as that ARN's own
-        // failure so the caller sees which resources were not tagged.
+        /// A request-level parameter fault: the error the service declares for
+        /// it, refusing the WHOLE call.
+        fn invalid(message: String) -> TagResourcesError {
+            TagResourcesErrorModeled::InvalidParameterException(InvalidParameterException {
+                message: Some(message),
+            })
+            .into()
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+
+        // Request-level validation runs over the WHOLE request before anything
+        // is written, because the batch is atomic: a parameter fault leaves no
+        // ARN in the request tagged. The modelled bounds (1..20 ARNs, 1..50
+        // tags, each key 1..128 and each value 0..256 characters) are refused at
+        // the boundary before this runs.
+        let mut addressed: Vec<crate::state::ParsedArn> =
+            Vec::with_capacity(input.resource_arn_list.len());
+        for arn in &input.resource_arn_list {
+            addressed.push(crate::state::addressable_arn(arn, &region).map_err(invalid)?);
+        }
+        if input
+            .tags
+            .keys()
+            .any(|key| crate::state::is_reserved_tag_key(key))
+        {
+            return Err(invalid(crate::state::SYSTEM_TAGS_MESSAGE.to_string()));
+        }
+
+        // Ordered, so the write applied to an owning service's tag map does not
+        // depend on a hash order. The documented limit — "Each resource can have
+        // up to 50 tags" — travels WITH the change, so an owning service's lock
+        // is taken once for the check and the write together.
+        let upserts: owners::Tags = input
+            .tags
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        let change = owners::Change::Upsert {
+            tags: &upserts,
+            max_tags: crate::state::MAX_TAGS_PER_RESOURCE,
+        };
+
+        // Per-resource: a well-formed ARN naming nothing is this ARN's own
+        // `FailedResourcesMap` entry carrying the OWNING service's not-found
+        // identity, with HTTP 200 overall, because the live ARNs in the same
+        // request were tagged.
         let mut failed: std::collections::HashMap<String, FailureInfo> =
             std::collections::HashMap::new();
-        for arn in &input.resource_arn_list {
-            let Some(parsed) = crate::state::parse_arn(arn) else {
-                failed.insert(arn.clone(), crate::state::malformed_arn_failure(arn));
-                continue;
-            };
-            let would_hold = state.tag_count_after_merging(arn, input.tags.keys());
-            if would_hold > crate::state::MAX_TAGS_PER_RESOURCE {
-                failed.insert(
-                    arn.clone(),
-                    crate::state::too_many_tags_failure(arn, would_hold),
-                );
-                continue;
+        // The ARNs whose tags this service is the home for, written below under
+        // the store's own lock — never while an owning service's lock is held.
+        let mut ours: Vec<&crate::state::ParsedArn> = Vec::new();
+        for parsed in &addressed {
+            match owners::visit(&*self.engine, parsed, Some(&change)) {
+                owners::Resolution::Absent(failure) => {
+                    failed.insert(parsed.arn.clone(), failure);
+                }
+                owners::Resolution::TooManyTags(would_hold) => {
+                    failed.insert(
+                        parsed.arn.clone(),
+                        crate::state::too_many_tags_failure(&parsed.arn, would_hold),
+                    );
+                }
+                owners::Resolution::Present { tags: Some(_) } => {}
+                owners::Resolution::Present { tags: None } | owners::Resolution::Unowned => {
+                    ours.push(parsed);
+                }
             }
-            let Some(entry) = state.entry_mut(&parsed) else {
-                failed.insert(arn.clone(), crate::state::store_at_capacity_failure(arn));
-                continue;
+        }
+
+        if !ours.is_empty() {
+            let Some(state) = crate::state::service_state(&*self.engine) else {
+                return Err(TagResourcesErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some("the tagging store is unavailable".to_string()),
+                    },
+                )
+                .into());
             };
-            for (key, value) in &input.tags {
-                entry.tags.insert(key.clone(), value.clone());
+            let mut state = state.lock();
+            for parsed in ours {
+                // Checked before the entry is created, so a refused write does
+                // not leave the store holding a resource that never had a tag.
+                let would_hold = state.tag_count_after_merging(&parsed.arn, upserts.keys());
+                if would_hold > crate::state::MAX_TAGS_PER_RESOURCE {
+                    failed.insert(
+                        parsed.arn.clone(),
+                        crate::state::too_many_tags_failure(&parsed.arn, would_hold),
+                    );
+                    continue;
+                }
+                let Some(entry) = state.entry_mut(parsed) else {
+                    failed.insert(
+                        parsed.arn.clone(),
+                        crate::state::store_at_capacity_failure(&parsed.arn),
+                    );
+                    continue;
+                };
+                if let Err(would_hold) = change.apply(&mut entry.tags) {
+                    failed.insert(
+                        parsed.arn.clone(),
+                        crate::state::too_many_tags_failure(&parsed.arn, would_hold),
+                    );
+                }
             }
         }
 

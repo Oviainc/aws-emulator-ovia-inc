@@ -19,6 +19,8 @@ mod behavior_graph_lifecycle;
 mod datasource_package_ingest;
 #[path = "all/datasource_package_reporting.rs"]
 mod datasource_package_reporting;
+#[path = "all/list_tags_for_resource.rs"]
+mod list_tags_for_resource;
 #[path = "all/member_datasource_ingest_history.rs"]
 mod member_datasource_ingest_history;
 #[path = "all/member_removal.rs"]

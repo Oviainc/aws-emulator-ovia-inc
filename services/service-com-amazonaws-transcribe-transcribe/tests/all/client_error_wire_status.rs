@@ -31,12 +31,14 @@ use serde_json::{json, Value};
 use crate::transcription_jobs::Transcribe;
 
 /// The resource kinds this service's own refusals name, one per ARN resource type it
-/// stores records of, plus the neutral word for a type it holds none of. The stored
-/// types are the ones `TranscribeArn`'s `<type>/<name>` segment spells
+/// stores records of, plus the neutral word for a type that names no family at all.
+/// The stored types are the ones `TranscribeArn`'s `<type>/<name>` segment spells
 /// (`smithy_query(query="operation", operation="TagResource")`), whose own doc lists
 /// the valid values ("transcription-job, medical-transcription-job, vocabulary,
-/// medical-vocabulary, vocabulary-filter, and language-model") — of which
-/// `medical-transcription-job` is one this emulator stores no records of.
+/// medical-vocabulary, vocabulary-filter, and language-model") — all of which this
+/// emulator now stores records of, so the neutral word is reached through a type
+/// segment that doc does not list and no resource family of this service answers to
+/// (`call-analytics-job`).
 const KIND_VOCABULARY: &str = "vocabulary";
 const KIND_VOCABULARY_FILTER: &str = "vocabulary filter";
 const KIND_JOB: &str = "job";
@@ -280,9 +282,21 @@ async fn a_resource_this_account_does_not_hold_is_a_bad_request() {
             KIND_LANGUAGE_MODEL,
         ),
         (
-            "ListTagsForResource for a resource type this emulator holds none of",
+            "GetMedicalTranscriptionJob for a job that was never started",
+            "GetMedicalTranscriptionJob",
+            json!({"MedicalTranscriptionJobName": "never-started"}),
+            KIND_JOB,
+        ),
+        (
+            "ListTagsForResource for a medical-transcription-job ARN that names nothing",
             "ListTagsForResource",
-            json!({"ResourceArn": arn("medical-transcription-job", "any-job")}),
+            json!({"ResourceArn": arn("medical-transcription-job", "never-started")}),
+            KIND_JOB,
+        ),
+        (
+            "ListTagsForResource for a resource type that names no family at all",
+            "ListTagsForResource",
+            json!({"ResourceArn": arn("call-analytics-job", "any-job")}),
             KIND_RESOURCE,
         ),
     ];

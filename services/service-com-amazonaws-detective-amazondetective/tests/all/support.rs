@@ -14,7 +14,7 @@
 use std::sync::Arc;
 
 use serde_json::{json, Map, Value};
-use service_com_amazonaws_detective_amazondetective::state::ACCOUNT_ID_LEN;
+use service_com_amazonaws_detective_amazondetective::state::{ACCOUNT_ID_LEN, GRAPH_ID_LEN};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region most requests sign for; the ARNs they mint carry exactly this one.
@@ -124,31 +124,88 @@ pub async fn call(router: &MultiServiceRouter, uri: &str, body: &Value) -> (u16,
     call_in(router, REGION, uri, body).await
 }
 
-/// The tag map `ListTagsForResource` reports for `graph_arn` in `region` — the one
-/// reader every tag suite in this crate checks a write through.
-pub async fn tags_of(
+/// One `ListTagsForResource` call on `graph_arn` in `region`: status and parsed answer,
+/// with nothing asserted — for a suite that is testing a refusal.
+pub async fn list_tags(
     router: &MultiServiceRouter,
     region: &str,
     graph_arn: &str,
-) -> Map<String, Value> {
-    let (status, body) = call_with(
+) -> (u16, Value) {
+    call_with(
         router,
         "GET",
         region,
         &format!("/tags/{graph_arn}"),
         &Value::Null,
     )
-    .await;
+    .await
+}
+
+/// The tag map `ListTagsForResource` reports for `graph_arn` in `region`, labelled with
+/// the table row that asked for it — the one reader every tag suite in this crate checks
+/// a write through. An untagged graph reports an EMPTY map, so the member has to be
+/// present either way.
+pub async fn tags_of_case(
+    router: &MultiServiceRouter,
+    region: &str,
+    graph_arn: &str,
+    case: &str,
+) -> Map<String, Value> {
+    let (status, body) = list_tags(router, region, graph_arn).await;
     assert_eq!(
         status, 200,
-        "ListTagsForResource({graph_arn}): expected 200, got {status} {body:?}"
+        "case {case:?}: ListTagsForResource({graph_arn}) expected 200, got {status} {body:?}"
     );
     body.get("Tags")
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_else(|| {
-            panic!("ListTagsForResource({graph_arn}) carried no Tags, got {body:?}")
+            panic!("case {case:?}: ListTagsForResource({graph_arn}) carried no Tags, got {body:?}")
         })
+}
+
+/// As [`tags_of_case`], for a caller with no table row to name.
+pub async fn tags_of(
+    router: &MultiServiceRouter,
+    region: &str,
+    graph_arn: &str,
+) -> Map<String, Value> {
+    tags_of_case(router, region, graph_arn, "ListTagsForResource").await
+}
+
+/// Owned key/value pairs from a literal table row.
+pub fn pairs(entries: &[(&str, &str)]) -> Vec<(String, String)> {
+    entries
+        .iter()
+        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+        .collect()
+}
+
+/// Owned keys from a literal table row.
+pub fn keys(entries: &[&str]) -> Vec<String> {
+    entries.iter().map(|key| (*key).to_string()).collect()
+}
+
+/// Pairs as a JSON tag map — the shape `ListTagsForResource` reports and the shape the
+/// `Tags` member of `CreateGraph`/`TagResource` carries.
+pub fn tag_map(entries: &[(String, String)]) -> Map<String, Value> {
+    entries
+        .iter()
+        .map(|(key, value)| (key.clone(), json!(value)))
+        .collect()
+}
+
+/// A `GraphArn` built from its parts, satisfying the modelled pattern
+/// `^arn:aws[-\w]{0,10}?:detective:[-\w]{2,20}?:\d{12}?:graph:[abcdef\d]{32}?$`
+/// (`smithy_query(query="shape",shape="GraphArn")`) — for a suite that needs an ARN the
+/// store never held.
+pub fn graph_arn_of(partition: &str, region: &str, account: &str, id: &str) -> String {
+    assert_eq!(
+        id.len(),
+        GRAPH_ID_LEN,
+        "a graph id is the modelled pattern's {GRAPH_ID_LEN} hex characters"
+    );
+    format!("arn:{partition}:detective:{region}:{account}:graph:{id}")
 }
 
 /// The modelled error shape a failed call reported.

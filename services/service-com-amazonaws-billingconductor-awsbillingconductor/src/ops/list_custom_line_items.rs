@@ -191,19 +191,7 @@ fn element(item: &CustomLineItemRecord) -> CustomLineItemListElement {
     CustomLineItemListElement {
         arn: Some(item.arn.clone()),
         name: Some(item.name.clone()),
-        charge_details: Some(ListCustomLineItemChargeDetails {
-            // "It should contain only one of `Flat` or `Percentage`": the create stored
-            // exactly one of the two values, and this reports the one it stored.
-            flat: item
-                .flat_charge_value
-                .map(|charge_value| ListCustomLineItemFlatChargeDetails { charge_value }),
-            percentage: item.percentage_value.map(|percentage_value| {
-                ListCustomLineItemPercentageChargeDetails { percentage_value }
-            }),
-            r#type: item.charge_type.clone(),
-            line_item_filters: (!item.line_item_filters.is_empty())
-                .then(|| item.line_item_filters.clone()),
-        }),
+        charge_details: Some(item.charge_details()),
         currency_code: Some(crate::state::custom_line_item_currency_code(&item.arn).to_string()),
         description: Some(item.description.clone()),
         // Nothing in this service's surface sets a product code — neither

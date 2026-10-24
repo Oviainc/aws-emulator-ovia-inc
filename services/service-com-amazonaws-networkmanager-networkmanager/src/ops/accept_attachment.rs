@@ -1,34 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AcceptAttachment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AcceptAttachment`'s real behaviour. Implement it here — this is
+//! Accepts the attachment request of an attachment that is waiting for one, and stores the
+//! acceptance in the one attachment map every attachment operation reads
+//! (`crate::state::ComAmazonawsNetworkmanagerNetworkmanagerState::attachments`). This is
 //! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AcceptAttachment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
-//!
-//! ## Shape of an operation
-//!
-//! Each operation is a struct that owns the shared engine and implements
-//! [`smithy_server_runtime::Operation`]. The framework constructs one per service via
-//! `AcceptAttachment::new(engine)` and drives it through the centralized request walk:
-//! deserialize → validate → `handle` → serialize. You write ONLY the `handle` body.
+//! An attachment waits for an acceptance only where the `attachment-policies` rule of its
+//! core network's policy that claimed it asks for one
+//! (`crate::state::PolicyTopology::attachment_claim`): such an attachment is created in
+//! `PENDING_ATTACHMENT_ACCEPTANCE`, and no span of the clock moves it out of that state.
+//! Accepting it is what starts the attachment — it becomes `CREATING`, and the
+//! `CREATING` -> `AVAILABLE` transition the clock owes falls due a settle span later. An
+//! attachment that is NOT waiting for an acceptance has no attachment request to accept,
+//! which is this service's concurrent-state refusal (`ConflictException`, HTTP 409).
 //!
 //! ## Reaching this service's state
 //!
-//! The engine is held on `self` (constructor-injected), NOT passed per request — so
-//! engine access is guaranteed by the time any request runs. Reach the store through
-//! [`crate::state::service_state`] and read and write it through the guard it hands back:
-//!
-//! ```ignore
-//!     let state = crate::state::service_state(&*self.engine)
-//!         .ok_or(/* a modelled server error */)?;
-//!     state.lock().your_field = /* ... */;
-//! ```
+//! The engine is held on `self` (constructor-injected), NOT passed per request. Reach the
+//! store through [`crate::state::service_state`] and read and write it through the guard it
+//! hands back.
 //!
 //! `ctx` ([`smithy_server_runtime::OperationContext`]) carries request metadata only —
 //! headers, URI, method, and anything middleware placed in `ctx.parts().extensions`.
@@ -148,18 +139,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AcceptAttachment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AcceptAttachmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AcceptAttachment"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            AcceptAttachmentErrorModeled::InternalServerException(InternalServerException {
+                message: "the networkmanager store is unavailable".to_string(),
+                retry_after_seconds: None,
+            })
+        })?;
+        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+
+        // One id space holds every attachment kind, and this operation accepts any of them,
+        // so an id that names no stored attachment is the service's not-found refusal.
+        let record = store
+            .attachments
+            .get_mut(&input.attachment_id)
+            .ok_or_else(|| {
+                AcceptAttachmentErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(
+                        crate::state::ATTACHMENT_KIND,
+                        &input.attachment_id,
+                    ),
+                )
+            })?;
+
+        // "Accepts a core network attachment request. Once the attachment request is
+        // accepted by a core network owner, the attachment is created and connected to a
+        // core network" (`smithy_query query="doc" shape="AcceptAttachment"`): there is a
+        // request to accept only while the attachment is waiting for one. An attachment
+        // already under way, or already available, is in the wrong state for this call —
+        // this service's concurrent-state refusal — and its stored record is left untouched.
+        if !record.accept_at(now) {
+            let held = record.state_at(now);
+            return Err(AcceptAttachmentErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "attachment {} is {held}, not {}, so it has no attachment request to accept",
+                        record.id,
+                        crate::state::STATE_PENDING_ATTACHMENT_ACCEPTANCE
+                    ),
+                    resource_id: record.id.clone(),
+                    resource_type: crate::state::ATTACHMENT_KIND.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // The accepted attachment is `CREATING` until the settle span the clock now owes
+        // elapses, so the response reports the state the stored record is in at this
+        // instant, computed from that record like every other read of it.
+        Ok(AcceptAttachmentOutput {
+            attachment: Some(record.to_attachment(now)),
+        })
     }
 }

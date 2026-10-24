@@ -116,6 +116,15 @@ async fn every_caller_keyed_token_ledger_stays_within_its_ceiling() {
         },
     );
     assert_bounded(
+        "create-lens-share",
+        &mut store.create_lens_share_tokens,
+        |index| state::CreateLensShareToken {
+            lens_id: format!("{index:032x}"),
+            share_id: format!("{index:032x}"),
+            fingerprint: format!("fingerprint-{index}"),
+        },
+    );
+    assert_bounded(
         "create-review-template",
         &mut store.create_review_template_tokens,
         |index| state::CreateReviewTemplateToken {

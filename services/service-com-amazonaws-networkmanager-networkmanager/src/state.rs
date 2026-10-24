@@ -11,7 +11,11 @@
 //! whose segments and edges are a function of the core network policy document it holds.
 //! A core network in turn owns its ATTACHMENTS: each joins one resource to ONE of the
 //! edge locations that policy configures, and a Connect attachment is carried over
-//! another attachment (its transport) rather than over a resource of its own.
+//! another attachment (its transport) rather than over a resource of its own. The policy's
+//! `attachment-policies` rules decide what becomes of each attachment created on the core
+//! network — which segment or network function group it joins, and whether its attachment
+//! request has to be ACCEPTED first, which is what holds it in
+//! `PENDING_ATTACHMENT_ACCEPTANCE` until `AcceptAttachment` grants that acceptance.
 //! Beside that tree a global network holds the CONNECTIONS registered with it (a Connect
 //! peer of either kind, a VPN connection), whose session health is what
 //! `GetNetworkTelemetry` reports.
@@ -47,6 +51,17 @@ pub const STATE_DELETING: &str = "DELETING";
 /// core network waits in CREATING where the resources above wait in [`STATE_PENDING`];
 /// AVAILABLE and DELETING it shares with them.
 pub const STATE_CREATING: &str = "CREATING";
+
+/// The state an ATTACHMENT waits in while the `attachment-policies` rule of the core
+/// network policy that claimed it asks for the attachment request to be accepted. One of
+/// `AttachmentState`'s own values (`smithy_query shape=AttachmentState`, mirrored in
+/// `ops::types::ATTACHMENT_STATE_VALUES`).
+///
+/// Unlike [`STATE_CREATING`] this is NOT a wait on the clock: no span is owed on it, and
+/// only an acceptance (`AcceptAttachment`, [`AttachmentRecord::accept_at`]) moves an
+/// attachment out of it — after which the ordinary `CREATING` -> `AVAILABLE` transition
+/// the clock owes begins.
+pub const STATE_PENDING_ATTACHMENT_ACCEPTANCE: &str = "PENDING_ATTACHMENT_ACCEPTANCE";
 
 /// The ARN namespace the model declares for this service (`arnNamespace: networkmanager`).
 const ARN_NAMESPACE: &str = "networkmanager";
@@ -890,8 +905,11 @@ impl TelemetryResourceRecord {
 /// store the quota, the inventory count and the core-network delete refusal are computed
 /// from, so no two operations can disagree about which attachments exist.
 ///
-/// Like the records above, `state` is not a field but a function of the clock
-/// ([`Self::state_at`]), so reporting an attachment never writes.
+/// Like the records above, `state` is not a field but a function of what is stored and the
+/// clock ([`Self::state_at`]), so reporting an attachment never writes. The one thing the
+/// clock does NOT decide is the acceptance an `attachment-policies` rule can ask for: an
+/// attachment waiting for one stays in [`STATE_PENDING_ATTACHMENT_ACCEPTANCE`] until
+/// `AcceptAttachment` grants it ([`Self::accept_at`]).
 #[derive(Debug, Clone)]
 pub struct AttachmentRecord {
     pub id: String,
@@ -916,8 +934,25 @@ pub struct AttachmentRecord {
     /// — so it is held here rather than dropped.
     pub routing_policy_label: Option<String>,
     pub created_at: SystemTime,
-    /// The instant the `CREATING` -> `AVAILABLE` transition the clock owes becomes due.
-    pub available_at: SystemTime,
+    /// The instant the `CREATING` -> `AVAILABLE` transition the clock owes becomes due, or
+    /// `None` while the attachment is still waiting for the acceptance the core network
+    /// policy asked for: nothing is being created until the request is accepted, so no
+    /// transition is owed on it until then (see [`Self::accept_at`]).
+    pub available_at: Option<SystemTime>,
+    /// When the acceptance the policy asked for was granted — the instant the attachment
+    /// last changed before the transition above falls due. `None` for an attachment no rule
+    /// asked acceptance for, which never waited for one.
+    pub accepted_at: Option<SystemTime>,
+    /// The `attachment-policies` rule of the core network policy in force that claimed this
+    /// attachment, and what that rule put the attachment in: the
+    /// `Attachment$AttachmentPolicyRuleNumber`, `Attachment$SegmentName` and
+    /// `Attachment$NetworkFunctionGroupName` a read of it reports. All three are absent
+    /// where no rule of that policy claims the attachment.
+    pub attachment_policy_rule_number: Option<i32>,
+    /// See [`Self::attachment_policy_rule_number`].
+    pub segment_name: Option<String>,
+    /// See [`Self::attachment_policy_rule_number`].
+    pub network_function_group_name: Option<String>,
     /// The `ClientToken` of the request that minted this record, kept so a retry of that
     /// request answers this record instead of minting a second attachment.
     pub client_token: Option<String>,
@@ -951,28 +986,47 @@ impl AttachmentRecord {
     /// `AttachmentState` is a wider enum than the resource states above (REJECTED,
     /// PENDING_ATTACHMENT_ACCEPTANCE, CREATING, FAILED, AVAILABLE, UPDATING,
     /// PENDING_NETWORK_UPDATE, PENDING_TAG_ACCEPTANCE, DELETING: `smithy_query
-    /// shape=AttachmentState`, mirrored in `ops::types::ATTACHMENT_STATE_VALUES`), but it
-    /// shares the two this slice uses with [`CoreNetworkRecord::state_at`]: an attachment
+    /// shape=AttachmentState`, mirrored in `ops::types::ATTACHMENT_STATE_VALUES`), and it
+    /// shares two of them with [`CoreNetworkRecord::state_at`]: an attachment under way
     /// waits in [`STATE_CREATING`] until the transition the clock owes falls due and is
-    /// [`STATE_AVAILABLE`] after it. The states that depend on an attachment-acceptance
-    /// rule of the core network policy are not reachable here: nothing in this service
-    /// acts on a policy's `attachment-policies` yet.
+    /// [`STATE_AVAILABLE`] after it. An attachment the policy in force asked acceptance for
+    /// waits in [`STATE_PENDING_ATTACHMENT_ACCEPTANCE`] INSTEAD, and the clock never moves
+    /// it: only [`Self::accept_at`] does, after which the span above starts.
     pub fn state_at(&self, now: SystemTime) -> &'static str {
-        if now >= self.available_at {
-            STATE_AVAILABLE
-        } else {
-            STATE_CREATING
+        match self.available_at {
+            None => STATE_PENDING_ATTACHMENT_ACCEPTANCE,
+            Some(available_at) if now >= available_at => STATE_AVAILABLE,
+            Some(_) => STATE_CREATING,
         }
     }
 
-    /// When this attachment last changed, as of `now`: the create, or the
-    /// `CREATING` -> `AVAILABLE` transition once that has fallen due. DERIVED from the two
-    /// stored instants, so a read reports a current `UpdatedAt` without writing one.
+    /// Whether this attachment is still waiting for the acceptance its core network policy
+    /// asked for — the one thing `AcceptAttachment` can act on.
+    pub fn awaits_acceptance(&self) -> bool {
+        self.available_at.is_none()
+    }
+
+    /// Grant the acceptance this attachment is waiting for, at `now`: the attachment starts
+    /// being created, so the `CREATING` -> `AVAILABLE` transition the clock owes becomes due
+    /// a [`SETTLE_DELAY`] later. Answers `false`, writing nothing, when the attachment was
+    /// not waiting for one.
+    pub fn accept_at(&mut self, now: SystemTime) -> bool {
+        if !self.awaits_acceptance() {
+            return false;
+        }
+        self.accepted_at = Some(now);
+        self.available_at = Some(now + SETTLE_DELAY);
+        true
+    }
+
+    /// When this attachment last changed, as of `now`: the create, the acceptance that
+    /// started it, or the `CREATING` -> `AVAILABLE` transition once that has fallen due.
+    /// DERIVED from the stored instants, so a read reports a current `UpdatedAt` without
+    /// writing one.
     pub fn updated_at(&self, now: SystemTime) -> SystemTime {
-        if now >= self.available_at {
-            self.available_at
-        } else {
-            self.created_at
+        match self.available_at {
+            Some(available_at) if now >= available_at => available_at,
+            _ => self.accepted_at.unwrap_or(self.created_at),
         }
     }
 
@@ -991,13 +1045,13 @@ impl AttachmentRecord {
             // carries, so this member is absent rather than a one-entry copy of it.
             edge_locations: None,
             resource_arn: Some(self.resource_arn.clone()),
-            // Which `attachment-policies` rule of the core network policy claimed the
-            // attachment, and the segment or network function group it put it in, are
-            // decided by that policy — which no operation of this service acts on yet, so
-            // these are absent rather than guessed.
-            attachment_policy_rule_number: None,
-            segment_name: None,
-            network_function_group_name: None,
+            // Which `attachment-policies` rule of the core network policy claimed this
+            // attachment, and the segment or network function group that rule put it in,
+            // were decided where the attachment was created, from the policy in force on
+            // its core network, and are reported from the record rather than re-derived.
+            attachment_policy_rule_number: self.attachment_policy_rule_number,
+            segment_name: self.segment_name.clone(),
+            network_function_group_name: self.network_function_group_name.clone(),
             tags: Some(self.tags.clone()),
             // A proposed change exists only while a tag or segment change is awaiting
             // acceptance, which nothing here can start.
@@ -2018,6 +2072,78 @@ const POLICY_SEGMENTS: &str = "segments";
 const POLICY_NETWORK_FUNCTION_GROUPS: &str = "network-function-groups";
 /// See [`POLICY_VERSION`].
 const POLICY_NAME: &str = "name";
+/// See [`POLICY_VERSION`]: the keys of an `attachment-policies[]` rule, the part of the
+/// document that decides what happens to an attachment created on the core network. A rule
+/// carries a `rule-number`, the `conditions` an attachment is matched against (combined by
+/// its `condition-logic`) and the `action` taken on the attachment it claims.
+const POLICY_ATTACHMENT_POLICIES: &str = "attachment-policies";
+/// See [`POLICY_ATTACHMENT_POLICIES`].
+const POLICY_RULE_NUMBER: &str = "rule-number";
+/// See [`POLICY_ATTACHMENT_POLICIES`].
+const POLICY_CONDITION_LOGIC: &str = "condition-logic";
+/// See [`POLICY_ATTACHMENT_POLICIES`].
+const POLICY_CONDITIONS: &str = "conditions";
+/// See [`POLICY_ATTACHMENT_POLICIES`].
+const POLICY_ACTION: &str = "action";
+/// See [`POLICY_ATTACHMENT_POLICIES`]: the keys of one `conditions[]` entry.
+const POLICY_TYPE: &str = "type";
+/// See [`POLICY_TYPE`].
+const POLICY_OPERATOR: &str = "operator";
+/// See [`POLICY_TYPE`].
+const POLICY_KEY: &str = "key";
+/// See [`POLICY_TYPE`].
+const POLICY_VALUE: &str = "value";
+/// See [`POLICY_ATTACHMENT_POLICIES`]: the keys of a rule's `action`.
+const POLICY_REQUIRE_ATTACHMENT_ACCEPTANCE: &str = "require-attachment-acceptance";
+/// See [`POLICY_REQUIRE_ATTACHMENT_ACCEPTANCE`].
+const POLICY_ASSOCIATION_METHOD: &str = "association-method";
+/// See [`POLICY_REQUIRE_ATTACHMENT_ACCEPTANCE`].
+const POLICY_SEGMENT: &str = "segment";
+/// See [`POLICY_REQUIRE_ATTACHMENT_ACCEPTANCE`].
+const POLICY_TAG_VALUE_OF_KEY: &str = "tag-value-of-key";
+/// See [`POLICY_REQUIRE_ATTACHMENT_ACCEPTANCE`].
+const POLICY_ADD_TO_NETWORK_FUNCTION_GROUP: &str = "add-to-network-function-group";
+
+/// The `condition-logic` value that makes a rule claim an attachment ANY one of its
+/// conditions holds for; the other published value, `and`, is the default and is what every
+/// other string (and an absent member) means here.
+const POLICY_LOGIC_OR: &str = "or";
+
+/// The `association-method` values a rule's action may carry: `constant` names the segment
+/// in `segment`, `tag` takes the segment name from the value of the attachment's
+/// `tag-value-of-key` tag (Cloud WAN "Core network policy" documentation).
+const POLICY_ASSOCIATION_CONSTANT: &str = "constant";
+/// See [`POLICY_ASSOCIATION_CONSTANT`].
+const POLICY_ASSOCIATION_TAG: &str = "tag";
+
+/// The `conditions[].type` values an attachment-policy rule matches an attachment against,
+/// as the published policy schema lists them: `any` claims every attachment, and the rest
+/// each compare one property of the attachment with the condition's `value` under its
+/// `operator` — the account that owns it, the Region of its edge location, its
+/// `AttachmentType`, the ARN of the resource it attaches, or one of its tags.
+const CONDITION_ANY: &str = "any";
+/// See [`CONDITION_ANY`].
+const CONDITION_ACCOUNT_ID: &str = "account-id";
+/// See [`CONDITION_ANY`].
+const CONDITION_REGION: &str = "region";
+/// See [`CONDITION_ANY`].
+const CONDITION_ATTACHMENT_TYPE: &str = "attachment-type";
+/// See [`CONDITION_ANY`].
+const CONDITION_RESOURCE_ID: &str = "resource-id";
+/// See [`CONDITION_ANY`].
+const CONDITION_TAG_EXISTS: &str = "tag-exists";
+/// See [`CONDITION_ANY`].
+const CONDITION_TAG_VALUE: &str = "tag-value";
+
+/// The `conditions[].operator` values the schema lists, each comparing the attachment's
+/// property with the condition's `value`.
+const OPERATOR_EQUALS: &str = "equals";
+/// See [`OPERATOR_EQUALS`].
+const OPERATOR_NOT_EQUALS: &str = "not-equals";
+/// See [`OPERATOR_EQUALS`].
+const OPERATOR_CONTAINS: &str = "contains";
+/// See [`OPERATOR_EQUALS`].
+const OPERATOR_BEGINS_WITH: &str = "begins-with";
 
 /// How many entries of one list a policy document may carry.
 ///
@@ -2038,6 +2164,13 @@ pub const MAX_POLICY_EDGE_LOCATIONS: usize = 100;
 pub const MAX_POLICY_SEGMENTS: usize = 100;
 /// See [`MAX_POLICY_EDGE_LOCATIONS`].
 pub const MAX_POLICY_NETWORK_FUNCTION_GROUPS: usize = 100;
+/// See [`MAX_POLICY_EDGE_LOCATIONS`]: how many `attachment-policies` rules one document may
+/// carry, and how many conditions one of those rules may carry. CHOSEN for the same reason
+/// — every rule of the policy in force is walked, in order, for each attachment created, so
+/// the work one create costs is bounded by their product.
+pub const MAX_POLICY_ATTACHMENT_POLICIES: usize = 100;
+/// See [`MAX_POLICY_ATTACHMENT_POLICIES`].
+pub const MAX_POLICY_CONDITIONS_PER_RULE: usize = 20;
 
 /// How long one value inside a policy document may be, in characters.
 ///
@@ -2283,6 +2416,73 @@ pub fn validate_policy_document(document: &str) -> Result<(), Vec<CoreNetworkPol
         }
     }
 
+    // `attachment-policies` decides what becomes of every attachment created on this core
+    // network, so a document carrying one is judged like the lists above: it has to be an
+    // array, each rule has to carry the `rule-number` that orders it and the `action` that
+    // says what it does, and both the rule count and each rule's condition count are capped
+    // so the walk one attachment create costs stays bounded.
+    match root.get(POLICY_ATTACHMENT_POLICIES) {
+        None => {}
+        Some(::serde_json::Value::Array(rules)) => {
+            if rules.len() > MAX_POLICY_ATTACHMENT_POLICIES {
+                errors.push(policy_error(
+                    POLICY_ERROR_TOO_MANY_ENTRIES,
+                    format!(
+                        "$.{POLICY_ATTACHMENT_POLICIES} carries {} entries, but at most {MAX_POLICY_ATTACHMENT_POLICIES} are allowed",
+                        rules.len()
+                    ),
+                    &format!("$.{POLICY_ATTACHMENT_POLICIES}"),
+                ));
+            }
+            for (index, rule) in rules
+                .iter()
+                .enumerate()
+                .take(MAX_POLICY_ATTACHMENT_POLICIES)
+            {
+                if rule
+                    .get(POLICY_RULE_NUMBER)
+                    .and_then(::serde_json::Value::as_i64)
+                    .is_none()
+                {
+                    errors.push(policy_error(
+                        POLICY_ERROR_MISSING_FIELD,
+                        format!("every entry of {POLICY_ATTACHMENT_POLICIES:?} must carry a {POLICY_RULE_NUMBER:?} number"),
+                        &format!("$.{POLICY_ATTACHMENT_POLICIES}[{index}].{POLICY_RULE_NUMBER}"),
+                    ));
+                }
+                if rule
+                    .get(POLICY_ACTION)
+                    .and_then(::serde_json::Value::as_object)
+                    .is_none()
+                {
+                    errors.push(policy_error(
+                        POLICY_ERROR_MISSING_FIELD,
+                        format!("every entry of {POLICY_ATTACHMENT_POLICIES:?} must carry an {POLICY_ACTION:?} object"),
+                        &format!("$.{POLICY_ATTACHMENT_POLICIES}[{index}].{POLICY_ACTION}"),
+                    ));
+                }
+                let conditions = rule
+                    .get(POLICY_CONDITIONS)
+                    .and_then(::serde_json::Value::as_array)
+                    .map_or(0, Vec::len);
+                if conditions > MAX_POLICY_CONDITIONS_PER_RULE {
+                    errors.push(policy_error(
+                        POLICY_ERROR_TOO_MANY_ENTRIES,
+                        format!(
+                            "a rule's {POLICY_CONDITIONS:?} carries {conditions} entries, but at most {MAX_POLICY_CONDITIONS_PER_RULE} are allowed"
+                        ),
+                        &format!("$.{POLICY_ATTACHMENT_POLICIES}[{index}].{POLICY_CONDITIONS}"),
+                    ));
+                }
+            }
+        }
+        Some(_) => errors.push(policy_error(
+            POLICY_ERROR_INVALID_TYPE,
+            format!("{POLICY_ATTACHMENT_POLICIES:?} must be an array"),
+            &format!("$.{POLICY_ATTACHMENT_POLICIES}"),
+        )),
+    }
+
     if errors.is_empty() {
         Ok(())
     } else {
@@ -2315,6 +2515,9 @@ pub struct PolicyTopology {
     pub segments: Vec<NamedGroup>,
     /// One entry per named `network-function-groups[]` of the document.
     pub network_function_groups: Vec<NamedGroup>,
+    /// One entry per `attachment-policies[]` rule of the document, in the order the rules
+    /// are evaluated: ascending `rule-number`.
+    pub attachment_policies: Vec<AttachmentPolicyRule>,
 }
 
 /// One named `segments[]` / `network-function-groups[]` entry of a policy document.
@@ -2325,6 +2528,164 @@ pub struct NamedGroup {
     /// The edge locations the entry restricts itself to, or `None` for "every edge
     /// location this core network has" — the case a stored copy would duplicate.
     pub edge_locations: Option<Vec<String>>,
+}
+
+/// One `attachment-policies[]` rule of a core network policy document: which attachments
+/// the rule claims, and what it then does with one.
+#[derive(Debug, Clone)]
+pub struct AttachmentPolicyRule {
+    /// The rule's `rule-number`, which orders it against the others and is what an
+    /// attachment reports as `Attachment$AttachmentPolicyRuleNumber` (an `Integer`,
+    /// `smithy_query shape=Attachment`).
+    pub rule_number: i32,
+    /// Whether EVERY condition has to hold for the rule to claim an attachment — the
+    /// `condition-logic` default `and` — or any one of them ([`POLICY_LOGIC_OR`]).
+    pub all_conditions: bool,
+    /// The rule's `conditions[]`, each capped at [`MAX_POLICY_CONDITIONS_PER_RULE`].
+    pub conditions: Vec<AttachmentCondition>,
+    /// The rule's `action.require-attachment-acceptance`: whether an attachment this rule
+    /// claims has to be accepted before it is created.
+    pub require_acceptance: bool,
+    /// How the rule's action names the segment it puts the attachment in, or `None` where
+    /// it names none.
+    pub segment: Option<SegmentAssociation>,
+    /// The rule's `action.add-to-network-function-group`, where it adds the attachment to a
+    /// network function group instead of a segment.
+    pub network_function_group: Option<String>,
+}
+
+/// How an attachment-policy rule's action names the segment the attachment joins.
+#[derive(Debug, Clone)]
+pub enum SegmentAssociation {
+    /// `association-method: constant` — the one name the action's `segment` carries.
+    Constant(String),
+    /// `association-method: tag` — the value of the attachment's tag whose key the action's
+    /// `tag-value-of-key` names, so an attachment carrying no such tag joins no segment.
+    TagValueOfKey(String),
+}
+
+/// One `conditions[]` entry of an attachment-policy rule, kept as the document spells it:
+/// the property compared ([`CONDITION_ANY`] and friends), the `operator`
+/// ([`OPERATOR_EQUALS`] and friends) and the `key` / `value` the comparison uses.
+#[derive(Debug, Clone)]
+pub struct AttachmentCondition {
+    pub condition_type: String,
+    pub operator: Option<String>,
+    pub key: Option<String>,
+    pub value: Option<String>,
+}
+
+/// The attachment an `attachment-policies` rule is matched against: the properties of it
+/// the published condition types compare.
+#[derive(Debug, Clone, Copy)]
+pub struct AttachmentCandidate<'a> {
+    /// One of `ops::types::ATTACHMENT_TYPE_VALUES`, what `attachment-type` compares.
+    pub attachment_type: &'a str,
+    /// The Region of the attachment's edge location, what `region` compares.
+    pub edge_location: &'a str,
+    /// The ARN of the resource the attachment attaches, what `resource-id` compares.
+    pub resource_arn: &'a str,
+    /// The account that owns the attachment, what `account-id` compares.
+    pub account_id: &'a str,
+    /// The attachment's tags, what `tag-exists` and `tag-value` look in.
+    pub tags: &'a [Tag],
+}
+
+/// What the policy in force decided about one attachment: the rule that claimed it, where
+/// that rule put it, and whether it has to be accepted first. The default — every member
+/// absent, no acceptance required — is the answer for an attachment no rule claims, which
+/// includes every attachment on a core network whose policy carries no
+/// `attachment-policies` at all.
+#[derive(Debug, Clone, Default)]
+pub struct AttachmentClaim {
+    /// The `rule-number` of the claiming rule.
+    pub rule_number: Option<i32>,
+    /// The segment that rule put the attachment in.
+    pub segment_name: Option<String>,
+    /// The network function group that rule added the attachment to.
+    pub network_function_group_name: Option<String>,
+    /// Whether that rule asks for the attachment request to be accepted, which is what
+    /// holds the attachment in [`STATE_PENDING_ATTACHMENT_ACCEPTANCE`].
+    pub require_acceptance: bool,
+}
+
+/// The value of the tag `key` names, or `None` when the list carries no such tag.
+fn tag_value_of<'a>(tags: &'a [Tag], key: &str) -> Option<&'a str> {
+    tags.iter()
+        .find(|tag| tag.key.as_deref() == Some(key))
+        .map(|tag| tag.value.as_deref().unwrap_or_default())
+}
+
+impl AttachmentCondition {
+    /// Whether this condition holds for `candidate`.
+    ///
+    /// A condition type this service does not know, or one missing the `key` or `value` its
+    /// comparison needs, holds for NOTHING: an unreadable condition must not silently widen
+    /// the rule it belongs to into one that claims every attachment.
+    fn holds(&self, candidate: &AttachmentCandidate<'_>) -> bool {
+        match self.condition_type.as_str() {
+            CONDITION_ANY => true,
+            CONDITION_ACCOUNT_ID => self.compares(candidate.account_id),
+            CONDITION_REGION => self.compares(candidate.edge_location),
+            CONDITION_ATTACHMENT_TYPE => self.compares(candidate.attachment_type),
+            CONDITION_RESOURCE_ID => self.compares(candidate.resource_arn),
+            CONDITION_TAG_EXISTS => self
+                .key
+                .as_deref()
+                .is_some_and(|key| tag_value_of(candidate.tags, key).is_some()),
+            CONDITION_TAG_VALUE => self
+                .key
+                .as_deref()
+                .and_then(|key| tag_value_of(candidate.tags, key))
+                .is_some_and(|held| self.compares(held)),
+            _ => false,
+        }
+    }
+
+    /// Whether `held`, the attachment's own value, satisfies this condition's `operator`
+    /// against its `value`.
+    fn compares(&self, held: &str) -> bool {
+        let Some(wanted) = self.value.as_deref() else {
+            return false;
+        };
+        match self.operator.as_deref() {
+            Some(OPERATOR_EQUALS) => held == wanted,
+            Some(OPERATOR_NOT_EQUALS) => held != wanted,
+            Some(OPERATOR_CONTAINS) => held.contains(wanted),
+            Some(OPERATOR_BEGINS_WITH) => held.starts_with(wanted),
+            Some(_) | None => false,
+        }
+    }
+}
+
+impl AttachmentPolicyRule {
+    /// Whether this rule claims `candidate`: every condition holds, or — under
+    /// [`POLICY_LOGIC_OR`] — any one does. A rule carrying no condition claims nothing.
+    fn claims(&self, candidate: &AttachmentCandidate<'_>) -> bool {
+        if self.conditions.is_empty() {
+            return false;
+        }
+        if self.all_conditions {
+            self.conditions
+                .iter()
+                .all(|condition| condition.holds(candidate))
+        } else {
+            self.conditions
+                .iter()
+                .any(|condition| condition.holds(candidate))
+        }
+    }
+
+    /// The segment this rule puts `candidate` in: the constant it names, or the value of the
+    /// tag it takes the name from — which is absent when the attachment carries no such tag.
+    fn segment_for(&self, candidate: &AttachmentCandidate<'_>) -> Option<String> {
+        match self.segment.as_ref()? {
+            SegmentAssociation::Constant(name) => Some(name.clone()),
+            SegmentAssociation::TagValueOfKey(key) => {
+                tag_value_of(candidate.tags, key).map(str::to_string)
+            }
+        }
+    }
 }
 
 impl PolicyTopology {
@@ -2347,6 +2708,34 @@ impl PolicyTopology {
         self.edges
             .iter()
             .any(|edge| edge.edge_location.as_deref() == Some(location))
+    }
+
+    /// What this policy decides about the attachment `candidate` describes.
+    ///
+    /// The rules of `attachment-policies` are evaluated in ascending `rule-number` and the
+    /// FIRST one whose conditions claim the attachment decides it (Cloud WAN "Attachment
+    /// policies" documentation), so a later rule never overrides an earlier one. Only the
+    /// claiming rule's action asks for acceptance: an attachment no rule claims \u2014 every
+    /// attachment, where the document carries no `attachment-policies` \u2014 needs none, since
+    /// the action is the only place a document asks for one.
+    ///
+    /// Called ONCE, where the attachment is created, and the answer is stored on the
+    /// attachment record: an attachment keeps the decision the policy in force made about
+    /// it, so a later read never re-derives it from a policy that has since changed.
+    pub fn attachment_claim(&self, candidate: &AttachmentCandidate<'_>) -> AttachmentClaim {
+        let Some(rule) = self
+            .attachment_policies
+            .iter()
+            .find(|rule| rule.claims(candidate))
+        else {
+            return AttachmentClaim::default();
+        };
+        AttachmentClaim {
+            rule_number: Some(rule.rule_number),
+            segment_name: rule.segment_for(candidate),
+            network_function_group_name: rule.network_function_group.clone(),
+            require_acceptance: rule.require_acceptance,
+        }
     }
 
     /// The modelled `Segments` of this topology.
@@ -2399,8 +2788,10 @@ impl PolicyTopology {
 /// names none, the next ASN of the configuration's `asn-ranges` that no entry claims, as
 /// Cloud WAN assigns one from the ranges — and its `inside-cidr-blocks`; a segment exists
 /// for each named entry of `segments`, present in the edge locations it restricts itself
-/// to or, where it names none, in every edge location of the core network; and the same
-/// location rule holds for each named entry of `network-function-groups`.
+/// to or, where it names none, in every edge location of the core network; the same
+/// location rule holds for each named entry of `network-function-groups`; and each
+/// `attachment-policies` rule is kept with its conditions and its action, ordered by the
+/// ascending `rule-number` the rules are evaluated in.
 ///
 /// A document this service cannot parse describes no topology, so it answers the empty
 /// one rather than guessing: a document is only stored once
@@ -2478,7 +2869,101 @@ pub fn policy_topology(document: &str) -> PolicyTopology {
         segments: named(POLICY_SEGMENTS),
         network_function_groups: named(POLICY_NETWORK_FUNCTION_GROUPS),
         edges,
+        attachment_policies: attachment_policies(root),
     }
+}
+
+/// The `attachment-policies` rules of a policy document's root object, in the order they
+/// are evaluated: ascending `rule-number`. A rule the document spells without the
+/// `rule-number` that orders it, or without the `action` that says what it does, describes
+/// no decision and is skipped — [`validate_policy_document`] refuses such a document, which
+/// is what keeps a STORED document from carrying one. Both the rule count and each rule's
+/// condition count are capped there too, so this walk is bounded.
+fn attachment_policies(
+    root: &::serde_json::Map<String, ::serde_json::Value>,
+) -> Vec<AttachmentPolicyRule> {
+    let mut rules: Vec<AttachmentPolicyRule> = root
+        .get(POLICY_ATTACHMENT_POLICIES)
+        .and_then(::serde_json::Value::as_array)
+        .map_or(&[][..], Vec::as_slice)
+        .iter()
+        .take(MAX_POLICY_ATTACHMENT_POLICIES)
+        .filter_map(|entry| {
+            let rule_number = entry
+                .get(POLICY_RULE_NUMBER)
+                .and_then(::serde_json::Value::as_i64)?;
+            let action = entry
+                .get(POLICY_ACTION)
+                .and_then(::serde_json::Value::as_object)?;
+            let conditions = entry
+                .get(POLICY_CONDITIONS)
+                .and_then(::serde_json::Value::as_array)
+                .map_or(&[][..], Vec::as_slice)
+                .iter()
+                .take(MAX_POLICY_CONDITIONS_PER_RULE)
+                .filter_map(|condition| {
+                    let condition_type = condition
+                        .get(POLICY_TYPE)
+                        .and_then(::serde_json::Value::as_str)?;
+                    Some(AttachmentCondition {
+                        condition_type: condition_type.to_string(),
+                        operator: text_of(condition, POLICY_OPERATOR),
+                        key: text_of(condition, POLICY_KEY),
+                        value: text_of(condition, POLICY_VALUE),
+                    })
+                })
+                .collect();
+            // The segment the action names, by the method it names it with. An action
+            // asking for neither method names no segment, so the attachment joins none.
+            let segment = match action
+                .get(POLICY_ASSOCIATION_METHOD)
+                .and_then(::serde_json::Value::as_str)
+            {
+                Some(POLICY_ASSOCIATION_CONSTANT) => action
+                    .get(POLICY_SEGMENT)
+                    .and_then(::serde_json::Value::as_str)
+                    .map(|name| SegmentAssociation::Constant(name.to_string())),
+                Some(POLICY_ASSOCIATION_TAG) => action
+                    .get(POLICY_TAG_VALUE_OF_KEY)
+                    .and_then(::serde_json::Value::as_str)
+                    .map(|key| SegmentAssociation::TagValueOfKey(key.to_string())),
+                Some(_) | None => None,
+            };
+            Some(AttachmentPolicyRule {
+                // A `rule-number` outside the `Integer` the attachment reports it through
+                // is clamped to that range rather than dropped: the rule still decides,
+                // and the number it reports stays inside the modelled type.
+                rule_number: rule_number.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32,
+                all_conditions: entry
+                    .get(POLICY_CONDITION_LOGIC)
+                    .and_then(::serde_json::Value::as_str)
+                    != Some(POLICY_LOGIC_OR),
+                conditions,
+                require_acceptance: action
+                    .get(POLICY_REQUIRE_ATTACHMENT_ACCEPTANCE)
+                    .and_then(::serde_json::Value::as_bool)
+                    .unwrap_or(false),
+                segment,
+                network_function_group: action
+                    .get(POLICY_ADD_TO_NETWORK_FUNCTION_GROUP)
+                    .and_then(::serde_json::Value::as_str)
+                    .map(str::to_string),
+            })
+        })
+        .collect();
+    // Evaluated lowest rule number first, so the order is fixed here rather than at every
+    // attachment create. `sort_by_key` is stable, so two rules sharing a number keep the
+    // order the document listed them in.
+    rules.sort_by_key(|rule| rule.rule_number);
+    rules
+}
+
+/// The string at `key` of a JSON object, or `None` when it carries none there.
+fn text_of(value: &::serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(::serde_json::Value::as_str)
+        .map(str::to_string)
 }
 
 /// The strings of a JSON array, skipping any entry that is not one.

@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetResources
-//! Reports the stored resources — ARN and tag set — that the request's filters
-//! select, one page at a time. It is a pure projection of what `TagResources` and
-//! `UntagResources` wrote: `TagFilters` are AND-ed across keys with each filter's
-//! `Values` OR-ed, `ResourceTypeFilters` match the `service[:resourceType]` key
-//! embedded in the ARN, and `ResourceARNList` restricts the answer to the named
-//! ARNs.
+//! Reports the tagged resources of the Region this request is scoped to — ARN
+//! and tag set — that the request's filters select, one page at a time. It is a
+//! pure projection: of the tag set each OWNING service holds for its own
+//! resources (`crate::state::owners`), and of what `TagResources` and
+//! `UntagResources` wrote for the resources this service is the tag home for.
+//! `TagFilters` are AND-ed across keys with each filter's `Values` OR-ed,
+//! `ResourceTypeFilters` match the `service[:resourceType]` key of the resource
+//! in either the bare or the qualified form, and `ResourceARNList` restricts the
+//! answer to the named ARNs.
 //!
 //! ## Shape of an operation
 //!
@@ -217,8 +220,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
-
         /// A documented restriction the model cannot express, reported with the
         /// error the service declares for it rather than the generic 400.
         fn invalid(message: String) -> GetResourcesError {
@@ -232,6 +233,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let type_filters: &[String] = input.resource_type_filters.as_deref().unwrap_or_default();
         let arn_list: &[String] = input.resource_arn_list.as_deref().unwrap_or_default();
         let token = input.pagination_token.as_deref().unwrap_or_default();
+        let region = crate::state::request_region(ctx.parts());
+
+        // "A provided string parameter is malformed" is a request-level fault,
+        // so a `ResourceARNList` value that is not an ARN at all refuses the
+        // whole call — as distinct from one that names nothing, which "doesn't
+        // generate an error; it simply isn't included in the response".
+        if let Some(value) = arn_list
+            .iter()
+            .find(|value| crate::state::parse_arn(value).is_none())
+        {
+            return Err(invalid(crate::state::not_an_arn_message(value)));
+        }
 
         // "You can't specify both this parameter and the ResourceTypeFilters /
         // TagFilters parameter … and any of the pagination parameters
@@ -254,12 +267,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Documented ranges neither member carries as a modelled constraint.
+        // Each window is a fixed API constant, so the refusal names the member
+        // and that window and does not echo the value.
         if let Some(per_page) = input.resources_per_page {
             if !(crate::state::MIN_RESOURCES_PER_PAGE..=crate::state::MAX_RESOURCES_PER_PAGE)
                 .contains(&per_page)
             {
-                return Err(invalid(format!(
-                    "ResourcesPerPage must be between {} and {}; got {per_page}",
+                return Err(invalid(crate::state::out_of_range_message(
+                    "ResourcesPerPage",
                     crate::state::MIN_RESOURCES_PER_PAGE,
                     crate::state::MAX_RESOURCES_PER_PAGE,
                 )));
@@ -269,8 +284,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !(crate::state::MIN_TAGS_PER_PAGE..=crate::state::MAX_TAGS_PER_PAGE)
                 .contains(&tags_per_page)
             {
-                return Err(invalid(format!(
-                    "TagsPerPage must be between {} and {}; got {tags_per_page}",
+                return Err(invalid(crate::state::out_of_range_message(
+                    "TagsPerPage",
                     crate::state::MIN_TAGS_PER_PAGE,
                     crate::state::MAX_TAGS_PER_PAGE,
                 )));
@@ -308,10 +323,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // The token is minted for exactly this projection, so a token cut from
-        // another operation, another filter set or another compliance scope is
+        // The token is minted for exactly this projection — the serving Region
+        // included, because the result set is Region-scoped — so a token cut
+        // from another operation, Region, filter set or compliance scope is
         // refused rather than resumed against a list it never belonged to.
-        let mut scope: Vec<String> = vec![Self::NAME.to_string()];
+        let mut scope: Vec<String> = vec![Self::NAME.to_string(), region.clone()];
         for filter in tag_filters {
             scope.push(filter.key.clone().unwrap_or_default());
             let mut values = filter.values.clone().unwrap_or_default();
@@ -326,18 +342,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         scope.push(include_compliance_details.to_string());
         scope.push(exclude_compliant_resources.to_string());
         let scope: Vec<&str> = scope.iter().map(String::as_str).collect();
-        let fingerprint = crate::state::page_fingerprint(&scope);
 
         let after = if token.is_empty() {
             None
         } else {
-            match crate::state::decode_pagination_token(token, &fingerprint) {
-                Some(after) => Some(after),
-                None => {
+            match crate::state::decode_pagination_token(token, &scope) {
+                Ok(after) => Some(after),
+                // The two rejections drive opposite client behaviour, so they
+                // are the two errors the model declares for them: a token this
+                // service never minted for this query is a malformed parameter
+                // and will never succeed, while one it DID mint past its
+                // 15-minute window tells the client to restart the scan.
+                Err(crate::state::TokenRejection::NotMinted) => {
+                    return Err(invalid(crate::state::invalid_token_message(token)))
+                }
+                Err(crate::state::TokenRejection::Expired) => {
                     return Err(GetResourcesErrorModeled::PaginationTokenExpiredException(
                         PaginationTokenExpiredException {
                             message: Some(
-                                "the specified PaginationToken is not valid for this request"
+                                "The specified PaginationToken has expired. A PaginationToken is \
+                                 valid for a maximum of 15 minutes."
                                     .to_string(),
                             ),
                         },
@@ -346,6 +370,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
         };
+
+        // What the owning services themselves hold tags for, read BEFORE this
+        // service's own store is locked, so the two are never locked in two
+        // orders.
+        let owned = crate::state::owners::tagged_resources(&*self.engine, &region);
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetResourcesErrorModeled::InternalServiceException(
@@ -358,11 +387,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = state.lock();
 
         // An ARN in `ResourceARNList` that nothing ever tagged "doesn't generate
-        // an error; it simply isn't included in the response". Rows are borrowed
-        // from the store, so no row the page discards is ever cloned.
-        let selected: Vec<(String, &crate::state::ResourceEntry)> = state
-            .resources
-            .values()
+        // an error; it simply isn't included in the response".
+        let selected: Vec<(String, crate::state::ResourceEntry)> = state
+            .resources_in_region(owned, &region)
+            .into_iter()
             .filter(|entry| arn_list.is_empty() || arn_list.iter().any(|arn| arn == &entry.arn))
             .filter(|entry| entry.matches_resource_type_filters(type_filters))
             .filter(|entry| entry.matches_tag_filters(tag_filters))
@@ -381,7 +409,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             per_page,
             tags_budget,
             crate::state::ResourceEntry::tags_per_page_cost_of,
-            &fingerprint,
+            &scope,
         );
 
         Ok(GetResourcesOutput {
