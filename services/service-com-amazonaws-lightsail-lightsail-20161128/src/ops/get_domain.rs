@@ -154,7 +154,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // Lightsail serves the domain APIs from the N. Virginia endpoint ALONE,
+        // so the Region the request was signed for decides whether this call is
+        // served at all — a zone is not readable through any other Region's
+        // endpoint.
+        if let Some(message) = crate::state::domain_region_refusal(ctx.parts()) {
+            return Err(invalid(message));
+        }
 
         // `domainName` is a modelled `@required` member, so the centralized walk
         // already refused an absent one. A name that names no stored recordset is
@@ -172,6 +178,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             domain: Some(domain),
         })
     }
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not serve: the modelled `InvalidInputException`.
+fn invalid(message: String) -> GetDomainError {
+    GetDomainErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
 }
 
 /// No domain recordset of that name is stored: Lightsail's `DoesNotExist`

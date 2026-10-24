@@ -16,6 +16,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -60,6 +61,11 @@ const LOG_TYPES: [&str; 5] = [
     "WebserverLogs",
     "WorkerLogs",
 ];
+
+/// Comfortably longer than [`state::TRANSITION_SPAN`], so a transition the clock owes an
+/// environment has certainly come due — an `UpdateEnvironment` is accepted only once the
+/// environment has settled into AVAILABLE.
+const PAST_TRANSITION: Duration = Duration::from_millis(900);
 
 /// The days `WeeklyMaintenanceWindowStart`'s pattern accepts
 /// (`(MON|TUE|WED|THU|FRI|SAT|SUN):([01]\d|2[0-3]):(00|30)`).
@@ -477,7 +483,10 @@ async fn a_defaulted_member_is_stable_across_reads_and_survives_an_unrelated_upd
     }
 
     // An update that names none of them leaves every default exactly where the create put
-    // it; one that names a member replaces only that member.
+    // it; one that names a member replaces only that member. Each update waits for the
+    // environment to settle: an environment still CREATING, or under an update already in
+    // flight, does not accept another one.
+    tokio::time::sleep(PAST_TRANSITION).await;
     let (status, json) = harness
         .update(case.name, json!({"DagS3Path": "other/dags"}))
         .await;
@@ -489,6 +498,7 @@ async fn a_defaulted_member_is_stable_across_reads_and_survives_an_unrelated_upd
     let after = harness.environment(case.name).await;
     assert_defaults_resolved(&case, &after);
 
+    tokio::time::sleep(PAST_TRANSITION).await;
     let (status, json) = harness
         .update(
             case.name,

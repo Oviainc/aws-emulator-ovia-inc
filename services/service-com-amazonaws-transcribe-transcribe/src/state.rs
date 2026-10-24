@@ -2,15 +2,19 @@
 
 //! Engine state for the com-amazonaws-transcribe-transcribe service.
 //!
-//! Four resource families live here: the transcription-job lifecycle — the stored
+//! Five resource families live here: the transcription-job lifecycle — the stored
 //! record, the clock-owed status transitions, and the projections of a record onto
 //! the modelled `TranscriptionJob` / `TranscriptionJobSummary` shapes — the
 //! custom-vocabulary family (vocabularies and vocabulary filters), with its own
 //! records, its `PENDING` -> `READY` transition and its projections onto
 //! `VocabularyInfo` / `VocabularyFilterInfo` — the custom MEDICAL vocabularies
 //! ([`MedicalVocabularyRecord`]), a family of the same shape projected onto the same
-//! `VocabularyInfo` — and the Call Analytics categories, each a record of the rules
-//! and input type it was created with and its projection onto `CategoryProperties`.
+//! `VocabularyInfo` — the Call Analytics categories, each a record of the rules
+//! and input type it was created with and its projection onto `CategoryProperties` —
+//! and the custom LANGUAGE models ([`LanguageModelRecord`]), each a record of the
+//! base model, language and training data a create named, with its
+//! `IN_PROGRESS` -> `FAILED` transition and its projection onto the modelled
+//! `LanguageModel` shape.
 //! Several operations read each record, so
 //! the projections are single-homed here rather than copied into each handler; the
 //! three tagging operations reach every family's tag set through one lookup
@@ -41,16 +45,20 @@
 //! `READY`. A Call Analytics category is the same kind of record: its
 //! rules are held here, where a Call Analytics job that applies the category would
 //! read them from, and nothing evaluates a rule against a call, because no audio is
-//! analysed.
+//! analysed. A custom language model is the MEDICAL vocabulary's case again: its
+//! training and tuning data can only be read from the Amazon S3 location a create
+//! names ([`LanguageModelRecord`]), so the record is real and the training it cannot
+//! run ends in the service's own modelled `FAILED` state — nothing here reports a
+//! `COMPLETED` model, because nothing trained one.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    CategoryProperties, ContentRedaction, EncryptionConfiguration, JobExecutionSettings,
-    LanguageIdSettings, Media, ModelSettings, Rule, Settings, SubtitlesOutput, Tag,
-    ToxicityDetectionSettings, Transcript, TranscriptionJob, TranscriptionJobSummary,
-    VocabularyFilterInfo, VocabularyInfo,
+    CategoryProperties, ContentRedaction, EncryptionConfiguration, InputDataConfig,
+    JobExecutionSettings, LanguageIdSettings, LanguageModel, Media, ModelSettings, Rule, Settings,
+    SubtitlesOutput, Tag, ToxicityDetectionSettings, Transcript, TranscriptionJob,
+    TranscriptionJobSummary, VocabularyFilterInfo, VocabularyInfo,
 };
 
 /// `TranscriptionJobStatus` values, from the model's enum
@@ -197,6 +205,48 @@ pub const DEFAULT_INPUT_TYPE: &str = INPUT_TYPE_POST_CALL;
 /// `DeleteCallAnalyticsCategory` is what makes room again.
 pub const MAX_CALL_ANALYTICS_CATEGORIES: usize = 100;
 
+/// `ModelStatus` values, from the model's enum
+/// (`smithy_query(query="shape", shape="ModelStatus")`): a custom language model is
+/// being trained, has finished training, or failed.
+pub const MODEL_STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
+/// See [`MODEL_STATUS_IN_PROGRESS`]. No model this emulator records reaches it:
+/// training would have to READ the training data at `InputDataConfig$S3Uri`, which
+/// this emulator does not do (see [`LanguageModelRecord`]).
+pub const MODEL_STATUS_COMPLETED: &str = "COMPLETED";
+/// See [`MODEL_STATUS_IN_PROGRESS`].
+pub const MODEL_STATUS_FAILED: &str = "FAILED";
+
+/// Whether a custom language model in `status` has finished training, so the service
+/// is no longer working on it.
+///
+/// `ModelStatus` is `IN_PROGRESS | FAILED | COMPLETED`
+/// (`smithy_query(query="shape", shape="ModelStatus")`); the first is the
+/// non-terminal one a delete is refused for, per `BadRequestException`'s own
+/// documentation ("if it's in a non-terminal state (such as IN PROGRESS)"), the same
+/// rule the vocabulary and job families apply ([`is_terminal_job_status`]).
+pub fn is_terminal_model_status(status: &str) -> bool {
+    status == MODEL_STATUS_COMPLETED || status == MODEL_STATUS_FAILED
+}
+
+/// How long after the call that starts it a custom language model's next status
+/// transition is owed (`IN_PROGRESS` -> `FAILED` for one whose training data this
+/// emulator cannot read).
+///
+/// A chosen span, not a documented one: Amazon Transcribe gives no training-time
+/// guarantee for a custom language model. It is deliberately non-zero, so a caller
+/// that describes the model straight back still observes `IN_PROGRESS` (and the
+/// state errors that go with it), and short enough that a poll-until-done script
+/// terminates quickly. The due instant is stored on the record; nothing sleeps for it.
+pub const MODEL_TRANSITION_DELAY: Duration = Duration::from_millis(500);
+
+/// The most custom language models this emulator holds for an account.
+///
+/// A CHOSEN ceiling, not a published one: the model carries no per-account figure for
+/// custom language models. Applying the same figure the other families use keeps the
+/// store bounded — a caller that never deletes cannot grow it without end, and
+/// `DeleteLanguageModel` is what makes room again.
+pub const MAX_LANGUAGE_MODELS: usize = 100;
+
 /// The ARN resource type of a transcription job, as the `TranscribeArn` pattern's
 /// `<type>/<name>` resource segment spells it
 /// (`^arn:aws(-[^:]+)?:transcribe:[a-zA-Z0-9-]*:[0-9]{12}:[a-zA-Z-]*/[0-9a-zA-Z._-]+$`),
@@ -213,6 +263,9 @@ pub const RESOURCE_TYPE_MEDICAL_VOCABULARY: &str = "medical-vocabulary";
 /// The ARN resource type of a custom vocabulary filter. See
 /// [`RESOURCE_TYPE_TRANSCRIPTION_JOB`].
 pub const RESOURCE_TYPE_VOCABULARY_FILTER: &str = "vocabulary-filter";
+/// The ARN resource type of a custom language model, as the Amazon Transcribe
+/// "Tagging resources" guide lists it. See [`RESOURCE_TYPE_TRANSCRIPTION_JOB`].
+pub const RESOURCE_TYPE_LANGUAGE_MODEL: &str = "language-model";
 
 /// The word this service's own client-error messages use for the kind of resource an
 /// ARN's `<type>` segment names, for each type this emulator stores records of.
@@ -228,6 +281,8 @@ pub const KIND_VOCABULARY: &str = "vocabulary";
 pub const KIND_MEDICAL_VOCABULARY: &str = "medical vocabulary";
 /// See [`KIND_JOB`].
 pub const KIND_VOCABULARY_FILTER: &str = "vocabulary filter";
+/// See [`KIND_JOB`].
+pub const KIND_LANGUAGE_MODEL: &str = "language model";
 /// See [`KIND_JOB`]: the word the recorded Call Analytics category responses name
 /// that family by ("The category that you've specified couldn't be found. Check the
 /// category name and try your request again.").
@@ -247,6 +302,7 @@ pub fn resource_kind(resource_type: &str) -> &'static str {
         RESOURCE_TYPE_VOCABULARY => KIND_VOCABULARY,
         RESOURCE_TYPE_MEDICAL_VOCABULARY => KIND_MEDICAL_VOCABULARY,
         RESOURCE_TYPE_VOCABULARY_FILTER => KIND_VOCABULARY_FILTER,
+        RESOURCE_TYPE_LANGUAGE_MODEL => KIND_LANGUAGE_MODEL,
         _ => KIND_RESOURCE,
     }
 }
@@ -306,6 +362,11 @@ pub struct ComAmazonawsTranscribeTranscribeState {
     /// names are case sensitive and must be unique within an Amazon Web Services
     /// account" — model doc for `CategoryProperties$CategoryName`).
     pub call_analytics_categories: BTreeMap<String, CallAnalyticsCategoryRecord>,
+    /// Every custom language model this account holds, keyed by its name (which
+    /// `CreateLanguageModel` requires to be unique within an account: "If you try to
+    /// create a new custom language model with the same name as an existing custom
+    /// language model, you get a `ConflictException` error").
+    pub language_models: BTreeMap<String, LanguageModelRecord>,
     /// Source of [`TranscriptionJobRecord::sequence`]: a monotonic counter, so
     /// creation order is total even when two jobs start in the same clock tick.
     next_sequence: u64,
@@ -396,6 +457,18 @@ impl ComAmazonawsTranscribeTranscribeState {
         records
     }
 
+    /// The custom language model named `name`, with every clock-owed transition of it
+    /// already materialised, or `None` when this account holds no such model.
+    pub fn language_model_mut(
+        &mut self,
+        name: &str,
+        now: SystemTime,
+    ) -> Option<&mut LanguageModelRecord> {
+        let record = self.language_models.get_mut(name)?;
+        record.advance_clock(now);
+        Some(record)
+    }
+
     /// The tag set of the resource `resource` names, or `None` when this account holds
     /// no such resource.
     ///
@@ -421,6 +494,10 @@ impl ComAmazonawsTranscribeTranscribeState {
                 .vocabulary_filters
                 .get(&resource.name)
                 .map(|record| &record.tags),
+            RESOURCE_TYPE_LANGUAGE_MODEL => self
+                .language_models
+                .get(&resource.name)
+                .map(|record| &record.tags),
             _ => None,
         }
     }
@@ -430,11 +507,10 @@ impl ComAmazonawsTranscribeTranscribeState {
     ///
     /// One lookup for the two tagging operations that WRITE, so `TagResource` and
     /// `UntagResource` cannot disagree about which ARN names which stored record. A
-    /// resource type this lookup does not map (a language model, or a Call Analytics
-    /// category — whose tag set is written by its own create and reported by its own
-    /// operations, since this emulator has no recorded spelling for that family's ARN
-    /// `<type>` segment) answers `None`, which the caller renders as the modelled
-    /// not-found error — never as an empty tag set.
+    /// resource type this lookup does not map (a Call Analytics category — whose tag
+    /// set is written by its own create, since this emulator has no recorded spelling
+    /// for that family's ARN `<type>` segment) answers `None`, which the caller renders
+    /// as the modelled not-found error — never as an empty tag set.
     pub fn tags_mut(&mut self, resource: &ResourceRef) -> Option<&mut Vec<Tag>> {
         match resource.resource_type.as_str() {
             RESOURCE_TYPE_TRANSCRIPTION_JOB => self
@@ -451,6 +527,10 @@ impl ComAmazonawsTranscribeTranscribeState {
                 .map(|record| &mut record.tags),
             RESOURCE_TYPE_VOCABULARY_FILTER => self
                 .vocabulary_filters
+                .get_mut(&resource.name)
+                .map(|record| &mut record.tags),
+            RESOURCE_TYPE_LANGUAGE_MODEL => self
+                .language_models
                 .get_mut(&resource.name)
                 .map(|record| &mut record.tags),
             _ => None,
@@ -734,6 +814,146 @@ pub fn file_not_read_failure_reason(kind: &str, file_uri: &str) -> String {
         "The VocabularyFileUri {file_uri} was not read: this emulator reads no object \
          store and makes no outbound request, so it cannot build a custom {kind} from \
          a file. No terms were loaded for this vocabulary."
+    )
+}
+
+/// One stored custom language model: the base model, language and training-data
+/// location a create named, plus the lifecycle facts the service itself owns (its
+/// training status and its timestamps).
+///
+/// WHAT IS REAL HERE: the record. A custom language model's training and tuning data
+/// can only come from the Amazon S3 location at `InputDataConfig$S3Uri`, which
+/// `CreateLanguageModel` models `@required` and for which it publishes no inline
+/// alternative ("The location of your training and tuning files (this must be an
+/// Amazon S3 URI)" — the operation's own doc). Reading that location is work this
+/// emulator cannot perform, so the resource is recorded — its name, language, base
+/// model, input data config, status, timestamps and tag set are the control plane
+/// every operation of this family reports — and the training it cannot run ends in
+/// the service's own modelled failure state: [`MODEL_STATUS_IN_PROGRESS`] at the
+/// create, then [`MODEL_STATUS_FAILED`] with a `FailureReason` that says the data was
+/// not read ([`language_model_failure_reason`]) once the clock makes that transition
+/// due. Nothing here reports a `COMPLETED` model, because nothing trained one; this
+/// is the custom MEDICAL vocabulary's case again ([`MedicalVocabularyRecord`]).
+#[derive(Debug, Clone)]
+pub struct LanguageModelRecord {
+    /// `ModelName`, also this record's key in the store.
+    pub name: String,
+    /// Creation order, newest = largest. Also the cursor a listing of this family
+    /// would page with.
+    pub sequence: u64,
+    /// `LanguageCode`: the one language this model's terms are in.
+    pub language_code: String,
+    /// `BaseModelName`: the standard Amazon Transcribe model this one was built on.
+    pub base_model_name: String,
+    /// `InputDataConfig`: where the training (and optionally tuning) data would be
+    /// read from, and the role that would read it. Held so the failure reason can
+    /// name it and every reader can report it; never fetched.
+    pub input_data_config: InputDataConfig,
+    /// `EncryptionConfiguration`, as the create named it, or `None`.
+    pub encryption_configuration: Option<EncryptionConfiguration>,
+    /// `ModelStatus`: [`MODEL_STATUS_IN_PROGRESS`] until the clock makes the training
+    /// due, then [`MODEL_STATUS_FAILED`].
+    pub status: String,
+    /// `FailureReason`, set only on a `FAILED` model.
+    pub failure_reason: Option<String>,
+    /// When `IN_PROGRESS` -> `FAILED` falls due; `None` once it has been materialised.
+    pub failed_due: Option<SystemTime>,
+    /// `CreateTime`: when the create that stored this record was served.
+    pub create_time: SystemTime,
+    /// `LastModifiedTime`: when the record last changed.
+    pub last_modified_time: SystemTime,
+    pub tags: Vec<Tag>,
+}
+
+impl LanguageModelRecord {
+    /// The record a create of `name` stores: `IN_PROGRESS`, with its one clock-owed
+    /// transition already due at a fixed span from `now`.
+    ///
+    /// Single-homed so the create and any later update cannot disagree about the
+    /// invariant that an `IN_PROGRESS` record always carries the instant its
+    /// transition falls due.
+    #[allow(clippy::too_many_arguments)]
+    pub fn in_progress(
+        name: String,
+        sequence: u64,
+        language_code: String,
+        base_model_name: String,
+        input_data_config: InputDataConfig,
+        encryption_configuration: Option<EncryptionConfiguration>,
+        tags: Vec<Tag>,
+        now: SystemTime,
+    ) -> Self {
+        Self {
+            name,
+            sequence,
+            language_code,
+            base_model_name,
+            input_data_config,
+            encryption_configuration,
+            status: MODEL_STATUS_IN_PROGRESS.to_string(),
+            failure_reason: None,
+            failed_due: Some(now + MODEL_TRANSITION_DELAY),
+            create_time: now,
+            last_modified_time: now,
+            tags,
+        }
+    }
+
+    /// Materialise the status transition the CLOCK already owes this model: it was due
+    /// at its stored instant whether or not anybody called. A reporting operation
+    /// (`DescribeLanguageModel`, a listing) runs this before projecting the record,
+    /// and that is the only write it performs.
+    pub fn advance_clock(&mut self, now: SystemTime) {
+        if self.status != MODEL_STATUS_IN_PROGRESS {
+            return;
+        }
+        if let Some(due) = self.failed_due.filter(|due| now >= *due) {
+            self.status = MODEL_STATUS_FAILED.to_string();
+            self.failure_reason = Some(language_model_failure_reason(
+                &self.input_data_config.s3_uri,
+            ));
+            // The resource changed when the training ended, so the modification
+            // instant is that of the transition, not of the request that started it.
+            self.last_modified_time = due;
+            self.failed_due = None;
+        }
+    }
+
+    /// This record as the modelled `LanguageModel` shape, which
+    /// `DescribeLanguageModel` and `ListLanguageModels` both report.
+    pub fn to_language_model(&self) -> LanguageModel {
+        LanguageModel {
+            model_name: Some(self.name.clone()),
+            create_time: Some(to_date_time(self.create_time)),
+            last_modified_time: Some(to_date_time(self.last_modified_time)),
+            language_code: Some(self.language_code.clone()),
+            base_model_name: Some(self.base_model_name.clone()),
+            model_status: Some(self.status.clone()),
+            // "If `false`, your custom language model is using the most up-to-date
+            // base model" (model doc for `LanguageModel$UpgradeAvailability`). This
+            // emulator publishes exactly the two base models the `BaseModelName` enum
+            // names and never supersedes one, so the base model a create named is
+            // still the most current one for this model.
+            upgrade_availability: Some(false),
+            failure_reason: self.failure_reason.clone(),
+            input_data_config: Some(self.input_data_config.clone()),
+            encryption_configuration: self.encryption_configuration.clone(),
+        }
+    }
+}
+
+/// Why a custom language model this emulator recorded ends `FAILED`: the Amazon S3
+/// location its training data would have come from is one this emulator does not read
+/// (see [`LanguageModelRecord`]).
+///
+/// The wording is this emulator's own — AWS publishes no text for a custom language
+/// model's `FailureReason` — and it names the URI the request gave, so a caller can
+/// see which location was not read.
+pub fn language_model_failure_reason(s3_uri: &str) -> String {
+    format!(
+        "The InputDataConfig S3Uri {s3_uri} was not read: this emulator reads no object \
+         store and makes no outbound request, so it cannot train a custom language \
+         model from data held there. No model was trained."
     )
 }
 

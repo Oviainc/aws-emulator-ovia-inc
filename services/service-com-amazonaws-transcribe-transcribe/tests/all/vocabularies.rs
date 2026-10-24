@@ -931,7 +931,7 @@ async fn tags_round_trip_on_each_taggable_resource() {
     let unknown: Vec<(&str, String)> = vec![
         ("a vocabulary that does not exist", arn("vocabulary", "never-created")),
         ("a job that does not exist", arn("transcription-job", "never-started")),
-        ("a resource type this emulator holds none of", arn("language-model", "any-model")),
+        ("a resource type this emulator holds none of", arn("medical-transcription-job", "any-job")),
     ];
     for (case, resource_arn) in unknown {
         transcribe

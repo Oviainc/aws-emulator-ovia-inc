@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCustomDetectionRuleOrgConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateCustomDetectionRuleOrgConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: replaces the mode and the account scope of the organization
+//! configuration the account holds for a custom detection rule, which
+//! `GetCustomDetectionRuleOrgConfiguration` then reports. The configuration is
+//! identified by `RuleId` alone — the URI label — and `Mode` is one of the values
+//! the update SETS, so a configuration held in the other mode MOVES to the mode the
+//! request names. A rule the account holds no organization configuration for is
+//! refused with the modelled `ResourceNotFoundException`, and an account list that is
+//! not an account id — or both `IncludeAccountIds` and `ExcludeAccountIds`, which are
+//! mutually exclusive — with the `BadRequestException` envelope. This is the ONLY file
+//! to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateCustomDetectionRuleOrgConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The modelled `ConflictException` has no reachable case here: `AssociationMode` has
+//! two members, so a rule configured in the mode the request names is the
+//! configuration the request UPDATES, and only a rule configured in the other mode
+//! alone is moved — there is never a second configuration for the update to collide
+//! with.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +153,147 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateCustomDetectionRuleOrgConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateCustomDetectionRuleOrgConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateCustomDetectionRuleOrgConfiguration"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateCustomDetectionRuleOrgConfigurationErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx);
+
+        // The two account lists describe ONE scope — "mutually exclusive"
+        // (`smithy_query(query="doc",shape="DetectionRuleOrgConfiguration",member="IncludeAccountIds")`)
+        // — so a request naming both describes two scopes at once and is refused
+        // before anything is written, exactly as the create refuses it. An EMPTY
+        // list is not a scope, so it does not conflict.
+        let include = input.include_account_ids.clone().unwrap_or_default();
+        let exclude = input.exclude_account_ids.clone().unwrap_or_default();
+        if !include.is_empty() && !exclude.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::ORG_CONFIGURATION_ACCOUNT_SCOPE_MESSAGE,
+            ));
+        }
+        // `AccountId` is `len 12..12` but constrains no CHARACTERS
+        // (`smithy_query(shape="DetectionRuleAccountIds")`), so an entry of the
+        // right length that is not an account id at all reaches the handler: a
+        // parameter failure, refused before anything is written.
+        if include
+            .iter()
+            .chain(exclude.iter())
+            .any(|account_id| !crate::state::is_account_id(account_id))
+        {
+            return Err(crate::scaffolded::Scaffolded::invalid_input(
+                crate::state::invalid_parameter_message(crate::state::ACCOUNT_ID_MEMBER),
+            ));
+        }
+        // Carrying EITHER list replaces the whole scope, because the two ARE one
+        // scope: the side the request names wins and the other is cleared, so no
+        // update can leave a configuration holding both. A request carrying NEITHER
+        // member says nothing about the scope and leaves the stored one where it
+        // was — the partial-update reading `UpdateIPSet` gives an omitted optional
+        // member.
+        let scope_given =
+            input.include_account_ids.is_some() || input.exclude_account_ids.is_some();
+
+        let mut state = state.lock();
+
+        // The configuration is identified by `RuleId` ALONE: `Mode` is bound to the
+        // BODY here and is one of the values this operation updates — "including
+        // the mode and include/exclude account lists"
+        // (`smithy_query(query="doc",shape="UpdateCustomDetectionRuleOrgConfiguration")`)
+        // — where the read and the delete bind it as a query parameter to select
+        // with. So the request's mode names the configuration when the rule is
+        // already configured in it, and otherwise the rule's single configuration
+        // MOVES to that mode.
+        let modes = state.detection_rule_org_configuration_modes(&region, &input.rule_id);
+        let target_mode = if modes.contains(&input.mode) {
+            Some(input.mode.clone())
+        } else {
+            match modes.as_slice() {
+                [only] => Some(only.clone()),
+                _ => None,
+            }
+        };
+        // Taken OUT of the store under the key the selection found, so a move to
+        // another mode cannot leave a second copy of the configuration behind.
+        let stored = target_mode.and_then(|mode| {
+            state
+                .custom_detection_rule_org_configurations
+                .remove(&(region.clone(), input.rule_id.clone(), mode))
+        });
+        let Some(mut record) = stored else {
+            // Nothing to update. `RuleId` carries its own length and pattern
+            // constraints and `Mode` is a modelled enum, both refused at the
+            // request boundary, so a well-formed request whose rule has no
+            // configuration is the only way to get here — the modelled 404. An
+            // update is never an upsert:
+            // `CreateCustomDetectionRuleOrgConfiguration` is the operation that
+            // makes a configuration.
+            return Err(not_found(
+                crate::state::detection_rule_org_configuration_rule_not_found_message(),
+            ));
+        };
+
+        let mut changed = record.mode != input.mode;
+        record.mode = input.mode.clone();
+        if scope_given {
+            changed |=
+                record.include_account_ids != include || record.exclude_account_ids != exclude;
+            record.include_account_ids = include;
+            record.exclude_account_ids = exclude;
+        }
+        if changed {
+            // A MUTATION: the instant this hands out is the configuration's new
+            // `UpdatedAt` and what the roll-out transition is owed from. An update
+            // asking for the state the configuration is already in changes nothing,
+            // so it advances neither — which is what makes a replayed PUT
+            // (`@idempotent`) observably a no-op.
+            let now = state.tick_millis();
+            record.updated_at_millis = now;
+            // A changed configuration is rolled out across the organization again,
+            // so it re-enters the transitional `PROCESSING` status the create opens
+            // and the clock owes it `ACTIVE`
+            // (`crate::state::ORG_CONFIGURATION_TRANSITION_MILLIS`). The due
+            // instant is STORED and never slept for.
+            record.status_due_millis =
+                Some(now.saturating_add(crate::state::ORG_CONFIGURATION_TRANSITION_MILLIS));
+        }
+
+        // Put back under the mode the record now carries. No Region PARTITION is
+        // added — the record came out of this same Region — so the store bound
+        // `CreateCustomDetectionRuleOrgConfiguration` enforces cannot be crossed
+        // here.
+        state
+            .custom_detection_rule_org_configurations
+            .insert((region, record.rule_id.clone(), record.mode.clone()), record);
+
+        // `UpdateCustomDetectionRuleOrgConfigurationResponse` declares no members
+        // (`smithy_query(operation="UpdateCustomDetectionRuleOrgConfiguration")`):
+        // the configuration is read back with
+        // `GetCustomDetectionRuleOrgConfiguration`.
+        Ok(UpdateCustomDetectionRuleOrgConfigurationOutput {})
     }
+}
+
+/// The error CLASS an update naming a rule with no organization configuration is
+/// named by on the wire — the modelled 404
+/// (`smithy_query(operation="UpdateCustomDetectionRuleOrgConfiguration")`), so it
+/// is answered as the modelled shape rather than under the `BadRequestException`
+/// envelope this service's 400s use.
+const RESOURCE_NOT_FOUND_EXCEPTION: &str = "ResourceNotFoundException";
+
+/// Refuse with the modelled 404, carrying `message`.
+fn not_found(message: String) -> UpdateCustomDetectionRuleOrgConfigurationError {
+    UpdateCustomDetectionRuleOrgConfigurationErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: Some(message),
+            // "The error type"
+            // (`smithy_query(shape="ResourceNotFoundException")`): the class, the
+            // same value the body's `__type` carries.
+            r#type: Some(RESOURCE_NOT_FOUND_EXCEPTION.to_string()),
+        },
+    )
+    .into()
 }
