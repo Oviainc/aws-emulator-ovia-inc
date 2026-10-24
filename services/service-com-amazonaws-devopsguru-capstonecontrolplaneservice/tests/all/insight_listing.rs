@@ -33,10 +33,14 @@ const HOST: &str = "devops-guru.us-east-1.amazonaws.com";
 
 /// An instant well inside the range a `Timestamp` can carry, in epoch milliseconds.
 /// Every seeded insight is placed relative to it, so no row depends on the clock.
-const BASE_MILLIS: i64 = 1_700_000_000_000;
+///
+/// `pub(crate)` with [`insight`], [`selection_fixture`] and [`epoch_seconds`], so the
+/// organization-wide insight listing is asserted over the SAME fixture this suite uses
+/// instead of a second one: the two listings select over one store, so they must agree.
+pub(crate) const BASE_MILLIS: i64 = 1_700_000_000_000;
 
 /// One minute, in milliseconds — the step between seeded instants.
-const MINUTE_MILLIS: i64 = 60_000;
+pub(crate) const MINUTE_MILLIS: i64 = 60_000;
 
 /// One reply, as a client sees it.
 struct Reply {
@@ -226,7 +230,7 @@ impl Guru {
 ///
 /// `severity` is `HIGH` from `INSIGHT_SEVERITY_VALUES`; `insight_type` and `status` are
 /// the caller's, from `INSIGHT_TYPE_VALUES` and `INSIGHT_STATUS_VALUES`.
-fn insight(
+pub(crate) fn insight(
     id: &str,
     insight_type: &str,
     status: &str,
@@ -246,7 +250,7 @@ fn insight(
 }
 
 /// A timestamp as restJson1 renders and reads one: epoch SECONDS.
-fn epoch_seconds(millis: i64) -> f64 {
+pub(crate) fn epoch_seconds(millis: i64) -> f64 {
     millis as f64 / 1_000.0
 }
 
@@ -254,7 +258,7 @@ fn epoch_seconds(millis: i64) -> f64 {
 /// statuses, and instants spread over a known grid.
 ///
 /// `started`/`ended` are offsets from [`BASE_MILLIS`], in minutes.
-fn selection_fixture() -> Vec<InsightRecord> {
+pub(crate) fn selection_fixture() -> Vec<InsightRecord> {
     let at = |minutes: i64| BASE_MILLIS + minutes * MINUTE_MILLIS;
     vec![
         insight("ongoing-proactive-early", "PROACTIVE", "ONGOING", at(0), None),

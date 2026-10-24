@@ -40,7 +40,7 @@ use super::workload_harness::{encode_path_segment, Answer, Client};
 /// Every value the `Pillar` enum publishes, in the model's order
 /// (`smithy_query(query="shape", shape="Pillar")`). Spelled out here so the suite pins
 /// the catalog rather than reading it back out of the code under test.
-const PILLARS: [&str; 5] = [
+pub(crate) const PILLARS: [&str; 5] = [
     "COST_OPTIMIZATION",
     "SECURITY",
     "RESILIENCE",
@@ -61,20 +61,20 @@ fn role_arn(name: &str) -> String {
 /// A well-formed `AgentProfileArn` (the modelled
 /// `^arn:aws…:wellarchitected:<region>:<account>:agent-profile/[a-zA-Z0-9_-]+$`) that no
 /// stored profile carries.
-fn absent_profile_arn(resource: &str) -> String {
+pub(crate) fn absent_profile_arn(resource: &str) -> String {
     format!(
         "arn:aws:wellarchitected:us-west-2:{}:agent-profile/{resource}",
         engine::emulator_account_id()
     )
 }
 
-fn member<'a>(answer: &'a Answer, name: &str) -> &'a str {
+pub(crate) fn member<'a>(answer: &'a Answer, name: &str) -> &'a str {
     answer.body.get(name).and_then(Value::as_str).unwrap_or("")
 }
 
 /// A minimal valid `CreateAgentProfile` body; a caller overrides what its case varies.
 /// `aggregation` is how many account/Region scopes the profile names.
-fn profile_body(name: &str, pillars: &[&str], aggregation: usize) -> Value {
+pub(crate) fn profile_body(name: &str, pillars: &[&str], aggregation: usize) -> Value {
     json!({
         "name": name,
         "displayName": format!("{name} display"),
@@ -97,13 +97,13 @@ fn profile_body(name: &str, pillars: &[&str], aggregation: usize) -> Value {
 /// several scopes is not several copies of one.
 const PILLARS_REGIONS: [&str; 2] = ["us-east-1", "eu-west-1"];
 
-async fn create_profile(client: &Client, body: Value) -> Answer {
+pub(crate) async fn create_profile(client: &Client, body: Value) -> Answer {
     client
         .send("POST", "/api/v1/agent-profiles", Some(body))
         .await
 }
 
-async fn get_profile(client: &Client, profile_arn: &str) -> Answer {
+pub(crate) async fn get_profile(client: &Client, profile_arn: &str) -> Answer {
     client
         .send(
             "GET",
@@ -207,7 +207,7 @@ fn created_goal_id(answer: &Answer, case: &str) -> String {
 /// epoch seconds (the same form `UpdatedAt` and `RecordedAt` take in the suites beside
 /// this one). Checked against the TEST's own clock rather than a recorded value, which
 /// no two runs share: the stamp has to be the moment of the call, not a constant.
-fn assert_create_instant(value: Option<&Value>, case: &str, label: &str) {
+pub(crate) fn assert_create_instant(value: Option<&Value>, case: &str, label: &str) {
     let seconds = value.and_then(Value::as_f64).unwrap_or_default();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -223,7 +223,7 @@ fn assert_create_instant(value: Option<&Value>, case: &str, label: &str) {
 /// A tag list in one stable order, so a comparison does not depend on the order the
 /// request happened to list them in: tags are keyed by `Tag$key`, and this service
 /// reports a resource's tags in key order.
-fn tags_by_key(value: Option<&Value>) -> Vec<(String, String)> {
+pub(crate) fn tags_by_key(value: Option<&Value>) -> Vec<(String, String)> {
     let mut tags: Vec<(String, String)> = value
         .and_then(Value::as_array)
         .map(|tags| {
@@ -245,6 +245,94 @@ fn tags_by_key(value: Option<&Value>) -> Vec<(String, String)> {
         .unwrap_or_default();
     tags.sort();
     tags
+}
+
+/// Assert that `answer` projects the agent profile `sent` created: every member the
+/// request carried comes back as sent, the members the SERVICE owns are its own, and the
+/// members DERIVED from the stored profile answer for that profile's aggregation scope.
+///
+/// The one place this projection is pinned, so a change to it is re-pinned once: both
+/// `CreateAgentProfile` and `GetAgentProfile` answer the same stored record through their
+/// own output shape, and the suites in this crate check both against it. `reader` names
+/// the operation whose answer is under test, `expected_protection` the
+/// `deletionProtection` the row must read back (the value sent, or the modelled
+/// `default: true`), and `eligible` whether the profile names a scope to analyse.
+pub(crate) fn assert_profile_projection(
+    answer: &Answer,
+    sent: &Value,
+    case: &str,
+    reader: &str,
+    expected_protection: bool,
+    eligible: bool,
+) {
+    for member_name in [
+        "name",
+        "displayName",
+        "description",
+        "businessOverview",
+        "pillars",
+        "executionRoleArn",
+        "aggregationConfiguration",
+    ] {
+        assert_eq!(
+            answer.body.get(member_name),
+            sent.get(member_name),
+            "case {case:?}/{reader}: expected {member_name} as sent, got {answer:?}"
+        );
+    }
+    assert_eq!(
+        tags_by_key(answer.body.get("tags")),
+        tags_by_key(sent.get("tags")),
+        "case {case:?}/{reader}: expected the tags as sent, got {answer:?}"
+    );
+    assert_eq!(
+        answer.body.get("deletionProtection").and_then(Value::as_bool),
+        Some(expected_protection),
+        "case {case:?}/{reader}: expected deletionProtection {expected_protection}, \
+         got {answer:?}"
+    );
+    assert_eq!(
+        answer.body.get("createdBy").and_then(Value::as_str),
+        Some(engine::emulator_account_id()),
+        "case {case:?}/{reader}: createdBy must be the account the request is attributed \
+         to, got {answer:?}"
+    );
+    assert_create_instant(answer.body.get("createdAt"), case, "createdAt");
+
+    // A profile is eligible for generation exactly when it names a scope to analyse, and
+    // `fieldErrors` says so when it names none.
+    for derived in [
+        "eligibleForScheduledGeneration",
+        "eligibleForArchitectureGeneration",
+    ] {
+        assert_eq!(
+            answer.body.get(derived).and_then(Value::as_bool),
+            Some(eligible),
+            "case {case:?}/{reader}: expected {derived} {eligible}, got {answer:?}"
+        );
+    }
+    let field_errors = answer.body.get("fieldErrors");
+    if eligible {
+        assert!(
+            field_errors.is_none_or(|errors| errors
+                .as_object()
+                .is_some_and(serde_json::Map::is_empty)),
+            "case {case:?}/{reader}: an eligible profile reports no fieldErrors, \
+             got {answer:?}"
+        );
+    } else {
+        assert_eq!(
+            field_errors
+                .and_then(|errors| errors.get("aggregationConfiguration"))
+                .and_then(Value::as_str),
+            Some(
+                "At least one aggregation configuration is required to generate \
+                 recommendations."
+            ),
+            "case {case:?}/{reader}: an ineligible profile must say which member leaves \
+             it so, got {answer:?}"
+        );
+    }
 }
 
 /// The rows every goal test spans: the pillar sets a goal may name (one, several, and
@@ -932,75 +1020,14 @@ async fn a_created_agent_profile_round_trips_with_its_derived_members() {
         );
 
         for (reader, answer) in [("CreateAgentProfile", &created), ("GetAgentProfile", &fetched)] {
-            for sent in [
-                "name",
-                "displayName",
-                "description",
-                "businessOverview",
-                "pillars",
-                "executionRoleArn",
-                "aggregationConfiguration",
-            ] {
-                assert_eq!(
-                    answer.body.get(sent),
-                    body.get(sent),
-                    "case {case:?}/{reader}: expected {sent} as sent, got {answer:?}"
-                );
-            }
-            assert_eq!(
-                tags_by_key(answer.body.get("tags")),
-                tags_by_key(body.get("tags")),
-                "case {case:?}/{reader}: expected the tags as sent, got {answer:?}"
+            assert_profile_projection(
+                answer,
+                &body,
+                case,
+                reader,
+                expected_protection,
+                aggregation > 0,
             );
-            assert_eq!(
-                answer.body.get("deletionProtection").and_then(Value::as_bool),
-                Some(expected_protection),
-                "case {case:?}/{reader}: expected deletionProtection \
-                 {expected_protection}, got {answer:?}"
-            );
-            assert_eq!(
-                answer.body.get("createdBy").and_then(Value::as_str),
-                Some(engine::emulator_account_id()),
-                "case {case:?}/{reader}: createdBy must be the account the request is \
-                 attributed to, got {answer:?}"
-            );
-            assert_create_instant(answer.body.get("createdAt"), case, "createdAt");
-
-            // A profile is eligible for generation exactly when it names a scope to
-            // analyse, and `fieldErrors` says so when it names none.
-            let eligible = aggregation > 0;
-            for derived in [
-                "eligibleForScheduledGeneration",
-                "eligibleForArchitectureGeneration",
-            ] {
-                assert_eq!(
-                    answer.body.get(derived).and_then(Value::as_bool),
-                    Some(eligible),
-                    "case {case:?}/{reader}: expected {derived} {eligible}, got {answer:?}"
-                );
-            }
-            let field_errors = answer.body.get("fieldErrors");
-            if eligible {
-                assert!(
-                    field_errors.is_none_or(|errors| errors
-                        .as_object()
-                        .is_some_and(serde_json::Map::is_empty)),
-                    "case {case:?}/{reader}: an eligible profile reports no fieldErrors, \
-                     got {answer:?}"
-                );
-            } else {
-                assert_eq!(
-                    field_errors
-                        .and_then(|errors| errors.get("aggregationConfiguration"))
-                        .and_then(Value::as_str),
-                    Some(
-                        "At least one aggregation configuration is required to generate \
-                         recommendations."
-                    ),
-                    "case {case:?}/{reader}: an ineligible profile must say which member \
-                     leaves it so, got {answer:?}"
-                );
-            }
         }
 
         assert_eq!(
