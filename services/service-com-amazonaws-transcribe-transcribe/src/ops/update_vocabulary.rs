@@ -209,14 +209,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // Same pair of alternatives as the create, and the same refusals: "you can
+        // Same pair of alternatives as the create, and the same handling: "you can
         // either upload a text file … or you can include a list of terms directly in
-        // your request using the Phrases flag".
-        let phrases = match crate::state::content_source(
+        // your request using the Phrases flag". Either is recorded; only the
+        // transition the rebuild owes differs (see
+        // [`crate::state::VocabularyRecord::advance_clock`]).
+        let (phrases, file_uri) = match crate::state::content_source(
             input.phrases.as_deref(),
             input.vocabulary_file_uri.as_deref(),
         ) {
-            crate::state::ContentSource::Inline(phrases) => phrases.to_vec(),
+            crate::state::ContentSource::Inline(phrases) => (phrases.to_vec(), None),
+            // Recorded, not read, exactly as on the create: this emulator reads no
+            // object store and makes no outbound request, so no terms are loaded and
+            // the rebuild ends in the modelled `FAILED` state.
+            crate::state::ContentSource::File(uri) => (Vec::new(), Some(uri.to_string())),
             crate::state::ContentSource::Neither => {
                 return Err(bad_request(
                     "Your request must include either Phrases or VocabularyFileUri. Add the \
@@ -229,16 +235,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                      terms of your custom vocabulary one way or the other and try your \
                      request again.",
                 ))
-            }
-            // Unreachable to this emulator, exactly as on the create: it reads no
-            // object store and makes no outbound request, so it would have nothing to
-            // rebuild the vocabulary from.
-            crate::state::ContentSource::File(uri) => {
-                return Err(bad_request(&format!(
-                    "The VocabularyFileUri {uri} can't be read by this emulator: it \
-                     rebuilds a custom vocabulary only from the terms a request lists in \
-                     Phrases. Send the terms in Phrases and try your request again."
-                )))
             }
         };
 
@@ -272,9 +268,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the same transition a create owes, from the instant of this call.
         record.language_code = input.language_code;
         record.phrases = phrases;
+        record.file_uri = file_uri;
         record.state = crate::state::VOCABULARY_STATE_PENDING.to_string();
         record.failure_reason = None;
-        record.ready_due = Some(now + crate::state::VOCABULARY_TRANSITION_DELAY);
+        record.transition_due = Some(now + crate::state::VOCABULARY_TRANSITION_DELAY);
         record.last_modified_time = now;
         record.region = region;
         record.data_access_role_arn = input.data_access_role_arn;
@@ -285,6 +282,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             vocabulary = %record.name,
             state = %record.state,
             terms = record.phrases.len(),
+            from_file = record.file_uri.is_some(),
             "custom vocabulary updated"
         );
 
