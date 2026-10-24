@@ -30,6 +30,8 @@ const MIN_MAX_RESULTS: i32 = 1;
 /// spells it (`MaxResults`, lowerCamel in a message path).
 const MAX_RESULTS_MEMBER: &str = "maxResults";
 
+/// The controls the catalog publishes, as data.
+mod published_controls;
 /// The domain/objective/common-control ontology the catalog publishes, as data.
 mod published_ontology;
 
@@ -494,17 +496,6 @@ const CATALOG_EPOCH: i64 = 1_701_043_200;
 /// One day in seconds, the step between seeded catalog timestamps.
 const DAY: i64 = 86_400;
 
-// The compliance frameworks this catalog's FRAMEWORK mappings name, each written as
-// the framework's own published title. The modeled `FrameworkName` admits 3..250
-// characters, so the published title is what goes on the wire; the item beside it in
-// a mapping row is that framework's own identifier for the requirement.
-const NIST_SP_800_53_R5: &str = "NIST Special Publication 800-53 Revision 5";
-const NIST_CSF_V1_1: &str = "NIST Cybersecurity Framework Version 1.1";
-const PCI_DSS_V4_0: &str = "Payment Card Industry Data Security Standard v4.0";
-const CIS_AWS_FOUNDATIONS_V3_0_0: &str = "CIS Amazon Web Services Foundations Benchmark v3.0.0";
-const CIS_CONTROLS_V8_0: &str = "CIS Critical Security Controls Version 8.0";
-const CIS_GCP_FOUNDATION_V2_0_0: &str = "CIS Google Cloud Platform Foundation Benchmark v2.0.0";
-
 /// Build the catalog this emulator serves.
 ///
 /// The ontology (domains, objectives, common controls) is the whole published table in
@@ -594,197 +585,66 @@ fn seed_catalog() -> ComAmazonawsControlcatalogControlcatalogState {
     let common_control_arn = |slug: &str| catalog_arn("common-control", &catalog_id(slug));
 
     // --- controls ----------------------------------------------------------
-    // Regions a REGIONAL control in this catalog can be deployed in.
-    let deployable = |regions: &[&str]| regions.iter().map(|r| (*r).to_string()).collect::<Vec<_>>();
-    let control_seed: Vec<Control> = vec![
-        Control {
-            arn: catalog_arn("control", &catalog_id("s3-bucket-server-side-encryption-enabled")),
-            control_tower_identifier: None,
-            aliases: vec!["SH.S3.4".to_string()],
-            name: "Require server-side encryption on Amazon S3 buckets".to_string(),
-            description: "Checks whether an Amazon S3 bucket has a default server-side encryption configuration."
-                .to_string(),
-            behavior: "DETECTIVE".to_string(),
-            severity: Some("MEDIUM".to_string()),
-            region_configuration: RegionConfig {
-                scope: "REGIONAL".to_string(),
-                deployable_regions: deployable(&["us-east-1", "us-west-2", "eu-west-1"]),
-            },
-            implementation: Some(Implementation {
-                implementation_type: "AWS::Config::ConfigRule".to_string(),
-                identifier: Some("S3_BUCKET_SERVER_SIDE_ENCRYPTION_ENABLED".to_string()),
-            }),
-            parameter_requirement_summary: Some("NONE".to_string()),
-            parameters: Vec::new(),
-            create_time: CATALOG_EPOCH,
-            governed_resources: vec!["AWS::S3::Bucket".to_string()],
-            governed_providers: vec!["AWS".to_string()],
-        },
-        Control {
-            arn: catalog_arn("control", &catalog_id("restrict-root-user-access-keys")),
-            control_tower_identifier: Some("AWS-GR_RESTRICT_ROOT_USER_ACCESS_KEYS".to_string()),
-            aliases: vec!["CT.IAM.PV.1".to_string(), "SH.IAM.4".to_string()],
-            name: "Disallow the creation of access keys for the root user".to_string(),
-            description: "Prevents the creation of access keys for the Amazon Web Services account root user."
-                .to_string(),
-            behavior: "PREVENTIVE".to_string(),
-            severity: Some("CRITICAL".to_string()),
-            region_configuration: RegionConfig {
-                // A control implemented by a service control policy governs every
-                // Region, so its scope is GLOBAL and it reports no deployable Regions.
-                scope: "GLOBAL".to_string(),
-                deployable_regions: Vec::new(),
-            },
-            implementation: Some(Implementation {
-                implementation_type: "AWS::Organizations::Policy::SERVICE_CONTROL_POLICY"
-                    .to_string(),
-                identifier: None,
-            }),
-            parameter_requirement_summary: Some("OPTIONAL".to_string()),
-            parameters: vec![ControlParam {
-                name: "ExemptedPrincipalArns".to_string(),
-                requirement: Some("OPTIONAL".to_string()),
-            }],
-            create_time: CATALOG_EPOCH + DAY,
-            governed_resources: vec!["AWS::IAM::AccessKey".to_string()],
-            governed_providers: vec!["AWS".to_string()],
-        },
-        Control {
-            arn: catalog_arn("control", &catalog_id("cloud-trail-multi-region-enabled")),
-            control_tower_identifier: Some("AWS-GR_CLOUDTRAIL_ENABLED".to_string()),
-            aliases: vec!["SH.CloudTrail.1".to_string()],
-            name: "Require a multi-Region CloudTrail trail".to_string(),
-            description: "Checks whether an account records management events in all Regions through a CloudTrail trail."
-                .to_string(),
-            behavior: "DETECTIVE".to_string(),
-            severity: Some("HIGH".to_string()),
-            region_configuration: RegionConfig {
-                scope: "REGIONAL".to_string(),
-                deployable_regions: deployable(&[
-                    "ap-southeast-2",
-                    "eu-west-1",
-                    "us-east-1",
-                    "us-west-2",
-                ]),
-            },
-            implementation: Some(Implementation {
-                implementation_type: "AWS::Config::ConfigRule".to_string(),
-                identifier: Some("MULTI_REGION_CLOUD_TRAIL_ENABLED".to_string()),
-            }),
-            parameter_requirement_summary: Some("NONE".to_string()),
-            parameters: Vec::new(),
-            create_time: CATALOG_EPOCH + 2 * DAY,
-            governed_resources: vec!["AWS::CloudTrail::Trail".to_string()],
-            governed_providers: vec!["AWS".to_string()],
-        },
-        Control {
-            arn: catalog_arn("control", &catalog_id("require-encrypted-ebs-volumes")),
-            control_tower_identifier: None,
-            aliases: Vec::new(),
-            name: "Require encryption on Amazon EBS volumes at creation".to_string(),
-            description: "Rejects a CloudFormation deployment that would create an unencrypted Amazon EBS volume."
-                .to_string(),
-            behavior: "PROACTIVE".to_string(),
-            severity: Some("MEDIUM".to_string()),
-            region_configuration: RegionConfig {
-                scope: "REGIONAL".to_string(),
-                deployable_regions: deployable(&["eu-central-1", "us-east-1"]),
-            },
-            implementation: Some(Implementation {
-                implementation_type: "AWS::CloudFormation::Type::HOOK".to_string(),
-                identifier: Some("AWS.EBS.EncryptionHook".to_string()),
-            }),
-            parameter_requirement_summary: Some("REQUIRED".to_string()),
-            parameters: vec![
-                ControlParam {
-                    name: "AllowedRegions".to_string(),
-                    requirement: Some("REQUIRED".to_string()),
+    //
+    // ONE pass over the published control table, which carries one row per published
+    // control: its identity, the surface that implements it, the parameters that
+    // surface takes, and the common control and framework items it is published
+    // against. The ARN is minted from the row's slug, exactly as the ontology's are.
+    //
+    // Timestamps are positional and fixed (see CATALOG_EPOCH), so the catalog a client
+    // reads is identical in every process and on every run.
+    for (position, seed) in published_controls::PUBLISHED_CONTROLS.iter().enumerate() {
+        let arn = catalog_arn("control", &catalog_id(seed.slug));
+        controls.insert(
+            arn.clone(),
+            Control {
+                arn,
+                control_tower_identifier: seed.control_tower_identifier.map(str::to_string),
+                // Derived from the identifiers the designators are a function of, so
+                // one surface's designator cannot land on another surface's control.
+                aliases: published_controls::aliases(seed),
+                name: seed.name.to_string(),
+                description: seed.description.to_string(),
+                behavior: seed.behavior.to_string(),
+                severity: Some(seed.severity.to_string()),
+                region_configuration: RegionConfig {
+                    scope: seed.scope.to_string(),
+                    deployable_regions: seed
+                        .deployable_regions
+                        .iter()
+                        .map(|region| (*region).to_string())
+                        .collect(),
                 },
-                ControlParam {
-                    name: "ExemptedResourceArns".to_string(),
-                    requirement: Some("OPTIONAL".to_string()),
-                },
-            ],
-            create_time: CATALOG_EPOCH + 3 * DAY,
-            governed_resources: vec![
-                "AWS::EC2::Volume".to_string(),
-                "AWS::EC2::Instance".to_string(),
-            ],
-            governed_providers: vec!["AWS".to_string()],
-        },
-        Control {
-            arn: catalog_arn("control", &catalog_id("deny-public-rds-snapshots")),
-            control_tower_identifier: Some("AWS-GR_RDS_SNAPSHOT_PUBLIC_PROHIBITED".to_string()),
-            aliases: vec!["CT.RDS.PV.4".to_string()],
-            name: "Disallow public Amazon RDS database snapshots".to_string(),
-            description: "Prevents an Amazon RDS database snapshot from being shared publicly."
-                .to_string(),
-            behavior: "PREVENTIVE".to_string(),
-            severity: Some("HIGH".to_string()),
-            region_configuration: RegionConfig {
-                scope: "GLOBAL".to_string(),
-                deployable_regions: Vec::new(),
+                implementation: Some(Implementation {
+                    implementation_type: seed.implementation_type.to_string(),
+                    identifier: seed.implementation_identifier.map(str::to_string),
+                }),
+                // A summary OF the parameters below, never an independent fact about
+                // the control.
+                parameter_requirement_summary: Some(
+                    published_controls::parameter_requirement_summary(seed.parameters).to_string(),
+                ),
+                parameters: seed
+                    .parameters
+                    .iter()
+                    .map(|(name, requirement)| ControlParam {
+                        name: (*name).to_string(),
+                        requirement: Some((*requirement).to_string()),
+                    })
+                    .collect(),
+                create_time: CATALOG_EPOCH + (position as i64) * DAY,
+                governed_resources: seed
+                    .governed_resources
+                    .iter()
+                    .map(|resource| (*resource).to_string())
+                    .collect(),
+                governed_providers: seed
+                    .governed_providers
+                    .iter()
+                    .map(|provider| (*provider).to_string())
+                    .collect(),
             },
-            implementation: Some(Implementation {
-                implementation_type: "AWS::Organizations::Policy::SERVICE_CONTROL_POLICY"
-                    .to_string(),
-                identifier: None,
-            }),
-            parameter_requirement_summary: Some("NONE".to_string()),
-            parameters: Vec::new(),
-            create_time: CATALOG_EPOCH + 4 * DAY,
-            governed_resources: vec!["AWS::RDS::DBSnapshot".to_string()],
-            governed_providers: vec!["AWS".to_string()],
-        },
-        Control {
-            arn: catalog_arn("control", &catalog_id("require-mfa-for-console-access")),
-            control_tower_identifier: None,
-            aliases: vec!["SH.IAM.5".to_string()],
-            name: "Require multi-factor authentication for console users".to_string(),
-            description: "Checks whether every identity with a console password also has multi-factor authentication enabled."
-                .to_string(),
-            behavior: "DETECTIVE".to_string(),
-            severity: Some("LOW".to_string()),
-            region_configuration: RegionConfig {
-                scope: "REGIONAL".to_string(),
-                deployable_regions: deployable(&["us-east-1"]),
-            },
-            implementation: Some(Implementation {
-                implementation_type: "AWS::SecurityHub::SecurityControl".to_string(),
-                identifier: Some("IAM.5".to_string()),
-            }),
-            parameter_requirement_summary: Some("NONE".to_string()),
-            parameters: Vec::new(),
-            create_time: CATALOG_EPOCH + 5 * DAY,
-            governed_resources: vec!["AWS::IAM::User".to_string()],
-            governed_providers: vec!["AWS".to_string()],
-        },
-        Control {
-            arn: catalog_arn("control", &catalog_id("gcp-storage-bucket-uniform-access")),
-            control_tower_identifier: None,
-            aliases: Vec::new(),
-            name: "Require uniform bucket-level access on Cloud Storage buckets".to_string(),
-            description: "Checks whether a Google Cloud Storage bucket enforces uniform bucket-level access."
-                .to_string(),
-            behavior: "DETECTIVE".to_string(),
-            severity: Some("MEDIUM".to_string()),
-            region_configuration: RegionConfig {
-                scope: "REGIONAL".to_string(),
-                deployable_regions: deployable(&["us-east-1"]),
-            },
-            implementation: Some(Implementation {
-                implementation_type: "AWS::SecurityHub::SecurityControl".to_string(),
-                identifier: Some("GCP.Storage.1".to_string()),
-            }),
-            parameter_requirement_summary: Some("NONE".to_string()),
-            parameters: Vec::new(),
-            create_time: CATALOG_EPOCH + 6 * DAY,
-            governed_resources: vec!["storage.googleapis.com/Bucket".to_string()],
-            governed_providers: vec!["GCP".to_string()],
-        },
-    ];
-    for control in control_seed {
-        controls.insert(control.arn.clone(), control);
+        );
     }
     let control_arn = |slug: &str| catalog_arn("control", &catalog_id(slug));
 
@@ -793,148 +653,47 @@ fn seed_catalog() -> ComAmazonawsControlcatalogControlcatalogState {
     // mapping set, which is the only wire source for "what does this control
     // satisfy, implement and relate to":
     //
-    //  * COMMON_CONTROL — the common control the control implements;
+    //  * COMMON_CONTROL — the common control the control implements (its row's
+    //    `implements`);
     //  * FRAMEWORK — one entry per published compliance-framework item the control
-    //    satisfies. A control normally satisfies items in SEVERAL frameworks at
-    //    once, so one entry per control is not the catalog's shape;
-    //  * RELATED_CONTROL — one entry per control it is published alongside, with
-    //    how the two relate: COMPLEMENTARY where both can be enabled and reinforce
-    //    one another, ALTERNATIVE where either one satisfies the common control the
-    //    pair implements, MUTUALLY_EXCLUSIVE where enabling both would conflict
-    //    (this catalog publishes no pair that does, so it records none).
-    //
-    // Each framework row names a published framework and that framework's own
-    // identifier for the requirement the control satisfies; the identifier is
-    // quoted in the comment beside the row. Relations are recorded in both
-    // directions, because a query filters on one control at a time and each side of
-    // a pair has to report the relation when it is the one queried.
-    let framework = |name: &str, item: &str| MappingDetails::Framework {
-        name: name.to_string(),
-        item: item.to_string(),
-    };
-    let implements = |common_control_slug: &str| MappingDetails::CommonControl {
-        common_control_arn: common_control_arn(common_control_slug),
-    };
-    let related = |control_slug: &str, relation_type: &str| MappingDetails::RelatedControl {
-        control_arn: Some(control_arn(control_slug)),
-        relation_type: relation_type.to_string(),
-    };
-    let mapping_seed: Vec<(&str, Vec<MappingDetails>)> = vec![
-        (
-            "s3-bucket-server-side-encryption-enabled",
-            vec![
-                implements("encrypt-data-at-rest-in-storage-services"),
-                // "Protection of information at rest".
-                framework(NIST_SP_800_53_R5, "SC-28"),
-                // "Data-at-rest is protected".
-                framework(NIST_CSF_V1_1, "PR.DS-1"),
-                // "Primary account number is rendered unreadable wherever it is stored".
-                framework(PCI_DSS_V4_0, "3.5.1"),
-                // "Encrypt sensitive data at rest".
-                framework(CIS_CONTROLS_V8_0, "3.11"),
-                related("require-encrypted-ebs-volumes", "COMPLEMENTARY"),
-            ],
-        ),
-        (
-            "restrict-root-user-access-keys",
-            vec![
-                implements("require-multi-factor-authentication"),
-                // "Ensure no 'root' user account access key exists".
-                framework(CIS_AWS_FOUNDATIONS_V3_0_0, "1.4"),
-                // "Least privilege".
-                framework(NIST_SP_800_53_R5, "AC-6"),
-                // "Identities and credentials are issued, managed and revoked".
-                framework(NIST_CSF_V1_1, "PR.AC-1"),
-                // "Group, shared and generic accounts are managed".
-                framework(PCI_DSS_V4_0, "8.2.2"),
-                // Both controls implement the multi-factor-authentication common
-                // control for the same provider through different implementation
-                // types (an Organizations policy and a Security Hub control), so
-                // either one satisfies it: the catalog records them as ALTERNATIVE.
-                related("require-mfa-for-console-access", "ALTERNATIVE"),
-            ],
-        ),
-        (
-            "cloud-trail-multi-region-enabled",
-            vec![
-                implements("enable-centralized-logging"),
-                // "Event logging".
-                framework(NIST_SP_800_53_R5, "AU-2"),
-                // "Event data are collected and correlated".
-                framework(NIST_CSF_V1_1, "DE.AE-3"),
-                // "Ensure CloudTrail is enabled in all Regions".
-                framework(CIS_AWS_FOUNDATIONS_V3_0_0, "3.1"),
-                // "Audit logs are enabled and active for all system components".
-                framework(PCI_DSS_V4_0, "10.2.1"),
-            ],
-        ),
-        (
-            "require-encrypted-ebs-volumes",
-            vec![
-                implements("encrypt-data-at-rest-in-storage-services"),
-                // "Protection of information at rest".
-                framework(NIST_SP_800_53_R5, "SC-28"),
-                // "Data-at-rest is protected".
-                framework(NIST_CSF_V1_1, "PR.DS-1"),
-                // "Ensure EBS volume encryption is enabled".
-                framework(CIS_AWS_FOUNDATIONS_V3_0_0, "2.2.1"),
-                related("s3-bucket-server-side-encryption-enabled", "COMPLEMENTARY"),
-            ],
-        ),
-        (
-            "deny-public-rds-snapshots",
-            vec![
-                implements("restrict-public-access"),
-                // "Access enforcement".
-                framework(NIST_SP_800_53_R5, "AC-3"),
-                // "Protections against data leaks are implemented".
-                framework(NIST_CSF_V1_1, "PR.DS-5"),
-                // "Configure data access control lists".
-                framework(CIS_CONTROLS_V8_0, "3.3"),
-                // Both controls implement the restrict-public-access common control,
-                // each over the resources of its own provider, so an estate that spans
-                // both enables both: COMPLEMENTARY rather than ALTERNATIVE.
-                related("gcp-storage-bucket-uniform-access", "COMPLEMENTARY"),
-            ],
-        ),
-        (
-            "require-mfa-for-console-access",
-            vec![
-                implements("require-multi-factor-authentication"),
-                // "Identification and authentication (organizational users)".
-                framework(NIST_SP_800_53_R5, "IA-2"),
-                // "Users, devices and other assets are authenticated".
-                framework(NIST_CSF_V1_1, "PR.AC-7"),
-                // "Ensure MFA is enabled for all IAM users that have a console password".
-                framework(CIS_AWS_FOUNDATIONS_V3_0_0, "1.10"),
-                // "Multi-factor authentication is implemented for all access".
-                framework(PCI_DSS_V4_0, "8.4.2"),
-                related("restrict-root-user-access-keys", "ALTERNATIVE"),
-            ],
-        ),
-        (
-            "gcp-storage-bucket-uniform-access",
-            vec![
-                implements("restrict-public-access"),
-                // "Ensure that uniform bucket-level access is enabled on Cloud Storage buckets".
-                framework(CIS_GCP_FOUNDATION_V2_0_0, "5.2"),
-                // "Access enforcement".
-                framework(NIST_SP_800_53_R5, "AC-3"),
-                // "Protections against data leaks are implemented".
-                framework(NIST_CSF_V1_1, "PR.DS-5"),
-                related("deny-public-rds-snapshots", "COMPLEMENTARY"),
-            ],
-        ),
-    ];
-    let mapping_seed: Vec<(String, MappingDetails)> = mapping_seed
-        .into_iter()
-        .flat_map(|(control_slug, mappings)| {
-            let arn = control_arn(control_slug);
-            mappings
-                .into_iter()
-                .map(move |mapping| (arn.clone(), mapping))
-        })
-        .collect();
+    //    satisfies (its row's `frameworks`, each naming a published framework and that
+    //    framework's own identifier for the requirement). A control normally satisfies
+    //    items in SEVERAL frameworks at once, so one entry per control is not the
+    //    catalog's shape;
+    //  * RELATED_CONTROL — one entry per control it is published alongside, with how
+    //    the two relate (`published_controls::RELATED_CONTROLS`). Relations are
+    //    recorded in both directions, because a query filters on one control at a time
+    //    and each side of a pair has to report the relation when it is the one queried.
+    let mut mapping_seed: Vec<(String, MappingDetails)> = Vec::new();
+    for seed in published_controls::PUBLISHED_CONTROLS {
+        let arn = control_arn(seed.slug);
+        mapping_seed.push((
+            arn.clone(),
+            MappingDetails::CommonControl {
+                common_control_arn: common_control_arn(seed.implements),
+            },
+        ));
+        for &(framework_name, item) in seed.frameworks {
+            mapping_seed.push((
+                arn.clone(),
+                MappingDetails::Framework {
+                    name: framework_name.to_string(),
+                    item: item.to_string(),
+                },
+            ));
+        }
+    }
+    for &(one, other, relation_type) in published_controls::RELATED_CONTROLS {
+        for (from, to) in [(one, other), (other, one)] {
+            mapping_seed.push((
+                control_arn(from),
+                MappingDetails::RelatedControl {
+                    control_arn: Some(control_arn(to)),
+                    relation_type: relation_type.to_string(),
+                },
+            ));
+        }
+    }
     for (control_arn, mapping) in mapping_seed {
         let (mapping_type, target) = match &mapping {
             MappingDetails::Framework { name, item } => {
