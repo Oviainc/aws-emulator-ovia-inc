@@ -17,11 +17,12 @@
 //! portion is the URI of the operation that reads that resource
 //! (`smithy_query(query="operation", operation="GetRestApi,GetStage,GetApiKey")`:
 //! `/restapis/{restApiId}`, `/restapis/{restApiId}/stages/{stageName}`,
-//! `/apikeys/{apiKey}`). Those three are the kinds this suite's harness builds records
-//! for, so the table spans all three; a custom domain name's tags are read by its ARN in
-//! the `domain_name_collection` suite, which is where that record is created, and the
-//! kinds whose creates are still scaffolds can hold no record and are covered among the
-//! 404 rows.
+//! `/apikeys/{apiKey}`). A REST API, a stage, an API key and a VPC link
+//! (`/vpclinks/{vpcLinkId}`) are the kinds this suite's harness builds records for, so
+//! the table spans them; a custom domain name's tags are read by its ARN in the
+//! `domain_name_collection` suite, which is where that record is created, and the kinds
+//! whose creates are still scaffolds can hold no record and are covered among the 404
+//! rows.
 //!
 //! [`Gateway`], [`Answer`], [`assert_failure`] and [`string_member`] are this crate's one
 //! wire-test harness, reused rather than standing a second emulator up another way.
@@ -386,7 +387,7 @@ async fn get_tags_answers_not_found_for_a_taggable_arn_no_record_answers_to() {
             apigateway_arn("/clientcertificates/zzzzz99999"),
         ),
         (
-            "a vpc link, a kind with no records",
+            "an unknown vpc link",
             apigateway_arn("/vpclinks/zzzzz99999"),
         ),
         (

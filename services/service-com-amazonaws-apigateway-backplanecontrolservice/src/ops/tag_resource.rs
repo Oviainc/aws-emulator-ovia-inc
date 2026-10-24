@@ -176,7 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the same ARN to two different records.
         let resource = crate::state::parse_tagged_resource(&input.resource_arn)
             .ok_or_else(|| {
-                bad_request(crate::state::invalid_tagged_resource_arn(&input.resource_arn))
+                bad_request(crate::state::invalid_arn(&input.resource_arn))
             })?;
         // The request's OWN entry count is clamped before anything caller-sized is
         // built: the merged collection always holds at least the request's distinct

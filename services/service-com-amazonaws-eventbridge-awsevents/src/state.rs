@@ -14,18 +14,32 @@
 //! routes a published event to
 //! every enabled rule on the entry's bus whose `EventPattern` matches, and
 //! appends what it routed to [`ComAmazonawsEventbridgeAwseventsState::delivered`]
-//! so the delivery is observable state rather than a discarded side effect.
+//! so the delivery is observable state rather than a discarded side effect; what
+//! came of handing that event to each target of each matched rule is appended to
+//! [`ComAmazonawsEventbridgeAwseventsState::invocations`]. Whether EventBridge
+//! may invoke a target at all is decided against the account's OWN IAM records
+//! ([`delivery_refusal`]), and an invocation it may not make is counted on the
+//! rule's `FailedInvocations` metric in the CloudWatch store
+//! ([`count_failed_invocation`]) — both reached through the same shared engine
+//! this service's store lives in, so there is one copy of each fact.
+//!
+//! Beside the bus tree, EventBridge owns the CONNECTION resource
+//! ([`ConnectionRecord`]): the authorization type and credentials
+//! `CreateConnection` writes, `DescribeConnection` reports, `DeauthorizeConnection`
+//! strips and `DeleteConnection` removes. A connection answered in a non-terminal
+//! state reaches its next one on its own, [`CONNECTION_TRANSITION`] later
+//! ([`ComAmazonawsEventbridgeAwseventsState::settle_connections`]).
 //!
 //! Everything a handler of this service reads or writes lives below; the maps
 //! are ordered so enumeration is deterministic, which is what lets the list
 //! operations resume from an opaque page token.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    DeadLetterConfig, LogConfig, Rule as RuleSummary, Tag, Target, INCLUDE_DETAIL_VALUES,
-    LEVEL_VALUES, RULE_STATE_VALUES,
+    ConnectionAuthResponseParameters, DeadLetterConfig, DescribeConnectionOutput, LogConfig,
+    Rule as RuleSummary, Tag, Target, INCLUDE_DETAIL_VALUES, LEVEL_VALUES, RULE_STATE_VALUES,
 };
 
 /// The event bus a request lands on when it names none.
@@ -580,15 +594,237 @@ impl DeliveredEvent {
     }
 }
 
+/// What came of handing ONE routed event to ONE target of a matched rule.
+///
+/// [`DeliveredEvent`] says WHERE an event was routed; this says what happened
+/// when it was handed over, which is a different fact and the one a client
+/// observes through the target itself (a message on the queue, an execution on
+/// the state machine) or through the dead-letter queue when the handover failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InvocationOutcome {
+    /// The target's own API accepted the event.
+    Invoked,
+    /// Nothing was handed over, and nothing was invented in its place: a target
+    /// kind this emulator has no invocation for, a target asking for an input
+    /// transformation, or a target service that answered `NotImplemented`.
+    /// `reason` says which.
+    NotAttempted(String),
+    /// The invocation was attempted and refused. `code` is the condition
+    /// EventBridge reports for it, `message` the detail.
+    Failed { code: String, message: String },
+}
+
+/// One handover of a routed event to one target, and what came of it.
+#[derive(Debug, Clone)]
+pub struct TargetInvocation {
+    pub event_id: String,
+    /// The rule whose pattern matched, which is what `FailedInvocations` is
+    /// dimensioned by.
+    pub rule: String,
+    pub target_id: String,
+    pub target_arn: String,
+    pub outcome: InvocationOutcome,
+}
+
+/// The service principal EventBridge assumes a rule target's `RoleArn` as.
+///
+/// `Target$RoleArn`: "The Amazon Resource Name (ARN) of the IAM role to be used
+/// for this target when the rule is triggered" — a role EventBridge is to act as
+/// has to trust this principal for `sts:AssumeRole`.
+pub const SERVICE_PRINCIPAL: &str = "events.amazonaws.com";
+
+/// The condition EventBridge reports for an event it could not deliver because
+/// the target's `RoleArn` does not let it act as that role.
+///
+/// The value is the condition's own name, not this constant's: EventBridge
+/// reports a role it cannot assume as `NO_PERMISSIONS` — the same vocabulary its
+/// `InvocationsFailedToBeSentToDlq`/delivery-failure reasons use — so the
+/// constant is named after the value it carries.
+pub const NO_PERMISSIONS: &str = "NO_PERMISSIONS";
+
+/// The condition EventBridge reports for an event whose target invocation was
+/// refused for want of a permission on the target itself.
+pub const ACCESS_DENIED: &str = "ACCESS_DENIED";
+
+/// The CloudWatch namespace EventBridge's own metrics live in.
+pub const METRIC_NAMESPACE: &str = "AWS/Events";
+
+/// The EventBridge metric counting events a rule could not deliver to a target.
+pub const FAILED_INVOCATIONS_METRIC: &str = "FailedInvocations";
+
+/// The dimension `FailedInvocations` is reported per: the rule whose target
+/// could not be invoked.
+pub const RULE_NAME_DIMENSION: &str = "RuleName";
+
+/// The `StandardUnit` a count of invocations is published in.
+pub const METRIC_UNIT_COUNT: &str = "Count";
+
+/// The `StorageResolution` a standard-resolution metric is published at, in
+/// seconds: "the default is 60" (`MetricDatum$StorageResolution`).
+pub const STANDARD_STORAGE_RESOLUTION_SECONDS: i32 = 60;
+
+/// Largest number of target invocations the log holds.
+///
+/// This emulator's OWN bound, like [`MAX_DELIVERED_EVENTS`]: the log is a ring,
+/// so a long-running engine cannot grow it without limit. Each record holds only
+/// identifiers and a refusal message, never the event text.
+pub const MAX_TARGET_INVOCATIONS: usize = 10_000;
+
+/// The `ConnectionState` a connection is created in: "CREATING".
+pub const CONNECTION_STATE_CREATING: &str = "CREATING";
+
+/// The `ConnectionState` a connection whose credentials are in place reaches.
+pub const CONNECTION_STATE_AUTHORIZED: &str = "AUTHORIZED";
+
+/// The `ConnectionState` `DeauthorizeConnection` moves a connection into while
+/// its authorization parameters are being removed.
+pub const CONNECTION_STATE_DEAUTHORIZING: &str = "DEAUTHORIZING";
+
+/// The `ConnectionState` a deauthorized connection settles in.
+pub const CONNECTION_STATE_DEAUTHORIZED: &str = "DEAUTHORIZED";
+
+/// The `ConnectionState` `DeleteConnection` moves a connection into while it is
+/// being removed.
+pub const CONNECTION_STATE_DELETING: &str = "DELETING";
+
+/// How long after the call that starts it a connection's next state becomes due.
+///
+/// A connection AWS answers in a non-terminal state (`CREATING`, `DEAUTHORIZING`,
+/// `DELETING`) reaches its next state a moment later, not instantly, so a caller
+/// acting straight after the call still observes the transient state. AWS
+/// publishes no duration for it; this is the emulator's own span, chosen inside
+/// the 250–750 ms window the project fixes for a clock-owed transition, and it is
+/// stored as a DUE INSTANT rather than waited for.
+pub const CONNECTION_TRANSITION: Duration = Duration::from_millis(400);
+
+/// Largest number of connections this store holds.
+///
+/// This emulator's OWN bound, not a quota AWS publishes: a `CreateConnection`
+/// past it answers the modelled `LimitExceededException` instead of growing
+/// memory without limit. It is far above any realistic fixture's needs.
+pub const MAX_CONNECTIONS: usize = 1_000;
+
+/// The next state a connection's clock owes it.
+#[derive(Debug, Clone)]
+pub enum ConnectionTransition {
+    /// The connection moves to this `ConnectionState`.
+    To(String),
+    /// The connection is removed from the store.
+    Removed,
+}
+
+/// The transition a connection's clock owes, and when it falls due.
+#[derive(Debug, Clone)]
+pub struct PendingTransition {
+    pub due: SystemTime,
+    pub to: ConnectionTransition,
+}
+
+/// A connection as this emulator persists it.
+///
+/// "A connection defines the authorization type and credentials to use for
+/// authorization with an API destination HTTP endpoint" (`CreateConnection`). The
+/// credentials the request carried are NOT kept on the record: EventBridge puts
+/// them in a secret and reports only the non-secret half of the parameters back
+/// ([`ConnectionAuthResponseParameters`] carries a user name, an API key NAME and
+/// a client id, never a password, key value or client secret), so this record
+/// holds exactly what a read may report.
+#[derive(Debug, Clone)]
+pub struct ConnectionRecord {
+    pub name: String,
+    /// Minted ONCE, when the connection is created, and never recomputed: the
+    /// ARN carries a unique id segment, so a connection deleted and recreated
+    /// under one name has a different ARN.
+    pub arn: String,
+    /// The secret the connection's credentials are held in, named after the
+    /// connection itself. The secret VALUE is never reported, and no caller can
+    /// read it through this service.
+    pub secret_arn: String,
+    pub description: Option<String>,
+    /// One of `ConnectionAuthorizationType`'s values.
+    pub authorization_type: String,
+    /// The authorization parameters as a read reports them: every secret member
+    /// the request carried is withheld.
+    pub auth_parameters: ConnectionAuthResponseParameters,
+    /// The resource configuration a connection to a PRIVATE api names
+    /// (`CreateConnection$InvocationConnectivityParameters`), as the request gave
+    /// it.
+    ///
+    /// It is stored but NOT reported: `DescribeConnection`'s connectivity
+    /// parameters carry the ARN of the resource ASSOCIATION EventBridge made
+    /// with that configuration beside the configuration's own ARN, and this
+    /// emulator makes no such association — so there is none to name, and a read
+    /// reports no connectivity parameters rather than an ARN that names
+    /// something else.
+    pub invocation_resource_configuration_arn: Option<String>,
+    pub kms_key_identifier: Option<String>,
+    /// One of `ConnectionState`'s values (`CONNECTION_STATE_VALUES`).
+    pub state: String,
+    pub state_reason: Option<String>,
+    pub created: SystemTime,
+    pub last_modified: SystemTime,
+    pub last_authorized: Option<SystemTime>,
+    /// The transition the clock owes this connection, or `None` once it has
+    /// settled.
+    pub pending: Option<PendingTransition>,
+}
+
+impl ConnectionRecord {
+    /// Whether this connection is already on its way OUT: the transition the
+    /// clock owes it REMOVES it, so there is no later state for another call to
+    /// put it in.
+    ///
+    /// This is the one conflict a write of the connection slice refuses. Every
+    /// other non-terminal state (`CREATING`, `DEAUTHORIZING`) is a connection
+    /// that still exists and can be written: a client that creates a connection
+    /// and deletes it at once is not refused.
+    pub fn is_being_removed(&self) -> bool {
+        self.pending.as_ref().is_some_and(|pending| {
+            matches!(pending.to, ConnectionTransition::Removed)
+        })
+    }
+
+    /// Every member `DescribeConnection` reports, read back from the stored
+    /// record — so a read and the write that created the connection cannot
+    /// disagree about any of them.
+    pub fn to_describe_output(&self) -> DescribeConnectionOutput {
+        DescribeConnectionOutput {
+            connection_arn: Some(self.arn.clone()),
+            name: Some(self.name.clone()),
+            description: self.description.clone(),
+            // See `invocation_resource_configuration_arn`: this emulator makes
+            // no resource association, so there is none to report.
+            invocation_connectivity_parameters: None,
+            connection_state: Some(self.state.clone()),
+            state_reason: self.state_reason.clone(),
+            authorization_type: Some(self.authorization_type.clone()),
+            secret_arn: Some(self.secret_arn.clone()),
+            kms_key_identifier: self.kms_key_identifier.clone(),
+            auth_parameters: Some(self.auth_parameters.clone()),
+            creation_time: Some(to_wire_timestamp(self.created)),
+            last_modified_time: Some(to_wire_timestamp(self.last_modified)),
+            last_authorized_time: self.last_authorized.map(to_wire_timestamp),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-eventbridge-awsevents. A handler reaches it through [`service_state`].
 #[derive(Debug)]
 pub struct ComAmazonawsEventbridgeAwseventsState {
     /// Every event bus, by name. The account's `default` bus is always present.
     pub buses: BTreeMap<String, EventBus>,
+    /// Every connection, by name — the resource `CreateConnection` writes and
+    /// `DescribeConnection` reports.
+    pub connections: BTreeMap<String, ConnectionRecord>,
     /// The routing log: what `PutEvents` accepted and where it went, newest
     /// last. A ring bounded by [`MAX_DELIVERED_EVENTS`] — see
     /// [`Self::record_delivery`], the one place it grows.
     pub delivered: VecDeque<DeliveredEvent>,
+    /// The invocation log: what came of handing each routed event to each
+    /// target of each matched rule, newest last. A ring bounded by
+    /// [`MAX_TARGET_INVOCATIONS`] — see [`Self::record_invocation`], the one
+    /// place it grows.
+    pub invocations: VecDeque<TargetInvocation>,
     /// How many bytes the records in `delivered` hold, kept in step with the
     /// ring so the byte bound costs nothing to check.
     delivered_bytes: usize,
@@ -609,7 +845,9 @@ impl Default for ComAmazonawsEventbridgeAwseventsState {
         );
         Self {
             buses,
+            connections: BTreeMap::new(),
             delivered: VecDeque::new(),
+            invocations: VecDeque::new(),
             delivered_bytes: 0,
             event_seq: 0,
         }
@@ -700,6 +938,14 @@ impl ComAmazonawsEventbridgeAwseventsState {
     /// minted within one nanosecond still differ; the creation instant supplies
     /// the high bits so ids from separate runs do not collide.
     pub fn next_event_id(&mut self, now: SystemTime) -> String {
+        self.next_unique_id(now)
+    }
+
+    /// A fresh, unique identifier in the hyphenated 8-4-4-4-12 hex form, the
+    /// ONE id mint of this store: an event id and the id segment of a
+    /// connection's ARN come from the same counter, so no two resources of one
+    /// run can be handed the same identifier.
+    pub fn next_unique_id(&mut self, now: SystemTime) -> String {
         self.event_seq = self.event_seq.wrapping_add(1);
         let nanos = u64::try_from(
             now.duration_since(UNIX_EPOCH)
@@ -716,6 +962,77 @@ impl ComAmazonawsEventbridgeAwseventsState {
             ((seq >> 48) & 0xffff) as u16,
             seq & 0xffff_ffff_ffff,
         )
+    }
+
+    /// Append one target invocation to the log, evicting the oldest records
+    /// first so it never holds more than [`MAX_TARGET_INVOCATIONS`].
+    ///
+    /// The ONE place that log grows.
+    pub fn record_invocation(&mut self, invocation: TargetInvocation) {
+        while self.invocations.len() >= MAX_TARGET_INVOCATIONS {
+            if self.invocations.pop_front().is_none() {
+                break;
+            }
+        }
+        self.invocations.push_back(invocation);
+    }
+
+    /// The connection `name` names, for a REPORTING operation.
+    pub fn connection(&self, name: &str) -> Option<&ConnectionRecord> {
+        self.connections.get(name)
+    }
+
+    /// The connection `name` names, mutably. Creates nothing: a connection
+    /// comes into existence through `CreateConnection`.
+    pub fn connection_mut(&mut self, name: &str) -> Option<&mut ConnectionRecord> {
+        self.connections.get_mut(name)
+    }
+
+    /// Materialise every connection transition the clock has ALREADY made due
+    /// at `now`, and answer how many were applied.
+    ///
+    /// A connection AWS answers in `CREATING`, `DEAUTHORIZING` or `DELETING`
+    /// reaches its next state on its own, [`CONNECTION_TRANSITION`] after the
+    /// call that started it; the due instant is stored, never waited for. This
+    /// is the only write a reporting operation of the connection slice makes: it
+    /// finishes a change the clock already owed, which was owed at the same
+    /// instant even if nobody had called.
+    pub fn settle_connections(&mut self, now: SystemTime) -> usize {
+        let due: Vec<String> = self
+            .connections
+            .values()
+            .filter(|connection| {
+                connection
+                    .pending
+                    .as_ref()
+                    .is_some_and(|pending| pending.due <= now)
+            })
+            .map(|connection| connection.name.clone())
+            .collect();
+        for name in &due {
+            let Some(connection) = self.connections.get_mut(name) else {
+                continue;
+            };
+            let Some(pending) = connection.pending.take() else {
+                continue;
+            };
+            match pending.to {
+                ConnectionTransition::Removed => {
+                    self.connections.remove(name);
+                }
+                ConnectionTransition::To(state) => {
+                    // The stamps move to the instant the transition fell DUE,
+                    // not to the instant it was noticed, so two reads of a
+                    // settled connection report the same timestamps.
+                    if state == CONNECTION_STATE_AUTHORIZED {
+                        connection.last_authorized = Some(pending.due);
+                    }
+                    connection.last_modified = pending.due;
+                    connection.state = state;
+                }
+            }
+        }
+        due.len()
     }
 }
 
@@ -759,6 +1076,255 @@ pub fn rule_arn(region: &str, event_bus_name: &str, rule_name: &str) -> String {
         format!("rule/{event_bus_name}/{rule_name}")
     };
     ::engine::emulator_arn(ARN_NAMESPACE, region, &resource)
+}
+
+/// The ARN namespace of AWS Secrets Manager, where a connection's credentials
+/// are held ([`connection_secret_arn`]).
+pub const SECRETS_MANAGER_ARN_NAMESPACE: &str = "secretsmanager";
+
+/// `arn:aws:events:<region>:<account>:connection/<name>/<id>`.
+///
+/// `ConnectionArn`'s modelled pattern is
+/// `^arn:aws([a-z]|\-)*:events:([a-z]|\d|\-)*:([0-9]{12})?:connection\/[\.\-_A-Za-z0-9]+\/[\-A-Za-z0-9]+$`,
+/// so the resource carries the connection's NAME and then a unique id segment of
+/// hyphens and alphanumerics ([`ComAmazonawsEventbridgeAwseventsState::next_unique_id`]
+/// mints one).
+pub fn connection_arn(region: &str, name: &str, id: &str) -> String {
+    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("connection/{name}/{id}"))
+}
+
+/// The ARN of the secret a connection's credentials are held in.
+///
+/// `DescribeConnection$SecretArn` is "the ARN of the secret created from the
+/// authorization parameters specified for the connection", and its modelled
+/// pattern is
+/// `^arn:aws([a-z]|\-)*:secretsmanager:([a-z]|\d|\-)*:([0-9]{12})?:secret:[\/_+=\.@\-A-Za-z0-9]+$`
+/// — so the secret is named after the connection it belongs to, under this
+/// service's own `events/connection/` prefix. The secret's VALUE is held on the
+/// connection record's behalf by this service and is never reported: no operation
+/// of this service hands a connection's credentials back.
+pub fn connection_secret_arn(region: &str, name: &str, id: &str) -> String {
+    ::engine::emulator_arn(
+        SECRETS_MANAGER_ARN_NAMESPACE,
+        region,
+        &format!("secret:events/connection/{name}/{id}"),
+    )
+}
+
+/// The IAM store a target's `RoleArn` is resolved against.
+///
+/// It is the IAM service's OWN state struct, reached through the SAME shared
+/// engine this service's store lives in, so EventBridge reads the very records
+/// `CreateRole`, `PutRolePolicy` and `AttachRolePolicy` wrote rather than a
+/// second copy of them.
+pub type IamState =
+    ::service_com_amazonaws_iam_awsidentitymanagementv20100508::ComAmazonawsIamAwsidentitymanagementv20100508State;
+
+/// The IAM store in the SAME shared engine, which is where the account's roles
+/// live. `None` means the engine carries no such store — a deployment with no
+/// IAM to ask, which is evidence of nothing.
+pub fn iam_state<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<IamState>> {
+    ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state::service_state(engine)
+}
+
+/// The CloudWatch store EventBridge's own metrics live in.
+///
+/// It is the CloudWatch service's OWN state struct, reached through the SAME
+/// shared engine this service's store lives in, so what EventBridge counts is
+/// what `ListMetrics` and `GetMetricStatistics` report.
+pub type CloudWatchState =
+    ::service_com_amazonaws_cloudwatch_graniteserviceversion20100801::ComAmazonawsCloudwatchGraniteserviceversion20100801State;
+
+/// The CloudWatch store in the SAME shared engine. `None` means the engine
+/// carries no such store — a deployment with no CloudWatch to count on.
+pub fn cloudwatch_state<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<::engine::ServiceState<CloudWatchState>> {
+    ::service_com_amazonaws_cloudwatch_graniteserviceversion20100801::state::service_state(engine)
+}
+
+/// Count ONE undeliverable event on the rule's `FailedInvocations` metric.
+///
+/// "FailedInvocations: the number of invocations that failed permanently"
+/// (EventBridge's published metrics), in the `AWS/Events` namespace and
+/// dimensioned by `RuleName`. The datapoint is appended to the CloudWatch store
+/// directly rather than sent through `PutMetricData`: CloudWatch reserves the
+/// `AWS/` namespaces for the services that own them ("you should not specify a
+/// namespace that begins with `AWS/`", `PutMetricData$Namespace`), so a service's
+/// own metric never travels over that API. It goes into the very store
+/// `ListMetrics` and `GetMetricStatistics` read, through CloudWatch's own
+/// bounded append, so one metric and its reader cannot disagree.
+pub fn count_failed_invocation(cloudwatch: &mut CloudWatchState, rule: &str) {
+    use ::service_com_amazonaws_cloudwatch_graniteserviceversion20100801::state as metrics;
+
+    let key = metrics::MetricKey {
+        namespace: METRIC_NAMESPACE.to_string(),
+        metric_name: FAILED_INVOCATIONS_METRIC.to_string(),
+        dimensions: [(RULE_NAME_DIMENSION.to_string(), rule.to_string())]
+            .into_iter()
+            .collect(),
+    };
+    // One failed invocation: a single observation of the value 1, at standard
+    // (60-second) storage resolution, counted in `Count` — the unit the metric
+    // is published in.
+    let datum = metrics::StoredDatum {
+        timestamp_secs: metrics::now_secs(),
+        sample_count: 1.0,
+        sum: 1.0,
+        minimum: 1.0,
+        maximum: 1.0,
+        unit: Some(METRIC_UNIT_COUNT.to_string()),
+        storage_resolution: STANDARD_STORAGE_RESOLUTION_SECONDS,
+    };
+    if cloudwatch.append_datapoints(key, vec![datum]).is_err() {
+        ::tracing::warn!(
+            %rule,
+            "the CloudWatch store is at capacity; a failed EventBridge invocation \
+             could not be counted on {FAILED_INVOCATIONS_METRIC}"
+        );
+    }
+}
+
+/// The most policy documents the delivery gate reads for ONE role.
+///
+/// A role carries its inline policies plus at most the IAM store's own ceiling of
+/// attached managed policies. A role whose documents outnumber this is one the
+/// gate does not finish reading, and an unread document might be the one that
+/// carries the grant — so nothing is shown about such a role and the delivery
+/// goes ahead.
+pub const MAX_ROLE_DOCUMENTS: usize = 32;
+
+/// Why EventBridge cannot deliver a matched event to a target under the role the
+/// target names, or `None` when nothing of the kind can be shown.
+///
+/// A rule's target is invoked by EventBridge ACTING AS the target's `RoleArn`, so
+/// two things have to hold before the invocation is made: the role must let
+/// [`SERVICE_PRINCIPAL`] assume it, and the policies in force on it must not
+/// withhold the API call the target's invocation makes. Both are decided against
+/// the account's OWN IAM records — the ones `CreateRole`/`PutRolePolicy` wrote —
+/// and through the shared readers every service that resolves a caller-supplied
+/// role uses, so no two services answer differently.
+///
+/// The emulator refuses only what it can SHOW, so each of these is evidence of
+/// nothing and lets the delivery go ahead: a target naming no role at all (SQS,
+/// SNS and Lambda targets are reached through the resource's own policy instead),
+/// an engine with no IAM store, a `RoleArn` the store holds no role for (it may
+/// belong to another account), a trust document that cannot be read as a policy,
+/// and a role carrying more documents than [`MAX_ROLE_DOCUMENTS`].
+pub fn delivery_refusal(
+    role_arn: Option<&str>,
+    action: &str,
+    resource: &str,
+    iam: &IamState,
+) -> Option<(String, String)> {
+    let role_arn = role_arn?;
+    let role = iam.roles.values().find(|role| role.arn == role_arn)?;
+    // The trust policy first: a role EventBridge cannot assume never gets as far
+    // as its permissions.
+    let trust = role.assume_role_policy_document.as_deref();
+    if trust.and_then(|document| {
+        ::service_common::iam_trust_policy::admits_service_principal(document, SERVICE_PRINCIPAL)
+    }) == Some(false)
+    {
+        return Some((
+            NO_PERMISSIONS.to_string(),
+            format!(
+                "Event bus failed to assume role {role_arn}: its trust policy does not let \
+                 {SERVICE_PRINCIPAL} perform {}.",
+                ::service_common::iam_trust_policy::ASSUME_ROLE_ACTION
+            ),
+        ));
+    }
+    let documents = role_documents(role_arn, iam)?;
+    let request = ::service_common::iam_authorization::Request::new(action, resource, &[]);
+    match ::service_common::iam_authorization::identity_decision(&documents, &request) {
+        ::service_common::iam_authorization::Decision::Allowed => None,
+        // Nothing stated is an implicit deny in IAM, and the documents in force
+        // on the role ARE the authority on what it may do: a role whose policies
+        // say nothing about the call is not allowed to make it.
+        ::service_common::iam_authorization::Decision::Denied
+        | ::service_common::iam_authorization::Decision::NotStated => Some((
+            ACCESS_DENIED.to_string(),
+            format!("Role {role_arn} is not authorized to perform {action} on {resource}."),
+        )),
+    }
+}
+
+/// The identity-based policy documents in force on the role `role_arn` names: its
+/// inline role policies plus the documents of the customer-managed policies
+/// attached to it.
+///
+/// Called with the IAM guard held, and it CLONES what it reads, so the deciding
+/// walk holds no IAM guard.
+///
+/// `None` when nothing can be SHOWN about the role's permissions — the store
+/// holds no such role, one of its attachments is an AWS-managed policy whose
+/// document this account does not hold, or it carries more documents than
+/// [`MAX_ROLE_DOCUMENTS`].
+///
+/// The same IAM-STORE LOOKUP lives in
+/// `service-com-amazonaws-fis-faultinjectionsimulator/src/state/action_permissions.rs`
+/// and in Transfer Family's and CloudWatch RUM's authorization modules, for the
+/// reason that module records: lifting it beside the shared evaluator would make
+/// `services/common` depend on the IAM SERVICE crate, which is a change to every
+/// service rather than to this one. What is NOT duplicated is the rule itself —
+/// the trust reading and the policy evaluation are
+/// [`::service_common::iam_trust_policy`] and
+/// [`::service_common::iam_authorization`], called here, so two services handed
+/// the same documents cannot answer differently.
+pub fn role_documents(role_arn: &str, iam: &IamState) -> Option<Vec<String>> {
+    use ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam_store;
+
+    let role = iam.roles.values().find(|role| role.arn == role_arn)?;
+    let role_key = iam_store::name_key(&role.role_name);
+    let mut documents: Vec<String> = iam
+        .role_inline_policies
+        .get(&role_key)
+        .into_iter()
+        .flat_map(|policies| policies.values())
+        .map(|policy| policy.policy_document.clone())
+        .collect();
+    for arn in iam
+        .role_attached_policies
+        .get(&role_key)
+        .into_iter()
+        .flatten()
+    {
+        match default_policy_document(iam, arn) {
+            Some(document) => documents.push(document),
+            // An AWS-managed policy might be the one that carries the grant, and
+            // this account cannot read it: nothing can be shown about this role.
+            // Which ARNs those are is IAM's OWN reading, called rather than
+            // re-derived.
+            None if iam_store::is_aws_managed_policy_arn(arn) => return None,
+            None => {}
+        }
+    }
+    // More documents than this gate reads: an unread one might carry the grant.
+    if documents.len() > MAX_ROLE_DOCUMENTS {
+        return None;
+    }
+    Some(documents)
+}
+
+/// The default version's document of the managed policy `arn` names, or `None`
+/// when the account holds no such policy or no document for its default version.
+fn default_policy_document(iam: &IamState, arn: &str) -> Option<String> {
+    let managed = iam.policy_by_arn(arn)?;
+    managed
+        .policy
+        .default_version_id
+        .as_deref()
+        .and_then(|default| managed.versions.get(default))
+        .or_else(|| {
+            managed
+                .versions
+                .values()
+                .find(|version| version.is_default_version)
+        })
+        .and_then(|version| version.document.clone())
 }
 
 /// The bus name a request addresses.

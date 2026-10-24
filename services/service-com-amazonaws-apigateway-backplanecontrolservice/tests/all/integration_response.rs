@@ -28,8 +28,11 @@ use crate::method_response::response_header;
 use crate::rest_api_lifecycle::{assert_failure, create_api, Answer, Gateway};
 
 /// `PutIntegrationResponse` for `status` on the integration of the `verb` method of
-/// `resource`. Shared with the sibling `delete_integration` suite, which stands responses
-/// on the integrations it deletes.
+/// `resource`.
+///
+/// Shared with the sibling `control_plane_deletes` suite, which removes the responses it
+/// puts, and with `delete_integration`, which stands responses on the integrations it
+/// deletes — so every suite writes an integration response the same way.
 pub(crate) async fn put_integration_response(
     gateway: &Gateway,
     api: &str,
@@ -50,8 +53,9 @@ pub(crate) async fn put_integration_response(
 }
 
 /// `GetIntegrationResponse` for `status` on the integration of the `verb` method of
-/// `resource`. Shared with the sibling `delete_integration` suite, which reads a deleted
-/// integration's responses back through it.
+/// `resource`. Shared with the sibling `control_plane_deletes` and `delete_integration`
+/// suites, which read a removed response back through it; see
+/// [`put_integration_response`].
 pub(crate) async fn get_integration_response(
     gateway: &Gateway,
     api: &str,
@@ -302,13 +306,13 @@ async fn the_status_codes_an_integration_response_takes_are_the_ones_the_pattern
         assert_failure(
             &put_integration_response(&gateway, &api, &resource, "GET", status, json!({})).await,
             400,
-            "ValidationException",
+            "BadRequestException",
             &format!("PutIntegrationResponse({status})"),
         );
         assert_failure(
             &get_integration_response(&gateway, &api, &resource, "GET", status).await,
             400,
-            "ValidationException",
+            "BadRequestException",
             &format!("GetIntegrationResponse({status})"),
         );
     }
