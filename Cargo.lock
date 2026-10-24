@@ -13210,12 +13210,10 @@ dependencies = [
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
  "bytes",
- "hex",
  "http",
  "serde_json",
  "service-com-amazonaws-sagemaker-sagemaker",
  "service-common",
- "sha2 0.10.9",
  "tokio",
  "tracing",
 ]

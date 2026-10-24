@@ -12,7 +12,9 @@
 //! imports, the versions `CreateLensVersion` publishes from them, the content
 //! `ExportLens` reads back and the versions `GetLensVersionDifference` compares are backed
 //! the same way, and `ListLenses` pages over those
-//! lenses beside the AWS-official lens this emulator ships. The agent profiles
+//! lenses beside the AWS-official lens this emulator ships. The Well-Architected Tool
+//! profiles (`CreateProfile`, `GetProfile`) are backed the same way, each keyed by the
+//! `ProfileArn` the create minted. The agent profiles
 //! (`CreateAgentProfile`, `GetAgentProfile`) and the optimization goals recorded against
 //! one (`CreateAgentGoal`, `GetAgentGoal`, `DeleteAgentGoal`) are backed the same way,
 //! each goal keyed under the profile it belongs to. The contexts recorded against a
@@ -34,7 +36,7 @@
 //! uniqueness rule must word the failure identically, so there is ONE place each
 //! message is built.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
@@ -43,6 +45,7 @@ use crate::ops::types::{
     AggregationConfiguration, Choice, ConflictException, ContextContent, ContextSummary,
     GoalSummary, LensSummary, Milestone,
     MilestoneSummary,
+    Profile, ProfileQuestion,
     ResourceNotFoundException,
     ReviewTemplate, ReviewTemplateLensReview, ReviewTemplatePillarReviewSummary,
     ShareInvitation, ShareInvitationSummary, Tag, Workload, WorkloadDiscoveryConfig,
@@ -861,9 +864,11 @@ pub const LENS_REVIEW_RESOURCE_TYPE: &str = "LENS_REVIEW";
 /// The enum publishes exactly `PRIORITIZED` and `NON_PRIORITIZED`
 /// (`smithy_query(query="shape", shape="QuestionType")`), and a question is prioritized
 /// because a PROFILE associated with the workload prioritises it. No profile can be
-/// associated in this emulator yet — `CreateProfile` and `AssociateProfiles` are stubs,
-/// each with its own issue, and `CreateWorkload` refuses a `ProfileArn` with a 404 — so
-/// no question of any workload is prioritized.
+/// associated with a workload in this emulator yet — `AssociateProfiles` is a stub with
+/// its own issue, and `CreateWorkload` refuses a `ProfileArn` with a 404, because which
+/// lens questions a profile prioritises is decided by the profile TEMPLATE's questions,
+/// which this emulator does not carry (`GetProfileTemplate` is a stub with its own
+/// issue) — so no question of any workload is prioritized.
 pub const DEFAULT_QUESTION_TYPE: &str = "NON_PRIORITIZED";
 
 /// The `QuestionType` a question is prioritized with, the counterpart of
@@ -2758,6 +2763,148 @@ pub struct CreateReviewTemplateToken {
     pub fingerprint: String,
 }
 
+/// The `ProfileVersion` a profile carries the moment it is created.
+///
+/// A profile is VERSIONED — `GetProfile` reads one version of it
+/// (`GetProfileInput$ProfileVersion`), `UpgradeProfileVersion` moves a workload from the
+/// version it holds to a later one, and `ProfileNotificationSummary` compares a
+/// workload's `CurrentProfileVersion` with the profile's `LatestProfileVersion`
+/// (`smithy_query(query="shape", shape="ProfileNotificationSummary")`) — so the version
+/// is the SERVICE's own counter over a profile's revisions, not a value a request
+/// carries. A profile nothing has revised yet is at its first revision, and `1`
+/// satisfies the modelled `ProfileVersion` (`@length(1, 32)`, `^[A-Za-z0-9-]+$`).
+/// Minting the next one belongs to `UpdateProfile`, still a stub with its own issue.
+pub const INITIAL_PROFILE_VERSION: &str = "1";
+
+/// The most Well-Architected Tool profiles this emulator holds for its one account and
+/// Region.
+///
+/// `CreateProfile` models `ServiceQuotaExceededException` (HTTP 402, "The user has
+/// reached their resource quota") for an account that has reached its profile quota; the
+/// real quota is adjustable through Service Quotas, so the number here is this emulator's
+/// own ceiling rather than one read off a doc page. It is what bounds
+/// [`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::profiles`] (and,
+/// with it, the create ledger that is 1:1 with a live profile), and it sits far above any
+/// realistic client workflow, so a caller never meets it by accident.
+pub const MAX_PROFILES: usize = 1_000;
+
+/// The most profile questions one profile records here.
+///
+/// In the real service the questions come from the ONE profile template the service
+/// publishes (`GetProfileTemplate`), so their number is fixed by that template rather
+/// than by the request. This emulator carries no such template — `GetProfileTemplate` is
+/// a stub with its own issue — so this is the ceiling that keeps a stored profile's
+/// question map bounded, answered with the modelled `ServiceQuotaExceededException` for
+/// the reason [`MAX_PROFILES`] gives.
+pub const MAX_QUESTIONS_PER_PROFILE: usize = 100;
+
+/// The modelled input member a profile-question finding names
+/// (`CreateProfileInput$ProfileQuestions` / `UpdateProfileInput$ProfileQuestions`).
+pub const PROFILE_QUESTIONS_MEMBER: &str = "ProfileQuestions";
+
+/// One stored Well-Architected Tool profile: the resource `CreateProfile` mints and
+/// `GetProfile` reports.
+///
+/// The record holds what the request carried plus what the SERVICE owns — the ARN it
+/// minted, the version it is at, the account it attributed the create to and when it
+/// happened. The `Profile` shape is DERIVED from it by [`ProfileRecord::to_profile`], the
+/// only place a response is built from this record, so a read cannot drift from what is
+/// stored.
+#[derive(Debug, Clone)]
+pub struct ProfileRecord {
+    pub profile_arn: String,
+    pub profile_version: String,
+    pub profile_name: String,
+    pub profile_description: String,
+    /// The profile's answered questions: `QuestionId` -> the choices selected for it.
+    ///
+    /// A `BTreeMap` because a profile records ONE answer per question — the modelled
+    /// `Profile$ProfileQuestions` reports each question once — and question-id order is
+    /// then the stable order every read reports them in. The selection is a `BTreeSet`
+    /// for the same reason: "The selected choices"
+    /// (`ProfileQuestionUpdate$SelectedChoiceIds`) is the set of choices in force, so a
+    /// choice is either selected or not and naming one twice selects it once.
+    pub questions: BTreeMap<String, BTreeSet<String>>,
+    pub owner: String,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
+    /// The profile's tags, by key — a `BTreeMap` so they are reported in one stable
+    /// order, as a workload's and a review template's tags are held.
+    pub tags: BTreeMap<String, String>,
+}
+
+impl ProfileRecord {
+    /// The `Profile` shape `GetProfile` returns.
+    pub fn to_profile(&self) -> Profile {
+        Profile {
+            profile_arn: Some(self.profile_arn.clone()),
+            profile_version: Some(self.profile_version.clone()),
+            profile_name: Some(self.profile_name.clone()),
+            profile_description: Some(self.profile_description.clone()),
+            profile_questions: Some(self.profile_questions()),
+            owner: Some(self.owner.clone()),
+            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            updated_at: Some(::aws_smithy_types::DateTime::from(self.updated_at)),
+            // "The ID assigned to the share invitation": only a profile reached through a
+            // share invitation carries one, and profile shares are still stubs with their
+            // own issues, so a profile this account owns carries none.
+            share_invitation_id: None,
+            // The tag map the profile carries, empty when it carries none: the
+            // `@length(min: 1)` on `TagMap` constrains the tags a REQUEST supplies, not
+            // what a projection of the stored profile reports.
+            tags: Some(self.tags.clone().into_iter().collect()),
+        }
+    }
+
+    /// The stored questions as the modelled `Profile$ProfileQuestions` carries them.
+    ///
+    /// `QuestionTitle`, `QuestionDescription`, `QuestionChoices`, `MinSelectedChoices`
+    /// and `MaxSelectedChoices` describe the question itself, and the service reads them
+    /// off the profile TEMPLATE it publishes (the same members on
+    /// `ProfileTemplateQuestion` — `smithy_query(query="shape",
+    /// shape="ProfileTemplateQuestion")`). This emulator carries no profile template —
+    /// `GetProfileTemplate` is a stub with its own issue — so they are reported ABSENT
+    /// rather than invented, and what is reported is exactly what the profile records:
+    /// the question and the choices selected for it.
+    pub fn profile_questions(&self) -> Vec<ProfileQuestion> {
+        self.questions
+            .iter()
+            .map(|(question_id, selected)| ProfileQuestion {
+                question_id: Some(question_id.clone()),
+                selected_choice_ids: Some(selected.iter().cloned().collect()),
+                question_title: None,
+                question_description: None,
+                question_choices: None,
+                min_selected_choices: None,
+                max_selected_choices: None,
+            })
+            .collect()
+    }
+
+    /// The questions as [`parameter_fingerprint`] input: the NORMALIZED question map, so
+    /// two `CreateProfile` requests fingerprint alike exactly when they would record the
+    /// same selections — the order the questions arrive in, and a choice named twice, do
+    /// not make a different request.
+    pub fn question_fingerprint(&self) -> ::serde_json::Value {
+        ::serde_json::json!(self
+            .questions
+            .iter()
+            .map(|(question_id, selected)| (
+                question_id.clone(),
+                selected.iter().cloned().collect::<Vec<String>>()
+            ))
+            .collect::<BTreeMap<String, Vec<String>>>())
+    }
+}
+
+/// What a `CreateProfile` idempotency token resolves to: the profile the original request
+/// created, plus that request's parameter fingerprint.
+#[derive(Debug, Clone)]
+pub struct CreateProfileToken {
+    pub profile_arn: String,
+    pub fingerprint: String,
+}
+
 /// `ConflictException$ResourceType` / `ResourceNotFoundException$ResourceType` for an
 /// AGENT profile — the resource `CreateAgentProfile` mints and every
 /// `/api/v1/agent-profiles/{profileArn}` route resolves.
@@ -3125,6 +3272,14 @@ pub struct ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// `CreateReviewTemplate`'s `ClientRequestToken` -> what the original request
     /// created. Caller input keys it, so it is a BOUNDED [`TokenLedger`].
     pub create_review_template_tokens: TokenLedger<CreateReviewTemplateToken>,
+    /// Every stored Well-Architected Tool profile, keyed by its `ProfileArn` — the only
+    /// identifier the modelled profile operations take for one (`GetProfile`,
+    /// `UpdateProfile`, `DeleteProfile` and every `/profiles/{ProfileArn}` route bind it
+    /// as the URI label).
+    pub profiles: HashMap<String, ProfileRecord>,
+    /// `CreateProfile`'s `ClientRequestToken` -> what the original request created.
+    /// Caller input keys it, so it is a BOUNDED [`TokenLedger`].
+    pub create_profile_tokens: TokenLedger<CreateProfileToken>,
     /// Every stored custom lens, keyed by its 32-lowercase-hex lens id — the resource
     /// part of its ARN, which is how a `LensAlias` names it.
     pub lenses: HashMap<String, LensRecord>,
@@ -3192,6 +3347,25 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
             let arn =
                 ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("review-template/{id}"));
             if !self.review_templates.contains_key(&arn) {
+                return arn;
+            }
+        }
+    }
+
+    /// A fresh `ProfileArn`: `profile/<32 lowercase hex>` in `region`, which satisfies
+    /// the modelled `ProfileArn` pattern's `profile/[a-z0-9]+` resource part, and unused
+    /// by any stored profile. The ARN is what [`Self::profiles`] is keyed by, so the
+    /// collision check is ONE lookup — and exact, where a suffix match over the stored
+    /// ARNs could also collide across Regions.
+    ///
+    /// The resource part is a minted id rather than the profile's name: the name is a
+    /// mutable member (`UpdateProfile`), and an ARN identifies the resource for its whole
+    /// life.
+    pub fn mint_profile_arn(&mut self, region: &str) -> String {
+        loop {
+            let id = self.next_hex_id();
+            let arn = ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("profile/{id}"));
+            if !self.profiles.contains_key(&arn) {
                 return arn;
             }
         }
@@ -4087,6 +4261,35 @@ pub fn review_template_not_found(template_arn: &str) -> ResourceNotFoundExceptio
         REVIEW_TEMPLATE_RESOURCE_TYPE,
         template_arn.to_string(),
         &format!("review template with ARN {template_arn}"),
+    )
+}
+
+/// [`resource_not_found`] for a `ProfileArn` that names no stored Well-Architected Tool
+/// profile. Shared by every operation that resolves a `ProfileArn`, so they cannot word
+/// it differently.
+pub fn profile_not_found(profile_arn: &str) -> ResourceNotFoundException {
+    resource_not_found(
+        PROFILE_RESOURCE_TYPE,
+        profile_arn.to_string(),
+        &format!("profile with ARN {profile_arn}"),
+    )
+}
+
+/// [`resource_not_found`] for a `ProfileVersion` the profile `profile_arn` names does not
+/// have.
+///
+/// A profile is read AT a version (`GetProfileInput$ProfileVersion`), so a version the
+/// profile never had names no readable resource; the `ResourceId` is the profile ARN as
+/// sent qualified by the version asked for, so a caller can tell which of the two it got
+/// wrong.
+pub fn profile_version_not_found(
+    profile_arn: &str,
+    profile_version: &str,
+) -> ResourceNotFoundException {
+    resource_not_found(
+        PROFILE_RESOURCE_TYPE,
+        format!("{profile_arn}.{profile_version}"),
+        &format!("version {profile_version} of a profile with ARN {profile_arn}"),
     )
 }
 

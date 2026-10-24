@@ -19,6 +19,11 @@
 //!    or that only reports (`DescribeVpcs`) carries none.
 //! 2. EVERY EC2 `ec2Query` RESPONSE DECLARES `content-type: text/xml;charset=UTF-8` —
 //!    success and modelled refusal alike.
+//! 3. EVERY MODELLED REFUSAL CLOSES ITS `<Response>` ENVELOPE WITH ONE `<RequestID>`, the
+//!    correlation id the EC2 API Reference's "Error Response" shows as the last child of
+//!    that envelope, after `<Errors>`, in the 8-4-4-4-12 hexadecimal form. It is generated
+//!    per response, so two refusals never carry the same one — the error-envelope
+//!    counterpart of the `<requestId>` rule 1 already pins on a success.
 //!
 //! The flag reports the success of the call, so a call that FAILED carries none: a refusal
 //! answers the error envelope, whatever its operation's output shape is.
@@ -53,6 +58,17 @@ const RESPONSE_CONTENT_TYPE: &str = "text/xml;charset=UTF-8";
 /// A well-formed VPC id in the long (17 hexadecimal digit) form that the account holds no
 /// VPC for — the row that makes the service answer a modelled refusal.
 const UNKNOWN_VPC_ID: &str = "vpc-0ffffffffffffffff";
+
+/// A well-formed Capacity Reservation id the account holds no reservation for.
+const UNKNOWN_CAPACITY_RESERVATION_ID: &str = "cr-00000000000000000";
+
+/// A well-formed transit gateway attachment id the account holds no attachment for. The
+/// dry-run row names it because an authorized `DryRun=true` is answered
+/// `DryRunOperation` whether or not the resources it names exist.
+const UNKNOWN_ATTACHMENT_ID: &str = "tgw-attach-00000000000000000";
+
+/// The HTTP status EC2 answers `DryRunOperation` with.
+const DRY_RUN_STATUS: u16 = 412;
 
 /// The XML namespace every EC2 envelope is stamped with — the service shape's
 /// `@xmlNamespace` URI:
@@ -114,6 +130,13 @@ enum Call {
     /// operation whose modelled output is `smithy.api#Unit`, so the flag must not be
     /// written for a call that did not succeed.
     DeleteAVpcTheAccountDoesNotHold,
+    /// `CreateInterruptibleCapacityReservationAllocation` naming a source Capacity
+    /// Reservation the account does not hold: a refusal from a mutation that reports a
+    /// result of its own, on a third resource kind.
+    AllocateFromACapacityReservationTheAccountDoesNotHold,
+    /// `AcceptTransitGatewayVpcAttachment` with `DryRun=true`: a refusal in another status
+    /// class (412), so the envelope's parts are not pinned to the 400s alone.
+    DryRunATransitGatewayAcceptance,
 }
 
 /// One `action` call signed for `region`, as an [`Answer`].
@@ -392,6 +415,30 @@ async fn perform(case: &str, call: Call) -> Answer {
             )
             .await
         }
+        Call::AllocateFromACapacityReservationTheAccountDoesNotHold => {
+            answer(
+                &router,
+                REGION,
+                "CreateInterruptibleCapacityReservationAllocation",
+                &[
+                    param("CapacityReservationId", UNKNOWN_CAPACITY_RESERVATION_ID),
+                    param("InstanceCount", "1"),
+                ],
+            )
+            .await
+        }
+        Call::DryRunATransitGatewayAcceptance => {
+            answer(
+                &router,
+                REGION,
+                "AcceptTransitGatewayVpcAttachment",
+                &[
+                    param("TransitGatewayAttachmentId", UNKNOWN_ATTACHMENT_ID),
+                    param("DryRun", "true"),
+                ],
+            )
+            .await
+        }
     }
 }
 
@@ -423,6 +470,42 @@ fn envelope_children(case: &str, answered: &Answer, name: &str) -> Vec<String> {
         .filter(|node| node.is_element() && node.tag_name().name() == name)
         .map(|node| node.text().unwrap_or_default().to_string())
         .collect()
+}
+
+/// The text of every DIRECT child named `name` of a REFUSAL's `<Response>` envelope, in
+/// document order, having first pinned that the envelope's root is `<Response>`.
+///
+/// The error envelope's root is the protocol's own `<Response>` rather than the
+/// operation's `<{action}Response>`, so a refusal is read with this rather than with
+/// [`envelope_children`].
+fn refusal_children(case: &str, answered: &Answer, name: &str) -> Vec<String> {
+    let parsed = document(case, &answered.body);
+    let root = parsed.root_element();
+    assert_eq!(
+        root.tag_name().name(),
+        "Response",
+        "case {case:?}: expected a <Response> error envelope from {}, got {}",
+        answered.action,
+        answered.body
+    );
+    root.children()
+        .filter(|node| node.is_element() && node.tag_name().name() == name)
+        .map(|node| node.text().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// Whether `id` has the form an AWS request id takes: five hyphen-separated groups of 8,
+/// 4, 4, 4 and 12 hexadecimal digits.
+fn is_request_id_shaped(id: &str) -> bool {
+    let groups: Vec<&str> = id.split('-').collect();
+    groups.len() == 5
+        && groups
+            .iter()
+            .map(|group| group.len())
+            .eq([8, 4, 4, 4, 12])
+        && groups
+            .iter()
+            .all(|group| group.chars().all(|c| c.is_ascii_hexdigit()))
 }
 
 /// Every row whose response carries the envelope's success flag, and the modelled elements
@@ -494,8 +577,9 @@ const NO_FLAG_ROWS: [(&str, Call, &str); 2] = [
 /// Every row that is REFUSED, the HTTP status it is refused with and the `<Code>` of the
 /// refusal. The second is an operation whose modelled output is `smithy.api#Unit` — the
 /// shape rule 1 writes the flag for — so it pins that the flag follows the call's SUCCESS
-/// and not the output shape.
-const REFUSED_ROWS: [(&str, Call, u16, &str); 2] = [
+/// and not the output shape. The last two widen the table past the reporting/mutating
+/// split: a create that reports a result of its own, and a refusal in another status class.
+const REFUSED_ROWS: [(&str, Call, u16, &str); 4] = [
     (
         "DescribeVpcs for a VPC the account does not hold",
         Call::DescribeAVpcTheAccountDoesNotHold,
@@ -507,6 +591,19 @@ const REFUSED_ROWS: [(&str, Call, u16, &str); 2] = [
         Call::DeleteAVpcTheAccountDoesNotHold,
         400,
         "InvalidVpcID.NotFound",
+    ),
+    (
+        "CreateInterruptibleCapacityReservationAllocation from a source the account does \
+         not hold",
+        Call::AllocateFromACapacityReservationTheAccountDoesNotHold,
+        400,
+        "InvalidCapacityReservationId.NotFound",
+    ),
+    (
+        "AcceptTransitGatewayVpcAttachment with DryRun=true",
+        Call::DryRunATransitGatewayAcceptance,
+        DRY_RUN_STATUS,
+        "DryRunOperation",
     ),
 ];
 
@@ -649,5 +746,58 @@ async fn every_response_declares_the_xml_media_type_with_its_charset() {
             answered.content_type,
             answered.body
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// RULE 3: the request id a refusal closes its envelope with
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn every_refusal_closes_its_envelope_with_one_distinct_request_id() {
+    let mut seen: Vec<String> = Vec::new();
+    for (case, call, expected_status, expected_code) in REFUSED_ROWS {
+        // Each row is called TWICE: the id is generated per RESPONSE, so the same request
+        // refused again carries a different one.
+        for attempt in 1..=2 {
+            let answered = perform(case, call).await;
+            assert_eq!(
+                answered.status, expected_status,
+                "case {case:?} (attempt {attempt}): expected HTTP {expected_status} from \
+                 {}, got {} with body {}",
+                answered.action, answered.status, answered.body
+            );
+            assert_eq!(
+                error_code(&answered.body),
+                expected_code,
+                "case {case:?} (attempt {attempt}): expected the {expected_code} refusal \
+                 from {}, got {}",
+                answered.action,
+                answered.body
+            );
+            let ids = refusal_children(case, &answered, "RequestID");
+            assert_eq!(
+                ids.len(),
+                1,
+                "case {case:?} (attempt {attempt}): expected exactly one <RequestID> in \
+                 the {} error envelope, got {ids:?} in {}",
+                answered.action,
+                answered.body
+            );
+            let id = ids.into_iter().next().unwrap_or_default();
+            assert!(
+                is_request_id_shaped(&id),
+                "case {case:?} (attempt {attempt}): expected a <RequestID> in the \
+                 8-4-4-4-12 hexadecimal form from {}, got {id:?} in {}",
+                answered.action,
+                answered.body
+            );
+            assert!(
+                !seen.contains(&id),
+                "case {case:?} (attempt {attempt}): the request id {id:?} has already been \
+                 answered to another call; ids answered so far: {seen:?}"
+            );
+            seen.push(id);
+        }
     }
 }

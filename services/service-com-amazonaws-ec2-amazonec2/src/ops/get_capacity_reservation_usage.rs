@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetCapacityReservationUsage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetCapacityReservationUsage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetCapacityReservationUsage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the stored Capacity Reservation the request names — its counts, its
+//! state, its interruptible allocation — and the usage of its capacity per account, paged by
+//! `MaxResults`/`NextToken`. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +162,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetCapacityReservationUsage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetCapacityReservationUsageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state;
+
+        // `ctx` carries request metadata only; this operation reads none of it — the store
+        // holds Capacity Reservations per account, so the Region a request was signed for
+        // does not narrow them. The store is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "The token to use to retrieve the next page of results" — anything else is
+        // refused rather than read as an account id, and it is refused before the store is
+        // looked at, so whether a bogus token is caught never depends on what is stored.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                state::decode_page_token(token)
+                    .ok_or_else(|| state::invalid_pagination_token_for(token))?,
+            ),
+        };
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+        // A move the clock already owed is materialised before the reservation is read, so
+        // this report shows the state a caller would have been shown anyway — and nothing
+        // else is written: asking about usage is a READ.
+        store.materialize_due_transitions();
+
+        // "The ID of the Capacity Reservation": an id the account holds no reservation for
+        // is an error, not an empty report.
+        let record =
+            state::require_known_capacity_reservation(&store, &input.capacity_reservation_id)?;
+
+        // DryRun sits AFTER the named reservation has been resolved: the flag asks whether
+        // the request WOULD have succeeded, so one that would have been refused is refused
+        // with that reason instead.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        let total = record.view.total_instance_count.unwrap_or_default();
+        let available = record.available_instance_count();
+        // "The Capacity Reservation's state changes to `expired` when it reaches its end
+        // date and time" (`CapacityReservation$EndDate`): the state is read off that date
+        // rather than out of the stored word, so this read reports what the clock has
+        // reached without writing it.
+        let view = record.view_at(::std::time::SystemTime::now());
+
+        // "If the Capacity Reservation is shared, it shows usage information for the
+        // Capacity Reservation owner and each Amazon Web Services account that is currently
+        // using the shared capacity. If the Capacity Reservation is not shared, it shows
+        // only the Capacity Reservation owner's usage" (`GetCapacityReservationUsage`), and
+        // "The number of instances the Amazon Web Services account currently has in the
+        // Capacity Reservation" (`InstanceUsage$UsedInstanceCount`) counts INSTANCES.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetCapacityReservationUsage"))
+        // No instance in this store belongs to a Capacity Reservation: an [`InstanceRecord`]
+        // carries no capacity reservation target, because `RunInstances` does not place an
+        // instance into one yet (its `CapacityReservationSpecification` is its own issue).
+        // So no account — the owner included — has usage of this reservation to report, and
+        // the set is empty, which is also why `CapacityReservation$CapacityAllocations` is.
+        // Deliberately NOT `TotalInstanceCount - AvailableInstanceCount`: capacity moved
+        // into an interruptible reservation lowers the available count without any instance
+        // running, and that capacity is reported by `InterruptibleCapacityAllocation`, so
+        // deriving usage from the counts would make the two members disagree.
+        let usages: Vec<InstanceUsage> = Vec::new();
+        // Paged in account-id order, which the cursor below names a position in. The paging
+        // is written for the list in general — it is what grows the day an instance joins a
+        // reservation, or a shared reservation has another account's usage in it.
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => usages
+                .partition_point(|usage: &InstanceUsage| {
+                    usage.account_id.as_deref().unwrap_or_default() < cursor
+                }),
+        };
+        let page = usages.get(from..).unwrap_or_default();
+
+        // `MaxResults` carries the modelled `range 1..1000`
+        // (`smithy_query(query="shape",shape="GetCapacityReservationUsageRequestMaxResults")`),
+        // so the boundary validator has already refused anything outside it, and a request
+        // that names no page size gets the largest page this service serves.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(state::MAX_PAGE_SIZE)
+            .clamp(1, state::MAX_PAGE_SIZE);
+
+        // A token only when an entry follows this page: "This value is null when there are
+        // no more results to return" (`NextToken`).
+        let next_token = page
+            .get(limit)
+            .and_then(|usage| usage.account_id.as_deref())
+            .map(state::encode_page_token);
+
+        Ok(GetCapacityReservationUsageOutput {
+            next_token,
+            capacity_reservation_id: view.capacity_reservation_id,
+            instance_type: view.instance_type,
+            total_instance_count: Some(total),
+            available_instance_count: Some(available),
+            state: view.state,
+            instance_usages: Some(page.iter().take(limit).cloned().collect()),
+            interruptible: view.interruptible,
+            interruptible_capacity_allocation: view.interruptible_capacity_allocation,
+            interruption_info: view.interruption_info,
+        })
     }
 }

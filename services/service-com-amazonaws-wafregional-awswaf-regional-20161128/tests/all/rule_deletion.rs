@@ -28,8 +28,10 @@ use service_com_amazonaws_wafregional_awswaf_regional_20161128::state::{
     MESSAGE_NON_EMPTY_ENTITY, MESSAGE_REFERENCED_ITEM, MESSAGE_STALE_DATA,
 };
 
+use crate::harness::store_web_acl;
 use crate::wire::{
     call, change_token, error_message, expect_error, ok_call, router, router_on, token_status,
+    DEFAULT_TEST_REGION,
 };
 
 /// A UUID-shaped id this service never minted.
@@ -114,24 +116,21 @@ async fn create_geo_match_set(router: &MultiServiceRouter, name: &str) -> String
         .to_string()
 }
 
-/// Create a `WebACL` and return its `WebACLId`.
-async fn create_web_acl(router: &MultiServiceRouter, name: &str) -> String {
-    let token = change_token(router).await;
-    let body = ok_call(
-        router,
-        "CreateWebACL",
-        &json!({
-            "Name": name,
-            "MetricName": "ruleDeletionWebAcl",
-            "DefaultAction": {"Type": "ALLOW"},
-            "ChangeToken": token,
-        }),
+/// Store a `WebACL` for a rule to be activated in, and return its `WebACLId`.
+///
+/// `CreateWebACL` admits no new web ACL (AWS WAF Classic is past its end of support, see
+/// `web_acl_end_of_support.rs`), so the record goes in through the shared
+/// `harness::store_web_acl` fixture — the same record `GetWebACL` reads and this suite's
+/// `activate` writes an activation onto.
+fn create_web_acl(engine: &engine::InMemoryEngine, name: &str) -> String {
+    store_web_acl(
+        engine,
+        DEFAULT_TEST_REGION,
+        name,
+        "ruleDeletionWebAcl",
+        "ALLOW",
+        &[],
     )
-    .await;
-    body["WebACL"]["WebACLId"]
-        .as_str()
-        .unwrap_or_else(|| panic!("CreateWebACL returned no WebACLId: {body}"))
-        .to_string()
 }
 
 /// Apply one `RuleUpdate` to `rule_id` with a fresh change token.
@@ -432,8 +431,8 @@ async fn delete_refuses_a_rule_a_web_acl_still_activates() {
         }
     }
 
-    let first_acl = create_web_acl(&router, "deletion-web-acl-one").await;
-    let second_acl = create_web_acl(&router, "deletion-web-acl-two").await;
+    let first_acl = create_web_acl(&engine, "deletion-web-acl-one");
+    let second_acl = create_web_acl(&engine, "deletion-web-acl-two");
 
     // (label, the web ACLs that activate the rule, the priority each activation carries)
     let cases: &[(&str, &[&str], i32)] = &[

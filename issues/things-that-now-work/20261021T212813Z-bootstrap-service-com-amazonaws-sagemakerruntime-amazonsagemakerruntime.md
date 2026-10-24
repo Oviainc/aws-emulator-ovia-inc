@@ -62,3 +62,50 @@ OPERATIONS.md (crate root) lists all 3 operations with routes, members and error
 7. `POST /endpoints/my-endpoint/async-invocations` with `X-Amzn-SageMaker-RequestTTLSeconds: 10` — expect HTTP 400 (below the modeled range 60..21600).
 8. Register `failing-endpoint` with a failing model and invoke it — expect HTTP 424 `ModelError`; register `provisioning-endpoint` as not ready and invoke it — expect HTTP 429 `ModelNotReadyException`.
 9. `POST /endpoints/my-endpoint/invocations-response-stream` — expect HTTP 200 with an `application/vnd.amazon.eventstream` body carrying `PayloadPart` events computed by the same stored model (currently unroutable/501).
+
+## Status note (left by the fixer of this issue)
+
+All three operations are implemented in
+`services/service-com-amazonaws-sagemakerruntime-amazonsagemakerruntime`, but NOT with the
+emulator-local endpoint registry this issue sketched: by the time the slice landed, the
+SageMaker CONTROL PLANE crate (`service-com-amazonaws-sagemaker-sagemaker`) existed and
+owned endpoints, so the premise above ("no `services/*sagemaker*` control-plane crate
+exists") no longer held. Every invocation therefore resolves the endpoint it names in the
+control plane's own store through the one shared engine — `crate::state::resolve_endpoint`,
+the single resolver all three operations ask — and this crate keeps no endpoint of its
+own. What its state holds is what the data plane produced: the bounded log of answered
+invocations and the bounded queue of accepted asynchronous submissions.
+
+- `InvokeEndpoint` refuses an unknown endpoint, one with no deployment behind it, a
+  `TargetVariant` the endpoint does not host, `EnableExplanations` without an
+  `ExplainerConfig` and a `SessionId` naming no session (all 400 `ValidationError`), and
+  answers an otherwise valid invocation with the modelled 424 `ModelError`.
+- `InvokeEndpointAsync` answers 202 with `InferenceId` and the `OutputLocation` /
+  `FailureLocation` computed from the endpoint's own `AsyncInferenceConfig$OutputConfig`
+  paths plus the request's `S3OutputPathExtension` / `Filename`, and queues the submission.
+- `InvokeEndpointWithResponseStream` is hand-authored and routed through
+  `Service::override_operation` (the generator declines a `@streaming` output).
+
+What this emulator will NOT do, and why: a SageMaker model is customer code in a container
+image, which a generated emulator does not run. So no `Body` is synthesised for a
+real-time invocation, no `PayloadPart` is framed for the streaming route (a part carries
+the model's own output, and nothing produced one), and a queued asynchronous submission
+leaves `InProgress` for the modelled failure state once its outcome falls due, with a
+reason that says no container ran it — never a `Completed` claiming an output object
+nothing wrote. The echo/weighted/fixed "model behaviour" registry, the stateful-session
+lifecycle and the custom-attribute echo this issue asked for all depend on a container's
+behaviour and are answered by those modelled errors instead.
+
+The crate's `tests/all/` suites cover it end to end.
+
+Accepted follow-ups, each worth its own issue:
+
+- the data plane reports no `InvokedProductionVariant` and no weighted distribution,
+  because nothing routes an invocation to a variant; if the control plane ever grows
+  variant weights worth honouring, the choice belongs beside `resolve_endpoint`;
+- an asynchronous submission's `RequestTTLSeconds` expiry is stored but not yet
+  materialised as its own clock-owed outcome (the queue settles on the no-container
+  failure first);
+- `service-com-amazonaws-sagemakerruntimehttp2-amazonsagemakerruntimehttp2` still carries
+  its own endpoint registry and model behaviour, which should be reconciled with this
+  control-plane resolution rather than left as a second, different answer.

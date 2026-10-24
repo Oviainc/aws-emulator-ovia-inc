@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelQuery
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelQuery`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelQuery::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Cancels one query in flight on one graph: the request names the graph
+//! (`graphIdentifier`) and the query running on it (`queryId`), and a graph or a query
+//! this store does not hold is a 404 `ResourceNotFoundException`. The cancel is
+//! ACCEPTED here, not finished — the query reports `CANCELLING` until the clock makes
+//! its termination due ([`crate::state::CANCELLATION_SPAN`]), after which it has
+//! stopped and is no longer a query the service reports. The operation is
+//! `@idempotent`, so cancelling a query already stopping is the same empty 200 and
+//! leaves the termination it is already owed where it is.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +164,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelQuery` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelQueryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelQuery"))
+        // The graph and the query the request names are the whole request; nothing here
+        // depends on request metadata.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CancelQueryErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the neptune-graph store is not mounted on this engine".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::Instant::now();
+        let mut store = state.lock();
+
+        // A query is addressed as a query OF a graph, so the graph is resolved first:
+        // an identifier no graph holds names no queries either. The lookup settles the
+        // transitions the clock has already made due, so a graph whose provisioning has
+        // come due is a graph queries can be cancelled on.
+        if store.settled_graph(&input.graph_identifier, now).is_none() {
+            return Err(CancelQueryErrorModeled::ResourceNotFoundException(
+                crate::state::graph_not_found(&input.graph_identifier),
+            )
+            .into());
+        }
+
+        // Only a query still in flight on THAT graph can be cancelled: one that has
+        // already terminated (including through an earlier cancel the clock has since
+        // made due) is gone, and the same id on another graph names nothing here.
+        let Some(query) = store.live_query_mut(&input.graph_identifier, &input.query_id, now) else {
+            return Err(CancelQueryErrorModeled::ResourceNotFoundException(
+                crate::state::query_not_found(&input.graph_identifier, &input.query_id),
+            )
+            .into());
+        };
+
+        // The cancel is accepted, not finished: the query reports `CANCELLING` until
+        // the clock makes its termination due a fixed span later, so a caller that
+        // reads it straight after this call still sees the cancellation in flight.
+        query.begin_cancellation(now);
+
+        // The modelled output is `Unit`: an accepted cancel carries no members.
+        Ok(CancelQueryOutput)
     }
 }

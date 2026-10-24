@@ -21,6 +21,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+// The expected metric catalogue, and the rendering of one answer's references, come from
+// the suite that owns that rule, so this crate's tests state the catalogue ONCE.
+use super::discovered_metric_references::{metric_set, standard_metrics};
+
 /// The SigV4 credential scope routes the request to this service. Signature verification
 /// is off (see `set_request_authentication`), so the signature bytes are never read.
 const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
@@ -292,13 +296,13 @@ async fn one_summary_per_discovered_service_round_trips_through_get_service() {
         .unwrap_or_default()
     {
         let case = format!("summary {}", identity_key(&summary["KeyAttributes"]));
-        // `MetricReferences` is `@required`, so it is PRESENT and empty — this emulator
-        // receives no telemetry to learn a metric from — and the telemetry-derived members
-        // stay absent rather than being invented.
+        // `MetricReferences` reports the standard metrics Application Signals collects for
+        // the discovered service, dimensioned by the identity reported here; the
+        // telemetry-derived members stay absent rather than being invented.
         assert_eq!(
-            summary["MetricReferences"].as_array().map(Vec::len),
-            Some(0),
-            "case {case:?}: expected a present, empty MetricReferences, got {:?}",
+            metric_set(&summary["MetricReferences"]),
+            standard_metrics(),
+            "case {case:?}: expected the standard metric references, got {:?}",
             summary["MetricReferences"]
         );
         assert!(
