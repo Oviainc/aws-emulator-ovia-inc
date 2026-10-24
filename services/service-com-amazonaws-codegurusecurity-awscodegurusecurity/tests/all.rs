@@ -23,3 +23,5 @@ mod resource_tagging;
 mod scan_lifecycle;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/upload_target.rs"]
+mod upload_target;

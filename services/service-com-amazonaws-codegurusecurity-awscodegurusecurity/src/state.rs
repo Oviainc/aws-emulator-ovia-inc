@@ -3,9 +3,10 @@
 //! Engine state for the com-amazonaws-codegurusecurity-awscodegurusecurity service.
 //!
 //! ONE store behind [`service_state`], shared by every handler of this service: the
-//! upload artifacts `CreateUploadUrl` mints, the scans `CreateScan` records (each with
-//! its runs), the findings both `GetFindings` and `BatchGetFindings` read, and the
-//! idempotency ledger that makes a `CreateScan` retry answer with its original run.
+//! upload artifacts `CreateUploadUrl` mints (each with the code resource uploaded to its
+//! target), the scans `CreateScan` records (each with its runs), the findings both
+//! `GetFindings` and `BatchGetFindings` read, and the idempotency ledger that makes a
+//! `CreateScan` retry answer with its original run.
 //!
 //! # Every caller-driven collection here is BOUNDED
 //!
@@ -14,6 +15,9 @@
 //!
 //! * [`UPLOAD_ARTIFACT_QUOTA`] caps `upload_artifacts`, and an artifact also expires
 //!   [`UPLOAD_ARTIFACT_TTL_MILLIS`] after it was minted ([`Store::expire_due_artifacts`]).
+//! * [`UPLOAD_CONTENT_MAX_BYTES`] caps the resource uploaded to one minted target and
+//!   [`UPLOAD_CONTENT_TOTAL_MAX_BYTES`] the bytes every target holds together, both
+//!   enforced in [`Store::receive_upload`], which is the only writer of uploaded bytes.
 //! * [`SCAN_QUOTA`] caps `scans`, and [`RUNS_PER_SCAN_QUOTA`] caps the runs of one scan,
 //!   so the (scans x runs) product is bounded.
 //! * [`TAGS_PER_SCAN_QUOTA`] caps the tags of one scan, enforced in `TagResource`, so
@@ -145,17 +149,48 @@ pub const STANDARD_SCAN_SETTLE_MILLIS: i64 = 500;
 /// i.e. sooner than a Standard scan. Also chosen, not documented.
 pub const EXPRESS_SCAN_SETTLE_MILLIS: i64 = 250;
 
-/// Why every scan run this emulator records ends in `Failed` rather than `Successful`.
+/// Why a scan run whose code resource this emulator DID receive still ends in `Failed`
+/// rather than `Successful`.
 ///
-/// `CreateUploadUrl` mints the upload target and records the code artifact, but this
-/// emulator has no S3 data plane to accept the upload and does not run CodeGuru
-/// Security's detectors, so the analysis a scan run represents never happens. The run
-/// therefore ends in the modelled failure state carrying this reason, instead of
-/// reporting `Successful` for work nothing performed.
+/// The minted upload target is served (see [`upload_url`]) and the uploaded archive is
+/// held against the code artifact, but this emulator does not run CodeGuru Security's
+/// detectors, so the analysis a scan run represents never happens. The run therefore ends
+/// in the modelled failure state carrying this reason, instead of reporting `Successful`
+/// for work nothing performed.
 pub const SCAN_NOT_ANALYSED_MESSAGE: &str =
-    "The code resource for this scan run was never analyzed: this emulator mints the \
-     CreateUploadUrl upload target but has no S3 data plane to receive the resource and \
-     does not run CodeGuru Security's detectors, so the run produced no findings.";
+    "The code resource for this scan run was never analyzed: the uploaded resource is \
+     held against the code artifact, but this emulator does not run CodeGuru Security's \
+     detectors, so the run produced no findings.";
+
+/// Why a scan run whose code resource was never uploaded ends in `Failed`.
+///
+/// `CreateUploadUrl` mints an upload target and records the code artifact; the archive
+/// itself arrives only when the caller performs the documented upload to that target. A
+/// run started on an artifact nothing was uploaded to has no resource to analyse at all,
+/// which is a different failure from [`SCAN_NOT_ANALYSED_MESSAGE`].
+pub const SCAN_RESOURCE_NOT_UPLOADED_MESSAGE: &str =
+    "The code resource for this scan run was never analyzed: nothing was uploaded to the \
+     target CreateUploadUrl minted for this code artifact, so the run had no resource to \
+     analyze.";
+
+/// The first host label this emulator publishes a minted upload target under.
+///
+/// The label names no emulated service, so the framework's route key cannot resolve a
+/// service from it: recognising the host ([`is_upload_host`]) is what routes a request to
+/// a URL THIS service handed out back to this service (see `crate::service`).
+pub const UPLOAD_HOST_LABEL: &str = "codeguru-security-upload";
+
+/// The most bytes one minted upload target retains.
+///
+/// A STORE BOUND chosen by this emulator, not a published AWS limit: it is what stops one
+/// upload growing the emulator's heap without end. A larger archive is refused rather
+/// than truncated, so a target never holds a resource that is not what was uploaded.
+pub const UPLOAD_CONTENT_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// The most bytes every minted upload target together retains; see
+/// [`UPLOAD_CONTENT_MAX_BYTES`], which bounds one of them. Also a chosen store bound:
+/// [`UPLOAD_ARTIFACT_QUOTA`] alone would admit the quota times one archive.
+pub const UPLOAD_CONTENT_TOTAL_MAX_BYTES: usize = 64 * 1024 * 1024;
 
 /// A code artifact `CreateUploadUrl` minted an upload target for, and `CreateScan`
 /// resolves its `resourceId` against.
@@ -174,6 +209,22 @@ pub struct UploadArtifact {
     /// Epoch milliseconds at which the minted target expires; see
     /// [`UPLOAD_ARTIFACT_TTL_MILLIS`].
     pub expires_at_millis: i64,
+    /// The code resource uploaded to this artifact's target, once it has been, and `None`
+    /// while the caller has uploaded nothing. The SINGLE copy of the uploaded bytes: a
+    /// scan run resolves the resource it was started on through this record.
+    pub upload: Option<UploadedResource>,
+}
+
+/// The code resource a caller uploaded to a minted target.
+#[derive(Debug, Clone)]
+pub struct UploadedResource {
+    /// The uploaded bytes, exactly as they arrived. Bounded by
+    /// [`UPLOAD_CONTENT_MAX_BYTES`].
+    pub bytes: Vec<u8>,
+    /// The media type the upload declared, when it declared one.
+    pub content_type: Option<String>,
+    /// Epoch milliseconds at which the upload was received.
+    pub received_at_millis: i64,
 }
 
 /// One run (one revision) of a scan.
@@ -196,6 +247,10 @@ pub struct ScanRun {
     pub updated_at_millis: Option<i64>,
     /// Why the run failed, once it has.
     pub error_message: Option<String>,
+    /// Whether the code artifact this run was started on held an uploaded resource when
+    /// the run started. Decided once, at the start of the run, so what the run reports
+    /// never changes under a later upload to the same target.
+    pub resource_uploaded: bool,
     /// Epoch milliseconds at which this run's transition out of `InProgress` falls due.
     /// Stored, never slept on: a reader materialises the transition the clock already
     /// owes (see [`Store::settle_due_runs`]).
@@ -304,6 +359,10 @@ pub struct ComAmazonawsCodegurusecurityAwscodegurusecurityState {
     /// scan name as well as the token, so a token reused for a different scan can never
     /// answer for the other scan's run.
     pub idempotency: HashMap<(String, String), String>,
+    /// How many bytes the uploaded resources of `upload_artifacts` hold in total, kept in
+    /// step with every write and release so the ceiling
+    /// [`UPLOAD_CONTENT_TOTAL_MAX_BYTES`] can be enforced without walking the store.
+    pub upload_bytes_held: usize,
     /// The account's configuration record, absent until the account is onboarded to
     /// CodeGuru Security ([`Self::onboard_account`]). The SINGLE copy of the
     /// configuration: `GetAccountConfiguration` reports it, `UpdateAccountConfiguration`
@@ -344,7 +403,11 @@ impl ComAmazonawsCodegurusecurityAwscodegurusecurityState {
                 continue;
             }
             run.scan_state = SCAN_STATE_FAILED.to_string();
-            run.error_message = Some(SCAN_NOT_ANALYSED_MESSAGE.to_string());
+            run.error_message = Some(if run.resource_uploaded {
+                SCAN_NOT_ANALYSED_MESSAGE.to_string()
+            } else {
+                SCAN_RESOURCE_NOT_UPLOADED_MESSAGE.to_string()
+            });
             run.updated_at_millis = Some(due_at);
             scan.updated_at_millis = Some(scan.updated_at_millis.unwrap_or(i64::MIN).max(due_at));
         }
@@ -358,8 +421,71 @@ impl ComAmazonawsCodegurusecurityAwscodegurusecurityState {
         let due: Vec<(i64, String)> = self.artifact_expiry.range(..horizon).cloned().collect();
         for key in due {
             self.artifact_expiry.remove(&key);
-            self.upload_artifacts.remove(&key.1);
+            if let Some(released) = self.upload_artifacts.remove(&key.1) {
+                self.release_upload_bytes(&released);
+            }
         }
+    }
+
+    /// Take the bytes a released artifact held out of the retained total.
+    fn release_upload_bytes(&mut self, released: &UploadArtifact) {
+        if let Some(upload) = &released.upload {
+            self.upload_bytes_held = self.upload_bytes_held.saturating_sub(upload.bytes.len());
+        }
+    }
+
+    /// Receive one upload to a minted target: store `bytes` as the code resource of the
+    /// artifact `target` names.
+    ///
+    /// The whole judgement lives here, so the data plane that serves the target and any
+    /// later caller agree on what a target holds:
+    ///
+    /// * every part of the published URL must agree with the recorded artifact — an
+    ///   artifact this store no longer holds (its lifetime ended), or a path that crosses
+    ///   one artifact's id with another scan's name or another account, names no target;
+    /// * an archive past [`UPLOAD_CONTENT_MAX_BYTES`], or one that would push the retained
+    ///   total past [`UPLOAD_CONTENT_TOTAL_MAX_BYTES`], is refused rather than truncated;
+    /// * a target holds ONE resource, so a second upload to the same target replaces the
+    ///   first — which is what makes an interrupted upload retryable.
+    pub fn receive_upload(
+        &mut self,
+        target: &UploadTarget,
+        bytes: Vec<u8>,
+        content_type: Option<String>,
+        now_millis: i64,
+    ) -> UploadOutcome {
+        // The targets whose lifetime the clock has already ended are released first, so an
+        // expired target is not written to.
+        self.expire_due_artifacts(now_millis);
+        let held = self
+            .upload_artifacts
+            .get(&target.code_artifact_id)
+            .filter(|artifact| artifact.scan_name == target.scan_name)
+            .filter(|_| target.account_id == ::engine::emulator_account_id());
+        let Some(artifact) = held else {
+            return UploadOutcome::NoSuchTarget;
+        };
+        if bytes.len() > UPLOAD_CONTENT_MAX_BYTES {
+            return UploadOutcome::TooLarge;
+        }
+        let already = artifact.upload.as_ref().map_or(0, |held| held.bytes.len());
+        let would_hold = self
+            .upload_bytes_held
+            .saturating_sub(already)
+            .saturating_add(bytes.len());
+        if would_hold > UPLOAD_CONTENT_TOTAL_MAX_BYTES {
+            return UploadOutcome::StoreFull;
+        }
+        let Some(artifact) = self.upload_artifacts.get_mut(&target.code_artifact_id) else {
+            return UploadOutcome::NoSuchTarget;
+        };
+        artifact.upload = Some(UploadedResource {
+            bytes,
+            content_type,
+            received_at_millis: now_millis,
+        });
+        self.upload_bytes_held = would_hold;
+        UploadOutcome::Stored
     }
 
     /// The account's configured customer-managed `encryptionConfig.kmsKeyArn`: the key
@@ -533,6 +659,138 @@ pub fn request_region(headers: &::http::HeaderMap) -> String {
 /// shared ARN helper so the account segment is the emulator's canonical one.
 pub fn scan_name_arn(region: &str, scan_name: &str) -> String {
     ::engine::emulator_arn(SERVICE_CODE, region, &format!("scans/{scan_name}"))
+}
+
+/// The upload target `CreateUploadUrl` publishes as `s3Url` for one code artifact:
+/// `https://<UPLOAD_HOST_LABEL>.<region>.amazonaws.com/<account>/<scanName>/<artifactId>`.
+///
+/// A URL this emulator SERVES: the host is the one [`is_upload_host`] recognises and the
+/// path is the one [`parse_upload_path`] reads back, so the upload the response documents
+/// can actually be performed against this emulator (`crate::service` serves it).
+///
+/// The URL is derived from the RECORDED artifact. The region only ever reaches the host
+/// through [`url_region`], which keeps a credential scope that is not a Region out of the
+/// host position; the scan name and the artifact id are path segments of a record this
+/// service minted.
+pub fn upload_url(region: &str, scan_name: &str, code_artifact_id: &str) -> String {
+    format!(
+        "https://{host}/{account}/{scan_name}/{code_artifact_id}",
+        host = upload_host(region),
+        account = ::engine::emulator_account_id(),
+    )
+}
+
+/// The host [`upload_url`] publishes a target on, for `region`.
+pub fn upload_host(region: &str) -> String {
+    format!(
+        "{UPLOAD_HOST_LABEL}.{region}.amazonaws.com",
+        region = url_region(region)
+    )
+}
+
+/// True when `host` is the hostname this service publishes its upload targets under, as
+/// [`upload_host`] builds it — with any `user@` and `:port` removed, as a `Host` header
+/// may carry either.
+///
+/// Recognising it is what routes a request to a URL this service HANDED OUT back to this
+/// service: the host's first label names no service, so the framework's route key cannot
+/// name one from it.
+pub fn is_upload_host(host: &str) -> bool {
+    let host = host.rsplit('@').next().unwrap_or(host);
+    let host = host.split(':').next().unwrap_or(host);
+    let Some(rest) = host
+        .strip_prefix(UPLOAD_HOST_LABEL)
+        .and_then(|rest| rest.strip_prefix('.'))
+    else {
+        return false;
+    };
+    rest.strip_suffix(".amazonaws.com")
+        .is_some_and(is_region_shaped)
+}
+
+/// What a request to a published upload target names: the account the target belongs to,
+/// the scan the uploaded resource is for, and the code artifact it is held against.
+///
+/// The path is the one [`upload_url`] builds: `/<account>/<scanName>/<codeArtifactId>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadTarget {
+    /// The ARN-style account id of the target's first path segment.
+    pub account_id: String,
+    /// The `scanName` the target was minted for.
+    pub scan_name: String,
+    /// The `codeArtifactId` the target was minted for.
+    pub code_artifact_id: String,
+}
+
+/// The upload target a request path names, or `None` when the path is not one this
+/// service publishes.
+///
+/// Reading the path back is a syntax check only: whether the target it names is a
+/// recorded artifact of this account is [`Store::receive_upload`]'s judgement, which is
+/// the one place that resolves a target against the store.
+pub fn parse_upload_path(path: &str) -> Option<UploadTarget> {
+    let mut segments = path.strip_prefix('/')?.split('/');
+    let (Some(account_id), Some(scan_name), Some(code_artifact_id), None) = (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) else {
+        return None;
+    };
+    if account_id.is_empty() || scan_name.is_empty() || code_artifact_id.is_empty() {
+        return None;
+    }
+    Some(UploadTarget {
+        account_id: account_id.to_string(),
+        scan_name: scan_name.to_string(),
+        code_artifact_id: code_artifact_id.to_string(),
+    })
+}
+
+/// How a write to a minted upload target was answered; see [`Store::receive_upload`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadOutcome {
+    /// The resource is now held against the code artifact the target names.
+    Stored,
+    /// The target names no code artifact of this account, or no longer does.
+    NoSuchTarget,
+    /// The archive is larger than one target retains ([`UPLOAD_CONTENT_MAX_BYTES`]).
+    TooLarge,
+    /// Storing the archive would push the retained total past
+    /// [`UPLOAD_CONTENT_TOTAL_MAX_BYTES`].
+    StoreFull,
+}
+
+/// The region a published URL's host names: the request's own when it has a Region's
+/// shape, else [`DEFAULT_REGION`].
+///
+/// A credential scope is request-controlled text, and this value is interpolated into a
+/// host, so only a value shaped like a Region may reach it — which is also what keeps
+/// every URL this service publishes one [`is_upload_host`] recognises.
+fn url_region(region: &str) -> &str {
+    if is_region_shaped(region) {
+        region
+    } else {
+        DEFAULT_REGION
+    }
+}
+
+/// True when `value` has an AWS Region's shape: lowercase alphabetic segments joined by
+/// `-`, ending in a digit group, at least three segments.
+fn is_region_shaped(value: &str) -> bool {
+    let mut segments = value.split('-').rev();
+    let Some(number) = segments.next() else {
+        return false;
+    };
+    if number.is_empty() || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    let words: Vec<&str> = segments.collect();
+    words.len() >= 2
+        && words
+            .iter()
+            .all(|word| !word.is_empty() && word.bytes().all(|byte| byte.is_ascii_lowercase()))
 }
 
 /// The `@pattern` of the modelled `ScanNameArn` shape, verbatim
