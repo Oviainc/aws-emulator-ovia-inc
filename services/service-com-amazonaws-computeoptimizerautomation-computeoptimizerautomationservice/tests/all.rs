@@ -25,6 +25,8 @@ mod automation_rule_lifecycle;
 mod automation_rule_preview;
 #[path = "all/automation_rule_preview_summaries.rs"]
 mod automation_rule_preview_summaries;
+#[path = "all/automation_rule_validation.rs"]
+mod automation_rule_validation;
 #[path = "all/enrollment_gate.rs"]
 mod enrollment_gate;
 #[path = "all/enum_parameter_rejection.rs"]

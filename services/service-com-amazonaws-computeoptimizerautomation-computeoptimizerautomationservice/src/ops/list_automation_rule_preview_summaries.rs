@@ -202,12 +202,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // `recommendedActionTypes` is required and names the action types to
         // include, so an empty list selects nothing at all — and a summary of
-        // nothing would read as "your rule matches no resource".
-        if input.recommended_action_types.is_empty() {
-            return Err(invalid_parameter(crate::state::constraint_report(
-                "recommendedActionTypes",
-                "Member must have length greater than or equal to 1",
-            )));
+        // nothing would read as "your rule matches no resource". Judged by the
+        // one check every operation taking the member shares.
+        if let Some(report) =
+            crate::state::recommended_action_types_violation(&input.recommended_action_types)
+        {
+            return Err(invalid_parameter(report));
         }
         // `organizationScope` names the accounts of an ORGANIZATION preview; an
         // account-scoped rule previews only the account it lives in, so a scope

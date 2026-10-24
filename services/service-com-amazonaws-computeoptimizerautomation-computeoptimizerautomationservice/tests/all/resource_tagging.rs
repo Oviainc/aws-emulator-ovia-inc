@@ -8,7 +8,8 @@
 //! value and keeps its place, so the stored list holds at most one entry per key
 //! — it is checked against the resource's current `ruleRevision`, it does not
 //! advance that revision (the operation is modelled `@idempotent`), and it
-//! writes nothing when it refuses.
+//! writes nothing when it refuses. One request may not name the same key twice:
+//! that states two values for one tag and is refused.
 //!
 //! Every case drives the service over the wire through the same router the
 //! emulator binary mounts (the harness lives in
@@ -143,15 +144,6 @@ async fn tagging_merges_the_requested_tags_into_the_stored_list() {
                 {"key": "cost-center", "value": "4711"},
                 {"key": "tier", "value": "2"}
             ]),
-        ),
-        (
-            "the-same-key-twice-in-one-request-takes-the-last-value",
-            json!([]),
-            json!([
-                {"key": "env", "value": "staging"},
-                {"key": "env", "value": "prod"}
-            ]),
-            json!([{"key": "env", "value": "prod"}]),
         ),
         (
             "every-character-class-the-patterns-admit",
@@ -409,9 +401,10 @@ async fn tagging_past_the_per_resource_tag_limit_is_refused() {
 }
 
 /// A tag whose key or value is outside the modelled `Tag` constraints is
-/// refused with `InvalidParameterValueException` (400) and adds nothing, and a
-/// request missing a required member is refused the same way — never with a 501,
-/// because the operation is implemented.
+/// refused with `InvalidParameterValueException` (400) and adds nothing, a
+/// request naming the same key twice is refused the same way (a tag list states
+/// one value per key), and a request missing a required member is refused the
+/// same way too — never with a 501, because the operation is implemented.
 #[tokio::test]
 async fn a_tag_outside_the_modelled_constraints_is_refused() {
     let router = emulator();
@@ -438,6 +431,24 @@ async fn a_tag_outside_the_modelled_constraints_is_refused() {
         (
             "a-bad-key-beside-a-good-one",
             json!([{"key": "fine", "value": "v"}, {"key": "bad!", "value": "v"}]),
+        ),
+        // A tag list states one value per key, so one request may not name a key
+        // twice — whatever the two values are, and wherever in the list they sit.
+        (
+            "the-same-key-twice-in-one-request",
+            json!([{"key": "env", "value": "staging"}, {"key": "env", "value": "prod"}]),
+        ),
+        (
+            "the-same-key-twice-with-the-same-value",
+            json!([{"key": "env", "value": "prod"}, {"key": "env", "value": "prod"}]),
+        ),
+        (
+            "a-repeated-key-around-a-distinct-one",
+            json!([
+                {"key": "env", "value": "prod"},
+                {"key": "team", "value": "platform"},
+                {"key": "env", "value": "staging"}
+            ]),
         ),
     ];
 

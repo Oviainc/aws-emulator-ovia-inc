@@ -175,6 +175,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // A tag list states one value per key, so a request naming the same key
+        // twice states two values for one tag. Refused ahead of the token ledger
+        // and of the store, so it consumes nothing and changes nothing. The same
+        // check the create path makes of the `tags` it stores.
+        if let Some(report) = crate::state::duplicate_tag_key_violation(&input.tags) {
+            return Err(invalid_parameter(report));
+        }
+
         let mut probe = input.clone();
         probe.client_token = None;
         let request_fingerprint = crate::state::fingerprint(&probe);
@@ -266,8 +274,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// `stored` with `added` applied: a key `stored` does not carry is APPENDED,
 /// and a key it already carries keeps its position and takes the new value —
 /// so a tag list holds at most one entry per key, in whatever order the
-/// additions arrive. Within one request a later entry for a key wins, for the
-/// same reason: the request's tags are applied in order.
+/// additions arrive. `added` itself names each key at most once: a request that
+/// named one twice was refused above
+/// ([`crate::state::duplicate_tag_key_violation`]).
 fn merge_tags(stored: &[Tag], added: &[Tag]) -> Vec<Tag> {
     let mut merged = stored.to_vec();
     for tag in added {

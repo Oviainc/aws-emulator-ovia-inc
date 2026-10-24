@@ -11,7 +11,7 @@
 //! list filter. Handlers live in `src/ops/`, one file per operation, and build
 //! their own output shapes from what they read back out of here.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
@@ -1697,6 +1697,29 @@ fn condition_violation(
             &format!("{path}.member.values"),
             &format!("Member must have length less than or equal to {MAX_VALUES_PER_CONDITION}"),
         ));
+    }
+    None
+}
+
+/// Why this `tags` list cannot be applied as sent, if it cannot: one request may
+/// not name the same tag key twice.
+///
+/// A tag list is a MAP of key to value — a resource holds at most one value per
+/// key, which is what [`crate::ops::tag_resource`]'s merge and every reader of a
+/// stored list assume — so a request naming one key twice states two values for
+/// one tag and is refused rather than silently resolved to one of them. The
+/// `TagList` shape is a list with a `@length` only, so the boundary admits the
+/// repeat and the rule lives here. The report names no key: a validation report
+/// of this service echoes no request value.
+pub fn duplicate_tag_key_violation(tags: &[Tag]) -> Option<String> {
+    let mut seen: HashSet<&str> = HashSet::with_capacity(tags.len());
+    for tag in tags {
+        if !seen.insert(tag.key.as_str()) {
+            return Some(constraint_report(
+                "tags",
+                "Member must not name the same tag key more than once",
+            ));
+        }
     }
     None
 }
