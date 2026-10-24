@@ -69,12 +69,6 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// How many instance names one batch may carry, as the model documents for the
-/// member
-/// (`smithy_query(query="doc",shape="BatchGetOnPremisesInstancesInput",member="instanceNames")`:
-/// "The maximum number of instance names you can specify is 25").
-const MAX_BATCH_INSTANCE_NAMES: usize = 25;
-
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -149,16 +143,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let names = input.instance_names;
         // The batch precondition comes FIRST: a batch above the limit is refused
         // whatever the names in it are, and nothing about the store is read for
-        // it.
-        if names.len() > MAX_BATCH_INSTANCE_NAMES {
+        // it. The quota is the one `BatchLimitExceededException` states for every
+        // batch reader of this service (`crate::state::MAX_BATCH_SIZE`).
+        if names.len() > crate::state::MAX_BATCH_SIZE {
             return Err(
                 BatchGetOnPremisesInstancesErrorModeled::BatchLimitExceededException(
                     BatchLimitExceededException {
-                        message: Some(format!(
-                            "The maximum number of names you can specify for instanceNames is \
-                             {MAX_BATCH_INSTANCE_NAMES}, but {} were specified",
-                            names.len()
-                        )),
+                        message: Some(crate::state::batch_limit_exceeded_message()),
                     },
                 )
                 .into(),
@@ -179,7 +170,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
         for name in &names {
-            match crate::state::check_instance_name(name) {
+            match crate::state::check_on_premises_instance_name(name) {
                 Ok(()) => {}
                 Err(crate::state::NameRefusal::Missing) => {
                     return Err(
@@ -191,14 +182,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .into(),
                     )
                 }
-                Err(crate::state::NameRefusal::Malformed) => {
+                Err(refusal) => {
                     return Err(
                         BatchGetOnPremisesInstancesErrorModeled::InvalidInstanceNameException(
                             InvalidInstanceNameException {
-                                message: Some(format!(
-                                    "The on-premises instance name {name} was specified in an \
-                                     invalid format"
-                                )),
+                                message: Some(
+                                    crate::state::invalid_instance_name_message(refusal)
+                                        .to_string(),
+                                ),
                             },
                         )
                         .into(),

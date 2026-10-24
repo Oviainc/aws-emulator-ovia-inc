@@ -41,7 +41,7 @@
 //! do not write it; editing the entry would let this file drift from the model.
 
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service, ViolationKind,
+    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
 };
 use std::sync::Arc;
 
@@ -50,8 +50,23 @@ use std::sync::Arc;
 type AbsentAnswer = Option<(&'static str, &'static str)>;
 
 /// The modelled error's code for a value that is present but not one the service
-/// accepts; the message stays the clause the framework built from the request.
-type InvalidAnswer = Option<&'static str>;
+/// accepts, with the sentence that error carries for it.
+///
+/// `None` in the sentence position keeps the clause the framework built from the
+/// request, which names the member and the constraint it failed. `Some(builder)`
+/// is for a member whose error states the offending VALUE in the service's own
+/// sentence instead; the builder is handed that value.
+type InvalidAnswer = Option<(&'static str, Option<fn(&str) -> String>)>;
+
+/// The `InvalidRegistrationStatusException` sentence: the registration status
+/// the request asked to filter on, which is the one thing the caller has to
+/// change, stated as the error's own sentence rather than as the constraint
+/// validator's generic echo. The statuses that exist are the members of
+/// `RegistrationStatus` (the generated
+/// `crate::ops::types::REGISTRATION_STATUS_VALUES`).
+fn invalid_registration_status(value: &str) -> String {
+    format!("Registration status {value} is not valid.")
+}
 
 /// What CodeDeploy answers for a refused input member: the modelled error for an
 /// ABSENT (or empty) value — with the fixed sentence that error carries — and
@@ -78,7 +93,7 @@ const REFUSAL_CODES: &[(&str, AbsentAnswer, InvalidAnswer)] = &[
             "ApplicationNameRequiredException",
             crate::state::APPLICATION_NAME_MISSING,
         )),
-        Some("InvalidApplicationNameException"),
+        Some(("InvalidApplicationNameException", None)),
     ),
     (
         "applicationNames",
@@ -86,7 +101,7 @@ const REFUSAL_CODES: &[(&str, AbsentAnswer, InvalidAnswer)] = &[
             "ApplicationNameRequiredException",
             crate::state::APPLICATION_NAME_MISSING,
         )),
-        Some("InvalidApplicationNameException"),
+        Some(("InvalidApplicationNameException", None)),
     ),
     // `UpdateApplication`'s rename target: an `ApplicationName` like the others,
     // and that operation models the same pair of codes for it.
@@ -96,7 +111,7 @@ const REFUSAL_CODES: &[(&str, AbsentAnswer, InvalidAnswer)] = &[
             "ApplicationNameRequiredException",
             crate::state::APPLICATION_NAME_MISSING,
         )),
-        Some("InvalidApplicationNameException"),
+        Some(("InvalidApplicationNameException", None)),
     ),
     (
         "deploymentGroupName",
@@ -104,7 +119,7 @@ const REFUSAL_CODES: &[(&str, AbsentAnswer, InvalidAnswer)] = &[
             "DeploymentGroupNameRequiredException",
             crate::state::DEPLOYMENT_GROUP_NAME_MISSING,
         )),
-        Some("InvalidDeploymentGroupNameException"),
+        Some(("InvalidDeploymentGroupNameException", None)),
     ),
     (
         "deploymentGroupNames",
@@ -112,7 +127,7 @@ const REFUSAL_CODES: &[(&str, AbsentAnswer, InvalidAnswer)] = &[
             "DeploymentGroupNameRequiredException",
             crate::state::DEPLOYMENT_GROUP_NAME_MISSING,
         )),
-        Some("InvalidDeploymentGroupNameException"),
+        Some(("InvalidDeploymentGroupNameException", None)),
     ),
     (
         "deploymentConfigName",
@@ -120,7 +135,7 @@ const REFUSAL_CODES: &[(&str, AbsentAnswer, InvalidAnswer)] = &[
             "DeploymentConfigNameRequiredException",
             crate::state::DEPLOYMENT_CONFIG_NAME_MISSING,
         )),
-        Some("InvalidDeploymentConfigNameException"),
+        Some(("InvalidDeploymentConfigNameException", None)),
     ),
     (
         "deploymentId",
@@ -128,7 +143,7 @@ const REFUSAL_CODES: &[(&str, AbsentAnswer, InvalidAnswer)] = &[
             "DeploymentIdRequiredException",
             crate::state::DEPLOYMENT_ID_MISSING,
         )),
-        Some("InvalidDeploymentIdException"),
+        Some(("InvalidDeploymentIdException", None)),
     ),
     (
         "deploymentIds",
@@ -136,7 +151,7 @@ const REFUSAL_CODES: &[(&str, AbsentAnswer, InvalidAnswer)] = &[
             "DeploymentIdRequiredException",
             crate::state::DEPLOYMENT_ID_MISSING,
         )),
-        Some("InvalidDeploymentIdException"),
+        Some(("InvalidDeploymentIdException", None)),
     ),
     (
         "instanceName",
@@ -144,7 +159,7 @@ const REFUSAL_CODES: &[(&str, AbsentAnswer, InvalidAnswer)] = &[
             "InstanceNameRequiredException",
             crate::state::INSTANCE_NAME_MISSING,
         )),
-        Some("InvalidInstanceNameException"),
+        Some(("InvalidInstanceNameException", None)),
     ),
     (
         "instanceNames",
@@ -152,7 +167,7 @@ const REFUSAL_CODES: &[(&str, AbsentAnswer, InvalidAnswer)] = &[
             "InstanceNameRequiredException",
             crate::state::INSTANCE_NAME_MISSING,
         )),
-        Some("InvalidInstanceNameException"),
+        Some(("InvalidInstanceNameException", None)),
     ),
     (
         "instanceId",
@@ -176,7 +191,7 @@ const REFUSAL_CODES: &[(&str, AbsentAnswer, InvalidAnswer)] = &[
             "DeploymentTargetIdRequiredException",
             crate::state::DEPLOYMENT_TARGET_ID_MISSING,
         )),
-        Some("InvalidDeploymentTargetIdException"),
+        Some(("InvalidDeploymentTargetIdException", None)),
     ),
     (
         "targetIds",
@@ -184,12 +199,12 @@ const REFUSAL_CODES: &[(&str, AbsentAnswer, InvalidAnswer)] = &[
             "DeploymentTargetIdRequiredException",
             crate::state::DEPLOYMENT_TARGET_ID_MISSING,
         )),
-        Some("InvalidDeploymentTargetIdException"),
+        Some(("InvalidDeploymentTargetIdException", None)),
     ),
     (
         "serviceRoleArn",
         Some(("RoleRequiredException", crate::state::ROLE_MISSING)),
-        Some("InvalidRoleException"),
+        Some(("InvalidRoleException", None)),
     ),
     (
         // The framework reports a violated member by its lowerCamel name, even
@@ -200,58 +215,69 @@ const REFUSAL_CODES: &[(&str, AbsentAnswer, InvalidAnswer)] = &[
             "ResourceArnRequiredException",
             crate::state::RESOURCE_ARN_MISSING,
         )),
-        Some("InvalidArnException"),
+        Some(("InvalidArnException", None)),
     ),
     (
         "revision",
         Some(("RevisionRequiredException", crate::state::REVISION_MISSING)),
-        Some("InvalidRevisionException"),
+        Some(("InvalidRevisionException", None)),
     ),
     (
         "revisions",
         Some(("RevisionRequiredException", crate::state::REVISION_MISSING)),
-        Some("InvalidRevisionException"),
+        Some(("InvalidRevisionException", None)),
     ),
     // Value-set members: a refusal can only ever be "not one of the values".
-    ("computePlatform", None, Some("InvalidComputePlatformException")),
+    (
+        "computePlatform",
+        None,
+        Some(("InvalidComputePlatformException", None)),
+    ),
     (
         "fileExistsBehavior",
         None,
-        Some("InvalidFileExistsBehaviorException"),
+        Some(("InvalidFileExistsBehaviorException", None)),
     ),
     (
         "includeOnlyStatuses",
         None,
-        Some("InvalidDeploymentStatusException"),
+        Some(("InvalidDeploymentStatusException", None)),
     ),
     (
         "registrationStatus",
         None,
-        Some("InvalidRegistrationStatusException"),
+        Some((
+            "InvalidRegistrationStatusException",
+            Some(invalid_registration_status),
+        )),
     ),
-    ("tagFilters", None, Some("InvalidTagFilterException")),
+    ("tagFilters", None, Some(("InvalidTagFilterException", None))),
     (
         "deploymentWaitType",
         None,
-        Some("InvalidDeploymentWaitTypeException"),
+        Some(("InvalidDeploymentWaitTypeException", None)),
     ),
     (
         "status",
         None,
-        Some("InvalidLifecycleEventHookExecutionStatusException"),
+        Some(("InvalidLifecycleEventHookExecutionStatusException", None)),
     ),
-    ("sortBy", None, Some("InvalidSortByException")),
-    ("sortOrder", None, Some("InvalidSortOrderException")),
-    ("deployed", None, Some("InvalidDeployedStateFilterException")),
+    ("sortBy", None, Some(("InvalidSortByException", None))),
+    ("sortOrder", None, Some(("InvalidSortOrderException", None))),
+    (
+        "deployed",
+        None,
+        Some(("InvalidDeployedStateFilterException", None)),
+    ),
     (
         "instanceStatusFilter",
         None,
-        Some("InvalidInstanceStatusException"),
+        Some(("InvalidInstanceStatusException", None)),
     ),
     (
         "instanceTypeFilter",
         None,
-        Some("InvalidInstanceTypeException"),
+        Some(("InvalidInstanceTypeException", None)),
     ),
     // `targetFilters` is a map whose KEY is the enumerated filter name, and the
     // framework captures no key constraints, so such a value is not refused at the
@@ -263,10 +289,11 @@ const REFUSAL_CODES: &[(&str, AbsentAnswer, InvalidAnswer)] = &[
 struct RefusalAnswer {
     /// The modelled error shape's name.
     code: &'static str,
-    /// The fixed sentence that error owns, for a member the request did not
-    /// give. `None` keeps the clause the framework built from the request, which
-    /// is the right answer for a value that is present but unacceptable.
-    sentence: Option<&'static str>,
+    /// The sentence that error owns for this refusal. `None` keeps the clause
+    /// the framework built from the request, which is the right answer for a
+    /// value that is present and unacceptable where the error states no sentence
+    /// of its own.
+    sentence: Option<String>,
 }
 
 /// The error [`EmulatedService::override_refusal`] answers for `member` failing
@@ -277,9 +304,13 @@ struct RefusalAnswer {
 /// minimum failure maps to the member's `…RequiredException` alongside an absent
 /// one; every other constraint failure means the value itself is not one the
 /// service accepts.
-fn refusal_answer(member: &str, kind: &ViolationKind) -> Option<RefusalAnswer> {
+fn refusal_answer(violation: &Violation) -> Option<RefusalAnswer> {
+    // The path is rooted at the top-level input member and descends from there
+    // (`includeOnlyStatuses.1.member`), so the root segment is the member the
+    // caller sent.
+    let member = violation.path.split('.').next()?;
     let absent = matches!(
-        kind,
+        violation.kind,
         ViolationKind::MissingRequiredMember | ViolationKind::MinLength(_)
     );
     let (_, for_absent, for_invalid) = REFUSAL_CODES
@@ -287,16 +318,19 @@ fn refusal_answer(member: &str, kind: &ViolationKind) -> Option<RefusalAnswer> {
         .find(|(name, _, _)| *name == member)?;
     if absent {
         let (code, sentence) = (*for_absent)?;
-        Some(RefusalAnswer {
+        return Some(RefusalAnswer {
             code,
-            sentence: Some(sentence),
-        })
-    } else {
-        Some(RefusalAnswer {
-            code: (*for_invalid)?,
-            sentence: None,
-        })
+            sentence: Some(sentence.to_string()),
+        });
     }
+    let (code, sentence) = (*for_invalid)?;
+    Some(RefusalAnswer {
+        code,
+        // A sentence built from the value is only available where the request
+        // carried one; an absent value cannot be named, so that case keeps the
+        // framework's clause.
+        sentence: sentence.zip(violation.value.as_deref()).map(|(build, value)| build(value)),
+    })
 }
 
 /// The `com-amazonaws-codedeploy-codedeploy-20141006` emulated service: the generated [`ServiceDefinition`] plus
@@ -362,19 +396,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         };
         // The first refused member, which is the one the service names.
         let violation = violations.first()?;
-        // The path is rooted at the top-level input member and descends from there
-        // (`includeOnlyStatuses.1.member`), so the root segment is the member the
-        // caller sent.
-        let member = violation.path.split('.').next()?;
-        let answer = refusal_answer(member, &violation.kind)?;
+        let answer = refusal_answer(violation)?;
         Some(Refused {
             code: answer.code.to_string(),
-            // A required-member error carries its OWN sentence; anything else
-            // keeps the clause the framework built from the request, which names
-            // the member and the constraint it failed.
-            message: answer
-                .sentence
-                .map_or_else(|| violation.message(), str::to_string),
+            // An error that owns a sentence for this refusal states it; anything
+            // else keeps the clause the framework built from the request, which
+            // names the member and the constraint it failed.
+            message: answer.sentence.unwrap_or_else(|| violation.message()),
         })
     }
 

@@ -313,26 +313,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
         // A deployment's `overrideAlarmConfiguration` is bounded by the same
-        // alarm rules as a deployment group's, from the one place they live.
+        // alarm rules as a deployment group's, from the one place they live —
+        // under the DEPLOYMENT's own alarm quota, which is not the deployment
+        // group's (see `crate::state::AlarmQuota`).
         if let Some(configuration) = input.override_alarm_configuration.as_ref() {
-            match crate::state::validate_alarm_configuration(configuration) {
+            match crate::state::validate_alarm_configuration(
+                configuration,
+                crate::state::AlarmQuota::Deployment,
+            ) {
                 Ok(()) => {}
-                Err(crate::state::AlarmConfigurationRejection::TooManyAlarms(count)) => {
+                Err(crate::state::AlarmConfigurationRejection::TooManyAlarms(message)) => {
                     return Err(CreateDeploymentErrorModeled::AlarmsLimitExceededException(
                         AlarmsLimitExceededException {
-                            message: Some(format!(
-                                "The maximum number of alarms for a deployment group ({}) was \
-                                 exceeded: {count} alarms were specified",
-                                crate::state::MAX_ALARMS_PER_ALARM_CONFIGURATION
-                            )),
+                            message: Some(message),
                         },
                     )
                     .into());
                 }
-                Err(crate::state::AlarmConfigurationRejection::Malformed(reason)) => {
+                Err(crate::state::AlarmConfigurationRejection::Malformed(message)) => {
                     return Err(CreateDeploymentErrorModeled::InvalidAlarmConfigException(
                         InvalidAlarmConfigException {
-                            message: Some(format!("The alarm configuration is invalid: {reason}")),
+                            message: Some(message),
                         },
                     )
                     .into());
@@ -448,9 +449,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     CreateDeploymentErrorModeled::InvalidAutoRollbackConfigException(
                         InvalidAutoRollbackConfigException {
                             message: Some(
-                                "The automatic rollback configuration is enabled but lists no \
-                                 triggering event type"
-                                    .to_string(),
+                                crate::state::AUTO_ROLLBACK_WITHOUT_EVENTS.to_string(),
                             ),
                         },
                     ),
