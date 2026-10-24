@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateListener
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateListener`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateListener::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies the supplied members to the listener in [`crate::state`] and returns the
+//! record as it now stands: `PortRanges`, `Protocol` and `ClientAffinity` are replaced
+//! when the request carries them and left as they are when it does not. An unknown
+//! `ListenerArn` is `ListenerNotFoundException`; a port range that names no ports is
+//! `InvalidPortRangeException`.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +155,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateListener` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateListenerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateListener"))
+        // `ctx` carries request metadata only; this operation needs none of it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateListenerErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {
+                    message: Some("the Global Accelerator store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The same rule `CreateListener` enforces: every supplied range must name at
+        // least one port, checked before anything is written.
+        let mut port_ranges: Option<Vec<(i32, i32)>> = None;
+        if let Some(supplied) = input.port_ranges.as_deref() {
+            let mut pairs = Vec::with_capacity(supplied.len());
+            for range in supplied {
+                match crate::state::validate_port_range(range) {
+                    Ok(pair) => pairs.push(pair),
+                    Err(message) => {
+                        return Err(UpdateListenerErrorModeled::InvalidPortRangeException(
+                            InvalidPortRangeException {
+                                message: Some(message),
+                            },
+                        )
+                        .into())
+                    }
+                }
+            }
+            port_ranges = Some(pairs);
+        }
+
+        let mut store = state.lock();
+        let Some(record) = store.listeners.get_mut(&input.listener_arn) else {
+            return Err(UpdateListenerErrorModeled::ListenerNotFoundException(
+                ListenerNotFoundException {
+                    message: Some(crate::state::listener_not_found_message(
+                        &input.listener_arn,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // Each member the request carries replaces the stored one; a member it omits is
+        // not a change, so the persisted value stays ("The updated list of port ranges",
+        // "The updated protocol" — `UpdateListener`'s own input docs).
+        if let Some(pairs) = port_ranges {
+            record.port_ranges = pairs;
+        }
+        if let Some(protocol) = input.protocol {
+            record.protocol = protocol;
+        }
+        if let Some(client_affinity) = input.client_affinity {
+            record.client_affinity = client_affinity;
+        }
+
+        Ok(UpdateListenerOutput {
+            listener: Some(record.to_wire()),
+        })
     }
 }

@@ -17,5 +17,7 @@ mod accelerator_lifecycle;
 mod endpoint_groups;
 #[path = "all/input_refusals.rs"]
 mod input_refusals;
+#[path = "all/resource_projection.rs"]
+mod resource_projection;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

@@ -220,15 +220,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let allocated = store.allocate_ipv4();
                 addresses.push(allocated);
             }
+            let set = crate::state::StoredIpSet::new(crate::state::IP_FAMILY_IPV4, addresses);
             match crate::state::ipv4_set_index(&record.ip_sets) {
-                Some(index) => record.ip_sets[index].ip_addresses = addresses,
-                None => record.ip_sets.insert(
-                    0,
-                    crate::state::StoredIpSet {
-                        ip_address_family: crate::state::IP_FAMILY_IPV4.to_string(),
-                        ip_addresses: addresses,
-                    },
-                ),
+                Some(index) => record.ip_sets[index] = set,
+                None => record.ip_sets.insert(0, set),
             }
         }
         if let Some(ip_address_type) = input.ip_address_type {
@@ -249,10 +244,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if dual_stack {
                 if !already_dual_stack {
                     let addresses = vec![store.allocate_ipv6(), store.allocate_ipv6()];
-                    record.ip_sets.push(crate::state::StoredIpSet {
-                        ip_address_family: crate::state::IP_FAMILY_IPV6.to_string(),
-                        ip_addresses: addresses,
-                    });
+                    record.ip_sets.push(crate::state::StoredIpSet::new(
+                        crate::state::IP_FAMILY_IPV6,
+                        addresses,
+                    ));
                 }
                 record.dual_stack_dns_name = Some(crate::state::dual_stack_dns_name(&label));
             } else {

@@ -244,18 +244,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let allocated = store.allocate_ipv4();
             ipv4_addresses.push(allocated);
         }
-        let mut ip_sets = vec![crate::state::StoredIpSet {
-            ip_address_family: crate::state::IP_FAMILY_IPV4.to_string(),
-            ip_addresses: ipv4_addresses,
-        }];
+        let mut ip_sets = vec![crate::state::StoredIpSet::new(
+            crate::state::IP_FAMILY_IPV4,
+            ipv4_addresses,
+        )];
         if dual_stack {
             // A dual-stack accelerator has "four static IP addresses: two IPv4 addresses
             // and two IPv6 addresses" (`Accelerator$DualStackDnsName`).
             let ipv6_addresses = vec![store.allocate_ipv6(), store.allocate_ipv6()];
-            ip_sets.push(crate::state::StoredIpSet {
-                ip_address_family: crate::state::IP_FAMILY_IPV6.to_string(),
-                ip_addresses: ipv6_addresses,
-            });
+            ip_sets.push(crate::state::StoredIpSet::new(
+                crate::state::IP_FAMILY_IPV6,
+                ipv6_addresses,
+            ));
         }
 
         let record = crate::state::StoredAccelerator {

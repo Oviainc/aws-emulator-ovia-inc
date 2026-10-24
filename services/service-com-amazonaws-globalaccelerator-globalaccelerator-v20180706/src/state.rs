@@ -18,8 +18,8 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    Accelerator, EndpointConfiguration, EndpointDescription, EndpointGroup, IpSet, Listener,
-    PortOverride, PortRange, Tag,
+    Accelerator, EndpointConfiguration, EndpointDescription, EndpointGroup, IpAddressDetail, IpSet,
+    Listener, PortOverride, PortRange, Tag,
 };
 
 /// `AcceleratorStatus` values, from the model enum of the same name
@@ -155,29 +155,93 @@ const IPV4_POOL_LEN: u32 = 1 << 17;
 /// prefix. Non-routable, for the same reason as [`IPV4_POOL_BASE`].
 const IPV6_POOL_BASE: u128 = 0x2001_0db8_u128 << 96;
 
+/// One static address of an accelerator, as persisted: the address and the network
+/// zone it sits in.
+///
+/// The two are stored TOGETHER rather than as parallel lists so a write path that
+/// replaces an address cannot leave a zone behind that belongs to another address.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredStaticAddress {
+    /// `IpAddressDetail$IpAddress` — also the entry `IpSet$IpAddresses` carries.
+    pub address: String,
+    /// `IpAddressDetail$NetworkZone`: "The network zone that the specified IP address
+    /// is located on." See [`network_zone`] for where the label comes from.
+    pub network_zone: String,
+}
+
+/// The network zone the `index`-th address of an IP address set sits in.
+///
+/// "A network zone services the static IP addresses for your accelerator from a unique
+/// IP subnet. ... Global Accelerator assigns the static IP addresses for an accelerator
+/// from two network zones" (Global Accelerator Developer Guide, Network zones), so each
+/// of a set's (at most two, per `IpSet$IpAddresses`) addresses sits in its OWN zone: the
+/// zones of one set are distinct, and there is exactly one per allocated address.
+///
+/// The LABEL is environment-specific — AWS's own differ per partition and Region — so
+/// this emulator numbers its zones by the address's position in the set, which keeps the
+/// label short (`NetworkZone` is `@length(0..24)`), stable for the life of the record and
+/// distinct within a set.
+pub fn network_zone(index: usize) -> String {
+    format!("nz{}", index + 1)
+}
+
 /// One of an accelerator's IP address sets, as persisted.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredIpSet {
     /// An `IpAddressFamily` value: [`IP_FAMILY_IPV4`] or [`IP_FAMILY_IPV6`].
     pub ip_address_family: String,
-    /// The addresses in this set; an IP address set holds at most two.
-    pub ip_addresses: Vec<String>,
+    /// The addresses in this set, each with its network zone; an IP address set holds
+    /// at most two (`IpSet$IpAddresses`, `@length(0..2)`).
+    pub addresses: Vec<StoredStaticAddress>,
 }
 
 impl StoredIpSet {
+    /// A set of `addresses` of one family, each placed in its own network zone by
+    /// [`network_zone`].
+    pub fn new(ip_address_family: &str, addresses: Vec<String>) -> Self {
+        Self {
+            ip_address_family: ip_address_family.to_string(),
+            addresses: addresses
+                .into_iter()
+                .enumerate()
+                .map(|(index, address)| StoredStaticAddress {
+                    address,
+                    network_zone: network_zone(index),
+                })
+                .collect(),
+        }
+    }
+
+    /// Just the addresses of this set, in order — the `IpSet$IpAddresses` projection.
+    pub fn ip_addresses(&self) -> Vec<String> {
+        self.addresses
+            .iter()
+            .map(|entry| entry.address.clone())
+            .collect()
+    }
+
     /// This set as the modelled `IpSet`.
     ///
     /// `IpFamily` carries the same value as `IpAddressFamily`: the model marks it
     /// `@deprecated` with "IpFamily has been replaced by IpAddressFamily", i.e.
-    /// it is an alias, not a second datum. `IpAddressDetails` is left unset —
-    /// its `NetworkZone` is a datum this emulator has no rule for, and inventing
-    /// one would be fabrication.
+    /// it is an alias, not a second datum. `IpAddressDetails` is "The array of IP
+    /// addresses in the IP address set, with detailed information about the IP
+    /// addresses", so it carries one entry per address of this set, in the same order
+    /// as `IpAddresses`, each naming that address and the zone it was allocated in.
     fn to_wire(&self) -> IpSet {
         IpSet {
             ip_family: Some(self.ip_address_family.clone()),
-            ip_addresses: Some(self.ip_addresses.clone()),
+            ip_addresses: Some(self.ip_addresses()),
             ip_address_family: Some(self.ip_address_family.clone()),
-            ip_address_details: None,
+            ip_address_details: Some(
+                self.addresses
+                    .iter()
+                    .map(|entry| IpAddressDetail {
+                        ip_address: Some(entry.address.clone()),
+                        network_zone: Some(entry.network_zone.clone()),
+                    })
+                    .collect(),
+            ),
         }
     }
 }
@@ -565,18 +629,36 @@ pub fn dual_stack_dns_name(label: &str) -> String {
     format!("{label}.dualstack.awsglobalaccelerator.com")
 }
 
+/// Hex digits in the id of a listener ARN's final segment, as the service's own ARNs
+/// carry it (`.../accelerator/<uuid>/listener/<8 hex>`).
+pub const LISTENER_ID_HEX_LEN: usize = 8;
+
+/// Hex digits in the id of an endpoint-group ARN's final segment, as the service's own
+/// ARNs carry it (`.../listener/<8 hex>/endpoint-group/<12 hex>`): an endpoint group's
+/// id is WIDER than its listener's, so the two cannot share one width.
+pub const ENDPOINT_GROUP_ID_HEX_LEN: usize = 12;
+
+/// The lowercase-hex id of an ARN's final segment, `digits` wide, taken from a freshly
+/// minted UUID (see
+/// [`ComAmazonawsGlobalacceleratorGlobalacceleratorV20180706State::mint_uuid`]): the
+/// UUID's own 32 hex digits are opaque and unique, so a prefix of them is too.
+fn arn_segment_id(uuid: &str, digits: usize) -> String {
+    uuid.chars().filter(|c| *c != '-').take(digits).collect()
+}
+
 /// Mint a listener ARN under its parent accelerator, the form
 /// `<accelerator arn>/listener/<id>`.
 pub fn mint_listener_arn(accelerator_arn: &str, uuid: &str) -> String {
-    let id: String = uuid.chars().filter(|c| *c != '-').take(8).collect();
+    let id = arn_segment_id(uuid, LISTENER_ID_HEX_LEN);
     format!("{accelerator_arn}/listener/{id}")
 }
 
 /// Mint an endpoint group ARN under its parent listener, the form
 /// `<listener arn>/endpoint-group/<id>` — the shape the service's own ARNs have
-/// (`.../accelerator/<id>/listener/<id>/endpoint-group/<id>`).
+/// (`.../accelerator/<id>/listener/<id>/endpoint-group/<id>`), whose endpoint-group id
+/// is [`ENDPOINT_GROUP_ID_HEX_LEN`] hex digits wide.
 pub fn mint_endpoint_group_arn(listener_arn: &str, uuid: &str) -> String {
-    let id: String = uuid.chars().filter(|c| *c != '-').take(8).collect();
+    let id = arn_segment_id(uuid, ENDPOINT_GROUP_ID_HEX_LEN);
     format!("{listener_arn}/endpoint-group/{id}")
 }
 
