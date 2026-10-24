@@ -7,8 +7,8 @@
 //! service carries one group per grouping attribute definition that gives it a value —
 //! derived from the service's own attributes under one of the definition's source keys,
 //! otherwise the definition's declared default — and none for a definition that gives it no
-//! value. The groups are the same whichever read reports the service, and nothing is grouped
-//! while no configuration is stored.
+//! value. The groups are the same whichever read reports the service and on whichever page
+//! `ListServices` reports it, and nothing is grouped while no configuration is stored.
 //!
 //! Every test drives the real `restJson1` surface through the router that production mounts,
 //! so the routes, the status codes and the JSON bodies are the ones a client sees.
@@ -497,6 +497,143 @@ async fn a_discovered_service_carries_the_groups_the_configuration_gives_it() {
             "case {:?}: two reads of one service reported different groups",
             case.label
         );
+    }
+}
+
+/// `ListServices` reports each discovered service's OWN groups, on whichever page that
+/// service falls: a definition over an attribute every service carries gives each one the
+/// value IT holds, and a definition over an attribute only one of them carries groups only
+/// that one. Paging does not change what a summary carries, and every page names the metrics
+/// of the services on it.
+///
+/// The walk spans the page size — 1, 2, and a size past the number of discovered services,
+/// within the modelled `ListServicesMaxResults` range of 1..100 — over three services whose
+/// identities differ in size (three attributes and the modelled maximum of four), in the
+/// attributes they carry, and in the value they hold under the attribute the first
+/// definition reads.
+#[tokio::test]
+async fn listed_services_carry_their_own_groups_on_every_page() {
+    let router = router();
+    let services = [
+        (
+            "checkout-latency",
+            json!({ "Type": "Service", "Name": "checkout", "Environment": "prod" }),
+            vec![group("Stage", "prod", "OTEL")],
+        ),
+        (
+            "orders-latency",
+            json!({ "Type": "Service", "Name": "orders", "Environment": "staging" }),
+            vec![group("Stage", "staging", "OTEL")],
+        ),
+        (
+            "orders-table-latency",
+            json!({
+                "Type": "AWS::Resource",
+                "ResourceType": "AWS::DynamoDB::Table",
+                "Identifier": "orders-table",
+                "Environment": "prod"
+            }),
+            vec![
+                group("Stage", "prod", "OTEL"),
+                group("Store", "orders-table", "OTEL"),
+            ],
+        ),
+    ];
+
+    for (name, entity, _) in &services {
+        create_slo(&router, name, name, entity).await;
+    }
+    put_grouping(
+        &router,
+        "a grouping over one shared and one service-specific attribute",
+        &json!([
+            {
+                "GroupingName": "Stage",
+                "GroupingSourceKeys": ["Environment"],
+                "DefaultGroupingValue": "Unassigned"
+            },
+            { "GroupingName": "Store", "GroupingSourceKeys": ["Identifier"] }
+        ]),
+    )
+    .await;
+
+    for page_size in [1_usize, 2, 100] {
+        let case = format!("MaxResults={page_size}");
+        let mut walked: Vec<Value> = Vec::new();
+        let mut token: Option<String> = None;
+        for _ in 0..services.len() + 2 {
+            let uri = match token.as_deref() {
+                Some(token) => format!(
+                    "/services?{}&MaxResults={page_size}&NextToken={token}",
+                    window()
+                ),
+                None => format!("/services?{}&MaxResults={page_size}", window()),
+            };
+            let (status, answer) = call(&router, "GET", &uri, None).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected HTTP 200, got {status} with {answer}"
+            );
+            // The page BOUND and the cursor's once-each walk are
+            // `list_services::pages_are_bounded_and_the_cursor_walks_every_service_once`'s
+            // rule; what is asserted here is what each summary CARRIES, on each page.
+            let summaries = answer["ServiceSummaries"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+
+            for summary in &summaries {
+                let (name, _, expected) = services
+                    .iter()
+                    .find(|(_, entity, _)| &summary["KeyAttributes"] == entity)
+                    .unwrap_or_else(|| {
+                        panic!("case {case:?}: unexpected summary {summary}");
+                    });
+                assert_eq!(
+                    reported_groups(summary),
+                    *expected,
+                    "case {case:?}, service {name:?}: expected its own groups {expected:?}, got {:?}",
+                    summary.get("ServiceGroups")
+                );
+                // The issue this suite's rule answers also had every listed service naming
+                // no metric at all, so a page's summaries are asserted to name theirs.
+                let references = summary["MetricReferences"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default();
+                assert!(
+                    !references.is_empty(),
+                    "case {case:?}, service {name:?}: expected the service's metrics, got {:?}",
+                    summary["MetricReferences"]
+                );
+                for reference in &references {
+                    assert!(
+                        ["Namespace", "MetricName", "MetricType"].iter().all(|member| {
+                            reference[*member].as_str().is_some_and(|value| !value.is_empty())
+                        }),
+                        "case {case:?}, service {name:?}: expected a fully named metric, got {reference:?}"
+                    );
+                }
+                walked.push(summary["KeyAttributes"].clone());
+            }
+
+            token = answer["NextToken"].as_str().map(ToString::to_string);
+            if token.is_none() {
+                break;
+            }
+        }
+        assert!(
+            token.is_none(),
+            "case {case:?}: expected the walk to end without a NextToken, got {token:?}"
+        );
+        // Not a vacuous pass: the walk must have reached every service, so every row's
+        // groups were actually asserted.
+        for (name, entity, _) in &services {
+            assert!(
+                walked.iter().any(|walked| walked == entity),
+                "case {case:?}: expected the walk to reach {name:?}, got {walked:?}"
+            );
+        }
     }
 }
 

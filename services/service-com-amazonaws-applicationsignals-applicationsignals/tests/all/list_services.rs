@@ -312,6 +312,10 @@ async fn one_summary_per_discovered_service_round_trips_through_get_service() {
             "case {case:?}: expected the standard metric references, got {:?}",
             summary["MetricReferences"]
         );
+        // `AttributeMaps` is platform and telemetry fact this emulator never receives, and
+        // this store holds no grouping configuration, so no grouping attribute resolves a
+        // value and the service belongs to no group (the `service_groups` suite owns the
+        // rule for a store that DOES hold one).
         assert!(
             summary.get("AttributeMaps").is_none() && summary.get("ServiceGroups").is_none(),
             "case {case:?}: expected no telemetry-derived members and no groups, got {summary:?}"
