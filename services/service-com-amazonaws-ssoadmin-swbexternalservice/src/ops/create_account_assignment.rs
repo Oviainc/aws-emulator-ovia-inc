@@ -5,11 +5,24 @@
 //! the assignment and the status record of the operation that created it. This is the
 //! ONLY file to touch for this operation.
 //!
-//! The emulator applies the assignment in full before answering, so the status it
-//! reports is the terminal `SUCCEEDED` rather than a pending one: there is no work left
-//! outstanding for a later poll to finish. `RequestId` is a freshly minted UUID and the
-//! status record is stored under it, so `DescribeAccountAssignmentCreationStatus` and
-//! `ListAccountAssignmentCreationStatus` have a real record to read.
+//! Creating an account assignment is ASYNCHRONOUS: this call ACCEPTS the work and
+//! answers with the tracking record of the operation it started — the non-terminal
+//! `IN_PROGRESS` status, the `RequestId` to poll it by and the date it was accepted —
+//! which is what the operation's own documentation asks of a caller ("After a successful
+//! response, call DescribeAccountAssignmentCreationStatus to describe the status of an
+//! assignment creation request"). The operation reaches the terminal `SUCCEEDED` one
+//! `crate::state::ASSIGNMENT_OPERATION_SPAN` later, as a stored due instant the status is
+//! derived from, so nothing sleeps and a poller sees the transition. `RequestId` is a
+//! freshly minted UUID and the status record is stored under it, so
+//! `DescribeAccountAssignmentCreationStatus` and `ListAccountAssignmentCreationStatus`
+//! have a real record to read.
+//!
+//! The ASSIGNMENT itself is stored by this call, before the operation's completion is
+//! due, so `ListAccountAssignments` reports the grant straight away: the assignment is a
+//! record of IAM Identity Center, and what the operation tracks is the provisioning the
+//! doc describes ("the specified permission set will automatically be provisioned to the
+//! account in the form of an IAM policy"), which `ListAccountAssignments` does not
+//! report. Both are written together, so neither store can hold half a create.
 //!
 //! ## Shape of an operation
 //!
@@ -191,11 +204,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
         let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // What the CLOCK already owes every instance, plus the account's ambient instance
         // if nothing has enabled one yet, so this create resolves the same instance a read
         // at this instant would resolve.
-        store.on_request(&region, ::std::time::SystemTime::now());
+        store.on_request(&region, now);
 
         // The ACCOUNT-INSTANCE restriction, asked BEFORE any resource lookup: permission
         // sets are a feature of an organization instance, so on an account instance no
@@ -244,7 +258,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let created_date = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+        let created_date = ::aws_smithy_types::DateTime::from(now);
         // (instance, account, permission set, principal type, principal id) is the
         // assignment's identity, so re-creating one that already exists grants nothing
         // further: it must not add a second assignment row AND must not write a second
@@ -270,7 +284,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         },
                     )
                 })?
-                .to_shape();
+                .to_tracking_shape(now);
             return Ok(CreateAccountAssignmentOutput {
                 account_assignment_creation_status: Some(status),
             });
@@ -308,7 +322,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store
             .account_assignments
             .push(crate::state::AccountAssignmentRecord {
-                instance_arn: input.instance_arn,
+                instance_arn: input.instance_arn.clone(),
                 account_id: input.target_id.clone(),
                 target_type: input.target_type.clone(),
                 permission_set_arn: input.permission_set_arn.clone(),
@@ -321,8 +335,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             request_id.clone(),
             crate::state::AssignmentOperationRecord {
                 request_id: request_id.clone(),
-                status: crate::state::STATUS_SUCCEEDED.to_string(),
-                // Nothing failed: the assignment is in effect by the time this returns.
+                instance_arn: input.instance_arn,
+                // Nothing fails an assignment operation here, so the status walks
+                // `IN_PROGRESS` to `SUCCEEDED` and never carries a failure message.
                 failure_reason: None,
                 target_id: input.target_id,
                 target_type: input.target_type,
@@ -330,6 +345,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 principal_type: input.principal_type,
                 principal_id: input.principal_id,
                 created_date,
+                // The operation is accepted NOW and completes one span from now; the
+                // status is derived from this instant, so no later call has to write to
+                // move it on.
+                succeeded_due: now + crate::state::ASSIGNMENT_OPERATION_SPAN,
             },
         );
         // Answer from the STORED status record, so a later read of it by `RequestId`
@@ -347,7 +366,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })?;
         Ok(CreateAccountAssignmentOutput {
-            account_assignment_creation_status: Some(stored.to_shape()),
+            account_assignment_creation_status: Some(stored.to_tracking_shape(now)),
         })
     }
 }
