@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GenerateQuery
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GenerateQuery`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Answers a natural-language prompt against one CloudTrail Lake event data store.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GenerateQuery::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reporting only, and it writes nothing: it resolves the single event data store the
+//! request names against the shared registry (`crate::state`) and refuses the request
+//! the way the model declares when that identifier cannot be read as an event data store
+//! ARN or id (`EventDataStoreARNInvalidException`), names no stored store
+//! (`EventDataStoreNotFoundException`), or names one that cannot serve queries
+//! (`InactiveEventDataStoreException`).
+//!
+//! The generative step itself does NOT run here. The model documents this operation as
+//! using "generative artificial intelligence (generative AI)" — "generative AI large
+//! language models (LLMs)" — to turn an English prompt into a SQL query statement. This
+//! emulator runs no language model, and a statement assembled by matching on the
+//! prompt's text would be a fabrication rather than a generated query. So a request
+//! that names a store this emulator holds is answered with the modelled
+//! `GenerateResponseException`, which the model documents as "thrown when a valid query
+//! could not be generated for the provided prompt" — exactly this outcome — rather than
+//! with a synthesised statement.
 //!
 //! ## Shape of an operation
 //!
@@ -111,7 +120,7 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-cloudtrail-cloudtrail-2
 
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `GenerateQueryError` alias below. An operation that models no errors
+// here — hence the `GenerateQueryError` channel below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
 #[smithy_macros::operation_error("com.amazonaws.cloudtrail#GenerateQuery")]
@@ -129,13 +138,15 @@ pub enum GenerateQueryErrorModeled {
 
 /// This operation's error channel, as the generated `impl Operation` names it
 /// (`crate::ops::generate_query::GenerateQueryError`). Wrapping the modeled enum is what
-/// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
+/// lets a scaffolded operation answer 501 for one whose model declares no errors at all,
+/// and what lets an implemented one answer a modelled failure with the status the real
+/// service returns (`Scaffolded::modeled_with_status`) or refuse a bad request the model
+/// declares no error for.
 pub type GenerateQueryError = crate::scaffolded::Scaffolded<GenerateQueryErrorModeled>;
 
 /// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
 /// implemented handler writes `Err(SomeModeledError.into())` rather than naming the
-/// wrapper variant. See `crate::scaffolded` for how to drop the wrapper entirely once
-/// this operation is implemented.
+/// wrapper variant.
 impl From<GenerateQueryErrorModeled> for GenerateQueryError {
     fn from(modeled: GenerateQueryErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
@@ -178,18 +189,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GenerateQuery` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GenerateQueryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GenerateQuery"))
+        let region = crate::state::request_region(ctx.parts());
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GenerateQueryErrorModeled::UnsupportedOperationException(
+                UnsupportedOperationException {
+                    message: Some(
+                        "GenerateQuery needs the CloudTrail event data store registry, \
+                         which this engine does not carry"
+                            .to_string(),
+                    ),
+                },
+            )
+        })?;
+        let guard = state.lock();
+
+        // `EventDataStores` is modelled `len 1..1` ("You can only specify one event data
+        // store"), so the boundary validator has already refused any other count and the
+        // one element is the store this prompt is asked against.
+        let identifier = input.event_data_stores.first().ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(
+                "EventDataStores must carry exactly one event data store ARN or id",
+            )
+        })?;
+
+        // An unreadable identifier is refused as a malformed ARN; a readable one naming
+        // no store in the Region it addresses is not found. Both rules, and the text they
+        // are refused with, are the registry's, so every event data store operation
+        // answers them the same way.
+        let record = guard
+            .event_data_store(identifier, &region)
+            .map_err(|rejection| match rejection {
+                // The one way an identifier can be unreadable: it is neither an event
+                // data store ARN nor the bare id suffix of one. Matching the variant
+                // rather than mapping every rejection keeps a future rejection kind a
+                // compile error instead of a mis-coded refusal.
+                crate::state::EventDataStoreRejection::InvalidArn(_) => {
+                    GenerateQueryErrorModeled::EventDataStoreARNInvalidException(
+                        EventDataStoreARNInvalidException {
+                            message: Some(rejection.message(&region)),
+                        },
+                    )
+                }
+            })?
+            .ok_or_else(event_data_store_not_found)?;
+
+        if !record.status.is_queryable() {
+            return Err(GenerateQueryErrorModeled::InactiveEventDataStoreException(
+                InactiveEventDataStoreException {
+                    message: Some(format!(
+                        "The event data store {} is {} and cannot be queried.",
+                        record.arn(),
+                        record.status.as_wire(),
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The store is there and can be queried, so all that is left is the generative
+        // step — which nothing in this process can perform. See the module docs: this is
+        // the modelled outcome for a prompt no query could be generated for, and it is
+        // why no `QueryStatement` is returned.
+        Err(
+            GenerateQueryErrorModeled::GenerateResponseException(GenerateResponseException {
+                message: Some(format!(
+                    "No query could be generated for the prompt against event data store \
+                     {}: this emulator runs no generative model, so it cannot turn a \
+                     natural language prompt into a query statement.",
+                    record.arn(),
+                )),
+            })
+            .into(),
+        )
     }
 }
+
+/// Refuse the request because no event data store resolved.
+///
+/// The model annotates `EventDataStoreNotFoundException` `@httpError(404)`, but
+/// CloudTrail answers 400 for it on the wire: the recorded response for this very
+/// operation is `HTTP 400` with `__type` `EventDataStoreNotFoundException` and `Message`
+/// "The event data store was not found.". The error CODE and the text are the model's and
+/// the service's; only the status is stated here, the way `DescribeQuery` states it.
+fn event_data_store_not_found() -> GenerateQueryError {
+    crate::scaffolded::Scaffolded::modeled_with_status(
+        GenerateQueryErrorModeled::EventDataStoreNotFoundException(
+            EventDataStoreNotFoundException {
+                message: Some(crate::state::EVENT_DATA_STORE_NOT_FOUND_MESSAGE.to_string()),
+            },
+        ),
+        NOT_FOUND_STATUS,
+    )
+}
+
+/// See [`event_data_store_not_found`]: the status this service answers a not-found
+/// refusal with.
+const NOT_FOUND_STATUS: u16 = 400;
+
+
