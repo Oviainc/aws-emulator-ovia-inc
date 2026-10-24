@@ -19,6 +19,8 @@ mod attachment_lifecycle;
 mod connection_lifecycle;
 #[path = "all/core_network_lifecycle.rs"]
 mod core_network_lifecycle;
+#[path = "all/core_network_policy_versions.rs"]
+mod core_network_policy_versions;
 #[path = "all/delete_dependency_refusal.rs"]
 mod delete_dependency_refusal;
 #[path = "all/device_lifecycle.rs"]

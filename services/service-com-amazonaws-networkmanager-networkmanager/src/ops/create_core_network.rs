@@ -217,7 +217,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             {
                 let same_request = existing.global_network_id == input.global_network_id
                     && existing.description == input.description
-                    && existing.policy_document == input.policy_document
+                    && existing.created_policy_document() == input.policy_document.as_deref()
                     && crate::state::same_tags(
                         &existing.tags,
                         input.tags.as_deref().unwrap_or_default(),
@@ -263,7 +263,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let id = store.next_id(crate::state::CORE_NETWORK_KIND);
-        let record = crate::state::CoreNetworkRecord {
+        let mut record = crate::state::CoreNetworkRecord {
             arn: crate::state::ComAmazonawsNetworkmanagerNetworkmanagerState::resource_arn(
                 crate::state::CORE_NETWORK_KIND,
                 &id,
@@ -273,11 +273,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             description: input.description,
             created_at: now,
             available_at: now + crate::state::SETTLE_DELAY,
-            policy_document: input.policy_document,
+            policy_versions: ::std::collections::BTreeMap::new(),
+            live_policy_version: None,
+            policy_version_counter: 0,
             topology: topology.unwrap_or_default(),
             client_token: input.client_token.filter(|token| !token.is_empty()),
             tags: input.tags.unwrap_or_default(),
         };
+        // The document a create carries becomes the core network's FIRST policy version,
+        // and the create executes its change set itself — that is what makes the topology
+        // above the one in force — so the version is stored as executed and is this core
+        // network's LIVE policy. A core network created without a document holds no
+        // version at all until a `PutCoreNetworkPolicy` mints one. This operation reports
+        // the CORE NETWORK, so the version's own shape is not part of its answer.
+        if let Some(document) = input.policy_document {
+            record.add_policy_version(document, None, None, now, true);
+        }
         // A core network is `CREATING` until the settle span the clock owes elapses, so the
         // response reports the state the stored record is in now.
         let core_network = record.to_shape(now);
