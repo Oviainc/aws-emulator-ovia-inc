@@ -50,7 +50,7 @@ use sha2::{Digest, Sha256};
 use crate::ops::types::{
     AcceptedTerm, Acceptor, AgreementCancellationRequestSummary, AgreementEntitlement,
     AgreementViewSummary, BatchCreateBillingAdjustmentRequestEntry, BillingAdjustmentSummary,
-    ByolPricingTerm, ChargeSummary, ConfigurableUpfrontPricingTerm, ConflictException,
+    ByolPricingTerm, Charge, ChargeSummary, ConfigurableUpfrontPricingTerm, ConflictException,
     DescribeAgreementOutput, EndTimeBehavior, Entitlement, EstimatedCharges, ExpectedCharge,
     Filter, FixedUpfrontPricingTerm, FreeTrialPricingTerm, GetBillingAdjustmentRequestOutput,
     InternalServerException, ItemizedCharge, LegalTerm, NetPaymentTerm, PaymentRequestSummary,
@@ -332,6 +332,18 @@ pub const TIMING_ON_ACCEPTANCE: &str = "ON_ACCEPTANCE";
 pub const TIMING_BILLING_PERIOD: &str = "BILLING_PERIOD";
 /// See [`TIMING_ON_ACCEPTANCE`].
 pub const TIMING_SCHEDULED: &str = "SCHEDULED";
+
+/// The revision every charge this store holds reports as `Charge$revision`.
+///
+/// `ChargeRevision` is modelled `@range(min: 1)`
+/// (`smithy_query(query="shape", shape="ChargeRevision")`), so a charge's first
+/// revision is 1. A charge is minted once — by the quote whose requested terms
+/// imply it ([`ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State::charge_summary`])
+/// — and no operation of this service revises one: what changes afterwards is
+/// the purchase-order association recorded ON the charge, which is a member of
+/// the charge's report rather than a new revision of the charge. So every charge
+/// this store holds is at its first revision.
+pub const INITIAL_CHARGE_REVISION: i64 = 1;
 
 /// Every term kind `AcceptedTerm` models, spelled as the term's own `type`
 /// member spells it (`GetAgreementTerms` documents "`TermType` – The type of
@@ -1607,6 +1619,25 @@ pub fn payment_request_scope(
     )
 }
 
+/// The scope a `ListAgreementCharges` page token belongs to: every parameter
+/// that selects which charges the list reports, so a token minted for one list
+/// cannot resume another.
+///
+/// Built from [`query_scope`] like every other scope in this module, so no value
+/// a caller supplies can imitate the delimiters and make two different listings
+/// hash alike.
+pub fn charge_scope(
+    agreement_id: Option<&str>,
+    agreement_type: Option<&str>,
+    catalog: Option<&str>,
+) -> String {
+    query_scope(&[
+        agreement_id.unwrap_or_default(),
+        agreement_type.unwrap_or_default(),
+        catalog.unwrap_or_default(),
+    ])
+}
+
 // ---------------------------------------------------------------------------
 // Purchase orders
 // ---------------------------------------------------------------------------
@@ -1644,7 +1675,7 @@ pub struct PurchaseOrderRefusal {
 /// [`filter_member_path`] is, so a path this service builds for a rule the model
 /// cannot express reads like one the boundary validator builds for a modelled
 /// constraint.
-fn purchase_order_member_path(index: usize, member: &str) -> String {
+pub fn purchase_order_member_path(index: usize, member: &str) -> String {
     use ::aws_smithy_schema_server::constraints::path;
     path::join(&[
         path::member(PURCHASE_ORDERS_MEMBER),
@@ -2344,6 +2375,83 @@ impl ComAmazonawsMarketplaceagreementAwsmpcommerceserviceV20200301State {
                 request.updated_at = request.completes_at;
             }
         }
+    }
+
+    /// The ids of the charges `agreement` holds.
+    ///
+    /// A charge belongs to the agreement whose quote minted it: the charges of
+    /// an agreement are the `ChargeSummary$expectedCharges` of the agreement
+    /// request it was accepted from ([`expected_charge_ids`]), which is the one
+    /// copy of them this store keeps — nothing re-derives a charge id, so a
+    /// charge cannot be reported under two identities.
+    pub fn charge_ids_of<'a>(&'a self, agreement: &Agreement) -> BTreeSet<&'a str> {
+        self.agreement_requests
+            .get(&agreement.agreement_request_id)
+            .map(|request| expected_charge_ids(&request.charge_summary))
+            .unwrap_or_default()
+    }
+
+    /// Every charge this store holds, mapped to the id of the agreement holding
+    /// it.
+    ///
+    /// Charge ids are minted from the store's single counter
+    /// ([`Self::mint_charge_id`]), so no charge belongs to two agreements and
+    /// this map IS the resolution of a `chargeId` a request names to the
+    /// agreement whose charge it is — what `UpdatePurchaseOrders` needs, since
+    /// its input names charges without naming an agreement.
+    pub fn charge_owners(&self) -> BTreeMap<String, String> {
+        let mut owners: BTreeMap<String, String> = BTreeMap::new();
+        for agreement in self.agreements.values() {
+            for charge_id in self.charge_ids_of(agreement) {
+                owners.insert(charge_id.to_string(), agreement.id.clone());
+            }
+        }
+        owners
+    }
+
+    /// The charges of `agreement`, in the order its quote minted them, as
+    /// `ListAgreementCharges` reports them.
+    ///
+    /// Every member is read from the one copy of the resource it belongs to:
+    /// the charge's identity and timing from the quote's own `ExpectedCharge`,
+    /// the agreement's id and type from the agreement, and the purchase order
+    /// reference from the association recorded on that agreement's charge —
+    /// absent while the charge carries none, which is what "The purchase order
+    /// reference associated with the charge, if any" states.
+    pub fn charges_of(&self, agreement: &Agreement) -> Vec<Charge> {
+        let Some(request) = self.agreement_requests.get(&agreement.agreement_request_id) else {
+            return Vec::new();
+        };
+        request
+            .charge_summary
+            .expected_charges
+            .iter()
+            .flatten()
+            .filter_map(|expected| {
+                let id = expected.id.as_deref()?;
+                Some(Charge {
+                    id: Some(id.to_string()),
+                    revision: Some(INITIAL_CHARGE_REVISION),
+                    agreement_id: Some(agreement.id.clone()),
+                    agreement_type: Some(agreement.agreement_type.clone()),
+                    purchase_order_reference: agreement
+                        .purchase_orders
+                        .iter()
+                        .find(|order| order.charge_id == id)
+                        .and_then(|order| order.purchase_order_reference.clone()),
+                    // The amount and the currency it is priced in come from the
+                    // proposal's rate card, which this emulator does not hold
+                    // (see the module docs), so both are read from the quote's
+                    // own charge rather than invented — and the quote carries
+                    // neither.
+                    currency_code: request.charge_summary.currency_code.clone(),
+                    amount: expected.amount.clone(),
+                    // "available only when the charge date is known", which is
+                    // exactly when the quote's expected charge carries one.
+                    time: expected.time,
+                })
+            })
+            .collect()
     }
 
     /// Mint a charge id for an expected charge of a quote. `ExpectedCharge$id`

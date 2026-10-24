@@ -50,7 +50,11 @@ const UNCHARGED_TERM: &str = "eula.v1";
 
 /// Create a quote whose requested terms imply `charges` charges, answering its
 /// `agreementRequestId` and the charge ids it minted.
-async fn quote(
+///
+/// `pub(crate)` because `purchase_order_updates` builds the agreements it
+/// updates purchase orders on from the same quotes rather than a second
+/// harness.
+pub(crate) async fn quote(
     router: &MultiServiceRouter,
     proposal: &str,
     charges: usize,
@@ -82,7 +86,7 @@ async fn quote(
 }
 
 /// One purchase order naming `charge_id` and carrying `reference`.
-fn order(charge_id: &str, reference: &str) -> Value {
+pub(crate) fn order(charge_id: &str, reference: &str) -> Value {
     json!({"chargeId": charge_id, "purchaseOrderReference": reference})
 }
 

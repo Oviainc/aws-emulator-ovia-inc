@@ -25,6 +25,8 @@ mod error_bodies;
 mod payment_requests;
 #[path = "all/purchase_order_associations.rs"]
 mod purchase_order_associations;
+#[path = "all/purchase_order_updates.rs"]
+mod purchase_order_updates;
 #[path = "all/refusal_wording.rs"]
 mod refusal_wording;
 #[path = "all/state_roundtrip.rs"]
