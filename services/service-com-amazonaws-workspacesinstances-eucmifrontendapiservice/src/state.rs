@@ -1372,6 +1372,21 @@ impl WorkspaceInstanceRecord {
         self.provision_state = PROVISION_STATE_DEALLOCATING.to_string();
     }
 
+    /// The Availability Zone this instance was placed in, when its create call named
+    /// one — `ManagedInstance.Placement.AvailabilityZone`.
+    ///
+    /// `None` where the create call named no zone (no `Placement` at all, the member
+    /// left out, or an empty string, which names no zone): the placement was left to
+    /// the service, and this emulator reports no zone for such an instance, so nothing
+    /// may be decided from a zone it does not know.
+    pub fn placement_availability_zone(&self) -> Option<&str> {
+        self.managed_instance
+            .placement
+            .as_ref()
+            .and_then(|placement| placement.availability_zone.as_deref())
+            .filter(|zone| !zone.is_empty())
+    }
+
     /// Whether a delete has been accepted for this instance, so it is tearing down or
     /// torn down and no longer one of the account's running instances.
     pub fn is_tearing_down(&self) -> bool {
@@ -2091,6 +2106,47 @@ pub const VOLUME_DEVICE_MISMATCH_MESSAGE: &str =
 /// accepted for, which is tearing down and taking its attachments with it.
 pub const INSTANCE_TEARING_DOWN_MESSAGE: &str =
     "workspace instance is being deallocated, so no volume can be attached to it";
+
+/// The `Message` for an attach whose volume sits in a different Availability Zone
+/// from the WorkSpace Instance it would be attached to.
+///
+/// From the backing Amazon EBS `AttachVolume` reference: "The volume and the instance
+/// must be in the same Availability Zone" — an attach of a volume elsewhere is refused
+/// there as `InvalidVolume.ZoneMismatch`. The wording names the member and the
+/// constraint, never what the caller sent, like every other refusal this service
+/// builds through [`field_validation_failed`].
+pub const VOLUME_ZONE_MISMATCH_MESSAGE: &str =
+    "VolumeId must name a volume in the same Availability Zone as the workspace instance";
+
+/// The input member a zone mismatch is reported against: the volume is what the call
+/// attaches, and its zone is the one that has to match the instance's placement.
+pub const VOLUME_ID_MEMBER: &str = "VolumeId";
+
+/// Whether a volume in `volume_zone` may be attached to a WorkSpace Instance placed in
+/// `instance_zone`.
+///
+/// A block volume and the instance it is attached to live in ONE Availability Zone, so
+/// the zones have to be the same one. `instance_zone` is `None` for an instance whose
+/// create call named no zone ([`WorkspaceInstanceRecord::placement_availability_zone`]):
+/// the service placed it, this emulator reports no zone for it, and a placement nobody
+/// can observe decides nothing — such an instance takes a volume from any zone of its
+/// Region.
+pub fn zones_allow_attachment(instance_zone: Option<&str>, volume_zone: &str) -> bool {
+    instance_zone.is_none_or(|zone| zone == volume_zone)
+}
+
+/// The modelled `ValidationException` (HTTP 400) for an attach across Availability
+/// Zones — the one place that refusal is built, so every attach path refuses it alike.
+///
+/// A 400 rather than the modelled `ConflictException`: the zone of a volume and the
+/// placement of an instance are both fixed when the resource is created and no later
+/// call can change either, so this attach is not a state another call clears but a
+/// pair of ids that can never be attached to one another — which is how the backing
+/// Amazon EBS volume service answers it too (a client `InvalidVolume.*` error, not the
+/// `VolumeInUse` it answers for a state).
+pub fn volume_zone_mismatch() -> ValidationException {
+    field_validation_failed(VOLUME_ID_MEMBER, VOLUME_ZONE_MISMATCH_MESSAGE)
+}
 
 /// The `Message` for a delete of a volume that is still attached.
 ///
