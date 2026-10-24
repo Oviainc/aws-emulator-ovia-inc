@@ -562,7 +562,9 @@ async fn a_request_within_every_modelled_constraint_reaches_the_operation() {
             "POST",
             "/list-pricing-plans-associated-with-pricing-rule",
             json!({ "PricingRuleArn": VALID_RULE_ARN, "MaxResults": 100 }),
-            501,
+            // Implemented: no pricing rule answers to this ARN, so the operation's own
+            // `ResourceNotFoundException` is what comes back.
+            404,
         ),
     ];
     for (case, method, path, body, expected) in &reaches_the_operation {

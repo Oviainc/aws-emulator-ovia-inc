@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListOrganizationInsights
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListOrganizationInsights`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the insights DevOps Guru's analysis produced for the member accounts of an
+//! organization: selected by the ONE status filter the request names, narrowed to the
+//! member accounts its `AccountIds` / `OrganizationalUnitIds` filters leave in scope, and
+//! available only to the account that administers DevOps Guru for that organization. A
+//! pure read: it never writes to the store.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListOrganizationInsights::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The account-scoped `ListInsights` selects over the same `insights` map with the same
+//! `ListInsightsStatusFilter`, so the selector, the account scope and the record-to-wire
+//! conversion all live in [`crate::state`] and the two listings cannot disagree about one
+//! store.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +165,134 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListOrganizationInsights` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListOrganizationInsightsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListOrganizationInsights"))
+        // This listing is computed from the store alone: no request metadata beyond the
+        // deserialized input takes part, so the context is unused.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListOrganizationInsightsError::Modeled(
+                ListOrganizationInsightsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the DevOps Guru insight store is unavailable".to_string(),
+                        retry_after_seconds: 0,
+                    },
+                ),
+            )
+        })?;
+
+        // The same `ListInsightsStatusFilter` the account-scoped listing takes, resolved
+        // by the shared selector; only the error channel it is reported on is this
+        // operation's.
+        let selector = crate::state::InsightStatusSelector::of(&input.status_filter).map_err(
+            |rejection| -> ListOrganizationInsightsError {
+                ListOrganizationInsightsErrorModeled::ValidationException(
+                    rejection.validation_exception(),
+                )
+                .into()
+            },
+        )?;
+        let scope = crate::state::OrganizationAccountScope::of(
+            &input.account_ids,
+            &input.organizational_unit_ids,
+        );
+        // `ListInsightsMaxResults` is modelled range 1..100, which the boundary validator
+        // already enforces; the clamp keeps one page bounded if the model ever widens.
+        let page_size = input
+            .max_results
+            .map_or(crate::state::PAGE_SIZE, |requested| {
+                (requested as usize).clamp(1, crate::state::PAGE_SIZE)
+            });
+
+        // The caller: the one account this emulator serves. An organization-wide view
+        // belongs to the account that administers DevOps Guru for the organization, so a
+        // caller that administers none is refused — decided BEFORE any lookup, so the
+        // refusal reports nothing about what the organization holds.
+        let caller = crate::state::requested_account_id(None);
+
+        let guard = state.lock();
+        if !guard.administers_organization(&caller) {
+            return Err(
+                ListOrganizationInsightsErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: format!(
+                            "Access denied when listing organization-wide insights: account \
+                             {caller} does not administer DevOps Guru for an organization"
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The member accounts of the organization this store records: the ONE account
+        // this emulator serves, which belongs to no organizational unit (see
+        // `OrganizationAccountScope::holds_served_member`) — so an
+        // `OrganizationalUnitIds` filter leaves no account in scope, and a reported
+        // summary omits the optional `OrganizationalUnitId` rather than inventing one.
+        let member_organizational_unit_id: Option<&str> = None;
+
+        // Select, then page: only the member accounts the filters leave in scope
+        // contribute, because an out-of-scope member's insights are not what was asked
+        // for.
+        let matching: Vec<&crate::state::InsightRecord> = if scope.holds_served_member(&caller) {
+            guard
+                .insights
+                .values()
+                .filter(|insight| selector.matches(insight))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // A token names an offset into the insights THIS selector and THIS account scope
+        // select, so it is scoped to both: a token from another selector, another filter,
+        // or the account-scoped `ListInsights` walk does not resolve.
+        let page_scope = format!(
+            "ListOrganizationInsights/{}/{}",
+            selector.page_scope(),
+            scope.page_fragment()
+        );
+        let (page, next_token) = crate::state::page_sized(
+            &matching,
+            &page_scope,
+            input.next_token.as_deref(),
+            page_size,
+        )
+        .ok_or_else(|| -> ListOrganizationInsightsError {
+            ListOrganizationInsightsErrorModeled::ValidationException(
+                crate::state::FilterRejection::stale_cursor(
+                    "ListOrganizationInsights",
+                    "the organization insights this status filter selects",
+                    "StatusFilter, AccountIds and OrganizationalUnitIds",
+                )
+                .validation_exception(),
+            )
+            .into()
+        })?;
+
+        // An insight is reported in the list for ITS OWN type, so the page is partitioned
+        // rather than placed wholesale in one list. Each summary is stamped with the
+        // member account whose store holds the insight.
+        let proactive_insights: Vec<ProactiveOrganizationInsightSummary> = page
+            .iter()
+            .filter(|insight| insight.is_proactive())
+            .map(|insight| {
+                insight.to_proactive_organization_summary(&caller, member_organizational_unit_id)
+            })
+            .collect();
+        let reactive_insights: Vec<ReactiveOrganizationInsightSummary> = page
+            .iter()
+            .filter(|insight| insight.is_reactive())
+            .map(|insight| {
+                insight.to_reactive_organization_summary(&caller, member_organizational_unit_id)
+            })
+            .collect();
+
+        // An organization whose analysis produced no matching insight is not an error:
+        // both lists are simply empty.
+        Ok(ListOrganizationInsightsOutput {
+            proactive_insights: Some(proactive_insights),
+            reactive_insights: Some(reactive_insights),
+            next_token,
+        })
     }
 }
