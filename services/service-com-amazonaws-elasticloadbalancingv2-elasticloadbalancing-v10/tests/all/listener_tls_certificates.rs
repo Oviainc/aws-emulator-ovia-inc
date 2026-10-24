@@ -324,6 +324,9 @@ async fn every_bound_action_dispatches_at_the_models_api_version() {
     let mut listeners_of = action("DescribeListeners");
     listeners_of.push(p("LoadBalancerArn", &lb_arn));
 
+    let mut load_balancer_attributes = action("DescribeLoadBalancerAttributes");
+    load_balancer_attributes.push(p("LoadBalancerArn", &lb_arn));
+
     let bound: Vec<DispatchCase> = vec![
         ("CreateListener", listener, 200),
         ("DescribeLoadBalancers", action("DescribeLoadBalancers"), 200),
@@ -341,7 +344,15 @@ async fn every_bound_action_dispatches_at_the_models_api_version() {
         // DISPATCHED answer — the request reached the operation — and is what a stub
         // must answer until its own issue implements it. What it must never be is
         // `InvalidAction`, which would tell the caller this API has no such action.
-        ("DescribeRules", action("DescribeRules"), 501),
+        (
+            "DescribeLoadBalancerAttributes",
+            load_balancer_attributes,
+            501,
+        ),
+        // Implemented, and answering with its OWN refusal: `DescribeRules` is
+        // documented "You must specify either a listener or rules", so a request
+        // naming neither is that operation's 400 rather than a routing failure.
+        ("DescribeRules", action("DescribeRules"), 400),
     ];
 
     for (case, form, expected_status) in bound {

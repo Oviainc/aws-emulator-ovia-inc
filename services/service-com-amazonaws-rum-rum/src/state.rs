@@ -11,6 +11,13 @@
 //! documented defaults, the record -> wire-shape projections and the error builders) live
 //! here for the same reason: every operation file shares them, and a second copy of any
 //! of them would let two operations disagree about one resource.
+//!
+//! The metrics side of a monitor hangs off that same record: the extended-metrics
+//! destinations `PutRumMetricsDestination` creates, and under each of them the metric
+//! definitions `BatchCreateRumMetricDefinitions` creates,
+//! `BatchGetRumMetricDefinitions` reports and `UpdateRumMetricDefinition` replaces. Both
+//! are keyed through the one [`metric_destination_key`], so no two of those operations can
+//! disagree about which destination a request names.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -19,7 +26,8 @@ use crate::ops::types::{
     AccessDeniedException, AppMonitor, AppMonitorConfiguration, AppMonitorDetails,
     AppMonitorSummary, ConflictException, CustomEvents, CwLog, DataStorage,
     DeobfuscationConfiguration, InvalidPolicyRevisionIdException, JavaScriptSourceMaps,
-    MetricDestinationSummary, PolicyNotFoundException, ResourceNotFoundException,
+    MetricDefinition, MetricDefinitionRequest, MetricDestinationSummary,
+    PolicyNotFoundException, ResourceNotFoundException, ServiceQuotaExceededException,
     METRIC_DESTINATION_VALUES,
 };
 
@@ -147,6 +155,34 @@ pub const EVIDENTLY_DESTINATION: &str = "Evidently";
 /// refusal past it is the `ValidationException` it does model.
 pub const MAX_METRIC_DESTINATIONS_PER_APP_MONITOR: usize = 100;
 
+/// The most metric definitions one extended-metrics destination holds.
+///
+/// AWS's OWN documented limit, not a bound this emulator chose: the model's
+/// `BatchCreateRumMetricDefinitions` documents "The maximum number of metric definitions
+/// that one destination can contain is 2000." A definition that would take a destination
+/// past it is refused with the `ServiceQuotaExceededException` (HTTP 402) that operation
+/// models.
+pub const MAX_METRIC_DEFINITIONS_PER_DESTINATION: usize = 2000;
+
+/// The most metric definitions one `BatchCreateRumMetricDefinitions` call may name.
+///
+/// Also AWS's own: "The maximum number of metric definitions that you can specify in one
+/// BatchCreateRumMetricDefinitions operation is 200." `MetricDefinitionsRequest` carries
+/// no modelled length, so the handler is what refuses a longer list.
+pub const MAX_METRIC_DEFINITIONS_PER_BATCH: usize = 200;
+
+/// The namespace RUM publishes EXTENDED metrics to.
+///
+/// From the model (`MetricDefinitionRequest`): "For extended metrics that are sent to the
+/// `AWS/RUM` namespace … The `Namespace` parameter must be omitted or set to `AWS/RUM`."
+pub const EXTENDED_METRICS_NAMESPACE: &str = "AWS/RUM";
+
+/// The metric-namespace prefix AWS reserves for its own metrics.
+///
+/// From the model (`MetricDefinitionRequest$Namespace`): "You cannot use any string that
+/// starts with `AWS/` for your namespace."
+pub const RESERVED_NAMESPACE_PREFIX: &str = "AWS/";
+
 /// The most bytes a resource-policy document may carry.
 ///
 /// From the model: `PutResourcePolicy` documents "The maximum size of the policy is 4
@@ -273,6 +309,78 @@ impl MetricDestinationRecord {
     }
 }
 
+/// One persisted metric definition of an app monitor's extended-metrics destination.
+///
+/// Mirrors the model's `MetricDefinition` — the only shape any operation reports a
+/// definition through — with the two members the service always knows held non-optional:
+/// a stored definition always has the `MetricDefinitionId` the service minted for it and
+/// the `Name` the request named (both `@required` there). The rest is kept exactly as the
+/// request carried it, including a member the destination kind ignores, so what a read
+/// reports is the definition that was written.
+#[derive(Debug, Clone)]
+pub struct MetricDefinitionRecord {
+    /// The minted `MetricDefinitionId`, the identity `UpdateRumMetricDefinition` and
+    /// `BatchDeleteRumMetricDefinitions` address one definition by.
+    pub metric_definition_id: String,
+    /// `Name`: the metric's name, an extended metric's from RUM's catalog or any name at
+    /// all for a custom metric.
+    pub name: String,
+    /// `ValueKey`: the event field the metric value is read from.
+    pub value_key: Option<String>,
+    /// `UnitLabel`: the CloudWatch unit the metric is recorded in.
+    pub unit_label: Option<String>,
+    /// `DimensionKeys`: field path -> CloudWatch dimension name. A `BTreeMap`, so one
+    /// stored definition projects in ONE stable key order however the request spelled it.
+    pub dimension_keys: Option<BTreeMap<String, String>>,
+    /// `EventPattern`: the JSON pattern an event has to match to feed this metric.
+    pub event_pattern: Option<String>,
+    /// `Namespace`: the custom namespace a custom metric is published to.
+    pub namespace: Option<String>,
+}
+
+impl MetricDefinitionRecord {
+    /// The record `request` is stored as, under the id `metric_definition_id`.
+    ///
+    /// The ONE conversion from the request shape, shared by the create and the update, so
+    /// a definition written by either carries exactly the same members — and so an update
+    /// REPLACES the whole definition under the id it keeps (`UpdateRumMetricDefinition`
+    /// takes "the new definition that you want to use for this metric", not a patch).
+    pub fn from_request(metric_definition_id: &str, request: &MetricDefinitionRequest) -> Self {
+        Self {
+            metric_definition_id: metric_definition_id.to_string(),
+            name: request.name.clone(),
+            value_key: request.value_key.clone(),
+            unit_label: request.unit_label.clone(),
+            dimension_keys: request.dimension_keys.as_ref().map(|keys| {
+                keys.iter()
+                    .map(|(field, dimension)| (field.clone(), dimension.clone()))
+                    .collect()
+            }),
+            event_pattern: request.event_pattern.clone(),
+            namespace: request.namespace.clone(),
+        }
+    }
+
+    /// Project the stored record onto the model's `MetricDefinition` — the one conversion
+    /// `BatchCreateRumMetricDefinitions` and `BatchGetRumMetricDefinitions` go through, so
+    /// the create's answer and a later read cannot report one definition differently.
+    pub fn to_metric_definition(&self) -> MetricDefinition {
+        MetricDefinition {
+            metric_definition_id: self.metric_definition_id.clone(),
+            name: self.name.clone(),
+            value_key: self.value_key.clone(),
+            unit_label: self.unit_label.clone(),
+            dimension_keys: self.dimension_keys.as_ref().map(|keys| {
+                keys.iter()
+                    .map(|(field, dimension)| (field.clone(), dimension.clone()))
+                    .collect()
+            }),
+            event_pattern: self.event_pattern.clone(),
+            namespace: self.namespace.clone(),
+        }
+    }
+}
+
 /// The resource-based policy attached to one app monitor.
 ///
 /// `PutResourcePolicy` documents "Each app monitor can have one resource-based policy",
@@ -371,6 +479,18 @@ pub struct AppMonitorRecord {
     /// monitor drops its destinations with it. Bounded by
     /// [`MAX_METRIC_DESTINATIONS_PER_APP_MONITOR`].
     pub metric_destinations: BTreeMap<MetricDestinationKey, MetricDestinationRecord>,
+    /// The metric definitions stored for each of this monitor's extended-metrics
+    /// destinations: keyed by the SAME [`MetricDestinationKey`] the destinations map uses,
+    /// and inside that by `MetricDefinitionId`.
+    ///
+    /// Definitions hang off the destination they were created under because that is the
+    /// resource they belong to — "You must have already created a destination for the
+    /// metrics before you send them" — so they go away with it
+    /// ([`Self::remove_metric_destination`]) and with the monitor. Each inner map is
+    /// bounded by [`MAX_METRIC_DEFINITIONS_PER_DESTINATION`] and a `BTreeMap`, so
+    /// `BatchGetRumMetricDefinitions` pages in a stable, resumable order.
+    pub metric_definitions:
+        BTreeMap<MetricDestinationKey, BTreeMap<String, MetricDefinitionRecord>>,
     /// This monitor's one resource-based policy, or `None` while it carries none — the
     /// state `GetResourcePolicy` and `DeleteResourcePolicy` answer
     /// `PolicyNotFoundException` for, and what the authorization evaluation reads beside
@@ -461,8 +581,80 @@ impl AppMonitorRecord {
         destination: &str,
         destination_arn: Option<&str>,
     ) -> Option<MetricDestinationRecord> {
+        let key = metric_destination_key(destination, destination_arn);
+        // A metric definition belongs to the destination it was created under, so the
+        // destination takes its definitions with it rather than leaving them stored under
+        // a destination that no longer exists.
+        self.metric_definitions.remove(&key);
+        self.metric_destinations.remove(&key)
+    }
+
+    /// Whether this monitor has the extended-metrics destination the
+    /// `(Destination, DestinationArn)` pair names.
+    ///
+    /// The precondition every metric-definition call shares: the model's
+    /// `BatchCreateRumMetricDefinitions` documents "You must have already created a
+    /// destination for the metrics before you send them", so a definition is created,
+    /// read and updated under a destination `PutRumMetricsDestination` stored, and a pair
+    /// naming none addresses no resource.
+    pub fn has_metric_destination(&self, destination: &str, destination_arn: Option<&str>) -> bool {
         self.metric_destinations
-            .remove(&metric_destination_key(destination, destination_arn))
+            .contains_key(&metric_destination_key(destination, destination_arn))
+    }
+
+    /// The definitions stored for that destination, for a caller that only REPORTS them
+    /// (`BatchGetRumMetricDefinitions`). `None` when the destination holds none.
+    pub fn metric_definitions_for(
+        &self,
+        destination: &str,
+        destination_arn: Option<&str>,
+    ) -> Option<&BTreeMap<String, MetricDefinitionRecord>> {
+        self.metric_definitions
+            .get(&metric_destination_key(destination, destination_arn))
+    }
+
+    /// How many definitions that destination holds — what
+    /// [`MAX_METRIC_DEFINITIONS_PER_DESTINATION`] is checked against.
+    pub fn metric_definition_count(
+        &self,
+        destination: &str,
+        destination_arn: Option<&str>,
+    ) -> usize {
+        self.metric_definitions_for(destination, destination_arn)
+            .map_or(0, BTreeMap::len)
+    }
+
+    /// The ONE stored definition the `(Destination, DestinationArn, MetricDefinitionId)`
+    /// triple names, for the caller that REPLACES it (`UpdateRumMetricDefinition`).
+    /// `None` when that destination holds no definition under that id, which the caller
+    /// renders as `ResourceNotFoundException`. Nothing is stored on the `None` path, so a
+    /// refused update leaves the state exactly as it was.
+    pub fn metric_definition_mut(
+        &mut self,
+        destination: &str,
+        destination_arn: Option<&str>,
+        metric_definition_id: &str,
+    ) -> Option<&mut MetricDefinitionRecord> {
+        self.metric_definitions
+            .get_mut(&metric_destination_key(destination, destination_arn))?
+            .get_mut(metric_definition_id)
+    }
+
+    /// Store `record` as a definition of that destination, under the id it carries.
+    ///
+    /// The ONE writer of [`Self::metric_definitions`]: the id in the record IS the map
+    /// key, so the id a create reports and the id a later read or update resolves cannot
+    /// differ.
+    pub fn insert_metric_definition(
+        &mut self,
+        destination: &str,
+        destination_arn: Option<&str>,
+        record: MetricDefinitionRecord,
+    ) {
+        self.metric_definitions
+            .entry(metric_destination_key(destination, destination_arn))
+            .or_default()
+            .insert(record.metric_definition_id.clone(), record);
     }
 
     /// The revision id of this monitor's stored resource policy, or `None` while it
@@ -558,16 +750,40 @@ impl ComAmazonawsRumRumState {
     /// under the returned id while still holding the same state lock, or the id it
     /// returned names nothing.
     pub fn mint_app_monitor_id(&mut self) -> String {
-        if self.id_seed == 0 {
-            self.id_seed = nanos_since_epoch() as u64;
-        }
         loop {
-            self.next_id_seq = self.next_id_seq.wrapping_add(1);
-            let candidate = uuid_v4_shaped(APP_MONITOR_ID_DOMAIN, self.id_seed, self.next_id_seq);
+            let candidate = self.mint_id(APP_MONITOR_ID_DOMAIN);
             if !self.monitor_ids.contains_key(&candidate) {
                 return candidate;
             }
         }
+    }
+
+    /// Mint a fresh `MetricDefinitionId`.
+    ///
+    /// `MetricDefinitionId` is modelled as a 1..255-character string with no pattern and
+    /// the value is the SERVICE's — a caller only ever passes back one it was handed — so
+    /// the id is drawn the way an app monitor's is: 16 bytes of a SHA-256 digest of this
+    /// state's clock-derived seed and its monotonic counter, laid out as a version-4,
+    /// RFC 4122 variant UUID. The counter advances on every mint and this id space is its
+    /// own ([`METRIC_DEFINITION_ID_DOMAIN`]), so no two ids this state hands out — of this
+    /// kind or of any other — are equal, and no caller can guess one from another. The
+    /// caller must store the definition under the returned id while still holding the
+    /// same state lock, or the id it returned names nothing.
+    pub fn mint_metric_definition_id(&mut self) -> String {
+        self.mint_id(METRIC_DEFINITION_ID_DOMAIN)
+    }
+
+    /// One id, drawn from the id space `domain`: the next value of this state's monotonic
+    /// counter, digested with the seed the counter is drawn under
+    /// ([`uuid_v4_shaped`]). The ONE place the seed is initialised and the counter is
+    /// advanced, so two id spaces of this state cannot drift apart or draw the same
+    /// `(seed, sequence)` pair twice.
+    fn mint_id(&mut self, domain: &str) -> String {
+        if self.id_seed == 0 {
+            self.id_seed = nanos_since_epoch() as u64;
+        }
+        self.next_id_seq = self.next_id_seq.wrapping_add(1);
+        uuid_v4_shaped(domain, self.id_seed, self.next_id_seq)
     }
 
     /// Store `record`, keeping the `Id` -> `Name` index in step with the primary map.
@@ -641,6 +857,9 @@ fn nanos_since_epoch() -> u128 {
 
 /// The id space [`ComAmazonawsRumRumState::mint_app_monitor_id`] draws from.
 const APP_MONITOR_ID_DOMAIN: &str = "rum/appmonitor";
+
+/// The id space [`ComAmazonawsRumRumState::mint_metric_definition_id`] draws from.
+const METRIC_DEFINITION_ID_DOMAIN: &str = "rum/metricdefinition";
 
 /// One `(domain, seed, sequence)` triple as a canonical, lowercase, version-4-shaped
 /// UUID string.
@@ -926,6 +1145,124 @@ pub fn metric_destination_not_found(
         }
     };
     ResourceNotFoundException { message }
+}
+
+/// Why this `MetricDefinitionRequest` is not a metric definition this service can store,
+/// or `None` when it is one.
+///
+/// The modelled constraints (every member's length, the namespace's pattern) are refused
+/// before a handler runs. What is left are the rules the model states in PROSE, which is
+/// why they live here: every operation that accepts a definition — the batch create, where
+/// one bad definition fails alone, and the update, where it fails the call — judges a
+/// definition exactly the same way.
+///
+/// * `Namespace` (from the model): "You cannot use any string that starts with `AWS/` for
+///   your namespace", while an extended metric's namespace "must be omitted or set to
+///   `AWS/RUM`" — so the reserved space is closed except for RUM's own namespace.
+/// * `EventPattern` (from the model): "The pattern that defines the metric, specified as a
+///   JSON object", so a pattern that is not one defines nothing.
+/// * `DimensionKeys` (from the model): "For both extended metrics and custom metrics, all
+///   dimensions listed in this field must also be included in `EventPattern`" — the
+///   dimension's value is read out of the matched event, so the pattern has to name that
+///   field, and a definition with dimensions but no pattern names none of them.
+pub fn metric_definition_refusal(definition: &MetricDefinitionRequest) -> Option<String> {
+    if let Some(namespace) = definition.namespace.as_deref() {
+        if namespace.starts_with(RESERVED_NAMESPACE_PREFIX)
+            && namespace != EXTENDED_METRICS_NAMESPACE
+        {
+            return Some(format!(
+                "Namespace {namespace} is reserved: a namespace starting with \
+                 {RESERVED_NAMESPACE_PREFIX} cannot be used, other than \
+                 {EXTENDED_METRICS_NAMESPACE} for extended metrics."
+            ));
+        }
+    }
+
+    // An empty `EventPattern` is the same input as an absent one: the member is modelled
+    // `@length(min: 0, max: 4000)`, so the empty string reaches here and names no event.
+    let declared = definition
+        .event_pattern
+        .as_deref()
+        .map(str::trim)
+        .filter(|pattern| !pattern.is_empty());
+    let pattern = match declared {
+        Some(text) => match ::serde_json::from_str::<::serde_json::Value>(text) {
+            Ok(parsed) if parsed.is_object() => Some(parsed),
+            Ok(_) => return Some("EventPattern must be a JSON object.".to_string()),
+            Err(error) => return Some(format!("EventPattern is not valid JSON: {error}.")),
+        },
+        None => None,
+    };
+
+    // Sorted, so the one dimension a refusal names is the same whichever order the
+    // request's map iterated in.
+    let mut dimensions: Vec<&str> = definition
+        .dimension_keys
+        .iter()
+        .flatten()
+        .map(|(field, _)| field.as_str())
+        .collect();
+    dimensions.sort_unstable();
+    // A definition that lists no dimension has nothing left to check.
+    let first = *dimensions.first()?;
+    let Some(pattern) = pattern else {
+        return Some(format!(
+            "DimensionKeys names the field {first}, so an EventPattern including it is \
+             required."
+        ));
+    };
+    dimensions
+        .into_iter()
+        .find(|field| !event_pattern_names_field(&pattern, field))
+        .map(|field| {
+            format!("DimensionKeys names the field {field}, which the EventPattern does not include.")
+        })
+}
+
+/// Whether the event pattern `pattern` names the event field `path` — a dot-separated
+/// field path, which is how a `DimensionKeys` key spells one (`metadata.browserName`,
+/// `event_details.fileType`).
+///
+/// A pattern is nested JSON objects down to the matcher for one field, so the path is
+/// resolved segment by segment: the field is named when every segment is a member of the
+/// object the previous one resolved to.
+fn event_pattern_names_field(pattern: &::serde_json::Value, path: &str) -> bool {
+    let mut cursor = pattern;
+    for segment in path.split('.') {
+        match cursor.as_object().and_then(|members| members.get(segment)) {
+            Some(next) => cursor = next,
+            None => return false,
+        }
+    }
+    true
+}
+
+/// `ResourceNotFoundException` for a `MetricDefinitionId` the destination the request
+/// named holds no definition under.
+///
+/// The message is built from the request: the app monitor it addressed and the id it asked
+/// for. Like every other not-found body of this service it carries `message` ALONE (see
+/// [`crate::ops::types::ResourceNotFoundException`]).
+pub fn metric_definition_not_found(
+    app_monitor_name: &str,
+    metric_definition_id: &str,
+) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: format!(
+            "App monitor {app_monitor_name} has no metric definition {metric_definition_id}."
+        ),
+    }
+}
+
+/// `ServiceQuotaExceededException` for a destination already holding the most metric
+/// definitions it may ([`MAX_METRIC_DEFINITIONS_PER_DESTINATION`]).
+pub fn metric_definitions_quota_exceeded(destination: &str) -> ServiceQuotaExceededException {
+    ServiceQuotaExceededException {
+        message: format!(
+            "The {destination} metrics destination already contains the maximum number of \
+             metric definitions ({MAX_METRIC_DEFINITIONS_PER_DESTINATION})."
+        ),
+    }
 }
 
 /// The name of the CloudWatch Logs group an app monitor's telemetry is copied into.
