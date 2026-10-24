@@ -192,7 +192,7 @@ async fn the_delete_removes_the_named_interface_whatever_shape_it_has() {
         (
             "a private address and two security groups",
             NetworkInterfaceSpec {
-                private_ip_address: Some("172.31.7.42".to_string()),
+                private_ip_addresses: vec!["172.31.7.42".to_string()],
                 groups: vec![
                     GroupIdentifier {
                         group_id: Some("sg-0aaaaaaaaaaaaaaaa".to_string()),

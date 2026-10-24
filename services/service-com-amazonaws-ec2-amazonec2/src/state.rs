@@ -91,6 +91,19 @@
 //! `DhcpOptionsId` names a set `DescribeDhcpOptions` reports, and two VPCs of one Region
 //! report the same one.
 //!
+//! ## Network interfaces
+//!
+//! [`ComAmazonawsEc2Amazonec2State::network_interfaces`] holds the account's elastic
+//! network interfaces the same way, keyed by `NetworkInterfaceId`, and starts EMPTY: AWS
+//! gives a fresh account a default VPC with its subnets and security group, but no network
+//! interface exists until something creates one. The addresses an interface holds are the
+//! store's own: a caller-named one is judged by [`is_assignable_subnet_address`] and taken
+//! with [`ComAmazonawsEc2Amazonec2State::reserve_private_ip`], and a service-chosen one
+//! comes from [`ComAmazonawsEc2Amazonec2State::mint_private_ip_in_cidr`] — the one scan of
+//! a subnet's free addresses, judged against the one definition of "held" — and they are
+//! counted off the subnet's `AvailableIpAddressCount`, so the subnet, interface, instance
+//! and route server stores cannot disagree about which addresses are in use.
+//!
 //! ## Windows fast launch
 //!
 //! [`ComAmazonawsEc2Amazonec2State::fast_launch_images`] holds the Windows fast launch
@@ -778,7 +791,8 @@ use crate::ops::types::{
     InstanceState, InstanceTypeOffering, InterruptionInfo, IpPermission, IpRange,
     LOCATION_TYPE_VALUES,
     LaunchTemplate, MacHost, Monitoring, NatGateway, NetworkInsightsAccessScope,
-    NetworkInsightsAccessScopeAnalysis, OperatorResponse, PeeringAttachmentStatus, Placement,
+    NetworkInsightsAccessScopeAnalysis, NetworkInterface, NetworkInterfacePrivateIpAddress,
+    OperatorResponse, PeeringAttachmentStatus, Placement,
     PlacementGroup,
     PrivateDnsNameOptionsOnLaunch,
     DnsEntry, PayerResponsibilityEntry, ProductCode,
@@ -1757,6 +1771,19 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// `DescribeSecurityGroups` without a field-by-field copy. Ordered by id, which is the
     /// order the describe reports and pages over.
     pub security_groups: BTreeMap<String, SecurityGroup>,
+    /// Every network interface the account holds, by `NetworkInterfaceId`, as the modelled
+    /// [`NetworkInterface`] shape itself — the same reason the VPC and subnet stores hold
+    /// their modelled shapes: a member a writer sets round-trips through
+    /// `DescribeNetworkInterfaces` without a field-by-field copy that can silently drop
+    /// one. Ordered by id, which is the order the describe reports and pages over.
+    ///
+    /// A fresh account holds NONE: nothing in AWS gives an account a network interface
+    /// until something asks for one (`CreateNetworkInterface`, a launch, a NAT gateway, a
+    /// load balancer), unlike the default VPC, its subnets and its security group.
+    pub network_interfaces: BTreeMap<String, NetworkInterface>,
+    /// A `CreateNetworkInterface` `ClientToken` and the interface id it minted, so a repeat
+    /// of the same request answers with that interface instead of creating a second one.
+    pub network_interface_client_tokens: HashMap<String, String>,
     /// Every security group rule the account holds, by `SecurityGroupRuleId`.
     ///
     /// "When you add a rule to a security group, it is assigned a unique ID"
@@ -1873,14 +1900,6 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// Monotonic source of the Elastic IP addresses [`Self::mint_elastic_ip`] hands out,
     /// so one allocation can never be given an address another still holds.
     next_elastic_ip: u64,
-    /// Every elastic network interface the account holds, by `NetworkInterfaceId`, as the
-    /// modelled [`NetworkInterface`] shape itself — so a member a writer sets round-trips
-    /// through `DescribeNetworkInterfaces` without a field-by-field copy. Ordered by id,
-    /// which is the order the describe reports and pages over. See the module docs.
-    ///
-    /// Starts EMPTY: a fresh account holds no interface of its own until something creates
-    /// one through [`Self::insert_network_interface`].
-    pub network_interfaces: BTreeMap<String, NetworkInterface>,
     /// Every route server the account holds, by `RouteServerId` — see the module docs.
     /// Ordered by id, which is the order `DescribeRouteServers` reports and pages over.
     pub route_servers: BTreeMap<String, RouteServerRecord>,
@@ -2225,6 +2244,8 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             network_insights_access_scope_analysis_client_tokens: HashMap::new(),
             images: BTreeMap::new(),
             security_groups: BTreeMap::new(),
+            network_interfaces: BTreeMap::new(),
+            network_interface_client_tokens: HashMap::new(),
             security_group_rules: BTreeMap::new(),
             launch_templates: BTreeMap::new(),
             launch_template_client_tokens: HashMap::new(),
@@ -2247,7 +2268,6 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             fast_launch_images: BTreeMap::new(),
             addresses: BTreeMap::new(),
             next_elastic_ip: 0,
-            network_interfaces: BTreeMap::new(),
             route_servers: BTreeMap::new(),
             route_server_client_tokens: HashMap::new(),
             address_transfers: BTreeMap::new(),
@@ -10517,6 +10537,63 @@ fn page_token_checksum(start_at: &str) -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// Network interfaces
+// ---------------------------------------------------------------------------
+
+// The status an unattached interface sits in and the default `NetworkInterfaceType`
+// ([`NETWORK_INTERFACE_STATUS_AVAILABLE`] and [`NETWORK_INTERFACE_TYPE_INTERFACE`]) are
+// defined in the network-interface section further down, beside the attachment statuses the
+// store derives an interface's status from, so one definition serves every operation.
+
+/// The interface type that carries no IP addresses at all: "If you specify `efa-only`, do
+/// not assign any IP addresses to the network interface. EFA-only network interfaces do
+/// not support IP addresses" (`CreateNetworkInterfaceRequest$InterfaceType`).
+pub const NETWORK_INTERFACE_TYPE_EFA_ONLY: &str = "efa-only";
+
+/// The `ResourceType` a `CreateNetworkInterface` tag specification may name: the network
+/// interface it creates. Also the type `RunInstances` accepts for the interfaces of a
+/// launch (see [`RUN_INSTANCES_TAGGABLE_RESOURCES`]).
+pub const RESOURCE_TYPE_NETWORK_INTERFACE: &str = "network-interface";
+
+/// The largest number of network interfaces this in-memory store holds.
+///
+/// A capacity bound in the same style as [`MAX_VPCS`] and [`MAX_SUBNETS`], not an AWS
+/// quota (AWS's "Network interfaces per Region" quota is adjustable): each interface is a
+/// record in this process's memory, so the number a caller can create has to be finite.
+/// [`ComAmazonawsEc2Amazonec2State::has_network_interface_capacity`] is the predicate a
+/// writer asks before inserting; a create past it refuses with
+/// [`NETWORK_INTERFACE_LIMIT_EXCEEDED`].
+pub const MAX_NETWORK_INTERFACES: usize = 5_000;
+
+/// The most private IPv4 addresses one network interface may hold here.
+///
+/// CHOSEN: "The number of IP addresses you can assign to a network interface varies by
+/// instance type" (`CreateNetworkInterface`), and 50 is the largest per-interface IPv4
+/// count AWS publishes for any instance type (Amazon EC2 User Guide, "IP addresses per
+/// network interface per instance type"). It is the bound a request's
+/// `SecondaryPrivateIpAddressCount` and `PrivateIpAddresses` are held to, because the
+/// model declares no `@range` on either and each address is a record this store keeps.
+pub const MAX_PRIVATE_IPS_PER_NETWORK_INTERFACE: usize = 50;
+
+/// EC2's error code for a create that would take the account past the number of network
+/// interfaces it may hold: "You've reached the limit on the number of network interfaces
+/// that you can create" (EC2 API error codes).
+pub const NETWORK_INTERFACE_LIMIT_EXCEEDED: &str = "NetworkInterfaceLimitExceeded";
+
+/// `NetworkInterfaceLimitExceeded` (HTTP 400): the store already holds
+/// [`MAX_NETWORK_INTERFACES`] interfaces.
+pub fn network_interface_limit_exceeded<E>() -> Scaffolded<E> {
+    Scaffolded::service_error(
+        NETWORK_INTERFACE_LIMIT_EXCEEDED,
+        400,
+        format!(
+            "This emulator holds at most {MAX_NETWORK_INTERFACES} network interfaces, \
+             so it cannot create another one"
+        ),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // The VPC-scoped network resource lifecycle
 // ---------------------------------------------------------------------------
 //
@@ -10871,6 +10948,281 @@ pub fn cannot_delete<E>(group_id: &str) -> Scaffolded<E> {
              and cannot be deleted"
         ),
     )
+}
+
+/// What one network interface is created with, beyond everything the service itself owns
+/// (its id, MAC address, owning account, private DNS names and status), which
+/// [`ComAmazonawsEc2Amazonec2State::insert_network_interface`] derives.
+#[derive(Debug, Clone, Default)]
+pub struct NetworkInterfaceSpec {
+    /// The subnet the interface sits in.
+    pub subnet_id: String,
+    /// That subnet's VPC.
+    pub vpc_id: String,
+    /// That subnet's Availability Zone.
+    pub availability_zone: String,
+    /// That zone's id.
+    pub availability_zone_id: String,
+    /// The Region the request was made in, which the private DNS names are built for.
+    pub region: String,
+    /// "A description for the network interface"
+    /// (`CreateNetworkInterfaceRequest$Description`).
+    /// AWS reports an EMPTY description rather than none for an interface created without
+    /// one, so a writer that has none leaves this empty rather than deciding what absence
+    /// looks like.
+    pub description: String,
+    /// One of the `NetworkInterfaceType` enum's values,
+    /// [`NETWORK_INTERFACE_TYPE_INTERFACE`] unless the request named another.
+    pub interface_type: String,
+    /// The interface's private IPv4 addresses, PRIMARY FIRST: "Indicates whether this IPv4
+    /// address is the primary private IPv4 address of the network interface"
+    /// (`NetworkInterfacePrivateIpAddress$Primary`), and only one address can be primary.
+    /// Empty for an interface that carries none ([`NETWORK_INTERFACE_TYPE_EFA_ONLY`]).
+    pub private_ip_addresses: Vec<String>,
+    /// The security groups of the interface, as the describe reports them.
+    pub groups: Vec<GroupIdentifier>,
+    /// "The network interface attachment" (`NetworkInterface$Attachment`), for an interface
+    /// something already holds; `None` for one attached to nothing, which is what a create
+    /// stores. The `Status` the store derives follows from it, so a stored interface cannot
+    /// claim to be `available` while something holds it.
+    pub attachment: Option<NetworkInterfaceAttachment>,
+    /// The tags the create asked for.
+    pub tags: Vec<Tag>,
+}
+
+/// The MAC address of the network interface whose store counter value is `counter`.
+///
+/// Derived from the counter, never from a clock or a random source, so it is the same
+/// across reads and across runs and no two interfaces share one. The first octet is `02`:
+/// bit 1 set marks a locally administered address, which is what a virtualised NIC gets.
+fn mac_address_for(counter: u64) -> String {
+    let octets = counter.to_be_bytes();
+    format!(
+        "02:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        octets[3], octets[4], octets[5], octets[6], octets[7]
+    )
+}
+
+// The reserved-address arithmetic a network interface's addresses are judged by is
+// [`assignable_subnet_window`] / [`is_assignable_subnet_address`] further up, and the
+// free-address search and take are the store's own `free_subnet_address` /
+// `mint_private_ip_in_cidr` / `reserve_private_ip`: one computation, one definition of
+// "held", so a service-chosen address and a caller-named one cannot be judged differently.
+
+/// A boolean attribute as an EC2 filter value compares against it: the wire rendering of
+/// the member, `true` or `false`. A member that is not set carries no value for the filter
+/// to match, like any other absent attribute.
+///
+/// Beside [`matches_every_filter`], which consumes what it answers, so every describe
+/// renders a boolean attribute the same way.
+pub fn boolean_filter_values(value: Option<bool>) -> Vec<Cow<'static, str>> {
+    value
+        .map(|set| Cow::Borrowed(if set { "true" } else { "false" }))
+        .into_iter()
+        .collect()
+}
+
+/// A numeric attribute as an EC2 filter value compares against it: its decimal rendering,
+/// which is how the wire carries it. The integer companion of
+/// [`boolean_filter_values`].
+pub fn integer_filter_values(value: Option<i32>) -> Vec<Cow<'static, str>> {
+    value
+        .map(|number| Cow::Owned(number.to_string()))
+        .into_iter()
+        .collect()
+}
+
+/// Do two tag lists ask for the same tags?
+///
+/// What a replayed `ClientToken` is compared on, beside the scalar members, by every create
+/// of this crate that honors one. A tag set is unordered — "Tag keys must be unique per
+/// resource", so a list is a SET of key/value pairs and the order a client sent them in is
+/// not part of what it asked for — so both lists are compared as sorted pairs rather than
+/// positionally. The members are compared as the `Option`s they are, so a tag that carries
+/// no value stays distinguishable from one whose value is the empty string. The modelled
+/// `Tag` carries no `PartialEq`, hence the explicit pairs.
+pub fn same_tags(stored: &[Tag], asked: &[Tag]) -> bool {
+    let pairs = |tags: &[Tag]| -> Vec<(Option<String>, Option<String>)> {
+        let mut pairs: Vec<(Option<String>, Option<String>)> = tags
+            .iter()
+            .map(|tag| (tag.key.clone(), tag.value.clone()))
+            .collect();
+        pairs.sort();
+        pairs
+    };
+    pairs(stored) == pairs(asked)
+}
+
+/// Do two security-group lists name the same groups?
+///
+/// The group-list companion of [`same_tags`], for a replayed `ClientToken`. A group list is
+/// a SET of ids — "the IDs of one or more security groups" — so the order a client sent them
+/// in is not part of what it asked for, and the comparison is on the ids, the only part of a
+/// `GroupIdentifier` a request chooses.
+pub fn same_group_ids(stored: &[GroupIdentifier], asked: &[GroupIdentifier]) -> bool {
+    let ids = |groups: &[GroupIdentifier]| -> Vec<Option<String>> {
+        let mut ids: Vec<Option<String>> = groups
+            .iter()
+            .map(|group| group.group_id.clone())
+            .collect();
+        ids.sort();
+        ids
+    };
+    ids(stored) == ids(asked)
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another network interface fits inside the store's ceiling
+    /// ([`MAX_NETWORK_INTERFACES`]).
+    ///
+    /// The same contract as [`Self::has_vpc_capacity`]: a create asks first and refuses
+    /// with [`network_interface_limit_exceeded`] when it answers `false`.
+    pub fn has_network_interface_capacity(&self) -> bool {
+        self.network_interfaces.len() < MAX_NETWORK_INTERFACES
+    }
+
+    /// Store a network interface, and answer the `NetworkInterfaceId` it was given.
+    ///
+    /// Everything the service itself owns is derived here rather than taken from the
+    /// caller — the id, the MAC address built from it, the owning account, the private DNS
+    /// name of each address and the `available` status of an unattached interface — so two
+    /// writers cannot report the same interface differently.
+    ///
+    /// The addresses the interface takes leave the subnet: "`AvailableIpAddressCount` - The
+    /// number of IPv4 addresses in the subnet that are available"
+    /// (`DescribeSubnetsRequest$Filters`), so the subnet's count is decremented here rather
+    /// than by each writer, and they are recorded in the one in-use pool
+    /// [`Self::allocate_private_ip`] and [`Self::private_ip_in_use`] read, so the instance
+    /// path cannot hand out an address an interface holds. Like [`Self::insert_vpc`], the
+    /// caller-chosen bytes of `spec.tags` are charged against the store's byte budget here
+    /// too.
+    ///
+    /// [`Self::remove_network_interface`] is the exact reverse: it gives the record's bytes,
+    /// its addresses and the subnet's count back on the terms this method took them on, so
+    /// a create followed by a delete leaves the store where it started.
+    ///
+    /// `None` means NOTHING was stored because the store is full — at
+    /// [`MAX_NETWORK_INTERFACES`] interfaces or at [`MAX_STORED_RECORDS_PER_STORE`] records
+    /// — so a writer that forgets to ask [`Self::has_network_interface_capacity`] cannot
+    /// grow the store without bound either.
+    pub fn insert_network_interface(&mut self, spec: NetworkInterfaceSpec) -> Option<String> {
+        if !self.has_network_interface_capacity()
+            || self.network_interfaces.len() >= MAX_STORED_RECORDS_PER_STORE
+        {
+            return None;
+        }
+        let network_interface_id = self.next_id(NETWORK_INTERFACE_ID_PREFIX);
+        let mac_address = mac_address_for(self.id_counter);
+        let primary_address = spec.private_ip_addresses.first().cloned();
+        let private_ip_addresses: Vec<NetworkInterfacePrivateIpAddress> = spec
+            .private_ip_addresses
+            .iter()
+            .enumerate()
+            .map(|(index, address)| NetworkInterfacePrivateIpAddress {
+                // No Elastic IP address is associated until something associates one.
+                association: None,
+                primary: Some(index == 0),
+                private_dns_name: Some(private_dns_name(address, &spec.region)),
+                private_ip_address: Some(address.clone()),
+            })
+            .collect();
+        let assigned_addresses = private_ip_addresses.len();
+        // The caller-chosen bytes this record will retain, counted from the SPEC before it
+        // is taken apart — the one formula the create's own byte-budget question asks and
+        // [`Self::remove_network_interface`] gives back.
+        let retained_bytes =
+            network_interface_spec_bytes(&spec).saturating_add(STORED_RECORD_OVERHEAD_BYTES);
+        // "The status of the network interface" (`NetworkInterface$Status`): an interface
+        // something holds is `in-use`, one attached to nothing is `available`, and an
+        // attachment that has reached `detached` holds nothing. Derived here rather than
+        // taken from the writer, so a stored interface cannot claim to be `available` while
+        // something holds it — a create, which attaches nothing, always gets `available`.
+        let held = spec
+            .attachment
+            .as_ref()
+            .is_some_and(|attachment| !attachment_is_detached(attachment));
+        let status = if held {
+            NETWORK_INTERFACE_STATUS_IN_USE
+        } else {
+            NETWORK_INTERFACE_STATUS_AVAILABLE
+        };
+        let interface = NetworkInterface {
+            // No Elastic IP address is associated until something associates one.
+            association: None,
+            attachment: spec.attachment,
+            availability_zone: Some(spec.availability_zone),
+            availability_zone_id: Some(spec.availability_zone_id),
+            // Set only by a request that carries a connection tracking specification.
+            connection_tracking_configuration: None,
+            // AWS reports an empty description rather than none for an interface created
+            // without one, which is also what a `description` filter compares against.
+            description: Some(spec.description),
+            groups: Some(spec.groups),
+            interface_type: Some(spec.interface_type),
+            // No IPv6 address or prefix is assigned until something assigns one.
+            ipv6_addresses: Some(Vec::new()),
+            ipv6_address: None,
+            ipv6_native: Some(false),
+            ipv4_prefixes: Some(Vec::new()),
+            ipv6_prefixes: Some(Vec::new()),
+            mac_address: Some(mac_address),
+            network_interface_id: Some(network_interface_id.clone()),
+            // An interface is on an Outpost only when it was created in an Outpost subnet.
+            outpost_arn: None,
+            owner_id: Some(::engine::emulator_account_id().to_string()),
+            private_dns_name: primary_address
+                .as_deref()
+                .map(|address| private_dns_name(address, &spec.region)),
+            // A public hostname exists only for an interface with a public address.
+            public_dns_name: None,
+            public_ip_dns_name_options: None,
+            private_ip_address: primary_address,
+            private_ip_addresses: Some(private_ip_addresses),
+            // "The alias or Amazon Web Services account ID of the principal or service that
+            // created the network interface" (`NetworkInterface$RequesterId`): reported for
+            // an interface an AWS service created, which this is not.
+            requester_id: None,
+            requester_managed: Some(false),
+            // "Indicates whether source/destination checking is enabled": on by default,
+            // the value an interface has to be changed away from to do NAT.
+            source_dest_check: Some(true),
+            status: Some(status.to_string()),
+            subnet_id: Some(spec.subnet_id.clone()),
+            tag_set: Some(spec.tags),
+            vpc_id: Some(spec.vpc_id),
+            // Reported only for an IPv6 interface, which this slice does not create.
+            deny_all_igw_traffic: None,
+            // Set for an interface a service provider manages; a caller's own has none.
+            operator: None,
+            associated_subnets: Some(vec![spec.subnet_id.clone()]),
+        };
+        // Every caller-chosen byte the record retains — its tags, its description and the
+        // addresses it holds — plus [`STORED_RECORD_OVERHEAD_BYTES`], so an interface with
+        // no description and no tags is not free against the budget either. The same
+        // quantity [`Self::remove_network_interface`] gives back, counted by the one
+        // function both read.
+        self.add_stored_bytes(retained_bytes);
+        // The addresses leave the one pool every address path of this store draws from, so
+        // a later `RunInstances` can neither be handed an address an interface holds nor
+        // accept one a caller names that an interface already holds
+        // ([`Self::allocate_private_ip`] and [`Self::private_ip_in_use`] both read it).
+        for address in &spec.private_ip_addresses {
+            self.assigned_private_ips.insert(address.clone());
+        }
+        if let Some(subnet) = self.subnets.get_mut(&spec.subnet_id) {
+            let taken = i32::try_from(assigned_addresses).unwrap_or(i32::MAX);
+            subnet.available_ip_address_count = Some(
+                subnet
+                    .available_ip_address_count
+                    .unwrap_or_default()
+                    .saturating_sub(taken)
+                    .max(0),
+            );
+        }
+        self.network_interfaces
+            .insert(network_interface_id.clone(), interface);
+        Some(network_interface_id)
+    }
 }
 
 /// Refuse a subnet CIDR block that overlaps one already in the VPC: HTTP 400
@@ -13675,12 +14027,10 @@ pub fn invalid_network_interface_id_not_found<E>(network_interface_id: &str) -> 
 // seam a create lands on, and what a delete refuses
 // ---------------------------------------------------------------------------
 
-// Imported here rather than in this module's shared import list, beside the only
-// code that names these shapes, the way the import tasks' shapes are imported
-// with their own section further up.
-use crate::ops::types::{
-    NetworkInterface, NetworkInterfaceAttachment, NetworkInterfacePrivateIpAddress,
-};
+// `NetworkInterface` and `NetworkInterfacePrivateIpAddress` are in this module's shared
+// import list, beside the store field that holds them; the attachment shape is imported
+// here, beside the statuses and the derivation that read it.
+use crate::ops::types::NetworkInterfaceAttachment;
 
 /// The id prefix EC2 mints a network interface with, as
 /// [`network_interface_id_is_well_formed`] reads one: `eni-`, carried here without the
@@ -13737,38 +14087,9 @@ pub fn network_interface_in_use<E>(network_interface_id: &str) -> Scaffolded<E> 
     )
 }
 
-/// One network interface as a writer asks for it: the members a creator chooses.
-///
-/// Everything the service itself owns — the `NetworkInterfaceId`, the owning account, the
-/// primary private address entry and the `Status` that follows from the attachment — is
-/// derived by [`ComAmazonawsEc2Amazonec2State::insert_network_interface`], so two writers
-/// cannot report the same interface differently.
-#[derive(Debug, Clone, Default)]
-pub struct NetworkInterfaceSpec {
-    /// "The ID of the subnet" the interface sits in (`NetworkInterface$SubnetId`).
-    pub subnet_id: String,
-    /// "The ID of the VPC" that subnet belongs to (`NetworkInterface$VpcId`).
-    pub vpc_id: String,
-    /// "The Availability Zone" of that subnet (`NetworkInterface$AvailabilityZone`).
-    pub availability_zone: String,
-    /// "The ID of the Availability Zone" (`NetworkInterface$AvailabilityZoneId`).
-    pub availability_zone_id: String,
-    /// "A description" (`NetworkInterface$Description`).
-    pub description: String,
-    /// "Any security groups for the network interface" (`NetworkInterface$Groups`).
-    pub groups: Vec<GroupIdentifier>,
-    /// "The IPv4 address of the network interface within the subnet"
-    /// (`NetworkInterface$PrivateIpAddress`) — the interface's primary private address.
-    pub private_ip_address: Option<String>,
-    /// "The type of network interface" (`NetworkInterface$InterfaceType`), one of the
-    /// `NetworkInterfaceType` values; [`NETWORK_INTERFACE_TYPE_INTERFACE`] is the default.
-    pub interface_type: String,
-    /// "The network interface attachment" (`NetworkInterface$Attachment`), for an interface
-    /// that is already held by something; `None` for one that is attached to nothing.
-    pub attachment: Option<NetworkInterfaceAttachment>,
-    /// "Any tags assigned to the network interface" (`NetworkInterface$TagSet`).
-    pub tags: Vec<Tag>,
-}
+// What one network interface is created with lives in [`NetworkInterfaceSpec`], beside the
+// writer seam [`ComAmazonawsEc2Amazonec2State::insert_network_interface`] further up, so a
+// create and a seeded fixture ask for an interface the same way.
 
 /// The caller-chosen bytes a stored network interface retains: its tags, its description
 /// and the addresses it holds. The same quantity
@@ -13792,90 +14113,30 @@ pub fn network_interface_payload_bytes(interface: &NetworkInterface) -> usize {
         .saturating_add(address_bytes)
 }
 
-impl ComAmazonawsEc2Amazonec2State {
-    /// Insert a network interface, and answer the `NetworkInterfaceId` it was given.
-    ///
-    /// The writer seam for the network interface store, ahead of the operation that will
-    /// call it: `CreateNetworkInterface` is still a scaffold stub with its own open issue,
-    /// so for now this is reached only from this crate's tests, which seed interfaces the
-    /// way that create will. It lives here rather than in a test so the create lands on
-    /// this one record instead of a second copy of an interface beside it, exactly as
-    /// [`Self::insert_coip_pool`] does for a CoIP pool.
-    ///
-    /// The `Status` is derived from the attachment rather than taken from the writer, so a
-    /// stored interface cannot claim to be `available` while something holds it. The
-    /// caller-chosen bytes are charged against the store's byte budget here, so a writer
-    /// cannot store them uncharged. `None` means the store is at
-    /// [`MAX_STORED_RECORDS_PER_STORE`] and NOTHING was stored: the ceiling is enforced
-    /// here so a writer that forgets to ask cannot grow the store without bound.
-    pub fn insert_network_interface(&mut self, spec: NetworkInterfaceSpec) -> Option<String> {
-        if self.network_interfaces.len() >= MAX_STORED_RECORDS_PER_STORE {
-            return None;
-        }
-        let network_interface_id = self.next_id(NETWORK_INTERFACE_ID_PREFIX);
-        // "The status of the network interface" (`NetworkInterface$Status`): an interface
-        // something holds is `in-use`, one that is attached to nothing is `available`. A
-        // detached attachment holds nothing, so it leaves the interface `available`.
-        let held = spec
-            .attachment
-            .as_ref()
-            .is_some_and(|attachment| !attachment_is_detached(attachment));
-        let status = if held {
-            NETWORK_INTERFACE_STATUS_IN_USE
-        } else {
-            NETWORK_INTERFACE_STATUS_AVAILABLE
-        };
-        let interface = NetworkInterface {
-            attachment: spec.attachment,
-            availability_zone: Some(spec.availability_zone),
-            availability_zone_id: Some(spec.availability_zone_id),
-            description: Some(spec.description),
-            groups: Some(spec.groups),
-            interface_type: Some(spec.interface_type),
-            network_interface_id: Some(network_interface_id.clone()),
-            owner_id: Some(::engine::emulator_account_id().to_string()),
-            // "The private IPv4 addresses associated with the network interface"
-            // (`NetworkInterface$PrivateIpAddresses`): the primary one is one of them, so
-            // it appears in both members rather than only in the scalar. An interface
-            // stored without a private address reports NO set rather than an empty one:
-            // AWS never reports an interface that holds no address at all.
-            private_ip_addresses: spec.private_ip_address.as_ref().map(|address| {
-                vec![NetworkInterfacePrivateIpAddress {
-                    primary: Some(true),
-                    private_ip_address: Some(address.clone()),
-                    ..NetworkInterfacePrivateIpAddress::default()
-                }]
-            }),
-            private_ip_address: spec.private_ip_address,
-            // An interface a caller creates is the account's own, not one Amazon manages
-            // on its behalf ("Indicates whether the network interface is being managed by
-            // Amazon Web Services" — `NetworkInterface$RequesterManaged`).
-            requester_managed: Some(false),
-            // "Indicates whether source/destination checking is enabled"
-            // (`NetworkInterface$SourceDestCheck`): on, which is where AWS starts an
-            // interface until `ModifyNetworkInterfaceAttribute` turns it off.
-            source_dest_check: Some(true),
-            status: Some(status.to_string()),
-            subnet_id: Some(spec.subnet_id),
-            tag_set: Some(spec.tags),
-            vpc_id: Some(spec.vpc_id),
-            ..NetworkInterface::default()
-        };
-        // [`STORED_RECORD_OVERHEAD_BYTES`] beside the caller-chosen bytes, so an interface
-        // with no description and no tags is not free against the byte budget either.
-        self.add_stored_bytes(
-            network_interface_payload_bytes(&interface)
-                .saturating_add(STORED_RECORD_OVERHEAD_BYTES),
-        );
-        self.network_interfaces
-            .insert(network_interface_id.clone(), interface);
-        Some(network_interface_id)
-    }
+/// The caller-chosen bytes a network interface a writer ASKS for will retain, from the spec
+/// rather than from the stored record: the same three members
+/// [`network_interface_payload_bytes`] counts on the record it becomes — the tags, the
+/// description and the private addresses — so a create can ask the store's byte budget for
+/// exactly what [`ComAmazonawsEc2Amazonec2State::insert_network_interface`] will charge and
+/// [`ComAmazonawsEc2Amazonec2State::remove_network_interface`] will give back.
+pub fn network_interface_spec_bytes(spec: &NetworkInterfaceSpec) -> usize {
+    tag_list_bytes(&spec.tags)
+        .saturating_add(spec.description.len())
+        .saturating_add(spec.private_ip_addresses.iter().map(String::len).sum())
+}
 
+impl ComAmazonawsEc2Amazonec2State {
     /// Remove the network interface `network_interface_id` and answer it as it was last
-    /// reported, or `None` when the store holds no such interface. The bytes the record
-    /// held go back to the store's budget on exactly the terms
-    /// [`Self::insert_network_interface`] took them on.
+    /// reported, or `None` when the store holds no such interface.
+    ///
+    /// The exact reverse of [`Self::insert_network_interface`]: the record's bytes go back
+    /// to the store's budget, every private IPv4 address it held goes back to the one in-use
+    /// pool ([`Self::release_private_ip`]), the subnet it sat in gets those addresses
+    /// back in its `AvailableIpAddressCount`, and the `ClientToken` entry that named this
+    /// interface goes with it, bytes and all — so a create followed by a delete leaves the
+    /// store exactly where it started, an address a deleted interface held can be handed
+    /// out again, and a token whose interface is gone names nothing rather than naming a
+    /// record the store no longer holds.
     pub fn remove_network_interface(
         &mut self,
         network_interface_id: &str,
@@ -13885,6 +14146,42 @@ impl ComAmazonawsEc2Amazonec2State {
             network_interface_payload_bytes(&interface)
                 .saturating_add(STORED_RECORD_OVERHEAD_BYTES),
         );
+        // The token a create recorded for this interface, and the bytes it was charged:
+        // a token outliving the interface it names would make a replay of that create
+        // resolve to a record the store does not hold.
+        let tokens: Vec<String> = self
+            .network_interface_client_tokens
+            .iter()
+            .filter(|(_, named)| named.as_str() == network_interface_id)
+            .map(|(token, _)| token.clone())
+            .collect();
+        for token in tokens {
+            self.release_stored_bytes(token.len());
+            self.network_interface_client_tokens.remove(&token);
+        }
+        let released: Vec<String> = match interface.private_ip_addresses.as_deref() {
+            Some(addresses) => addresses
+                .iter()
+                .filter_map(|address| address.private_ip_address.clone())
+                .collect(),
+            None => interface.private_ip_address.clone().into_iter().collect(),
+        };
+        for address in &released {
+            self.release_private_ip(address);
+        }
+        if let Some(subnet) = interface
+            .subnet_id
+            .as_deref()
+            .and_then(|subnet_id| self.subnets.get_mut(subnet_id))
+        {
+            let given_back = i32::try_from(released.len()).unwrap_or(i32::MAX);
+            subnet.available_ip_address_count = Some(
+                subnet
+                    .available_ip_address_count
+                    .unwrap_or_default()
+                    .saturating_add(given_back),
+            );
+        }
         Some(interface)
     }
 

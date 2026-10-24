@@ -82,6 +82,11 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// A boolean and a numeric attribute render as a filter value the same way in every
+// describe of this crate, so both renderings live in `crate::state` rather than once per
+// operation.
+use crate::state::{boolean_filter_values, integer_filter_values};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -400,26 +405,6 @@ const VOLUME_MODIFICATION_FILTERS: [&str; 11] = [
     "volume-id",
 ];
 
-/// A boolean attribute as a filter value compares against it: the wire rendering of the
-/// member, `true` or `false`. A member that is not set carries no value for the filter to
-/// match, like any other absent attribute.
-fn boolean_values(value: Option<bool>) -> Vec<::std::borrow::Cow<'static, str>> {
-    value
-        .map(|set| ::std::borrow::Cow::Borrowed(if set { "true" } else { "false" }))
-        .into_iter()
-        .collect()
-}
-
-/// An integer attribute as a filter value compares against it: its decimal rendering. An
-/// attribute the modification does not carry — the IOPS of a volume type that provisions
-/// none, say — compares against nothing, so a filter naming it selects nothing.
-fn integer_values(value: Option<i32>) -> Vec<::std::borrow::Cow<'static, str>> {
-    value
-        .map(|number| ::std::borrow::Cow::Owned(number.to_string()))
-        .into_iter()
-        .collect()
-}
-
 /// The values the EC2 filter `name` compares against this modification.
 ///
 /// `name` is a name [`VOLUME_MODIFICATION_FILTERS`] admits. A filter naming an attribute
@@ -437,19 +422,19 @@ fn filter_values<'a>(
     };
     match name {
         "modification-state" => text(modification.modification_state.as_deref()),
-        "original-iops" => integer_values(modification.original_iops),
-        "original-size" => integer_values(modification.original_size),
+        "original-iops" => integer_filter_values(modification.original_iops),
+        "original-size" => integer_filter_values(modification.original_size),
         "original-volume-type" => text(modification.original_volume_type.as_deref()),
-        "originalMultiAttachEnabled" => boolean_values(modification.original_multi_attach_enabled),
+        "originalMultiAttachEnabled" => boolean_filter_values(modification.original_multi_attach_enabled),
         "start-time" => modification
             .start_time
             .map(|start_time| Cow::Owned(start_time.to_string()))
             .into_iter()
             .collect(),
-        "target-iops" => integer_values(modification.target_iops),
-        "target-size" => integer_values(modification.target_size),
+        "target-iops" => integer_filter_values(modification.target_iops),
+        "target-size" => integer_filter_values(modification.target_size),
         "target-volume-type" => text(modification.target_volume_type.as_deref()),
-        "targetMultiAttachEnabled" => boolean_values(modification.target_multi_attach_enabled),
+        "targetMultiAttachEnabled" => boolean_filter_values(modification.target_multi_attach_enabled),
         "volume-id" => text(modification.volume_id.as_deref()),
         // Unreachable: the handler has already refused every other name. An undefined name
         // compares against nothing, so it could never widen a result even if that check

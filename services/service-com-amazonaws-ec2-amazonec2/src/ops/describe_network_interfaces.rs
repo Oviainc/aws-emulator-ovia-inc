@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeNetworkInterfaces
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeNetworkInterfaces`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeNetworkInterfaces::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the account's network interfaces out of [`crate::state`]: the whole store by
+//! default, or the subset the request's `NetworkInterfaceIds` and `Filters` select, one
+//! `MaxResults`-sized page at a time. A reporting operation only — it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -92,6 +87,13 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::borrow::Cow;
+
+use crate::state::{
+    CompiledFilter, MAX_FILTERS, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES, MAX_FILTER_VALUE_BYTES,
+    MAX_PAGE_SIZE, MAX_RESOURCE_IDS, MatchBudget, boolean_filter_values, integer_filter_values,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -159,18 +161,423 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeNetworkInterfaces` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeNetworkInterfacesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries request metadata only; this operation reads none of it. The store
+        // is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "Checks whether you have the required permissions for the action, without
+        // actually making the request, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation"
+        // (`DescribeNetworkInterfacesRequest$DryRun`). Every caller of this emulator is
+        // permitted, so a dry run reports that outcome and reads nothing.
+        if input.dry_run.unwrap_or(false) {
+            return Err(crate::state::dry_run_operation());
+        }
+
+        let state = crate::state::require_service_state(&*self.engine)?;
+
+        // "The token returned from a previous paginated request"
+        // (`DescribeNetworkInterfacesRequest$NextToken`) — anything else is refused rather
+        // than read as an id, and it is refused before any other member is looked at, so
+        // whether a bogus token is caught never depends on the rest of the request.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_page_token(token)
+                    .ok_or_else(crate::state::invalid_pagination_token)?,
+            ),
+        };
+
+        // "You cannot specify this parameter and the network interface IDs parameter in
+        // the same request" (`DescribeNetworkInterfacesRequest$MaxResults`).
+        let requested: &[String] = input.network_interface_ids.as_deref().unwrap_or_default();
+        if input.max_results.is_some() && !requested.is_empty() {
+            return Err(crate::state::invalid_parameter_combination(
+                "The parameter MaxResults cannot be used with the parameter \
+                 NetworkInterfaceId",
+            ));
+        }
+        // The id list is caller-sized and each entry is resolved against the store, so it
+        // is capped the way every other EC2 describe of this crate caps a resource-id list.
+        if requested.len() > MAX_RESOURCE_IDS {
+            return Err(crate::state::invalid_parameter_value(format!(
+                "NetworkInterfaceIds carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
+                requested.len()
+            )));
+        }
+
+        // Matching cost is filters x values x value length x stored interfaces, and the
+        // model bounds none of them (`FilterList` and `Filter$Values` carry no `@length`),
+        // so every request-controlled factor is capped HERE, before any work proportional
+        // to it is done and before the store is locked — the same ceilings
+        // `DescribeSecurityGroups` and `DescribeInstances` enforce, from `crate::state`.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        if filters.len() > MAX_FILTERS {
+            return Err(crate::state::invalid_parameter_value(format!(
+                "The request carries {} filters, above the maximum of {MAX_FILTERS}",
+                filters.len()
+            )));
+        }
+        // A filter name this operation does not document is refused whether or not any
+        // interface would have matched it, so an unsupported filter can never read as "no
+        // results". Each value is compiled into its pattern ONCE here, rather than
+        // recompiled for every candidate interface.
+        let mut compiled: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !filter_name_is_documented(name) {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+            let values: &[String] = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so a value's size is bounded
+            // here too.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            compiled.push(CompiledFilter::new(name.to_string(), values.to_vec()));
+        }
+
+        // "Indicates whether to include managed resources in the output. If this parameter
+        // is set to true, the output includes resources that are managed by Amazon Web
+        // Services services, even if managed resource visibility is set to hidden"
+        // (`DescribeNetworkInterfacesRequest$IncludeManagedResources`). What makes an
+        // interface hidden is its own `Operator.HiddenByDefault` — "if true, the resource
+        // is hidden by default based on the managed resource visibility settings for the
+        // account" (`OperatorResponse$HiddenByDefault`) — so that member, and nothing else,
+        // is what this flag reveals.
+        let include_managed_resources = input.include_managed_resources.unwrap_or(false);
+
+        let store = state.lock();
+
+        // "The network interface IDs" (`DescribeNetworkInterfacesRequest$NetworkInterfaceIds`):
+        // an id that names no interface of the account is an error, not an absent row. Each
+        // id is looked up in the store's ordered map, so a request that names ids costs one
+        // lookup per id rather than a scan of the whole store. Repeats of one id name one
+        // interface, so the candidates are deduplicated before anything is reported.
+        let candidates: Vec<&NetworkInterface> = if requested.is_empty() {
+            store.network_interfaces.values().collect()
+        } else {
+            let named = crate::state::deduplicate_ids(requested);
+            let mut found: Vec<&NetworkInterface> = Vec::with_capacity(named.len());
+            for id in named {
+                let Some(interface) = store.network_interfaces.get(&id) else {
+                    return Err(crate::state::invalid_network_interface_id_not_found(&id));
+                };
+                found.push(interface);
+            }
+            found
+        };
+
+        // "Default: Describes all your network interfaces": `NetworkInterfaceIds` narrows
+        // the store to the ids named, and every filter must then hold ("If you specify
+        // multiple filters, the filters are joined with an AND" — `Filter`). An id the
+        // request names is reported even when it is hidden by default: the caller asked
+        // for that interface by name.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeNetworkInterfaces"))
+        // Every comparison is charged to ONE budget, so the product of stored interfaces,
+        // filters, values and value length is bounded however the caller combines them —
+        // which is also what bounds how long this holds the store's lock.
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<&NetworkInterface> = Vec::new();
+        for interface in candidates {
+            if budget.exhausted() {
+                break;
+            }
+            if requested.is_empty() && !include_managed_resources && is_hidden_by_default(interface)
+            {
+                continue;
+            }
+            if crate::state::matches_every_filter(&compiled, &mut budget, &|name| {
+                filter_values(interface, name)
+            }) {
+                selected.push(interface);
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report
+        // as a result: the request asked for more filtering than one call will do, and is
+        // told so.
+        if budget.exhausted() {
+            return Err(crate::scaffolded::Scaffolded::request_limit_exceeded(
+                format!(
+                    "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                     comparisons to evaluate; narrow them or page with MaxResults"
+                ),
+            ));
+        }
+
+        // Page in `NetworkInterfaceId` order, which the cursor below names a position in.
+        // The store is an ordered map, so its iteration order already satisfies this sort;
+        // doing it here establishes the invariant the cursor depends on at the point of use
+        // rather than inheriting it from the container `crate::state` happens to hold.
+        selected.sort_by(|left, right| left.network_interface_id.cmp(&right.network_interface_id));
+
+        // That order is both the stable paging order and the cursor, so a token naming the
+        // id the next page starts at always advances.
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => selected.partition_point(|interface| {
+                interface.network_interface_id.as_deref().unwrap_or_default() < cursor
+            }),
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        // "The maximum number of items to return for this request"
+        // (`DescribeNetworkInterfacesRequest$MaxResults`). A request that names none gets
+        // the largest page the model publishes, so the `NextToken` path below behaves the
+        // same whether or not a page size was asked for. The model's `range 5..1000` has
+        // already refused anything outside it; the clamp is what keeps the token invariant
+        // below — a page that carries at least one interface, so a caller paging on the
+        // token always advances — a property of this handler rather than of validation
+        // happening upstream.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .map(|max_results| max_results.clamp(1, MAX_PAGE_SIZE))
+            .unwrap_or(MAX_PAGE_SIZE);
+
+        // "This value is null when there are no more items to return"
+        // (`DescribeNetworkInterfacesResult$NextToken`): a token only when an interface
+        // follows this page.
+        let next_token = page
+            .get(limit)
+            .and_then(|interface| interface.network_interface_id.as_deref())
+            .map(crate::state::encode_page_token);
+
+        Ok(DescribeNetworkInterfacesOutput {
+            network_interfaces: Some(
+                page.iter()
+                    .take(limit)
+                    .map(|interface| (*interface).clone())
+                    .collect(),
+            ),
+            next_token,
+        })
+    }
+}
+
+/// The filter names this operation documents, from
+/// `DescribeNetworkInterfacesRequest$Filters`:
+///
+/// ```text
+/// smithy_query(query="doc",shape="DescribeNetworkInterfacesRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// `tag:<key>` is the one name with a variable part, so it is matched by prefix rather
+/// than listed here. Every entry must be answered by [`filter_values`].
+const NETWORK_INTERFACE_FILTERS: [&str; 36] = [
+    "addresses.association.owner-id",
+    "addresses.association.public-ip",
+    "addresses.primary",
+    "addresses.private-ip-address",
+    "association.allocation-id",
+    "association.association-id",
+    "association.ip-owner-id",
+    "association.public-dns-name",
+    "association.public-ip",
+    "attachment.attach-time",
+    "attachment.attachment-id",
+    "attachment.delete-on-termination",
+    "attachment.device-index",
+    "attachment.instance-id",
+    "attachment.instance-owner-id",
+    "attachment.status",
+    "availability-zone",
+    "availability-zone-id",
+    "description",
+    "group-id",
+    "interface-type",
+    "ipv6-addresses.ipv6-address",
+    "mac-address",
+    "network-interface-id",
+    "operator.managed",
+    "operator.principal",
+    "owner-id",
+    "private-dns-name",
+    "private-ip-address",
+    "requester-id",
+    "requester-managed",
+    "source-dest-check",
+    "status",
+    "subnet-id",
+    "tag-key",
+    "vpc-id",
+];
+
+/// Whether this operation documents a filter called `name`.
+///
+/// "Filter names are case-sensitive" (`Filter$Name`), so every comparison is exact — and a
+/// `tag:` prefix with no key names no tag, so it is as undocumented as any other
+/// misspelling.
+fn filter_name_is_documented(name: &str) -> bool {
+    if name
+        .strip_prefix(crate::state::TAG_FILTER_PREFIX)
+        .is_some_and(|key| !key.is_empty())
+    {
+        return true;
+    }
+    NETWORK_INTERFACE_FILTERS.contains(&name)
+}
+
+/// Whether this interface is one the account's managed resource visibility settings hide:
+/// "If `true`, the resource is hidden by default based on the managed resource visibility
+/// settings for the account" (`OperatorResponse$HiddenByDefault`). An interface with no
+/// operator is nobody's managed resource, so it is never hidden.
+fn is_hidden_by_default(interface: &NetworkInterface) -> bool {
+    interface
+        .operator
+        .as_ref()
+        .and_then(|operator| operator.hidden_by_default)
+        .unwrap_or(false)
+}
+
+/// The values the EC2 filter `name` compares against this network interface.
+///
+/// The AND/OR evaluation and the per-comparison budget live in
+/// [`crate::state::matches_every_filter`], which every describe of this crate shares; this
+/// is the per-operation half it calls — what values one interface holds for a filter name.
+///
+/// A filter naming an attribute this interface does not carry compares against NO values,
+/// so it selects nothing — the same answer AWS gives for, say, `attachment.instance-id` on
+/// an interface that is not attached to anything. `name` is a name
+/// [`filter_name_is_documented`] accepted.
+fn filter_values<'a>(interface: &'a NetworkInterface, name: &str) -> Vec<Cow<'a, str>> {
+    if let Some(key) = name.strip_prefix(crate::state::TAG_FILTER_PREFIX) {
+        return interface
+            .tag_set
+            .iter()
+            .flatten()
+            .filter(|tag| tag.key.as_deref() == Some(key))
+            .filter_map(|tag| tag.value.as_deref().map(Cow::Borrowed))
+            .collect();
+    }
+
+    let association = || interface.association.as_ref();
+    let attachment = || interface.attachment.as_ref();
+    let operator = || interface.operator.as_ref();
+    let addresses = || interface.private_ip_addresses.iter().flatten();
+    let address_associations = || addresses().filter_map(|address| address.association.as_ref());
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    match name {
+        "addresses.association.owner-id" => address_associations()
+            .filter_map(|found| found.ip_owner_id.as_deref().map(Cow::Borrowed))
+            .collect(),
+        "addresses.association.public-ip" => address_associations()
+            .filter_map(|found| found.public_ip.as_deref().map(Cow::Borrowed))
+            .collect(),
+        "addresses.primary" => addresses()
+            .flat_map(|address| boolean_filter_values(address.primary))
+            .collect(),
+        "addresses.private-ip-address" => addresses()
+            .filter_map(|address| address.private_ip_address.as_deref().map(Cow::Borrowed))
+            .collect(),
+        "association.allocation-id" => {
+            text(association().and_then(|found| found.allocation_id.as_deref()))
+        }
+        "association.association-id" => {
+            text(association().and_then(|found| found.association_id.as_deref()))
+        }
+        "association.ip-owner-id" => {
+            text(association().and_then(|found| found.ip_owner_id.as_deref()))
+        }
+        "association.public-dns-name" => {
+            text(association().and_then(|found| found.public_dns_name.as_deref()))
+        }
+        "association.public-ip" => text(association().and_then(|found| found.public_ip.as_deref())),
+        // The attach time compares as the wire carries it: RFC 3339 in UTC, the rendering
+        // `@timestampFormat` `date-time` names.
+        "attachment.attach-time" => attachment()
+            .and_then(|found| found.attach_time.as_ref())
+            .and_then(|at| {
+                at.fmt(::aws_smithy_types::date_time::Format::DateTime)
+                    .ok()
+            })
+            .map(Cow::Owned)
+            .into_iter()
+            .collect(),
+        "attachment.attachment-id" => {
+            text(attachment().and_then(|found| found.attachment_id.as_deref()))
+        }
+        "attachment.delete-on-termination" => {
+            boolean_filter_values(attachment().and_then(|found| found.delete_on_termination))
+        }
+        "attachment.device-index" => {
+            integer_filter_values(attachment().and_then(|found| found.device_index))
+        }
+        "attachment.instance-id" => {
+            text(attachment().and_then(|found| found.instance_id.as_deref()))
+        }
+        "attachment.instance-owner-id" => {
+            text(attachment().and_then(|found| found.instance_owner_id.as_deref()))
+        }
+        "attachment.status" => text(attachment().and_then(|found| found.status.as_deref())),
+        "availability-zone" => text(interface.availability_zone.as_deref()),
+        "availability-zone-id" => text(interface.availability_zone_id.as_deref()),
+        "description" => text(interface.description.as_deref()),
+        "group-id" => interface
+            .groups
+            .iter()
+            .flatten()
+            .filter_map(|group| group.group_id.as_deref().map(Cow::Borrowed))
+            .collect(),
+        "interface-type" => text(interface.interface_type.as_deref()),
+        "ipv6-addresses.ipv6-address" => interface
+            .ipv6_addresses
+            .iter()
+            .flatten()
+            .filter_map(|address| address.ipv6_address.as_deref().map(Cow::Borrowed))
+            .collect(),
+        "mac-address" => text(interface.mac_address.as_deref()),
+        "network-interface-id" => text(interface.network_interface_id.as_deref()),
+        "operator.managed" => boolean_filter_values(operator().and_then(|found| found.managed)),
+        "operator.principal" => text(operator().and_then(|found| found.principal.as_deref())),
+        "owner-id" => text(interface.owner_id.as_deref()),
+        "private-dns-name" => text(interface.private_dns_name.as_deref()),
+        // "The private IPv4 address or addresses of the network interface": the primary
+        // address and every address the interface holds, so the filter selects on a
+        // secondary address too.
+        "private-ip-address" => {
+            let mut values = text(interface.private_ip_address.as_deref());
+            values.extend(
+                addresses().filter_map(|address| {
+                    address.private_ip_address.as_deref().map(Cow::Borrowed)
+                }),
+            );
+            values
+        }
+        "requester-id" => text(interface.requester_id.as_deref()),
+        "requester-managed" => boolean_filter_values(interface.requester_managed),
+        "source-dest-check" => boolean_filter_values(interface.source_dest_check),
+        "status" => text(interface.status.as_deref()),
+        "subnet-id" => text(interface.subnet_id.as_deref()),
+        "tag-key" => interface
+            .tag_set
+            .iter()
+            .flatten()
+            .filter_map(|tag| tag.key.as_deref().map(Cow::Borrowed))
+            .collect(),
+        "vpc-id" => text(interface.vpc_id.as_deref()),
+        // Unreachable: `filter_name_is_documented` has already refused every other name.
+        // An undefined name compares against nothing, so it could never widen a result
+        // even if that check were bypassed.
+        _ => Vec::new(),
     }
 }

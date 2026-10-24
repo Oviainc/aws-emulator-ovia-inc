@@ -88,6 +88,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// A boolean attribute renders as a filter value the same way in every describe of this
+// crate, so that rendering lives in `crate::state` rather than once per operation.
+use crate::state::boolean_filter_values;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -420,16 +424,6 @@ fn canonical_filter_name(name: &str) -> Option<&str> {
     VOLUME_FILTERS.contains(&name).then_some(name)
 }
 
-/// A boolean attribute as a filter value compares against it: the wire rendering of the
-/// member, `true` or `false`. A member that is not set carries no value for the filter to
-/// match, like any other absent attribute.
-fn boolean_values(value: Option<bool>) -> Vec<::std::borrow::Cow<'static, str>> {
-    value
-        .map(|set| ::std::borrow::Cow::Borrowed(if set { "true" } else { "false" }))
-        .into_iter()
-        .collect()
-}
-
 /// The values the EC2 filter `name` compares against this volume.
 ///
 /// A filter naming an attribute this volume does not carry compares against NO values, so
@@ -463,7 +457,7 @@ fn filter_values<'a>(
             .map(|attach_time| Cow::Owned(attach_time.to_string()))
             .collect(),
         "attachment.delete-on-termination" => attachments()
-            .flat_map(|attachment| boolean_values(attachment.delete_on_termination))
+            .flat_map(|attachment| boolean_filter_values(attachment.delete_on_termination))
             .collect(),
         "attachment.device" => attachments()
             .filter_map(|attachment| attachment.device.as_deref().map(Cow::Borrowed))
@@ -481,10 +475,10 @@ fn filter_values<'a>(
             .map(|create_time| Cow::Owned(create_time.to_string()))
             .into_iter()
             .collect(),
-        "encrypted" => boolean_values(volume.encrypted),
-        "fast-restored" => boolean_values(volume.fast_restored),
-        "multi-attach-enabled" => boolean_values(volume.multi_attach_enabled),
-        "operator.managed" => boolean_values(operator().and_then(|operator| operator.managed)),
+        "encrypted" => boolean_filter_values(volume.encrypted),
+        "fast-restored" => boolean_filter_values(volume.fast_restored),
+        "multi-attach-enabled" => boolean_filter_values(volume.multi_attach_enabled),
+        "operator.managed" => boolean_filter_values(operator().and_then(|operator| operator.managed)),
         "operator.principal" => {
             text(operator().and_then(|operator| operator.principal.as_deref()))
         }

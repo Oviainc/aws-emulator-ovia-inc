@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateNetworkInterface
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateNetworkInterface`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateNetworkInterface::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates one elastic network interface in the subnet the request names and stores it in
+//! [`crate::state`], where `DescribeNetworkInterfaces` reports it: the interface's private
+//! IPv4 addresses come out of that subnet's assignable range, its VPC and Availability
+//! Zone from the subnet itself, and its security groups from the account's groups in that
+//! VPC. The IPv6, prefix, connection-tracking and operator members name state this slice
+//! does not hold, so a request that carries one is answered with a 501 rather than an
+//! interface that silently lacks what was asked for.
 //!
 //! ## Shape of an operation
 //!
@@ -200,18 +199,464 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateNetworkInterface` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateNetworkInterfaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateNetworkInterface"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state;
+
+        // Members that name state this slice does not hold. Each one CONTRADICTS what the
+        // interface would otherwise report — an IPv6 address has to come out of the
+        // subnet's IPv6 range, a prefix out of its delegated prefixes, a connection
+        // tracking configuration and an operator are resources of their own — so a request
+        // that carries one is refused as unwritten rather than answered with an interface
+        // that silently lacks it.
+        if input
+            .ipv6_addresses
+            .as_ref()
+            .is_some_and(|addresses| !addresses.is_empty())
+            || input.ipv6_address_count.is_some_and(|count| count > 0)
+            || input.enable_primary_ipv6.unwrap_or(false)
+        {
+            return Err(Scaffolded::not_implemented(
+                "CreateNetworkInterface with IPv6 addresses",
+            ));
+        }
+        if input
+            .ipv4_prefixes
+            .as_ref()
+            .is_some_and(|prefixes| !prefixes.is_empty())
+            || input.ipv4_prefix_count.is_some_and(|count| count > 0)
+            || input
+                .ipv6_prefixes
+                .as_ref()
+                .is_some_and(|prefixes| !prefixes.is_empty())
+            || input.ipv6_prefix_count.is_some_and(|count| count > 0)
+        {
+            return Err(Scaffolded::not_implemented(
+                "CreateNetworkInterface with assigned prefixes",
+            ));
+        }
+        if input.connection_tracking_specification.is_some() {
+            return Err(Scaffolded::not_implemented(
+                "CreateNetworkInterface with a connection tracking specification",
+            ));
+        }
+        if input.operator.is_some() {
+            return Err(Scaffolded::not_implemented(
+                "CreateNetworkInterface with an operator",
+            ));
+        }
+
+        // "The type of network interface. The default is interface" (`InterfaceType`). The
+        // member targets `NetworkInterfaceCreationType`, so the boundary validator has
+        // already refused every value outside that enum.
+        let interface_type = input
+            .interface_type
+            .clone()
+            .unwrap_or_else(|| state::NETWORK_INTERFACE_TYPE_INTERFACE.to_string());
+        let efa_only = interface_type == state::NETWORK_INTERFACE_TYPE_EFA_ONLY;
+
+        // "Unique, case-sensitive identifier that you provide to ensure the idempotency of
+        // the request" (`ClientToken`) — a caller-chosen string this store retains, so it
+        // is held to the length EC2 documents for a client token.
+        if let Some(token) = input.client_token.as_deref() {
+            if token.chars().count() > state::MAX_CLIENT_TOKEN_CHARS {
+                return Err(state::invalid_parameter_value(format!(
+                    "Invalid value for clientToken: it may carry at most {max} characters",
+                    max = state::MAX_CLIENT_TOKEN_CHARS,
+                )));
+            }
+        }
+
+        // "The tags to apply to the new network interface" — the shared tag-specification
+        // reader every create of this crate uses, so the resource-type rule, the tag
+        // ceilings and the reserved-key refusal cannot drift per operation.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_NETWORK_INTERFACE,
+            "CreateNetworkInterface",
+        )?;
+
+        // The address members' own documented combination rules, each refused before any
+        // address is resolved so the answer never depends on which one was looked at first.
+        let specified: &[PrivateIpAddressSpecification] =
+            input.private_ip_addresses.as_deref().unwrap_or_default();
+        let secondary_count = input.secondary_private_ip_address_count.unwrap_or(0);
+        // `PrivateIpAddresses` carries no `@length`, so the list a caller may send is
+        // unbounded; the per-interface ceiling is enforced HERE, before any work
+        // proportional to the list's size — parsing an address, probing the in-use set — is
+        // done, the way the describe path caps its filter factors up front.
+        if specified.len() > state::MAX_PRIVATE_IPS_PER_NETWORK_INTERFACE {
+            return Err(state::invalid_parameter_value(format!(
+                "The request names {} private IPv4 addresses, above the maximum of {max} \
+                 per network interface",
+                specified.len(),
+                max = state::MAX_PRIVATE_IPS_PER_NETWORK_INTERFACE,
+            )));
+        }
+        if secondary_count < 0 {
+            return Err(state::invalid_parameter_value(format!(
+                "Invalid value '{secondary_count}' for secondaryPrivateIpAddressCount. \
+                 It cannot be negative"
+            )));
+        }
+        if efa_only
+            && (input.private_ip_address.is_some() || !specified.is_empty() || secondary_count > 0)
+        {
+            // "If you specify efa-only, do not assign any IP addresses to the network
+            // interface. EFA-only network interfaces do not support IP addresses"
+            // (`InterfaceType`).
+            return Err(state::invalid_parameter_combination(
+                "An efa-only network interface does not support IP addresses",
+            ));
+        }
+        if secondary_count > 0 && specified.len() > 1 {
+            // "You can't specify this option and specify more than one private IP address
+            // using privateIpAddresses" (`SecondaryPrivateIpAddressCount`).
+            return Err(state::invalid_parameter_combination(
+                "You cannot specify SecondaryPrivateIpAddressCount and more than one \
+                 address in PrivateIpAddresses",
+            ));
+        }
+        if specified
+            .iter()
+            .filter(|address| address.primary.unwrap_or(false))
+            .count()
+            > 1
+        {
+            // "Only one IPv4 address can be designated as primary"
+            // (`PrivateIpAddressSpecification$Primary`).
+            return Err(state::invalid_parameter_value(
+                "Only one IPv4 address can be designated as primary",
+            ));
+        }
+        if input.private_ip_address.is_some()
+            && specified
+                .iter()
+                .any(|address| address.primary.unwrap_or(false))
+        {
+            // "If you specify an IP address, you cannot indicate any IP addresses specified
+            // in privateIpAddresses as primary" (`PrivateIpAddress`).
+            return Err(state::invalid_parameter_combination(
+                "You cannot designate an address in PrivateIpAddresses as primary when \
+                 PrivateIpAddress is specified",
+            ));
+        }
+        // Each entry has to carry the address it specifies: an entry with none names
+        // nothing to assign.
+        for address in specified {
+            if address
+                .private_ip_address
+                .as_deref()
+                .is_none_or(str::is_empty)
+            {
+                return Err(state::missing_parameter(
+                    "Each entry of PrivateIpAddresses must carry a privateIpAddress",
+                ));
+            }
+        }
+
+        let interfaces = state::require_service_state(&*self.engine)?;
+        let region = state::request_region(ctx.parts());
+        let mut store = interfaces.lock();
+
+        // "Unique, case-sensitive identifier that you provide to ensure the idempotency of
+        // the request": a repeat of a request this store already served answers with the
+        // interface it created then, and creates nothing. The request is compared against
+        // that interface further down, once every member has been resolved — a token is
+        // idempotent for the request it was first given with, not for any later one.
+        let replayed: Option<String> = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.network_interface_client_tokens.get(token))
+            .cloned();
+
+        // "The ID of the subnet to associate with the network interface" (`SubnetId`): the
+        // subnet is what the interface's VPC, Availability Zone and address range come
+        // from, so an id naming no subnet of the account is an error.
+        let Some(subnet) = store.subnets.get(&input.subnet_id) else {
+            return Err(state::invalid_subnet_id_not_found(&input.subnet_id));
+        };
+        let subnet_id = input.subnet_id.clone();
+        let vpc_id = subnet.vpc_id.clone().unwrap_or_default();
+        let availability_zone = subnet.availability_zone.clone().unwrap_or_default();
+        let availability_zone_id = subnet.availability_zone_id.clone().unwrap_or_default();
+        let cidr_block = subnet.cidr_block.clone().unwrap_or_default();
+
+        // "The IDs of the security groups" (`Groups`). A group has to exist and has to be a
+        // group of the interface's own VPC — a security group only applies within its VPC —
+        // and the list is held to the number AWS documents per network interface.
+        let requested_groups = state::deduplicate_ids(input.groups.as_deref().unwrap_or_default());
+        if requested_groups.len() > state::MAX_SECURITY_GROUPS_PER_INSTANCE {
+            return Err(state::invalid_parameter_value(format!(
+                "The request names {} security groups, above the maximum of {max} per \
+                 network interface",
+                requested_groups.len(),
+                max = state::MAX_SECURITY_GROUPS_PER_INSTANCE,
+            )));
+        }
+        let mut groups: Vec<GroupIdentifier> = Vec::with_capacity(requested_groups.len());
+        for group_id in &requested_groups {
+            let Some(group) = store
+                .security_groups
+                .get(group_id)
+                .filter(|group| group.vpc_id.as_deref() == Some(vpc_id.as_str()))
+            else {
+                return Err(state::invalid_group_not_found(group_id));
+            };
+            groups.push(GroupIdentifier {
+                group_id: group.group_id.clone(),
+                group_name: group.group_name.clone(),
+            });
+        }
+        // "Default: Amazon EC2 uses the default security group"
+        // (`RunInstancesRequest$SecurityGroupIds`) — the group "your VPC automatically comes
+        // with" (Amazon VPC User Guide, "Default security groups for your VPCs") — so an
+        // interface created without groups gets its VPC's default group rather than none.
+        if groups.is_empty() {
+            if let Some(default_group) = store.security_groups.values().find(|group| {
+                group.vpc_id.as_deref() == Some(vpc_id.as_str())
+                    && group.group_name.as_deref() == Some(state::DEFAULT_SECURITY_GROUP_NAME)
+            }) {
+                groups.push(GroupIdentifier {
+                    group_id: default_group.group_id.clone(),
+                    group_name: default_group.group_name.clone(),
+                });
+            }
+        }
+
+        // The addresses the interface will hold, PRIMARY FIRST. "If you don't specify an
+        // IPv4 address, Amazon EC2 selects one for you from the subnet's IPv4 CIDR range"
+        // (`PrivateIpAddress`), and the same for each secondary address a count asks for.
+        // Both the judgement and the taking are the store's own: a caller-named address is
+        // judged by [`crate::state::is_assignable_subnet_address`] and taken with
+        // `reserve_private_ip`, and a service-chosen one comes from
+        // `mint_private_ip_in_cidr` — the one scan every subnet address of this crate comes
+        // out of, which sees the addresses recorded on a route server endpoint as well as
+        // the pool, so no two resources of a subnet can be handed the same address.
+        let mut addresses: Vec<String> = Vec::new();
+        let explicit_primary = input.private_ip_address.clone().or_else(|| {
+            specified
+                .iter()
+                .find(|address| address.primary.unwrap_or(false))
+                .and_then(|address| address.private_ip_address.clone())
+        });
+        let mut explicit: Vec<String> = explicit_primary.clone().into_iter().collect();
+        explicit.extend(
+            specified
+                .iter()
+                .filter_map(|address| address.private_ip_address.clone())
+                .filter(|address| explicit_primary.as_deref() != Some(address.as_str())),
+        );
+        // "When you specify a number of secondary IPv4 addresses, Amazon EC2 selects these
+        // IP addresses within the subnet's IPv4 CIDR range"
+        // (`SecondaryPrivateIpAddressCount`): they are additional to the primary address,
+        // which every interface that carries addresses at all has — so an interface asks
+        // for the addresses the request named (at least the primary one) plus that count.
+        let wanted = if efa_only {
+            0
+        } else {
+            explicit
+                .len()
+                .max(1)
+                .saturating_add(usize::try_from(secondary_count).unwrap_or_default())
+        };
+        if wanted > state::MAX_PRIVATE_IPS_PER_NETWORK_INTERFACE {
+            return Err(state::invalid_parameter_value(format!(
+                "The request asks for {wanted} private IPv4 addresses, above the maximum \
+                 of {max} per network interface",
+                max = state::MAX_PRIVATE_IPS_PER_NETWORK_INTERFACE,
+            )));
+        }
+
+        // A token is only idempotent for the REQUEST it was first given with: replayed with
+        // different parameters it names an interface the caller did not ask for, which EC2
+        // refuses with `IdempotentParameterMismatch` rather than answers. Compared on what
+        // the REQUEST chose — the subnet, description, type, security groups, tags, the
+        // addresses it named and how many it asked for — never on the values the service
+        // selected itself, which a repeat could not have asked for. Checked here, before
+        // any address is resolved, so a replay is neither charged for the addresses the
+        // first call already took nor refused for a store that has since filled up.
+        if let Some(network_interface_id) = replayed.as_deref() {
+            let stored = store
+                .network_interfaces
+                .get(network_interface_id)
+                .ok_or_else(|| {
+                    Scaffolded::internal_error(format!(
+                        "a client token names network interface '{network_interface_id}', \
+                         which is not stored"
+                    ))
+                })?
+                .clone();
+            let stored_addresses: Vec<&str> = stored
+                .private_ip_addresses
+                .iter()
+                .flatten()
+                .filter_map(|address| address.private_ip_address.as_deref())
+                .collect();
+            let same_request = stored.subnet_id.as_deref() == Some(subnet_id.as_str())
+                && stored.description.as_deref().unwrap_or_default()
+                    == input.description.as_deref().unwrap_or_default()
+                && stored.interface_type.as_deref() == Some(interface_type.as_str())
+                && state::same_group_ids(stored.groups.as_deref().unwrap_or_default(), &groups)
+                && state::same_tags(stored.tag_set.as_deref().unwrap_or_default(), &tags)
+                && stored_addresses.len() == wanted
+                && explicit
+                    .iter()
+                    .all(|address| stored_addresses.contains(&address.as_str()));
+            if !same_request {
+                // The crate's ONE helper for this refusal, which carries EC2's documented
+                // wording rather than echoing what the caller sent.
+                return Err(state::idempotent_parameter_mismatch());
+            }
+            // A dry run never makes the request, and an idempotent repeat is still the
+            // request: "If you have the required permissions, the error response is
+            // DryRunOperation" (`DryRun`). So the token's own outcome is reported the same
+            // way a first call's would be, rather than the stored interface.
+            if input.dry_run.unwrap_or(false) {
+                return Err(state::dry_run_operation());
+            }
+            return Ok(CreateNetworkInterfaceOutput {
+                network_interface: Some(stored),
+                client_token: input.client_token.clone(),
+            });
+        }
+
+        for address in explicit {
+            // "The private IPv4 address" has to be one of the subnet's assignable
+            // addresses: outside its CIDR block, or one of the five AWS reserves in it,
+            // there is nothing to assign.
+            if !state::is_assignable_subnet_address(&cidr_block, &address) {
+                release_taken(&mut store, &addresses);
+                return Err(state::invalid_parameter_value(format!(
+                    "Value ({address}) for parameter privateIpAddress is invalid. \
+                     Address does not fall within the subnet's assignable address range \
+                     {cidr_block}"
+                )));
+            }
+            // `reserve_private_ip` answers `false` when anything in the account already
+            // holds the address — including an address recorded on a route server endpoint
+            // rather than in the pool — so ONE question decides it for every resource, and
+            // a request naming one address twice is refused the second time.
+            if !store.reserve_private_ip(&address) {
+                release_taken(&mut store, &addresses);
+                return Err(Scaffolded::invalid_ip_address_in_use(&address));
+            }
+            addresses.push(address);
+        }
+        // The addresses the request did not name, EC2 selects: "If you don't specify an
+        // IPv4 address, Amazon EC2 selects one for you from the subnet's IPv4 CIDR range".
+        // Each one is the store's own choice-and-take, so a secondary address can collide
+        // neither with one this request already took nor with one another resource holds.
+        while addresses.len() < wanted {
+            let Some(free) = store.mint_private_ip_in_cidr(&cidr_block) else {
+                // "The subnet does not have enough free private IPv4 addresses to satisfy
+                // the request" — EC2's `InsufficientFreeAddressesInSubnet`.
+                release_taken(&mut store, &addresses);
+                return Err(Scaffolded::insufficient_free_addresses());
+            };
+            addresses.push(free);
+        }
+
+        // The interface this request asks for, built BEFORE the store's ceilings are asked
+        // so the byte budget is asked for exactly what the insert will charge: the record's
+        // own bytes are `network_interface_spec_bytes` of this spec plus the per-record
+        // overhead — the one formula `insert_network_interface` charges and
+        // `remove_network_interface` gives back — and the client token is charged beside the
+        // entry that retains it.
+        let spec = state::NetworkInterfaceSpec {
+            subnet_id,
+            vpc_id,
+            availability_zone,
+            availability_zone_id,
+            region,
+            // AWS reports an empty description for an interface created without one.
+            description: input.description.clone().unwrap_or_default(),
+            interface_type,
+            private_ip_addresses: addresses,
+            groups,
+            // A created interface is attached to nothing: "available" until an attach
+            // moves it.
+            attachment: None,
+            tags,
+        };
+        let payload_bytes = state::network_interface_spec_bytes(&spec)
+            .saturating_add(state::STORED_RECORD_OVERHEAD_BYTES)
+            .saturating_add(input.client_token.as_deref().map_or(0, str::len));
+        // The addresses the selection took, as the release path reads them: every refusal
+        // below hands them back, and the spec itself moves into the store.
+        let addresses_taken = spec.private_ip_addresses.clone();
+
+        // A count ceiling first, then the byte budget: a record count on its own admits
+        // gigabytes, because each record holds strings the caller chose the length of. Both
+        // refusals hand the addresses back, so a refused create leaves the subnet's
+        // addresses exactly as it found them.
+        if !store.has_network_interface_capacity() {
+            release_taken(&mut store, &addresses_taken);
+            return Err(state::network_interface_limit_exceeded());
+        }
+        if store.would_exceed_stored_bytes(payload_bytes) {
+            release_taken(&mut store, &addresses_taken);
+            return Err(Scaffolded::tag_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied \
+                 data, so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (`DryRun`).
+        // Nothing is stored, and the addresses the selection took go back.
+        if input.dry_run.unwrap_or(false) {
+            release_taken(&mut store, &addresses_taken);
+            return Err(state::dry_run_operation());
+        }
+
+        // `None` only when the store filled between the capacity question above and here,
+        // which cannot happen under the one lock this handler holds — it is answered with
+        // the same refusal that question earns rather than unwrapped, handing the addresses
+        // back the way every refusal above does.
+        let Some(network_interface_id) = store.insert_network_interface(spec) else {
+            release_taken(&mut store, &addresses_taken);
+            return Err(state::network_interface_limit_exceeded());
+        };
+        if let Some(token) = input.client_token.clone() {
+            store.add_stored_bytes(token.len());
+            store
+                .network_interface_client_tokens
+                .insert(token, network_interface_id.clone());
+        }
+
+        // The answer is the record as it was stored, so `CreateNetworkInterface` and
+        // `DescribeNetworkInterfaces` cannot drift apart.
+        let Some(interface) = store.network_interfaces.get(&network_interface_id).cloned() else {
+            return Err(state::internal_error(
+                "the network interface just created could not be read back",
+            ));
+        };
+        Ok(CreateNetworkInterfaceOutput {
+            network_interface: Some(interface),
+            client_token: input.client_token.clone(),
+        })
     }
 }
+
+/// Hand back every private IPv4 address this call had already taken.
+///
+/// The selection above TAKES each address as it chooses it (`reserve_private_ip` /
+/// `mint_private_ip_in_cidr`), which is what stops one request handing the same address out
+/// twice; so every refusal after the first take releases them again
+/// ([`crate::state::ComAmazonawsEc2Amazonec2State::release_private_ip`], the reverse of
+/// that take), and a refused create leaves the subnet's addresses exactly as it found them.
+fn release_taken(
+    store: &mut crate::state::ComAmazonawsEc2Amazonec2State,
+    addresses: &[String],
+) {
+    for address in addresses {
+        store.release_private_ip(address);
+    }
+}
+
+// What a replayed `ClientToken` compares its security groups and its tags on lives in
+// `crate::state` (`same_group_ids` / `same_tags`), beside the other comparisons every
+// create of this crate shares, so one rule about what "the same request" means serves all
+// of them.

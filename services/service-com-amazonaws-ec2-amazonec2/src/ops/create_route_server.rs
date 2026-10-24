@@ -151,7 +151,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::state::{
             idempotent_parameter_mismatch, request_region, require_service_state,
             route_server_limit_exceeded, route_server_payload_bytes, route_server_sns_topic_arn,
-            tags_from_specifications, RouteServerRecord, AMAZON_SIDE_ASN_RANGE,
+            same_tags, tags_from_specifications, RouteServerRecord, AMAZON_SIDE_ASN_RANGE,
             MAX_CLIENT_TOKEN_CHARS, MAX_STORED_BYTES, MAX_STORED_ROUTE_SERVERS,
             PERSIST_ROUTES_DURATION_RANGE, PERSIST_ROUTES_ENABLE, ROUTE_SERVER_ID_PREFIX,
             ROUTE_SERVER_TAGGABLE_RESOURCE, TRANSITION_DELAY,
@@ -383,23 +383,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// Do two tag lists ask for the same tags?
-///
-/// What a replayed `ClientToken` is compared on, beside the scalar members. A tag set is
-/// unordered — "Tag keys must be unique per resource", so a list is a SET of key/value pairs
-/// and the order a client sent them in is not part of what it asked for — so both lists are
-/// compared as sorted pairs rather than positionally. The members are compared as the
-/// `Option`s they are, so a tag that carries no value stays distinguishable from one whose
-/// value is the empty string. The modelled `Tag` carries no `PartialEq`, hence the explicit
-/// pairs.
-fn same_tags(stored: &[Tag], asked: &[Tag]) -> bool {
-    let pairs = |tags: &[Tag]| -> Vec<(Option<String>, Option<String>)> {
-        let mut pairs: Vec<(Option<String>, Option<String>)> = tags
-            .iter()
-            .map(|tag| (tag.key.clone(), tag.value.clone()))
-            .collect();
-        pairs.sort();
-        pairs
-    };
-    pairs(stored) == pairs(asked)
-}
+// What a replayed `ClientToken` compares its tags on lives in `crate::state::same_tags`,
+// beside the other comparisons every create of this crate shares, so one rule about what
+// "the same request" means serves all of them.

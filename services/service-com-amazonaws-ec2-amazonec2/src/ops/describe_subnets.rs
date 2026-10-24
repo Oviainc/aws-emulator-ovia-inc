@@ -82,6 +82,11 @@ use super::types::*;
 
 use std::borrow::Cow;
 
+// A boolean and a numeric attribute render as a filter value the same way in every
+// describe of this crate, so both renderings live in `crate::state` rather than once per
+// operation.
+use crate::state::{boolean_filter_values, integer_filter_values};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -348,25 +353,6 @@ fn canonical_filter_name(name: &str) -> Option<&str> {
         .map(|(_, documented)| *documented)
 }
 
-/// A boolean attribute as a filter value compares against it: the wire rendering of the
-/// member, `true` or `false`. A member that is not set carries no value for the filter to
-/// match, like any other absent attribute.
-fn boolean_values(value: Option<bool>) -> Vec<Cow<'static, str>> {
-    value
-        .map(|set| Cow::Borrowed(if set { "true" } else { "false" }))
-        .into_iter()
-        .collect()
-}
-
-/// A numeric attribute as a filter value compares against it: its decimal rendering, which
-/// is how the wire carries it.
-fn integer_values(value: Option<i32>) -> Vec<Cow<'static, str>> {
-    value
-        .map(|number| Cow::Owned(number.to_string()))
-        .into_iter()
-        .collect()
-}
-
 /// The values the EC2 filter `name` compares against this subnet.
 ///
 /// A filter naming an attribute this subnet does not carry compares against NO values, so
@@ -391,12 +377,12 @@ fn filter_values<'a>(subnet: &'a Subnet, name: &str) -> Vec<Cow<'a, str>> {
     match name {
         "availability-zone" => text(subnet.availability_zone.as_deref()),
         "availability-zone-id" => text(subnet.availability_zone_id.as_deref()),
-        "available-ip-address-count" => integer_values(subnet.available_ip_address_count),
+        "available-ip-address-count" => integer_filter_values(subnet.available_ip_address_count),
         "cidr-block" => text(subnet.cidr_block.as_deref()),
         "customer-owned-ipv4-pool" => text(subnet.customer_owned_ipv4_pool.as_deref()),
-        "default-for-az" => boolean_values(subnet.default_for_az),
-        "enable-dns64" => boolean_values(subnet.enable_dns64),
-        "enable-lni-at-device-index" => integer_values(subnet.enable_lni_at_device_index),
+        "default-for-az" => boolean_filter_values(subnet.default_for_az),
+        "enable-dns64" => boolean_filter_values(subnet.enable_dns64),
+        "enable-lni-at-device-index" => integer_filter_values(subnet.enable_lni_at_device_index),
         "ipv6-cidr-block-association.association-id" => ipv6_associations()
             .filter_map(|association| association.association_id.as_deref().map(Cow::Borrowed))
             .collect(),
@@ -412,18 +398,20 @@ fn filter_values<'a>(subnet: &'a Subnet, name: &str) -> Vec<Cow<'a, str>> {
                     .map(Cow::Borrowed)
             })
             .collect(),
-        "ipv6-native" => boolean_values(subnet.ipv6_native),
+        "ipv6-native" => boolean_filter_values(subnet.ipv6_native),
         "map-customer-owned-ip-on-launch" => {
-            boolean_values(subnet.map_customer_owned_ip_on_launch)
+            boolean_filter_values(subnet.map_customer_owned_ip_on_launch)
         }
-        "map-public-ip-on-launch" => boolean_values(subnet.map_public_ip_on_launch),
+        "map-public-ip-on-launch" => boolean_filter_values(subnet.map_public_ip_on_launch),
         "outpost-arn" => text(subnet.outpost_arn.as_deref()),
         "owner-id" => text(subnet.owner_id.as_deref()),
-        "private-dns-name-options-on-launch.enable-resource-name-dns-a-record" => boolean_values(
-            private_dns_options().and_then(|options| options.enable_resource_name_dns_a_record),
-        ),
+        "private-dns-name-options-on-launch.enable-resource-name-dns-a-record" => {
+            boolean_filter_values(
+                private_dns_options().and_then(|options| options.enable_resource_name_dns_a_record),
+            )
+        }
         "private-dns-name-options-on-launch.enable-resource-name-dns-aaaa-record" => {
-            boolean_values(
+            boolean_filter_values(
                 private_dns_options()
                     .and_then(|options| options.enable_resource_name_dns_aaaa_record),
             )

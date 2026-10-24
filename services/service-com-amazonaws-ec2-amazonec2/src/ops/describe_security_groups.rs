@@ -428,7 +428,10 @@ fn canonical_filter_name(name: &str) -> Option<&str> {
 }
 
 /// A numeric attribute as a filter value compares against it: its decimal rendering, which
-/// is how the wire carries it.
+/// is how the wire carries it — the same rendering [`crate::state::integer_filter_values`]
+/// gives every describe of this crate, as at most one value rather than a list, which is
+/// what this operation's rule filters compose with. One value needs no allocation beyond
+/// the rendering itself, so it is spelled here rather than taken out of a `Vec`.
 fn integer_values(value: Option<i32>) -> Option<Cow<'static, str>> {
     value.map(|number| Cow::Owned(number.to_string()))
 }
