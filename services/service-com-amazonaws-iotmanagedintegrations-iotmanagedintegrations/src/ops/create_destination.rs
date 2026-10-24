@@ -208,6 +208,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A destination delivers to a target of the SAME region as the service call, so an
+        // ARN naming a target of another region is a request problem rather than a stored
+        // record — the same rule `UpdateDestination` applies to the member.
+        if crate::state::delivery_destination_is_cross_region(
+            &region,
+            &input.delivery_destination_arn,
+        ) {
+            audit(&akid, &region, "refused");
+            return Err(CreateDestinationErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(
+                        crate::state::DELIVERY_DESTINATION_REGION_MISMATCH_MESSAGE.to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
         let created_at = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
@@ -230,17 +248,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A destination is addressed by its NAME (`GET /destinations/{Name}`), so a name
         // the region already holds a destination under is a conflict rather than a second
-        // record: the caller updates or deletes the existing one.
+        // record: the caller updates or deletes the existing one. The stored destination
+        // is left exactly as it was.
         if store.destination_in(&region, &input.name).is_some() {
             drop(store);
             audit(&akid, &region, "conflict");
             return Err(CreateDestinationErrorModeled::ConflictException(
                 ConflictException {
-                    message: Some(
-                        "a destination with this name already exists; delete it or update it \
-                         instead of creating another"
-                            .to_string(),
-                    ),
+                    message: Some(crate::state::already_exists_message(
+                        crate::state::DESTINATION_RESOURCE_SUBJECT,
+                    )),
                 },
             )
             .into());
