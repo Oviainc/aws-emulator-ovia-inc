@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAliases
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAliases`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAliases::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the aliases of the function the request names, read out of that function's
+//! record in [`crate::state`]: every alias it holds, in alias-name order (the order the
+//! store keys them in), each entry the stored `AliasConfiguration` `GetAlias` reports
+//! for the same alias. `FunctionVersion` narrows the answer to the aliases that invoke
+//! that version, and `MaxItems`/`Marker` cut it into pages whose marker is the name of
+//! the last alias the page reported. Nothing here is persisted: this operation only
+//! reports what the writes before it stored.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +156,173 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAliases` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAliasesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAliases"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListAliasesErrorModeled::ServiceException(ServiceException {
+                r#type: None,
+                message: Some("Lambda state is not reachable on this engine".to_string()),
+            })
+            .into());
+        };
+
+        // `FunctionVersion` is typed `VersionWithLatestPublished`, which also admits
+        // `$LATEST.PUBLISHED` — a version `CreateAlias` refuses to mint an alias to
+        // (its own `FunctionVersion` output member, `^(\$LATEST|[0-9]+)$`, cannot even
+        // express it) and which the model says nothing further about. Rather than
+        // invent what filtering on it selects, that one value keeps the scaffold's 501;
+        // every other version is served below.
+        if input.function_version.as_deref() == Some(LATEST_PUBLISHED) {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                "ListAliases with FunctionVersion={LATEST_PUBLISHED}"
+            )));
+        }
+
+        // The model declares `MaxItems` as `@range(min: 1, max: 10000)`, so the boundary
+        // validator has already refused anything outside it; this handler enforces the
+        // same floor itself rather than letting a page size of zero reach the pagination
+        // arithmetic below.
+        if let Some(requested) = input.max_items.filter(|requested| *requested < 1) {
+            return Err(invalid_parameter(format!(
+                "1 validation error detected: Value '{requested}' at 'maxItems' failed to \
+                 satisfy constraint: Member must have value greater than or equal to 1"
+            )));
+        }
+        // "Limit the number of aliases returned": the limit is the caller's to set, and
+        // this operation's `MaxItems` — unlike `ListFunctions`'s and
+        // `ListVersionsByFunction`'s, which both document "returns a maximum of 50 items
+        // in each response, even if you set the number higher" — documents no
+        // per-response ceiling, so a caller that names none is answered with every alias
+        // the function holds (`None` here, resolved against the entry count below).
+        let requested_page_size = input
+            .max_items
+            .and_then(|requested| usize::try_from(requested).ok())
+            .map(|requested| requested.max(1));
+
+        // The marker is the name of the last alias the previous page reported, so a
+        // value that is no alias name at all names no place in the order aliases are
+        // reported in.
+        if let Some(marker) = input
+            .marker
+            .as_deref()
+            .filter(|marker| !crate::state::is_alias_name(marker))
+        {
+            return Err(invalid_parameter(format!(
+                "1 validation error detected: Value '{marker}' at 'marker' failed to satisfy \
+                 constraint: Member must be the name of a previous page's last alias"
+            )));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+
+        // "The name or ARN of the Lambda function": the aliases listed are the aliases
+        // of the one function the name resolves to, resolved exactly the way every other
+        // operation on this service resolves a `FunctionName`.
+        let record = match crate::state::resolve_function(
+            &mut store,
+            &input.function_name,
+            None,
+            &region,
+            now,
+        ) {
+            Ok((record, version)) => {
+                // An alias belongs to the function rather than to one of its versions —
+                // the version it invokes is `FunctionVersion`'s to filter on — so a
+                // `FunctionName` qualified with a version or an alias names no function
+                // whose aliases to list.
+                if version != crate::state::VERSION_LATEST {
+                    return Err(invalid_parameter(format!(
+                        "An alias belongs to a function and invokes the version named by \
+                         'FunctionVersion', and the qualifier '{version}' in 'functionName' \
+                         names a published version or an alias"
+                    )));
+                }
+                record
+            }
+            Err(crate::state::ResolveFailure::Malformed(message)) => {
+                return Err(invalid_parameter(message))
+            }
+            Err(crate::state::ResolveFailure::NotFound(message)) => {
+                return Err(not_found(message))
+            }
+        };
+
+        // "Specify a function version to only list aliases that invoke that version":
+        // the version filtered on is one of the function's own, so a version the
+        // function does not hold is a resource that does not exist rather than a filter
+        // that selects nothing.
+        if let Some(version) = input.function_version.as_deref() {
+            if record.config_of(version).is_none() {
+                return Err(not_found(format!(
+                    "Function not found: {}",
+                    record.versioned_arn(version)
+                )));
+            }
+        }
+
+        // The store keys a function's aliases by name, so its own order is the order
+        // the entries are reported and paginated in. Each entry is built from the
+        // stored record, so a listed alias reports exactly what `GetAlias` reports.
+        let entries: Vec<CreateAliasOutput> = record
+            .aliases
+            .values()
+            .filter(|alias| {
+                input
+                    .function_version
+                    .as_deref()
+                    .is_none_or(|version| alias.function_version == version)
+            })
+            .map(|alias| record.alias_configuration(alias))
+            .collect();
+
+        // The next page starts at the first alias ordered after the one the marker
+        // names, so no alias is ever reported twice.
+        let start = match input.marker.as_deref() {
+            Some(marker) => entries
+                .iter()
+                .position(|entry| entry.name.as_deref().is_some_and(|name| name > marker))
+                .unwrap_or(entries.len()),
+            None => 0,
+        };
+        let page = match entries.get(start..) {
+            Some(remaining) => {
+                let page_size = requested_page_size.unwrap_or(remaining.len());
+                &remaining[..page_size.min(remaining.len())]
+            }
+            None => &[][..],
+        };
+        let truncated = start + page.len() < entries.len();
+
+        Ok(ListAliasesOutput {
+            aliases: Some(page.to_vec()),
+            // "The pagination token that's included if more results are available" — so
+            // it is absent on the last page, and it is the name of the last alias THIS
+            // page reported, which is what the next page continues after.
+            next_marker: page
+                .last()
+                .filter(|_| truncated)
+                .and_then(|entry| entry.name.clone()),
+        })
     }
+}
+
+/// The one `FunctionVersion` value this operation does not serve; see the handler.
+const LATEST_PUBLISHED: &str = "$LATEST.PUBLISHED";
+
+/// The modelled 400 this operation refuses a request it cannot satisfy with.
+fn invalid_parameter(message: String) -> ListAliasesError {
+    ListAliasesErrorModeled::InvalidParameterValueException(InvalidParameterValueException {
+        r#type: None,
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled 404 for a function, or a version of one, this emulator does not hold.
+fn not_found(message: String) -> ListAliasesError {
+    ListAliasesErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        r#type: None,
+        message: Some(message),
+    })
+    .into()
 }
