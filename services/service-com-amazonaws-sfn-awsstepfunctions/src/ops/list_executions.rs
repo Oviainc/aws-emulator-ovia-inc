@@ -259,14 +259,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The ARN is validated BEFORE the lookup: a malformed ARN, an ARN of another
         // service and an ARN of another region are defects in the REQUEST, which
         // `InvalidArn` reports, not a state machine that is absent here.
-        if let Err(message) =
-            crate::state::read_state_machine_arn(state_machine_arn, &endpoint_region)
+        let parsed = match crate::state::read_state_machine_arn(state_machine_arn, &endpoint_region)
         {
-            return Err(ListExecutionsErrorModeled::InvalidArn(InvalidArn {
-                message: Some(message),
-            })
-            .into());
-        }
+            Ok(parsed) => parsed,
+            Err(message) => {
+                return Err(ListExecutionsErrorModeled::InvalidArn(InvalidArn {
+                    message: Some(message),
+                })
+                .into())
+            }
+        };
 
         let Some(offset) = crate::state::page_offset(input.next_token.as_deref()) else {
             return Err(ListExecutionsErrorModeled::InvalidToken(InvalidToken {
@@ -281,7 +283,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // clock already owed is reported terminal here.
         store.settle(crate::state::now());
 
-        let Some(machine) = store.state_machines.get(state_machine_arn) else {
+        // "You can also return a list of executions associated with a specific alias
+        // or version, by specifying an alias ARN or a version ARN in the
+        // stateMachineArn parameter": a qualified ARN is resolved to the state
+        // machine that owns it, and the version or alias it named is what this list
+        // is then SCOPED to.
+        let Some(reference) = store.read_state_machine_reference(state_machine_arn, &parsed) else {
+            return Err(ListExecutionsErrorModeled::StateMachineDoesNotExist(
+                StateMachineDoesNotExist {
+                    message: Some(crate::state::resource_error_message(
+                        crate::state::STATE_MACHINE_DOES_NOT_EXIST,
+                        state_machine_arn,
+                    )),
+                },
+            )
+            .into());
+        };
+        let Some(machine) = store.state_machines.get(&reference.state_machine_arn) else {
             return Err(ListExecutionsErrorModeled::StateMachineDoesNotExist(
                 StateMachineDoesNotExist {
                     message: Some(crate::state::resource_error_message(
@@ -307,7 +325,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `REDRIVEN` selects the executions a redrive was performed on.
         let redrive_filter = input.redrive_filter.as_deref();
         let matching: Vec<&crate::state::Execution> = store
-            .executions_newest_first(state_machine_arn)
+            .executions_newest_first(&reference.state_machine_arn)
             .into_iter()
             .filter(|execution| {
                 input
@@ -319,6 +337,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         Some("NOT_REDRIVEN") => execution.redrive_count == 0,
                         _ => true,
                     }
+                    // A qualified ARN selects the executions that reference started:
+                    // an execution is associated with the version it ran and, when it
+                    // was started through one, with that alias.
+                    && reference.version_arn.as_deref().is_none_or(|version_arn| {
+                        execution.state_machine_version_arn.as_deref() == Some(version_arn)
+                    })
+                    && reference.alias_arn.as_deref().is_none_or(|alias_arn| {
+                        execution.state_machine_alias_arn.as_deref() == Some(alias_arn)
+                    })
             })
             .collect();
 
@@ -335,8 +362,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 stop_date: execution.stop_date.map(crate::state::to_date_time),
                 map_run_arn: None,
                 item_count: None,
-                state_machine_version_arn: None,
-                state_machine_alias_arn: None,
+                // The alias and version the start was made through, from the
+                // execution's own record — the same attribution `DescribeExecution`
+                // reports.
+                state_machine_version_arn: execution.state_machine_version_arn.clone(),
+                state_machine_alias_arn: execution.state_machine_alias_arn.clone(),
                 redrive_count: Some(execution.redrive_count),
                 redrive_date: execution.redrive_date.map(crate::state::to_date_time),
             })

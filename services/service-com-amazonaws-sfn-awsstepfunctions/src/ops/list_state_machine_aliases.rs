@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListStateMachineAliases
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListStateMachineAliases`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListStateMachineAliases::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: lists the alias records of the state machine the ARN names — or, for
+//! a version ARN, the aliases that route to that version — newest first and paged;
+//! this is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +162,149 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListStateMachineAliases` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListStateMachineAliasesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListStateMachineAliases"))
+        // `maxResults` (0..1000), `nextToken` (len 1..1024) and `stateMachineArn`
+        // (len 1..256) are modelled, so the centralized walk has already refused
+        // anything outside them.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // The ARN is judged BEFORE anything is resolved from it: text that is not a
+        // well-formed state machine ARN of this service, in the region this endpoint
+        // serves, is a defect in the REQUEST, which `InvalidArn` reports.
+        let endpoint_region = crate::state::request_region(ctx.parts());
+        let parsed =
+            match crate::state::read_state_machine_arn(&input.state_machine_arn, &endpoint_region) {
+                Ok(parsed) => parsed,
+                Err(message) => {
+                    return Err(ListStateMachineAliasesErrorModeled::InvalidArn(InvalidArn {
+                        message: Some(message),
+                    })
+                    .into())
+                }
+            };
+
+        // A map-run LABELED ARN names a Distributed Map state inside a state machine
+        // rather than a state machine whose aliases could be listed. This operation's
+        // model declares no `ValidationException`, so the refusal goes out through the
+        // crate's one non-modelled channel — a 400 `ValidationException` carrying the
+        // sentence every other operation states it with.
+        if parsed.label().is_some() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::LABELED_ARN_MESSAGE,
+            ));
+        }
+
+        // "The value of nextToken is a unique pagination token for each page": a token
+        // this service never issued is the modelled `InvalidToken`.
+        let Some(offset) = crate::state::page_offset(input.next_token.as_deref()) else {
+            return Err(ListStateMachineAliasesErrorModeled::InvalidToken(
+                InvalidToken {
+                    message: Some("nextToken is not a token this service issued".to_string()),
+                },
+            )
+            .into());
+        };
+        let page = crate::state::page_size(input.max_results);
+
+        let mut store = state.lock();
+        // The one write a report may make: a state machine whose removal the clock
+        // already owed is gone, and its aliases went with it, so this listing does
+        // not name them.
+        store.settle(crate::state::now());
+
+        // "Lists aliases for a specified state machine ARN. [...] To list aliases that
+        // reference a state machine version, you can specify the version ARN in the
+        // stateMachineArn parameter" — so an unqualified ARN names the state machine
+        // whose aliases these are, and a version ARN names one of its versions and
+        // SELECTS the aliases whose routing configuration references that version.
+        let version_arn = parsed
+            .qualifier
+            .as_deref()
+            .filter(|qualifier| crate::state::qualifier_version(qualifier).is_some())
+            .map(|_| input.state_machine_arn.clone());
+        let state_machine_arn = match version_arn.as_deref() {
+            Some(version_arn) => {
+                // A version ARN the store holds nothing for is the referenced
+                // resource that could not be found.
+                let Some(version) = store.state_machine_versions.get(version_arn) else {
+                    return Err(ListStateMachineAliasesErrorModeled::ResourceNotFound(
+                        ResourceNotFound {
+                            message: Some(crate::state::resource_not_found_message(version_arn)),
+                            resource_name: Some(version_arn.to_string()),
+                        },
+                    )
+                    .into());
+                };
+                version.state_machine_arn.clone()
+            }
+            // A qualifier that is not a version number names an ALIAS, which has no
+            // aliases of its own; this operation models no error for that input, so
+            // it goes out through the same non-modelled channel as the labeled ARN.
+            None if parsed.qualifier.is_some() => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "'{}' is the ARN of a state machine alias, which has no aliases of its own",
+                    input.state_machine_arn
+                )))
+            }
+            None => input.state_machine_arn.clone(),
+        };
+
+        let Some(machine) = store.state_machines.get(&state_machine_arn) else {
+            return Err(ListStateMachineAliasesErrorModeled::StateMachineDoesNotExist(
+                StateMachineDoesNotExist {
+                    message: Some(crate::state::resource_error_message(
+                        crate::state::STATE_MACHINE_DOES_NOT_EXIST,
+                        &input.state_machine_arn,
+                    )),
+                },
+            )
+            .into());
+        };
+        if machine.is_deleting() {
+            return Err(ListStateMachineAliasesErrorModeled::StateMachineDeleting(
+                StateMachineDeleting {
+                    message: Some(crate::state::resource_error_message(
+                        crate::state::STATE_MACHINE_DELETING,
+                        &input.state_machine_arn,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "Results are sorted by time, with the most recently created aliases listed
+        // first."
+        let aliases: Vec<&crate::state::StateMachineAlias> = store
+            .aliases_newest_first(&state_machine_arn)
+            .into_iter()
+            .filter(|alias| {
+                version_arn.as_deref().is_none_or(|version_arn| {
+                    alias
+                        .routing_configuration
+                        .iter()
+                        .any(|item| item.state_machine_version_arn == version_arn)
+                })
+            })
+            .collect();
+        let total = aliases.len();
+        let state_machine_aliases: Vec<StateMachineAliasListItem> = aliases
+            .iter()
+            .skip(offset)
+            .take(page)
+            .map(|alias| StateMachineAliasListItem {
+                state_machine_alias_arn: alias.arn.clone(),
+                creation_date: crate::state::to_date_time(alias.creation_date),
+            })
+            .collect();
+
+        let next_token =
+            crate::state::next_page_token(offset, state_machine_aliases.len(), total);
+        Ok(ListStateMachineAliasesOutput {
+            state_machine_aliases,
+            next_token,
+        })
     }
 }
