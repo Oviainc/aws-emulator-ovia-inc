@@ -68,6 +68,12 @@
 //! detector is an account-level resource rather than a log group's: it watches log groups
 //! named by their ARNs and outlives none of them, so it lives beside the groups and not on
 //! [`LogGroupRecord`].
+//!
+//! The account's integrations — each "an integration between CloudWatch Logs and another
+//! service in this account", which `PutIntegration` creates and `GetIntegration` /
+//! `ListIntegrations` report — live in
+//! [`ComAmazonawsCloudwatchlogsLogs20140328State::integrations`], each one an
+//! [`IntegrationRecord`] carrying the instant the clock owes it its ACTIVE status.
 
 use std::collections::BTreeMap;
 
@@ -534,6 +540,90 @@ pub const MAX_ANOMALY_DETECTORS: usize = 1_000;
 /// definition already stored is never refused by it: it adds nothing.
 pub const MAX_QUERY_DEFINITIONS: usize = 1_000;
 
+/// The only integration type CloudWatch Logs supports, from the model's `IntegrationType`
+/// enum (`OPENSEARCH`), which `PutIntegration` states as well: "Currently, only
+/// integrations with OpenSearch Service are supported".
+pub const INTEGRATION_TYPE_OPENSEARCH: &str = "OPENSEARCH";
+
+/// The status an integration is created in, from the model's `IntegrationStatus` enum:
+/// "After you create an integration, it takes a few minutes to complete. During this time,
+/// you'll see the status as PROVISIONING" (`PutIntegrationResponse$integrationStatus`).
+pub const INTEGRATION_STATUS_PROVISIONING: &str = "PROVISIONING";
+
+/// The status an integration settles in once its OpenSearch Service resources are
+/// provisioned, from the model's `IntegrationStatus` enum. Nothing but a delete moves an
+/// integration out of it, so the clock owes it nothing further.
+pub const INTEGRATION_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// The status an integration whose provisioning failed carries, from the model's
+/// `IntegrationStatus` enum. Nothing in this emulator puts an integration here: a
+/// `PutIntegration` it cannot accept is refused outright, and one it accepts provisions.
+pub const INTEGRATION_STATUS_FAILED: &str = "FAILED";
+
+/// How long after it is created an integration takes to leave
+/// [`INTEGRATION_STATUS_PROVISIONING`] for [`INTEGRATION_STATUS_ACTIVE`].
+///
+/// AWS states only that it "takes a few minutes to complete", so the span is THE
+/// EMULATOR'S OWN CHOICE: the provisioning runs asynchronously, so the create hands back a
+/// PROVISIONING integration and the clock owes it ACTIVE later. It is deliberately not
+/// zero — a caller that reads, lists or deletes the integration straight after creating it
+/// still observes PROVISIONING, and the rules that go with that status.
+pub const INTEGRATION_PROVISIONING_DELAY_MS: i64 = 500;
+
+/// How many integrations one account may hold, from `PutIntegration`: "currently you can
+/// have only one integration in your account", which `ListIntegrations` repeats
+/// ("Currently, only one integration can be created in an account").
+pub const MAX_INTEGRATIONS: usize = 1;
+
+/// An OpenSearch Service resource of an integration that is there, from the model's
+/// `OpenSearchResourceStatusType` enum (`ACTIVE` | `NOT_FOUND` | `ERROR`).
+pub const OPENSEARCH_RESOURCE_STATUS_ACTIVE: &str = "ACTIVE";
+
+/// An OpenSearch Service resource of an integration that is not there yet, from the
+/// model's `OpenSearchResourceStatusType` enum.
+pub const OPENSEARCH_RESOURCE_STATUS_NOT_FOUND: &str = "NOT_FOUND";
+
+/// An OpenSearch Service resource of an integration that failed, from the model's
+/// `OpenSearchResourceStatusType` enum.
+pub const OPENSEARCH_RESOURCE_STATUS_ERROR: &str = "ERROR";
+
+/// The ARN service segment of IAM, the service whose roles and users
+/// `OpenSearchResourceConfig$dataSourceRoleArn` and `$dashboardViewerPrincipals` name.
+const IAM_SERVICE: &str = "iam";
+
+/// The ARN service segment of KMS, the service whose keys
+/// `OpenSearchResourceConfig$kmsKeyArn` names.
+const KMS_SERVICE: &str = "kms";
+
+/// The ARN service segment of OpenSearch Service, whose applications
+/// `OpenSearchResourceConfig$applicationArn` names and whose application an integration's
+/// setup creates.
+const OPENSEARCH_SERVICE: &str = "opensearch";
+
+/// The ARN service segment of OpenSearch Serverless, which owns the collection an
+/// integration's setup creates (`OpenSearchCollection$collectionArn`).
+const OPENSEARCH_SERVERLESS_SERVICE: &str = "aoss";
+
+/// The suffixes the OpenSearch Service resources an integration's setup creates are named
+/// with, each appended to the integration's own name so one integration's resources are
+/// distinguishable from another's and stable across reads. They are the emulator's own
+/// naming: AWS documents that the setup creates these resources but not what it calls
+/// them. Every suffix uses only characters the resource-name patterns admit
+/// (`^[\.\-_/#A-Za-z0-9]+$`).
+const APPLICATION_SUFFIX: &str = "-application";
+/// See [`APPLICATION_SUFFIX`].
+const COLLECTION_SUFFIX: &str = "-collection";
+/// See [`APPLICATION_SUFFIX`].
+const WORKSPACE_SUFFIX: &str = "-workspace";
+/// See [`APPLICATION_SUFFIX`].
+const ENCRYPTION_POLICY_SUFFIX: &str = "-encryption-policy";
+/// See [`APPLICATION_SUFFIX`].
+const NETWORK_POLICY_SUFFIX: &str = "-network-policy";
+/// See [`APPLICATION_SUFFIX`].
+const ACCESS_POLICY_SUFFIX: &str = "-access-policy";
+/// See [`APPLICATION_SUFFIX`].
+const LIFECYCLE_POLICY_SUFFIX: &str = "-lifecycle-policy";
+
 /// Per-service state for com-amazonaws-cloudwatchlogs-logs-20140328. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsCloudwatchlogsLogs20140328State {
@@ -619,6 +709,18 @@ pub struct ComAmazonawsCloudwatchlogsLogs20140328State {
     /// Monotonic counter behind the anomaly-detector identifiers, so every create mints an
     /// ARN no earlier create used — including after the detector holding it was deleted.
     pub next_anomaly_detector_seq: u64,
+    /// Every integration of this account — the resource `PutIntegration` creates,
+    /// `GetIntegration` and `ListIntegrations` report and `DeleteIntegration` removes —
+    /// keyed by `integrationName`, the one member every other integration operation
+    /// identifies one by.
+    ///
+    /// An integration is an account-level resource rather than a log group's: it connects
+    /// the account's logs to another service, and no log group owns it.
+    pub integrations: BTreeMap<String, IntegrationRecord>,
+    /// Monotonic counter behind [`IntegrationRecord::creation_seq`], so the creation order
+    /// `ListIntegrations` enumerates by is total and never reused — including after the
+    /// integration holding a position has been deleted.
+    pub next_integration_seq: u64,
 }
 
 impl ComAmazonawsCloudwatchlogsLogs20140328State {
@@ -640,6 +742,13 @@ impl ComAmazonawsCloudwatchlogsLogs20140328State {
     pub fn take_anomaly_detector_seq(&mut self) -> u64 {
         let seq = self.next_anomaly_detector_seq;
         self.next_anomaly_detector_seq = self.next_anomaly_detector_seq.saturating_add(1);
+        seq
+    }
+
+    /// Take the next integration sequence number, advancing the counter.
+    pub fn take_integration_seq(&mut self) -> u64 {
+        let seq = self.next_integration_seq;
+        self.next_integration_seq = self.next_integration_seq.saturating_add(1);
         seq
     }
 
@@ -710,6 +819,32 @@ impl ComAmazonawsCloudwatchlogsLogs20140328State {
         for detector in self.anomaly_detectors.values_mut() {
             detector.materialize_due_transitions(now_ms);
         }
+    }
+
+    /// Materialise every integration status change the clock has ALREADY made due, as of
+    /// `now_ms`.
+    ///
+    /// An integration provisions on its own — "it takes a few minutes to complete" — so the
+    /// status it is in is owed by the clock rather than by a call
+    /// ([`IntegrationRecord::status_due_ms`]). A reporting operation calls this before it
+    /// reads, so what it reports is what the clock already decided — never a status moved
+    /// on because something was polled.
+    pub fn materialize_due_integration_transitions(&mut self, now_ms: i64) {
+        for integration in self.integrations.values_mut() {
+            integration.materialize_due_transitions(now_ms);
+        }
+    }
+
+    /// The account's integrations in the order they were created
+    /// ([`IntegrationRecord::creation_seq`]), which is what `ListIntegrations` reports.
+    ///
+    /// AWS documents no order for that operation, so this one is the emulator's: creation
+    /// order is stable across calls and does not move when another integration is created
+    /// or deleted, which name order would not be.
+    pub fn integrations_in_creation_order(&self) -> Vec<&IntegrationRecord> {
+        let mut integrations: Vec<&IntegrationRecord> = self.integrations.values().collect();
+        integrations.sort_by_key(|integration| integration.creation_seq);
+        integrations
     }
 }
 
@@ -1324,6 +1459,280 @@ pub fn anomaly_detector_arn(region: &str, id: &str) -> String {
 /// [`mint_uuid_from_seq`] every UUID-shaped id of this service comes from.
 pub fn mint_anomaly_detector_id(seq: u64) -> String {
     mint_uuid_from_seq(seq)
+}
+
+/// One integration between CloudWatch Logs and another service — the resource
+/// `PutIntegration` creates, `GetIntegration` and `ListIntegrations` report and
+/// `DeleteIntegration` removes — as it is stored.
+///
+/// `PutIntegration` is the only call that creates one and "You can't modify an existing
+/// integration", so every member here is set once, at create time, from the request's
+/// `resourceConfig`; the only thing that moves afterwards is [`Self::status`], which the
+/// CLOCK owes ([`Self::status_due_ms`]).
+#[derive(Debug, Clone)]
+pub struct IntegrationRecord {
+    /// `IntegrationSummary$integrationName` — "A name for the integration", which is also
+    /// the key the store is keyed by: `GetIntegration` and `DeleteIntegration` identify an
+    /// integration by nothing else.
+    pub name: String,
+    /// `IntegrationSummary$integrationType`, one value of the model's `IntegrationType`
+    /// enum ([`INTEGRATION_TYPE_OPENSEARCH`]).
+    pub integration_type: String,
+    /// `IntegrationSummary$integrationStatus`, one value of the model's `IntegrationStatus`
+    /// enum ([`INTEGRATION_STATUS_PROVISIONING`] and its family).
+    pub status: String,
+    /// The region the create was signed in, so the ARNs this integration's OpenSearch
+    /// Service resources are reported under do not move when a later read arrives in
+    /// another credential scope.
+    pub region: String,
+    /// `OpenSearchResourceConfig$kmsKeyArn` — the key "the vended dashboard data" is
+    /// encrypted with, when the create named one; `None` leaves "the CloudWatch Logs
+    /// default encryption method".
+    pub kms_key_arn: Option<String>,
+    /// `OpenSearchResourceConfig$dataSourceRoleArn` — "the ARN of an IAM role that
+    /// CloudWatch Logs will use to create the integration".
+    pub data_source_role_arn: String,
+    /// `OpenSearchResourceConfig$dashboardViewerPrincipals` — "the ARNs of IAM roles and
+    /// IAM users who you want to grant permission to for viewing the dashboards".
+    pub dashboard_viewer_principals: Vec<String>,
+    /// The existing OpenSearch Service application the create named, if it named one:
+    /// "If you want to use an existing OpenSearch Service application for your integration
+    /// [...] specify it here. If you omit this, a new application will be created" — which
+    /// is why this is `None` for an integration whose application the setup created, and
+    /// [`Self::application_arn`] is what a reader reports either way.
+    pub existing_application_arn: Option<String>,
+    /// `OpenSearchResourceConfig$retentionDays` — "how many days that you want the data
+    /// derived by OpenSearch Service to be retained in the index that the dashboard refers
+    /// to", exactly as the create named it.
+    pub retention_days: i32,
+    /// When this integration was created, in epoch milliseconds. The instant the
+    /// provisioning transition is measured from.
+    pub created_at_ms: i64,
+    /// The position this integration takes in the account's creation order, from the
+    /// store's monotonic integration counter: what `ListIntegrations` enumerates by, so
+    /// the order it reports does not move when another integration is created or deleted.
+    pub creation_seq: u64,
+    /// The instant this integration is due to reach its next status, stored rather than
+    /// waited for: a reader materialises the transition once the clock is past it
+    /// ([`IntegrationRecord::materialize_due_transitions`]). `None` once it is in a status
+    /// the clock owes nothing after.
+    pub status_due_ms: Option<i64>,
+}
+
+impl IntegrationRecord {
+    /// A brand-new integration over the configuration the create named: still
+    /// provisioning, and due to become [`INTEGRATION_STATUS_ACTIVE`]
+    /// [`INTEGRATION_PROVISIONING_DELAY_MS`] after it was created. This is what
+    /// `PutIntegration` stores.
+    pub fn new(
+        region: &str,
+        name: &str,
+        integration_type: &str,
+        config: &crate::ops::types::OpenSearchResourceConfig,
+        created_at_ms: i64,
+        creation_seq: u64,
+    ) -> Self {
+        Self {
+            name: name.to_string(),
+            integration_type: integration_type.to_string(),
+            status: INTEGRATION_STATUS_PROVISIONING.to_string(),
+            region: region.to_string(),
+            kms_key_arn: config.kms_key_arn.clone(),
+            data_source_role_arn: config.data_source_role_arn.clone(),
+            dashboard_viewer_principals: config.dashboard_viewer_principals.clone(),
+            existing_application_arn: config.application_arn.clone(),
+            retention_days: config.retention_days,
+            created_at_ms,
+            creation_seq,
+            status_due_ms: Some(created_at_ms.saturating_add(INTEGRATION_PROVISIONING_DELAY_MS)),
+        }
+    }
+
+    /// Materialise the status change the clock owes this integration: one whose next
+    /// status was due before `now_ms` is already in it — the change taken AT the instant it
+    /// was due, not at the time something happened to look.
+    pub fn materialize_due_transitions(&mut self, now_ms: i64) {
+        while let Some(due) = self.status_due_ms {
+            if due > now_ms {
+                return;
+            }
+            match self.status.as_str() {
+                // "After you create an integration, it takes a few minutes to complete.
+                // During this time, you'll see the status as PROVISIONING" — so an
+                // integration leaves that status on the clock, with nothing further owed
+                // after it.
+                INTEGRATION_STATUS_PROVISIONING => {
+                    self.status = INTEGRATION_STATUS_ACTIVE.to_string();
+                    self.status_due_ms = None;
+                }
+                // Every other status is one the clock owes nothing after.
+                _ => self.status_due_ms = None,
+            }
+        }
+    }
+
+    /// This integration as the model's `IntegrationSummary`, which is what
+    /// `ListIntegrations` reports, so one record renders the same way through any reader.
+    pub fn summary(&self) -> crate::ops::types::IntegrationSummary {
+        crate::ops::types::IntegrationSummary {
+            integration_name: Some(self.name.clone()),
+            integration_type: Some(self.integration_type.clone()),
+            integration_status: Some(self.status.clone()),
+        }
+    }
+
+    /// `OpenSearchDataSource$dataSourceName` — the data source "created as part of the
+    /// integration setup", named after the integration it belongs to.
+    pub fn data_source_name(&self) -> String {
+        self.name.clone()
+    }
+
+    /// `OpenSearchApplication$applicationArn` — the existing application the create named,
+    /// or the ARN of the one the setup created for it.
+    pub fn application_arn(&self) -> String {
+        self.existing_application_arn.clone().unwrap_or_else(|| {
+            ::engine::emulator_arn(
+                OPENSEARCH_SERVICE,
+                &self.region,
+                &format!("application/{}", self.application_id()),
+            )
+        })
+    }
+
+    /// `OpenSearchApplication$applicationId` — the id the application's ARN carries, which
+    /// is the last segment of its resource part for an application the create named, and
+    /// the derived id otherwise.
+    pub fn application_id(&self) -> String {
+        match self
+            .existing_application_arn
+            .as_deref()
+            .and_then(arn_service_and_resource)
+            .and_then(|(_, resource)| resource.split('/').next_back())
+        {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => format!("{}{}", self.name, APPLICATION_SUFFIX),
+        }
+    }
+
+    /// `OpenSearchCollection$collectionArn` — the serverless collection the setup created
+    /// for this integration, which the dashboards query.
+    pub fn collection_arn(&self) -> String {
+        ::engine::emulator_arn(
+            OPENSEARCH_SERVERLESS_SERVICE,
+            &self.region,
+            &format!("collection/{}{}", self.name, COLLECTION_SUFFIX),
+        )
+    }
+
+    /// `OpenSearchWorkspace$workspaceId` — the workspace the setup created for this
+    /// integration.
+    pub fn workspace_id(&self) -> String {
+        format!("{}{}", self.name, WORKSPACE_SUFFIX)
+    }
+
+    /// The status every OpenSearch Service resource of this integration is in, derived from
+    /// the integration's own status: the setup creates them all together, so until the
+    /// integration has finished provisioning none of them is there
+    /// ([`OPENSEARCH_RESOURCE_STATUS_NOT_FOUND`]), once it is active they all are, and an
+    /// integration that failed reports them in error.
+    fn resource_status(&self) -> crate::ops::types::OpenSearchResourceStatus {
+        let status = match self.status.as_str() {
+            INTEGRATION_STATUS_ACTIVE => OPENSEARCH_RESOURCE_STATUS_ACTIVE,
+            INTEGRATION_STATUS_PROVISIONING => OPENSEARCH_RESOURCE_STATUS_NOT_FOUND,
+            _ => OPENSEARCH_RESOURCE_STATUS_ERROR,
+        };
+        crate::ops::types::OpenSearchResourceStatus {
+            status: Some(status.to_string()),
+            status_message: None,
+        }
+    }
+
+    /// This integration as the model's `IntegrationDetails` union — "information about
+    /// OpenSearch Service resources such as the collection, the workspace, and policies" —
+    /// which is what `GetIntegration` reports.
+    ///
+    /// Every name, id and ARN here is derived from the integration itself, so two reads of
+    /// one integration report the same resources. No endpoint is reported: this emulator
+    /// stands up no OpenSearch Service collection or application, so there is no host a
+    /// client could reach, and `applicationEndpoint` / `collectionEndpoint` are left absent
+    /// rather than filled with one nothing answers on.
+    pub fn details(&self) -> crate::ops::types::IntegrationDetails {
+        let status = self.resource_status();
+        crate::ops::types::IntegrationDetails::openSearchIntegrationDetails(
+            crate::ops::types::OpenSearchIntegrationDetails {
+                data_source: Some(crate::ops::types::OpenSearchDataSource {
+                    data_source_name: Some(self.data_source_name()),
+                    status: Some(status.clone()),
+                }),
+                application: Some(crate::ops::types::OpenSearchApplication {
+                    application_endpoint: None,
+                    application_arn: Some(self.application_arn()),
+                    application_id: Some(self.application_id()),
+                    status: Some(status.clone()),
+                }),
+                collection: Some(crate::ops::types::OpenSearchCollection {
+                    collection_endpoint: None,
+                    collection_arn: Some(self.collection_arn()),
+                    status: Some(status.clone()),
+                }),
+                workspace: Some(crate::ops::types::OpenSearchWorkspace {
+                    workspace_id: Some(self.workspace_id()),
+                    status: Some(status.clone()),
+                }),
+                encryption_policy: Some(crate::ops::types::OpenSearchEncryptionPolicy {
+                    policy_name: Some(format!("{}{}", self.name, ENCRYPTION_POLICY_SUFFIX)),
+                    status: Some(status.clone()),
+                }),
+                network_policy: Some(crate::ops::types::OpenSearchNetworkPolicy {
+                    policy_name: Some(format!("{}{}", self.name, NETWORK_POLICY_SUFFIX)),
+                    status: Some(status.clone()),
+                }),
+                access_policy: Some(crate::ops::types::OpenSearchDataAccessPolicy {
+                    policy_name: Some(format!("{}{}", self.name, ACCESS_POLICY_SUFFIX)),
+                    status: Some(status.clone()),
+                }),
+                lifecycle_policy: Some(crate::ops::types::OpenSearchLifecyclePolicy {
+                    policy_name: Some(format!("{}{}", self.name, LIFECYCLE_POLICY_SUFFIX)),
+                    status: Some(status),
+                }),
+            },
+        )
+    }
+}
+
+/// Whether an ARN names an IAM role — what `OpenSearchResourceConfig$dataSourceRoleArn`
+/// must be ("Specify the ARN of an IAM role that CloudWatch Logs will use to create the
+/// integration"). An IAM ARN's resource part is `role/<path><name>`.
+pub fn is_iam_role_arn(arn: &str) -> bool {
+    arn_service_and_resource(arn)
+        .is_some_and(|(service, resource)| service == IAM_SERVICE && resource.starts_with("role/"))
+}
+
+/// Whether an ARN names a principal `OpenSearchResourceConfig$dashboardViewerPrincipals`
+/// admits: "the ARNs of IAM roles and IAM users who you want to grant permission to for
+/// viewing the dashboards".
+pub fn is_dashboard_viewer_principal_arn(arn: &str) -> bool {
+    arn_service_and_resource(arn).is_some_and(|(service, resource)| {
+        service == IAM_SERVICE && (resource.starts_with("role/") || resource.starts_with("user/"))
+    })
+}
+
+/// Whether an ARN names an OpenSearch Service application — what
+/// `OpenSearchResourceConfig$applicationArn` must be ("If you want to use an existing
+/// OpenSearch Service application for your integration [...] specify it here").
+pub fn is_opensearch_application_arn(arn: &str) -> bool {
+    arn_service_and_resource(arn).is_some_and(|(service, resource)| {
+        service == OPENSEARCH_SERVICE && resource.starts_with("application/")
+    })
+}
+
+/// Whether an ARN names a KMS key — what `OpenSearchResourceConfig$kmsKeyArn` must be
+/// ("specify the ARN of the KMS key that you want to use"). Unlike a log group's
+/// `kmsKeyId`, this member is modelled as an `Arn`, so a bare key id is not one of its
+/// values.
+pub fn is_kms_key_arn(arn: &str) -> bool {
+    arn_service_and_resource(arn)
+        .is_some_and(|(service, resource)| service == KMS_SERVICE && !resource.is_empty())
 }
 
 /// How many account-level policies of `policy_type` the account may hold IN TOTAL once a

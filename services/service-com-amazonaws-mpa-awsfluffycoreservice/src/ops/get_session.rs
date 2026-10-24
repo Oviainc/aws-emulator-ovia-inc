@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSession
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSession`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports one stored approval session, looked up by ARN in [`crate::state`]. A session
+//! ARN outside the caller's own account is refused with `AccessDeniedException` (403)
+//! BEFORE the lookup ([`crate::state::authorize_resource_arn`]); an ARN inside it that no
+//! stored session carries earns `ResourceNotFoundException` (404).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSession::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Every member is read off the stored [`crate::state::Session`] that
+//! `StartApprovalTeamBaseline` recorded — the one place a session of this service comes
+//! into being — so nothing in the answer is this handler's own.
+//!
+//! `@readonly`: this handler writes nothing of its own. It calls
+//! [`crate::state::ComAmazonawsMpaAwsfluffycoreserviceState::materialize_due`] first,
+//! which applies only what the CLOCK already owed at this instant (a session whose
+//! activation has come due, a session whose expiration has passed) — changes a caller who
+//! never polled would have seen anyway.
 //!
 //! ## Shape of an operation
 //!
@@ -193,18 +198,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSession` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSessionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSession"))
+        let _ = ctx;
+        // The account boundary is evaluated BEFORE the resource is resolved: an ARN
+        // outside the caller's account is refused with the modelled
+        // `AccessDeniedException` (403) whatever is stored under it, so a client can tell
+        // "not permitted" from "does not exist".
+        crate::state::authorize_resource_arn(Self::NAME, &input.session_arn)
+            .map_err(GetSessionErrorModeled::AccessDeniedException)?;
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetSessionError::Modeled(GetSessionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the approval-team store is unavailable".to_string(),
+                },
+            ))
+        })?;
+        let mut state = store.lock();
+        state.materialize_due(::std::time::SystemTime::now());
+
+        let Some(session) = state.session(&input.session_arn) else {
+            // The one message this service answers every resource lookup that resolves
+            // to nothing with: a service constant that names neither the operation nor
+            // the ARN asked for (`crate::state::resource_not_found`).
+            return Err(GetSessionErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(),
+            )
+            .into());
+        };
+
+        let crate::state::StoredApprovalStrategy::MofN {
+            min_approvals_required,
+        } = session.approval_strategy;
+        Ok(GetSessionOutput {
+            session_arn: Some(session.arn.clone()),
+            approval_team_arn: Some(session.approval_team_arn.clone()),
+            approval_team_name: Some(session.approval_team_name.clone()),
+            protected_resource_arn: Some(session.protected_resource_arn.clone()),
+            approval_strategy: Some(ApprovalStrategyResponse::MofN(MofNApprovalStrategy {
+                min_approvals_required,
+            })),
+            number_of_approvers: Some(session.number_of_approvers()),
+            initiation_time: Some(::aws_smithy_types::DateTime::from(session.initiation_time)),
+            expiration_time: Some(::aws_smithy_types::DateTime::from(session.expiration_time)),
+            completion_time: session
+                .completion_time
+                .map(::aws_smithy_types::DateTime::from),
+            description: session.description.clone(),
+            // `SessionMetadata`'s key and value are both `length(min: 1)`, so a session
+            // that recorded no metadata reports none rather than an empty object.
+            metadata: if session.metadata.is_empty() {
+                None
+            } else {
+                Some(
+                    session
+                        .metadata
+                        .iter()
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect(),
+                )
+            },
+            status: Some(session.status.as_wire().to_string()),
+            status_code: session.status_code.map(|code| code.as_wire().to_string()),
+            status_message: session.status_message.clone(),
+            execution_status: Some(session.execution_status.as_wire().to_string()),
+            // The action the session approves is fixed by what it was started FOR
+            // (`crate::state::SessionKind`), not by anything in this request.
+            action_name: Some(session.kind.action_name().to_string()),
+            requester_service_principal: Some(session.requester_service_principal.clone()),
+            requester_principal_arn: Some(session.requester_principal_arn.clone()),
+            requester_account_id: Some(session.requester_account_id.clone()),
+            requester_region: Some(session.requester_region.clone()),
+            requester_comment: session.requester_comment.clone(),
+            action_completion_strategy: Some(
+                session.action_completion_strategy.as_wire().to_string(),
+            ),
+            approver_responses: Some(
+                session
+                    .approvers
+                    .iter()
+                    .map(|approver| GetSessionResponseApproverResponse {
+                        approver_id: Some(approver.approver_id.clone()),
+                        identity_id: Some(approver.identity_id.clone()),
+                        identity_source_arn: Some(approver.identity_source_arn.clone()),
+                        response: Some(approver.response.as_wire().to_string()),
+                        response_time: approver
+                            .response_time
+                            .map(::aws_smithy_types::DateTime::from),
+                    })
+                    .collect(),
+            ),
+            // `AdditionalSecurityRequirements` is `length(min: 0, …)`: a session with no
+            // extra requirement reports the empty list it recorded.
+            additional_security_requirements: Some(
+                session
+                    .additional_security_requirements
+                    .iter()
+                    .map(|requirement| requirement.as_wire().to_string())
+                    .collect(),
+            ),
+        })
     }
 }

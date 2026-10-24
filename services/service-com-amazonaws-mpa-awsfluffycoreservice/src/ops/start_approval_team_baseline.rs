@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartApprovalTeamBaseline
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartApprovalTeamBaseline`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Starts a BASELINE SESSION for an ACTIVE approval team's approvers and records it in
+//! [`crate::state`], where `GetSession` reads it back. This is the one operation of this
+//! model that mints a session, so it is the one place a [`crate::state::Session`] comes
+//! into being.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartApprovalTeamBaseline::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An ARN outside the caller's own account is refused with `AccessDeniedException` (403)
+//! BEFORE the lookup ([`crate::state::authorize_resource_arn`]); an ARN inside it that no
+//! stored team carries earns `ResourceNotFoundException` (404); a team that is not
+//! `ACTIVE`, and an `ApproverIds` entry that is not an approver of that team, earn the
+//! modelled `ValidationException` (400), this operation declaring no `ConflictException`.
+//!
+//! The session is recorded `CREATING` with its activation due
+//! ([`crate::state::SESSION_ACTIVATION_DELAY`]) and its expiration recorded
+//! ([`crate::state::SESSION_EXPIRATION`]); both transitions are the clock's, applied by
+//! [`crate::state::ComAmazonawsMpaAwsfluffycoreserviceState::materialize_due`]. Nothing
+//! here records an approver's answer: no operation of this model casts a vote.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +158,196 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartApprovalTeamBaseline` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartApprovalTeamBaselineErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartApprovalTeamBaseline"))
+        // The account boundary is evaluated BEFORE the resource is resolved: an ARN
+        // outside the caller's account is refused with the modelled
+        // `AccessDeniedException` (403) whatever is stored under it.
+        crate::state::authorize_resource_arn(Self::NAME, &input.arn)
+            .map_err(StartApprovalTeamBaselineErrorModeled::AccessDeniedException)?;
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartApprovalTeamBaselineError::Modeled(
+                StartApprovalTeamBaselineErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the approval-team store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+        let mut state = store.lock();
+        let now = ::std::time::SystemTime::now();
+        state.materialize_due(now);
+
+        let Some(team) = state.team(&input.arn) else {
+            // The one message this service answers every resource lookup that resolves
+            // to nothing with (`crate::state::resource_not_found`).
+            return Err(
+                StartApprovalTeamBaselineErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(),
+                )
+                .into(),
+            );
+        };
+
+        // "Starts a baseline session for specified approvers on an ACTIVE approval team":
+        // a team in any other status has no baseline to start. This operation declares no
+        // `ConflictException`, so the refusal is the `ValidationException` (400) it does
+        // declare, and it names the status that made the request impossible.
+        if team.status != crate::state::TeamStatus::Active {
+            return Err(StartApprovalTeamBaselineErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "Approval team '{}' is {} and not ACTIVE, so a baseline session \
+                         cannot be started for it.",
+                        input.arn,
+                        team.status.as_wire()
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The session asks the approvers the request named; a request that names none
+        // asks every approver on the team, since `ApproverIds` carries no minimum and a
+        // baseline session with no approver would ask nobody.
+        let requested: Vec<String> = input.approver_ids.clone().unwrap_or_default();
+        let mut seen = ::std::collections::BTreeSet::new();
+        for approver_id in &requested {
+            if !team
+                .approvers
+                .iter()
+                .any(|approver| &approver.approver_id == approver_id)
+            {
+                return Err(StartApprovalTeamBaselineErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "ApproverIds names '{approver_id}', which is not an approver of \
+                             approval team '{}'.",
+                            input.arn
+                        ),
+                    },
+                )
+                .into());
+            }
+            if !seen.insert(approver_id.as_str()) {
+                return Err(StartApprovalTeamBaselineErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "ApproverIds names approver '{approver_id}' more than once; each \
+                             approver may take part in a session once."
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let approvers: Vec<crate::state::SessionApprover> = team
+            .approvers
+            .iter()
+            .filter(|approver| requested.is_empty() || seen.contains(approver.approver_id.as_str()))
+            .map(|approver| crate::state::SessionApprover {
+                approver_id: approver.approver_id.clone(),
+                identity_id: approver.primary_identity_id.clone(),
+                identity_source_arn: approver.primary_identity_source_arn.clone(),
+                // No operation of this model records an approver's answer, so every
+                // approver starts — and stays — unanswered.
+                response: crate::state::SessionResponse::NoResponse,
+                response_time: None,
+            })
+            .collect();
+
+        // A session is minted FOR the team, so it takes the region off the team's own ARN
+        // rather than off this request; a team whose ARN carries no region segment this
+        // grammar accepts falls back to the region the request was signed for.
+        let team_arn = team.arn.clone();
+        let team_name = team.name.clone();
+        let approval_strategy = team.approval_strategy;
+        let requester_region = crate::state::request_region(ctx.parts());
+        let region = crate::state::arn_region(&team_arn)
+            .map_or_else(|| requester_region.clone(), ToString::to_string);
+
+        // The store is bounded, so a caller looping on this operation cannot grow this
+        // process's memory without end (`crate::state::MAX_SESSIONS`).
+        if state.sessions.len() >= crate::state::MAX_SESSIONS {
+            return Err(StartApprovalTeamBaselineErrorModeled::ValidationException(
+                ValidationException {
+                    message: format!(
+                        "The account has reached its quota of {} approval sessions.",
+                        crate::state::MAX_SESSIONS
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let seq = state.next_session_seq();
+        let arn = crate::state::session_arn(&region, &team_name, seq);
+        let Some(expiration_time) = now.checked_add(crate::state::SESSION_EXPIRATION) else {
+            return Err(
+                StartApprovalTeamBaselineErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the session's expiration instant could not be computed"
+                            .to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+        let session = crate::state::Session {
+            arn: arn.clone(),
+            kind: crate::state::SessionKind::Baseline,
+            approval_team_arn: team_arn.clone(),
+            approval_team_name: team_name,
+            approval_strategy,
+            approvers,
+            // The resource the approved action acts on is the approval team itself.
+            protected_resource_arn: team_arn,
+            // A session is reported `CREATING` until its activation comes due, the
+            // non-terminal status `SessionStatus` declares for one.
+            status: crate::state::SessionStatus::Creating,
+            status_code: None,
+            status_message: None,
+            // This emulator executes no protected operation, so nothing has run and
+            // nothing has failed: the execution is `PENDING` for as long as the session
+            // exists.
+            execution_status: crate::state::SessionExecutionStatus::Pending,
+            // The only strategy `ActionCompletionStrategy` declares.
+            action_completion_strategy:
+                crate::state::ActionCompletionStrategy::AutoCompletionUponApproval,
+            // Nothing in this request names an additional security requirement, so the
+            // session applies none.
+            additional_security_requirements: Vec::new(),
+            requester_service_principal: crate::state::SERVICE_PRINCIPAL.to_string(),
+            requester_principal_arn: crate::state::caller_identity_arn(),
+            requester_account_id: crate::state::caller_account_id().to_string(),
+            requester_region,
+            // `RequesterComment` and `Description` are what a requester supplies, and
+            // this operation's input carries neither.
+            requester_comment: None,
+            description: None,
+            metadata: ::std::collections::BTreeMap::new(),
+            initiation_time: now,
+            expiration_time,
+            completion_time: None,
+            activation_due: now.checked_add(crate::state::SESSION_ACTIVATION_DELAY),
+            seq,
+        };
+        state.insert_session(session);
+
+        // Read the answer back out of the store, so the response can only ever name a
+        // session that was really recorded.
+        let Some(session) = state.session(&arn) else {
+            return Err(
+                StartApprovalTeamBaselineErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the baseline session could not be read back after being stored"
+                            .to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+        Ok(StartApprovalTeamBaselineOutput {
+            baseline_session_arn: Some(session.arn.clone()),
+        })
     }
 }

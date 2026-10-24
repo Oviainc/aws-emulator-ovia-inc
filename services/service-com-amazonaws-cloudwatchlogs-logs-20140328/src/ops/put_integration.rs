@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutIntegration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutIntegration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Implemented: creates ONE integration between CloudWatch Logs and OpenSearch Service
+//! from the `resourceConfig` the request names, stores it PROVISIONING with the instant
+//! the clock owes it ACTIVE, and hands back its name and that status — or refuses a
+//! request whose ARNs do not name the resources they must, a put onto an integration the
+//! account already holds ("You can't modify an existing integration"), or one past the
+//! account's single-integration limit. This is the ONLY file to touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`PutIntegration::handle`] with real behaviour and
@@ -157,18 +160,151 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutIntegration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutIntegrationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutIntegration"))
+        let region = crate::state::request_region(ctx.parts());
+
+        let invalid = |message: String| {
+            PutIntegrationError::from(PutIntegrationErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            ))
+        };
+
+        // The `resourceConfig` union carries "configuration information for the integration
+        // that you are creating", one variant per integration type; OpenSearch Service is
+        // the only type the model declares, so its variant is the only configuration there
+        // is to read.
+        let ResourceConfig::openSearchResourceConfig(config) = &input.resource_config;
+
+        // The type and the configuration must name the same service: `integrationType` is
+        // "The type of integration. Currently, the only supported type is OPENSEARCH", and
+        // the configuration handed in is OpenSearch Service's.
+        if input.integration_type != crate::state::INTEGRATION_TYPE_OPENSEARCH {
+            return Err(PutIntegrationErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "integrationType {} does not match the resourceConfig, which configures \
+                         an {} integration",
+                        input.integration_type,
+                        crate::state::INTEGRATION_TYPE_OPENSEARCH
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Every ARN-typed member of the configuration is parsed before anything is stored,
+        // with the service's validation-error message naming the member and the value it
+        // could not parse, and then held to the KIND of resource its own documentation says
+        // it names — a well-formed ARN of another kind names nothing the integration can
+        // use.
+        if let Some(message) =
+            crate::state::unparsable_arn_message("dataSourceRoleArn", &config.data_source_role_arn)
+        {
+            return Err(invalid(message));
+        }
+        if !crate::state::is_iam_role_arn(&config.data_source_role_arn) {
+            return Err(invalid(format!(
+                "dataSourceRoleArn must name an IAM role, got '{}'",
+                config.data_source_role_arn
+            )));
+        }
+        for principal in &config.dashboard_viewer_principals {
+            if let Some(message) =
+                crate::state::unparsable_arn_message("dashboardViewerPrincipals", principal)
+            {
+                return Err(invalid(message));
+            }
+            if !crate::state::is_dashboard_viewer_principal_arn(principal) {
+                return Err(invalid(format!(
+                    "dashboardViewerPrincipals must name IAM roles and IAM users, got \
+                     '{principal}'"
+                )));
+            }
+        }
+        if let Some(kms_key_arn) = config.kms_key_arn.as_deref() {
+            if let Some(message) = crate::state::unparsable_arn_message("kmsKeyArn", kms_key_arn) {
+                return Err(invalid(message));
+            }
+            if !crate::state::is_kms_key_arn(kms_key_arn) {
+                return Err(invalid(format!(
+                    "kmsKeyArn must name a KMS key, got '{kms_key_arn}'"
+                )));
+            }
+        }
+        if let Some(application_arn) = config.application_arn.as_deref() {
+            if let Some(message) =
+                crate::state::unparsable_arn_message("applicationArn", application_arn)
+            {
+                return Err(invalid(message));
+            }
+            if !crate::state::is_opensearch_application_arn(application_arn) {
+                return Err(invalid(format!(
+                    "applicationArn must name an OpenSearch Service application, got \
+                     '{application_arn}'"
+                )));
+            }
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutIntegrationError::from(PutIntegrationErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("the log store is unavailable".to_string()),
+                },
+            ))
+        })?;
+        let mut store = state.lock();
+
+        // "You can use this operation only to create a new integration. You can't modify an
+        // existing integration": a put naming an integration the account already holds is
+        // refused rather than overwriting its configuration.
+        if store.integrations.contains_key(&input.integration_name) {
+            return Err(PutIntegrationErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "Integration with name [{}] already exists. You can't modify an existing \
+                         integration.",
+                        input.integration_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "Currently you can have only one integration in your account" — the account's
+        // integration limit, answered with the `LimitExceededException` this operation
+        // models ("You have reached the maximum number of resources that can be created").
+        if store.integrations.len() >= crate::state::MAX_INTEGRATIONS {
+            return Err(PutIntegrationErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "the maximum of {} integration(s) per account has been reached",
+                        crate::state::MAX_INTEGRATIONS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let creation_seq = store.take_integration_seq();
+        let integration = crate::state::IntegrationRecord::new(
+            &region,
+            &input.integration_name,
+            &input.integration_type,
+            config,
+            crate::state::now_ms(),
+            creation_seq,
+        );
+        // The status handed back is the stored one, so what this create reports is what a
+        // read of the integration reports at the same instant.
+        let status = integration.status.clone();
+        store
+            .integrations
+            .insert(input.integration_name.clone(), integration);
+
+        Ok(PutIntegrationOutput {
+            integration_name: Some(input.integration_name),
+            integration_status: Some(status),
+        })
     }
 }

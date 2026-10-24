@@ -135,17 +135,25 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
-        // The centralized walk calls this on a framework-level refusal (an absent
-        // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // This service models no `ValidationException`, which is the code the framework
+        // would otherwise name for a value that breaks a modelled constraint. Its own
+        // error for that is `InvalidArgumentException` — "The value for this input
+        // parameter is invalid" — which both operations declare, and which is what a
+        // handler answers for the same class of bad input it checks itself (an ARN that
+        // is not a signaling-channel ARN). Both the code and the message are replaced,
+        // so a client branching on the code sees one code for one logical failure.
+        //
+        // An authentication refusal keeps the framework's wording: it is refused before
+        // this service is reached, and the modelled `NotAuthorizedException` is the
+        // authorization answer, not the authentication one.
+        match refusal {
+            Refusal::Invalid(violations) => Some(Refused {
+                code: "InvalidArgumentException".to_string(),
+                message: aws_smithy_schema_server::envelope(violations)
+                    .unwrap_or_else(|| "The value for this input parameter is invalid".to_string()),
+            }),
+            _ => None,
+        }
     }
 
     fn override_routing_error(
