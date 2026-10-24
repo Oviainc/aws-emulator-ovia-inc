@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateWhatIfAnalysis
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateWhatIfAnalysis`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mints
+//! `arn:aws:forecast:<region>:<account>:what-if-analysis/<WhatIfAnalysisName>` over the
+//! baseline forecast its `ForecastArn` names, which must be `ACTIVE` — an analysis of a
+//! forecast that is still being created has no baseline to modify.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateWhatIfAnalysis::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `TimeSeriesSelector` narrows the analysis to the time series its identifiers name,
+//! read from object storage by the same reader an import file is
+//! ([`crate::state::series::read_identifiers`]).
+//!
+//! As on AWS the submission answers before the analysis is ready: the clock owes
+//! `CREATE_IN_PROGRESS` and then `ACTIVE` over the spans in
+//! [`crate::state::PENDING_SPAN`] / [`crate::state::RUN_SPAN`].
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +174,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateWhatIfAnalysis` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateWhatIfAnalysisErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateWhatIfAnalysis"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateWhatIfAnalysis",
+            ));
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let arn = crate::state::what_if_analysis_arn(&region, &input.what_if_analysis_name);
+
+        {
+            let store = state.lock();
+            if store.what_if_analyses.contains_key(&arn) {
+                return Err(
+                    CreateWhatIfAnalysisErrorModeled::ResourceAlreadyExistsException(
+                        ResourceAlreadyExistsException {
+                            message: Some(format!(
+                                "A what-if analysis already exists with the name {}.",
+                                input.what_if_analysis_name
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            if store.what_if_analyses.len() >= crate::state::MAX_WHAT_IF_ANALYSES {
+                return Err(CreateWhatIfAnalysisErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "You have reached the limit of {} what-if analyses for this \
+                             account.",
+                            crate::state::MAX_WHAT_IF_ANALYSES
+                        )),
+                    },
+                )
+                .into());
+            }
+            let Some(forecast) = store.forecasts.get(&input.forecast_arn) else {
+                return Err(CreateWhatIfAnalysisErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!("No resource found {}", input.forecast_arn)),
+                    },
+                )
+                .into());
+            };
+            // The analysis modifies a BASELINE forecast, so that forecast must be
+            // finished: one still being created has no baseline to modify yet.
+            if !forecast.lifecycle.is_active(now) {
+                return Err(CreateWhatIfAnalysisErrorModeled::ResourceInUseException(
+                    ResourceInUseException {
+                        message: Some(format!(
+                            "The status of forecast {} is {}. The status must be ACTIVE \
+                             before you can create a what-if analysis of it.",
+                            forecast.arn,
+                            forecast.lifecycle.status(now)
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The identifiers the selector names, read without the store lock held.
+        let selected = match input
+            .time_series_selector
+            .as_ref()
+            .and_then(|selector| selector.time_series_identifiers.clone())
+        {
+            Some(identifiers) => {
+                match crate::state::series::read_identifiers(ctx, &region, &identifiers).await {
+                    Ok(selected) => Some(selected),
+                    Err(reason) => {
+                        return Err(CreateWhatIfAnalysisErrorModeled::InvalidInputException(
+                            InvalidInputException {
+                                message: Some(reason),
+                            },
+                        )
+                        .into())
+                    }
+                }
+            }
+            None => None,
+        };
+
+        let mut store = state.lock();
+        // Re-checked under the lock: the selector's object-storage read was awaited
+        // without it, so another request may have taken the name in between.
+        if store.what_if_analyses.contains_key(&arn) {
+            return Err(
+                CreateWhatIfAnalysisErrorModeled::ResourceAlreadyExistsException(
+                    ResourceAlreadyExistsException {
+                        message: Some(format!(
+                            "A what-if analysis already exists with the name {}.",
+                            input.what_if_analysis_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        store.what_if_analyses.insert(
+            arn.clone(),
+            crate::state::WhatIfAnalysis {
+                arn: arn.clone(),
+                name: input.what_if_analysis_name,
+                forecast_arn: input.forecast_arn,
+                time_series_selector: input.time_series_selector,
+                selected,
+                lifecycle: crate::state::Lifecycle::succeeded(now),
+                tags: input.tags.unwrap_or_default(),
+            },
+        );
+
+        Ok(CreateWhatIfAnalysisOutput {
+            what_if_analysis_arn: Some(arn),
+        })
     }
 }

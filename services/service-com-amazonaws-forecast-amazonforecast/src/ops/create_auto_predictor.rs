@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAutoPredictor
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAutoPredictor`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mints `arn:aws:forecast:<region>:<account>:predictor/<PredictorName>`
+//! and FITS the predictor to the history already imported into the dataset group's
+//! TARGET_TIME_SERIES dataset — one fitted model per time series, computed from the
+//! rows a `CreateDatasetImportJob` read (see [`crate::state::series`] for the
+//! estimator, and for what Amazon Forecast's own learned models do instead).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAutoPredictor::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Fitting happens HERE, at creation, so the predictor carries the data it was trained
+//! on: a later import does not retroactively change an existing predictor's forecasts.
+//! A dataset group with no imported data is a predictor that cannot be trained, which
+//! is the modelled `InvalidInputException` rather than a model fitted to nothing.
+//!
+//! `ReferencePredictorArn` retrains: "When upgrading or retraining a predictor, only
+//! specify values for the ReferencePredictorArn and PredictorName", so the horizon,
+//! frequency, forecast types and dimensions come from the referenced predictor and the
+//! fit is redone against the data as it stands now.
+//!
+//! As on AWS the submission answers before training is finished: the clock owes
+//! `CREATE_IN_PROGRESS` and then the terminal status over the spans in
+//! [`crate::state::PENDING_SPAN`] / [`crate::state::RUN_SPAN`], so a caller that
+//! creates a forecast immediately still sees the transient state.
 //!
 //! ## Shape of an operation
 //!
@@ -221,18 +232,295 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAutoPredictor` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAutoPredictorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAutoPredictor"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateAutoPredictor",
+            ));
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let arn = crate::state::predictor_arn(&region, &input.predictor_name);
+
+        let mut store = state.lock();
+        if store.predictors.contains_key(&arn) {
+            return Err(CreateAutoPredictorErrorModeled::ResourceAlreadyExistsException(
+                ResourceAlreadyExistsException {
+                    message: Some(format!(
+                        "A predictor already exists with the name {}.",
+                        input.predictor_name
+                    )),
+                },
+            )
+            .into());
+        }
+        if store.predictors.len() >= crate::state::MAX_PREDICTORS {
+            return Err(CreateAutoPredictorErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "You have reached the limit of {} predictors for this account.",
+                        crate::state::MAX_PREDICTORS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Either a new predictor, which carries its own configuration, or a retrain,
+        // which takes the referenced predictor's: "When upgrading or retraining a
+        // predictor, only specify values for the ReferencePredictorArn and
+        // PredictorName".
+        let reference = match input.reference_predictor_arn.as_deref() {
+            Some(reference_arn) => {
+                let Some(reference) = store.predictors.get(reference_arn) else {
+                    return Err(CreateAutoPredictorErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(format!("No resource found {reference_arn}")),
+                        },
+                    )
+                    .into());
+                };
+                // A predictor still being created cannot be retrained from: it has no
+                // settled configuration to carry over yet.
+                if !reference.lifecycle.is_active(now) {
+                    return Err(CreateAutoPredictorErrorModeled::ResourceInUseException(
+                        ResourceInUseException {
+                            message: Some(format!(
+                                "The status of predictor {reference_arn} is {}. The \
+                                 status must be ACTIVE before you can retrain it.",
+                                reference.lifecycle.status(now)
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                Some(reference.clone())
+            }
+            None => None,
+        };
+
+        let (data_config, forecast_horizon, forecast_frequency, forecast_types, dimensions) =
+            match &reference {
+                Some(reference) => (
+                    reference.data_config.clone(),
+                    reference.forecast_horizon,
+                    reference.forecast_frequency.clone(),
+                    reference.forecast_types.clone(),
+                    reference.forecast_dimensions.clone(),
+                ),
+                None => {
+                    // "The following parameters are required when creating a new
+                    // predictor: PredictorName … DatasetGroupArn … ForecastFrequency …
+                    // ForecastHorizon" — none of which the model marks required, because
+                    // a retrain supplies them from its reference instead.
+                    let Some(data_config) = input.data_config.clone() else {
+                        return Err(invalid(
+                            "DataConfig is required when creating a new predictor.",
+                        ));
+                    };
+                    let Some(horizon) = input.forecast_horizon else {
+                        return Err(invalid(
+                            "ForecastHorizon is required when creating a new predictor.",
+                        ));
+                    };
+                    let Some(frequency) = input.forecast_frequency.clone() else {
+                        return Err(invalid(
+                            "ForecastFrequency is required when creating a new predictor.",
+                        ));
+                    };
+                    let forecast_types = match input.forecast_types.clone() {
+                        Some(types) => types,
+                        None => crate::state::DEFAULT_FORECAST_TYPES
+                            .iter()
+                            .map(|value| (*value).to_string())
+                            .collect(),
+                    };
+                    if let Some(unknown) = forecast_types
+                        .iter()
+                        .find(|value| !crate::state::series::is_forecast_type(value))
+                    {
+                        return Err(invalid(format!(
+                            "The forecast type {unknown} is not a quantile between 0.01 \
+                             and 0.99 or mean."
+                        )));
+                    }
+                    (
+                        data_config,
+                        horizon,
+                        frequency,
+                        forecast_types,
+                        input.forecast_dimensions.clone().unwrap_or_default(),
+                    )
+                }
+            };
+
+        if forecast_horizon <= 0 {
+            return Err(invalid(
+                "ForecastHorizon must be at least one time-step.".to_string(),
+            ));
+        }
+        if forecast_horizon > crate::state::MAX_FORECAST_HORIZON {
+            return Err(invalid(format!(
+                "ForecastHorizon {forecast_horizon} is more than the maximum of {}.",
+                crate::state::MAX_FORECAST_HORIZON
+            )));
+        }
+        let Some(frequency) = crate::state::series::Frequency::parse(&forecast_frequency) else {
+            return Err(invalid(format!(
+                "ForecastFrequency {forecast_frequency} is not an interval Amazon \
+                 Forecast reads."
+            )));
+        };
+
+        // The dataset group is what the predictor trains on, so it must exist — and so
+        // must the imported history of its TARGET_TIME_SERIES dataset: "Creates a
+        // forecast for each item in the TARGET_TIME_SERIES dataset that was used to
+        // train the predictor" has no meaning for a dataset nothing was imported into.
+        let Some(group) = store.dataset_groups.get(&data_config.dataset_group_arn) else {
+            return Err(CreateAutoPredictorErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("No resource found {}", data_config.dataset_group_arn)),
+                },
+            )
+            .into());
+        };
+        let member_arns = group.dataset_arns.clone();
+        let target = member_arns
+            .iter()
+            .filter_map(|member| store.datasets.get(member))
+            .find(|dataset| dataset.dataset_type == crate::state::TARGET_TIME_SERIES);
+        let Some(target) = target else {
+            return Err(invalid(format!(
+                "The dataset group {} holds no {} dataset to train on.",
+                data_config.dataset_group_arn,
+                crate::state::TARGET_TIME_SERIES
+            )));
+        };
+        if target.series.is_empty() {
+            return Err(invalid(format!(
+                "No data has been imported into the {} dataset {}. Import training data \
+                 before creating a predictor.",
+                crate::state::TARGET_TIME_SERIES, target.arn
+            )));
+        }
+        let import_job_arns = target.import_job_arns.clone();
+        // Training reads data an import job has FINISHED importing: a job the clock has
+        // not settled yet is still running, and a predictor trained on it would be
+        // reading a job's result before that job reports one.
+        if let Some(unfinished) = import_job_arns
+            .iter()
+            .filter_map(|job_arn| store.dataset_import_jobs.get(job_arn))
+            .find(|job| !job.lifecycle.is_settled(now))
+        {
+            return Err(CreateAutoPredictorErrorModeled::ResourceInUseException(
+                ResourceInUseException {
+                    message: Some(format!(
+                        "The status of dataset import job {} is {}. The status must be \
+                         ACTIVE before you can train a predictor on its data.",
+                        unfinished.arn,
+                        unfinished.lifecycle.status(now)
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Fit one model per time series, from the stored history alone. The walk is
+        // bounded twice over — by each series' own bucket ceiling and by the whole
+        // run's budget — so the work done under the store lock is a bounded, millisecond
+        // -scale amount of calendar arithmetic rather than something a submission can
+        // grow.
+        let mut budget = crate::state::series::MAX_BUCKETS_PER_FIT;
+        let mut fitted = Vec::with_capacity(target.series.len());
+        for one in &target.series {
+            match crate::state::series::fit(one, &frequency, &mut budget) {
+                Ok(model) => fitted.push(model),
+                // A series with no observation at this frequency is not trainable; the
+                // others still are, exactly as Forecast skips a time series it has no
+                // data for. A run that has spent its bucket budget is a different
+                // matter: the training data is past what this emulator aggregates for
+                // one predictor, so the create is refused rather than silently fitted
+                // to the series that happened to come first.
+                Err(reason) => {
+                    if budget == 0 {
+                        return Err(invalid(reason));
+                    }
+                    continue;
+                }
+            }
+        }
+        if fitted.is_empty() {
+            return Err(invalid(format!(
+                "None of the time series imported into {} could be aggregated at the \
+                 forecast frequency {forecast_frequency}.",
+                target.arn
+            )));
+        }
+
+        // "The maximum forecast horizon is the lesser of 500 time-steps or 1/4 of the
+        // TARGET_TIME_SERIES dataset length. If you are retraining an existing
+        // AutoPredictor, then the maximum forecast horizon is the lesser of 500
+        // time-steps or 1/3 of the TARGET_TIME_SERIES dataset length"
+        // (`ForecastHorizon`). The dataset length is the longest series' bucket count
+        // at the forecast frequency, which is what this emulator holds.
+        let length = fitted.iter().map(|model| model.buckets).max().unwrap_or(0);
+        let ratio = if reference.is_some() {
+            crate::state::RETRAINED_PREDICTOR_HISTORY_RATIO
+        } else {
+            crate::state::NEW_PREDICTOR_HISTORY_RATIO
+        };
+        let allowed = length / ratio;
+        if usize::try_from(forecast_horizon).unwrap_or(usize::MAX) > allowed {
+            return Err(invalid(format!(
+                "ForecastHorizon {forecast_horizon} is more than 1/{ratio} of the \
+                 {length} time-steps of training data, which is {allowed}."
+            )));
+        }
+
+        let dimension_names: Vec<String> = dimensions;
+        // The TARGET attribute's own name, from the training dataset's schema: it is
+        // what a what-if transformation must name to change this emulator's forecast.
+        let target_attribute = match crate::state::series::ColumnLayout::read(&target.schema) {
+            Ok(layout) => layout
+                .names
+                .get(layout.target)
+                .cloned()
+                .unwrap_or_default(),
+            Err(reason) => return Err(invalid(reason)),
+        };
+        store.predictors.insert(
+            arn.clone(),
+            crate::state::Predictor {
+                arn: arn.clone(),
+                name: input.predictor_name,
+                dataset_group_arn: data_config.dataset_group_arn.clone(),
+                dataset_import_job_arns: import_job_arns,
+                forecast_horizon,
+                forecast_frequency,
+                forecast_types,
+                forecast_dimensions: dimension_names,
+                data_config,
+                encryption_config: input.encryption_config,
+                reference_predictor_arn: input.reference_predictor_arn,
+                optimization_metric: input.optimization_metric,
+                time_alignment_boundary: input.time_alignment_boundary,
+                fitted,
+                target_attribute,
+                lifecycle: crate::state::Lifecycle::succeeded(now),
+                tags: input.tags.unwrap_or_default(),
+            },
+        );
+
+        Ok(CreateAutoPredictorOutput {
+            predictor_arn: Some(arn),
+        })
     }
+}
+
+/// The modelled `InvalidInputException` (HTTP 400) a request this service cannot
+/// create a predictor from is refused with.
+fn invalid(message: impl Into<String>) -> CreateAutoPredictorError {
+    CreateAutoPredictorErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message.into()),
+    })
+    .into()
 }

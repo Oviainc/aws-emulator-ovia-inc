@@ -203,6 +203,23 @@ impl ResourceKind {
         format!("No resource found {arn}")
     }
 
+    /// The `Message` an ARN that names a resource of this kind which EXISTS but whose
+    /// creation run has not reached `ACTIVE` yet is refused with.
+    ///
+    /// The rule, not the instance: "The Status of the forecast must be ACTIVE before
+    /// you can query or export the forecast" (the control plane's `CreateForecast`
+    /// documentation), so a forecast the control plane has minted and not finished
+    /// creating is a resource that is in use — the modelled `ResourceInUseException`
+    /// (HTTP 409) — and not one that cannot be found. Request-derived: the submitted
+    /// ARN quoted back after the kind of resource that is not ready.
+    pub fn not_active_message(&self, arn: &str) -> String {
+        format!(
+            "The status of {} {arn} is not ACTIVE. The status must be ACTIVE before you \
+             can query it.",
+            self.resource_type
+        )
+    }
+
     /// The dotted member path a boundary refusal names this ARN member under.
     ///
     /// Spelled by the framework's OWN path writer (lowerCamel), so this service's table
@@ -304,6 +321,18 @@ pub struct StoredForecast {
     /// When the control plane created the forecast. Stored for the control plane's own
     /// readers (`DescribeForecast`), not reported by a query.
     pub created_at: SystemTime,
+    /// When the control plane's creation run makes this forecast QUERYABLE: "The Status
+    /// of the forecast must be ACTIVE before you can query or export the forecast"
+    /// (the control plane's `CreateForecast` documentation).
+    ///
+    /// The control plane publishes a forecast the instant it accepts the create, which
+    /// is BEFORE its creation run is due to finish, so this is the instant a query may
+    /// start answering from. Before it, the forecast exists and is not readable yet,
+    /// which is the modelled `ResourceInUseException` rather than an absent resource.
+    /// A forecast seeded directly — by a test standing in for the control plane — is
+    /// queryable from the start, so [`StoredForecast::new`] sets this to the creation
+    /// instant and [`StoredForecast::active_from`] is how a pending run moves it.
+    pub active_at: SystemTime,
     /// For a what-if forecast, the forecast it was derived from; `None` for a base
     /// forecast. The what-if's own series is what a query answers with, so this is the
     /// provenance link the control plane records, not an instruction to read the base.
@@ -318,15 +347,31 @@ impl StoredForecast {
         frequency: impl Into<String>,
         forecast_types: impl IntoIterator<Item = T>,
     ) -> Self {
+        let created_at = SystemTime::now();
         Self {
             arn: arn.into(),
             name: name.into(),
             forecast_types: forecast_types.into_iter().map(Into::into).collect(),
             frequency: frequency.into(),
             series: Vec::new(),
-            created_at: SystemTime::now(),
+            created_at,
+            active_at: created_at,
             base_forecast_arn: None,
         }
+    }
+
+    /// Make this forecast queryable only from `active_at` — the instant the control
+    /// plane's creation run is due to reach `ACTIVE`.
+    #[must_use]
+    pub fn active_from(mut self, active_at: SystemTime) -> Self {
+        self.active_at = active_at;
+        self
+    }
+
+    /// Whether a query may answer from this forecast at `now` (see
+    /// [`StoredForecast::active_at`]).
+    pub fn is_active_at(&self, now: SystemTime) -> bool {
+        now >= self.active_at
     }
 
     /// Add one time series.

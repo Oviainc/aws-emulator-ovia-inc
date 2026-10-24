@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDatasetImportJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDatasetImportJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mints
+//! `arn:aws:forecast:<region>:<account>:dataset-import-job/<DatasetName>/<DatasetImportJobName>`
+//! and RUNS the import: it reads the CSV files the `DataSource` names out of the
+//! emulator's own S3 (in process, through the framework's callback), reads every row
+//! against the dataset's own `Schema`, and stores the time series it found on the
+//! dataset — which is the history a predictor is later fitted to.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDatasetImportJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The job's terminal status is therefore the outcome of work that actually ran:
+//! `ACTIVE` when every file was read, and the modelled `CREATE_FAILED` with a
+//! `Message` naming what stopped it otherwise (no file at the path, a row that does
+//! not match the schema, a timestamp outside the submitted format, or one of this
+//! emulator's read bounds). Nothing is imported for a job that failed.
+//!
+//! As on AWS the submission answers before the import is finished: the record is
+//! persisted and the clock owes `CREATE_IN_PROGRESS` and then the terminal status over
+//! the spans in [`crate::state::PENDING_SPAN`] / [`crate::state::RUN_SPAN`], so a
+//! caller that creates a predictor immediately still sees the transient state, and no
+//! status is invented for a read that never happened.
+//!
+//! PARQUET is refused at the submission with the modelled `InvalidInputException`:
+//! this emulator reads CSV import files only, and a job it cannot run is refused
+//! rather than answered with a result nothing produced.
 //!
 //! ## Shape of an operation
 //!
@@ -136,6 +149,38 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::series::{ColumnLayout, ImportedData};
+
+/// The only import `Format` this emulator reads: "The format of the imported data, CSV
+/// or PARQUET" (`CreateDatasetImportJob$Format`), and a Parquet reader is not
+/// something this emulator has.
+const READABLE_FORMAT: &str = "CSV";
+
+/// Read and parse one import, or the reason it could not be carried out — ready for
+/// the job's own `CREATE_FAILED` message.
+///
+/// Held outside `handle` so the store lock is never held across the S3 calls.
+async fn run_import(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    path: &str,
+    layout: &ColumnLayout,
+    timestamp_format: &str,
+) -> Result<ImportedData, String> {
+    let location = crate::state::series::parse_s3_path(path)
+        .ok_or_else(|| format!("The data source {path} names no Amazon S3 bucket."))?;
+    let client = crate::state::series::s3_client(ctx, region);
+    let objects = crate::state::series::read_objects(&client, &location, path).await?;
+    let data = crate::state::series::read_rows(&objects, layout, timestamp_format)?;
+    if data.series.is_empty() {
+        return Err(format!(
+            "The import files at {path} hold no rows this emulator could read as a time \
+             series."
+        ));
+    }
+    Ok(data)
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -208,18 +253,224 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDatasetImportJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDatasetImportJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDatasetImportJob"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable through the router, which mounts every service on the one
+            // shared `InMemoryEngine`: this build cannot serve the operation at all on
+            // the engine it was handed, which is exactly what 501 states.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateDatasetImportJob",
+            ));
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // "The default value is CSV" (`Format`). A Parquet import is a job this
+        // emulator cannot run, so it is refused at the submission rather than recorded
+        // as a run that produced nothing.
+        let format = input
+            .format
+            .clone()
+            .unwrap_or_else(|| crate::state::DEFAULT_IMPORT_FORMAT.to_string());
+        if format != READABLE_FORMAT {
+            return Err(CreateDatasetImportJobErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "The {format} import format is not one this emulator reads; use \
+                         {READABLE_FORMAT}."
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "If the format isn't specified, Amazon Forecast expects the format to be
+        // \"yyyy-MM-dd HH:mm:ss\"" (`TimestampFormat`), and those two are the only
+        // formats it documents, so a third is a value this service cannot read a
+        // timestamp with.
+        let timestamp_format = input
+            .timestamp_format
+            .clone()
+            .unwrap_or_else(|| crate::state::series::DATE_TIME_FORMAT.to_string());
+        if ![
+            crate::state::series::DATE_FORMAT,
+            crate::state::series::DATE_TIME_FORMAT,
+        ]
+        .contains(&timestamp_format.as_str())
+        {
+            return Err(CreateDatasetImportJobErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "The timestamp format {timestamp_format} is not one Amazon \
+                         Forecast reads: use {} or {}.",
+                        crate::state::series::DATE_FORMAT,
+                        crate::state::series::DATE_TIME_FORMAT,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let import_mode = input
+            .import_mode
+            .clone()
+            .unwrap_or_else(|| crate::state::DEFAULT_IMPORT_MODE.to_string());
+
+        // Everything the run needs from the store, read under one lock: the dataset the
+        // data is imported INTO decides the column layout, and the ARN it is keyed by
+        // is what a repeated submission collides on.
+        let (schema, arn) = {
+            let store = state.lock();
+            let Some(dataset) = store.datasets.get(&input.dataset_arn) else {
+                return Err(
+                    CreateDatasetImportJobErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(format!("No resource found {}", input.dataset_arn)),
+                        },
+                    )
+                    .into(),
+                );
+            };
+            let arn = crate::state::dataset_import_job_arn(
+                &region,
+                &dataset.name,
+                &input.dataset_import_job_name,
+            );
+            if store.dataset_import_jobs.contains_key(&arn) {
+                return Err(
+                    CreateDatasetImportJobErrorModeled::ResourceAlreadyExistsException(
+                        ResourceAlreadyExistsException {
+                            message: Some(format!(
+                                "A dataset import job already exists with the name {}.",
+                                input.dataset_import_job_name
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            if store.dataset_import_jobs.len() >= crate::state::MAX_DATASET_IMPORT_JOBS {
+                return Err(CreateDatasetImportJobErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "You have reached the limit of {} dataset import jobs for \
+                             this account.",
+                            crate::state::MAX_DATASET_IMPORT_JOBS
+                        )),
+                    },
+                )
+                .into());
+            }
+            (dataset.schema.clone(), arn)
+        };
+
+        // The schema IS the column layout of the import files, so a schema no rows can
+        // be read against is a request this service cannot carry out at all — refused,
+        // not recorded as a failed run.
+        let layout = match ColumnLayout::read(&schema) {
+            Ok(layout) => layout,
+            Err(reason) => {
+                return Err(CreateDatasetImportJobErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(reason),
+                    },
+                )
+                .into())
+            }
+        };
+
+        let path = input.data_source.s3_config.path.clone();
+        let outcome = run_import(ctx, &region, &path, &layout, &timestamp_format).await;
+
+        let mut store = state.lock();
+        // Everything this submission is judged against is re-checked here, under the
+        // lock that inserts the record: the import's S3 work was awaited without the
+        // lock, so the dataset may have been deleted and the name or the ceiling may
+        // have been taken by another submission in between. Two concurrent submissions
+        // of one name therefore cannot both land, with the later silently overwriting
+        // the earlier.
+        if store.dataset_import_jobs.contains_key(&arn) {
+            return Err(
+                CreateDatasetImportJobErrorModeled::ResourceAlreadyExistsException(
+                    ResourceAlreadyExistsException {
+                        message: Some(format!(
+                            "A dataset import job already exists with the name {}.",
+                            input.dataset_import_job_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        if store.dataset_import_jobs.len() >= crate::state::MAX_DATASET_IMPORT_JOBS {
+            return Err(CreateDatasetImportJobErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "You have reached the limit of {} dataset import jobs for this \
+                         account.",
+                        crate::state::MAX_DATASET_IMPORT_JOBS
+                    )),
+                },
+            )
+            .into());
+        }
+        let Some(dataset) = store.datasets.get_mut(&input.dataset_arn) else {
+            return Err(
+                CreateDatasetImportJobErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!("No resource found {}", input.dataset_arn)),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let (lifecycle, data_size, field_statistics) = match outcome {
+            Ok(data) => match crate::state::apply_import(dataset, &data, &import_mode, &arn) {
+                Ok(()) => {
+                    dataset.last_modification_time = now;
+                    (
+                        crate::state::Lifecycle::succeeded(now),
+                        // "The size of the dataset in gigabytes (GB) after the import
+                        // job has finished" (`DataSize`), from the bytes actually read.
+                        Some(data.bytes as f64 / 1_000_000_000.0),
+                        data.statistics.clone(),
+                    )
+                }
+                Err(reason) => (
+                    crate::state::Lifecycle::failed(now, reason),
+                    None,
+                    ::std::collections::BTreeMap::new(),
+                ),
+            },
+            Err(reason) => (
+                crate::state::Lifecycle::failed(now, reason),
+                None,
+                ::std::collections::BTreeMap::new(),
+            ),
+        };
+
+        store.dataset_import_jobs.insert(
+            arn.clone(),
+            crate::state::DatasetImportJob {
+                arn: arn.clone(),
+                name: input.dataset_import_job_name,
+                dataset_arn: input.dataset_arn,
+                data_source: input.data_source,
+                timestamp_format,
+                time_zone: input.time_zone,
+                use_geolocation_for_time_zone: input.use_geolocation_for_time_zone,
+                geolocation_format: input.geolocation_format,
+                format,
+                import_mode,
+                data_size,
+                field_statistics,
+                lifecycle,
+                tags: input.tags.unwrap_or_default(),
+            },
+        );
+
+        Ok(CreateDatasetImportJobOutput {
+            dataset_import_job_arn: Some(arn),
+        })
     }
 }

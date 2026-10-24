@@ -24,6 +24,25 @@ tracing = { workspace = true }
 # Opaque pagination cursors: the `NextToken` the List operations mint is a
 # hex-encoded cursor, so a client cannot read a state key out of it.
 hex = { workspace = true }
+# The Amazon Forecast RUNTIME (forecastquery) store: `CreateForecast` publishes the
+# forecast it computed into it and `DeleteForecast` withdraws it, so a forecast this
+# control plane minted is what `QueryForecast` answers from. One shared engine, so
+# this is a path dependency on the crate that owns that store's type.
+service-com-amazonaws-forecastquery-amazonforecastruntime = { workspace = true }
+# Amazon S3 client the dataset import job reads its CSV training data with, over the
+# in-process callback into this same emulator (no network client feature is enabled:
+# the transport is the emulator's own).
+aws-sdk-s3 = { version = "1", default-features = false, features = [
+    "rt-tokio",
+    "behavior-version-latest",
+] }
+# CSV reader for the import files `CreateDatasetImportJob`'s `DataSource` names, with
+# the RFC 4180 quoting Forecast's CSV format allows.
+csv = "1.3"
+# Calendar arithmetic for the forecast frequencies (`Y`, `M`, `W`, `D`, `H`, `<n>min`
+# and their integer multiples): bucketing imported timestamps and stepping a forecast
+# horizon forward need month- and year-aware dates, not a seconds count.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -31,6 +50,13 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The propagation suite mounts S3 and the forecastquery runtime beside this control
+# plane on ONE engine: the import job reads its CSV from S3 by calling it in process,
+# and `QueryForecast` is what proves a created forecast reached the runtime store.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
+# `tokio::time::sleep` is how a test waits out the span the clock owes a created
+# resource before it becomes ACTIVE.
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true

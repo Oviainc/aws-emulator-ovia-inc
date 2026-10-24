@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAutoPredictor
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAutoPredictor`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the predictor record `CreateAutoPredictor` wrote — its
+//! configuration, the import jobs whose data it was fitted to, and the
+//! `Status`/`Message` the CLOCK owes its training run at the moment of the read
+//! ([`crate::state::Lifecycle`]). A pure read: nothing here writes.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAutoPredictor::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `ExplainabilityInfo` and `MonitorInfo` are NOT reported: an explainability resource
+//! and a monitor are separate resources, created by `CreateExplainability` /
+//! `CreateMonitor`, which are still 501 stubs with their own gap issues — so reporting
+//! either would be describing a resource this emulator never created.
 //!
 //! ## Shape of an operation
 //!
@@ -184,18 +184,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAutoPredictor` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAutoPredictorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAutoPredictor"))
+        // A read keyed entirely by the request's ARN; no request metadata is needed.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DescribeAutoPredictor",
+            ));
+        };
+        let now = ::std::time::SystemTime::now();
+
+        let state = state.lock();
+        let Some(predictor) = state.predictors.get(&input.predictor_arn) else {
+            return Err(DescribeAutoPredictorErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("No resource found {}", input.predictor_arn)),
+                },
+            )
+            .into());
+        };
+
+        Ok(DescribeAutoPredictorOutput {
+            predictor_arn: Some(predictor.arn.clone()),
+            predictor_name: Some(predictor.name.clone()),
+            forecast_horizon: Some(predictor.forecast_horizon),
+            forecast_types: Some(predictor.forecast_types.clone()),
+            forecast_frequency: Some(predictor.forecast_frequency.clone()),
+            forecast_dimensions: (!predictor.forecast_dimensions.is_empty())
+                .then(|| predictor.forecast_dimensions.clone()),
+            dataset_import_job_arns: Some(predictor.dataset_import_job_arns.clone()),
+            data_config: Some(predictor.data_config.clone()),
+            encryption_config: predictor.encryption_config.clone(),
+            // "The ARN and state of the reference predictor" — reported only for a
+            // retrain, and `Active` because this emulator refuses to retrain from a
+            // predictor that is not, and keeps the reference as long as it exists.
+            reference_predictor_summary: predictor.reference_predictor_arn.as_ref().map(
+                |reference| ReferencePredictorSummary {
+                    arn: Some(reference.clone()),
+                    state: Some(
+                        if state.predictors.contains_key(reference) {
+                            "Active"
+                        } else {
+                            "Deleted"
+                        }
+                        .to_string(),
+                    ),
+                },
+            ),
+            estimated_time_remaining_in_minutes: predictor
+                .lifecycle
+                .estimated_minutes_remaining(now),
+            status: Some(predictor.lifecycle.status(now).to_string()),
+            message: predictor.lifecycle.message(now),
+            creation_time: Some(::aws_smithy_types::DateTime::from(
+                predictor.lifecycle.created_at,
+            )),
+            last_modification_time: Some(::aws_smithy_types::DateTime::from(
+                predictor.lifecycle.last_modification_time(now),
+            )),
+            optimization_metric: predictor.optimization_metric.clone(),
+            explainability_info: None,
+            monitor_info: None,
+            time_alignment_boundary: predictor.time_alignment_boundary.clone(),
+        })
     }
 }

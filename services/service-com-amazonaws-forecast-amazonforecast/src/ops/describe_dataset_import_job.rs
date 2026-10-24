@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDatasetImportJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDatasetImportJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDatasetImportJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the import job record `CreateDatasetImportJob` wrote — its
+//! submission, the `FieldStatistics` computed from the rows that were actually read,
+//! the `DataSize` of what was read, and the `Status`/`Message` the CLOCK owes the run
+//! at the moment of the read ([`crate::state::Lifecycle`]). A pure read: nothing here
+//! writes.
 //!
 //! ## Shape of an operation
 //!
@@ -182,18 +178,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDatasetImportJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDatasetImportJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDatasetImportJob"))
+        // A read keyed entirely by the request's ARN; no request metadata is needed.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DescribeDatasetImportJob",
+            ));
+        };
+        let now = ::std::time::SystemTime::now();
+
+        let state = state.lock();
+        let Some(job) = state.dataset_import_jobs.get(&input.dataset_import_job_arn) else {
+            return Err(
+                DescribeDatasetImportJobErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "No resource found {}",
+                            input.dataset_import_job_arn
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(DescribeDatasetImportJobOutput {
+            dataset_import_job_name: Some(job.name.clone()),
+            dataset_import_job_arn: Some(job.arn.clone()),
+            dataset_arn: Some(job.dataset_arn.clone()),
+            timestamp_format: Some(job.timestamp_format.clone()),
+            time_zone: job.time_zone.clone(),
+            use_geolocation_for_time_zone: job.use_geolocation_for_time_zone,
+            geolocation_format: job.geolocation_format.clone(),
+            data_source: Some(job.data_source.clone()),
+            estimated_time_remaining_in_minutes: job.lifecycle.estimated_minutes_remaining(now),
+            // The statistics of the rows that were read, and only once the clock owes
+            // the run's outcome: a job still being processed has nothing to report.
+            field_statistics: job
+                .lifecycle
+                .is_settled(now)
+                .then(|| {
+                    (!job.field_statistics.is_empty())
+                        .then(|| job.field_statistics.clone().into_iter().collect())
+                })
+                .flatten(),
+            data_size: job.lifecycle.is_settled(now).then_some(job.data_size).flatten(),
+            status: Some(job.lifecycle.status(now).to_string()),
+            message: job.lifecycle.message(now),
+            creation_time: Some(::aws_smithy_types::DateTime::from(job.lifecycle.created_at)),
+            last_modification_time: Some(::aws_smithy_types::DateTime::from(
+                job.lifecycle.last_modification_time(now),
+            )),
+            format: Some(job.format.clone()),
+            import_mode: Some(job.import_mode.clone()),
+        })
     }
 }

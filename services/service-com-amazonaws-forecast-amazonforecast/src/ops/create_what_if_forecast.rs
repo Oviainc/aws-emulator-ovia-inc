@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateWhatIfForecast
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateWhatIfForecast`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mints
+//! `arn:aws:forecast:<region>:<account>:what-if-forecast/<WhatIfAnalysisName>/<WhatIfForecastName>`,
+//! RUNS the analysis's baseline forecast again over a history its
+//! `TimeSeriesTransformations` changed, and PUBLISHES the result into the Amazon
+//! Forecast RUNTIME store — which is what makes it answerable by
+//! `QueryWhatIfForecast` (`crate::state::publish_what_if_forecast`).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateWhatIfForecast::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Each transformation contains an action and a set of conditions. An action is
+//! applied only when all conditions are met. If no conditions are provided, the action
+//! is applied to all items" — which is exactly how
+//! [`crate::state::series::transform`] applies them. A transformation that names an
+//! attribute this emulator's estimator does not read (a related time series' price or
+//! promotion, say) leaves the series as the baseline has it, rather than inventing an
+//! effect for a regressor nothing was fitted on.
+//!
+//! `TimeSeriesReplacementsDataSource` is refused with the modelled
+//! `InvalidInputException`: merging a replacement RELATED time series into the baseline
+//! would change only attributes the estimator does not read, so this emulator cannot
+//! carry it out faithfully and says so instead of answering a forecast nothing
+//! modified.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +177,206 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateWhatIfForecast` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateWhatIfForecastErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateWhatIfForecast"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateWhatIfForecast",
+            ));
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // A replacement RELATED time series changes only attributes this emulator's
+        // estimator does not read, so the run it asks for cannot be carried out
+        // faithfully: refused at the submission rather than answered with a forecast
+        // identical to the baseline.
+        if input.time_series_replacements_data_source.is_some() {
+            return Err(invalid(
+                "TimeSeriesReplacementsDataSource is not supported by this emulator: it \
+                 replaces rows of a related time series, which this emulator's \
+                 predictor does not read. Use TimeSeriesTransformations instead.",
+            ));
+        }
+        let transformations = input.time_series_transformations.clone().unwrap_or_default();
+
+        let mut store = state.lock();
+        let Some(analysis) = store.what_if_analyses.get(&input.what_if_analysis_arn) else {
+            return Err(CreateWhatIfForecastErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("No resource found {}", input.what_if_analysis_arn)),
+                },
+            )
+            .into());
+        };
+        if !analysis.lifecycle.is_active(now) {
+            return Err(CreateWhatIfForecastErrorModeled::ResourceInUseException(
+                ResourceInUseException {
+                    message: Some(format!(
+                        "The status of what-if analysis {} is {}. The status must be \
+                         ACTIVE before you can create a what-if forecast in it.",
+                        analysis.arn,
+                        analysis.lifecycle.status(now)
+                    )),
+                },
+            )
+            .into());
+        }
+        let analysis = analysis.clone();
+        let arn = crate::state::what_if_forecast_arn(
+            &region,
+            &analysis.name,
+            &input.what_if_forecast_name,
+        );
+        if store.what_if_forecasts.contains_key(&arn) {
+            return Err(
+                CreateWhatIfForecastErrorModeled::ResourceAlreadyExistsException(
+                    ResourceAlreadyExistsException {
+                        message: Some(format!(
+                            "A what-if forecast already exists with the name {} in this \
+                             what-if analysis.",
+                            input.what_if_forecast_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        if store.what_if_forecasts.len() >= crate::state::MAX_WHAT_IF_FORECASTS {
+            return Err(CreateWhatIfForecastErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "You have reached the limit of {} what-if forecasts for this \
+                         account.",
+                        crate::state::MAX_WHAT_IF_FORECASTS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The baseline: the analysis's forecast, and the predictor whose fitted model
+        // produced it. Both must still exist — a what-if is computed from them, not from
+        // the baseline's rendered points.
+        let Some(baseline) = store.forecasts.get(&analysis.forecast_arn) else {
+            return Err(CreateWhatIfForecastErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("No resource found {}", analysis.forecast_arn)),
+                },
+            )
+            .into());
+        };
+        let baseline = baseline.clone();
+        let Some(predictor) = store.predictors.get(&baseline.predictor_arn) else {
+            return Err(CreateWhatIfForecastErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("No resource found {}", baseline.predictor_arn)),
+                },
+            )
+            .into());
+        };
+        let predictor = predictor.clone();
+
+        // The series the analysis covers: the baseline's own, narrowed by the
+        // analysis's `TimeSeriesSelector` when it named one.
+        let covered: Vec<crate::state::series::FittedSeries> = match &analysis.selected {
+            Some(identifiers) => baseline
+                .fitted
+                .iter()
+                .filter(|model| {
+                    crate::state::series::is_selected(&model.dimensions, identifiers)
+                })
+                .cloned()
+                .collect(),
+            None => baseline.fitted.clone(),
+        };
+        if covered.is_empty() {
+            return Err(invalid(format!(
+                "The what-if analysis {} covers none of the time series of the forecast \
+                 {}, so there is nothing to forecast.",
+                analysis.arn, baseline.arn
+            )));
+        }
+        let mut transformed = Vec::with_capacity(covered.len());
+        for model in &covered {
+            match crate::state::series::transform(
+                model,
+                &transformations,
+                &predictor.target_attribute,
+            ) {
+                Ok(one) => transformed.push(one),
+                Err(reason) => return Err(invalid(reason)),
+            }
+        }
+
+        // The POINTS this what-if forecast would materialise, bounded before a single
+        // one is built, as on the baseline path: every factor of the product is bounded
+        // on its own, but it is the product one request allocates and the runtime store
+        // keeps (`crate::state::forecast_points_rejection`).
+        let points = crate::state::forecast_point_count(
+            covered.len(),
+            &baseline.forecast_types,
+            predictor.forecast_horizon,
+        );
+        if let Some(reason) = crate::state::forecast_points_rejection(&store, points) {
+            return Err(CreateWhatIfForecastErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(reason),
+                },
+            )
+            .into());
+        }
+
+        let record = crate::state::WhatIfForecast {
+            arn: arn.clone(),
+            name: input.what_if_forecast_name,
+            what_if_analysis_arn: analysis.arn.clone(),
+            base_forecast_arn: baseline.arn.clone(),
+            // A what-if forecast reports the baseline's forecast types: it is the same
+            // predictor run over a modified history.
+            forecast_types: baseline.forecast_types.clone(),
+            time_series_transformations: transformations,
+            points,
+            lifecycle: crate::state::Lifecycle::succeeded(now),
+            tags: input.tags.unwrap_or_default(),
+        };
+        // The record is persisted, and the lock RELEASED before the points are built:
+        // the projection is bounded work, but it is not work the rest of this service
+        // should wait on.
+        store.what_if_forecasts.insert(arn.clone(), record.clone());
+        drop(store);
+
+        let stored = match crate::state::stored_what_if_forecast(
+            &record,
+            &predictor,
+            &transformed,
+            record.lifecycle.settled_at,
+        ) {
+            Ok(stored) => stored,
+            Err(reason) => {
+                state.lock().what_if_forecasts.remove(&arn);
+                return Err(invalid(reason));
+            }
+        };
+
+        // The runtime store is where `QueryWhatIfForecast` reads: a what-if forecast
+        // this control plane cannot publish is one no client could ever query.
+        if !crate::state::publish_what_if_forecast(&*self.engine, stored) {
+            state.lock().what_if_forecasts.remove(&arn);
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateWhatIfForecast",
+            ));
+        }
+
+        Ok(CreateWhatIfForecastOutput {
+            what_if_forecast_arn: Some(arn),
+        })
     }
+}
+
+/// The modelled `InvalidInputException` (HTTP 400) a request this service cannot create
+/// a what-if forecast from is refused with.
+fn invalid(message: impl Into<String>) -> CreateWhatIfForecastError {
+    CreateWhatIfForecastErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message.into()),
+    })
+    .into()
 }
