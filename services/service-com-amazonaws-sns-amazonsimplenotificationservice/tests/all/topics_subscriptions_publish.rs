@@ -133,7 +133,10 @@ impl Sns {
     }
 
     /// A read of this service's persisted state, the way a handler reaches it.
-    fn state(&self) -> ::engine::ServiceState<SnsState> {
+    ///
+    /// `pub(crate)` so a sibling suite in this test target asserts against the SAME
+    /// persisted records rather than building a second harness.
+    pub(crate) fn state(&self) -> ::engine::ServiceState<SnsState> {
         self.engine.state::<SnsState>()
     }
 }

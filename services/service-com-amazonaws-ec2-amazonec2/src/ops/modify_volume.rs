@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyVolume
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyVolume`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: applies the target configuration the request names to the STORED volume
+//! and records the modification it started in [`crate::state`], answering with that
+//! stored record. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyVolume::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What the clock owes a modification it accepted — its `modifying` -> `optimizing` ->
+//! `completed` moves — is derived on read from the stored due instants, so a reporting
+//! operation never has to write to observe it.
 //!
 //! ## Shape of an operation
 //!
@@ -134,6 +132,36 @@ impl From<ModifyVolumeErrorModeled> for ModifyVolumeError {
     }
 }
 
+/// EC2's error code for a `ModifyVolume` on a volume whose most recent modification has
+/// not finished: "After you initiate a volume modification, you must wait for that
+/// modification to reach the completed state before you can initiate another modification
+/// for the same volume" (this operation's own documentation, above).
+///
+/// It lives here rather than in [`crate::state`] because this is the only operation that
+/// answers it: the record it is read from ([`crate::state::VolumeModificationRecord`]) is
+/// shared with `DescribeVolumesModifications`, but the refusal is this call's alone.
+pub const INCORRECT_MODIFICATION_STATE: &str = "IncorrectModificationState";
+
+/// Refuse this request because the volume's most recent modification is still running:
+/// HTTP 400 [`INCORRECT_MODIFICATION_STATE`], naming the volume and the state its
+/// modification is in — the two facts the caller needs to know when to try again.
+fn incorrect_modification_state(
+    volume_id: &str,
+    state: &str,
+) -> ModifyVolumeError {
+    use crate::state::VOLUME_MODIFICATION_STATE_COMPLETED;
+
+    crate::scaffolded::Scaffolded::service_error(
+        INCORRECT_MODIFICATION_STATE,
+        400,
+        format!(
+            "The volume '{volume_id}' has a modification in state '{state}'; \
+             it must reach '{VOLUME_MODIFICATION_STATE_COMPLETED}' before another \
+             modification can be initiated"
+        ),
+    )
+}
+
 /// The `ModifyVolume` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -170,18 +198,269 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyVolume` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyVolumeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyVolume"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            DEFAULT_GP3_IOPS, DEFAULT_GP3_THROUGHPUT, DEFAULT_VOLUME_TYPE, GP3_THROUGHPUT_RANGE,
+            PROVISIONED_IOPS_VOLUME_TYPES, THROUGHPUT_VOLUME_TYPE,
+            VOLUME_MODIFICATION_STATE_COMPLETED, VolumeModificationRecord,
+            require_known_volume, require_service_state, system_time_to_date_time,
+            volume_iops_range, volume_size_range,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it. The store
+        // is reached through the engine held on `self`.
+        let _ = ctx;
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // "The ID of the volume" (`ModifyVolumeRequest$VolumeId`): an id that names no
+        // volume of the account is an error rather than a modification of nothing — a
+        // malformed id before an unknown one, the way the service orders the two.
+        require_known_volume(&store, &input.volume_id)?;
+        let volume_id = input.volume_id.clone();
+        let current = store
+            .volumes
+            .get(&volume_id)
+            .map(|record| record.view.clone())
+            .ok_or_else(|| {
+                Scaffolded::internal_error(format!(
+                    "the volume '{volume_id}' resolved and then could not be read"
+                ))
+            })?;
+
+        // "Default: The existing value is retained" on every target member
+        // (`ModifyVolumeRequest$Size`, `$Iops`, `$Throughput`, `$VolumeType`): the request
+        // names a DIFFERENCE from the volume's current configuration, so one that names no
+        // target member at all asks for no modification.
+        if input.size.is_none()
+            && input.volume_type.is_none()
+            && input.iops.is_none()
+            && input.throughput.is_none()
+            && input.multi_attach_enabled.is_none()
+        {
+            return Err(Scaffolded::missing_parameter(
+                "At least one of size, volumeType, iops, throughput or multiAttachEnabled \
+                 must be specified",
+            ));
+        }
+
+        // Every rule below is read against the configuration the request would LEAVE the
+        // volume in: each target member is the one the request names, or the volume's
+        // current one where it names none. The modelled `VolumeType` enum has already
+        // refused any spelling that is not a volume type, so a target type with no
+        // published size range here can only be one that table has yet to learn.
+        let current_type = current
+            .volume_type
+            .clone()
+            .unwrap_or_else(|| DEFAULT_VOLUME_TYPE.to_string());
+        let target_type = input
+            .volume_type
+            .clone()
+            .unwrap_or_else(|| current_type.clone());
+        let Some((size_min, size_max)) = volume_size_range(&target_type) else {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{target_type}' for volumeType"
+            )));
+        };
+
+        // "The target volume size must be greater than or equal to the existing size of
+        // the volume" (`ModifyVolumeRequest$Size`), and the target size has to fit the
+        // range the TARGET type publishes — which is what refuses a type change to a type
+        // whose smallest volume is larger than this one.
+        let current_size = current.size.unwrap_or_default();
+        let target_size = input.size.unwrap_or(current_size);
+        if target_size < current_size {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{target_size}' for size. The target size must be greater \
+                 than or equal to the volume's existing size of {current_size} GiB"
+            )));
+        }
+        if target_size < size_min || target_size > size_max {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{target_size}' for size. \
+                 A {target_type} volume holds from {size_min} to {size_max} GiB"
+            )));
+        }
+
+        // "This parameter is valid only for gp3, io1, and io2 volumes", with the per-type
+        // ranges this crate keeps beside that sentence, and "Default: The existing value is
+        // retained if you keep the same volume type. If you change the volume type to io1,
+        // io2, or gp3, the default is 3,000" (`ModifyVolumeRequest$Iops`).
+        let target_iops = match volume_iops_range(&target_type) {
+            None => {
+                if let Some(iops) = input.iops {
+                    return Err(Scaffolded::invalid_parameter_value(format!(
+                        "Invalid value '{iops}' for iops. \
+                         A {target_type} volume does not provision IOPS"
+                    )));
+                }
+                None
+            }
+            Some((iops_min, iops_max)) => {
+                // One default serves all three types that provision IOPS: the member
+                // publishes 3,000 for a change to io1, io2 OR gp3, so
+                // [`DEFAULT_GP3_IOPS`] — the same 3,000 `CreateVolume` gives a gp3
+                // volume — is the value a type change lands on whichever of the three
+                // it targets.
+                let iops = match input.iops {
+                    Some(iops) => iops,
+                    None if target_type == current_type => {
+                        current.iops.unwrap_or(DEFAULT_GP3_IOPS)
+                    }
+                    None => DEFAULT_GP3_IOPS,
+                };
+                if iops < iops_min || iops > iops_max {
+                    return Err(Scaffolded::invalid_parameter_value(format!(
+                        "Invalid value '{iops}' for iops. \
+                         A {target_type} volume provisions from {iops_min} to {iops_max} IOPS"
+                    )));
+                }
+                Some(iops)
+            }
+        };
+
+        // "This parameter is valid only for gp3 volumes" and "Default: The existing value
+        // is retained if the source and target volume type is gp3. Otherwise, the default
+        // value is 125" (`ModifyVolumeRequest$Throughput`), inside the range that member
+        // publishes.
+        let (throughput_min, throughput_max) = GP3_THROUGHPUT_RANGE;
+        let target_throughput = if target_type == THROUGHPUT_VOLUME_TYPE {
+            let throughput = match input.throughput {
+                Some(throughput) => throughput,
+                None if current_type == THROUGHPUT_VOLUME_TYPE => {
+                    current.throughput.unwrap_or(DEFAULT_GP3_THROUGHPUT)
+                }
+                None => DEFAULT_GP3_THROUGHPUT,
+            };
+            if throughput < throughput_min || throughput > throughput_max {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{throughput}' for throughput. \
+                     A {THROUGHPUT_VOLUME_TYPE} volume provisions from {throughput_min} to \
+                     {throughput_max} MiB/s"
+                )));
+            }
+            Some(throughput)
+        } else {
+            if let Some(throughput) = input.throughput {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{throughput}' for throughput. It is valid only for \
+                     {THROUGHPUT_VOLUME_TYPE} volumes, not for a {target_type} volume"
+                )));
+            }
+            None
+        };
+
+        // "This parameter is supported with io1 and io2 volumes only"
+        // (`ModifyVolumeRequest$MultiAttachEnabled`). The flag and the volume type are two
+        // parameters that cannot hold together, so a target configuration that enables
+        // Multi-Attach on a type that does not support it is refused as a COMBINATION —
+        // whether the request names the flag, the type, or only one of them and leaves the
+        // other as the volume already has it.
+        let target_multi_attach = input
+            .multi_attach_enabled
+            .or(current.multi_attach_enabled)
+            .unwrap_or(false);
+        if target_multi_attach && !PROVISIONED_IOPS_VOLUME_TYPES.contains(&target_type.as_str()) {
+            return Err(Scaffolded::invalid_parameter_combination(format!(
+                "multiAttachEnabled is supported with {} volumes only, so it cannot be \
+                 enabled on a {target_type} volume",
+                PROVISIONED_IOPS_VOLUME_TYPES.join(" and ")
+            )));
+        }
+
+        let now = ::std::time::Instant::now();
+
+        // "After you initiate a volume modification, you must wait for that modification
+        // to reach the completed state before you can initiate another modification for
+        // the same volume" (`ModifyVolume`). The modification's state is derived from the
+        // clock, so that wait is the clock's: it ends whether or not anybody polls.
+        if let Some(running) = store
+            .volume_modifications
+            .get(&volume_id)
+            .filter(|record| record.state_at(now) != VOLUME_MODIFICATION_STATE_COMPLETED)
+        {
+            return Err(incorrect_modification_state(
+                &volume_id,
+                running.state_at(now),
+            ));
+        }
+
+        // DryRun sits AFTER every parameter has been validated and BEFORE the first write:
+        // the flag asks whether the request WOULD have worked, so one that would have been
+        // refused is refused with that reason instead, and one that would have succeeded
+        // leaves both the volume and its modification record untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // The modification records where the volume came FROM, so every original member is
+        // read off the stored volume before the target configuration is applied to it. The
+        // record holds no caller-chosen string and a volume has at most one, so it is
+        // bounded by the volume store's own ceiling and charges nothing against the
+        // caller-supplied byte budget.
+        let view = VolumeModification {
+            volume_id: Some(volume_id.clone()),
+            original_size: current.size,
+            original_iops: current.iops,
+            original_volume_type: Some(current_type),
+            original_throughput: current.throughput,
+            original_multi_attach_enabled: current.multi_attach_enabled,
+            target_size: Some(target_size),
+            target_iops,
+            target_volume_type: Some(target_type.clone()),
+            target_throughput,
+            target_multi_attach_enabled: Some(target_multi_attach),
+            start_time: Some(system_time_to_date_time(::std::time::SystemTime::now())),
+            // "The service provider that manages the resource"
+            // (`VolumeModification$Operator`): this volume is the caller's, not a
+            // service's, so no managing operator.
+            operator: None,
+            // "A status message about the modification progress or failure"
+            // (`VolumeModification$StatusMessage`): the state and the progress say where
+            // this modification is, and nothing about it has failed.
+            status_message: None,
+            // Derived from the clock on every read, by `view_at`.
+            modification_state: None,
+            progress: None,
+            end_time: None,
+        };
+        let record = VolumeModificationRecord::starting_now(view);
+
+        // The target configuration takes effect at once — "you might be able to apply
+        // these changes without stopping the instance or detaching the volume from it" —
+        // so a later `DescribeVolumes` reports the volume the request asked for while the
+        // modification it started is still working through its own states. The volume was
+        // resolved under this same lock, so its absence here is impossible rather than a
+        // case to skip: it is answered the way that read answered it, so no path can
+        // record a modification that was never applied.
+        let Some(volume) = store.volumes.get_mut(&volume_id) else {
+            return Err(Scaffolded::internal_error(format!(
+                "the volume '{volume_id}' resolved and then could not be written"
+            )));
+        };
+        volume.view.size = Some(target_size);
+        volume.view.volume_type = Some(target_type);
+        volume.view.iops = target_iops;
+        volume.view.throughput = target_throughput;
+        volume.view.multi_attach_enabled = Some(target_multi_attach);
+        // One record per volume: "the most recent volume modification request" is what
+        // `DescribeVolumesModifications` reports, so a later modification of the same
+        // volume replaces this one rather than piling up beside it.
+        store.volume_modifications.insert(volume_id.clone(), record);
+
+        // Read the response back OUT of the store, so the caller sees what a later
+        // `DescribeVolumesModifications` will see rather than the record just built.
+        store
+            .volume_modifications
+            .get(&volume_id)
+            .map(|record| ModifyVolumeOutput {
+                volume_modification: Some(record.view_at(now)),
+            })
+            .ok_or_else(|| {
+                Scaffolded::internal_error(format!(
+                    "the modification of volume '{volume_id}' could not be read back"
+                ))
+            })
     }
 }

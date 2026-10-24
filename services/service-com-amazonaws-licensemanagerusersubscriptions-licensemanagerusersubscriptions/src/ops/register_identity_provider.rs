@@ -202,17 +202,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         resolve_directory(&state, &input.identity_provider)?;
 
         // One registration per (identity provider, product) pair: a second one conflicts
-        // with the registration already in state rather than shadowing it.
+        // with the registration already in state rather than shadowing it. A registration
+        // still being TORN DOWN holds its pair too — deregistration is asynchronous, so
+        // the pair is free again only once the teardown the `DEREGISTERING` status
+        // announces has completed.
         if let Some(existing) = state
             .identity_provider_index
             .get(&(key.clone(), input.product.clone()))
+            .cloned()
         {
+            let deregistering = state
+                .identity_providers
+                .get(&existing)
+                .is_some_and(|record| {
+                    crate::state::deregistration_started(&record.status)
+                });
+            let message = if deregistering {
+                format!(
+                    "the identity provider registered for product {} as {existing} is still \
+                     being deregistered",
+                    input.product
+                )
+            } else {
+                format!(
+                    "the identity provider is already registered for product {} as {existing}",
+                    input.product
+                )
+            };
             return Err(RegisterIdentityProviderErrorModeled::ConflictException(
                 ConflictException {
-                    message: Some(format!(
-                        "the identity provider is already registered for product {} as {existing}",
-                        input.product
-                    )),
+                    message: Some(message),
                 },
             )
             .into());
@@ -220,7 +239,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The in-memory store is bounded, and AWS bounds registrations per account too:
         // the modelled quota error is what a caller at the limit is told. It also bounds
-        // the per-request work every operation that reads the registrations does.
+        // the per-request work every operation that reads the registrations does. A
+        // registration still being torn down counts: it is a record the store holds, and
+        // it stops counting when the clock drops it.
         if crate::state::ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState::at_resource_limit(
             state.identity_providers.len(),
         ) {
@@ -250,6 +271,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             owner_account_id: ::engine::emulator_account_id().to_string(),
             created_at: now,
             registered_due_at: crate::state::registration_due_at(now),
+            deregistration_started_at: None,
+            deregistered_due_at: None,
         };
 
         if let Some(tags) = input.tags.as_ref() {

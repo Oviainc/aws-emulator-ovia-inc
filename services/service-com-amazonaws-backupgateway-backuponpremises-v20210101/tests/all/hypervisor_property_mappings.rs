@@ -21,13 +21,11 @@
 //! in resource type, partition, id and length, including each published bound of
 //! `ServerArn` and one past it.
 //!
-//! `PutHypervisorPropertyMappings` is the operation that SETS mappings and is still a
-//! scaffold answering 501 under its own stub issue
-//! (`issues/things-that-do-not-work/20261023T110543Z-backup-gateway-puthypervisorpropertymappings-stub.md`),
-//! so the store is the only place mappings can come from until it is implemented —
-//! seeded here through the same `property_mappings` field that handler will write, which
-//! is exactly what the sibling `hypervisor_reads` suite does for the members other
-//! scaffolded operations own.
+//! `PutHypervisorPropertyMappings` is the operation that SETS mappings; the cases here
+//! seed them straight into the `property_mappings` field it writes, so a read is asserted
+//! against a known store whatever that handler does, and the write side is covered
+//! end-to-end by the sibling `put_hypervisor_property_mappings` suite. The helpers below
+//! are shared with it.
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -46,7 +44,7 @@ use crate::gateway_lifecycle::{build_engine, build_router, call, create, Reply, 
 
 /// A hypervisor ARN in `partition` naming `id`, so the rows span every partition the
 /// modelled `ServerArn` pattern accepts (`aws`, `aws-cn`, `aws-us-gov`).
-fn hypervisor_arn_in(partition: &str, id: &str) -> String {
+pub(crate) fn hypervisor_arn_in(partition: &str, id: &str) -> String {
     format!(
         "arn:{partition}:backup-gateway:{REGION}:{}:hypervisor/{id}",
         engine::EMULATOR_ACCOUNT_ID
@@ -58,7 +56,7 @@ fn hypervisor_arn_in(partition: &str, id: &str) -> String {
 /// (`smithy_query(query="shape",shape="ServerArn")`). The id segment absorbs the length,
 /// so every character stays inside the pattern's `[a-zA-Z-0-9]+`, and the resource type
 /// is kept short enough that the 50-character minimum fits.
-fn arn_of_length(len: usize) -> String {
+pub(crate) fn arn_of_length(len: usize) -> String {
     let prefix = format!(
         "arn:aws:backup-gateway:{REGION}:{}:h/",
         engine::EMULATOR_ACCOUNT_ID
@@ -73,7 +71,12 @@ fn arn_of_length(len: usize) -> String {
 
 /// One modelled `VmwareToAwsTagMapping`
 /// (`smithy_query(query="shape",shape="VmwareToAwsTagMapping")`: every member required).
-fn mapping(category: &str, tag_name: &str, key: &str, value: &str) -> VmwareToAwsTagMapping {
+pub(crate) fn mapping(
+    category: &str,
+    tag_name: &str,
+    key: &str,
+    value: &str,
+) -> VmwareToAwsTagMapping {
     VmwareToAwsTagMapping {
         vmware_category: category.to_string(),
         vmware_tag_name: tag_name.to_string(),
@@ -84,7 +87,7 @@ fn mapping(category: &str, tag_name: &str, key: &str, value: &str) -> VmwareToAw
 
 /// The `VmwareToAwsTagMappings` list as it must appear in the response body, in the
 /// stored order.
-fn expected_mappings(mappings: &[VmwareToAwsTagMapping]) -> Value {
+pub(crate) fn expected_mappings(mappings: &[VmwareToAwsTagMapping]) -> Value {
     Value::Array(
         mappings
             .iter()
@@ -101,7 +104,7 @@ fn expected_mappings(mappings: &[VmwareToAwsTagMapping]) -> Value {
 }
 
 /// Import a hypervisor over the wire and hand back the ARN the import minted.
-async fn import(router: &MultiServiceRouter, name: &str, host: &str) -> String {
+pub(crate) async fn import(router: &MultiServiceRouter, name: &str, host: &str) -> String {
     let reply = call(
         router,
         "ImportHypervisorConfiguration",
@@ -119,7 +122,7 @@ async fn import(router: &MultiServiceRouter, name: &str, host: &str) -> String {
         .to_string()
 }
 
-async fn get_mappings(router: &MultiServiceRouter, arn: &str) -> Reply {
+pub(crate) async fn get_mappings(router: &MultiServiceRouter, arn: &str) -> Reply {
     call(
         router,
         "GetHypervisorPropertyMappings",
@@ -130,7 +133,7 @@ async fn get_mappings(router: &MultiServiceRouter, arn: &str) -> Reply {
 
 /// Set `mappings` on the stored hypervisor — the one field
 /// `PutHypervisorPropertyMappings` will write (see the module docs).
-fn set_mappings(
+pub(crate) fn set_mappings(
     engine: &Arc<engine::InMemoryEngine>,
     arn: &str,
     mappings: Option<StoredPropertyMappings>,
@@ -145,7 +148,7 @@ fn set_mappings(
 
 /// The mappings PERSISTED on the record under `arn`, rendered for comparison: what a read
 /// must not have changed.
-fn persisted_mappings(engine: &Arc<engine::InMemoryEngine>, arn: &str) -> String {
+pub(crate) fn persisted_mappings(engine: &Arc<engine::InMemoryEngine>, arn: &str) -> String {
     let state = service_state(&**engine).expect("the in-memory engine must expose this state");
     let store = state.lock();
     let record = store

@@ -284,6 +284,12 @@ pub const DEFAULT_LIST_PAGE_SIZE: usize = 100;
 /// The largest `maxResults` a list operation accepts, from the same doc sentence.
 pub const MAX_LIST_PAGE_SIZE: i32 = 100;
 
+/// `ListServices`'s page size when the caller gives no `maxResults`. Its own
+/// `maxResults` doc differs from the sentence [`DEFAULT_LIST_PAGE_SIZE`] quotes: "This
+/// value can be between 1 and 100. If this parameter isn't used, then ListServices
+/// returns up to 10 results and a nextToken value if applicable."
+pub const DEFAULT_LIST_SERVICES_PAGE_SIZE: usize = 10;
+
 /// How many containers one task definition may describe. The Amazon ECS service quota
 /// "Containers per task definition" is 10, and the cap is also what bounds the work and
 /// the stored bytes ONE `RegisterTaskDefinition` can ask for — and, through it, the
@@ -1595,6 +1601,16 @@ impl ServiceRecord {
     pub fn is_active(&self) -> bool {
         self.status == SERVICE_ACTIVE
     }
+
+    /// Who manages this service (`Service$resourceManagementType`). Every service this
+    /// slice holds came from `CreateService`, so it is the customer's
+    /// ([`RESOURCE_MANAGEMENT_CUSTOMER`]); an ECS-managed Express service comes from
+    /// `CreateExpressGatewayService`, which is not part of this slice. Read by both the
+    /// projection and the `ListServices` `resourceManagementType` filter, so the value
+    /// reported and the value filtered on cannot drift.
+    pub fn resource_management_type(&self) -> &'static str {
+        RESOURCE_MANAGEMENT_CUSTOMER
+    }
 }
 
 /// Which optional service fields a response carries, as `DescribeServices$include`
@@ -2129,7 +2145,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             propagate_tags: Some(service.propagate_tags.clone()),
             enable_execute_command: service.enable_execute_command,
             availability_zone_rebalancing: Some(service.availability_zone_rebalancing.clone()),
-            resource_management_type: Some(RESOURCE_MANAGEMENT_CUSTOMER.to_string()),
+            resource_management_type: Some(service.resource_management_type().to_string()),
         }
     }
 
