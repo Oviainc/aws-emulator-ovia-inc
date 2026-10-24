@@ -154,10 +154,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stores nothing.
         let Some(directory) = store.directories.get_mut(&input.directory_id) else {
             return Err(RegisterEventTopicErrorModeled::EntityDoesNotExistException(
-                EntityDoesNotExistException {
-                    message: Some(crate::state::no_such_directory(&input.directory_id)),
-                    request_id: None,
-                },
+                crate::state::refusal(crate::state::no_such_directory(&input.directory_id)),
             )
             .into());
         };
@@ -175,13 +172,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // call stores nothing.
         if directory.event_topics.len() >= crate::state::MAX_EVENT_TOPICS_PER_DIRECTORY {
             return Err(RegisterEventTopicErrorModeled::ClientException(
-                ClientException {
-                    message: Some(format!(
-                        "This emulator associates at most {max} Amazon SNS topics with one directory",
-                        max = crate::state::MAX_EVENT_TOPICS_PER_DIRECTORY
-                    )),
-                    request_id: None,
-                },
+                crate::state::refusal(format!(
+                    "This emulator associates at most {max} Amazon SNS topics with one directory",
+                    max = crate::state::MAX_EVENT_TOPICS_PER_DIRECTORY
+                )),
             )
             .into());
         }

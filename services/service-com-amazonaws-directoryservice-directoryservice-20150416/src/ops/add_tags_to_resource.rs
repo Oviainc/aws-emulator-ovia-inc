@@ -156,11 +156,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .directories
             .get_mut(&input.resource_id)
             .ok_or_else(|| {
+                // The tag family's own diagnostic: a `ResourceId` that names no taggable
+                // resource (see [`crate::state::invalid_resource_id`]).
                 AddTagsToResourceErrorModeled::EntityDoesNotExistException(
-                    EntityDoesNotExistException {
-                        message: Some(crate::state::no_such_directory(&input.resource_id)),
-                        request_id: None,
-                    },
+                    crate::state::invalid_resource_id(),
                 )
             })?;
 
@@ -184,12 +183,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// Refuse the request with the modelled `TagLimitExceededException`, naming the bound
 /// and the count that broke it.
 fn tag_limit_exceeded(count: usize) -> AddTagsToResourceError {
-    AddTagsToResourceErrorModeled::TagLimitExceededException(TagLimitExceededException {
-        message: Some(format!(
-            "A resource may carry at most {max} tags; the request would leave {count}",
-            max = crate::state::MAX_TAGS
-        )),
-        request_id: None,
-    })
+    AddTagsToResourceErrorModeled::TagLimitExceededException(crate::state::refusal(format!(
+        "A resource may carry at most {max} tags; the request would leave {count}",
+        max = crate::state::MAX_TAGS
+    )))
     .into()
 }

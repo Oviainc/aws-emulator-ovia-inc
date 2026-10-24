@@ -23,7 +23,9 @@ use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state
     self, AnswerRecord,
 };
 
-use super::workload_harness::{answered, encode_path_segment, Answer, Client};
+use super::workload_harness::{
+    answered, encode_path_segment, review_template as template, Answer, Client,
+};
 
 /// The published question numbering of the AWS Well-Architected Framework lens, pillar
 /// by pillar in the order the framework presents them: OPS 1-11, SEC 1-11, REL 1-13,
@@ -82,28 +84,6 @@ fn absent_template_arn(template_id: &str) -> String {
         "arn:aws:wellarchitected:us-west-2:{}:review-template/{template_id}",
         engine::emulator_account_id()
     )
-}
-
-/// Create a review template applying `lenses` and answer its `TemplateArn`.
-async fn template(client: &Client, name: &str, lenses: &[&str]) -> String {
-    let answer = client
-        .create_review_template(json!({
-            "TemplateName": name,
-            "Description": "a review template under test",
-            "Lenses": lenses,
-            "ClientRequestToken": format!("tok-{name}"),
-        }))
-        .await;
-    assert_eq!(
-        answer.status, 200,
-        "case {name:?}: expected CreateReviewTemplate 200, got {answer:?}"
-    );
-    answer
-        .body
-        .get("TemplateArn")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string()
 }
 
 /// `GET /reviewTemplates/{TemplateArn}/lensReviews/{LensAlias}/answers`: both labels are

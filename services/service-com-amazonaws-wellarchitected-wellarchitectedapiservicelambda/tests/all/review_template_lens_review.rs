@@ -32,7 +32,9 @@ use std::collections::BTreeMap;
 
 use serde_json::{json, Value};
 
-use super::workload_harness::{answered, official_lens_arn, Answer, Client};
+use super::workload_harness::{
+    answered, official_lens_arn, review_template as template, Answer, Client,
+};
 
 /// The pillars of the AWS Well-Architected Framework lens, in the order the framework
 /// presents them: the `PillarId` each is named by on the wire, its `PillarName`, and the
@@ -74,28 +76,6 @@ const NOTES_MAX: usize = 2084;
 /// The `ValidationExceptionReason` a refused member value is classified under, from
 /// `smithy_query(query="shape", shape="ValidationExceptionReason")`.
 const REASON_FIELD_VALIDATION_FAILED: &str = "FIELD_VALIDATION_FAILED";
-
-/// Create a review template applying `lenses` and answer its `TemplateArn`.
-async fn template(client: &Client, name: &str, lenses: &[&str]) -> String {
-    let answer = client
-        .create_review_template(json!({
-            "TemplateName": name,
-            "Description": "a review template under test",
-            "Lenses": lenses,
-            "ClientRequestToken": format!("tok-{name}"),
-        }))
-        .await;
-    assert_eq!(
-        answer.status, 200,
-        "case {name:?}: expected CreateReviewTemplate 200, got {answer:?}"
-    );
-    answer
-        .body
-        .get("TemplateArn")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string()
-}
 
 /// A well-formed `TemplateArn` (the modelled
 /// `^arn:aws…:wellarchitected:<region>:<account>:review-template/[a-f0-9]{32}$`) that no
