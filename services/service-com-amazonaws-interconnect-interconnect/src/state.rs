@@ -408,6 +408,18 @@ pub fn connection_not_retrievable_message(identifier: &str) -> String {
     format!("{REFUSAL_ENVELOPE}Unable to retrieve connection {identifier}, as it does not exist")
 }
 
+/// How `DescribeConnectionProposal` words an `activationKey` that resolves to no
+/// stored proposal.
+///
+/// `ActivationKey` is `@sensitive`, so — unlike the identifier-bearing refusals
+/// above — this message names the MEMBER and not the value the request carried: a
+/// key echoed into an error body would be a secret in a log.
+pub fn proposal_not_retrievable_message() -> String {
+    format!(
+        "{REFUSAL_ENVELOPE}Unable to retrieve a connection proposal for the supplied activationKey, as it does not exist"
+    )
+}
+
 /// How `UpdateConnection` words an identifier that names no stored connection.
 ///
 /// A distinct construction from [`connection_not_retrievable_message`]: the update
