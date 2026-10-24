@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ValidateStateMachineDefinition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ValidateStateMachineDefinition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ValidateStateMachineDefinition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +162,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ValidateStateMachineDefinition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ValidateStateMachineDefinitionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // "You can validate that a state machine definition is correct WITHOUT
+        // creating a state machine resource": this operation reports on the
+        // definition the request carries and persists nothing, so it reads no record
+        // and writes none — the engine and `ctx` are bound only because every
+        // operation of this service owns them.
+        let _ = (ctx, &self.engine);
+
+        // The modelled constraints are already refused before this handler runs:
+        // `definition` (len 1..1048576), `maxResults` (range 0..100) and the
+        // `severity`/`type` enums. What is computed here is what the definition
+        // itself says — `type` changes no rule below, because the Amazon States
+        // Language structure this service validates is the same for both workflow
+        // types.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ValidateStateMachineDefinition"))
+        // The diagnostics come from the ONE walk `CreateStateMachine` and
+        // `UpdateStateMachine` refuse a definition with (`crate::state::asl::validate`
+        // reports its first error), so "The result value will be OK when your
+        // workflow definition can be successfully created or updated" holds by
+        // construction rather than by two validators agreeing.
+        let found = crate::state::asl::diagnose(&input.definition);
+
+        // "The result value will be FAIL when the workflow definition contains
+        // errors that would prevent you from creating or updating your state
+        // machine", and "the result can be OK even when diagnostic warnings are
+        // present in the response" — so the result reads the severities, never the
+        // count, and it reads EVERY diagnostic found rather than the filtered list
+        // below: which severity the caller asked to SEE cannot change whether the
+        // definition can be created.
+        let result = if found.failed() {
+            crate::state::VALIDATION_RESULT_FAIL
+        } else {
+            crate::state::VALIDATION_RESULT_OK
+        };
+
+        // `severity`: "Minimum level of diagnostics to return. ERROR returns only
+        // ERROR diagnostics, whereas WARNING returns both WARNING and ERROR
+        // diagnostics. The default is ERROR."
+        let severity = input
+            .severity
+            .as_deref()
+            .unwrap_or(crate::state::SEVERITY_ERROR);
+        // Whether the walk itself had to drop a diagnostic of a severity this
+        // request reports, which is one of the two ways the reported list can be
+        // short of what the definition carries.
+        let dropped = found.dropped(severity);
+        let mut diagnostics: Vec<ValidateStateMachineDefinitionDiagnostic> = found
+            .diagnostics
+            .into_iter()
+            .filter(|diagnostic| {
+                severity == crate::state::SEVERITY_WARNING || diagnostic.is_error()
+            })
+            .map(|diagnostic| ValidateStateMachineDefinitionDiagnostic {
+                severity: diagnostic.severity.to_string(),
+                code: diagnostic.code.to_string(),
+                message: diagnostic.message,
+                location: diagnostic.location,
+            })
+            .collect();
+
+        // `maxResults`: "The maximum number of diagnostics that are returned per
+        // call. The default and maximum value is 100. Setting the value to 0 will
+        // also use the default of 100."
+        let max_results = match usize::try_from(input.max_results) {
+            Ok(0) | Err(_) => crate::state::asl::DEFAULT_MAX_DIAGNOSTICS,
+            Ok(asked) => asked.min(crate::state::asl::DEFAULT_MAX_DIAGNOSTICS),
+        };
+        // "If the number of diagnostics returned in the response exceeds maxResults,
+        // the value of the truncated field in the response will be set to true";
+        // "When all diagnostics results are returned, the value will be false." A
+        // walk that stopped early reports `truncated` too, for the same reason: not
+        // all of them are being returned.
+        let truncated = dropped || diagnostics.len() > max_results;
+        diagnostics.truncate(max_results);
+
+        Ok(ValidateStateMachineDefinitionOutput {
+            result: result.to_string(),
+            diagnostics,
+            truncated: Some(truncated),
+        })
     }
 }

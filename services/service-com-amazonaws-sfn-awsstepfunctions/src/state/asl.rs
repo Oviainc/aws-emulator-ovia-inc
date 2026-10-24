@@ -33,6 +33,16 @@
 //! dependency on broken hash functions to evaluate a payload template; it answers
 //! [`INTRINSIC_ERROR`], as any unknown intrinsic does.
 //!
+//! ## What is validated
+//!
+//! A definition is VALIDATED in both of the language's query languages, whether or
+//! not this emulator evaluates its expressions: [`diagnose`] reports every problem
+//! one carries — the errors that would stop `CreateStateMachine` from accepting it
+//! and the warnings that would not — and [`validate`] is the first of those errors,
+//! which is what the create and the update refuse a definition with. A definition
+//! this emulator cannot RUN is still valid ASL, so it is created and the refusal
+//! surfaces at execution time instead.
+//!
 //! ## What bounds a run
 //!
 //! Every input the walk reads — the definition, the execution input, each path and
@@ -278,7 +288,16 @@ pub const EXECUTED_STATE_TYPES: &[&str] =
 
 /// The query language this interpreter evaluates. ASL's `QueryLanguage` member
 /// selects between it and JSONata; a JSONata definition is not run.
-const JSONPATH: &str = "JSONPath";
+pub const JSONPATH: &str = "JSONPath";
+
+/// The other query language ASL's `QueryLanguage` member selects: its expressions
+/// are not evaluated here, but a definition written in it is still VALIDATED,
+/// because its members are the ones the language declares rather than JSONPath's.
+pub const JSONATA: &str = "JSONata";
+
+/// The two query languages `QueryLanguage` selects between, at the definition
+/// level and at one state's.
+pub const QUERY_LANGUAGES: &[&str] = &[JSONPATH, JSONATA];
 
 /// State types that end an execution, so they must NOT carry `Next`.
 const TERMINAL_STATE_TYPES: &[&str] = &["Fail", "Succeed"];
@@ -592,10 +611,234 @@ pub const MISSING_TRANSITION_TARGET: &str = "MISSING_TRANSITION_TARGET";
 /// `INVALID_STATE_NAME`: "The state name does not follow the naming convention".
 pub const INVALID_STATE_NAME: &str = "INVALID_STATE_NAME";
 
-/// One diagnostic as an `InvalidDefinition` message carries it: the code that
-/// classifies the problem, then the detail describing it.
-fn diagnostic(code: &str, detail: impl ::std::fmt::Display) -> String {
-    format!("{code}: {detail}")
+/// `MISSING_DESCRIPTION`: "Received a null or empty workflow input" — the request
+/// carried no document to validate at all.
+pub const MISSING_DESCRIPTION: &str = "MISSING_DESCRIPTION";
+
+/// `TOO_DEEPLY_NESTED`: "The states are too deeply nested".
+pub const TOO_DEEPLY_NESTED: &str = "TOO_DEEPLY_NESTED";
+
+/// `NO_DOLLAR`: "No `.$` on a field that appears to be a JSONPath or Intrinsic
+/// Function" — a WARNING, because the field is rendered as the literal it is
+/// rather than refused.
+pub const NO_DOLLAR: &str = "NO_DOLLAR";
+
+/// `NO_PATH`: "Field value looks like a path, but field name does not end with
+/// 'Path'" — a WARNING, for the same reason.
+pub const NO_PATH: &str = "NO_PATH";
+
+/// `PASS_RESULT_IS_STATIC`: "Attempt to use a path in the result of a pass state"
+/// — a WARNING: a `Pass` state's `Result` is its literal result.
+pub const PASS_RESULT_IS_STATIC: &str = "PASS_RESULT_IS_STATIC";
+
+/// The most diagnostics `ValidateStateMachineDefinition` reports in one call, which
+/// is also what it reports when the request asks for none in particular
+/// (`maxResults`: "The maximum number of diagnostics that are returned per call.
+/// The default and maximum value is 100. Setting the value to 0 will also use the
+/// default of 100.").
+pub const DEFAULT_MAX_DIAGNOSTICS: usize = 100;
+
+/// How many diagnostics of ONE severity a walk collects.
+///
+/// A definition is caller-sized (the modelled `Definition` is 1 MiB), so the list
+/// this walk builds carries its own ceiling like every other walk here. It is one
+/// past [`DEFAULT_MAX_DIAGNOSTICS`], which is `maxResults`' modelled maximum: no
+/// request can ask for more than that, so one more than the maximum is all it takes
+/// to report `truncated`.
+///
+/// The budget is per SEVERITY, and the walk stops only once the ERROR budget is
+/// spent: a definition's warnings can therefore never crowd out an error, which is
+/// what [`validate`] — and so what `CreateStateMachine` refuses — reads.
+const MAX_DIAGNOSTICS: usize = DEFAULT_MAX_DIAGNOSTICS + 1;
+
+/// The most characters of a caller's own value one diagnostic echoes.
+///
+/// A definition is caller-sized and its member names, state names and string values
+/// are caller-chosen, so a message that echoed one whole would let one request be
+/// amplified into a much larger response. The cap is the longest a state name may
+/// be ([`MAX_STATE_NAME_CHARS`]), so a value inside the language's own bounds is
+/// quoted in full and only one past them is clipped.
+const MAX_ECHOED_CHARS: usize = MAX_STATE_NAME_CHARS;
+/// The most characters one diagnostic's `location` carries, and the most any path
+/// the walk builds carries: the path to a state nests a caller-chosen name per
+/// level, so it is clipped AS IT IS BUILT ([`nested_at`]) rather than only where it
+/// is reported.
+pub const MAX_LOCATION_CHARS: usize = 256;
+
+/// `value` as a diagnostic echoes it: itself when it is short, and its first
+/// [`MAX_ECHOED_CHARS`] characters followed by an ellipsis when it is not.
+fn echoed(value: &str) -> String {
+    clipped(value, MAX_ECHOED_CHARS)
+}
+
+/// `value` clipped to `cap` characters, with an ellipsis marking what was dropped.
+///
+/// The ellipsis is one of the `cap`, so the result never carries more characters
+/// than the cap allows.
+///
+/// Not [`clip_cause`], which is the other truncation this module does and a
+/// different one: that cuts a `cause` to the BYTES the modelled `SensitiveCause`
+/// carries and must leave the text it keeps exactly as the run produced it, since
+/// it is a reported value rather than a quotation of one.
+fn clipped(value: &str, cap: usize) -> String {
+    if value.chars().count() <= cap {
+        return value.to_string();
+    }
+    let kept: String = value.chars().take(cap.saturating_sub(1)).collect();
+    format!("{kept}\u{2026}")
+}
+
+/// One problem found in a definition: what it is, where it is, and whether it
+/// prevents creating or updating a state machine with that definition.
+///
+/// `severity` is [`crate::state::SEVERITY_ERROR`] or
+/// [`crate::state::SEVERITY_WARNING`], `code` one of the codes above, and
+/// `location` the `/States/<StateName>/<FieldName>` form the `location` member of
+/// `ValidateStateMachineDefinitionDiagnostic` documents, for a diagnostic a field
+/// or a state owns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Diagnostic {
+    pub severity: &'static str,
+    pub code: &'static str,
+    pub message: String,
+    pub location: Option<String>,
+}
+
+impl Diagnostic {
+    /// Whether this diagnostic prevents a create or an update: "A value of `ERROR`
+    /// means that you cannot create or update a state machine with this
+    /// definition."
+    pub fn is_error(&self) -> bool {
+        self.severity == crate::state::SEVERITY_ERROR
+    }
+
+    /// This diagnostic as the SUBJECT of an `InvalidDefinition` message: the code
+    /// that classifies it, the detail describing it, and where it was found.
+    fn stated(&self) -> String {
+        match &self.location {
+            Some(location) => format!("{}: {} (at {location})", self.code, self.message),
+            None => format!("{}: {}", self.code, self.message),
+        }
+    }
+}
+
+/// One diagnostic of the given severity.
+fn diagnostic(
+    severity: &'static str,
+    code: &'static str,
+    location: Option<String>,
+    message: impl ::std::fmt::Display,
+) -> Diagnostic {
+    Diagnostic {
+        severity,
+        code,
+        message: message.to_string(),
+        location,
+    }
+}
+
+/// One ERROR diagnostic: a definition carrying it cannot be created or updated.
+fn error(code: &'static str, location: Option<String>, message: impl ::std::fmt::Display) -> Diagnostic {
+    diagnostic(crate::state::SEVERITY_ERROR, code, location, message)
+}
+
+/// One WARNING diagnostic: a definition carrying it is still created.
+fn warning(code: &'static str, location: Option<String>, message: impl ::std::fmt::Display) -> Diagnostic {
+    diagnostic(crate::state::SEVERITY_WARNING, code, location, message)
+}
+
+/// Where one diagnostic was found: the enclosing machine's own location followed
+/// by `member`, or `None` for the definition as a whole.
+///
+/// `prefix` is itself bounded (every caller builds one through [`nested_at`]), so
+/// the only caller-sized part of a location is the one member named here.
+fn at(prefix: &str, member: &str) -> Option<String> {
+    let location = format!("{prefix}{member}");
+    (!location.is_empty()).then(|| clipped(&location, MAX_LOCATION_CHARS))
+}
+
+/// The location to hand to something nested inside `prefix`: `prefix` followed by
+/// `member`, clipped AS IT IS BUILT.
+///
+/// The path to a state nests one caller-chosen name per level and is then built
+/// once per state, so a path that grew with the definition would make the work of
+/// one request the PRODUCT of the state count and the nesting; clipping here is
+/// what keeps every path handed down O([`MAX_LOCATION_CHARS`]).
+fn nested_at(prefix: &str, member: impl ::std::fmt::Display) -> String {
+    clipped(&format!("{prefix}{member}"), MAX_LOCATION_CHARS)
+}
+
+/// Everything ONE walk of a definition found: the diagnostics it reports, and
+/// whether it had to drop any of them.
+///
+/// The walk collects at most [`MAX_DIAGNOSTICS`] of each severity, so a caller is
+/// told that more exist (`truncated`) rather than being handed a list that grows
+/// with the definition.
+#[derive(Debug, Clone, Default)]
+pub struct Diagnosis {
+    /// What was found, in the order it was found.
+    pub diagnostics: Vec<Diagnostic>,
+    /// Whether an ERROR was found and not reported, the error budget being spent.
+    pub errors_dropped: bool,
+    /// Whether a WARNING was found and not reported, that budget being spent.
+    pub warnings_dropped: bool,
+    /// How many of each severity have been reported, which is what spends each
+    /// budget.
+    errors: usize,
+    warnings: usize,
+    /// Whether this walk is a [`validate`] — which reads the FIRST error and
+    /// nothing else, so there is no reason to build a warning it would discard or
+    /// to keep walking past that error.
+    first_error_only: bool,
+}
+
+impl Diagnosis {
+    /// A walk that stops at the first ERROR, for [`validate`]: no warning is built
+    /// and nothing past that error is looked at. What it reports about a definition
+    /// is the same verdict a full walk reports, because an error is an error
+    /// wherever in the definition it was found.
+    fn until_first_error() -> Self {
+        Self {
+            first_error_only: true,
+            ..Self::default()
+        }
+    }
+
+    /// Whether the definition carries a problem that prevents creating or updating
+    /// a state machine with it — what `result` reports as `FAIL`.
+    pub fn failed(&self) -> bool {
+        self.diagnostics.iter().any(Diagnostic::is_error)
+    }
+
+    /// Whether a diagnostic of a severity this request reports was dropped, so the
+    /// reported list is short of what the definition carries.
+    pub fn dropped(&self, severity: &str) -> bool {
+        self.errors_dropped
+            || (severity == crate::state::SEVERITY_WARNING && self.warnings_dropped)
+    }
+
+    /// Record one diagnostic, or that its severity's budget is spent.
+    fn push(&mut self, found: Diagnostic) {
+        let (reported, dropped) = if found.is_error() {
+            (&mut self.errors, &mut self.errors_dropped)
+        } else {
+            (&mut self.warnings, &mut self.warnings_dropped)
+        };
+        if *reported >= MAX_DIAGNOSTICS || (self.first_error_only && !found.is_error()) {
+            *dropped = true;
+            return;
+        }
+        *reported += 1;
+        self.diagnostics.push(found);
+    }
+
+    /// Whether the walk keeps looking: it stops once it can report no further ERROR
+    /// — its error budget spent, or, for a [`validate`], the one error it reads
+    /// already found. Every error past that point would change neither the result
+    /// nor the reported list.
+    fn looking(&self) -> bool {
+        !(self.errors_dropped || (self.first_error_only && self.errors > 0))
+    }
 }
 
 /// Why `definition` is not a definition this service accepts, or `Ok` when it is.
@@ -610,172 +853,626 @@ fn diagnostic(code: &str, detail: impl ::std::fmt::Display) -> String {
 /// The `Err` is the SUBJECT of that error's message — one diagnostic, `<code>:
 /// <detail>` — which the operation states through
 /// [`crate::state::resource_error_message`] with
-/// [`crate::state::INVALID_STATE_MACHINE_DEFINITION`].
+/// [`crate::state::INVALID_STATE_MACHINE_DEFINITION`]. It is the FIRST error
+/// [`diagnose`] found, so what a create refuses a definition for and what
+/// `ValidateStateMachineDefinition` reports `FAIL` for cannot disagree.
 ///
 /// A definition may use states this emulator does not EXECUTE and still be valid,
 /// because it is valid ASL: what cannot be run surfaces at execution time, as a
 /// `FAILED` execution, not as a rejected create.
+pub fn validate(definition: &str) -> Result<(), String> {
+    match collect(definition, Diagnosis::until_first_error())
+        .diagnostics
+        .iter()
+        .find(|found| found.is_error())
+    {
+        Some(found) => Err(found.stated()),
+        None => Ok(()),
+    }
+}
+
+/// Every problem `definition` carries: the errors that would prevent creating or
+/// updating a state machine with it, and the warnings that would not.
+///
+/// This is what `ValidateStateMachineDefinition` reports — "Validation will look
+/// for problems in your state machine definition and return a result and a list of
+/// diagnostic elements" — and, through [`validate`], what `CreateStateMachine` and
+/// `UpdateStateMachine` refuse a definition for.
 ///
 /// The rules are applied to EVERY state list the definition declares, not only the
 /// top-level one: a `Map` state's `ItemProcessor`/`Iterator` and a `Parallel` state's
 /// `Branches` each declare their own state machine, whose state names reach the same
-/// execution history.
-pub fn validate(definition: &str) -> Result<(), String> {
-    let document: Value = serde_json::from_str(definition).map_err(|error| {
-        diagnostic(
-            INVALID_JSON_DESCRIPTION,
-            format!("the definition is not valid JSON: {error}"),
-        )
-    })?;
-    validate_machine(&document, 1)
+/// execution history and whose states inherit the enclosing query language.
+///
+/// The list is bounded by [`MAX_DIAGNOSTICS`] per severity; a definition carrying
+/// more problems than that is reported as truncated rather than reported in full.
+///
+/// The walk costs the same ORDER as the parse that precedes it: it visits each
+/// member once, every path it builds is bounded by [`MAX_LOCATION_CHARS`] and every
+/// value it quotes by [`MAX_ECHOED_CHARS`], so no cost that is the product of the
+/// state count and the nesting can be built from a caller's definition.
+pub fn diagnose(definition: &str) -> Diagnosis {
+    collect(definition, Diagnosis::default())
 }
 
-/// [`validate`] for one state machine — the definition itself, or one nested inside
-/// it — carrying how deeply it is nested.
-fn validate_machine(document: &Value, depth: usize) -> Result<(), String> {
+/// [`diagnose`] into the walk `found` describes: every problem, or — for
+/// [`validate`] — the first error and nothing else.
+fn collect(definition: &str, mut found: Diagnosis) -> Diagnosis {
+    if definition.trim().is_empty() {
+        found.push(error(
+            MISSING_DESCRIPTION,
+            None,
+            "the request carried no definition to validate",
+        ));
+        return found;
+    }
+    match serde_json::from_str::<Value>(definition) {
+        Ok(document) => diagnose_machine(&document, "", JSONPATH, 1, &mut found),
+        Err(why) => found.push(error(
+            INVALID_JSON_DESCRIPTION,
+            None,
+            format!("the definition is not valid JSON: {why}"),
+        )),
+    }
+    found
+}
+
+/// [`diagnose`] for one state machine — the definition itself, or one nested inside
+/// it — carrying where it was found (`prefix`), the query language it inherits from
+/// the state that declares it, and how deeply it is nested.
+fn diagnose_machine(
+    document: &Value,
+    prefix: &str,
+    inherited: &str,
+    depth: usize,
+    into: &mut Diagnosis,
+) {
+    if !into.looking() {
+        return;
+    }
     if depth > MAX_DEFINITION_DEPTH {
-        return Err(diagnostic(
-            SCHEMA_VALIDATION_FAILED,
+        into.push(error(
+            TOO_DEEPLY_NESTED,
+            at(prefix, ""),
             format!(
                 "the definition nests state machines more than the {MAX_DEFINITION_DEPTH} levels \
                  this service reads"
             ),
         ));
+        return;
     }
-    let document = document.as_object().ok_or_else(|| {
-        diagnostic(SCHEMA_VALIDATION_FAILED, "the definition must be a JSON object")
-    })?;
-    let start_at = document
-        .get("StartAt")
-        .and_then(Value::as_str)
-        .ok_or_else(|| {
-            diagnostic(
-                SCHEMA_VALIDATION_FAILED,
-                "the definition must carry a string 'StartAt' member",
-            )
-        })?;
-    let states = document
-        .get("States")
-        .and_then(Value::as_object)
-        .ok_or_else(|| {
-            diagnostic(
-                SCHEMA_VALIDATION_FAILED,
-                "the definition must carry an object 'States' member",
-            )
-        })?;
-    if states.is_empty() {
-        return Err(diagnostic(
+    let Some(document) = document.as_object() else {
+        into.push(error(
             SCHEMA_VALIDATION_FAILED,
-            "'States' must declare at least one state",
+            at(prefix, ""),
+            "a state machine definition must be a JSON object",
         ));
-    }
-    if !states.contains_key(start_at) {
-        return Err(diagnostic(
-            MISSING_TRANSITION_TARGET,
-            format!("'StartAt' names '{start_at}', which 'States' does not declare"),
-        ));
-    }
-    for (name, state) in states {
-        // A state name is a caller-chosen JSON object key and lands in every
-        // history event of that state, so its LENGTH is bounded here, not only
-        // the number of events: this is what keeps a history's bytes bounded.
-        if name.chars().count() > MAX_STATE_NAME_CHARS {
-            return Err(diagnostic(
-                INVALID_STATE_NAME,
-                format!(
-                    "a state name may carry at most {MAX_STATE_NAME_CHARS} characters, and this \
-                     definition declares one of {}",
-                    name.chars().count()
-                ),
+        return;
+    };
+    // `QueryLanguage` selects which members the states below are written with, so
+    // it is read before them; a definition that names neither language is written
+    // in the one `QueryLanguage` defaults to.
+    let language = match declared_language(document.get("QueryLanguage")) {
+        Ok(declared) => declared.unwrap_or(inherited),
+        Err(why) => {
+            into.push(error(
+                SCHEMA_VALIDATION_FAILED,
+                at(prefix, "/QueryLanguage"),
+                why,
             ));
+            inherited
         }
-        let state = state.as_object().ok_or_else(|| {
-            diagnostic(
-                SCHEMA_VALIDATION_FAILED,
-                format!("state '{name}' must be a JSON object"),
-            )
-        })?;
-        let state_type = state.get("Type").and_then(Value::as_str).ok_or_else(|| {
-            diagnostic(
-                SCHEMA_VALIDATION_FAILED,
-                format!("state '{name}' must carry a string 'Type' member"),
-            )
-        })?;
-        // A `Fail` state's `Error` and `Cause` are reported verbatim by
-        // `DescribeExecution`, through shapes with their own maxima, so a
-        // definition carrying a longer one could never be reported.
-        for (member, cap) in [("Error", MAX_ERROR_BYTES), ("Cause", MAX_CAUSE_BYTES)] {
-            if let Some(value) = state.get(member).and_then(Value::as_str) {
-                if value.len() > cap {
-                    return Err(diagnostic(
-                        SCHEMA_VALIDATION_FAILED,
-                        format!(
-                            "state '{name}' carries a '{member}' of {} bytes, more than the {cap} \
-                             this service reports",
-                            value.len()
-                        ),
-                    ));
-                }
+    };
+    let states = document.get("States").and_then(Value::as_object);
+    match document.get("StartAt").and_then(Value::as_str) {
+        Some(start_at) => {
+            if states.is_some_and(|states| !states.contains_key(start_at)) {
+                into.push(error(
+                    MISSING_TRANSITION_TARGET,
+                    at(prefix, "/StartAt"),
+                    format!(
+                        "'StartAt' names '{}', which 'States' does not declare",
+                        echoed(start_at)
+                    ),
+                ));
             }
         }
-        match state.get("Next") {
+        None => into.push(error(
+            SCHEMA_VALIDATION_FAILED,
+            at(prefix, "/StartAt"),
+            "a state machine definition must carry a string 'StartAt' member",
+        )),
+    }
+    let Some(states) = states else {
+        into.push(error(
+            SCHEMA_VALIDATION_FAILED,
+            at(prefix, "/States"),
+            "a state machine definition must carry an object 'States' member",
+        ));
+        return;
+    };
+    if states.is_empty() {
+        into.push(error(
+            SCHEMA_VALIDATION_FAILED,
+            at(prefix, "/States"),
+            "'States' must declare at least one state",
+        ));
+        return;
+    }
+    for (name, state) in states {
+        if !into.looking() {
+            return;
+        }
+        diagnose_state(name, state, states, language, prefix, depth, into);
+    }
+}
+
+/// [`diagnose_machine`] for ONE state of a state machine: the rules the state's own
+/// members must satisfy, then the state machines nested inside it.
+fn diagnose_state(
+    name: &str,
+    state: &Value,
+    states: &Map<String, Value>,
+    inherited: &str,
+    prefix: &str,
+    depth: usize,
+    into: &mut Diagnosis,
+) {
+    // A state name is a caller-chosen JSON object key and lands in every history
+    // event of that state, so its LENGTH is bounded here, not only the number of
+    // events: this is what keeps a history's bytes bounded. The name a message
+    // quotes, and the one the location carries, is the clipped one, for the reason
+    // [`echoed`] and [`nested_at`] record; the length checked and reported is the
+    // DECLARED one.
+    let declared_chars = name.chars().count();
+    let shown = echoed(name);
+    let name = shown.as_str();
+    let here = nested_at(prefix, format_args!("/States/{name}"));
+    if declared_chars > MAX_STATE_NAME_CHARS {
+        into.push(error(
+            INVALID_STATE_NAME,
+            at(&here, ""),
+            format!(
+                "a state name may carry at most {MAX_STATE_NAME_CHARS} characters, and this \
+                 definition declares one of {declared_chars}"
+            ),
+        ));
+    }
+    let Some(state) = state.as_object() else {
+        into.push(error(
+            SCHEMA_VALIDATION_FAILED,
+            at(&here, ""),
+            format!("state '{name}' must be a JSON object"),
+        ));
+        return;
+    };
+    let Some(state_type) = state.get("Type").and_then(Value::as_str) else {
+        into.push(error(
+            SCHEMA_VALIDATION_FAILED,
+            at(&here, "/Type"),
+            format!("state '{name}' must carry a string 'Type' member"),
+        ));
+        return;
+    };
+    // A `Fail` state's `Error` and `Cause` are reported verbatim by
+    // `DescribeExecution`, through shapes with their own maxima, so a
+    // definition carrying a longer one could never be reported.
+    for (member, cap) in [("Error", MAX_ERROR_BYTES), ("Cause", MAX_CAUSE_BYTES)] {
+        if let Some(value) = state.get(member).and_then(Value::as_str) {
+            if value.len() > cap {
+                into.push(error(
+                    SCHEMA_VALIDATION_FAILED,
+                    at(&here, &format!("/{member}")),
+                    format!(
+                        "state '{name}' carries a '{member}' of {} bytes, more than the {cap} \
+                         this service reports",
+                        value.len()
+                    ),
+                ));
+            }
+        }
+    }
+    match state.get("Next") {
+        Some(next) => match next.as_str() {
             Some(next) => {
-                let next = next.as_str().ok_or_else(|| {
-                    diagnostic(
-                        SCHEMA_VALIDATION_FAILED,
-                        format!("state '{name}' has a non-string 'Next' member"),
-                    )
-                })?;
                 if !states.contains_key(next) {
-                    return Err(diagnostic(
+                    into.push(error(
                         MISSING_TRANSITION_TARGET,
+                        at(&here, "/Next"),
                         format!(
-                            "state '{name}' transitions to '{next}', which 'States' does not \
-                             declare"
+                            "state '{name}' transitions to '{}', which 'States' does not \
+                             declare",
+                            echoed(next)
                         ),
                     ));
                 }
                 if TERMINAL_STATE_TYPES.contains(&state_type) {
-                    return Err(diagnostic(
+                    into.push(error(
                         SCHEMA_VALIDATION_FAILED,
+                        at(&here, "/Next"),
                         format!(
-                            "state '{name}' is a '{state_type}' state, which ends an execution \
-                             and must not carry 'Next'"
+                            "state '{name}' is a '{}' state, which ends an execution \
+                             and must not carry 'Next'",
+                            echoed(state_type)
                         ),
                     ));
                 }
             }
-            None => {
-                if CONTINUING_STATE_TYPES.contains(&state_type)
-                    && state.get("End").and_then(Value::as_bool) != Some(true)
-                {
-                    return Err(diagnostic(
-                        SCHEMA_VALIDATION_FAILED,
-                        format!(
-                            "state '{name}' is a '{state_type}' state, so it must carry either \
-                             'Next' or \"End\": true"
-                        ),
-                    ));
-                }
-            }
-        }
-        // A nested state machine's names reach the same history as this one's, so
-        // every rule above holds for it too. The diagnostic the nested machine
-        // reported is the one the caller sees, prefixed with where it was found.
-        for member in ["ItemProcessor", "Iterator"] {
-            if let Some(processor) = state.get(member) {
-                validate_machine(processor, depth + 1)
-                    .map_err(|why| format!("{why} (in the '{member}' of state '{name}')"))?;
-            }
-        }
-        if let Some(branches) = state.get("Branches").and_then(Value::as_array) {
-            for (index, branch) in branches.iter().enumerate() {
-                validate_machine(branch, depth + 1)
-                    .map_err(|why| format!("{why} (in branch {index} of state '{name}')"))?;
+            None => into.push(error(
+                SCHEMA_VALIDATION_FAILED,
+                at(&here, "/Next"),
+                format!("state '{name}' has a non-string 'Next' member"),
+            )),
+        },
+        None => {
+            if CONTINUING_STATE_TYPES.contains(&state_type)
+                && state.get("End").and_then(Value::as_bool) != Some(true)
+            {
+                into.push(error(
+                    SCHEMA_VALIDATION_FAILED,
+                    at(&here, ""),
+                    format!(
+                        "state '{name}' is a '{}' state, so it must carry either \
+                         'Next' or \"End\": true",
+                        echoed(state_type)
+                    ),
+                ));
             }
         }
     }
-    Ok(())
+    // A state may be written in a query language of its own — but only in the
+    // direction the service allows: a JSONPath state machine may hold a JSONata
+    // state, a JSONata one may not hold a JSONPath state.
+    let language = match declared_language(state.get("QueryLanguage")) {
+        Ok(Some(declared)) => {
+            if declared == JSONPATH && inherited == JSONATA {
+                into.push(error(
+                    SCHEMA_VALIDATION_FAILED,
+                    at(&here, "/QueryLanguage"),
+                    format!(
+                        "state '{name}' selects '{JSONPATH}', which a state of a '{JSONATA}' \
+                         state machine must not do"
+                    ),
+                ));
+            }
+            declared
+        }
+        Ok(None) => inherited,
+        Err(why) => {
+            into.push(error(
+                SCHEMA_VALIDATION_FAILED,
+                at(&here, "/QueryLanguage"),
+                why,
+            ));
+            inherited
+        }
+    };
+    if language == JSONATA {
+        diagnose_jsonata_state(name, state, state_type, &here, into);
+    } else {
+        diagnose_jsonpath_state(name, state, state_type, &here, into);
+    }
+    // A nested state machine's names reach the same history as this one's, so every
+    // rule above holds for it too, and its states inherit this state's language.
+    for member in ["ItemProcessor", "Iterator"] {
+        if let Some(processor) = state.get(member) {
+            diagnose_machine(
+                processor,
+                &nested_at(&here, format_args!("/{member}")),
+                language,
+                depth + 1,
+                into,
+            );
+        }
+    }
+    if let Some(branches) = state.get("Branches").and_then(Value::as_array) {
+        for (index, branch) in branches.iter().enumerate() {
+            diagnose_machine(
+                branch,
+                &nested_at(&here, format_args!("/Branches/{index}")),
+                language,
+                depth + 1,
+                into,
+            );
+        }
+    }
+}
+
+/// The query language `declared` names, `None` when the member is absent, or why it
+/// is not a query language the Amazon States Language defines.
+fn declared_language(declared: Option<&Value>) -> Result<Option<&'static str>, String> {
+    let Some(declared) = declared else {
+        return Ok(None);
+    };
+    let Some(named) = declared.as_str() else {
+        return Err("'QueryLanguage' must be a string".to_string());
+    };
+    QUERY_LANGUAGES
+        .iter()
+        .find(|language| **language == named)
+        .copied()
+        .map(Some)
+        .ok_or_else(|| {
+            format!(
+                "'QueryLanguage' must be one of {}, and this definition names '{}'",
+                QUERY_LANGUAGES.join(", "),
+                echoed(named)
+            )
+        })
+}
+
+/// The members a state reads its data through in JSONPath, which a state written in
+/// JSONata must not carry: that language reads its data through members of its own
+/// (`Arguments`, `Output`, `Items`, a `Choice` rule's `Condition`), so each of these
+/// is a field of the OTHER query language.
+///
+/// These are the JSONPath data-flow members the Amazon States Language declares, as
+/// [`executable_members`] above lists them per state type: the `*Path` family, the
+/// payload templates and `Pass`'s static `Result`.
+const JSONPATH_ONLY_MEMBERS: &[&str] = &[
+    "CausePath",
+    "ErrorPath",
+    "HeartbeatSecondsPath",
+    "InputPath",
+    "ItemsPath",
+    "MaxConcurrencyPath",
+    "OutputPath",
+    "Parameters",
+    "Result",
+    "ResultPath",
+    "ResultSelector",
+    "SecondsPath",
+    "TimeoutSecondsPath",
+    "TimestampPath",
+    "ToleratedFailureCountPath",
+    "ToleratedFailurePercentagePath",
+];
+
+/// The members that declare a state machine of their own, walked as one rather than
+/// scanned as this state's data.
+const NESTED_MACHINE_MEMBERS: &[&str] = &["Branches", "ItemProcessor", "Iterator"];
+
+/// The reserved term a JSONata expression reads the error of a caught failure
+/// through, which the language scopes to a `Catch`: `$states.errorOutput` holds "the
+/// error output" of the state that failed, and only that `Catch`'s own `Assign` and
+/// `Output` are evaluated with it in scope.
+const ERROR_OUTPUT: &str = "$states.errorOutput";
+
+/// The rules a state written in JSONata must satisfy: it carries none of the other
+/// language's data-flow members, and it reads [`ERROR_OUTPUT`] only where that term
+/// is in scope.
+fn diagnose_jsonata_state(
+    name: &str,
+    state: &Map<String, Value>,
+    state_type: &str,
+    here: &str,
+    into: &mut Diagnosis,
+) {
+    for member in state.keys() {
+        // A `"<name>.$"` member is a JSONPath reference field, which is how that
+        // language — and only that one — spells a member read from the state's data.
+        if JSONPATH_ONLY_MEMBERS.contains(&member.as_str()) || member.ends_with(".$") {
+            let member = echoed(member);
+            into.push(error(
+                SCHEMA_VALIDATION_FAILED,
+                at(here, &format!("/{member}")),
+                format!(
+                    "state '{name}' is written in '{JSONATA}', so it must not carry the \
+                     '{JSONPATH}' member '{member}'"
+                ),
+            ));
+        }
+    }
+    if state_type == "Choice" {
+        if let Some(rules) = state.get("Choices").and_then(Value::as_array) {
+            for (index, rule) in rules.iter().enumerate() {
+                diagnose_jsonata_rule(
+                    name,
+                    rule,
+                    &nested_at(here, format_args!("/Choices/{index}")),
+                    MAX_EXPRESSION_DEPTH,
+                    into,
+                );
+            }
+        }
+    }
+    for (member, value) in state {
+        if member == "Catch" || NESTED_MACHINE_MEMBERS.contains(&member.as_str()) {
+            continue;
+        }
+        if references_error_output(value) {
+            let member = echoed(member);
+            into.push(error(
+                SCHEMA_VALIDATION_FAILED,
+                at(here, &format!("/{member}")),
+                format!(
+                    "the '{member}' of state '{name}' reads '{ERROR_OUTPUT}', which is in scope \
+                     only in the 'Catch' that handles a failure"
+                ),
+            ));
+        }
+    }
+}
+
+/// One `Choice` rule of a JSONata state, and every rule nested in its `And`, `Or`
+/// and `Not`: each one tests a `Condition`, never a JSONPath `Variable`.
+///
+/// `depth` bounds the nesting this follows, as every other expression tree here is
+/// bounded: the rule tree is caller-shaped.
+fn diagnose_jsonata_rule(
+    name: &str,
+    rule: &Value,
+    here: &str,
+    depth: usize,
+    into: &mut Diagnosis,
+) {
+    let Some(depth) = depth.checked_sub(1) else {
+        return;
+    };
+    let Some(rule) = rule.as_object() else {
+        return;
+    };
+    for (member, value) in rule {
+        if member == "Variable" || member.ends_with(".$") {
+            let shown = echoed(member);
+            into.push(error(
+                SCHEMA_VALIDATION_FAILED,
+                at(here, &format!("/{shown}")),
+                format!(
+                    "a 'Choice' rule of state '{name}' is written in '{JSONATA}', so it must not \
+                     carry the '{JSONPATH}' member '{shown}'"
+                ),
+            ));
+        }
+        match member.as_str() {
+            "And" | "Or" => {
+                if let Some(nested) = value.as_array() {
+                    for (index, rule) in nested.iter().enumerate() {
+                        diagnose_jsonata_rule(
+                            name,
+                            rule,
+                            &nested_at(here, format_args!("/{}/{index}", echoed(member))),
+                            depth,
+                            into,
+                        );
+                    }
+                }
+            }
+            "Not" => diagnose_jsonata_rule(name, value, &nested_at(here, "/Not"), depth, into),
+            _ => {}
+        }
+    }
+}
+
+/// Whether any JSONata expression inside `value` reads [`ERROR_OUTPUT`].
+///
+/// The walk is ITERATIVE: `value` is a caller-shaped document, so it carries its own
+/// stack rather than the thread's.
+fn references_error_output(value: &Value) -> bool {
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        match value {
+            Value::String(text) => {
+                if jsonata_expressions(text)
+                    .iter()
+                    .any(|expression| expression.contains(ERROR_OUTPUT))
+                {
+                    return true;
+                }
+            }
+            Value::Array(items) => pending.extend(items.iter()),
+            Value::Object(members) => pending.extend(members.values()),
+            _ => {}
+        }
+    }
+    false
+}
+
+/// The payload templates a JSONPath state renders: every member of one is a LITERAL
+/// unless its name ends in `.$`, which is what makes its value a path.
+const PAYLOAD_TEMPLATE_MEMBERS: &[&str] = &["ItemSelector", "Parameters", "ResultSelector"];
+
+/// Members whose string value names something — a state, a type, a language — rather
+/// than holding the state's data, so a `$` in one is part of that name.
+const NAMING_MEMBERS: &[&str] = &[
+    "Comment",
+    "Default",
+    "Next",
+    "QueryLanguage",
+    "StartAt",
+    "Type",
+];
+
+/// The WARNINGS a state written in JSONPath can carry: each one is a value that
+/// READS as a path or an intrinsic invocation where the language takes a literal, so
+/// the definition is created and the value is used verbatim.
+fn diagnose_jsonpath_state(
+    name: &str,
+    state: &Map<String, Value>,
+    state_type: &str,
+    here: &str,
+    into: &mut Diagnosis,
+) {
+    // PASS_RESULT_IS_STATIC: "Attempt to use a path in the result of a pass state".
+    if state_type == "Pass" {
+        if let Some(result) = state.get("Result").and_then(Value::as_str) {
+            if looks_like_a_path(result) {
+                into.push(warning(
+                    PASS_RESULT_IS_STATIC,
+                    at(here, "/Result"),
+                    format!(
+                        "the 'Result' of state '{name}' holds '{}', which reads as a path, \
+                         but a 'Result' is the state's literal result: 'Parameters' or \
+                         'ResultPath' read a path",
+                        echoed(result)
+                    ),
+                ));
+            }
+        }
+    }
+    // NO_DOLLAR: "No `.$` on a field that appears to be a JSONPath or Intrinsic
+    // Function".
+    for member in PAYLOAD_TEMPLATE_MEMBERS {
+        let Some(template) = state.get(*member).and_then(Value::as_object) else {
+            continue;
+        };
+        for (key, value) in template {
+            let Some(text) = value.as_str() else {
+                continue;
+            };
+            if key.ends_with(".$") || !(looks_like_a_path(text) || looks_like_an_intrinsic(text)) {
+                continue;
+            }
+            let key = echoed(key);
+            let text = echoed(text);
+            into.push(warning(
+                NO_DOLLAR,
+                at(here, &format!("/{member}/{key}")),
+                format!(
+                    "'{key}' of the '{member}' of state '{name}' holds '{text}', which reads as a \
+                     path or an intrinsic function, but a member evaluated as one is named \
+                     '{key}.$'"
+                ),
+            ));
+        }
+    }
+    // NO_PATH: "Field value looks like a path, but field name does not end with
+    // 'Path'".
+    for (member, value) in state {
+        let Some(text) = value.as_str() else {
+            continue;
+        };
+        if NAMING_MEMBERS.contains(&member.as_str())
+            || member.ends_with("Path")
+            || member.ends_with(".$")
+            || (state_type == "Pass" && member == "Result")
+            || !looks_like_a_path(text)
+        {
+            continue;
+        }
+        let member = echoed(member);
+        let text = echoed(text);
+        into.push(warning(
+            NO_PATH,
+            at(here, &format!("/{member}")),
+            format!(
+                "the '{member}' of state '{name}' holds '{text}', which reads as a path, but \
+                 '{member}' does not end in 'Path', so it is used as the literal it is"
+            ),
+        ));
+    }
+}
+
+/// Whether `text` reads as a JSONPath: every path the language takes starts at the
+/// state's data (`$`) or at the context object (`$$`).
+fn looks_like_a_path(text: &str) -> bool {
+    text.starts_with('$')
+}
+
+/// Whether `text` reads as an intrinsic-function invocation, which the language
+/// spells `States.<Name>(<arguments>)`.
+fn looks_like_an_intrinsic(text: &str) -> bool {
+    text.starts_with("States.") && text.contains('(') && text.ends_with(')')
 }
 
 // ---------------------------------------------------------------------------

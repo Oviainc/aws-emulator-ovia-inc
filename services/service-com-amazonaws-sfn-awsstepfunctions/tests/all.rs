@@ -15,6 +15,8 @@
 mod arn_validation;
 #[path = "all/client_error_wrappers.rs"]
 mod client_error_wrappers;
+#[path = "all/definition_validation.rs"]
+mod definition_validation;
 #[path = "all/error_messages.rs"]
 mod error_messages;
 #[path = "all/execution_interpreter.rs"]

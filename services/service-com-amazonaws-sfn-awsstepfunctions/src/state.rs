@@ -181,6 +181,28 @@ pub const EXECUTION_STATUS_ABORTED: &str = "ABORTED";
 /// declares.
 pub const EXECUTION_STATUS_TIMED_OUT: &str = "TIMED_OUT";
 
+/// `ValidateStateMachineDefinitionResultCode`'s value for a definition that
+/// carries no error: "The result value will be OK when no syntax errors are
+/// found", and "the result can be OK even when diagnostic warnings are present".
+pub const VALIDATION_RESULT_OK: &str = "OK";
+
+/// `ValidateStateMachineDefinitionResultCode`'s value for a definition that
+/// cannot be created: "FAIL if the workflow definition does not pass
+/// verification".
+pub const VALIDATION_RESULT_FAIL: &str = "FAIL";
+
+/// `ValidateStateMachineDefinitionSeverity`'s error level, which is also the
+/// `severity` member's default: "ERROR returns only ERROR diagnostics ... The
+/// default is ERROR." A diagnostic of this severity means "you cannot create or
+/// update a state machine with this definition".
+pub const SEVERITY_ERROR: &str = "ERROR";
+
+/// `ValidateStateMachineDefinitionSeverity`'s warning level: "WARNING returns
+/// both WARNING and ERROR diagnostics", and a `WARNING` diagnostic alerts to a
+/// potential issue that "will not prevent you from creating or updating your
+/// state machine".
+pub const SEVERITY_WARNING: &str = "WARNING";
+
 /// `IncludedData`'s metadata-only member: see [`reported_definition`].
 pub const INCLUDED_DATA_METADATA_ONLY: &str = "METADATA_ONLY";
 
