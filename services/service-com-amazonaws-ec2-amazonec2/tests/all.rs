@@ -78,6 +78,8 @@ mod create_security_group;
 mod dedicated_hosts;
 #[path = "all/default_network.rs"]
 mod default_network;
+#[path = "all/default_network_per_region.rs"]
+mod default_network_per_region;
 #[path = "all/delete_coip_pool.rs"]
 mod delete_coip_pool;
 #[path = "all/delete_network_interface.rs"]

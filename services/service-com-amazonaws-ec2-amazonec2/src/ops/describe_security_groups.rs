@@ -4,7 +4,11 @@
 //!
 //! Reports the account's security groups out of [`crate::state`]: the whole store by
 //! default, or the subset the request's `GroupIds`, `GroupNames` and `Filters` select, one
-//! `MaxResults`-sized page at a time. A reporting operation only — it writes nothing.
+//! `MaxResults`-sized page at a time. A reporting operation — the only thing it writes is
+//! what was already owed at the instant it was called: the ambient default network the
+//! account holds in the Region the request is signed for
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::ensure_default_network`], which is
+//! idempotent per Region).
 //!
 //! ## Shape of an operation
 //!
@@ -158,9 +162,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; this operation reads none of it. The store
-        // is reached through the engine held on `self`.
-        let _ = ctx;
+        // The Region this request was signed for: "Describes the specified security groups
+        // or all of your security groups" is answered for the Region the caller is asking
+        // in, and that Region is what says which ambient default group the account already
+        // holds (see below).
+        let region = crate::state::request_region(ctx.parts());
 
         // "Checks whether you have the required permissions for the action, without
         // actually making the request, and provides an error response. If you have the
@@ -249,7 +255,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        let store = state.lock();
+        let mut store = state.lock();
+
+        // The ambient default network of the Region this request is signed for: a VPC
+        // "automatically comes with a default security group" (Amazon VPC User Guide,
+        // "Default security groups for your VPCs") and the account already has a default
+        // VPC "in each AWS Region", so that group is already the account's whatever it has
+        // created. The call is idempotent per Region and materialises a group owed since
+        // the account existed rather than one this read created, so it changes nothing a
+        // later caller would not have seen anyway.
+        store.ensure_default_network(&region);
 
         // "The IDs of the security groups" / "the names of the security groups"
         // (`DescribeSecurityGroupsRequest$GroupIds`, `$GroupNames`): an id or a name that

@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/pipe_lifecycle.rs"]
 mod pipe_lifecycle;
+#[path = "all/pipe_refusal_bodies.rs"]
+mod pipe_refusal_bodies;
 #[path = "all/pipe_tagging.rs"]
 mod pipe_tagging;
 #[path = "all/pipe_update.rs"]
