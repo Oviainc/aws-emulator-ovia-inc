@@ -350,8 +350,9 @@ fn assert_members(case: &str, via: &str, expected: &Value, actual: &Value) {
     }
 }
 
-/// A created group reads back through its ARN — and through nothing else: the bare
-/// identifier forms the modelled pattern admits resolve no group.
+/// A created group reads back through BOTH identifier forms its `{identifier}` member
+/// documents — its ARN and its own name — and through nothing else: the bare id form,
+/// which no member documents, resolves no group.
 #[tokio::test]
 async fn a_created_group_reads_back_through_its_arn() {
     let router = emulator();
@@ -393,30 +394,40 @@ async fn a_created_group_reads_back_through_its_arn() {
             case.name
         );
 
-        // The bare forms the identifier pattern also admits name no group. A name
-        // outside that bare class (`[\-_A-Za-z0-9]{1,512}`) never even reaches the
-        // handler: the modelled pattern refuses it at the boundary.
+        // The group's own NAME is the other identifier form the member documents, so it
+        // reads back the same record — provided the name is inside the identifier's bare
+        // label class (`[\-_A-Za-z0-9]{1,512}`); a name outside it never even reaches the
+        // handler, because the modelled pattern refuses it at the boundary. The bare ID
+        // is a form no member documents, so it resolves nothing.
         let name = case.request["name"].as_str().unwrap_or_default().to_string();
         let name_is_bare_identifier = !name.is_empty()
             && name
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
-        for (form, identifier, want) in [
-            (
-                "its own name",
-                name,
-                if name_is_bare_identifier { 404 } else { 400 },
-            ),
-            ("its own bare id", id, 404),
-        ] {
-            let (status, answer) = get_in(&router, region, &identifier).await;
+        let (status, by_name) = get_in(&router, region, &name).await;
+        if name_is_bare_identifier {
             assert_eq!(
-                status, want,
-                "case {:?} read via {form}: a bare identifier resolves no group, \
-                 got {status} / {answer:?}",
+                (status, &by_name),
+                (200, &body),
+                "case {:?} read via its own name: expected the identical record the ARN \
+                 reports, got {status} / {by_name:?}",
+                case.name
+            );
+        } else {
+            assert_eq!(
+                status, 400,
+                "case {:?} read via its own name: a name outside the identifier's label \
+                 class is refused at the boundary, got {status} / {by_name:?}",
                 case.name
             );
         }
+        let (status, by_id) = get_in(&router, region, &id).await;
+        assert_eq!(
+            status, 404,
+            "case {:?} read via its own bare id: no member documents that form, \
+             got {status} / {by_id:?}",
+            case.name
+        );
 
         // The timestamps and the principal come from the create, not from the read.
         let created_at = body
@@ -475,13 +486,14 @@ async fn an_unknown_identifier_is_a_modelled_404_not_a_hollow_200() {
     let existing_id = assert_group_arn("the-one-group", REGION, &existing);
 
     // Each row is a well-formed identifier that names nothing: the existing group's
-    // own name and bare id (which the service resolves nothing from), a name and an
-    // id-shaped string nothing carries, a syntactically valid ARN of a group never
-    // created, and the existing group's ARN with ONE field changed — a different
-    // partition, region or account names a different resource, so none of them may
-    // resolve to this group.
+    // bare id (a form no `{identifier}` member documents, so the service resolves
+    // nothing from it), a name and an id-shaped string nothing carries, a
+    // syntactically valid ARN of a group never created, and the existing group's ARN
+    // with ONE field changed — a different partition, region or account names a
+    // different resource, so none of them may resolve to this group. The group's own
+    // NAME is deliberately absent: it is the second documented form and does resolve
+    // (`investigation_group_identifier_forms.rs`).
     let unknown = [
-        "the-one-group".to_string(),
         existing_id.clone(),
         "never-created".to_string(),
         "AAAAAAAAAAAAAAAA".to_string(),

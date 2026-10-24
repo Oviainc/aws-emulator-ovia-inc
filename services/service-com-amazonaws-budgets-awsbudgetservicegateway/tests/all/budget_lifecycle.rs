@@ -1522,6 +1522,7 @@ async fn an_account_cannot_exceed_its_budget_quota() {
                 StoredBudget {
                     budget,
                     notifications: Vec::new(),
+                    actions: Vec::new(),
                     tags: Vec::new(),
                 },
             );

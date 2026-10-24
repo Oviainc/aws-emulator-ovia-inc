@@ -111,7 +111,7 @@ fn query_encode(token: &str) -> String {
 }
 
 /// Whether `token` matches the modelled `NextToken` pattern `^[a-zA-Z0-9+/]*={0,2}$`.
-fn is_modelled_token(token: &str) -> bool {
+pub(crate) fn is_modelled_token(token: &str) -> bool {
     let body = token.trim_end_matches('=');
     let padding = token.len() - body.len();
     padding <= 2

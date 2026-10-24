@@ -198,20 +198,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`smithy_query(query="operation", operation="CreateInvoiceUnit")` lists
         // `ValidationException` as its only input refusal), so the quota is stated in
         // the error it does model.
-        let tags = input
-            .resource_tags
-            .unwrap_or_default()
-            .into_iter()
-            .map(|tag| (tag.key, tag.value))
-            .collect::<std::collections::BTreeMap<_, _>>();
-        if tags.len() > crate::state::MAX_RESOURCE_TAGS {
-            return Err(CreateInvoiceUnitErrorModeled::ValidationException(ValidationException {
-                message: Some(crate::state::TAG_QUOTA_EXCEEDED_MESSAGE.to_string()),
-                reason: Some("invalidInput".to_string()),
-                ..Default::default()
-            })
-            .into());
-        }
+        let tags = crate::state::resource_tags_for_new_resource(input.resource_tags).map_err(
+            |_| {
+                CreateInvoiceUnitErrorModeled::ValidationException(ValidationException {
+                    message: Some(crate::state::TAG_QUOTA_EXCEEDED_MESSAGE.to_string()),
+                    reason: Some("invalidInput".to_string()),
+                    ..Default::default()
+                })
+            },
+        )?;
 
         // `Name` is documented as "a unique name that is distinctive within your Amazon
         // Web Services [account]", and the model's `ValidationExceptionReason` enum

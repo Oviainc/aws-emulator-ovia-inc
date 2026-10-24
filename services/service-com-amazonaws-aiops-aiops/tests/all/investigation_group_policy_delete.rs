@@ -122,7 +122,8 @@ async fn call_in(
 /// This service is regional (`aiops.<region>.<dns-suffix>`), so an endpoint serves only
 /// its own Region's groups and a caller reaches a group through the Region its ARN
 /// names. An identifier that is not a group ARN names no Region, so those rows sign for
-/// [`REGION`] — and still resolve nothing, which is what they assert.
+/// [`REGION`] — which is where the rows addressing a group by NAME expect to find it,
+/// and where the rows that resolve nothing still resolve nothing.
 fn region_of(identifier: &str) -> String {
     identifier
         .strip_prefix("arn:")
@@ -216,7 +217,8 @@ fn message(body: &Value) -> String {
 }
 
 /// The id segment of a group ARN — a bare form the modelled
-/// `InvestigationGroupIdentifier` admits and which the service resolves no group from.
+/// `InvestigationGroupIdentifier` admits but which no `{identifier}` member documents,
+/// so the service resolves no group from it.
 fn id_of(arn: &str) -> String {
     arn.rsplit('/')
         .next()
@@ -253,8 +255,9 @@ async fn deleting_a_policy_removes_the_stored_document_and_keeps_the_group() {
     for (index, document) in documents.iter().enumerate() {
         let name = format!("delete-policy-{index}");
         let arn = create_ok(&router, &region(index), &name).await;
-        // The ARN is the only identifier that resolves the group, so it is what every
-        // call below addresses.
+        // The ARN is one of the two identifier forms that resolve the group, and the
+        // one every row here addresses; the name form has its own suite
+        // (`investigation_group_identifier_forms.rs`).
         let identifier = arn.clone();
         let case = format!("{name} ({} byte document)", document.len());
 
@@ -355,14 +358,14 @@ async fn deleting_a_policy_that_is_not_there_is_the_absent_resource_it_names() {
         "the two conditions must be distinguishable, got {group_absent:?} for both"
     );
 
-    // Rows: identifiers that resolve to no group at all — the bare name and bare id
-    // forms (which the service resolves nothing from even when a group carries them),
-    // a label nothing carries, and ARNs that differ from a stored one in exactly one
-    // field.
+    // Rows: identifiers that resolve to no group at all — the bare id form (which no
+    // `{identifier}` member documents), a label nothing carries, and ARNs that differ
+    // from a stored one in exactly one field. The group's own NAME is not among them: it
+    // is the second documented form and resolves the group, which the policy-absent rows
+    // below assert.
     let arn = create_ok(&router, REGION, "policy-bearer").await;
     let id = id_of(&arn);
     for (form, identifier) in [
-        ("the group's own name", "policy-bearer".to_string()),
         ("the group's own bare id", id.clone()),
         ("a name no group carries", "no-such-group".to_string()),
         ("an id no group carries", "A".repeat(16)),
@@ -402,9 +405,9 @@ async fn deleting_a_policy_that_is_not_there_is_the_absent_resource_it_names() {
     }
 
     // Rows: a group that exists and carries no document — never put, and already
-    // deleted — reports the POLICY absent instead, addressed by the ARN that resolves
-    // it.
-    for (form, identifier) in [("arn", arn.clone())] {
+    // deleted — reports the POLICY absent instead, addressed by EITHER form that
+    // resolves it: its ARN and its own name.
+    for (form, identifier) in [("arn", arn.clone()), ("name", "policy-bearer".to_string())] {
         let case = format!("never put, via {form}");
         let (status, code, body) = delete_policy(&router, &identifier).await;
         assert_eq!(
