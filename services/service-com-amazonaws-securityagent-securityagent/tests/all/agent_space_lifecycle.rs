@@ -56,7 +56,10 @@ fn created_id(created: &Value, case: &str) -> String {
         .unwrap_or_else(|| panic!("case {case:?}: CreateAgentSpace returned no agentSpaceId: {created}"))
 }
 
-/// `BatchGetAgentSpaces` over `ids`, as the (`agentSpaces`, `notFound`) pair it reports.
+/// `BatchGetAgentSpaces` over `ids`, as the (found, not-found) pair it reports.
+///
+/// The partition is the modelled `agentSpaces`/`notFound` pair; the recorded 200 carries
+/// a second, always-empty pair beside it, which `crate::recorded_wire_form` pins.
 async fn batch_get(
     router: &MultiServiceRouter,
     ids: &[String],
@@ -94,22 +97,18 @@ async fn batch_get(
 
 /// A timestamp member, as seconds since the epoch.
 ///
-/// The wire form is the generated schema's to choose, not a handler's: `restJson1`
-/// renders a timestamp carrying no `@timestampFormat` as epoch seconds, and as an
-/// RFC 3339 `date-time` string where the model asks for one. Both are read here, so
-/// this case asserts the VALUE is a real instant rather than pinning a rendering the
-/// handler under test does not own.
+/// `createdAt` and `updatedAt` are `@timestampFormat("date-time")` members, so the wire
+/// form is an RFC 3339 instant STRING; `crate::recorded_wire_form` owns that rule and
+/// pins it on every shape that carries such a member. What this case needs is the
+/// VALUE, so the instant is read back out of the rendered string here.
 fn instant(payload: &Value, name: &str, case: &str) -> f64 {
     match payload.get(name) {
-        Some(Value::Number(seconds)) => seconds.as_f64().unwrap_or_else(|| {
-            panic!("case {case:?}: {name} {seconds} is not a finite number of seconds")
-        }),
         Some(Value::String(text)) => DateTime::from_str(text, Format::DateTime)
             .unwrap_or_else(|error| {
                 panic!("case {case:?}: {name} {text:?} is not a date-time timestamp: {error}")
             })
             .as_secs_f64(),
-        _ => panic!("case {case:?}: expected a {name} timestamp, got {payload}"),
+        _ => panic!("case {case:?}: expected a {name} date-time string, got {payload}"),
     }
 }
 
@@ -281,7 +280,6 @@ async fn create_then_batch_get_reads_back_the_stored_agent_space() {
             created.get("tags").is_none(),
             "case {case:?}: CreateAgentSpace answered a tags member: {created}"
         );
-
         // A record nothing has updated yet was created and last updated at the same
         // instant, and both are real timestamps in the modelled wire format.
         let created_at = instant(&created, "createdAt", case);

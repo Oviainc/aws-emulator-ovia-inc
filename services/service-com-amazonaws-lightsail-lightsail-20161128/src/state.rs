@@ -6102,6 +6102,14 @@ pub const DEFAULT_HEALTH_CHECK_PATH: &str = "/";
 /// Region in your account."
 pub const MAX_LOAD_BALANCERS_PER_REGION: usize = 10;
 
+/// How many load balancers one `GetLoadBalancers` page carries.
+///
+/// CHOSEN: Lightsail publishes no page size for this operation, only that the
+/// response carries a `nextPageToken` when more load balancers remain. Kept
+/// below [`MAX_LOAD_BALANCERS_PER_REGION`] so an account that holds the most
+/// load balancers one Region admits still pages.
+pub const LOAD_BALANCER_PAGE_SIZE: usize = 5;
+
 /// The modelled `LoadBalancerAttributeName` members, which are the keys of
 /// `LoadBalancer$configurationOptions` ("A string to string map of the
 /// configuration options for your load balancer").

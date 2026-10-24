@@ -26,14 +26,44 @@ pub struct ListSecurityRequirementPackFilter {
     pub status: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.securityagent#ListSecurityRequirementPacksOutput")]
+/// `ListSecurityRequirementPacksOutput`, with its schema and serializer written out
+/// because its ELEMENT shape is: the derive's read path for the list member demands a
+/// `DeserializableStruct` on [`SecurityRequirementPackSummary`], which an output-only
+/// shape has no caller for (see `super::wire_shape`). The wire form of this shape is
+/// otherwise exactly the model's.
 #[derive(Debug, Clone, Default)]
 pub struct ListSecurityRequirementPacksOutput {
     pub security_requirement_pack_summaries: Vec<SecurityRequirementPackSummary>,
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.securityagent#SecurityRequirementPackSummary")]
+sa_schema_and_codec!(
+    ListSecurityRequirementPacksOutput,
+    LIST_SECURITY_REQUIREMENT_PACKS_OUTPUT_SCHEMA,
+    "com.amazonaws.securityagent#ListSecurityRequirementPacksOutput",
+    "com.amazonaws.securityagent",
+    "ListSecurityRequirementPacksOutput",
+    modelled: [
+        (
+            M_SECURITY_REQUIREMENT_PACK_SUMMARIES,
+            security_requirement_pack_summaries,
+            "securityRequirementPackSummaries",
+            0,
+            req,
+            list_of_struct(SecurityRequirementPackSummary)
+        ),
+        (M_NEXT_TOKEN, next_token, "nextToken", 1, opt, string),
+    ],
+    recorded: [],
+);
+
+/// `SecurityRequirementPackSummary`, with its schema and serializer written out instead
+/// of derived: `createdAt` and `updatedAt` carry `@timestampFormat("date-time")`
+/// (`smithy_query(query="shape", shape="SecurityRequirementPackSummary",
+/// model_path="services/service-com-amazonaws-securityagent-securityagent/smithy-model/com-amazonaws-securityagent-securityagent.json")`),
+/// which the derive drops, so each one would go onto the wire as an epoch-second number
+/// where the model requires an RFC 3339 string. Same reason, same machinery as the
+/// other `date-time`-bearing shapes of this service — see `super::wire_shape`.
 #[derive(Debug, Clone)]
 pub struct SecurityRequirementPackSummary {
     pub pack_id: String,
@@ -45,4 +75,23 @@ pub struct SecurityRequirementPackSummary {
     pub created_at: ::aws_smithy_types::DateTime,
     pub updated_at: ::aws_smithy_types::DateTime,
 }
+
+sa_schema_and_codec!(
+    SecurityRequirementPackSummary,
+    SECURITY_REQUIREMENT_PACK_SUMMARY_SCHEMA,
+    "com.amazonaws.securityagent#SecurityRequirementPackSummary",
+    "com.amazonaws.securityagent",
+    "SecurityRequirementPackSummary",
+    modelled: [
+        (M_PACK_ID, pack_id, "packId", 0, req, string),
+        (M_NAME, name, "name", 1, req, string),
+        (M_DESCRIPTION, description, "description", 2, opt, string),
+        (M_VENDOR_NAME, vendor_name, "vendorName", 3, opt, string),
+        (M_MANAGEMENT_TYPE, management_type, "managementType", 4, req, string),
+        (M_STATUS, status, "status", 5, req, string),
+        (M_CREATED_AT, created_at, "createdAt", 6, req, date_time),
+        (M_UPDATED_AT, updated_at, "updatedAt", 7, req, date_time),
+    ],
+    recorded: [],
+);
 

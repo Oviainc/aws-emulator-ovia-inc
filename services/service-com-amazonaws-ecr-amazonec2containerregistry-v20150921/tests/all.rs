@@ -19,6 +19,8 @@ mod authorization_token;
 mod batch_get_image;
 #[path = "all/create_repository_contract.rs"]
 mod create_repository_contract;
+#[path = "all/image_metadata.rs"]
+mod image_metadata;
 #[path = "all/image_tag_mutability.rs"]
 mod image_tag_mutability;
 #[path = "all/layer_availability.rs"]

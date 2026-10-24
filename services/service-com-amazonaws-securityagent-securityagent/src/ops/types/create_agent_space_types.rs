@@ -23,7 +23,22 @@ pub struct CreateAgentSpaceInput {
     pub tags: Option<std::collections::HashMap<String, String>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.securityagent#CreateAgentSpaceOutput")]
+/// `CreateAgentSpaceOutput`, with its schema and serializer written out instead of
+/// derived.
+///
+/// WHY it is not `#[smithy_macros::smithy(shape = ...)]` like the input beside it, in
+/// two parts — both spelled out in `super::wire_shape`:
+///
+/// 1. `createdAt` and `updatedAt` carry `@timestampFormat("date-time")`
+///    (`smithy_query(query="operation", operation="CreateAgentSpace",
+///    model_path="services/service-com-amazonaws-securityagent-securityagent/smithy-model/com-amazonaws-securityagent-securityagent.json")`),
+///    which the derive drops, so they would go out as epoch-second NUMBERS where the
+///    model (and every SDK's generated deserializer) requires an RFC 3339 string.
+/// 2. The recorded 200 carries three identity members the model does not declare —
+///    `id` (the same value as `agentSpaceId`), `ownerId` (the owning account) and
+///    `arn` — plus `targetDomains`, the association echoed RESOLVED: the stored record
+///    of every target domain the request named. A derived struct cannot carry a field
+///    that matches no Smithy member at all.
 #[derive(Debug, Clone, Default)]
 pub struct CreateAgentSpaceOutput {
     pub agent_space_id: String,
@@ -35,5 +50,48 @@ pub struct CreateAgentSpaceOutput {
     pub kms_key_id: Option<String>,
     pub created_at: Option<::aws_smithy_types::DateTime>,
     pub updated_at: Option<::aws_smithy_types::DateTime>,
+    /// Recorded, not modelled: the agent space's id again, under the name the service's
+    /// own record uses for it.
+    pub id: String,
+    /// Recorded, not modelled: the account that owns the agent space.
+    pub owner_id: String,
+    /// Recorded, not modelled: the agent space's ARN.
+    pub arn: String,
+    /// Recorded, not modelled: the full stored record of each associated target domain,
+    /// so a caller that associated domains at create time can read the challenge each
+    /// one is waiting on without a second call.
+    pub target_domains: Option<Vec<TargetDomain>>,
 }
+
+sa_schema_and_codec!(
+    CreateAgentSpaceOutput,
+    CREATE_AGENT_SPACE_OUTPUT_SCHEMA,
+    "com.amazonaws.securityagent#CreateAgentSpaceOutput",
+    "com.amazonaws.securityagent",
+    "CreateAgentSpaceOutput",
+    modelled: [
+        (M_AGENT_SPACE_ID, agent_space_id, "agentSpaceId", 0, req, string),
+        (M_NAME, name, "name", 1, req, string),
+        (M_DESCRIPTION, description, "description", 2, opt, string),
+        (M_AWS_RESOURCES, aws_resources, "awsResources", 3, opt, struct_of(AWSResources)),
+        (M_TARGET_DOMAIN_IDS, target_domain_ids, "targetDomainIds", 4, opt, list_of_string),
+        (
+            M_CODE_REVIEW_SETTINGS,
+            code_review_settings,
+            "codeReviewSettings",
+            5,
+            opt,
+            struct_of(CodeReviewSettings)
+        ),
+        (M_KMS_KEY_ID, kms_key_id, "kmsKeyId", 6, opt, string),
+        (M_CREATED_AT, created_at, "createdAt", 7, opt, date_time),
+        (M_UPDATED_AT, updated_at, "updatedAt", 8, opt, date_time),
+    ],
+    recorded: [
+        (M_ID, id, "id", 9, req, string),
+        (M_OWNER_ID, owner_id, "ownerId", 10, req, string),
+        (M_ARN, arn, "arn", 11, req, string),
+        (M_TARGET_DOMAINS, target_domains, "targetDomains", 12, opt, list_of_struct(TargetDomain)),
+    ],
+);
 

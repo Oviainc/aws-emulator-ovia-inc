@@ -52,6 +52,7 @@ pub struct Image {
     pub image_id: Option<ImageIdentifier>,
     pub image_manifest: Option<String>,
     pub image_manifest_media_type: Option<String>,
+    pub image_manifest_size: Option<i64>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.ecr#LimitExceededException")]

@@ -17,14 +17,131 @@ pub struct BatchGetAgentSpacesInput {
     pub agent_space_ids: Vec<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.securityagent#BatchGetAgentSpacesOutput")]
+/// `BatchGetAgentSpacesOutput`, with its schema and serializer written out instead of
+/// derived, for two reasons — the machinery lives in `super::wire_shape`:
+///
+/// 1. BOTH PARTITION LISTS, ALWAYS. A batch read answers every requested id in exactly
+///    one of `agentSpaces` and `notFound`, so a caller iterates both unconditionally and
+///    a strict deserializer faults on an absent one; the recorded 200 for a batch that
+///    matched nothing carries both. The two fields are therefore plain `Vec`s, not
+///    `Option`s: there is no state of this response in which a list is absent, so none
+///    can be omitted.
+/// 2. THE RECORDED SECOND PAIR. Beside those two the recorded 200 carries
+///    `agentInstances` and `ids`, which the model does not declare
+///    (`smithy_query(query="operation", operation="BatchGetAgentSpaces",
+///    model_path="services/service-com-amazonaws-securityagent-securityagent/smithy-model/com-amazonaws-securityagent-securityagent.json")`
+///    states `agentSpaces` and `notFound` alone). In every recording they are EMPTY
+///    ARRAYS — including the read that matched an agent space, whose record the recorded
+///    `agentSpaces` carries — so they are not this operation's partition under other
+///    names: they are a second pair the service keeps in the response and does not fill.
+///    This emulator cannot fill them either: nothing in this service's model creates an
+///    agent instance, so no stored state could put an entry in one. They are written as
+///    the empty arrays they are, which is why neither has a field to carry.
 #[derive(Debug, Clone, Default)]
 pub struct BatchGetAgentSpacesOutput {
-    pub agent_spaces: Option<Vec<AgentSpace>>,
-    pub not_found: Option<Vec<String>>,
+    pub agent_spaces: Vec<AgentSpace>,
+    pub not_found: Vec<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.securityagent#AgentSpace")]
+#[allow(non_upper_case_globals)]
+impl BatchGetAgentSpacesOutput {
+    const M_AGENT_SPACES: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.securityagent#BatchGetAgentSpacesOutput$agentSpaces",
+            "com.amazonaws.securityagent",
+            "agentSpaces",
+        ),
+        ::aws_smithy_schema::ShapeType::List,
+        "agentSpaces",
+        0,
+    );
+
+    const M_NOT_FOUND: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.securityagent#BatchGetAgentSpacesOutput$notFound",
+            "com.amazonaws.securityagent",
+            "notFound",
+        ),
+        ::aws_smithy_schema::ShapeType::List,
+        "notFound",
+        1,
+    );
+
+    /// Recorded, not modelled; always empty. See the note on the struct.
+    const M_AGENT_INSTANCES: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.securityagent.recorded#BatchGetAgentSpacesOutput$agentInstances",
+            "com.amazonaws.securityagent.recorded",
+            "agentInstances",
+        ),
+        ::aws_smithy_schema::ShapeType::List,
+        "agentInstances",
+        2,
+    );
+
+    /// Recorded, not modelled; always empty. See the note on the struct.
+    const M_IDS: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.securityagent.recorded#BatchGetAgentSpacesOutput$ids",
+            "com.amazonaws.securityagent.recorded",
+            "ids",
+        ),
+        ::aws_smithy_schema::ShapeType::List,
+        "ids",
+        3,
+    );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.securityagent#BatchGetAgentSpacesOutput",
+            "com.amazonaws.securityagent",
+            "BatchGetAgentSpacesOutput",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_AGENT_SPACES,
+            &Self::M_NOT_FOUND,
+            &Self::M_AGENT_INSTANCES,
+            &Self::M_IDS,
+        ],
+    );
+}
+
+pub static BATCH_GET_AGENT_SPACES_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema =
+    &BatchGetAgentSpacesOutput::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for BatchGetAgentSpacesOutput {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        serializer.write_list(&Self::M_AGENT_SPACES, &|elements| {
+            for agent_space in self.agent_spaces.iter() {
+                elements.write_struct(&AgentSpace::SCHEMA, agent_space)?;
+            }
+            Ok(())
+        })?;
+        serializer.write_list(&Self::M_NOT_FOUND, &|elements| {
+            for id in self.not_found.iter() {
+                elements.write_string(&Self::M_NOT_FOUND, id.as_str())?;
+            }
+            Ok(())
+        })?;
+        // The recorded second pair: present, and empty because this emulator holds no
+        // agent instance to report in it — no operation of this service creates one.
+        serializer.write_list(&Self::M_AGENT_INSTANCES, &|_| Ok(()))?;
+        serializer.write_list(&Self::M_IDS, &|_| Ok(()))?;
+        Ok(())
+    }
+}
+
+/// `AgentSpace`, with its schema and serializer written out instead of derived, for the
+/// reasons `CreateAgentSpaceOutput` carries: `createdAt`/`updatedAt` are
+/// `@timestampFormat("date-time")` members the derive would render as epoch numbers,
+/// and the recorded agent-space record carries `id`, `ownerId`, `arn` and the resolved
+/// `targetDomains` beside the modelled members. The read path answers the SAME
+/// projection as the create path — the record does not change shape between the call
+/// that minted it and a later read of it.
 #[derive(Debug, Clone, Default)]
 pub struct AgentSpace {
     pub agent_space_id: String,
@@ -36,5 +153,45 @@ pub struct AgentSpace {
     pub kms_key_id: Option<String>,
     pub created_at: Option<::aws_smithy_types::DateTime>,
     pub updated_at: Option<::aws_smithy_types::DateTime>,
+    /// Recorded, not modelled: see [`CreateAgentSpaceOutput`].
+    pub id: String,
+    /// Recorded, not modelled: the account that owns the agent space.
+    pub owner_id: String,
+    /// Recorded, not modelled: the agent space's ARN.
+    pub arn: String,
+    /// Recorded, not modelled: the associated target domains, resolved.
+    pub target_domains: Option<Vec<TargetDomain>>,
 }
+
+sa_schema_and_codec!(
+    AgentSpace,
+    AGENT_SPACE_SCHEMA,
+    "com.amazonaws.securityagent#AgentSpace",
+    "com.amazonaws.securityagent",
+    "AgentSpace",
+    modelled: [
+        (M_AGENT_SPACE_ID, agent_space_id, "agentSpaceId", 0, req, string),
+        (M_NAME, name, "name", 1, req, string),
+        (M_DESCRIPTION, description, "description", 2, opt, string),
+        (M_AWS_RESOURCES, aws_resources, "awsResources", 3, opt, struct_of(AWSResources)),
+        (M_TARGET_DOMAIN_IDS, target_domain_ids, "targetDomainIds", 4, opt, list_of_string),
+        (
+            M_CODE_REVIEW_SETTINGS,
+            code_review_settings,
+            "codeReviewSettings",
+            5,
+            opt,
+            struct_of(CodeReviewSettings)
+        ),
+        (M_KMS_KEY_ID, kms_key_id, "kmsKeyId", 6, opt, string),
+        (M_CREATED_AT, created_at, "createdAt", 7, opt, date_time),
+        (M_UPDATED_AT, updated_at, "updatedAt", 8, opt, date_time),
+    ],
+    recorded: [
+        (M_ID, id, "id", 9, req, string),
+        (M_OWNER_ID, owner_id, "ownerId", 10, req, string),
+        (M_ARN, arn, "arn", 11, req, string),
+        (M_TARGET_DOMAINS, target_domains, "targetDomains", 12, opt, list_of_struct(TargetDomain)),
+    ],
+);
 
