@@ -296,10 +296,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A profile named here has to exist to be associated, and no profile can be
-        // created in this emulator yet (`CreateProfile` is still a stub), so no profile
-        // ARN a caller passes resolves. A review template ARN is resolved against the
-        // store below, once the lock is held.
+        // A profile named here has to be ASSOCIATED with the workload, and no profile
+        // can be associated in this emulator yet: associating one prioritises the lens
+        // questions the profile's selected choices map to, and that mapping is published
+        // by the profile template this emulator does not carry (`GetProfileTemplate` is a
+        // stub with its own issue, as is `AssociateProfiles`). So no profile ARN a caller
+        // passes resolves to an association. A review template ARN is resolved against
+        // the store below, once the lock is held.
         if let Some(arn) = input.profile_arns.unwrap_or_default().first() {
             return Err(CreateWorkloadErrorModeled::ResourceNotFoundException(
                 crate::state::resource_not_found(

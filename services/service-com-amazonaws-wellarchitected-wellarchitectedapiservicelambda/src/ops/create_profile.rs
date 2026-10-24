@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: normalizes the profile questions the request answers, mints a profile and
+//! stores the whole record in
+//! [`crate::state::ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::profiles`],
+//! so `GetProfile` reads back exactly what was created.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +159,188 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateProfileErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool profile store is unavailable".to_string(),
+            })
+        })?;
+
+        // "The profile questions" (`CreateProfileInput$ProfileQuestions`) are answers to
+        // questions, so each one is recorded UNDER the question it answers: the request's
+        // list becomes the map the profile holds, keyed by `QuestionId`.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateProfile"))
+        // Two entries the model allows cannot be recorded that way, and both are refused
+        // with the modelled `ValidationException` rather than silently dropped or merged:
+        // an update that names no question (`ProfileQuestionUpdate$QuestionId` is
+        // optional) answers nothing, and two updates naming the SAME question disagree
+        // about one answer. The selected choices, by contrast, are a SET — "the selected
+        // choices", so a choice is either selected or not — so a choice named twice in
+        // one update selects it once.
+        let mut questions: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+            std::collections::BTreeMap::new();
+        for update in &input.profile_questions {
+            let question_id = update.question_id.as_deref().unwrap_or_default();
+            if question_id.is_empty() {
+                return Err(questions_validation(
+                    "Member must name the question it answers in QuestionId",
+                ));
+            }
+            if questions.contains_key(question_id) {
+                return Err(questions_validation(&format!(
+                    "Member must answer each question at most once, got {question_id} twice"
+                )));
+            }
+            questions.insert(
+                question_id.to_string(),
+                update
+                    .selected_choice_ids
+                    .clone()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect(),
+            );
+        }
+
+        // How many questions one profile records is a QUOTA this emulator sets, not a
+        // modelled constraint: `ProfileQuestionUpdates` publishes no `@length`, so the
+        // boundary validator does not bound the list. It is answered with the modelled
+        // `ServiceQuotaExceededException` — "The user has reached their resource quota" —
+        // rather than a `ValidationException`, so a caller is not told the model refused a
+        // list the model allows, and it is what keeps a STORED profile's question map
+        // bounded by something other than the request body size.
+        if questions.len() > crate::state::MAX_QUESTIONS_PER_PROFILE {
+            return Err(CreateProfileErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The quota of {} questions per profile has been reached",
+                        crate::state::MAX_QUESTIONS_PER_PROFILE
+                    ),
+                    resource_id: None,
+                    resource_type: Some(crate::state::PROFILE_RESOURCE_TYPE.to_string()),
+                    quota_code: "QuestionsPerProfile".to_string(),
+                    service_code: crate::state::ARN_NAMESPACE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        let tags: std::collections::BTreeMap<String, String> =
+            input.tags.unwrap_or_default().into_iter().collect();
+        let now = std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        // The record is built before the fingerprint so the fingerprint covers the
+        // NORMALIZED questions ([`crate::state::ProfileRecord::question_fingerprint`]):
+        // two requests that would record the same profile are the same request, however
+        // their question list was ordered.
+        let mut record = crate::state::ProfileRecord {
+            // Filled in below, once the store is locked and the profile is actually
+            // minted; the ARN is not part of what the request asked for.
+            profile_arn: String::new(),
+            profile_version: crate::state::INITIAL_PROFILE_VERSION.to_string(),
+            profile_name: input.profile_name,
+            profile_description: input.profile_description,
+            questions,
+            // The account that created the profile owns it (`Profile$Owner` is an
+            // `AwsAccountId`), and this emulator serves one account.
+            owner: ::engine::emulator_account_id().to_string(),
+            created_at: now,
+            // Nothing has revised a profile that has just been created, so it was last
+            // updated when it was created.
+            updated_at: now,
+            tags,
+        };
+        let fingerprint = crate::state::parameter_fingerprint(&serde_json::json!({
+            "ProfileDescription": &record.profile_description,
+            "ProfileName": &record.profile_name,
+            "ProfileQuestions": record.question_fingerprint(),
+            "Tags": &record.tags,
+        }));
+
+        let mut store = state.lock();
+
+        // `@idempotencyToken` replay: the same token with the same parameters returns the
+        // result of the original request instead of creating a second profile.
+        if let Some(token) = store.create_profile_tokens.get(&input.client_request_token) {
+            if token.fingerprint != fingerprint {
+                let profile_arn = token.profile_arn.clone();
+                return Err(CreateProfileErrorModeled::ConflictException(
+                    crate::state::idempotency_token_conflict(
+                        crate::state::PROFILE_RESOURCE_TYPE,
+                        profile_arn,
+                        &input.client_request_token,
+                    ),
+                )
+                .into());
+            }
+            if let Some(existing) = store.profiles.get(&token.profile_arn) {
+                return Ok(CreateProfileOutput {
+                    profile_arn: Some(existing.profile_arn.clone()),
+                    profile_version: Some(existing.profile_version.clone()),
+                });
+            }
+            // The token names a profile that is no longer stored, so there is no original
+            // result to return: forget the token and let this request create afresh, which
+            // is what the caller asked for. (Unreachable while `DeleteProfile` is a stub;
+            // handled here so the create stays well defined once it lands.)
+            store
+                .create_profile_tokens
+                .forget(&input.client_request_token);
+        }
+
+        // Profiles are metered, and this operation models `ServiceQuotaExceededException`
+        // for the case. Refusing here is also what keeps the store bounded: the create
+        // tokens are 1:1 with a live profile. The ceiling is store-wide, which for this
+        // single-account emulator also bounds every account-and-Region pair in it.
+        if store.profiles.len() >= crate::state::MAX_PROFILES {
+            return Err(CreateProfileErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The profile quota of {} has been reached",
+                        crate::state::MAX_PROFILES
+                    ),
+                    resource_id: None,
+                    resource_type: Some(crate::state::PROFILE_RESOURCE_TYPE.to_string()),
+                    // `QuotaCode` and `ServiceCode` are modelled `@required`. The service
+                    // code is this service's own (`OPERATIONS.md`: signing name
+                    // `wellarchitected`); the model publishes no numeric Service Quotas
+                    // code for the profile quota, so the quota is named by what it meters.
+                    quota_code: "Profiles".to_string(),
+                    service_code: crate::state::ARN_NAMESPACE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        let profile_arn = store.mint_profile_arn(&region);
+        record.profile_arn = profile_arn.clone();
+        let profile_version = record.profile_version.clone();
+        store.profiles.insert(profile_arn.clone(), record);
+        // Written through the ledger's bounded `remember`, which holds the remembered
+        // tokens at `MAX_REMEMBERED_REQUEST_TOKENS` by forgetting the oldest: the token is
+        // caller-chosen, so the ledger cannot be allowed to grow with the stream of them.
+        store.create_profile_tokens.remember(
+            input.client_request_token,
+            crate::state::CreateProfileToken {
+                profile_arn: profile_arn.clone(),
+                fingerprint,
+            },
+        );
+
+        Ok(CreateProfileOutput {
+            profile_arn: Some(profile_arn),
+            profile_version: Some(profile_version),
+        })
     }
+}
+
+/// The modelled `ValidationException` (HTTP 400) for a `ProfileQuestions` entry this
+/// operation cannot record, worded the way the framework's own constraint walk words a
+/// member failure ([`crate::state::member_constraint_exception`]) so a handler-enforced
+/// rule reads like a modelled one.
+fn questions_validation(constraint: &str) -> CreateProfileError {
+    CreateProfileErrorModeled::ValidationException(crate::state::member_constraint_exception(
+        crate::state::PROFILE_QUESTIONS_MEMBER,
+        constraint,
+    ))
+    .into()
 }

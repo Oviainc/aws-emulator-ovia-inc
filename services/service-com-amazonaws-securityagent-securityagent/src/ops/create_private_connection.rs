@@ -206,6 +206,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // Every identifier the request carries is checked for SYNTAX before anything is
+        // resolved in state: a value that is not an identifier of the kind the member
+        // takes names no resource and never could, so it is a bad request (400
+        // `ValidationException`) rather than a resource the account is missing (404).
+        // `ResourceConfigurationId` carries no `@pattern` in this service's model, so
+        // the boundary validator lets a malformed one through and this refuses it.
+        if let PrivateConnectionMode::selfManaged(configuration) = &input.mode {
+            let path = "mode.selfManaged.resourceConfigurationId";
+            let identifier = configuration.resource_configuration_id.as_str();
+            if let Some(requirement) =
+                crate::state::resource_configuration_id_violation(identifier)
+            {
+                return Err(invalid(
+                    path,
+                    &requirement,
+                    &format!(
+                        "1 validation error detected: Value '{identifier}' at '{path}' \
+                         failed to satisfy constraint: Member {requirement}"
+                    ),
+                ));
+            }
+        }
+
         let mut state = state.lock();
 
         // The name is unique within the account, so a second connection under a name

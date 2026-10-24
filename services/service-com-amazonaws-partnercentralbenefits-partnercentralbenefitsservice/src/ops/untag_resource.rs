@@ -14,6 +14,11 @@
 //! `ResourceNotFoundException` (HTTP 404), with the same message as the other tagging
 //! operations: see `crate::ops::tag_resource`.
 //!
+//! A key in the AWS-reserved `aws:` namespace is not the caller's to remove either: a
+//! request naming one is refused with the modelled `ValidationException` (HTTP 400) and
+//! no tag is removed — see [`crate::state::reserved_tag_key_refusal`], the one rule
+//! `TagResource` and `CreateBenefitApplication` apply to their own tag-key members.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -172,6 +177,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // entitlement refusal. The tag-READING operation is gated (its own recording
         // shows the refusal) — see `crate::ops::list_tags_for_resource`.
         let _ = ctx;
+
+        // The `aws:` tag-key namespace is AWS's own: a caller can no more REMOVE a key in
+        // it than create one, so a request naming one is refused before any resource is
+        // looked up and nothing is removed. The modelled `TagKey` pattern admits `:`, so
+        // this is not a constraint the centralized walk can enforce; see
+        // [`crate::state::reserved_tag_key_refusal`].
+        if let Some(refusal) = crate::state::reserved_tag_key_refusal(
+            "tagKeys",
+            input.tag_keys.iter().map(String::as_str),
+        ) {
+            return Err(UntagResourceErrorModeled::ValidationException(refusal).into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UntagResourceErrorModeled::InternalServerException(
                 InternalServerException {

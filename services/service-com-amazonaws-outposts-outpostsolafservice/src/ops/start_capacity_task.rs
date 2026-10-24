@@ -13,11 +13,12 @@
 //!
 //! One input class answers the scaffold's 501 and nothing else does: a DRY RUN. Its
 //! result is a verdict on the Outpost's available instance capacity, and this emulator
-//! models no installed capacity to weigh a request against (`ListAssets`,
-//! `GetOutpostInstanceTypes` and `GetOutpostSupportedInstanceTypes` are still stubs), so
-//! it cannot judge one — and a dry run must change nothing, so it cannot answer with a
-//! persisted task either. A 501 says "nobody has written this yet", which is exactly
-//! true of the capacity model a dry run needs.
+//! models no AVAILABLE capacity to weigh a request against — `ListAssets` reports only
+//! the hardware recorded for an Outpost (nothing in this API installs any, and
+//! `GetOutpostInstanceTypes` and `GetOutpostSupportedInstanceTypes` are still stubs),
+//! and nothing tracks what of it is in use — so it cannot judge one; and a dry run must
+//! change nothing, so it cannot answer with a persisted task either. A 501 says "nobody
+//! has written this yet", which is exactly true of the capacity model a dry run needs.
 //!
 //! ## Shape of an operation
 //!

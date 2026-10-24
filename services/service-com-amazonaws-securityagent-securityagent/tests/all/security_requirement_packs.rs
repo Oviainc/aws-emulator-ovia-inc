@@ -30,8 +30,8 @@ use service_com_amazonaws_securityagent_securityagent::ops::types::{
     MANAGEMENT_TYPE_VALUES, SECURITY_REQUIREMENT_PACK_STATUS_VALUES,
 };
 use service_com_amazonaws_securityagent_securityagent::state::{
-    MANAGEMENT_TYPE_CUSTOMER_MANAGED, MAX_PAGE_SIZE, MAX_SECURITY_REQUIREMENT_PACKS,
-    PACK_STATUS_ENABLED,
+    AWS_MANAGED_PACKS, MANAGEMENT_TYPE_AWS_MANAGED, MANAGEMENT_TYPE_CUSTOMER_MANAGED,
+    MAX_PAGE_SIZE, MAX_SECURITY_REQUIREMENT_PACKS, PACK_STATUS_ENABLED,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -174,6 +174,33 @@ fn pack_ids(summaries: &[Value]) -> Vec<String> {
                 .unwrap_or_else(|| panic!("a summary carries no packId: {summary}"))
         })
         .collect()
+}
+
+/// Only the summaries of packs a caller created.
+///
+/// A fresh account already holds the AWS managed catalog (`AWS_MANAGED_PACKS`), which
+/// every unfiltered listing reports beside the created packs, so a case about what a
+/// create put in the store looks at the customer managed ones.
+fn customer_managed(summaries: &[Value]) -> Vec<Value> {
+    summaries
+        .iter()
+        .filter(|summary| {
+            member(summary, "managementType").as_deref()
+                == Some(MANAGEMENT_TYPE_CUSTOMER_MANAGED)
+        })
+        .cloned()
+        .collect()
+}
+
+/// The `packId`s of the seeded AWS managed catalog, in the order the store holds them
+/// (its keys, sorted) — which is the order every listing walks.
+fn seeded_pack_ids() -> Vec<String> {
+    let mut ids: Vec<String> = AWS_MANAGED_PACKS
+        .iter()
+        .map(|entry| entry.pack_id.to_string())
+        .collect();
+    ids.sort();
+    ids
 }
 
 /// A modelled `date-time` timestamp as epoch seconds.
@@ -320,7 +347,17 @@ async fn created_packs_are_reported_by_the_list() {
         expected.insert(pack_id, (case, request));
     }
 
-    let summaries = list_all(&router, None, None, "every created pack").await;
+    let listed = list_all(&router, None, None, "every created pack").await;
+    let summaries = customer_managed(&listed);
+    assert_eq!(
+        listed.len(),
+        expected.len() + AWS_MANAGED_PACKS.len(),
+        "case every created pack: expected the {} created packs beside the {} seeded \
+         AWS managed ones, got {}",
+        expected.len(),
+        AWS_MANAGED_PACKS.len(),
+        listed.len()
+    );
     assert_eq!(
         summaries.len(),
         expected.len(),
@@ -384,7 +421,7 @@ async fn created_packs_are_reported_by_the_list() {
     // The list is a read: a second call answers exactly the same summaries.
     let again = list_all(&router, None, None, "a repeated list").await;
     assert_eq!(
-        again, summaries,
+        again, listed,
         "case a repeated list: two reads of the pack store disagreed"
     );
 }
@@ -410,12 +447,14 @@ async fn packs_sharing_one_name_are_both_listed() {
     );
 
     let summaries = list_all(&router, None, None, "identical requests").await;
-    let listed: BTreeSet<String> = pack_ids(&summaries).into_iter().collect();
+    let listed: BTreeSet<String> = pack_ids(&customer_managed(&summaries))
+        .into_iter()
+        .collect();
     assert_eq!(
         listed, unique.into_iter().cloned().collect::<BTreeSet<_>>(),
         "case identical requests: the list reported {listed:?} for the created {ids:?}"
     );
-    for summary in &summaries {
+    for summary in &customer_managed(&summaries) {
         assert_eq!(
             member(summary, "name"),
             member(&request, "name"),
@@ -473,16 +512,30 @@ async fn the_filter_selects_exactly_the_packs_it_names() {
                 filter["status"] = json!(status);
             }
 
-            // Every pack this API creates is CUSTOMER_MANAGED, so a filter naming
-            // another management type selects none of them.
-            let wanted: Vec<String> = created
+            // Every pack this API creates is CUSTOMER_MANAGED and every seeded one is
+            // AWS_MANAGED, so a filter naming a management type selects from exactly one
+            // of the two groups. The created packs sort before the seeded ones (a minted
+            // packId is lowercase hex, a seeded one starts `srp-`), which is the order
+            // the store's keys \u2014 and so the listing \u2014 walk.
+            let mut wanted: Vec<String> = created
                 .iter()
                 .filter(|(_, pack_status)| {
-                    management_type.is_none_or(|wanted| wanted == MANAGEMENT_TYPE_CUSTOMER_MANAGED)
+                    management_type
+                        .is_none_or(|wanted| wanted == MANAGEMENT_TYPE_CUSTOMER_MANAGED)
                         && status.is_none_or(|wanted| wanted == *pack_status)
                 })
                 .map(|(id, _)| id.clone())
                 .collect();
+            let mut seeded: Vec<String> = AWS_MANAGED_PACKS
+                .iter()
+                .filter(|entry| {
+                    management_type.is_none_or(|wanted| wanted == MANAGEMENT_TYPE_AWS_MANAGED)
+                        && status.is_none_or(|wanted| wanted == entry.status)
+                })
+                .map(|entry| entry.pack_id.to_string())
+                .collect();
+            seeded.sort();
+            wanted.append(&mut seeded);
 
             // The whole result in one page, and the same result paged one at a time:
             // the cursor must respect the filter too.
@@ -508,20 +561,22 @@ async fn pagination_reports_every_pack_exactly_once() {
         let case = format!("pack {index}");
         ids.push(create_pack_id(&router, &json!({"name": format!("pack-{index}")}), &case).await);
     }
+    // Every stored pack: the ones created here, then the seeded AWS managed catalog.
+    let stored: Vec<String> = ids.iter().cloned().chain(seeded_pack_ids()).collect();
 
     // The order one full page reports is the order every other page size must agree
     // with.
     let order = pack_ids(&list_all(&router, None, None, "the default page size").await);
     assert_eq!(
         order.len(),
-        ids.len(),
+        stored.len(),
         "case the default page size: expected {} packs, got {order:?}",
-        ids.len()
+        stored.len()
     );
     assert_eq!(
         order.iter().collect::<BTreeSet<_>>(),
-        ids.iter().collect::<BTreeSet<_>>(),
-        "case the default page size: expected the created packs {ids:?}, got {order:?}"
+        stored.iter().collect::<BTreeSet<_>>(),
+        "case the default page size: expected the stored packs {stored:?}, got {order:?}"
     );
 
     // Each row is a page size: below the record count, exactly it, above it, and past
@@ -546,7 +601,7 @@ async fn pagination_reports_every_pack_exactly_once() {
     );
     let token = first
         .next_token
-        .expect("case the first page: six packs remain, so a nextToken is due");
+        .expect("case the first page: more packs remain, so a nextToken is due");
     let second = list_page(&router, None, Some(1), Some(&token), "the second page").await;
     assert_eq!(
         pack_ids(&second.summaries),
@@ -557,10 +612,11 @@ async fn pagination_reports_every_pack_exactly_once() {
     );
 
     // The last page carries no cursor.
-    let whole = list_page(&router, None, Some(7), None, "one whole page").await;
+    let size = i32::try_from(stored.len()).expect("the stored pack count fits an i32");
+    let whole = list_page(&router, None, Some(size), None, "one whole page").await;
     assert_eq!(
         whole.summaries.len(),
-        7,
+        stored.len(),
         "case one whole page: expected every pack in one page, got {:?}",
         whole.summaries
     );
@@ -655,7 +711,7 @@ async fn inputs_the_service_cannot_act_on_are_refused() {
     }
 
     // Every refusal above left the store exactly as it was.
-    let summaries = list_all(&router, None, None, "after the refusals").await;
+    let summaries = customer_managed(&list_all(&router, None, None, "after the refusals").await);
     assert_eq!(
         summaries.len(),
         1,
@@ -663,18 +719,24 @@ async fn inputs_the_service_cannot_act_on_are_refused() {
     );
 }
 
-/// RULE: an empty store is an empty page, not an error and not a cursor.
+/// RULE: a fresh account holds no pack of its own, so a listing filtered to customer
+/// managed packs is an empty page — not an error and not a cursor. (What a fresh account
+/// DOES hold, the seeded AWS managed catalog, is
+/// `security_requirement_pack_lifecycle.rs`'s subject.)
 #[tokio::test]
-async fn an_empty_store_lists_no_packs() {
+async fn a_fresh_account_lists_no_customer_managed_pack() {
     let router = emulator();
     for (case, filter) in [
-        ("no filter", None),
         (
-            "a filter",
-            Some(json!({"managementType": MANAGEMENT_TYPE_CUSTOMER_MANAGED, "status": "ENABLED"})),
+            "a management type filter",
+            json!({"managementType": MANAGEMENT_TYPE_CUSTOMER_MANAGED}),
+        ),
+        (
+            "a management type and a status filter",
+            json!({"managementType": MANAGEMENT_TYPE_CUSTOMER_MANAGED, "status": "ENABLED"}),
         ),
     ] {
-        let page = list_page(&router, filter.as_ref(), None, None, case).await;
+        let page = list_page(&router, Some(&filter), None, None, case).await;
         assert!(
             page.summaries.is_empty(),
             "case {case:?}: expected no summaries, got {:?}",

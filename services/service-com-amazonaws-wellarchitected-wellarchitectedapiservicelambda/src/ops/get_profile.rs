@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the profile its `ProfileArn` resolves in
+//! [`crate::state::ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::profiles`],
+//! at the version the request asks for. A pure READ: nothing it does changes what a later
+//! caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -146,20 +141,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetProfile"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetProfileErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool profile store is unavailable".to_string(),
+            })
+        })?;
+
+        let store = state.lock();
+        let record = store.profiles.get(&input.profile_arn).ok_or_else(|| {
+            GetProfileErrorModeled::ResourceNotFoundException(crate::state::profile_not_found(
+                &input.profile_arn,
+            ))
+        })?;
+
+        // "The profile version" (`GetProfileInput$ProfileVersion`): a profile is read AT a
+        // version, so a request that names one is asking for THAT revision of it, and a
+        // version the profile does not have resolves to nothing. A request that names none
+        // reads the version the profile is at. Only the version `CreateProfile` minted can
+        // exist so far — `UpdateProfile`, which mints the next one, is a stub with its own
+        // issue — so the check compares against the stored version rather than searching a
+        // history this emulator does not keep yet.
+        if let Some(asked) = input.profile_version.as_deref() {
+            if asked != record.profile_version {
+                return Err(GetProfileErrorModeled::ResourceNotFoundException(
+                    crate::state::profile_version_not_found(&input.profile_arn, asked),
+                )
+                .into());
+            }
+        }
+
+        Ok(GetProfileOutput {
+            profile: Some(record.to_profile()),
+        })
     }
 }

@@ -19,3 +19,10 @@ union can be declared as `{Op}Output`. A `@required` union member and a
 handler returns an error, so it never has to construct a value.
 
 // SKIPPED: InvokeEndpointWithResponseStream — unsupported shape construct: operation 'InvokeEndpointWithResponseStream' has a @streaming event-stream output member, which needs wire framing the generator does not emit
+//
+// HAND-AUTHORED SINCE, so this crate has no unwired operation left: the generator still
+// declines the operation (the line above is the generator's own record of why), but
+// `ops/invoke_endpoint_with_response_stream.rs` now implements it and `service.rs` routes
+// the model's `POST /endpoints/{EndpointName}/invocations-response-stream` to it through
+// `Service::override_operation`, so a request on that route is served by this crate rather
+// than by the framework's unroutable-operation path.

@@ -196,7 +196,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 GetSecurityRequirementPackErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         message: format!(
-                            "No security requirement pack found with id {}",
+                            "No security requirement pack found for ID: {}",
                             input.pack_id
                         ),
                     },

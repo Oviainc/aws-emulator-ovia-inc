@@ -189,11 +189,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The policy statement is validated BEFORE anything is attached, so a
         // refused document leaves the resource exactly as it was.
-        if let Some(breach) = crate::state::resource_policy_breach(&input.policy, kind) {
+        if !crate::state::resource_policy_matches_permissions(&input.policy, kind) {
             return Err(
                 PutResourcePolicyErrorModeled::InvalidResourcePolicyException(
                     InvalidResourcePolicyException {
-                        message: Some(breach),
+                        // The refusal is a property of the RAM managed
+                        // permission the document failed to match, not of the
+                        // document: one constant, carrying neither the actions
+                        // the policy named nor the ones the permission allows.
+                        message: Some(crate::state::INVALID_RESOURCE_POLICY_MESSAGE.to_string()),
                     },
                 )
                 .into(),

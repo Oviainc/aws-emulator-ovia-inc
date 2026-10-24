@@ -107,6 +107,9 @@ mod instance_lifecycle;
 mod instance_type_offerings;
 #[path = "all/instance_types.rs"]
 mod instance_types;
+// Allocating unused capacity out of a Capacity Reservation into an interruptible one.
+#[path = "all/interruptible_capacity_reservation_allocations.rs"]
+mod interruptible_capacity_reservation_allocations;
 #[path = "all/ipam_pools.rs"]
 mod ipam_pools;
 #[path = "all/ipam_routing_policy_registrations.rs"]

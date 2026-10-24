@@ -188,10 +188,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if associations > 0 {
             return Err(DeleteRuleGroupErrorModeled::InvalidOperationException(
                 InvalidOperationException {
-                    message: Some(format!(
-                        "Rule group {key} is in use by {associations} firewall policy/policies \
-                         and cannot be deleted."
-                    )),
+                    // The same resource-agnostic constant `DeleteFirewallPolicy`
+                    // answers: neither the rule group nor the number of
+                    // referencing policies reaches the message.
+                    message: Some(crate::state::DELETE_IN_USE_MESSAGE.to_string()),
                 },
             )
             .into());

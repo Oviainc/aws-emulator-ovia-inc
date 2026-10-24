@@ -219,8 +219,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // part of minting a security configuration.
             security_configuration_id: input.security_configuration_id,
             session_enabled: input.session_enabled,
-            scheduler_configuration: input.scheduler_configuration,
+            // Normalised to what it actually configures: a configuration whose every
+            // member is omitted configures no limit, and `VirtualCluster$schedulerConfiguration`
+            // "is not returned when no scheduler limits are configured".
+            scheduler_configuration: crate::state::configured_scheduler_limits(
+                input.scheduler_configuration,
+            ),
             client_token: input.client_token.clone(),
+            update_client_tokens: Vec::new(),
             pending: None,
         };
         state.insert_virtual_cluster(record);

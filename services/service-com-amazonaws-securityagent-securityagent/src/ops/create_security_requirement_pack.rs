@@ -219,8 +219,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every pack is a stored record, so the number of them a caller can create is
         // bounded, as it is on the real service: past the quota this operation answers
         // the service's own `ServiceQuotaExceededException` (HTTP 402) instead of
-        // growing the store without end.
-        if state.security_requirement_packs.len() >= crate::state::MAX_SECURITY_REQUIREMENT_PACKS {
+        // growing the store without end. Only the packs a caller CREATED count against
+        // it — the seeded AWS managed catalog is the service's own.
+        if state.customer_managed_pack_count() >= crate::state::MAX_SECURITY_REQUIREMENT_PACKS {
             return Err(
                 CreateSecurityRequirementPackErrorModeled::ServiceQuotaExceededException(
                     ServiceQuotaExceededException {
