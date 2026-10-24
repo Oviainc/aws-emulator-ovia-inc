@@ -221,7 +221,7 @@ fn applications() -> Vec<Application> {
 /// Whether `arn` has the shape the model's `ApplicationArn` pattern requires for an
 /// application of `instance_arn`:
 /// `^arn:aws(-[a-z]{1,5}){0,3}:sso::\d{12}:application/(sso)?ins-[a-zA-Z0-9-.]{16}/apl-[a-zA-Z0-9]{16}$`.
-fn is_application_arn_of(arn: &str, instance_arn: &str) -> bool {
+pub(crate) fn is_application_arn_of(arn: &str, instance_arn: &str) -> bool {
     let instance_id = instance_arn.rsplit('/').next().unwrap_or_default();
     let Some(rest) = arn.strip_prefix("arn:aws:sso::") else {
         return false;
