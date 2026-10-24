@@ -30,7 +30,7 @@
 //! belong to the `UpdateEnabledBaseline` / `ResetEnabledBaseline` stub issues.
 
 use crate::landing_zone_lifecycle::{
-    call, emulator, is_operation_identifier, past_the_settle_span, Answer,
+    call, emulator, is_operation_identifier, past_the_settle_span, simple_manifest, Answer,
 };
 
 use smithy_server_runtime::MultiServiceRouter;
@@ -404,7 +404,7 @@ async fn an_identifier_no_baseline_call_returned_is_not_found() {
             "/create-landingzone",
             serde_json::json!({
                 "version": "3.3",
-                "manifest": { "governedRegions": ["us-west-2"] }
+                "manifest": simple_manifest()
             }),
         )
         .await;
