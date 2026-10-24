@@ -84,12 +84,32 @@ async fn remove_permission(
     statement_id: &str,
     revision_id: Option<&str>,
 ) -> Answer {
-    let uri = match revision_id {
-        Some(revision) => format!(
-            "/2015-03-31/functions/{reference}/policy/{statement_id}?RevisionId={revision}"
-        ),
-        None => format!("/2015-03-31/functions/{reference}/policy/{statement_id}"),
+    remove_permission_on(router, reference, statement_id, None, revision_id).await
+}
+
+/// `RemovePermission` on the policy of one qualifier, optionally carrying a `RevisionId`
+/// precondition: `Qualifier` and `RevisionId` are both query parameters of the bound
+/// `DELETE /2015-03-31/functions/{FunctionName}/policy/{StatementId}`.
+async fn remove_permission_on(
+    router: &MultiServiceRouter,
+    reference: &str,
+    statement_id: &str,
+    qualifier: Option<&str>,
+    revision_id: Option<&str>,
+) -> Answer {
+    let mut query: Vec<String> = Vec::new();
+    if let Some(qualifier) = qualifier {
+        query.push(format!("Qualifier={qualifier}"));
+    }
+    if let Some(revision_id) = revision_id {
+        query.push(format!("RevisionId={revision_id}"));
+    }
+    let suffix = if query.is_empty() {
+        String::new()
+    } else {
+        format!("?{}", query.join("&"))
     };
+    let uri = format!("/2015-03-31/functions/{reference}/policy/{statement_id}{suffix}");
     json_call(router, "DELETE", &uri, &serde_json::Value::Null).await
 }
 
@@ -1429,4 +1449,299 @@ async fn capacity_providers_round_trip_and_become_active_when_due() {
         unknown.status,
         String::from_utf8_lossy(&unknown.body)
     );
+}
+
+/// One row of the revocation table: the statements to grant, which one `RemovePermission`
+/// names, and which policy they live on.
+struct RevocationCase {
+    name: &'static str,
+    function: &'static str,
+    /// The published version the policy is attached to, or `None` for the function level.
+    qualifier: Option<&'static str>,
+    /// Whether that version is named by appending it to the `FunctionName` rather than by
+    /// the `Qualifier` parameter — "You can append a version number or alias to any of the
+    /// formats", so both name one resource.
+    qualifier_in_name: bool,
+    /// The `StatementId`s granted, in order, before anything is revoked.
+    granted: &'static [&'static str],
+    /// The one the revocation names.
+    revoke: &'static str,
+}
+
+/// `RemovePermission` takes out exactly the statement its `StatementId` names, leaves the
+/// rest of that policy in the order they were granted at a new revision, and touches no
+/// other qualifier's policy.
+///
+/// The rows differ along what the rule generalises over: how many statements the policy
+/// holds, whether the revoked one is the first, the middle, the last or the only one,
+/// whether the policy is the function's or a published version's, and which documented
+/// form names that version.
+#[tokio::test]
+async fn remove_permission_takes_out_one_statement_of_the_policy_it_names() {
+    let cases = vec![
+        RevocationCase {
+            name: "the first of three function-level statements",
+            function: "revoke-first",
+            qualifier: None,
+            qualifier_in_name: false,
+            granted: &["s3-invoke", "sns-invoke", "events-invoke"],
+            revoke: "s3-invoke",
+        },
+        RevocationCase {
+            name: "the middle of three function-level statements",
+            function: "revoke-middle",
+            qualifier: None,
+            qualifier_in_name: false,
+            granted: &["s3-invoke", "sns-invoke", "events-invoke"],
+            revoke: "sns-invoke",
+        },
+        RevocationCase {
+            name: "the last of three function-level statements",
+            function: "revoke-last",
+            qualifier: None,
+            qualifier_in_name: false,
+            granted: &["s3-invoke", "sns-invoke", "events-invoke"],
+            revoke: "events-invoke",
+        },
+        RevocationCase {
+            name: "the only statement of a function-level policy",
+            function: "revoke-only",
+            qualifier: None,
+            qualifier_in_name: false,
+            granted: &["only-invoke"],
+            revoke: "only-invoke",
+        },
+        RevocationCase {
+            name: "one of a published version's two statements",
+            function: "revoke-version",
+            qualifier: Some("1"),
+            qualifier_in_name: false,
+            granted: &["v1-first", "v1-second"],
+            revoke: "v1-first",
+        },
+        RevocationCase {
+            name: "a published version's only statement, named by appending the version",
+            function: "revoke-label",
+            qualifier: Some("1"),
+            qualifier_in_name: true,
+            granted: &["v1-only"],
+            revoke: "v1-only",
+        },
+    ];
+
+    for case in &cases {
+        let engine = Arc::new(engine::InMemoryEngine::new());
+        let router = crate::function_lifecycle::router_on(&engine);
+        create_active_function(&router, &engine, case.function, &package_bytes(64)).await;
+
+        // A version to attach a policy to, for the rows that name one.
+        if case.qualifier.is_some() {
+            let published = publish_version(&router, case.function, &json!({})).await;
+            assert_eq!(
+                published.status,
+                201,
+                "case {}: expected 201 from PublishVersion, got {} {}",
+                case.name,
+                published.status,
+                String::from_utf8_lossy(&published.body)
+            );
+        }
+
+        // How this row names the resource: the plain name plus a `Qualifier` parameter, or
+        // the version appended to the `FunctionName`.
+        let (reference, query_qualifier) = match (case.qualifier, case.qualifier_in_name) {
+            (Some(qualifier), true) => (format!("{}:{qualifier}", case.function), None),
+            (Some(qualifier), false) => (case.function.to_string(), Some(qualifier)),
+            (None, _) => (case.function.to_string(), None),
+        };
+        let resource = case.qualifier.map_or_else(
+            || function_arn(case.function),
+            |qualifier| format!("{}:{qualifier}", function_arn(case.function)),
+        );
+
+        // A statement on the function level, for the rows that edit a version's policy:
+        // one policy's revocation must not reach another's.
+        let sibling = "sibling-invoke";
+        if case.qualifier.is_some() {
+            let kept = add_permission(
+                &router,
+                case.function,
+                None,
+                &json!({
+                    "StatementId": sibling,
+                    "Action": "lambda:InvokeFunction",
+                    "Principal": "events.amazonaws.com",
+                }),
+            )
+            .await;
+            assert_eq!(
+                kept.status,
+                201,
+                "case {}: granting the function-level statement must succeed, got {} {}",
+                case.name,
+                kept.status,
+                String::from_utf8_lossy(&kept.body)
+            );
+        }
+
+        for statement_id in case.granted {
+            let granted = add_permission(
+                &router,
+                &reference,
+                query_qualifier,
+                &json!({
+                    "StatementId": statement_id,
+                    "Action": "lambda:InvokeFunction",
+                    "Principal": "s3.amazonaws.com",
+                }),
+            )
+            .await;
+            assert_eq!(
+                granted.status,
+                201,
+                "case {}: granting {statement_id:?} must succeed, got {} {}",
+                case.name,
+                granted.status,
+                String::from_utf8_lossy(&granted.body)
+            );
+        }
+
+        let before = get_policy(&router, &reference, query_qualifier).await;
+        let before_revision = before.string("RevisionId").unwrap_or_else(|| {
+            panic!(
+                "case {}: expected a RevisionId, got {}",
+                case.name,
+                String::from_utf8_lossy(&before.body)
+            )
+        });
+
+        let revoked =
+            remove_permission_on(&router, &reference, case.revoke, query_qualifier, None).await;
+        assert_eq!(
+            revoked.status,
+            204,
+            "case {}: expected 204 from RemovePermission, got {} {}",
+            case.name,
+            revoked.status,
+            String::from_utf8_lossy(&revoked.body)
+        );
+        assert!(
+            revoked.body.is_empty(),
+            "case {}: expected an empty body with the 204, got {}",
+            case.name,
+            String::from_utf8_lossy(&revoked.body)
+        );
+
+        let remaining: Vec<&str> = case
+            .granted
+            .iter()
+            .copied()
+            .filter(|statement_id| *statement_id != case.revoke)
+            .collect();
+
+        let after = get_policy(&router, &reference, query_qualifier).await;
+        if remaining.is_empty() {
+            // The last statement is gone, so the resource holds no policy to report.
+            assert_eq!(
+                after.status,
+                404,
+                "case {}: a policy with no statements left is no policy, got {} {}",
+                case.name,
+                after.status,
+                String::from_utf8_lossy(&after.body)
+            );
+        } else {
+            assert_eq!(
+                after.status,
+                200,
+                "case {}: expected 200 from GetPolicy, got {} {}",
+                case.name,
+                after.status,
+                String::from_utf8_lossy(&after.body)
+            );
+            let document: serde_json::Value = serde_json::from_str(
+                &after
+                    .string("Policy")
+                    .unwrap_or_else(|| panic!("case {}: expected a Policy member", case.name)),
+            )
+            .unwrap_or_else(|error| panic!("case {}: Policy must be JSON: {error}", case.name));
+            let statements = document["Statement"]
+                .as_array()
+                .unwrap_or_else(|| panic!("case {}: Statement must be an array", case.name))
+                .clone();
+            let sids: Vec<String> = statements
+                .iter()
+                .map(|statement| statement["Sid"].as_str().unwrap_or_default().to_string())
+                .collect();
+            assert_eq!(
+                sids,
+                remaining
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<String>>(),
+                "case {}: expected the statements granted but not revoked, in order, got {sids:?}",
+                case.name
+            );
+            for statement in &statements {
+                assert_eq!(
+                    statement["Resource"],
+                    json!(resource),
+                    "case {}: expected the ARN the grant was made on as Resource, got {:?}",
+                    case.name,
+                    statement["Resource"]
+                );
+            }
+            let after_revision = after.string("RevisionId").unwrap_or_default();
+            assert_ne!(
+                after_revision, before_revision,
+                "case {}: a changed policy is at a new revision, got the earlier \
+                 {after_revision:?}",
+                case.name
+            );
+        }
+
+        // Revoking the same statement twice finds nothing to revoke the second time.
+        let again =
+            remove_permission_on(&router, &reference, case.revoke, query_qualifier, None).await;
+        assert_eq!(
+            again.status,
+            404,
+            "case {}: expected 404 revoking the same statement twice, got {} {}",
+            case.name,
+            again.status,
+            String::from_utf8_lossy(&again.body)
+        );
+
+        // The other qualifier's policy is untouched by all of it.
+        if case.qualifier.is_some() {
+            let function_level = get_policy(&router, case.function, None).await;
+            assert_eq!(
+                function_level.status,
+                200,
+                "case {}: the function-level policy must survive, got {} {}",
+                case.name,
+                function_level.status,
+                String::from_utf8_lossy(&function_level.body)
+            );
+            let document: serde_json::Value = serde_json::from_str(
+                &function_level
+                    .string("Policy")
+                    .unwrap_or_else(|| panic!("case {}: expected a Policy member", case.name)),
+            )
+            .unwrap_or_else(|error| panic!("case {}: Policy must be JSON: {error}", case.name));
+            assert_eq!(
+                document["Statement"],
+                json!([{
+                    "Sid": sibling,
+                    "Effect": "Allow",
+                    "Principal": { "Service": "events.amazonaws.com" },
+                    "Action": "lambda:InvokeFunction",
+                    "Resource": function_arn(case.function),
+                }]),
+                "case {}: expected the function-level statement alone, got {:?}",
+                case.name,
+                document["Statement"]
+            );
+        }
+    }
 }
