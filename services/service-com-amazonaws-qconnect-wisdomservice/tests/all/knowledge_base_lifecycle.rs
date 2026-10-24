@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! End-to-end tests for the Amazon Q in Connect knowledge-base slice
-//! (`CreateKnowledgeBase` + `GetKnowledgeBase`).
+//! (`CreateKnowledgeBase` + `GetKnowledgeBase` + `DeleteKnowledgeBase`).
 //!
 //! Every assertion goes over the wire: a request is built, dispatched through the same
 //! [`MultiServiceRouter`] the production emulator mounts, and only the HTTP status, the
@@ -22,7 +22,11 @@
 //!   created rather than minting a second one;
 //! * a label this account holds no knowledge base under — a bare id, an ARN of this
 //!   account, an ARN of another account or partition — is `ResourceNotFoundException`
-//!   (HTTP 404).
+//!   (HTTP 404);
+//! * a delete forgets exactly the knowledge base it addresses (by id or by ARN) and
+//!   answers the modelled empty 204: every later read of it, and a repeated delete, is
+//!   the not-found above, every other knowledge base is untouched, the name the record
+//!   held is free again, and the `clientToken` that created it no longer resurrects it.
 //!
 //! The harness below is this suite's own: the sibling `assistant_lifecycle` suite's one
 //! is private to that module and speaks in assistants.
@@ -159,6 +163,12 @@ impl Emulator {
         // An ARN label carries `/`, which must not be read as path structure.
         let label = label.replace('/', "%2F");
         self.send("GET", &format!("/knowledgeBases/{label}"), None)
+            .await
+    }
+
+    async fn delete_knowledge_base(&self, label: &str) -> Reply {
+        let label = label.replace('/', "%2F");
+        self.send("DELETE", &format!("/knowledgeBases/{label}"), None)
             .await
     }
 }
@@ -650,5 +660,376 @@ async fn the_knowledge_base_store_is_bounded() {
         "case \"past the bound\": expected ServiceQuotaExceededException, got {:?} with body {}",
         refused.error_type,
         refused.body
+    );
+}
+
+/// A delete removes the knowledge base from the store: it answers the modelled empty
+/// 204, and from then on every read of that knowledge base is the not-found its own
+/// operation models — including a second delete of the same one.
+///
+/// The table spans what the rule generalises over: the label form the delete addresses
+/// the record by (its id, its ARN) and the shape of the record being deleted (type,
+/// description, tags, configuration members).
+#[tokio::test]
+async fn a_deleted_knowledge_base_is_gone() {
+    /// How the delete addresses the knowledge base it removes.
+    #[derive(Debug, Clone, Copy)]
+    enum Addressed {
+        Id,
+        Arn,
+    }
+
+    for case in knowledge_base_cases() {
+        for addressed in [Addressed::Id, Addressed::Arn] {
+            let label = case.label;
+            // Each pass gets its own store, so a row's name (one row's is the longest
+            // the model admits, which leaves no room for a suffix) is free every time.
+            let emulator = Emulator::new();
+            let created = emulator.create_knowledge_base(case.create_body()).await;
+            let knowledge_base_id = created
+                .string("/knowledgeBase/knowledgeBaseId")
+                .unwrap_or_else(|| {
+                    panic!("case {label:?} ({addressed:?}): no knowledgeBaseId in {}", created.body)
+                });
+            let arn = expected_knowledge_base_arn(REGION, &knowledge_base_id);
+            let addressed_label = match addressed {
+                Addressed::Id => knowledge_base_id.clone(),
+                Addressed::Arn => arn.clone(),
+            };
+
+            let deleted = emulator.delete_knowledge_base(&addressed_label).await;
+            assert_eq!(
+                deleted.status, 204,
+                "case {label:?} ({addressed:?}): expected the modelled HTTP 204 for a delete, \
+                 got {} with body {}",
+                deleted.status, deleted.body
+            );
+            assert!(
+                deleted
+                    .body
+                    .as_object()
+                    .is_none_or(serde_json::Map::is_empty),
+                "case {label:?} ({addressed:?}): DeleteKnowledgeBase models an empty output, \
+                 got {}",
+                deleted.body
+            );
+
+            // Gone for every label form that used to name it, not just the one the
+            // delete addressed.
+            for (form, addressed_again) in [("by id", &knowledge_base_id), ("by ARN", &arn)] {
+                let read_back = emulator.get_knowledge_base(addressed_again).await;
+                assert_eq!(
+                    read_back.status, 404,
+                    "case {label:?} ({addressed:?}, read back {form}): expected HTTP 404 after \
+                     the delete, got {} with body {}",
+                    read_back.status, read_back.body
+                );
+                assert!(
+                    read_back.error_type.contains("ResourceNotFoundException"),
+                    "case {label:?} ({addressed:?}, read back {form}): expected \
+                     ResourceNotFoundException, got {:?} with body {}",
+                    read_back.error_type,
+                    read_back.body
+                );
+            }
+
+            // A repeated delete of the same knowledge base names a knowledge base this
+            // account no longer holds, which is the same not-found.
+            let again = emulator.delete_knowledge_base(&addressed_label).await;
+            assert_eq!(
+                again.status, 404,
+                "case {label:?} ({addressed:?}): expected HTTP 404 for a repeated delete, got \
+                 {} with body {}",
+                again.status, again.body
+            );
+            assert!(
+                again.error_type.contains("ResourceNotFoundException"),
+                "case {label:?} ({addressed:?}): expected ResourceNotFoundException for a \
+                 repeated delete, got {:?} with body {}",
+                again.error_type,
+                again.body
+            );
+        }
+    }
+}
+
+/// A delete removes exactly the knowledge base it addresses: every other knowledge base
+/// the account holds still reads back unchanged, whichever one of them is deleted.
+#[tokio::test]
+async fn a_delete_leaves_every_other_knowledge_base_alone() {
+    let emulator = Emulator::new();
+
+    // Rows differ in WHICH of the stored knowledge bases the delete addresses — the
+    // first, a middle one and the last — so the rule is not tested on one position only.
+    for (label, deleted_index) in [("the first", 0usize), ("a middle one", 2), ("the last", 4)] {
+        let mut ids = Vec::new();
+        for index in 0..5 {
+            let created = emulator
+                .create_knowledge_base(json!({
+                    "name": format!("neighbour-kb-{label}-{index}").replace(' ', "-"),
+                    "knowledgeBaseType": KNOWLEDGE_BASE_TYPES[index % KNOWLEDGE_BASE_TYPES.len()],
+                }))
+                .await;
+            ids.push(
+                created
+                    .string("/knowledgeBase/knowledgeBaseId")
+                    .unwrap_or_else(|| {
+                        panic!("case {label:?}: no knowledgeBaseId in {}", created.body)
+                    }),
+            );
+        }
+
+        let target = ids[deleted_index].clone();
+        let deleted = emulator.delete_knowledge_base(&target).await;
+        assert_eq!(
+            deleted.status, 204,
+            "case {label:?}: expected HTTP 204 for the delete, got {} with body {}",
+            deleted.status, deleted.body
+        );
+
+        for (index, id) in ids.iter().enumerate() {
+            let reply = emulator.get_knowledge_base(id).await;
+            let expected_status = if index == deleted_index { 404 } else { 200 };
+            assert_eq!(
+                reply.status, expected_status,
+                "case {label:?} (neighbour {index}): expected HTTP {expected_status} after \
+                 deleting index {deleted_index}, got {} with body {}",
+                reply.status, reply.body
+            );
+            if expected_status == 200 {
+                assert_eq!(
+                    reply.string("/knowledgeBase/knowledgeBaseId").as_deref(),
+                    Some(id.as_str()),
+                    "case {label:?} (neighbour {index}): expected the stored record to be \
+                     untouched, got {}",
+                    reply.body
+                );
+            }
+        }
+    }
+}
+
+/// The name a deleted knowledge base held is free again: the conflict a duplicate name
+/// is refused with is a conflict with a LIVE knowledge base, so a create after the
+/// delete succeeds and mints a DIFFERENT knowledge base.
+#[tokio::test]
+async fn a_delete_releases_the_name_it_held() {
+    let emulator = Emulator::new();
+
+    // Rows differ in the name's form and in the type the second create asks for, so the
+    // release is shown to be about the name alone.
+    for (label, name, first_type, second_type) in [
+        ("plain name, same type", "recycled-kb".to_string(), "CUSTOM", "CUSTOM"),
+        ("shortest legal name", "k".repeat(NAME_MIN), "CUSTOM", "EXTERNAL"),
+        ("longest legal name", "k".repeat(NAME_MAX), "EXTERNAL", "QUICK_RESPONSES"),
+        (
+            "name with the punctuation the pattern admits",
+            "Recycled Case_kb.9,-".to_string(),
+            "QUICK_RESPONSES",
+            "CUSTOM",
+        ),
+    ] {
+        let first = emulator
+            .create_knowledge_base(json!({ "name": name, "knowledgeBaseType": first_type }))
+            .await;
+        let first_id = first
+            .string("/knowledgeBase/knowledgeBaseId")
+            .unwrap_or_else(|| panic!("case {label:?}: no knowledgeBaseId in {}", first.body));
+
+        // While it is live, the name is taken.
+        let refused = emulator
+            .create_knowledge_base(json!({ "name": name, "knowledgeBaseType": second_type }))
+            .await;
+        assert_eq!(
+            refused.status, 409,
+            "case {label:?}: expected HTTP 409 while the name is held by a live knowledge \
+             base, got {} with body {}",
+            refused.status, refused.body
+        );
+
+        let deleted = emulator.delete_knowledge_base(&first_id).await;
+        assert_eq!(
+            deleted.status, 204,
+            "case {label:?}: expected HTTP 204 for the delete, got {} with body {}",
+            deleted.status, deleted.body
+        );
+
+        let second = emulator
+            .create_knowledge_base(json!({ "name": name, "knowledgeBaseType": second_type }))
+            .await;
+        assert_eq!(
+            second.status, 200,
+            "case {label:?}: expected the name to be free after the delete, got {} with body {}",
+            second.status, second.body
+        );
+        let second_id = second
+            .string("/knowledgeBase/knowledgeBaseId")
+            .unwrap_or_else(|| panic!("case {label:?}: no knowledgeBaseId in {}", second.body));
+        assert_ne!(
+            second_id, first_id,
+            "case {label:?}: a create after a delete mints a NEW knowledge base, got the \
+             deleted id {first_id} again"
+        );
+        assert_eq!(
+            second.string("/knowledgeBase/knowledgeBaseType").as_deref(),
+            Some(second_type),
+            "case {label:?}: expected the second create's type to be stored, got {}",
+            second.body
+        );
+
+        // The replacement reads back, and the deleted id is still gone.
+        let read_back = emulator.get_knowledge_base(&second_id).await;
+        assert_eq!(
+            read_back.status, 200,
+            "case {label:?}: expected the replacement to read back, got {} with body {}",
+            read_back.status, read_back.body
+        );
+        let old = emulator.get_knowledge_base(&first_id).await;
+        assert_eq!(
+            old.status, 404,
+            "case {label:?}: expected the deleted knowledge base to stay gone, got {} with \
+             body {}",
+            old.status, old.body
+        );
+    }
+}
+
+/// A `clientToken` whose knowledge base was deleted does not resurrect it: the token is
+/// released with the record, so a create replaying it mints a new knowledge base rather
+/// than reporting the deleted one.
+#[tokio::test]
+async fn a_client_token_does_not_resurrect_a_deleted_knowledge_base() {
+    let emulator = Emulator::new();
+
+    for (label, token) in [
+        ("short token", "d".to_string()),
+        ("uuid-shaped token", "1a2b3c4d-5e6f-4071-8293-a4b5c6d7e8f9".to_string()),
+        ("longest legal token", "d".repeat(4096)),
+    ] {
+        let body = json!({
+            "name": format!("resurrect-kb-{label}").replace(' ', "-"),
+            "knowledgeBaseType": "CUSTOM",
+            "clientToken": token,
+        });
+        let first = emulator.create_knowledge_base(body.clone()).await;
+        let first_id = first
+            .string("/knowledgeBase/knowledgeBaseId")
+            .unwrap_or_else(|| panic!("case {label:?}: no knowledgeBaseId in {}", first.body));
+
+        let deleted = emulator.delete_knowledge_base(&first_id).await;
+        assert_eq!(
+            deleted.status, 204,
+            "case {label:?}: expected HTTP 204 for the delete, got {} with body {}",
+            deleted.status, deleted.body
+        );
+
+        let replayed = emulator.create_knowledge_base(body).await;
+        assert_eq!(
+            replayed.status, 200,
+            "case {label:?}: expected the create to succeed after the delete, got {} with \
+             body {}",
+            replayed.status, replayed.body
+        );
+        let replayed_id = replayed
+            .string("/knowledgeBase/knowledgeBaseId")
+            .unwrap_or_else(|| panic!("case {label:?}: no knowledgeBaseId in {}", replayed.body));
+        assert_ne!(
+            replayed_id, first_id,
+            "case {label:?}: a replay of a token whose knowledge base is deleted mints a new \
+             one, got the deleted id {first_id} again"
+        );
+
+        let read_back = emulator.get_knowledge_base(&replayed_id).await;
+        assert_eq!(
+            read_back.status, 200,
+            "case {label:?}: expected the knowledge base the replay minted to read back, got \
+             {} with body {}",
+            read_back.status, read_back.body
+        );
+    }
+}
+
+/// A delete addressed to a label this account holds no knowledge base under is
+/// `ResourceNotFoundException` (HTTP 404) and removes nothing; a label outside the
+/// modelled `UuidOrArn` pattern never reaches the store at all (HTTP 400).
+#[tokio::test]
+async fn deleting_an_unknown_knowledge_base_is_not_found() {
+    let emulator = Emulator::new();
+    let created = emulator
+        .create_knowledge_base(json!({ "name": "survivor-kb", "knowledgeBaseType": "CUSTOM" }))
+        .await;
+    let live_id = created
+        .string("/knowledgeBase/knowledgeBaseId")
+        .unwrap_or_else(|| panic!("no knowledgeBaseId in {}", created.body));
+
+    for (label, addressed) in [
+        ("bare uuid nothing holds", ABSENT_UUID.to_string()),
+        (
+            "this account's arn for an absent id",
+            expected_knowledge_base_arn(REGION, ABSENT_UUID),
+        ),
+        (
+            "another account's arn for a live id",
+            format!("arn:aws:wisdom:{REGION}:123456789012:knowledge-base/{live_id}"),
+        ),
+        (
+            "another partition's arn for a live id",
+            format!(
+                "arn:aws-cn:wisdom:{REGION}:{}:knowledge-base/{live_id}",
+                engine::EMULATOR_ACCOUNT_ID
+            ),
+        ),
+    ] {
+        let reply = emulator.delete_knowledge_base(&addressed).await;
+        assert_eq!(
+            reply.status, 404,
+            "case {label:?}: expected HTTP 404, got {} with body {}",
+            reply.status, reply.body
+        );
+        assert!(
+            reply.error_type.contains("ResourceNotFoundException"),
+            "case {label:?}: expected ResourceNotFoundException, got {:?} with body {}",
+            reply.error_type,
+            reply.body
+        );
+        assert_eq!(
+            reply.content_type, "application/json",
+            "case {label:?}: restJson1 answers application/json even for an error, got {:?}",
+            reply.content_type
+        );
+    }
+
+    for (label, addressed) in [
+        (
+            "another service's arn for a live id",
+            format!(
+                "arn:aws:connect:{REGION}:{}:knowledge-base/{live_id}",
+                engine::EMULATOR_ACCOUNT_ID
+            ),
+        ),
+        ("not an id at all", "not-a-knowledge-base".to_string()),
+    ] {
+        let reply = emulator.delete_knowledge_base(&addressed).await;
+        assert_eq!(
+            reply.status, 400,
+            "case {label:?}: expected HTTP 400 for a label outside the modelled pattern, got \
+             {} with body {}",
+            reply.status, reply.body
+        );
+        assert!(
+            reply.error_type.contains("ValidationException"),
+            "case {label:?}: expected ValidationException, got {:?} with body {}",
+            reply.error_type,
+            reply.body
+        );
+    }
+
+    // None of those refusals touched the knowledge base this account does hold.
+    let still_there = emulator.get_knowledge_base(&live_id).await;
+    assert_eq!(
+        still_there.status, 200,
+        "case \"live knowledge base after refused deletes\": expected HTTP 200, got {} with \
+         body {}",
+        still_there.status, still_there.body
     );
 }

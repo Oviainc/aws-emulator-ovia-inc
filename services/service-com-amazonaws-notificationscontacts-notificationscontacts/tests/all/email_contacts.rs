@@ -958,31 +958,42 @@ async fn the_store_refuses_to_grow_past_its_cap() {
 }
 
 #[tokio::test]
-async fn the_tagging_operations_are_still_honest_501s() {
+async fn the_tagging_operations_persist_through_the_same_record() {
     let em = emulator();
     let arn = create_ok(&em, "tagged", "tagged@example.com").await;
 
-    // Out of scope for this slice: each still answers the scaffold's 501 rather than
-    // a hollow success. `ListTagsForResource` is implemented and covered by
-    // `tests/all/resource_tags.rs`, so it is no longer one of them.
-    for (case, method, uri, body) in [
+    // The whole tagging slice is implemented now: `TagResource` and `UntagResource`
+    // write the tag set on the record and `ListTagsForResource` reports it, so none of
+    // them answers the scaffold's 501 any more. The rules they follow are owned by
+    // `tests/all/resource_tags.rs` (the read) and `tests/all/resource_tag_writes.rs`
+    // (the writes); this case only pins that each one is reachable on the wire.
+    for (case, method, uri, body, expected) in [
         (
             "TagResource",
             "POST",
             format!("/tags/{}", label(&arn)),
             Some(json!({ "tags": { "team": "infra" } })),
+            200,
+        ),
+        (
+            "ListTagsForResource",
+            "GET",
+            format!("/tags/{}", label(&arn)),
+            None,
+            200,
         ),
         (
             "UntagResource",
             "DELETE",
             format!("/tags/{}?tagKeys=team", label(&arn)),
             None,
+            200,
         ),
     ] {
         let (status, answer) = call(&em, method, &uri, body.as_ref()).await;
         assert_eq!(
-            status, 501,
-            "case {case:?}: an unimplemented operation must answer 501, got {status} / {answer:?}"
+            status, expected,
+            "case {case:?}: an implemented operation must answer {expected}, got {status} / {answer:?}"
         );
     }
 }

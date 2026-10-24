@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateKnowledgeBase
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateKnowledgeBase`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateKnowledgeBase::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: mints a knowledge base — a fresh v4 uuid `knowledgeBaseId`, the
+//! matching `knowledge-base/<id>` ARN, and the record every later
+//! `GetKnowledgeBase` and `DeleteKnowledgeBase` reads. A replayed `clientToken`
+//! answers with the knowledge base that token already created; a second live
+//! knowledge base under one name is the conflict `ConflictException` describes.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +170,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateKnowledgeBase` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateKnowledgeBaseErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateKnowledgeBase"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Mounted on an engine that holds no state: nothing can be persisted,
+            // and this operation models no error that says so.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("CreateKnowledgeBase"));
+        };
+        let region = crate::state::request_region(&ctx.parts().headers);
+        let mut state = state.lock();
+
+        // A retried create carrying the same `clientToken` answers with the
+        // resource the first call created, rather than minting a second one.
+        if let Some(token) = input.client_token.as_deref() {
+            let replayed = state
+                .replayed_resource_id(Self::NAME, "", token)
+                .cloned()
+                .and_then(|id| state.knowledge_bases.get(&id))
+                .map(crate::state::KnowledgeBase::to_data);
+            if let Some(knowledge_base) = replayed {
+                return Ok(CreateKnowledgeBaseOutput {
+                    knowledge_base: Some(knowledge_base),
+                });
+            }
+        }
+
+        // The model puts no bound on the `tags` map, so the store does: AWS's
+        // tagging restrictions allow at most 50 tags on a resource, and a request
+        // past that is outside what the service accepts. The count is taken from
+        // what the caller sent, before the map is stored.
+        let requested_tags = input.tags.unwrap_or_default();
+        if requested_tags.len() > crate::state::MAX_TAGS_PER_RESOURCE {
+            return Err(CreateKnowledgeBaseErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "tags must have at most {} entries, but {} were given.",
+                        crate::state::MAX_TAGS_PER_RESOURCE,
+                        requested_tags.len()
+                    )),
+                },
+            )
+            .into());
+        }
+        let tags: ::std::collections::BTreeMap<String, String> =
+            requested_tags.into_iter().collect();
+
+        // `name` identifies a knowledge base within the account, so a second one
+        // claiming a live name conflicts with the first.
+        if state.knowledge_base_name_index.contains_key(&input.name) {
+            return Err(CreateKnowledgeBaseErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "A knowledge base with the name {} already exists.",
+                        input.name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let knowledge_base_id = crate::state::new_resource_id();
+        let knowledge_base_arn = crate::state::knowledge_base_arn(&region, &knowledge_base_id);
+        let stored = state.insert_knowledge_base(crate::state::KnowledgeBase {
+            knowledge_base_id: knowledge_base_id.clone(),
+            knowledge_base_arn,
+            name: input.name,
+            knowledge_base_type: input.knowledge_base_type,
+            // A knowledge base is usable the moment it is created, so it is created
+            // in the terminal `ACTIVE` status, not a transient one.
+            status: crate::state::KNOWLEDGE_BASE_STATUS_ACTIVE.to_string(),
+            description: input.description,
+            tags,
+            source_configuration: input.source_configuration,
+            rendering_configuration: input.rendering_configuration,
+            server_side_encryption_configuration: input.server_side_encryption_configuration,
+            created_at: ::std::time::SystemTime::now(),
+        });
+        if !stored {
+            // The store holds as many knowledge bases as this emulator keeps
+            // (`state::MAX_KNOWLEDGE_BASES`); the service models this refusal.
+            return Err(
+                CreateKnowledgeBaseErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "The maximum number of knowledge bases ({}) has been reached. \
+                             Delete a knowledge base before creating another.",
+                            crate::state::MAX_KNOWLEDGE_BASES
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        if let Some(token) = input.client_token.as_deref() {
+            // A knowledge base is an account-level resource, so the token's scope is
+            // the account the whole store represents.
+            state.remember_client_token(Self::NAME, "", token, &knowledge_base_id);
+        }
+
+        // Answer from what was just persisted, so this response and a later
+        // `GetKnowledgeBase` cannot disagree.
+        let knowledge_base = state
+            .knowledge_bases
+            .get(&knowledge_base_id)
+            .map(crate::state::KnowledgeBase::to_data);
+        Ok(CreateKnowledgeBaseOutput { knowledge_base })
     }
 }

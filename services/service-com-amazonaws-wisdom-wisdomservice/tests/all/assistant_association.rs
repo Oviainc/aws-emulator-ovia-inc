@@ -26,11 +26,12 @@
 //!   base can be associated again; deleting the assistant takes its associations with
 //!   it.
 //!
-//! The knowledge bases the associations are made against are put in the store directly:
-//! this crate's `CreateKnowledgeBase` is still a scaffold stub (its own issue), and the
-//! association create resolves its `knowledgeBaseId` against the registry that create
-//! will fill. Everything else goes over the wire, so a response that is not computed
-//! from persisted state cannot pass.
+//! The knowledge bases the associations are made against are put in the store directly,
+//! so that one seeding step names the id and the ARN the assertions below use; the
+//! association create resolves its `knowledgeBaseId` against that same registry, which
+//! is the one `CreateKnowledgeBase` fills (covered end-to-end by the sibling
+//! `knowledge_base_lifecycle` suite). Everything else goes over the wire, so a response
+//! that is not computed from persisted state cannot pass.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -163,12 +164,30 @@ impl Emulator {
     /// base, so the test seeds the value it then asserts on.
     fn seed_knowledge_base(&self, knowledge_base_id: &str, arn: &str) -> String {
         let store = state::service_state(&*self.engine).expect("this service's store");
-        store
-            .lock()
-            .insert_knowledge_base(state::KnowledgeBase {
-                knowledge_base_id: knowledge_base_id.to_string(),
-                knowledge_base_arn: arn.to_string(),
-            });
+        let stored = store.lock().insert_knowledge_base(state::KnowledgeBase {
+            knowledge_base_id: knowledge_base_id.to_string(),
+            knowledge_base_arn: arn.to_string(),
+            // The rest of the record is what `CreateKnowledgeBase` fills. An
+            // association reports only the id and the ARN of the knowledge base it
+            // names, so nothing here is asserted on by this suite; what the create
+            // stores and reports is the sibling `knowledge_base_lifecycle` suite's
+            // subject. The name is derived from the id so two seeded knowledge bases
+            // do not claim one name.
+            name: format!("seeded-kb-{knowledge_base_id}"),
+            knowledge_base_type: "CUSTOM".to_string(),
+            status: "ACTIVE".to_string(),
+            description: None,
+            tags: BTreeMap::new(),
+            source_configuration: None,
+            rendering_configuration: None,
+            server_side_encryption_configuration: None,
+            created_at: std::time::SystemTime::now(),
+        });
+        assert!(
+            stored,
+            "case \"seed {knowledge_base_id}\": expected the store to accept the seeded \
+             knowledge base, got stored={stored}"
+        );
         arn.to_string()
     }
 
