@@ -3,8 +3,9 @@
 //! Engine state for the com-amazonaws-redshift-redshiftserviceversion20121201 service.
 //!
 //! One store per emulator, holding the provisioned-cluster control plane: the
-//! clusters, the snapshots taken of them, and the cluster parameter groups and
-//! cluster subnet groups they are configured from. Every collection keeps
+//! clusters, the snapshots taken of them, the cluster parameter groups and
+//! cluster subnet groups they are configured from, and the usage limits set on
+//! their features. Every collection keeps
 //! INSERTION ORDER, so the `Marker`
 //! cursor the paginated `Describe*` operations hand out is a stable, resumable
 //! offset into the same sequence a later page walks.
@@ -24,8 +25,8 @@
 use crate::ops::types::{
     AccountWithRestoreAccess, AquaConfiguration, AvailabilityZone, Cluster, ClusterNode,
     ClusterParameterGroup, ClusterParameterGroupStatus, ClusterParameterStatus, ClusterSubnetGroup,
-    ClusterVersion, NetworkInterface, Parameter, PendingModifiedValues, Snapshot, Subnet,
-    SupportedPlatform, VpcEndpoint, VpcSecurityGroupMembership,
+    ClusterVersion, CreateUsageLimitOutput, NetworkInterface, Parameter, PendingModifiedValues,
+    Snapshot, Subnet, SupportedPlatform, VpcEndpoint, VpcSecurityGroupMembership,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -866,6 +867,84 @@ pub const SUPPORTED_CLUSTER_IP_ADDRESS_TYPES: [&str; 1] = ["ipv4"];
 /// which matters because the sort runs while the shared state lock is held.
 pub const MAX_SORTING_ENTITIES: usize = 3;
 
+/// How many usage limits the store holds before `CreateUsageLimit` refuses with
+/// the modelled `LimitExceededFault`.
+///
+/// The same reasoning as [`CLUSTER_QUOTA`]: the emulator's own bound on
+/// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::usage_limits`],
+/// not a claim about an account's published limit. A usage limit's identity is
+/// the id its create mints, so repeating one configuration appends another
+/// record; this bound is what stops that collection growing without end. It is
+/// set far above any workflow an emulator serves (every feature of every cluster
+/// the store can hold, several times over), and every record it holds is
+/// released by `DeleteUsageLimit`.
+pub const USAGE_LIMIT_QUOTA: usize = 10_000;
+
+/// How many tags one resource may carry before a create that would exceed it
+/// refuses with the modelled `TagLimitExceededFault`.
+///
+/// Source: `smithy_query(query="doc", operation="CreateTags")` — "A resource can
+/// have up to 50 tags. If you try to create more than 50 tags for a resource,
+/// you will receive an error and the attempt will fail."
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// `UsageLimit$Period` when `CreateUsageLimit` names none.
+///
+/// Source: `smithy_query(query="doc", shape="CreateUsageLimitMessage",
+/// member="Period")` — "The default is monthly."
+pub const DEFAULT_USAGE_LIMIT_PERIOD: &str = "monthly";
+
+/// `UsageLimit$BreachAction` when `CreateUsageLimit` names none.
+///
+/// Source: `smithy_query(query="doc", shape="CreateUsageLimitMessage",
+/// member="BreachAction")` — "The default is log."
+pub const DEFAULT_USAGE_LIMIT_BREACH_ACTION: &str = "log";
+
+/// The `LimitType` each `FeatureType` is limited by, which is a property of the
+/// FEATURE rather than a choice: a feature metered in minutes takes `time`, one
+/// metered in terabytes takes `data-scanned`.
+///
+/// Source: `smithy_query(query="doc", shape="CreateUsageLimitMessage",
+/// member="LimitType")` — "If FeatureType is spectrum, then LimitType must be
+/// data-scanned. If FeatureType is concurrency-scaling, then LimitType must be
+/// time. If FeatureType is cross-region-datasharing, then LimitType must be
+/// data-scanned. If FeatureType is extra-compute-for-automatic-optimization,
+/// then LimitType must be time." The keys are every value of
+/// `UsageLimitFeatureType`.
+pub const USAGE_LIMIT_FEATURE_LIMIT_TYPES: [(&str, &str); 4] = [
+    ("spectrum", "data-scanned"),
+    ("concurrency-scaling", "time"),
+    ("cross-region-datasharing", "data-scanned"),
+    ("extra-compute-for-automatic-optimization", "time"),
+];
+
+/// The one `LimitType` this feature may be limited by, or `None` for a feature
+/// the model does not declare.
+pub fn usage_limit_type_of_feature(feature_type: &str) -> Option<&'static str> {
+    USAGE_LIMIT_FEATURE_LIMIT_TYPES
+        .iter()
+        .find(|(feature, _)| *feature == feature_type)
+        .map(|(_, limit_type)| *limit_type)
+}
+
+/// A fresh `UsageLimitId`.
+///
+/// A usage limit is "identified by the returned usage limit identifier"
+/// (`smithy_query(query="doc", operation="CreateUsageLimit")`): the id is minted
+/// by the service, carries nothing from the request, and is what every later
+/// call names the limit by — so it is drawn per call rather than derived from
+/// the limit's own values, and the minted id is STORED so every read of that
+/// limit reports the same one.
+///
+/// Minted by the same generator this crate already uses for its other
+/// wire-visible 8-4-4-4-12 lowercase-hex value, the awsQuery envelope's
+/// `<RequestId>`: a per-process sequence number digested with the wall clock, so
+/// two limits created in the same nanosecond still get different ids and no new
+/// dependency is needed.
+pub fn new_usage_limit_id() -> String {
+    crate::service::query_error_envelope::new_request_id()
+}
+
 /// What a handler answers when the shared store cannot be reached: the service's
 /// own modelled "a dependent internal service is temporarily unavailable" fault.
 pub const STORE_UNAVAILABLE: &str =
@@ -983,6 +1062,15 @@ pub struct ComAmazonawsRedshiftRedshiftserviceversion20121201State {
     /// order — the default parameter groups first, then the ones the account
     /// created.
     pub parameter_groups: Vec<StoredParameterGroup>,
+    /// Every usage limit, keyed by `UsageLimitId`, in creation order.
+    ///
+    /// The modelled `UsageLimit` shape (generated under the name
+    /// [`CreateUsageLimitOutput`], because `CreateUsageLimit` returns it
+    /// unwrapped) IS the whole record — a usage limit carries no status the clock
+    /// moves and nothing the shape has no member for — so, like
+    /// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::subnet_groups`],
+    /// this collection needs no `Stored*` wrapper.
+    pub usage_limits: Vec<CreateUsageLimitOutput>,
     /// The engine versions this service offers, in catalog order. Unlike the
     /// collections above this one is SEEDED when the store is created — the
     /// versions exist before any cluster does, which is why
@@ -1007,6 +1095,7 @@ impl Default for ComAmazonawsRedshiftRedshiftserviceversion20121201State {
             subnet_groups: Vec::new(),
             snapshots: Vec::new(),
             parameter_groups: default_parameter_groups(),
+            usage_limits: Vec::new(),
             cluster_versions: published_cluster_versions(),
         }
     }
@@ -1075,6 +1164,20 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
         self.clusters
             .iter()
             .find(|c| c.cluster.cluster_identifier.as_deref() == Some(identifier))
+    }
+
+    /// The stored usage limit with this `UsageLimitId`, if any.
+    pub fn usage_limit(&self, usage_limit_id: &str) -> Option<&CreateUsageLimitOutput> {
+        self.usage_limits
+            .iter()
+            .find(|limit| limit.usage_limit_id.as_deref() == Some(usage_limit_id))
+    }
+
+    /// The position of the usage limit with this `UsageLimitId`, if any.
+    pub fn usage_limit_position(&self, usage_limit_id: &str) -> Option<usize> {
+        self.usage_limits
+            .iter()
+            .position(|limit| limit.usage_limit_id.as_deref() == Some(usage_limit_id))
     }
 
     /// The position of the cluster with this identifier, if any.

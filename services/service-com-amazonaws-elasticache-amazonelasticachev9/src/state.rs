@@ -128,10 +128,11 @@ use crate::ops::types::{
     GlobalReplicationGroupMember, LogDeliveryConfiguration, LogDeliveryConfigurationRequest,
     NodeGroup, NodeGroupConfiguration, NodeGroupMember, NodeGroupMemberUpdateStatus,
     NodeGroupUpdateStatus, NodeSnapshot, NotificationConfiguration, Parameter,
-    PendingModifiedValues, ProcessedUpdateAction, RecurringCharge, ReplicationGroup,
-    ReservedCacheNode, ReservedCacheNodesOffering, ScaleConfig, SecurityGroupMembership,
-    ServerlessCache, ServiceUpdate, Snapshot, Subnet, Tag, UnprocessedUpdateAction, UpdateAction,
-    UserGroupPendingChanges,
+    PendingLogDeliveryConfiguration, PendingModifiedValues, ProcessedUpdateAction, RecurringCharge,
+    ReplicationGroup, ReplicationGroupPendingModifiedValues, ReservedCacheNode,
+    ReservedCacheNodesOffering, ScaleConfig, SecurityGroupMembership, ServerlessCache,
+    ServiceUpdate, Snapshot, Subnet, Tag, UnprocessedUpdateAction, UpdateAction,
+    UserGroupPendingChanges, UserGroupsUpdateStatus,
 };
 
 /// The region a request is treated as having been made in when its SigV4
@@ -722,6 +723,15 @@ pub const SECURITY_GROUP_STATUS: &str = "active";
 /// given. The emulator models no SNS subscription lifecycle, so a configured
 /// topic is reported in the one state a configured topic has.
 pub const NOTIFICATION_TOPIC_STATUS: &str = "active";
+
+/// `NotificationTopicStatus`'s two documented values: "The status of the Amazon
+/// SNS notification topic … Notifications are sent only if the status is active.
+/// Valid values: active | inactive." The member is a plain `String`, so these
+/// are the spellings a request is held to; [`NOTIFICATION_TOPIC_STATUS`] is the
+/// state a CONFIGURED topic is reported in, which is the `active` one.
+pub const NOTIFICATION_STATUS_ACTIVE: &str = NOTIFICATION_TOPIC_STATUS;
+/// See [`NOTIFICATION_STATUS_ACTIVE`].
+pub const NOTIFICATION_STATUS_INACTIVE: &str = "inactive";
 
 /// The `LogDeliveryConfiguration$Status` of a log delivery this emulator holds,
 /// from `LogDeliveryConfigurationStatus` (`active | enabling | modifying |
@@ -3437,9 +3447,10 @@ impl PendingValues {
             cache_node_type: self.cache_node_type.clone(),
             scale_config: self.scale_config.clone(),
             // An auth token change and a log-delivery change are applied by the
-            // handler rather than deferred, so neither is ever pending; the
-            // in-transit encryption mode can only be set by
-            // `ModifyReplicationGroup`, which is a scaffolded 501.
+            // handler rather than deferred, so neither is ever pending on a
+            // CLUSTER; a member cluster's in-transit encryption is the group's,
+            // and `ModifyReplicationGroup` reports what it defers under the
+            // GROUP's own pending values.
             auth_token_status: None,
             log_delivery_configurations: None,
             transit_encryption_enabled: None,
@@ -3877,6 +3888,45 @@ pub const SETTING_ENABLED: &str = "enabled";
 /// See [`SETTING_ENABLED`].
 pub const SETTING_DISABLED: &str = "disabled";
 
+/// `ClusterMode`'s third value (`smithy_query(query="shape",
+/// shape="ClusterMode")`: `enabled | disabled | compatible`), the step a group
+/// has to pass through to reach `enabled`: "To modify cluster mode from
+/// Disabled to Enabled, you must first set the cluster mode to Compatible."
+pub const CLUSTER_MODE_COMPATIBLE: &str = "compatible";
+
+/// `TransitEncryptionMode`'s values (`smithy_query(query="shape",
+/// shape="TransitEncryptionMode")`: `preferred | required`). "Setting
+/// TransitEncryptionMode to required is a two-step process that requires you to
+/// first set the TransitEncryptionMode to preferred."
+pub const TRANSIT_ENCRYPTION_PREFERRED: &str = "preferred";
+/// See [`TRANSIT_ENCRYPTION_PREFERRED`].
+pub const TRANSIT_ENCRYPTION_REQUIRED: &str = "required";
+
+/// `AuthTokenUpdateStrategyType`'s values (`smithy_query(query="shape",
+/// shape="AuthTokenUpdateStrategyType")`: `SET | ROTATE | DELETE`), with the
+/// documented order between them: "ROTATE - default, if no update strategy is
+/// provided. SET - allowed only after ROTATE. DELETE - allowed only when
+/// transitioning to RBAC."
+pub const AUTH_TOKEN_ROTATE: &str = "ROTATE";
+/// See [`AUTH_TOKEN_ROTATE`].
+pub const AUTH_TOKEN_SET: &str = "SET";
+/// See [`AUTH_TOKEN_ROTATE`].
+pub const AUTH_TOKEN_DELETE: &str = "DELETE";
+
+/// `AuthTokenUpdateStatus`'s values (`smithy_query(query="shape",
+/// shape="AuthTokenUpdateStatus")`: `SETTING | ROTATING`): what a DEFERRED
+/// auth-token update of each strategy is reported as until it is applied.
+pub const AUTH_TOKEN_STATUS_ROTATING: &str = "ROTATING";
+/// See [`AUTH_TOKEN_STATUS_ROTATING`].
+pub const AUTH_TOKEN_STATUS_SETTING: &str = "SETTING";
+
+/// The longest `ReplicationGroupDescription` a replication group may carry, as
+/// `ModifyReplicationGroup$ReplicationGroupDescription` documents it: "A
+/// description for the replication group. Maximum length is 255 characters."
+/// The member carries no modelled `@length`, so the bound is enforced in the
+/// handler.
+pub const MAX_REPLICATION_GROUP_DESCRIPTION_LENGTH: usize = 255;
+
 /// `NodeGroupMember$CurrentRole`'s values: "The role that is currently assigned
 /// to the node - primary or replica."
 pub const ROLE_PRIMARY: &str = "primary";
@@ -4118,6 +4168,32 @@ impl NodeGroupRecord {
             .members
             .iter()
             .position(|member| member.current_role != ROLE_PRIMARY)?;
+        self.swap_roles(primary, replica)
+    }
+
+    /// Promote the member cluster `cache_cluster_id` of this shard to the
+    /// primary role, demoting the primary it had — which is what
+    /// `ModifyReplicationGroup$PrimaryClusterId` asks for. Hands back
+    /// `(demoted cluster, promoted cluster)`, or `None` when this shard has no
+    /// such replica, or no primary to demote.
+    ///
+    /// Promotion by NAME and [`Self::fail_over`] are the same move over this
+    /// shard's members, so they go through the one implementation below rather
+    /// than two copies that can disagree about the member order.
+    pub fn promote(&mut self, cache_cluster_id: &str) -> Option<(String, String)> {
+        let primary = self
+            .members
+            .iter()
+            .position(|member| member.current_role == ROLE_PRIMARY)?;
+        let replica = self.members.iter().position(|member| {
+            member.current_role != ROLE_PRIMARY && member.cache_cluster_id == cache_cluster_id
+        })?;
+        self.swap_roles(primary, replica)
+    }
+
+    /// Give the member at `replica` the primary role and the one at `primary`
+    /// the replica role, keeping the primary at the front of `members`.
+    fn swap_roles(&mut self, primary: usize, replica: usize) -> Option<(String, String)> {
         self.members[primary].current_role = ROLE_REPLICA.to_string();
         self.members[replica].current_role = ROLE_PRIMARY.to_string();
         let demoted = self.members[primary].cache_cluster_id.clone();
@@ -4159,6 +4235,84 @@ impl NodeGroupRecord {
                     .collect(),
             ),
         }
+    }
+}
+
+/// The changes a `ModifyReplicationGroup` deferred past this call: the members
+/// the modelled `ReplicationGroupPendingModifiedValues` carries, which are
+/// exactly the ones `ApplyImmediately` governs. A member that shape does NOT
+/// model (the description, the maintenance window, the snapshot settings, the
+/// node type) has nowhere to be reported as pending, so it is applied at once.
+#[derive(Debug, Clone, Default)]
+pub struct ReplicationGroupPendingValues {
+    pub primary_cluster_id: Option<String>,
+    /// One of `PendingAutomaticFailoverStatus`'s values (`enabled |
+    /// disabled`).
+    pub automatic_failover_status: Option<String>,
+    /// One of `AuthTokenUpdateStatus`'s values (`SETTING | ROTATING`).
+    pub auth_token_status: Option<String>,
+    pub user_group_ids_to_add: Vec<String>,
+    pub user_group_ids_to_remove: Vec<String>,
+    pub log_delivery_configurations: Vec<LogDeliveryRecord>,
+    pub transit_encryption_enabled: Option<bool>,
+    /// One of `TransitEncryptionMode`'s values (`preferred | required`).
+    pub transit_encryption_mode: Option<String>,
+    /// One of `ClusterMode`'s values (`enabled | disabled | compatible`).
+    pub cluster_mode: Option<String>,
+}
+
+impl ReplicationGroupPendingValues {
+    /// True when nothing is pending.
+    pub fn is_empty(&self) -> bool {
+        self.primary_cluster_id.is_none()
+            && self.automatic_failover_status.is_none()
+            && self.auth_token_status.is_none()
+            && self.user_group_ids_to_add.is_empty()
+            && self.user_group_ids_to_remove.is_empty()
+            && self.log_delivery_configurations.is_empty()
+            && self.transit_encryption_enabled.is_none()
+            && self.transit_encryption_mode.is_none()
+            && self.cluster_mode.is_none()
+    }
+
+    /// These values as the modelled shape, or `None` when nothing is pending —
+    /// a group with no deferred change reports no member rather than an empty
+    /// structure.
+    pub fn to_modeled(&self) -> Option<ReplicationGroupPendingModifiedValues> {
+        if self.is_empty() {
+            return None;
+        }
+        Some(ReplicationGroupPendingModifiedValues {
+            primary_cluster_id: self.primary_cluster_id.clone(),
+            automatic_failover_status: self.automatic_failover_status.clone(),
+            // An online resharding is `ModifyReplicationGroupShardConfiguration`'s
+            // to report, and that operation is a scaffolded 501 with its own
+            // issue; nothing this operation defers is a resharding.
+            resharding: None,
+            auth_token_status: self.auth_token_status.clone(),
+            user_groups: (!self.user_group_ids_to_add.is_empty()
+                || !self.user_group_ids_to_remove.is_empty())
+            .then(|| UserGroupsUpdateStatus {
+                user_group_ids_to_add: (!self.user_group_ids_to_add.is_empty())
+                    .then(|| self.user_group_ids_to_add.clone()),
+                user_group_ids_to_remove: (!self.user_group_ids_to_remove.is_empty())
+                    .then(|| self.user_group_ids_to_remove.clone()),
+            }),
+            log_delivery_configurations: (!self.log_delivery_configurations.is_empty()).then(|| {
+                self.log_delivery_configurations
+                    .iter()
+                    .map(|record| PendingLogDeliveryConfiguration {
+                        log_type: record.log_type.clone(),
+                        destination_type: record.destination_type.clone(),
+                        destination_details: record.destination_details.clone(),
+                        log_format: record.log_format.clone(),
+                    })
+                    .collect()
+            }),
+            transit_encryption_enabled: self.transit_encryption_enabled,
+            transit_encryption_mode: self.transit_encryption_mode.clone(),
+            cluster_mode: self.cluster_mode.clone(),
+        })
     }
 }
 
@@ -4221,6 +4375,18 @@ pub struct ReplicationGroupRecord {
     /// The tags `CreateReplicationGroup` was given; see
     /// [`CacheClusterRecord::tags`].
     pub tags: Vec<(String, String)>,
+    /// The change `ModifyReplicationGroup` deferred past the call, which is
+    /// what `ReplicationGroup$PendingModifiedValues` reports; see
+    /// [`ReplicationGroupPendingValues`].
+    pub pending_modified_values: ReplicationGroupPendingValues,
+    /// "The cluster ID that is used as the daily snapshot source for the
+    /// replication group", as `ModifyReplicationGroup$SnapshottingClusterId`
+    /// set it.
+    pub snapshotting_cluster_id: Option<String>,
+    /// The `AuthTokenUpdateStrategyType` the last accepted auth-token update
+    /// used, which is what makes the documented `SET` step reachable: "SET -
+    /// allowed only after ROTATE".
+    pub auth_token_last_strategy: Option<String>,
     /// The Global datastore this group is a member of, and its role in it,
     /// which is what `ReplicationGroup$GlobalReplicationGroupInfo` reports.
     /// `CreateGlobalReplicationGroup` is still a scaffolded 501 with its own
@@ -4343,6 +4509,27 @@ impl ReplicationGroupRecord {
             })
     }
 
+    /// Whether `cache_cluster_id` is a member cluster of this group — what
+    /// `PrimaryClusterId` and `SnapshottingClusterId` have to name.
+    pub fn is_member_cluster(&self, cache_cluster_id: &str) -> bool {
+        self.node_groups
+            .iter()
+            .flat_map(|shard| shard.members.iter())
+            .any(|member| member.cache_cluster_id == cache_cluster_id)
+    }
+
+    /// Promote the member cluster `cache_cluster_id` to the primary role of
+    /// the shard it belongs to, demoting that shard's current primary — which
+    /// is what `ModifyReplicationGroup$PrimaryClusterId` asks for. Hands back
+    /// `(demoted cluster, promoted cluster)`, or `None` when no shard of this
+    /// group holds it as a replica (a cluster that is already the primary is
+    /// such a case: there is nothing to move).
+    pub fn promote_primary(&mut self, cache_cluster_id: &str) -> Option<(String, String)> {
+        self.node_groups
+            .iter_mut()
+            .find_map(|shard| shard.promote(cache_cluster_id))
+    }
+
     /// Start the span after which the clock owes this group `available`, leaving
     /// it and its shards in `status` until then — the same transition a create
     /// gets, so a caller that polls straight after a change sees the transient
@@ -4379,10 +4566,7 @@ impl ReplicationGroupRecord {
                 }
             }),
             status: Some(self.status.clone()),
-            // Nothing can be pending on a group this operation created:
-            // `ModifyReplicationGroup` and the resharding and replica-count
-            // operations are scaffolded 501s, and each owns its own issue.
-            pending_modified_values: None,
+            pending_modified_values: self.pending_modified_values.to_modeled(),
             member_clusters: Some(self.member_clusters()),
             node_groups: Some(
                 self.node_groups
@@ -4390,9 +4574,8 @@ impl ReplicationGroupRecord {
                     .map(|shard| shard.to_modeled(self, clusters))
                     .collect(),
             ),
-            // The daily snapshot source: `CreateSnapshot` is a scaffolded 501,
-            // so no member is snapshotting.
-            snapshotting_cluster_id: None,
+            // The daily snapshot source, as `ModifyReplicationGroup` set it.
+            snapshotting_cluster_id: self.snapshotting_cluster_id.clone(),
             automatic_failover: Some(self.automatic_failover.clone()),
             multi_az: Some(self.multi_az.clone()),
             // "Use the configuration endpoint to connect to this replication
@@ -7689,6 +7872,29 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
         Some(group)
     }
 
+    /// Run `edit` over every member CLUSTER of the replication group `group_id`.
+    ///
+    /// A replication group's settings are the settings of the clusters it is
+    /// made of — "the cache parameter group to apply to all of the clusters in
+    /// this replication group" — and those clusters are ordinary records in
+    /// [`Self::cache_clusters`], which `DescribeCacheClusters` reports. So a
+    /// change to the group is carried into them here, through the one walk, and
+    /// the two reads cannot disagree about what the account runs.
+    pub fn for_each_member_cluster(
+        &mut self,
+        group_id: &str,
+        mut edit: impl FnMut(&mut CacheClusterRecord),
+    ) {
+        let Some(group) = self.replication_groups.get(group_id) else {
+            return;
+        };
+        for cache_cluster_id in group.member_clusters() {
+            if let Some(cluster) = self.cache_clusters.get_mut(&cache_cluster_id) {
+                edit(cluster);
+            }
+        }
+    }
+
     /// Give the shard `node_group_id` of the replication group `group_id`
     /// `replicas` replicas, minting a member CLUSTER for each replica added and
     /// deleting the member cluster of each replica removed.
@@ -8263,6 +8469,12 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
             durability: new.durability,
             effective_durability: new.effective_durability,
             tags: new.tags,
+            // A created group has nothing deferred, no daily snapshot source
+            // and no auth-token update behind it; `ModifyReplicationGroup` is
+            // what writes all three.
+            pending_modified_values: ReplicationGroupPendingValues::default(),
+            snapshotting_cluster_id: None,
+            auth_token_last_strategy: None,
             // A created group belongs to no Global datastore: the Global
             // datastore operations are what make a group a member, and
             // `CreateReplicationGroup` refuses a `GlobalReplicationGroupId`

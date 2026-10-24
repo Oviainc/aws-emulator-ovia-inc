@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyUsageLimit
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyUsageLimit`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyUsageLimit::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Changes the `Amount` and/or the `BreachAction` of the usage limit its
+//! `UsageLimitId` names, leaving every member the request omits as it stood, and
+//! reports the limit as it is after the change.
 //!
 //! ## Shape of an operation
 //!
@@ -102,12 +97,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `ModifyUsageLimitError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#ModifyUsageLimit")]
+// `DependentServiceUnavailableFault` is widened in, as on the sibling modify
+// operations: the model does not list it for this operation, but the service
+// declares the shape, and it is the only modelled way to say "the control-plane
+// store could not be reached".
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#ModifyUsageLimit",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum ModifyUsageLimitErrorModeled {
     InvalidUsageLimitFault(InvalidUsageLimitFault),
     UnsupportedOperationFault(UnsupportedOperationFault),
     UsageLimitNotFoundFault(UsageLimitNotFoundFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -159,20 +162,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyUsageLimit` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyUsageLimitErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyUsageLimit"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(ModifyUsageLimitErrorModeled::DependentServiceUnavailableFault(
+                DependentServiceUnavailableFault {
+                    message: Some(st::STORE_UNAVAILABLE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The new amount is the same quantity `CreateUsageLimit` takes — "the new
+        // limit amount. For more information about this parameter, see
+        // UsageLimit" (`smithy_query(query="doc",
+        // shape="ModifyUsageLimitMessage", member="Amount")`) — so it satisfies
+        // the same rule: a limit amount is a positive number.
+        if let Some(amount) = input.amount {
+            if amount <= 0 {
+                return Err(ModifyUsageLimitErrorModeled::InvalidUsageLimitFault(
+                    InvalidUsageLimitFault {
+                        message: Some(format!(
+                            "Invalid value for Amount: {amount}. The limit amount must be a positive number."
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let mut store = state.lock();
+
+        let Some(position) = store.usage_limit_position(&input.usage_limit_id) else {
+            return Err(ModifyUsageLimitErrorModeled::UsageLimitNotFoundFault(
+                UsageLimitNotFoundFault {
+                    message: Some(format!(
+                        "Usage limit {} not found.",
+                        input.usage_limit_id
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // Only the two members this operation takes can change, and an absent one
+        // leaves the stored value alone: the limit's feature, limit type, period
+        // and tags are not this call's to touch.
+        let limit = &mut store.usage_limits[position];
+        if let Some(amount) = input.amount {
+            limit.amount = Some(amount);
+        }
+        if let Some(breach_action) = input.breach_action.clone() {
+            limit.breach_action = Some(breach_action);
+        }
+
+        // The limit as it now stands, which is also what a later
+        // `DescribeUsageLimits` reports.
+        Ok(ModifyUsageLimitOutput {
+            usage_limit_id: limit.usage_limit_id.clone(),
+            cluster_identifier: limit.cluster_identifier.clone(),
+            feature_type: limit.feature_type.clone(),
+            limit_type: limit.limit_type.clone(),
+            amount: limit.amount,
+            period: limit.period.clone(),
+            breach_action: limit.breach_action.clone(),
+            tags: limit.tags.clone(),
+        })
     }
 }

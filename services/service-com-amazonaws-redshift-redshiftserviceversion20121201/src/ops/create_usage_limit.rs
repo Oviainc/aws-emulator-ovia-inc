@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateUsageLimit
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateUsageLimit`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateUsageLimit::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a usage limit on one feature of one cluster: the limit is minted with
+//! a service-generated `UsageLimitId`, stored, and reported back — the same
+//! record `DescribeUsageLimits` then lists and `ModifyUsageLimit` /
+//! `DeleteUsageLimit` reach by that id.
 //!
 //! ## Shape of an operation
 //!
@@ -122,7 +118,14 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `CreateUsageLimitError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#CreateUsageLimit")]
+// `DependentServiceUnavailableFault` is widened in, as on the sibling create
+// operations: the model does not list it for this operation, but the service
+// declares the shape, and it is the only modelled way to say "the control-plane
+// store could not be reached".
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#CreateUsageLimit",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum CreateUsageLimitErrorModeled {
     ClusterNotFoundFault(ClusterNotFoundFault),
@@ -132,6 +135,7 @@ pub enum CreateUsageLimitErrorModeled {
     TagLimitExceededFault(TagLimitExceededFault),
     UnsupportedOperationFault(UnsupportedOperationFault),
     UsageLimitAlreadyExistsFault(UsageLimitAlreadyExistsFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -183,20 +187,160 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateUsageLimit` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateUsageLimitErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(CreateUsageLimitErrorModeled::DependentServiceUnavailableFault(
+                DependentServiceUnavailableFault {
+                    message: Some(st::STORE_UNAVAILABLE.to_string()),
+                },
+            )
+            .into());
+        };
+        let started = ::std::time::Instant::now();
+
+        // The request's own values first, so a limit nothing could meter is
+        // refused before the store is touched at all.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateUsageLimit"))
+        // "The value must be a positive number"
+        // (`smithy_query(query="doc", shape="CreateUsageLimitMessage",
+        // member="Amount")`), and the model declares no range on `Long` for the
+        // framework to refuse it earlier.
+        if input.amount <= 0 {
+            return Err(CreateUsageLimitErrorModeled::InvalidUsageLimitFault(
+                InvalidUsageLimitFault {
+                    message: Some(format!(
+                        "Invalid value for Amount: {}. The limit amount must be a positive number.",
+                        input.amount
+                    )),
+                },
+            )
+            .into());
+        }
+        // The limit type is fixed by the feature rather than chosen: a request
+        // that pairs them differently describes no limit this service meters.
+        let Some(required_limit_type) = st::usage_limit_type_of_feature(&input.feature_type) else {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Invalid value for FeatureType: '{}'. Valid Values: {}",
+                input.feature_type,
+                st::USAGE_LIMIT_FEATURE_LIMIT_TYPES
+                    .iter()
+                    .map(|(feature, _)| *feature)
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            )));
+        };
+        if input.limit_type != required_limit_type {
+            return Err(CreateUsageLimitErrorModeled::InvalidUsageLimitFault(
+                InvalidUsageLimitFault {
+                    message: Some(format!(
+                        "Invalid value for LimitType: '{}'. If FeatureType is {}, then LimitType must be {required_limit_type}.",
+                        input.limit_type, input.feature_type
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A limit carries the tags the request gives it, and no resource holds
+        // more than the documented 50.
+        let tags = input.tags.clone().unwrap_or_default();
+        if tags.len() > st::MAX_TAGS_PER_RESOURCE {
+            return Err(CreateUsageLimitErrorModeled::TagLimitExceededFault(
+                TagLimitExceededFault {
+                    message: Some(format!(
+                        "The request carries {} tags; a resource can have up to {} tags.",
+                        tags.len(),
+                        st::MAX_TAGS_PER_RESOURCE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // An absent member takes its documented default, and that default is
+        // what the limit IS from here on: the record below is what every later
+        // read reports.
+        let period = input
+            .period
+            .clone()
+            .unwrap_or_else(|| st::DEFAULT_USAGE_LIMIT_PERIOD.to_string());
+        let breach_action = input
+            .breach_action
+            .clone()
+            .unwrap_or_else(|| st::DEFAULT_USAGE_LIMIT_BREACH_ACTION.to_string());
+
+        let mut store = state.lock();
+        store.settle(started);
+
+        // "Creates a usage limit for a specified Amazon Redshift feature on a
+        // cluster": the cluster is what the limit is set ON, so it has to be
+        // there, and it has to be in the state that admits a configuration
+        // change.
+        let Some(stored_cluster) = store.cluster(&input.cluster_identifier) else {
+            return Err(CreateUsageLimitErrorModeled::ClusterNotFoundFault(
+                ClusterNotFoundFault {
+                    message: Some(format!("Cluster {} not found.", input.cluster_identifier)),
+                },
+            )
+            .into());
+        };
+        let cluster_status = stored_cluster
+            .cluster
+            .cluster_status
+            .clone()
+            .unwrap_or_default();
+        if cluster_status != st::STATUS_AVAILABLE {
+            return Err(CreateUsageLimitErrorModeled::InvalidClusterStateFault(
+                InvalidClusterStateFault {
+                    message: Some(format!(
+                        "Cluster {} is in state {cluster_status}; it must be {} to set a usage limit.",
+                        input.cluster_identifier,
+                        st::STATUS_AVAILABLE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Nothing else to resolve: a usage limit's identity is the id this call
+        // mints for it, not its configuration. The recorded lifecycle sets a
+        // second limit on a feature of a cluster that already carries one for
+        // the same period and the service accepts it, so repeating a
+        // configuration adds a limit rather than duplicating one — which leaves
+        // this operation's `UsageLimitAlreadyExistsFault` with no condition to
+        // raise it on, and makes the store bound below the only thing that keeps
+        // the collection finite.
+        if store.usage_limits.len() >= st::USAGE_LIMIT_QUOTA {
+            return Err(CreateUsageLimitErrorModeled::LimitExceededFault(
+                LimitExceededFault {
+                    message: Some(format!(
+                        "The request would exceed the allowed number of usage limits ({}).",
+                        st::USAGE_LIMIT_QUOTA
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The record a later `DescribeUsageLimits` reports verbatim, under the
+        // id this call mints for it.
+        let limit = CreateUsageLimitOutput {
+            usage_limit_id: Some(st::new_usage_limit_id()),
+            cluster_identifier: Some(input.cluster_identifier.clone()),
+            feature_type: Some(input.feature_type.clone()),
+            limit_type: Some(input.limit_type.clone()),
+            amount: Some(input.amount),
+            period: Some(period),
+            breach_action: Some(breach_action),
+            // The tags the request carried, an empty list when it carried none —
+            // which is what the limit then has.
+            tags: Some(tags),
+        };
+        store.usage_limits.push(limit.clone());
+
+        Ok(limit)
     }
 }

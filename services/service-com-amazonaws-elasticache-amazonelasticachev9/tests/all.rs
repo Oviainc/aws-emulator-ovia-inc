@@ -118,3 +118,8 @@ mod user_group_membership;
 // Appended for the same reason: the `DeleteSnapshot` suite.
 #[path = "all/snapshot_delete.rs"]
 mod snapshot_delete;
+
+// Appended for the same reason: the `ModifyReplicationGroup` settings-change
+// suite.
+#[path = "all/modify_replication_group.rs"]
+mod modify_replication_group;

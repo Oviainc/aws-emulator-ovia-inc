@@ -281,7 +281,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             virtual_cluster_id: input.virtual_cluster_id.clone(),
             arn: arn.clone(),
             // A submitted job run is accepted PENDING and reaches RUNNING on the clock,
-            // so a caller that reads straight back sees the transient state.
+            // so a caller that reads straight back sees the transient state. The
+            // admission is gated by the cluster's `maxConcurrentJobRuns`, so a run with
+            // no free slot waits in PENDING past its due instant (`state::settle`).
             state: crate::state::JOB_PENDING.to_string(),
             client_token: input.client_token.clone(),
             execution_role_arn: input.execution_role_arn,

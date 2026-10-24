@@ -487,6 +487,21 @@ impl ComAmazonawsCodeconnectionsCodeconnections20231201State {
             })
     }
 
+    /// How many connections are associated with the host this ARN names.
+    ///
+    /// The association is the `HostArn` `CreateConnection` stored on the connection
+    /// (`StoredConnection::host_arn`), which is the SAME reference `ListConnections`'
+    /// `HostArnFilter` selects on — so the count is read off the connection store
+    /// rather than from a second index that could disagree with it. `DeleteHost` needs
+    /// it for the precondition its documentation states ("Before you delete a host, all
+    /// connections associated to the host must be deleted").
+    pub fn connections_on_host(&self, host_arn: &str) -> usize {
+        self.connections
+            .values()
+            .filter(|connection| connection.host_arn.as_deref() == Some(host_arn))
+            .count()
+    }
+
     /// The repository link already registered for this connection, owner and
     /// repository, when there is one.
     ///
@@ -816,6 +831,45 @@ pub const CONNECTION_NOT_FOUND_MESSAGE: &str = "No connection exists with the AR
 /// this service is recorded to answer for a host.
 pub fn host_not_found_message(host_arn: &str) -> String {
     format!("No host exists with the ARN: {host_arn}")
+}
+
+/// The host statuses a host CANNOT be deleted from.
+///
+/// `DeleteHost`'s own documentation: "A host cannot be deleted if it is in the
+/// VPC_CONFIG_INITIALIZING or VPC_CONFIG_DELETING state." The other values the `Host`
+/// shape's `Status` member documents (PENDING, AVAILABLE,
+/// VPC_CONFIG_FAILED_INITIALIZATION) are not named there, so a host in one of them is
+/// deletable. Stated here rather than in the handler so any later operation that has to
+/// answer the same precondition reads one list.
+pub const HOST_STATUSES_BLOCKING_DELETE: &[&str] = &["VPC_CONFIG_INITIALIZING", "VPC_CONFIG_DELETING"];
+
+/// What `DeleteHost` answers for a host whose connections have not been deleted first:
+/// the rule it broke, naming the host ARN the caller already has and how many
+/// connections still reference it.
+///
+/// `DeleteHost`'s documentation states the precondition ("Before you delete a host, all
+/// connections associated to the host must be deleted") but no recorded template for the
+/// refusal is known, so — exactly like [`resource_not_found_message`] — the sentence
+/// states the rule and the values the request and the store already hold rather than
+/// borrowing another case's wording. The CODE (`ResourceUnavailableException`, 400) is
+/// the requirement: it is this service's "the host is there but is not usable" signal,
+/// and the only refusal `DeleteHost` models besides the 404 for an ARN naming nothing.
+pub fn host_has_connections_message(host_arn: &str, connections: usize) -> String {
+    format!(
+        "The host cannot be deleted while connections are associated with it. \
+         Delete the {connections} connection(s) associated with the host and try again: {host_arn}"
+    )
+}
+
+/// What `DeleteHost` answers for a host in a status it cannot be deleted from
+/// ([`HOST_STATUSES_BLOCKING_DELETE`]): the rule it broke, naming the status the host is
+/// in and the ARN the caller already has. Worded for the same reason as
+/// [`host_has_connections_message`], and carrying the same modelled code.
+pub fn host_not_deletable_in_status_message(host_arn: &str, status: &str) -> String {
+    format!(
+        "The host cannot be deleted while it is in the {status} state. \
+         Wait for the host to leave that state and try again: {host_arn}"
+    )
 }
 
 /// What the ARN-addressed tagging surface answers for an ARN of neither a connection nor
