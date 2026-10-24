@@ -14,11 +14,11 @@ use std::time::{Duration, Instant};
 use ::aws_smithy_types::base64;
 
 use crate::ops::types::{
-    AdditionalInfoRequest, AdditionalInfoResponse, Address, ConflictException,
+    AdditionalInfoRequest, AdditionalInfoResponse, Address, Authority, ConflictException,
     IndonesiaAdditionalInfo, InternalServerException, Jurisdiction, ResourceNotFoundException,
     SupplementalTaxRegistration, SupplementalTaxRegistrationEntry, TaxDocumentMetadata,
-    TaxRegistration, TaxRegistrationEntry, TaxRegistrationWithJurisdiction, ValidationException,
-    ValidationExceptionField,
+    TaxExemptionType, TaxRegistration, TaxRegistrationEntry, TaxRegistrationWithJurisdiction,
+    ValidationException, ValidationExceptionField,
 };
 
 /// The `TaxRegistrationStatus` values, from the model's enum
@@ -1355,6 +1355,122 @@ pub fn decode_page_token(token: &str) -> Result<String, ValidationException> {
         ));
     }
     Ok(account_id)
+}
+
+// ---------------------------------------------------------------------------
+// The tax exemption type catalog
+//
+// `GetTaxExemptionTypes` answers "the supported types of tax exemptions": a
+// collection the SERVICE publishes, the same for every account, that no
+// operation of this service creates, updates or deletes. So the catalog below IS
+// that collection — the same way the API Gateway emulator's `SdkType` collection
+// is a published table rather than a stored record — and the handler projects it
+// into the modelled shapes instead of reading an account's records.
+// ---------------------------------------------------------------------------
+
+/// One jurisdiction an exemption type applies in, as the catalog spells it:
+/// `(country, state)` — the two members of the model's `Authority` shape
+/// (`smithy_query(query="shape", shape="Authority")`: `country` is a required
+/// two-letter code, `state` an optional name). `None` means the type applies
+/// across the whole country rather than in one state of it.
+pub type JurisdictionRow = (&'static str, Option<&'static str>);
+
+/// One entry of the published catalog:
+/// `(displayName, description, applicableJurisdictions)` — the three members of
+/// the model's `TaxExemptionType` shape.
+pub type TaxExemptionTypeRow = (&'static str, &'static str, &'static [JurisdictionRow]);
+
+/// The tax exemption types this service supports.
+///
+/// Hand-written because the model declares no shape enumerating them: `TaxExemptionType`
+/// is a free-form structure, and the only thing the model says about which values are
+/// legal is `PutTaxExemptionRequest$exemptionType`'s "Use the supported tax exemption type
+/// description" (`smithy_query(query="doc", shape="PutTaxExemptionRequest",
+/// member="exemptionType")`) — i.e. the `description` of an entry of THIS catalog is the
+/// token a caller names an exemption type by, so the descriptions below are the catalog's
+/// identifying values and are kept distinct from one another.
+///
+/// What is claimed to match AWS: the categories of US sales-and-use-tax exemption AWS
+/// accepts a certificate for (AWS Billing and Cost Management User Guide, "Tax exemption"
+/// / "Managing your tax exemptions": tax exemptions are offered for United States sales
+/// tax, under the certificate categories a reseller, a direct-pay permit holder, a
+/// federal, state, local or tribal government body, an educational institution or a
+/// section 501(c)(3) charitable organization holds), and the single country-level
+/// jurisdiction each of them carries — `US`, with no `state`, because the exemption
+/// category is published for the country and a certificate's state is a fact about the
+/// certificate rather than about the type.
+///
+/// What is NOT claimed: the `displayName` and `description` WORDING, and the order of the
+/// entries. The model states no sentence for either member, so each is this emulator's own
+/// phrasing of a documented category, sorted by `displayName` so the collection is
+/// enumerated one stable way; a client that keys off the prose rather than off a type it
+/// already read from this catalog is reading wording the real service words differently.
+pub const TAX_EXEMPTION_TYPE_CATALOG: &[TaxExemptionTypeRow] = &[
+    (
+        "501(c)(3)",
+        "Charitable organization exempt under section 501(c)(3) of the US Internal Revenue Code",
+        UNITED_STATES,
+    ),
+    (
+        "Direct Pay Permit",
+        "Holder of a direct pay permit that remits sales and use tax directly to the taxing \
+         authority",
+        UNITED_STATES,
+    ),
+    (
+        "Educational Institution",
+        "Accredited school, college or university exempt from sales and use tax",
+        UNITED_STATES,
+    ),
+    (
+        "Federal Government",
+        "US federal government body exempt from sales and use tax",
+        UNITED_STATES,
+    ),
+    (
+        "Reseller",
+        "Purchases for resale, held under a resale certificate",
+        UNITED_STATES,
+    ),
+    (
+        "State or Local Government",
+        "US state, county or municipal government body exempt from sales and use tax",
+        UNITED_STATES,
+    ),
+    (
+        "Tribal Government",
+        "Federally recognized tribal government body exempt from sales and use tax",
+        UNITED_STATES,
+    ),
+];
+
+/// The jurisdiction every entry of [`TAX_EXEMPTION_TYPE_CATALOG`] applies in: the
+/// United States as a whole. See that constant for why it carries no `state`.
+const UNITED_STATES: &[JurisdictionRow] = &[("US", None)];
+
+/// The catalog as the modelled `TaxExemptionType` list `GetTaxExemptionTypes`
+/// reports, in [`TAX_EXEMPTION_TYPE_CATALOG`]'s order.
+///
+/// Every member is reported: the collection exists to tell a caller which types
+/// it may name and where each one applies, and an omitted member would leave that
+/// unanswerable.
+pub fn tax_exemption_type_catalog() -> Vec<TaxExemptionType> {
+    TAX_EXEMPTION_TYPE_CATALOG
+        .iter()
+        .map(|(display_name, description, jurisdictions)| TaxExemptionType {
+            display_name: Some((*display_name).to_string()),
+            description: Some((*description).to_string()),
+            applicable_jurisdictions: Some(
+                jurisdictions
+                    .iter()
+                    .map(|(country, state)| Authority {
+                        country: (*country).to_string(),
+                        state: state.map(std::string::ToString::to_string),
+                    })
+                    .collect(),
+            ),
+        })
+        .collect()
 }
 
 /// The `authorityId` a supplemental-listing page cursor names, or a
