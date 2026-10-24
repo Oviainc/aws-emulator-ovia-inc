@@ -31,6 +31,8 @@ mod state_machine_create_options;
 mod state_machine_lifecycle;
 #[path = "all/state_machine_projection.rs"]
 mod state_machine_projection;
+#[path = "all/state_machine_versions.rs"]
+mod state_machine_versions;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/sync_execution.rs"]

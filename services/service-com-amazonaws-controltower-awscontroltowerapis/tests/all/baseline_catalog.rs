@@ -13,9 +13,12 @@
 //!   against this service's baseline catalog; the partition, region and account segments
 //!   before that id select nothing, because the same catalog is published in all of them.
 //!   The answer is the catalog entry's `name` and `description` plus the ARN THIS endpoint
-//!   serves that baseline under (the request's region, the emulator's canonical account
-//!   id) — so every catalog entry resolves, through any of those ARN forms, to the same
-//!   baseline;
+//!   serves that baseline under — so every catalog entry resolves, through any of those
+//!   ARN forms, to the same baseline;
+//! * that served ARN names the region the request was signed for and NO account: a
+//!   baseline is AWS-managed catalog data no account owns, so its ARN's account segment is
+//!   EMPTY (which is why `BaselineArn`'s pattern admits zero digits there), and the ARN it
+//!   reports round-trips — feeding it back in resolves the same baseline;
 //! * an id the catalog does not hold is `ResourceNotFoundException` (404), including one
 //!   differing from a catalog id in a single character and one a caller passed to
 //!   `EnableBaseline`: nothing a caller does adds a baseline;
@@ -35,13 +38,14 @@ use service_com_amazonaws_controltower_awscontroltowerapis::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::landing_zone_lifecycle::{call, emulator, Answer};
+use crate::landing_zone_lifecycle::{call, call_in_region, emulator, Answer, SIGNED_REGION};
 
-/// The region these tests sign for, and therefore the region of every ARN the service
-/// mints for them (`crate::landing_zone_lifecycle::call` signs for `us-west-2`).
-const REQUEST_REGION: &str = "us-west-2";
+/// The region these tests sign for unless a case names another, and therefore the region
+/// of the ARNs the service mints for them.
+const REQUEST_REGION: &str = SIGNED_REGION;
 
-/// The emulator's canonical account id, which every ARN this service mints carries.
+/// The emulator's canonical account id, which the ARNs of the resources an account OWNS
+/// carry — and which a baseline ARN, owned by no account, must therefore not carry.
 fn emulator_account() -> &'static str {
     engine::emulator_account_id()
 }
@@ -96,14 +100,16 @@ fn arn_forms() -> Vec<ArnForm> {
     ]
 }
 
-/// The ARN this endpoint serves `baseline` under: the request's region and the emulator's
-/// canonical account id.
+/// The ARN this endpoint serves `baseline` under when the request is signed for `region`:
+/// that region, and an EMPTY account segment, because a baseline is service-managed data
+/// no account owns.
+fn served_arn_in(region: &str, baseline: &CatalogBaseline) -> String {
+    format!("arn:aws:controltower:{region}::baseline/{}", baseline.id)
+}
+
+/// [`served_arn_in`] for the region these tests sign for by default.
 fn served_arn(baseline: &CatalogBaseline) -> String {
-    format!(
-        "arn:aws:controltower:{REQUEST_REGION}:{}:baseline/{}",
-        emulator_account(),
-        baseline.id
-    )
+    served_arn_in(REQUEST_REGION, baseline)
 }
 
 /// RULE: every baseline in the catalog resolves through `GetBaseline`, by the resource id
@@ -142,6 +148,104 @@ async fn every_catalog_baseline_resolves_through_any_arn_form() {
                 "case {case:?}: expected the ARN this endpoint serves the baseline \
                  under, got {:?}",
                 answer.body
+            );
+        }
+    }
+}
+
+/// The regions this rule is checked in, spanning what it generalises over (the request's
+/// signed region): the ARN's region segment follows the request, while its account segment
+/// is empty in every one of them.
+const MINTING_REGIONS: &[&str] = &["us-west-2", "us-east-1", "eu-central-1", "ap-south-1"];
+
+/// RULE: the ARN `GetBaseline` reports for a baseline names the region the request was
+/// signed for and NO account — a baseline is AWS-managed catalog data no account owns — and
+/// that ARN round-trips: passing it back to `GetBaseline` resolves the same baseline.
+#[tokio::test]
+async fn the_served_baseline_arn_carries_no_account_and_round_trips() {
+    let router = emulator();
+
+    for region in MINTING_REGIONS {
+        for baseline in BASELINE_CATALOG {
+            let case = format!("{} read from {region}", baseline.name);
+            // Asked for through the form the model documents, so the answer's shape is
+            // the handler's choice rather than an echo of the request.
+            let answer = call_in_region(
+                &router,
+                region,
+                "/get-baseline",
+                serde_json::json!({
+                    "baselineIdentifier":
+                        format!("arn:aws:controltower:{region}::baseline/{}", baseline.id),
+                }),
+            )
+            .await;
+            assert_eq!(
+                answer.status, 200,
+                "case {case:?}: expected 200, got {} body {:?}",
+                answer.status, answer.body
+            );
+
+            let arn = answer.string("arn");
+            assert_eq!(
+                arn,
+                served_arn_in(region, baseline),
+                "case {case:?}: expected the account-less ARN of the signed region, got \
+                 {arn:?}"
+            );
+
+            // `BaselineArn`'s six colon-separated fields: the account field (index 4) is
+            // the one the pattern's `[0-9]{0,12}` lets be empty, and it must be.
+            let fields: Vec<&str> = arn.split(':').collect();
+            assert_eq!(
+                fields.len(),
+                6,
+                "case {case:?}: expected six ARN fields, got {arn:?}"
+            );
+            assert_eq!(
+                (fields[1], fields[2], fields[3], fields[4]),
+                ("aws", "controltower", *region, ""),
+                "case {case:?}: expected partition/service/region and an EMPTY account \
+                 segment, got {arn:?}"
+            );
+            assert!(
+                !arn.contains(emulator_account()),
+                "case {case:?}: a baseline is owned by no account, so its ARN must not \
+                 carry the emulator account id {:?}, got {arn:?}",
+                emulator_account()
+            );
+            assert_eq!(
+                fields[5],
+                format!("baseline/{}", baseline.id),
+                "case {case:?}: expected the catalog id as the resource segment, got \
+                 {arn:?}"
+            );
+
+            // The ARN AWS gave the client is an ARN the client may hand back: a read
+            // through it reports the very same baseline.
+            let round_trip = call_in_region(
+                &router,
+                region,
+                "/get-baseline",
+                serde_json::json!({ "baselineIdentifier": arn.clone() }),
+            )
+            .await;
+            assert_eq!(
+                (
+                    round_trip.status,
+                    round_trip.string("arn"),
+                    round_trip.string("name"),
+                    round_trip.string("description")
+                ),
+                (
+                    200,
+                    arn.clone(),
+                    baseline.name.to_string(),
+                    baseline.description.to_string()
+                ),
+                "case {case:?}: expected the reported ARN to round-trip to the same \
+                 baseline, got {:?}",
+                round_trip.body
             );
         }
     }

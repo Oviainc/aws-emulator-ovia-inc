@@ -153,13 +153,21 @@ const MEMBERS: &[Member] = &[
     },
     Member {
         path: "cmafPackage.segmentDurationSeconds",
-        body: |seconds| json!({ "cmafPackage": { "segmentDurationSeconds": seconds } }),
+        body: |seconds| {
+            json!({
+                "cmafPackage": {
+                    "segmentDurationSeconds": seconds,
+                    "hlsManifests": [{ "id": "child" }]
+                }
+            })
+        },
     },
     Member {
         path: "cmafPackage.encryption.keyRotationIntervalSeconds",
         body: |seconds| {
             json!({
                 "cmafPackage": {
+                    "hlsManifests": [{ "id": "child" }],
                     "encryption": {
                         "keyRotationIntervalSeconds": seconds,
                         "spekeKeyProvider": speke()

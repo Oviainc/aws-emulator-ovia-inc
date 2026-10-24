@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisableEbsEncryptionByDefault
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisableEbsEncryptionByDefault`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisableEbsEncryptionByDefault::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! MUTATING, as the spec says: this operation "disables EBS encryption by default for your
+//! account in the current Region", so it drops the Region through
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::set_ebs_encryption_by_default`] and
+//! answers "the updated status of encryption by default"
+//! (`DisableEbsEncryptionByDefaultResult$EbsEncryptionByDefault`) read back out of the
+//! store. Idempotent: disabling a Region it is already off in changes nothing. It does not
+//! touch any stored volume — "disabling encryption by default does not change the
+//! encryption status of your existing volumes".
 //!
 //! ## Shape of an operation
 //!
@@ -136,18 +136,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisableEbsEncryptionByDefault` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisableEbsEncryptionByDefaultErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisableEbsEncryptionByDefault"))
+        use crate::state;
+
+        // "for your account in the current Region": the Region is the one the request was
+        // signed for, so disabling the setting in one Region leaves every other Region's
+        // setting where it was.
+        let region = state::request_region(ctx.parts());
+
+        let store = state::require_service_state(&*self.engine)?;
+        let mut store = store.lock();
+
+        // DryRun sits BEFORE the write: a request that would have succeeded leaves the
+        // setting untouched. "If you have the required permissions, the error response is
+        // DryRunOperation" (`DisableEbsEncryptionByDefaultRequest$DryRun`).
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // Answer the status read back OUT of the store, so the caller sees what a later
+        // `GetEbsEncryptionByDefault` will see rather than what the request asked for.
+        let enabled = store.set_ebs_encryption_by_default(&region, false);
+        Ok(DisableEbsEncryptionByDefaultOutput {
+            ebs_encryption_by_default: Some(enabled),
+        })
     }
 }

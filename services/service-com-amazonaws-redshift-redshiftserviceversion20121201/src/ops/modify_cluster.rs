@@ -471,6 +471,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // A maintenance track the service does not publish names no track at
+        // all, so it is refused with the modelled `InvalidClusterTrackFault`
+        // rather than stored on the cluster: the track set a cluster can be on
+        // is exactly the one `DescribeClusterTracks` reports.
+        if let Some(track) = input.maintenance_track_name.as_deref() {
+            if let Err(message) = st::check_maintenance_track(track) {
+                return Err(ModifyClusterErrorModeled::InvalidClusterTrackFault(
+                    InvalidClusterTrackFault {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+        }
+
         let stored = &mut store.clusters[position];
         stored.cluster_type = cluster_type;
         stored.cluster.number_of_nodes = Some(number_of_nodes);

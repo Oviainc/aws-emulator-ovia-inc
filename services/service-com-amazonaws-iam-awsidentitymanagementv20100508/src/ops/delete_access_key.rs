@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAccessKey
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAccessKey`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAccessKey::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes one of an IAM user's long-term credentials: the key id is dropped from
+//! this service's access-key store, so nothing resolves a caller through it any
+//! more, and the credential itself is withdrawn from the emulator's credential
+//! store, so a request presenting it is refused.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +165,137 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAccessKey` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAccessKeyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteAccessKeyErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        // A mutation: the operation "deletes the access key pair associated with the
+        // specified IAM user", so the lock is held for write across the ownership
+        // check and the removal.
+        let mut store = state.lock();
+
+        // The access key id the request was signed with: the caller's identity when
+        // the request names no user, and the acting principal the audit record below
+        // is attributed to.
+        let caller_akid = ::engine::extract_akid(&ctx.parts().headers);
+
+        // With no `UserName`, "IAM determines the user name implicitly based on the
+        // Amazon Web Services access key ID signing the request", which is resolved
+        // through the same binding `GetUser` and `CreateAccessKey` resolve a nameless
+        // caller through. A caller whose credentials belong to no IAM user is refused
+        // rather than having an identity invented for it.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAccessKey"))
+        // LIMITATION, stated so the refusal is not mistaken for IAM's behaviour: real
+        // IAM also serves a nameless call made with ACCOUNT ROOT credentials ("you can
+        // use this operation to manage Amazon Web Services account root user
+        // credentials even if the Amazon Web Services account has no associated
+        // users"). This emulator mints no root credentials and holds no root user
+        // entity to attribute a key to — `CreateAccessKey` declines that path for the
+        // same reason — so such a call is refused instead of served.
+        let user_key = match &input.user_name {
+            Some(user_name) => crate::state::name_key(user_name),
+            None => match store.access_keys.get(&caller_akid) {
+                Some(record) => record.user_key.clone(),
+                None => {
+                    // Neither modelled client error fits: the request named no entity
+                    // to be missing and no quota was reached, so the refusal goes
+                    // through the crate's generic client-input channel (HTTP 400, code
+                    // `ValidationException`), exactly as `GetUser` and
+                    // `CreateAccessKey` refuse the same request.
+                    ::tracing::info!(
+                        audit = true,
+                        operation = "DeleteAccessKey",
+                        outcome = "refused_no_caller_identity",
+                        caller_akid = %caller_akid,
+                        "no access key was deleted"
+                    );
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        "Must specify userName when calling with non-User credentials",
+                    ));
+                }
+            },
+        };
+
+        // The key is deleted from a user the account holds. IAM entity names "are not
+        // distinguished by case", so the lookup is on the case-folded key.
+        if !store.users.contains_key(&user_key) {
+            ::tracing::info!(
+                audit = true,
+                operation = "DeleteAccessKey",
+                outcome = "refused_no_such_user",
+                caller_akid = %caller_akid,
+                "no access key was deleted"
+            );
+            return Err(DeleteAccessKeyErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The user with name {} cannot be found.",
+                        input.user_name.as_deref().unwrap_or(&user_key)
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // An access key is reachable only through the user that holds it, so an id the
+        // account never minted and an id that belongs to a DIFFERENT user are the same
+        // answer: that user has no such key. Nothing is removed in either case.
+        let held = store
+            .access_keys
+            .get(&input.access_key_id)
+            .is_some_and(|record| record.user_key == user_key);
+        if !held {
+            ::tracing::info!(
+                audit = true,
+                operation = "DeleteAccessKey",
+                outcome = "refused_no_such_access_key",
+                caller_akid = %caller_akid,
+                access_key_id = %input.access_key_id,
+                "no access key was deleted"
+            );
+            return Err(DeleteAccessKeyErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "The Access Key with id {} cannot be found.",
+                        input.access_key_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        store.access_keys.remove(&input.access_key_id);
+        // The lock is released before the credential store is touched: the two stores
+        // are independent, and nothing else needs the IAM state to answer this call.
+        drop(store);
+
+        // The key is no longer any user's, so the credential it was minted from is
+        // withdrawn too — a deleted access key must stop signing requests, which is
+        // the whole point of deleting one. A credential the store no longer knows is
+        // already withdrawn, so a `NotFound` here is not a failure of this call.
+        if let Err(error) = ctx.credential_store().delete(&input.access_key_id) {
+            ::tracing::warn!(
+                operation = "DeleteAccessKey",
+                reason = ?error,
+                "the deleted access key was not held by the credential store"
+            );
+        }
+
+        // Audit record for a credential-revoking call: the acting principal and the
+        // key id, never any secret material.
+        ::tracing::info!(
+            audit = true,
+            operation = "DeleteAccessKey",
+            outcome = "deleted",
+            caller_akid = %caller_akid,
+            access_key_id = %input.access_key_id,
+            "access key deleted"
+        );
+
+        Ok(DeleteAccessKeyOutput)
     }
 }

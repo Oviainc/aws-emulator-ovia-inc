@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeregisterTaskDefinition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeregisterTaskDefinition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeregisterTaskDefinition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +152,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeregisterTaskDefinition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeregisterTaskDefinitionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeregisterTaskDefinitionErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+        let _ = ctx;
+
+        let Some((family, revision)) =
+            crate::state::parse_task_definition_reference(&input.task_definition)
+        else {
+            return Err(DeregisterTaskDefinitionErrorModeled::ClientException(
+                ClientException {
+                    message: Some(crate::state::task_definition_reference_message(
+                        &input.task_definition,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // "Deregisters the specified task definition by family and revision. ... You
+        // must specify a revision." A reference that names only a family (or `family:*`)
+        // names a whole family, not the ONE revision this call deregisters, so it is
+        // refused for the member constraint it misses rather than resolved to the latest
+        // revision. Like every other refusal of a `taskDefinition` reference this
+        // service cannot turn into one stored revision, it is a `ClientException` — the
+        // error for a request "specifying an identifier that isn't valid" — and the
+        // message names the member and what it has to carry.
+        let Some(revision) = revision else {
+            return Err(DeregisterTaskDefinitionErrorModeled::ClientException(
+                ClientException {
+                    message: Some(format!(
+                        "taskDefinition must name a revision (family:revision or a \
+                         task-definition ARN); got {:?}",
+                        input.task_definition
+                    )),
+                },
+            )
+            .into());
+        };
+
+        let mut guard = state.lock();
+        let Some(record) = guard.task_definitions.get_mut(&(family, revision)) else {
+            return Err(DeregisterTaskDefinitionErrorModeled::ClientException(
+                ClientException {
+                    message: Some(crate::state::TASK_DEFINITION_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // "Upon deregistration, the task definition is marked as INACTIVE" and
+        // `TaskDefinition$deregisteredAt` is "the Unix timestamp for the time when the
+        // task definition was deregistered" — the instant THIS call ran. The revision
+        // itself is kept: "INACTIVE task definitions remain discoverable in your account
+        // indefinitely", so `DescribeTaskDefinition` still describes it, and the family's
+        // revision counter does not move (a later registration gets the next revision,
+        // never this one again).
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeregisterTaskDefinition"))
+        // A revision that is already out of `ACTIVE` is reported as it stands: there is
+        // no second transition to make, so the `deregisteredAt` of the call that made it
+        // INACTIVE stays as it was recorded.
+        if record.status == crate::state::TASK_DEFINITION_ACTIVE {
+            record.status = crate::state::TASK_DEFINITION_INACTIVE.to_string();
+            record.deregistered_at = Some(crate::state::now());
+        }
+
+        Ok(DeregisterTaskDefinitionOutput {
+            // "The full description of the deregistered task", built from the stored
+            // revision — the same projection every other task-definition response uses.
+            task_definition: Some(record.view()),
+        })
     }
 }

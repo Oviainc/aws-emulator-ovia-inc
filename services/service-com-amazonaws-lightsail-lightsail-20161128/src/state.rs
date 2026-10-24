@@ -22,9 +22,9 @@
 //! HTTP traffic across the instances attached to it), the **static IP** (a public
 //! IPv4 address the account reserves and attaches to an instance), the **CDN
 //! distribution** (a global resource that caches and serves the content of an
-//! origin resource), the append-only
-//! **operation log** every mutating call
-//! writes, and the service's static **Region catalog** — the Regions and
+//! origin resource), the peering of a Region's **Lightsail VPC** with the
+//! account's default VPC there, the append-only **operation log** every mutating
+//! call writes, and the service's static **Region catalog** — the Regions and
 //! Availability Zones `GetRegions` lists and every other operation validates a
 //! location against. Everything mutable in this module is reached through
 //! [`with_state`], so no handler can observe a store whose clock-owed transitions
@@ -223,6 +223,11 @@ pub const RESOURCE_TYPE_STATIC_IP: &str = "StaticIp";
 /// `ResourceType` enum — the value the modelled `Alarm$resourceType` member
 /// carries ("The Lightsail resource type of the alarm").
 pub const RESOURCE_TYPE_ALARM: &str = "Alarm";
+
+/// The `resourceType` the peering of a Region's Lightsail VPC with the account's
+/// default VPC reports, from the same modelled `ResourceType` enum — its
+/// `PeeredVpc` member, the only one that names a VPC peering.
+pub const RESOURCE_TYPE_PEERED_VPC: &str = "PeeredVpc";
 
 /// The `resourceType` a load balancer and its operations report, from the same
 /// modelled `ResourceType` enum — the value the modelled
@@ -517,6 +522,16 @@ pub const OPERATION_TYPE_DELETE_DOMAIN: &str = "DeleteDomain";
 /// wire (a client has to tolerate a value it does not know), so the honest entry
 /// names the operation that ran, exactly as every other value here does.
 pub const OPERATION_TYPE_EXPORT_SNAPSHOT: &str = "ExportSnapshot";
+/// The `operationType` the log entry of a `PeerVpc` call carries.
+///
+/// The modelled `OperationType` enum carries no member for either VPC peering
+/// call — it predates them, exactly as it predates the Amazon EC2 export family
+/// (see [`OPERATION_TYPE_EXPORT_SNAPSHOT`], where the same reasoning is spelled
+/// out) — and no member it does carry states what peering a VPC did. A Smithy
+/// enum is open on the wire, so the honest entry names the operation that ran.
+pub const OPERATION_TYPE_PEER_VPC: &str = "PeerVpc";
+/// See [`OPERATION_TYPE_PEER_VPC`].
+pub const OPERATION_TYPE_UNPEER_VPC: &str = "UnpeerVpc";
 
 // ---------------------------------------------------------------------------
 // Store bounds
@@ -7647,6 +7662,115 @@ pub struct RemovedInstance {
 }
 
 // ---------------------------------------------------------------------------
+// VPC peering
+// ---------------------------------------------------------------------------
+
+/// Where one Region's Lightsail VPC peering is in its lifecycle.
+///
+/// Lightsail peers a Region's Lightsail VPC with the account's default VPC in
+/// that Region on request — `PeerVpc` "peers the Lightsail VPC with the user's
+/// default VPC", `UnpeerVpc` "unpeers the Lightsail VPC from the user's default
+/// VPC" — and each of those calls answers an operation-log entry rather than the
+/// finished connection, so the connection is NOT established (nor torn down) at
+/// the instant the call returns: the clock owes it the rest of the walk, like
+/// every other non-terminal Lightsail resource in this store.
+///
+/// `IsVpcPeered` reports one boolean over this walk, and the boolean is about
+/// whether a connection EXISTS: a VPC being peered is not peered yet, and one
+/// being unpeered still is (see [`VpcPeeringPhase::is_peered`]). The phases
+/// themselves are this store's own — the model declares no shape for a Lightsail
+/// VPC peering, only the `PeeredVpc` resource type and that one boolean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VpcPeeringPhase {
+    /// `PeerVpc` has been called and the connection is being established.
+    Peering,
+    /// The connection is established: the Lightsail VPC is peered.
+    Peered,
+    /// `UnpeerVpc` has been called and the connection is being torn down. It is
+    /// still up, so the VPC is still peered.
+    Unpeering,
+    /// The connection is gone. The Lightsail VPC is not peered, and `PeerVpc`
+    /// may peer it again.
+    Unpeered,
+}
+
+impl VpcPeeringPhase {
+    /// Whether a Lightsail VPC in this phase IS peered — the one thing
+    /// `IsVpcPeered` answers.
+    ///
+    /// True from the instant the connection is established until the instant it
+    /// is gone, so a caller that peers and reads straight back still observes
+    /// the transient "not peered yet", exactly as it does against AWS.
+    pub fn is_peered(self) -> bool {
+        matches!(self, Self::Peered | Self::Unpeering)
+    }
+}
+
+/// A phase the clock already owes a Region's Lightsail VPC peering.
+///
+/// Separate from [`DueTransition`] and [`DueNamedState`] because a peering's
+/// phase is neither an EC2 `InstanceState` (a code and a name) nor a modelled
+/// state name, but this store's own [`VpcPeeringPhase`].
+#[derive(Debug, Clone, Copy)]
+pub struct DueVpcPeeringPhase {
+    /// Epoch milliseconds at which the phase became (or becomes) due.
+    pub at_ms: i64,
+    /// The phase the peering settles into.
+    pub phase: VpcPeeringPhase,
+}
+
+impl DueVpcPeeringPhase {
+    /// The walk to `phase`, due [`STATE_TRANSITION_MILLIS`] after `now_ms`.
+    pub fn after(now_ms: i64, phase: VpcPeeringPhase) -> Self {
+        Self {
+            at_ms: now_ms.saturating_add(STATE_TRANSITION_MILLIS),
+            phase,
+        }
+    }
+}
+
+/// The peering of ONE Region's Lightsail VPC with the account's default VPC
+/// there.
+///
+/// Per Region, because Lightsail's API is regional and the Lightsail VPC
+/// `PeerVpc` peers is the one in the Region the request is made in: peering in
+/// one Region leaves every other Region's Lightsail VPC unpeered.
+#[derive(Debug, Clone)]
+pub struct StoredVpcPeering {
+    /// Where the connection is now.
+    pub phase: VpcPeeringPhase,
+    /// What the clock owes it next, while it owes it anything.
+    pub due: Option<DueVpcPeeringPhase>,
+}
+
+impl StoredVpcPeering {
+    /// The peering a `PeerVpc` call at `now_ms` starts: the connection is being
+    /// established, and the clock owes it [`VpcPeeringPhase::Peered`].
+    pub fn peering(now_ms: i64) -> Self {
+        Self {
+            phase: VpcPeeringPhase::Peering,
+            due: Some(DueVpcPeeringPhase::after(now_ms, VpcPeeringPhase::Peered)),
+        }
+    }
+
+    /// Start the teardown an `UnpeerVpc` call at `now_ms` asks for: the
+    /// connection is still up, and the clock owes it
+    /// [`VpcPeeringPhase::Unpeered`].
+    pub fn start_unpeering(&mut self, now_ms: i64) {
+        self.phase = VpcPeeringPhase::Unpeering;
+        self.due = Some(DueVpcPeeringPhase::after(
+            now_ms,
+            VpcPeeringPhase::Unpeered,
+        ));
+    }
+
+    /// Whether this Region's Lightsail VPC is peered.
+    pub fn is_peered(&self) -> bool {
+        self.phase.is_peered()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The store
 // ---------------------------------------------------------------------------
 
@@ -7730,6 +7854,17 @@ pub struct ComAmazonawsLightsailLightsail20161128State {
     /// container service and a bucket. A `BTreeMap` so a listing walks a stable,
     /// total order and a page token can name the next load balancer.
     pub load_balancers: BTreeMap<(String, String), StoredLoadBalancer>,
+    /// The peering of each Region's Lightsail VPC with the account's default VPC
+    /// there, keyed by the Region's name. A Region with no entry is one whose
+    /// Lightsail VPC nothing has ever asked to peer.
+    ///
+    /// Unbounded by any `MAX_` of its own, and it needs none: the key is what
+    /// [`request_region`] answers, which is always a value of the modelled
+    /// `RegionName` enum, so the map holds at most one entry per Region that
+    /// enum declares however many calls a caller makes. A `BTreeMap` so the walk
+    /// in [`ComAmazonawsLightsailLightsail20161128State::advance_clock`] is in a
+    /// stable, total order.
+    pub vpc_peerings: BTreeMap<String, StoredVpcPeering>,
     /// Every CDN distribution, keyed by its name — the identifier every
     /// distribution operation takes.
     ///
@@ -8345,6 +8480,37 @@ impl ComAmazonawsLightsailLightsail20161128State {
         )
     }
 
+    /// The peering of the Lightsail VPC in `region`, for a reporting operation.
+    pub fn vpc_peering(&self, region: &str) -> Option<&StoredVpcPeering> {
+        self.vpc_peerings.get(region)
+    }
+
+    /// The peering of the Lightsail VPC in `region`, for an operation the spec
+    /// says mutates it — the teardown `UnpeerVpc` starts.
+    ///
+    /// `region` is this record's store key, so it must not be reassigned through
+    /// this handle: a peering belongs to the Region whose VPC it peers.
+    pub fn vpc_peering_mut(&mut self, region: &str) -> Option<&mut StoredVpcPeering> {
+        self.vpc_peerings.get_mut(region)
+    }
+
+    /// Store the peering `PeerVpc` just started for the Lightsail VPC in
+    /// `region`, replacing the spent record of a peering that has since been
+    /// torn down.
+    pub fn insert_vpc_peering(&mut self, region: &str, peering: StoredVpcPeering) {
+        self.vpc_peerings.insert(region.to_string(), peering);
+    }
+
+    /// Whether the Lightsail VPC in `region` is peered with the account's
+    /// default VPC — what `IsVpcPeered` answers.
+    ///
+    /// A Region nothing has peered reports `false`, which is also what a Region
+    /// whose peering has been torn down reports.
+    pub fn is_vpc_peered(&self, region: &str) -> bool {
+        self.vpc_peering(region)
+            .is_some_and(StoredVpcPeering::is_peered)
+    }
+
     /// The log entry `id` names, for a reporting operation.
     ///
     /// The log is append-only and bounded, so this is a linear scan of at most
@@ -8469,8 +8635,9 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// relational database, one of its snapshots, or a load balancer
     /// settles into the state it was owed, a container service walks
     /// into the phase it was owed (activating the deployment that was waiting),
-    /// a CDN distribution settles into the status it was owed,
-    /// and an operation whose work is done settles into `Succeeded`.
+    /// a Region's Lightsail VPC peering walks into the phase it was owed
+    /// (established, or gone), a CDN distribution settles into the status it was
+    /// owed, and an operation whose work is done settles into `Succeeded`.
     ///
     /// This is the one write a reporting operation performs. Each transition was
     /// owed at this instant whether or not anybody called, so applying it here
@@ -8483,8 +8650,9 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// [`MAX_RELATIONAL_DATABASES`],
     /// [`MAX_RELATIONAL_DATABASE_SNAPSHOTS`], [`MAX_LOAD_BALANCERS_PER_REGION`],
     /// [`MAX_DISTRIBUTIONS`] and
-    /// [`MAX_OPERATION_HISTORY`], and a record drops out of the work as soon as
-    /// it has nothing outstanding.
+    /// [`MAX_OPERATION_HISTORY`] — and, for the peering walk, by the modelled
+    /// `RegionName` enum [`vpc_peerings`](Self::vpc_peerings) is keyed by — and a
+    /// record drops out of the work as soon as it has nothing outstanding.
     fn advance_clock(&mut self, now_ms: i64) {
         for instance in self.instances.values_mut() {
             let Some(due) = instance.due else { continue };
@@ -8565,6 +8733,13 @@ impl ComAmazonawsLightsailLightsail20161128State {
             if due.at_ms <= now_ms {
                 balancer.state = due.state;
                 balancer.due = None;
+            }
+        }
+        for peering in self.vpc_peerings.values_mut() {
+            let Some(due) = peering.due else { continue };
+            if due.at_ms <= now_ms {
+                peering.phase = due.phase;
+                peering.due = None;
             }
         }
         for distribution in self.distributions.values_mut() {

@@ -17,11 +17,22 @@
 //!    `isHcxPublic`.
 //! 4. The operation is `@idempotent`: associating an allocation the VLAN already
 //!    carries reports the association it has rather than adding a second one.
+//! 5. An allocation some other VLAN of the account, or any other Amazon EC2 resource, is
+//!    already associated with is REFUSED with the modelled `ValidationException`: one
+//!    Elastic IP address carries one association at a time, which is EC2's own
+//!    single-use rule for an Elastic IP address (`Resource.AlreadyAssociated`).
+//!
+//! The association is a change to the caller's Amazon EC2 resource, not only to this
+//! service's records: `allocationId` is "the Elastic IP address allocation ID" of the
+//! account and the `eipassoc-` id reported is an EC2 `AssociationId`, so it is Amazon
+//! EC2 that records the association on the allocation's own `Address` record and EC2's
+//! own id minter that names it ([`crate::state::ec2_resources::associate_elastic_ip`]).
+//! `DescribeAddresses` therefore reports an address a VLAN is using as associated, and
+//! `DisassociateEipFromVlan` gives it back.
 //!
 //! The association's `ipAddress` is the Elastic IP address the account's Amazon EC2
-//! store holds for the allocation ([`crate::state::ec2_resources`]). An allocation that
-//! store does not hold leaves the member absent, because this service has no address of
-//! its own to report for it.
+//! store holds for the allocation. An allocation that store does not hold leaves the
+//! member absent, because this service has no address of its own to report for it.
 //!
 //! ## Shape of an operation
 //!
@@ -196,10 +207,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             return Err(denied);
         }
-        // The Elastic IP address behind the allocation, read from Amazon EC2's own store
-        // before this service's lock is taken, so only one store is ever held at a time.
-        let ip_address =
-            crate::state::ec2_resources::elastic_ip_address(&*self.engine, &input.allocation_id);
         let modified_at_ms = crate::state::now_ms();
 
         let mut state = state.lock();
@@ -266,14 +273,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let already_associated = hcx.eip_associations.iter().any(|association| {
             association.allocation_id.as_deref() == Some(input.allocation_id.as_str())
         });
+        let associations_held = hcx.eip_associations.len();
+
+        // One Elastic IP address carries ONE association at a time: the `allocationId` is
+        // an allocation of the caller's EC2 account, so associating it with this VLAN
+        // CONSUMES it, and an allocation some other VLAN is already using cannot be
+        // associated again — the single-use rule EC2 states as `Resource.AlreadyAssociated`.
+        // Asked of this service's own store first, because a VLAN of another environment
+        // is a holder this service knows about whether or not EC2 is readable.
+        if !already_associated {
+            if let Some((holder, held_by)) = state.eip_allocation_holder(&input.allocation_id) {
+                return Err(AssociateEipToVlanErrorModeled::ValidationException(
+                    crate::state::field_validation_error(
+                        "allocationId",
+                        &format!(
+                            "names an Elastic IP address that is already associated with the \
+                             {} VLAN of environment {holder} through association {held_by}; \
+                             disassociate it first",
+                            crate::state::HCX_FUNCTION
+                        ),
+                    ),
+                )
+                .into());
+            }
+        }
         // The store's own bound on how many associations one VLAN holds: the caller
         // chooses the `allocationId`, so this is the growth that has to be refused
         // rather than admitted. Refused with the operation's modelled
         // ValidationException, naming the member whose value cannot be admitted: the
         // operation models no quota error.
-        if !already_associated
-            && hcx.eip_associations.len() >= crate::state::MAX_EIP_ASSOCIATIONS_PER_VLAN
-        {
+        if !already_associated && associations_held >= crate::state::MAX_EIP_ASSOCIATIONS_PER_VLAN {
             return Err(AssociateEipToVlanErrorModeled::ValidationException(
                 crate::state::field_validation_error(
                     "allocationId",
@@ -287,41 +316,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let association = (!already_associated).then(|| EipAssociation {
-            association_id: Some(state.mint_eip_association_id()),
-            allocation_id: Some(input.allocation_id.clone()),
-            ip_address,
-        });
-        // The environment was found above, so this lookup resolves; answering honestly
-        // beats reporting a VLAN this call did not change as if it had.
-        let environment = state
-            .environment_in_region_mut(&region, &input.environment_id)
-            .ok_or_else(|| {
-                AssociateEipToVlanErrorModeled::InternalServerException(InternalServerException {
+        // The association itself is a change to the EC2 `Address` record of the
+        // allocation — that is what an `eipassoc-` id names — so it is EC2 that records
+        // it and EC2's own id minter that names it. This is the LAST thing before the
+        // VLAN is written, so every refusal above leaves both stores untouched.
+        let association = if already_associated {
+            None
+        } else {
+            use crate::state::ec2_resources::ElasticIpAssociation as Recorded;
+            match crate::state::ec2_resources::associate_elastic_ip(
+                &*self.engine,
+                &input.allocation_id,
+            ) {
+                Recorded::Associated {
+                    association_id,
+                    ip_address,
+                } => Some(EipAssociation {
+                    association_id: Some(association_id),
+                    allocation_id: Some(input.allocation_id.clone()),
+                    ip_address,
+                }),
+                // EC2 holds the allocation and it is in use elsewhere — on another EC2
+                // resource, since no VLAN of this service holds it (checked above).
+                Recorded::AlreadyAssociated {
+                    association_id,
+                    instance_id,
+                } => {
+                    let on = match instance_id {
+                        Some(instance_id) => format!(" with {instance_id}"),
+                        None => String::new(),
+                    };
+                    return Err(AssociateEipToVlanErrorModeled::ValidationException(
+                        crate::state::field_validation_error(
+                            "allocationId",
+                            &format!(
+                                "names an Elastic IP address that is already associated{on} \
+                                 through association {association_id}; disassociate it first"
+                            ),
+                        ),
+                    )
+                    .into());
+                }
+                // The account's EC2 store holds no such allocation, or carries no
+                // readable store at all: there is no `Address` record to associate and no
+                // address to report, so the association is named from this service's own
+                // id source. Whether an allocation that does not exist is refused at all
+                // is a question of its own, and not this one.
+                Recorded::NoSuchAllocation | Recorded::NoEc2Store => Some(EipAssociation {
+                    association_id: Some(state.mint_eip_association_id()),
+                    allocation_id: Some(input.allocation_id.clone()),
+                    ip_address: None,
+                }),
+            }
+        };
+        // The environment and its HCX VLAN were both found above, so these lookups
+        // resolve. If one somehow does not, the association Amazon EC2 has just recorded
+        // is released again before the failure is answered: an `Address` record
+        // associated with a VLAN that does not hold it would consume the allocation for
+        // nothing.
+        let recorded = match state.environment_in_region_mut(&region, &input.environment_id) {
+            Some(environment) => {
+                let wire = environment
+                    .vlans
+                    .iter_mut()
+                    .find(|vlan| vlan.function_name == crate::state::HCX_FUNCTION)
+                    .map(|vlan| {
+                        if let Some(association) = association.clone() {
+                            vlan.eip_associations.push(association);
+                            vlan.modified_at_ms = modified_at_ms;
+                        }
+                        vlan.to_wire()
+                    });
+                if wire.is_some() && !already_associated {
+                    environment.modified_at_ms = modified_at_ms;
+                }
+                wire
+            }
+            None => None,
+        };
+        let Some(vlan) = recorded else {
+            if let Some((allocation_id, association_id)) = association.and_then(|association| {
+                Some((association.allocation_id?, association.association_id?))
+            }) {
+                crate::state::ec2_resources::release_elastic_ips(
+                    &*self.engine,
+                    &[(allocation_id, association_id)],
+                );
+            }
+            return Err(AssociateEipToVlanErrorModeled::InternalServerException(
+                InternalServerException {
                     message: format!(
-                        "The environment {} is no longer available.",
+                        "The HCX VLAN of environment {} is no longer available.",
                         input.environment_id
                     ),
-                })
-            })?;
-        let vlan = environment
-            .vlans
-            .iter_mut()
-            .find(|vlan| vlan.function_name == crate::state::HCX_FUNCTION)
-            .ok_or_else(|| {
-                AssociateEipToVlanErrorModeled::InternalServerException(InternalServerException {
-                    message: "The HCX VLAN of this environment is no longer available."
-                        .to_string(),
-                })
-            })?;
-        if let Some(association) = association {
-            vlan.eip_associations.push(association);
-            vlan.modified_at_ms = modified_at_ms;
-        }
-        let vlan = vlan.to_wire();
-        if !already_associated {
-            environment.modified_at_ms = modified_at_ms;
-        }
+                },
+            )
+            .into());
+        };
         Ok(AssociateEipToVlanOutput { vlan: Some(vlan) })
     }
 }

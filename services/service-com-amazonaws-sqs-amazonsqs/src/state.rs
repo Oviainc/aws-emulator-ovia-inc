@@ -29,7 +29,10 @@
 //! [`ComAmazonawsSqsAmazonsqsState::message_move_tasks`]. The task's progress is a
 //! function of that record and the clock — [`MessageMoveTask::messages_moved`] and
 //! [`MessageMoveTask::status`] — so no handler stores a status it then has to keep up
-//! to date.
+//! to date. `ListMessageMoveTasks` reports those records through
+//! [`ComAmazonawsSqsAmazonsqsState::reported_message_move_tasks`], which projects the
+//! wire entry from the record and the clock exactly as
+//! [`Queue::reported_attributes`] projects a queue's attributes.
 //!
 //! Everything a caller can make this in-memory store hold is bounded — see the
 //! "Store bounds" section — and a bound is REFUSED rather than enforced by eviction,
@@ -41,9 +44,9 @@ use std::time::{Duration, SystemTime};
 use md5::{Digest, Md5};
 
 use crate::ops::types::{
-    InvalidAddress, InvalidAttributeName, InvalidAttributeValue, MessageAttributeValue,
-    QueueDoesNotExist, ReceiptHandleIsInvalid, ResourceNotFoundException, UnsupportedOperation,
-    QUEUE_ATTRIBUTE_NAME_VALUES,
+    InvalidAddress, InvalidAttributeName, InvalidAttributeValue, ListMessageMoveTasksResultEntry,
+    MessageAttributeValue, QueueDoesNotExist, ReceiptHandleIsInvalid, ResourceNotFoundException,
+    UnsupportedOperation, QUEUE_ATTRIBUTE_NAME_VALUES,
 };
 
 /// The region an ARN carries when the request names none (an unsigned call, which
@@ -765,6 +768,66 @@ impl ComAmazonawsSqsAmazonsqsState {
             self.message_move_tasks.remove(0);
         }
     }
+
+    /// The message movement tasks to report for the queue called `source_queue_name`:
+    /// "the most recent message movement tasks (up to 10) under a specific source queue"
+    /// (`ListMessageMoveTasks`), most recent FIRST and at most `max_results` of them.
+    ///
+    /// Every member is PROJECTED from the task record and `now`, the way
+    /// [`Queue::reported_attributes`] projects a queue's reported attributes: the status
+    /// and both `ApproximateNumberOfMessages*` counts are functions of the record and the
+    /// clock, and each ARN is the one the queue record itself reports, so two readers
+    /// cannot disagree about a task and nothing stores a progress value it would have to
+    /// keep up to date. `FailureReason` is left unset because no task this store records
+    /// can fail: it takes its messages when it starts, and a status it never reaches owes
+    /// no reason.
+    pub fn reported_message_move_tasks(
+        &self,
+        source_queue_name: &str,
+        now: SystemTime,
+        region: &str,
+        max_results: usize,
+    ) -> Vec<ListMessageMoveTasksResultEntry> {
+        // `message_move_tasks` is append-ordered, so reversing it is start-time order,
+        // newest first.
+        self.message_move_tasks
+            .iter()
+            .rev()
+            .filter(|task| task.source_queue_name == source_queue_name)
+            .take(max_results)
+            .map(|task| ListMessageMoveTasksResultEntry {
+                task_handle: Some(task.task_handle.clone()),
+                status: Some(task.status(now).to_string()),
+                source_arn: Some(self.reported_queue_arn(&task.source_queue_name, region)),
+                destination_arn: Some(
+                    self.reported_queue_arn(&task.destination_queue_name, region),
+                ),
+                max_number_of_messages_per_second: task.max_number_of_messages_per_second,
+                approximate_number_of_messages_moved: count_as_i64(task.messages_moved(now)),
+                approximate_number_of_messages_to_move: Some(count_as_i64(
+                    task.messages_to_move(now),
+                )),
+                failure_reason: None,
+                started_timestamp: epoch_millis_number(task.started_at),
+            })
+            .collect()
+    }
+
+    /// The ARN to report for the queue called `name`: the one the queue record carries,
+    /// or the ARN that name resolves to in `region` when no queue answers to it any more
+    /// — a task record outlives the queues it names.
+    fn reported_queue_arn(&self, name: &str, region: &str) -> String {
+        self.queues
+            .get(name)
+            .map(|queue| queue.arn.clone())
+            .unwrap_or_else(|| queue_arn(region, name))
+    }
+}
+
+/// A message count as the `long` a response carries it in. Every count here is bounded by
+/// the messages one queue may hold, so the saturation is unreachable.
+fn count_as_i64(count: u64) -> i64 {
+    i64::try_from(count).unwrap_or(i64::MAX)
 }
 
 // ---------------------------------------------------------------------------
@@ -785,10 +848,16 @@ pub const MAX_MESSAGES_PER_SECOND: i32 = 500;
 /// queue straight away still sees the task running and none of its messages yet.
 pub const MESSAGE_MOVE_TASK_START_DELAY: Duration = Duration::from_millis(500);
 
-/// How many message movement task records one source queue keeps: "Gets the most recent
-/// message movement tasks (up to 10) under a specific source queue"
-/// (`ListMessageMoveTasks`).
+/// How many message movement task records one source queue keeps, and the most
+/// `ListMessageMoveTasks` reports for it: "Gets the most recent message movement tasks
+/// (up to 10) under a specific source queue" / "The upper limit is 10"
+/// (`ListMessageMoveTasksRequest$MaxResults`).
 pub const MAX_MESSAGE_MOVE_TASKS_PER_QUEUE: usize = 10;
+
+/// How many message movement tasks `ListMessageMoveTasks` reports when the request names
+/// no `MaxResults`: "The default is 1, which provides the most recent message movement
+/// task" (`ListMessageMoveTasksRequest$MaxResults`).
+pub const DEFAULT_MESSAGE_MOVE_TASK_RESULTS: usize = 1;
 
 /// How many message movement task records the whole store holds. The per-queue bound
 /// alone would still scale with the number of queue NAMES that have ever existed, which
@@ -927,10 +996,20 @@ fn epoch_seconds(at: SystemTime) -> String {
 /// the `SentTimestamp`/`ApproximateFirstReceiveTimestamp` message system attributes
 /// ("epoch time in milliseconds").
 pub fn epoch_millis(at: SystemTime) -> String {
+    epoch_millis_number(at).to_string()
+}
+
+/// The same instant as a NUMBER of milliseconds since the Unix epoch, for the members a
+/// response carries as a `long` rather than as a string (`StartedTimestamp`).
+///
+/// An instant before the epoch, and one too far past it to count in an `i64`, are both
+/// unreachable for a value this store derives from the clock.
+pub fn epoch_millis_number(at: SystemTime) -> i64 {
     at.duration_since(SystemTime::UNIX_EPOCH)
         .map(|since| since.as_millis())
         .unwrap_or_default()
-        .to_string()
+        .try_into()
+        .unwrap_or(i64::MAX)
 }
 
 /// The ARN of the queue named `name` in `region`:

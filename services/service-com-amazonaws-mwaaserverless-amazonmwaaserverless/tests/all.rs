@@ -25,6 +25,8 @@ mod state_roundtrip;
 mod task_instance_reads;
 #[path = "all/validation_errors.rs"]
 mod validation_errors;
+#[path = "all/workflow_deletion_teardown.rs"]
+mod workflow_deletion_teardown;
 #[path = "all/workflow_lifecycle.rs"]
 mod workflow_lifecycle;
 #[path = "all/workflow_update_versions.rs"]

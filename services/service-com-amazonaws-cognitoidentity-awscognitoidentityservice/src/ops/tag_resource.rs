@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ASSIGNS tags to the identity pool the request's `ResourceArn` names, and PERSISTS them
+//! on that pool's own record (`IdentityPool::identity_pool_tags`), so `ListTagsForResource`
+//! and `DescribeIdentityPool` report back exactly what was assigned.
+//!
+//! Assignment is a MERGE, as AWS's resource tagging is: the keys the request carries are
+//! written — overwriting a key the pool already holds, so the last writer of a key wins —
+//! and every other key the pool holds is left exactly as it was. A call that is refused
+//! writes nothing, so a pool's tag set only ever changes through a call that succeeded.
+//!
+//! Three rules refuse a call before it writes: a tag entry outside the bounds the model's
+//! own `IdentityPoolTagsType` states (400 `ValidationException`, the protocol-level
+//! constraint refusal, because the bounds are on the map's KEY and VALUE shapes and so are
+//! not checked by the boundary walk over the member); a key in the `aws:` namespace AWS
+//! reserves for its own tags; and a call that would leave the pool with more tags than an
+//! identity pool can have. The last two are bad input parameters, which is the modelled
+//! 400 `InvalidParameterException` — the only client-input error this operation models for
+//! a tag this service will not store.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +163,146 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // A write to one named resource: `ctx` carries only request metadata, and the pool
+        // this call tags is named by the request's own `ResourceArn`.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the identity-pool store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `ARNString` constrains only the length (20..2048), so the ARN's own form is this
+        // service's rule — the same rule `ListTagsForResource` reads a `ResourceArn` by: a
+        // `ResourceArn` that is not an identity-pool ARN of this service names no resource
+        // at all, which is a bad input parameter rather than a missing resource.
+        let Some(identity_pool_id) = crate::state::identity_pool_id_from_arn(&input.resource_arn)
+        else {
+            return Err(invalid_parameter(format!(
+                "ResourceArn '{}' is not the ARN of an Amazon Cognito identity pool.",
+                input.resource_arn
+            )));
+        };
+
+        // The tags themselves are checked before the pool is looked up, and everything is
+        // checked before anything is written: a refused call leaves the pool's tag set
+        // exactly as it was.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        // Iterated in key order so which entry a multi-entry map is refused for does not
+        // depend on the iteration order of the request's map.
+        let mut requested: Vec<(&String, &String)> = input.tags.iter().collect();
+        requested.sort_by_key(|(tag_key, _)| *tag_key);
+
+        // The MODELLED bounds on the map's own key and value shapes. The protocol's
+        // boundary walk checks the map's VALUES against `TagValueType` before this handler
+        // runs, but not its KEYS, so a key outside `TagKeysType`'s bound reaches here: a
+        // constraint the model states is a protocol-level refusal — HTTP 400
+        // `ValidationException` with a message built from the request — which is what
+        // `Scaffolded::validation` answers. Both are checked here so the rule holds for
+        // every entry of the map whichever path refuses it.
+        let violations = constraint_violations(&requested);
+        if !violations.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "{} validation error{} detected: {}",
+                violations.len(),
+                if violations.len() == 1 { "" } else { "s" },
+                violations.join("; ")
+            )));
+        }
+
+        for (tag_key, _) in &requested {
+            if crate::state::is_reserved_tag_key(tag_key) {
+                return Err(invalid_parameter(format!(
+                    "Tags key '{tag_key}' is not valid: the '{}' prefix is reserved for Amazon \
+                     Web Services use.",
+                    crate::state::RESERVED_TAG_KEY_PREFIX
+                )));
+            }
+        }
+
+        let mut store = state.lock();
+        let Some(record) = store.identity_pools.get_mut(identity_pool_id) else {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("IdentityPool '{identity_pool_id}' not found.")),
+                },
+            )
+            .into());
+        };
+
+        // The tag set the pool would end up with: what it holds, plus the keys this call
+        // carries, with the call's value winning for a key that is already there. The
+        // ceiling is on the RESULT, so re-assigning keys a pool already holds never takes
+        // it past the limit however many tags the call carries.
+        let mut assigned = record.identity_pool_tags.clone().unwrap_or_default();
+        for (tag_key, tag_value) in requested {
+            assigned.insert(tag_key.clone(), tag_value.clone());
+        }
+        if assigned.len() > crate::state::MAX_TAGS_PER_IDENTITY_POOL {
+            return Err(invalid_parameter(format!(
+                "Assigning these tags would leave identity pool '{identity_pool_id}' with {} \
+                 tags: an identity pool can have as many as {} tags.",
+                assigned.len(),
+                crate::state::MAX_TAGS_PER_IDENTITY_POOL
+            )));
+        }
+
+        // A call carrying no tags assigns nothing, so it leaves the record untouched —
+        // including the distinction between a pool created with an empty tag map and one
+        // that was never given the member at all, which `DescribeIdentityPool` reports.
+        if !input.tags.is_empty() {
+            record.identity_pool_tags = Some(assigned);
+        }
+        Ok(TagResourceOutput {})
     }
+}
+
+/// The modelled length bounds of `IdentityPoolTagsType`'s key shape, `TagKeysType`
+/// (`smithy_query(query="shape",shape="IdentityPoolTagsType")`: key `len 1..128`).
+const TAG_KEY_LENGTH: ::std::ops::RangeInclusive<usize> = 1..=128;
+
+/// The modelled length bounds of its value shape, `TagValueType` (`len 0..256`), from the
+/// same query.
+const TAG_VALUE_LENGTH: ::std::ops::RangeInclusive<usize> = 0..=256;
+
+/// Every modelled-constraint violation in the request's `Tags`, in key order, each phrased
+/// the way a constraint refusal names the member and the constraint it failed.
+///
+/// The map's KEY and VALUE shapes carry the bounds, so a violation is in one entry of the
+/// map rather than in the member as a whole, and the entry is named in the member path.
+/// Length is counted in characters, as the `length` trait measures a string.
+fn constraint_violations(requested: &[(&String, &String)]) -> Vec<String> {
+    let mut violations = Vec::new();
+    for (tag_key, tag_value) in requested {
+        let key_length = tag_key.chars().count();
+        if !TAG_KEY_LENGTH.contains(&key_length) {
+            violations.push(format!(
+                "Value '{tag_key}' at 'tags' failed to satisfy constraint: Map keys must have \
+                 length greater than or equal to {} and less than or equal to {}",
+                TAG_KEY_LENGTH.start(),
+                TAG_KEY_LENGTH.end()
+            ));
+        }
+        let value_length = tag_value.chars().count();
+        if !TAG_VALUE_LENGTH.contains(&value_length) {
+            violations.push(format!(
+                "Value '{tag_value}' at 'tags.{tag_key}' failed to satisfy constraint: Member \
+                 must have length less than or equal to {}",
+                TAG_VALUE_LENGTH.end()
+            ));
+        }
+    }
+    violations
+}
+
+/// The modelled refusal for a bad input parameter (HTTP 400), carrying what was wrong with
+/// the request.
+fn invalid_parameter(message: String) -> TagResourceError {
+    TagResourceErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+    })
+    .into()
 }

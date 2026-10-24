@@ -17,7 +17,9 @@
 //! the request names, else the workflow's latest — so a workflow or a version the
 //! store does not hold is the modelled `ResourceNotFoundException` naming that
 //! version, answered with the status the recorded service answers it with (see
-//! `crate::state::unresolved`).
+//! `crate::state::unresolved`). A workflow whose `DeleteWorkflow` teardown has started
+//! (`WorkflowStatus` `DELETING`) admits no new run and is refused with the modelled
+//! `ConflictException`.
 //!
 //! ## Shape of an operation
 //!
@@ -221,6 +223,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let fingerprint = request_fingerprint(&input);
         let mut store = state.lock();
 
+        // Finish every workflow teardown the clock already made due, so a workflow
+        // past its `DELETING` span holds no runnable version here either.
+        store.reap_deleted_workflows(now);
+
         // The version this run would execute: the one the request names, else the
         // workflow's latest. It is the entity THIS operation has to resolve, so a
         // workflow the store does not hold and a version it does not hold are the
@@ -276,7 +282,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // Run the requested version, defaulting to the workflow's latest.
+        // Run the requested version, defaulting to the workflow's latest. A workflow
+        // whose teardown has started is not one a run can be admitted to — the
+        // cleanup "stop[s] any running executions" — so starting a NEW run on it is
+        // the modelled `ConflictException`: "the resource is in a state that prevents
+        // the requested operation" (`smithy_query(query="shape",
+        // shape="ConflictException")`). Checked after the replay above, so a repeated
+        // `ClientToken` still answers with the run it already started.
+        if store
+            .workflows
+            .get(&input.workflow_arn)
+            .is_some_and(crate::state::Workflow::is_deleting)
+        {
+            return Err(tearing_down(&input.workflow_arn));
+        }
+
         let version = store
             .workflows
             .get(&input.workflow_arn)
@@ -390,6 +410,20 @@ fn validate_input(input: &StartWorkflowRunInput) -> Result<(), ValidationExcepti
         return Ok(());
     }
     Err(crate::state::constraint_validation_exception(&violations))
+}
+
+/// The modelled refusal for a run asked of a workflow whose teardown has already
+/// started: the cleanup stops executions rather than admitting new ones.
+fn tearing_down(workflow_arn: &str) -> StartWorkflowRunError {
+    StartWorkflowRunErrorModeled::ConflictException(ConflictException {
+        message: format!(
+            "Workflow {workflow_arn} is {} and cannot start a run",
+            crate::state::WORKFLOW_STATUS_DELETING
+        ),
+        resource_id: workflow_arn.to_string(),
+        resource_type: "workflow".to_string(),
+    })
+    .into()
 }
 
 /// The modelled server error for a store this handler could not reach.

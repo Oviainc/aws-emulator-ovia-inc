@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteMembers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteMembers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteMembers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: each account the request names is looked up in the stored graph's member
+//! records and REMOVED from it, so `ListMembers` and `GetMembers` stop reporting it; an
+//! account the graph holds no membership for is reported in `UnprocessedAccounts` with
+//! the reason instead, so one call can both remove and refuse.
+//!
+//! The caller's own permissions are not evaluated here: this emulator runs no IAM policy
+//! evaluation and serves exactly one account, which is every graph's administrator
+//! (`crate::state::administrator_account_id`), so the modelled `AccessDeniedException`
+//! ("This operation can only be called by the administrator account for the behavior
+//! graph") is unreachable.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +166,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteMembers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteMembersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteMembers"))
+        let _ = ctx;
+        // `GraphArn`'s pattern, `AccountIds`' 1..50 length and each entry's 12-digit
+        // `AccountId` pattern are modelled constraints, so the centralized walk has
+        // already refused anything outside them with a 400 before this body runs: the
+        // reasons an account lands in `UnprocessedAccounts` below are the ones the model
+        // cannot express.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteMembersErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the behavior graph store is unavailable".to_string()),
+            })
+        })?;
+
+        let mut store = state.lock();
+        let graph = store.graph_mut(&input.graph_arn).ok_or_else(|| {
+            DeleteMembersErrorModeled::ResourceNotFoundException(crate::state::graph_not_found())
+        })?;
+
+        let administrator_id = graph.administrator_id.clone();
+        let mut removed = Vec::with_capacity(input.account_ids.len());
+        let mut unprocessed_accounts = Vec::new();
+        let mut seen = ::std::collections::BTreeSet::new();
+
+        for account_id in &input.account_ids {
+            // An account named twice is one account: it is removed once, and reported
+            // once, in the position it was first named.
+            if !seen.insert(account_id.clone()) {
+                continue;
+            }
+            // "An administrator account cannot use DeleteMembers to remove their own
+            // account from the behavior graph. To disable a behavior graph, the
+            // administrator account uses the DeleteGraph API method." The administrator
+            // is not a membership either, so without this the account would be reported
+            // with the generic reason; naming the rule is what tells the caller to use
+            // `DeleteGraph`. It is a per-account outcome of a batch, so it is reported in
+            // `UnprocessedAccounts` rather than failing the whole call.
+            if *account_id == administrator_id {
+                unprocessed_accounts.push(crate::state::unprocessed(
+                    account_id,
+                    crate::state::ADMINISTRATOR_NOT_REMOVABLE_REASON.to_string(),
+                ));
+                continue;
+            }
+            // "For invited accounts, the removed accounts are deleted from the list of
+            // accounts in the behavior graph": the membership record is DROPPED, whatever
+            // status it had reached, so the graph no longer ingests for the account and
+            // only another invitation can restore it. Nothing else of the graph changes.
+            match graph.members.remove(account_id) {
+                Some(_) => removed.push(account_id.clone()),
+                // There is no membership to remove, so the account cannot be processed —
+                // reported with the reason rather than counted as removed.
+                None => unprocessed_accounts.push(crate::state::unprocessed(
+                    account_id,
+                    crate::state::NOT_A_MEMBER_REASON.to_string(),
+                )),
+            }
+        }
+
+        Ok(DeleteMembersOutput {
+            // The modelled `AccountIds` output list carries 1..50 entries, so a call that
+            // removed nothing at all reports no list rather than an empty one outside
+            // that bound. `UnprocessedAccounts` has no such bound, so it is always
+            // present — empty when every named account was removed.
+            account_ids: (!removed.is_empty()).then_some(removed),
+            unprocessed_accounts: Some(unprocessed_accounts),
+        })
     }
 }

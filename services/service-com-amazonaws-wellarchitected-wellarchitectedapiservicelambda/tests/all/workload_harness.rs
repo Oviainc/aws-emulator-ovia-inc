@@ -262,6 +262,17 @@ impl Client {
             .await
     }
 
+    /// `ListReviewTemplates`: `GET /reviewTemplates`, with both paging members bound to
+    /// the query string. `query` is passed as sent, empty for a request that names none.
+    pub(crate) async fn list_review_templates(&self, query: &str) -> Answer {
+        let uri = if query.is_empty() {
+            "/reviewTemplates".to_string()
+        } else {
+            format!("/reviewTemplates?{query}")
+        };
+        self.send("GET", &uri, None).await
+    }
+
     /// `DeleteReviewTemplate`: `DELETE /reviewTemplates/{TemplateArn}` with the
     /// `@idempotencyToken` bound to `@httpQuery("ClientRequestToken")`. The ARN is a
     /// non-greedy `@httpLabel`, so it travels percent-encoded in one path segment,

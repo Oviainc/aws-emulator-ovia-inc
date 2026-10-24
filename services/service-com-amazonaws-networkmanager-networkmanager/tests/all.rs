@@ -31,6 +31,8 @@ mod link_lifecycle;
 mod list_tags_for_resource;
 #[path = "all/network_resource_counts.rs"]
 mod network_resource_counts;
+#[path = "all/network_telemetry.rs"]
+mod network_telemetry;
 #[path = "all/organization_service_access.rs"]
 mod organization_service_access;
 #[path = "all/resource_not_found_message.rs"]

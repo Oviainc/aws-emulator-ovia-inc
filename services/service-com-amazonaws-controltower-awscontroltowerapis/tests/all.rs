@@ -15,6 +15,8 @@
 mod baseline_catalog;
 #[path = "all/baseline_operations.rs"]
 mod baseline_operations;
+#[path = "all/disable_baseline.rs"]
+mod disable_baseline;
 #[path = "all/enabled_baseline_update.rs"]
 mod enabled_baseline_update;
 #[path = "all/enabled_control_lifecycle.rs"]

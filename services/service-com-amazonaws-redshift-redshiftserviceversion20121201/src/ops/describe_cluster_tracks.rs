@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeClusterTracks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeClusterTracks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeClusterTracks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the maintenance-track catalog this service publishes — each track, the
+//! cluster release it applies and the tracks it can be switched to — selected by
+//! `MaintenanceTrackName` and paginated through the opaque `Marker` cursor. A PURE
+//! read: the catalog is seeded into the store when the store is created, so this
+//! operation answers before any cluster exists and writes nothing.
+//!
 //!
 //! ## Shape of an operation
 //!
@@ -87,12 +85,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `DescribeClusterTracksError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#DescribeClusterTracks")]
+// here — hence the `DescribeClusterTracksError` alias below.
+// `DependentServiceUnavailableFault` is widened in on top of the two the model
+// declares, for the same reason as on the other catalog reads: the service
+// declares the shape, and it is the only modelled way to say "the control-plane
+// store could not be reached".
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#DescribeClusterTracks",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum DescribeClusterTracksErrorModeled {
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
     InvalidClusterTrackFault(InvalidClusterTrackFault),
     UnauthorizedOperation(UnauthorizedOperation),
 }
@@ -146,20 +150,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeClusterTracks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeClusterTracksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeClusterTracks"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                DescribeClusterTracksErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A pure read of the seeded catalog: a maintenance track carries no
+        // status the clock moves, so this settles nothing and writes nothing.
+        let store = state.lock();
+
+        // The model declares `InvalidClusterTrackFault` — "The provided cluster
+        // track name is not valid" — FOR this operation, so a name the catalog
+        // does not publish is refused rather than served as an empty page. The
+        // name is resolved against the store's own catalog, by the one rule every
+        // operation naming a maintenance track shares.
+        let matched: Vec<&MaintenanceTrack> = match input.maintenance_track_name.as_deref() {
+            None => store.maintenance_tracks.iter().collect(),
+            Some(requested) => match store.maintenance_track(requested) {
+                Some(track) => vec![track],
+                None => {
+                    return Err(DescribeClusterTracksErrorModeled::InvalidClusterTrackFault(
+                        InvalidClusterTrackFault {
+                            message: st::check_maintenance_track(requested).err(),
+                        },
+                    )
+                    .into());
+                }
+            },
+        };
+
+        // The same `Marker`/`MaxRecords` window every paginated Redshift
+        // `Describe*` shares, so a cursor cannot mean one thing here and another
+        // there.
+        let (start, end, next_marker) =
+            match st::page_bounds(input.marker.as_deref(), input.max_records, matched.len()) {
+                Ok(page) => page,
+                Err(message) => return Err(crate::scaffolded::Scaffolded::validation(message)),
+            };
+
+        Ok(DescribeClusterTracksOutput {
+            maintenance_tracks: Some(
+                matched[start..end]
+                    .iter()
+                    .map(|track| (*track).clone())
+                    .collect(),
+            ),
+            marker: next_marker,
+        })
     }
 }
+

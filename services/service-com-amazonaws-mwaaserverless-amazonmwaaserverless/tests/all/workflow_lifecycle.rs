@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use service_com_amazonaws_mwaaserverless_amazonmwaaserverless::state::{
-    RUN_ADMITTED_AFTER, RUN_SETTLE_AFTER,
+    RUN_ADMITTED_AFTER, RUN_SETTLE_AFTER, WORKFLOW_DELETED_AFTER,
 };
 use service_com_amazonaws_mwaaserverless_amazonmwaaserverless::{
     ComAmazonawsMwaaserverlessAmazonmwaaserverlessState, EmulatedService,
@@ -1027,6 +1027,13 @@ async fn delete_removes_the_workflow_its_versions_and_its_runs() {
             deleted["WorkflowVersion"]
         );
 
+        // The delete starts the teardown the docs describe rather than dropping the
+        // record inside the request, so the workflow reports the modelled `DELETING`
+        // first and disappears when the removal the clock owes falls due. The
+        // `DELETING` phase itself, and everything it refuses, is the subject of
+        // `workflow_deletion_teardown`.
+        tokio::time::sleep(WORKFLOW_DELETED_AFTER + Duration::from_millis(200)).await;
+
         // The workflow, its versions and its runs are all gone.
         let (status, _) = harness
             .call("GetWorkflow", serde_json::json!({"WorkflowArn": arn}))
@@ -1198,7 +1205,9 @@ async fn deleting_one_named_version_keeps_the_workflow_until_no_version_is_left(
             "case {case:?}: the deleted version must be gone, got {status}"
         );
 
-        // Deleting the last version is deleting all of them, so the record goes.
+        // Deleting the last version is deleting all of them, so the WORKFLOW goes —
+        // through the teardown the delete starts, which reports `DELETING` until the
+        // removal the clock owes falls due.
         let (status, answered) = harness
             .call(
                 "DeleteWorkflow",
@@ -1210,6 +1219,7 @@ async fn deleting_one_named_version_keeps_the_workflow_until_no_version_is_left(
             "case {case:?}: expected the last version's delete to succeed, got {status} \
              {answered:?}"
         );
+        tokio::time::sleep(WORKFLOW_DELETED_AFTER + Duration::from_millis(200)).await;
         let (status, _) = harness
             .call("GetWorkflow", serde_json::json!({"WorkflowArn": arn}))
             .await;

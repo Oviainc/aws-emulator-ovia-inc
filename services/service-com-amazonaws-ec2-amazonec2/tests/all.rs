@@ -76,6 +76,10 @@ mod describe_vpcs;
 mod dhcp_options;
 #[path = "all/dry_run_and_unknown_ids.rs"]
 mod dry_run_and_unknown_ids;
+// The account-level EBS encryption-by-default setting and the CreateVolume default it
+// decides.
+#[path = "all/ebs_encryption_by_default.rs"]
+mod ebs_encryption_by_default;
 // The shared ec2Query plumbing every suite drives the service through.
 #[path = "all/ec2_query.rs"]
 mod ec2_query;

@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteWorkflow
-//! IMPLEMENTED: removes versions of a persisted workflow from this service's store
-//! (`crate::state`), and echoes the identity of what it removed. `WorkflowVersion` is
-//! documented as optional, and "if not specified, all versions of the workflow are
-//! deleted" — so a named version removes that one version (promoting the newest one
-//! left when it was the latest) and the workflow record itself goes only when no
-//! version of it remains, taking its runs with it. An ARN (or a version) the store does
-//! not hold is the modelled `ResourceNotFoundException`, answered with the status the
-//! recorded service answers it with and naming the entity that did not resolve (see
-//! `crate::state::unresolved`).
+//! IMPLEMENTED: starts the teardown of a persisted workflow in this service's store
+//! (`crate::state`), and echoes the identity of what it is removing. `WorkflowVersion`
+//! is documented as optional, and "if not specified, all versions of the workflow are
+//! deleted" — so a named version that is one of several removes that one version
+//! (promoting the newest one left when it was the latest) and leaves the workflow
+//! `READY`, while deleting every version (no version named, or the only one left)
+//! deletes the WORKFLOW. That is the asynchronous cleanup the docs describe
+//! ("stopping any running executions, removing scheduled triggers, and cleaning up
+//! execution history"), so the record is not dropped inside the request: it reports
+//! the modelled `WorkflowStatus` `DELETING` and the clock owes its removal
+//! `crate::state::WORKFLOW_DELETED_AFTER` later, which every handler materialises
+//! through `crate::state::…::reap_deleted_workflows`. An ARN (or a version) the store
+//! does not hold is the modelled `ResourceNotFoundException`, answered with the status
+//! the recorded service answers it with and naming the entity that did not resolve
+//! (see `crate::state::unresolved`).
 //!
 //! ## Shape of an operation
 //!
@@ -193,7 +199,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 retry_after_seconds: None,
             })
         })?;
+        let now = SystemTime::now();
         let mut store = state.lock();
+
+        // Finish every teardown the clock already made due, so a workflow whose
+        // `DELETING` span has elapsed is as absent to this call as to any other.
+        store.reap_deleted_workflows(now);
 
         // A reference that resolves to nothing is a lookup miss, and the entity THIS
         // operation resolves is the workflow itself.
@@ -225,24 +236,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?
             .version
             .clone();
-        let name = workflow.name.clone();
         let arn = workflow.arn.clone();
+        // A workflow whose teardown is already running is on its way out with every
+        // version it holds, so repeating the delete starts nothing further: it
+        // answers the identity of what is being removed and leaves the pending
+        // removal — and its deadline — exactly where it was.
+        let already_deleting = workflow.is_deleting();
 
-        let remove_the_workflow = match requested {
-            // No version named: every version goes, so the whole record goes.
-            None => true,
-            Some(version) => {
-                let workflow = store.workflows.get_mut(&arn).ok_or_else(|| {
-                    DeleteWorkflowErrorModeled::InternalServerException(InternalServerException {
-                        message: "the workflow being deleted could not be read back".to_string(),
-                        retry_after_seconds: None,
-                    })
-                })?;
-                workflow.versions.retain(|rec| rec.version != version);
-                // The last version of a workflow is also all of them.
-                if workflow.versions.is_empty() {
-                    true
-                } else {
+        if !already_deleting {
+            let workflow = store.workflows.get_mut(&arn).ok_or_else(|| {
+                DeleteWorkflowErrorModeled::InternalServerException(InternalServerException {
+                    message: "the workflow being deleted could not be read back".to_string(),
+                    retry_after_seconds: None,
+                })
+            })?;
+            // Deleting every version of a workflow deletes the workflow, and the
+            // docs describe that as a cleanup over its associated resources —
+            // "stopping any running executions, removing scheduled triggers, and
+            // cleaning up execution history". So the record is NOT dropped inside
+            // this request: it moves to `DELETING` and the clock owes its removal
+            // (`crate::state::WORKFLOW_DELETED_AFTER` later), which is what makes
+            // the modelled `DELETING` status observable to a describe or a list.
+            let last_version_left = workflow.versions.len() <= 1;
+            match requested {
+                // No version named: every version goes, so the whole record goes.
+                None => workflow.begin_deletion(now),
+                // The only version left is also all of them.
+                Some(_) if last_version_left => workflow.begin_deletion(now),
+                Some(version) => {
+                    // One version of several is a change to the workflow, not its
+                    // teardown: that version goes now and the workflow stays.
+                    workflow.versions.retain(|rec| rec.version != version);
                     // Deleting the latest version promotes the newest one left, which
                     // is what the workflow then reports as its current configuration.
                     if !workflow.versions.iter().any(|rec| rec.is_latest) {
@@ -262,18 +286,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                 crate::state::mint_revision_id(&arn, &latest.version);
                         }
                     }
-                    workflow.modified_at = SystemTime::now();
-                    false
+                    workflow.modified_at = now;
                 }
             }
-        };
-
-        if remove_the_workflow {
-            // Remove the record itself, the name it held, and every token that replayed
-            // onto it; its versions and runs live inside the record and go with it.
-            store.workflows.remove(&arn);
-            store.workflow_names.remove(&name);
-            store.forget_tokens_for(&arn);
         }
 
         Ok(DeleteWorkflowOutput {

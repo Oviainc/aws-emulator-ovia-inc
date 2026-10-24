@@ -381,9 +381,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "If KmsKeyId is specified, the encrypted state must be true"
-        // (`CreateVolumeRequest$KmsKeyId`).
-        let encrypted = input.encrypted.unwrap_or(false);
-        if input.kms_key_id.is_some() && !encrypted {
+        // (`CreateVolumeRequest$KmsKeyId`): the REQUEST has to pair a key with
+        // `Encrypted=true`, so a key named without it is refused whatever the account's
+        // encryption-by-default setting is — that setting raises the encryption state of
+        // the volume this call stores (below), it does not supply the parameter dependency
+        // this one asks for.
+        if input.kms_key_id.is_some() && input.encrypted != Some(true) {
             return Err(Scaffolded::invalid_parameter_value(
                 "kmsKeyId may be specified only when encrypted is true",
             ));
@@ -454,6 +457,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = require_service_state(&*self.engine)?;
         let mut store = state.lock();
         let now = ::std::time::Instant::now();
+
+        // The encryption state the volume is created in: what the request asks for, OR the
+        // account's EBS encryption-by-default setting for this Region. "After you enable
+        // encryption by default, the EBS volumes that you create are always encrypted"
+        // (`EnableEbsEncryptionByDefault`), and the Amazon EBS User Guide's "Encryption by
+        // default" adds that once it is enabled for a Region you cannot disable it for
+        // individual volumes — so the setting raises the state a request leaves unset or
+        // sets to false, and never lowers it. Read under the SAME guard the write below
+        // takes, so no enable or disable can land between the read and the write.
+        let encrypted =
+            input.encrypted.unwrap_or(false) || store.ebs_encryption_by_default(&region);
 
         // Idempotency: "Unique, case-sensitive identifier that you provide to ensure the
         // idempotency of the request" (`CreateVolumeRequest$ClientToken`) — one token

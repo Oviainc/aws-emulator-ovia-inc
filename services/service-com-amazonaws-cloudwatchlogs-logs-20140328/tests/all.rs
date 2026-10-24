@@ -45,6 +45,8 @@ mod log_anomaly_detectors;
 mod log_core_loop;
 #[path = "all/log_group_auth_and_encryption.rs"]
 mod log_group_auth_and_encryption;
+#[path = "all/log_group_fields.rs"]
+mod log_group_fields;
 #[path = "all/log_group_name_pattern_lists.rs"]
 mod log_group_name_pattern_lists;
 #[path = "all/log_stream_removal.rs"]

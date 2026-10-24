@@ -115,12 +115,51 @@ pub const ACTIVATION_KEY_NOT_FOUND: &str = "ActivationKeyNotFound";
 /// See [`ACTIVATION_KEY_NOT_FOUND`].
 pub const ACTIVATION_KEY_NOT_FOUND_MESSAGE: &str = "The specified activation key was not found.";
 
-/// `ResourceNotFoundException$ErrorCode` for a well-formed hypervisor ARN that names no
-/// hypervisor, and the sentence that states it. See [`MissingResource`].
+/// `ErrorCode` for a well-formed hypervisor ARN that names no hypervisor, and the
+/// sentence that states it. See [`MissingResource`].
+///
+/// It is `ResourceNotFoundException$ErrorCode` for an operation that models that shape,
+/// and `ValidationException$ErrorCode` — "a description of what caused the validation
+/// error" — for one that does not: `AssociateGatewayToServer` models only
+/// `ConflictException` beside this service's common errors
+/// (`smithy_query(query="operation",operation="AssociateGatewayToServer")`), so the
+/// condition is named by the same code whichever modelled shape carries it.
 pub const HYPERVISOR_NOT_FOUND: &str = "HypervisorNotFound";
 
 /// See [`HYPERVISOR_NOT_FOUND`].
 pub const HYPERVISOR_NOT_FOUND_MESSAGE: &str = "The hypervisor is not found.";
+
+/// `ValidationException$ErrorCode` for a well-formed gateway ARN that names no gateway,
+/// on an operation whose model declares no `ResourceNotFoundException` to answer with,
+/// and the sentence that states it.
+///
+/// Phrased like [`HYPERVISOR_NOT_FOUND`], so the two resources this service resolves are
+/// named the same way; AWS publishes no vocabulary for the member, so the requirement is
+/// the error shape, its status and a code that names the missing resource.
+pub const GATEWAY_NOT_FOUND: &str = "GatewayNotFound";
+
+/// See [`GATEWAY_NOT_FOUND`].
+pub const GATEWAY_NOT_FOUND_MESSAGE: &str = "The gateway is not found.";
+
+/// `ConflictException$ErrorCode` for associating a gateway that is already associated
+/// with a DIFFERENT server, and the sentence that states it.
+///
+/// A gateway backs up the virtual machines of ONE hypervisor — `GatewayDetails` carries a
+/// single `HypervisorId` (`smithy_query(query="shape",shape="GatewayDetails")`) — so
+/// moving an associated gateway to another server is the modelled "the operation cannot
+/// proceed because it is not supported", whose `ErrorCode` member is REQUIRED and
+/// documented as "a description of why the operation is not supported". The gateway has
+/// to be disassociated first (`DisassociateGatewayFromServer`).
+pub const GATEWAY_ALREADY_ASSOCIATED: &str = "GatewayAlreadyAssociated";
+
+/// See [`GATEWAY_ALREADY_ASSOCIATED`]: the sentence the refusal states, naming the server
+/// the gateway is associated with — read off the stored link, so the caller learns which
+/// server it has to disassociate the gateway from. AWS publishes no wording for the
+/// member, so this sentence is an example; the requirement is the shape, its status and
+/// the `ErrorCode`.
+pub fn gateway_already_associated_message(server_arn: &str) -> String {
+    format!("The gateway is already associated with the server '{server_arn}'.")
+}
 
 /// `ResourceNotFoundException$ErrorCode` for a hypervisor that really exists but carries
 /// no property mappings, so there is no mappings resource to report. See
@@ -334,10 +373,12 @@ pub struct StoredGateway {
     /// The activation key the gateway was created with. Not part of any response
     /// shape — kept because it identifies the appliance this record stands for.
     pub activation_key: String,
-    /// The hypervisor this gateway is associated with, once `AssociateGatewayToServer`
-    /// is implemented. `None` means "not associated".
+    /// The hypervisor this gateway is associated with, as
+    /// [`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::associate_gateway_to_server`]
+    /// last set it. `None` means "not associated".
     pub hypervisor_arn: Option<String>,
-    /// `HypervisorId`, absent until the gateway is associated with a hypervisor.
+    /// `HypervisorId` — the `hypervisor/<id>` suffix of [`Self::hypervisor_arn`], absent
+    /// until the gateway is associated with a hypervisor.
     pub hypervisor_id: Option<String>,
     /// `LastSeenTime` — when the appliance last communicated with the cloud. Set when
     /// the record is minted and moved only by a call that really contacts the gateway;
@@ -834,6 +875,59 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
         page_of(&self.gateways, after, limit)
     }
 
+    /// Associate the gateway stored under `gateway_arn` with the hypervisor stored under
+    /// `server_arn`, and hand back the gateway as it is now STORED — cloned off the record
+    /// in the map after the write, so the ARN a caller gets is the key the store holds.
+    ///
+    /// Both ARNs have to name a record this store really holds: an association is a link
+    /// between two existing resources, so one naming a gateway or a server the service
+    /// does not have is refused and NOTHING is written
+    /// ([`AssociationRefusal::NoSuchGateway`], [`AssociationRefusal::NoSuchServer`]). The
+    /// gateway is resolved first, so a request that names neither is answered for the
+    /// gateway — one answer, not one that depends on which map was consulted first.
+    ///
+    /// A gateway backs up the machines of ONE hypervisor, so a gateway already associated
+    /// with a different server is refused too
+    /// ([`AssociationRefusal::AlreadyAssociated`], carrying the server it is associated
+    /// with). Associating it with the server it is ALREADY associated with is the same
+    /// link again: it succeeds and changes nothing, so a retried request answers as the
+    /// first one did.
+    ///
+    /// The `HypervisorId` the gateway then reports is read off the stored hypervisor's own
+    /// ARN ([`arn_resource_id`]), so the id a read reports and the hypervisor the gateway
+    /// is linked to cannot drift apart.
+    pub fn associate_gateway_to_server(
+        &mut self,
+        gateway_arn: &str,
+        server_arn: &str,
+    ) -> Result<StoredGateway, AssociationRefusal> {
+        if !self.gateways.contains_key(gateway_arn) {
+            return Err(AssociationRefusal::NoSuchGateway);
+        }
+        let server = self
+            .hypervisors
+            .get(server_arn)
+            .ok_or(AssociationRefusal::NoSuchServer)?;
+        // The link is to the record's own ARN — the key this store holds the hypervisor
+        // under — and not to the string the request spelled. Both are read before the
+        // gateway is borrowed mutably, which is why they are cloned here.
+        let server_arn = server.arn.clone();
+        let server_id = arn_resource_id(&server_arn).map(str::to_string);
+        // Present: the same `&mut self` borrow found it above, so nothing could have
+        // removed it in between.
+        let Some(gateway) = self.gateways.get_mut(gateway_arn) else {
+            return Err(AssociationRefusal::NoSuchGateway);
+        };
+        if let Some(current) = &gateway.hypervisor_arn {
+            if *current != server_arn {
+                return Err(AssociationRefusal::AlreadyAssociated(current.clone()));
+            }
+        }
+        gateway.hypervisor_arn = Some(server_arn);
+        gateway.hypervisor_id = server_id;
+        Ok(gateway.clone())
+    }
+
     /// Persist a hypervisor for `configuration` and hand back the record as it is now
     /// STORED — read out of the map after the insert, so the ARN that comes back is the
     /// key the store holds rather than a string built from the request.
@@ -905,6 +999,15 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
     /// ON a hypervisor, so once the hypervisor is gone the service holds no inventory for
     /// it and `ListVirtualMachines` reports none — rather than machines whose
     /// `HypervisorId` names nothing.
+    ///
+    /// The ASSOCIATION a gateway holds to it does NOT go with it: the link is a fact about
+    /// the GATEWAY ([`Self::associate_gateway_to_server`]), which stays its own resource,
+    /// and `DisassociateGatewayFromServer` is the operation that clears it. So a gateway
+    /// still names the server it was associated with, which is what
+    /// [`Self::gateway_for_hypervisor`] resolves and why
+    /// `PutHypervisorPropertyMappings` can tell a hypervisor the store no longer holds
+    /// ([`MissingResource::Hypervisor`]) from one no gateway serves
+    /// ([`GATEWAY_OUT_OF_DATE`]).
     pub fn remove_hypervisor(&mut self, arn: &str) -> Option<StoredHypervisor> {
         let removed = self.hypervisors.remove(arn)?;
         self.virtual_machines
@@ -1349,6 +1452,23 @@ pub fn arn_resource_type(arn: &str) -> Option<&str> {
 /// the record cannot name two different resources.
 pub fn arn_resource_id(arn: &str) -> Option<&str> {
     arn_parts(arn).map(|parts| parts.resource_id)
+}
+
+/// Why an association between a gateway and a server could not be made.
+///
+/// Returned by
+/// [`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::associate_gateway_to_server`],
+/// which writes nothing on any of these arms. The store names the CONDITION and the
+/// handler maps it to the modelled error its own operation declares, so the store does
+/// not have to know which error shapes an operation carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AssociationRefusal {
+    /// The `GatewayArn` names no gateway this store holds.
+    NoSuchGateway,
+    /// The `ServerArn` names no hypervisor this store holds.
+    NoSuchServer,
+    /// The gateway is already associated with a DIFFERENT server, whose ARN this carries.
+    AlreadyAssociated(String),
 }
 
 /// How this service refuses a well-formed resource ARN that names no resource it holds.

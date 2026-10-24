@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeRecommendationExportJobs
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeRecommendationExportJobs`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! "Describes recommendation export jobs created in the last seven days."
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeRecommendationExportJobs::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A REPORT, not a write: the jobs an `Export*Recommendations` call created are read out
+//! of [`crate::state`], and a job's `JobStatus` is DERIVED from the instant it was created
+//! rather than stored, so reporting the status the clock has made due writes nothing
+//! ([`crate::state::ExportJob::status_at`]).
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +166,163 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeRecommendationExportJobs` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeRecommendationExportJobsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeRecommendationExportJobs"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DescribeRecommendationExportJobsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "The Compute Optimizer recommendation store is unavailable."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A malformed request is refused BEFORE the store is read, so
+        // InvalidParameterValueException takes precedence over the opt-in gate below, as it
+        // does in every other read operation of this service.
+        let job_ids = input.job_ids.unwrap_or_default();
+        if job_ids.iter().any(|job_id| job_id.trim().is_empty()) {
+            return Err(invalid_parameter(
+                "The value supplied for parameter jobIds is not valid: a job ID must not be \
+                 empty."
+                    .to_string(),
+            ));
+        }
+
+        // The filter vocabulary is the model's own; a name or value outside it is refused
+        // rather than silently matching nothing. The modelled `@enum` on `JobFilter$name`
+        // already refuses an unmodelled name at the request boundary, so this covers the
+        // VALUES a filter carries and a filter with no name.
+        let filters = input.filters.unwrap_or_default();
+        if let Some(reason) = crate::state::job_filter_rejection(&filters) {
+            return Err(invalid_parameter(reason));
+        }
+
+        // The page token carries this operation's name and the selection it was taken with,
+        // so resuming a walk with a different selection, or with a token another operation
+        // issued, is refused rather than answered with a page of a different result set.
+        let selection_fingerprint =
+            crate::state::fingerprint(&(Self::NAME, &job_ids, &filters));
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let cursor = crate::state::decode_offset_page_token(token)
+                    .filter(|cursor| cursor.selection_fingerprint == selection_fingerprint);
+                let Some(cursor) = cursor else {
+                    return Err(invalid_parameter(
+                        "The value supplied for parameter nextToken is not valid: it must be a \
+                         token returned by a previous DescribeRecommendationExportJobs call for \
+                         the same jobIds and filters."
+                            .to_string(),
+                    ));
+                };
+                cursor.offset
+            }
+        };
+
+        // `maxResults` is modelled 0..1000 (the request boundary refuses anything outside
+        // that). Whatever it asks for, the page is capped at `MAX_PAGE_SIZE` so no number a
+        // request carries can size the response or the allocation that builds it; a request
+        // naming no size — or the range's lower bound `0`, which the service documents no
+        // meaning for — gets `DEFAULT_PAGE_SIZE` plus a `nextToken` to walk the rest.
+        let page_size = input
+            .max_results
+            .and_then(|requested| usize::try_from(requested).ok())
+            .filter(|requested| *requested > 0)
+            .unwrap_or(crate::state::DEFAULT_PAGE_SIZE)
+            .min(crate::state::MAX_PAGE_SIZE);
+
+        // Compute Optimizer is regional: a request reports the export jobs created at the
+        // Region's own endpoint, which is also where the one-job-in-progress limit applies.
+        let region = crate::state::request_region(ctx);
+        let now = crate::state::now_secs();
+
+        let guard = state.lock();
+        if !guard.enrollment.is_opted_in() {
+            return Err(
+                DescribeRecommendationExportJobsErrorModeled::OptInRequiredException(
+                    OptInRequiredException {
+                        message: Some(
+                            "The account is not opted in to Compute Optimizer.".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "All export jobs created in the last seven days are returned if this parameter is
+        // omitted" (`jobIds`): the window bounds what this operation can report at all, so
+        // an older job is not reportable even when its id is named.
+        let reportable: Vec<&crate::state::ExportJob> = guard
+            .export_jobs
+            .iter_in_order()
+            .filter(|job| job.region == region)
+            .filter(|job| job.is_reported_at(now))
+            .collect();
+
+        // A named job this Region holds no reportable job for does not exist as far as this
+        // request is concerned, which is what `ResourceNotFoundException` says.
+        if let Some(missing) = job_ids
+            .iter()
+            .find(|job_id| !reportable.iter().any(|job| &job.job_id == *job_id))
+        {
+            return Err(
+                DescribeRecommendationExportJobsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "A recommendation export job with the ID {missing} could not be \
+                             found."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The jobs the request selects: those it named, that satisfy every filter. A member
+        // the request omits selects nothing away.
+        let selected: Vec<RecommendationExportJob> = reportable
+            .into_iter()
+            .filter(|job| job_ids.is_empty() || job_ids.contains(&job.job_id))
+            .filter(|job| crate::state::export_job_matches_filters(job, &filters, now))
+            .map(|job| job.to_wire(now))
+            .collect();
+        drop(guard);
+
+        // One page of the selected sequence. A next token is handed out only when the
+        // sequence continues past this page, and it resumes exactly where this page stopped.
+        let page: Vec<RecommendationExportJob> = selected
+            .into_iter()
+            .skip(offset)
+            .take(page_size.saturating_add(1))
+            .collect();
+        let has_more = page.len() > page_size;
+        let page: Vec<RecommendationExportJob> = page.into_iter().take(page_size).collect();
+        let next_token = has_more.then(|| {
+            crate::state::encode_offset_page_token(&crate::state::PageCursor {
+                offset: offset.saturating_add(page.len()),
+                selection_fingerprint,
+            })
+        });
+
+        Ok(DescribeRecommendationExportJobsOutput {
+            recommendation_export_jobs: Some(page),
+            next_token,
+        })
     }
+}
+
+/// The 400 `InvalidParameterValueException` this operation refuses a bad request with:
+/// "The value supplied for the input parameter is out of range or not valid."
+fn invalid_parameter(message: String) -> DescribeRecommendationExportJobsError {
+    DescribeRecommendationExportJobsErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message),
+        },
+    )
+    .into()
 }

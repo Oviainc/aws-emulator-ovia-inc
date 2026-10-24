@@ -1283,14 +1283,22 @@ pub const BASELINE_CATALOG: &[CatalogBaseline] = &[
     },
 ];
 
-/// `arn:aws:controltower:<region>:<account>:baseline/<id>` — the ARN this endpoint
-/// serves a catalog baseline under.
+/// `arn:aws:controltower:<region>::baseline/<id>` — the ARN this endpoint serves a
+/// catalog baseline under.
 ///
-/// Built through `engine::emulator_arn`, so the account segment is the emulator's
-/// canonical account id rather than a literal, which `BaselineArn`'s `[0-9]{0,12}`
-/// account segment admits.
+/// The account segment is EMPTY, which is why this is NOT built through
+/// `engine::emulator_arn` the way the per-account resources below are: a baseline is
+/// AWS-managed catalog data that no account owns, so there is no account to name in its
+/// ARN. `BaselineArn`'s pattern
+/// `^arn:[a-z-]+:controltower:[a-z0-9-]*:[0-9]{0,12}:baseline/[A-Z0-9]{16}$` admits ZERO
+/// digits in the account position for exactly that reason, and the account-less form is
+/// the one a caller round-trips back into `GetBaseline` or `EnableBaseline`.
+///
+/// The resources an account DOES own keep the emulator's canonical account id
+/// ([`landing_zone_arn`], [`enabled_baseline_arn`], [`enabled_control_arn`]): an
+/// enablement belongs to the caller's account, a baseline belongs to none.
 pub fn baseline_arn(region: &str, baseline_id: &str) -> String {
-    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("baseline/{baseline_id}"))
+    format!("arn:aws:{ARN_NAMESPACE}:{region}::baseline/{baseline_id}")
 }
 
 /// The catalog entry a `baselineIdentifier` names, or `None` when the catalog holds no

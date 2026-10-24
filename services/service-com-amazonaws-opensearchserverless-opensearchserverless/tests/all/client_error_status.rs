@@ -137,7 +137,14 @@ async fn every_modeled_client_error_answers_the_single_client_error_status() {
     accepted(
         &router,
         "CreateCollection",
-        json!({ "name": "stored-collection", "collectionGroupName": "stored-group" }),
+        // A collection carries its own encryption setting: one has to come from the
+        // request or from a covering encryption security policy, and this suite is about
+        // the refusal STATUS, not about where that setting came from.
+        json!({
+            "name": "stored-collection",
+            "collectionGroupName": "stored-group",
+            "encryptionConfig": { "aWSOwnedKey": true },
+        }),
     )
     .await;
 
@@ -155,7 +162,10 @@ async fn every_modeled_client_error_answers_the_single_client_error_status() {
         Row {
             what: "a collection name already taken",
             operation: "CreateCollection",
-            request: json!({ "name": "stored-collection" }),
+            request: json!({
+                "name": "stored-collection",
+                "encryptionConfig": { "aWSOwnedKey": true },
+            }),
             code: "ConflictException",
         },
         Row {
@@ -307,7 +317,10 @@ async fn the_state_time_client_errors_answer_it_too() {
     let created = accepted(
         &router,
         "CreateCollection",
-        json!({ "name": "transient-collection" }),
+        json!({
+            "name": "transient-collection",
+            "encryptionConfig": { "aWSOwnedKey": true },
+        }),
     )
     .await;
     let id = text(at(&created, "createCollectionDetail"), "id");
@@ -359,15 +372,12 @@ async fn an_answer_that_is_not_a_client_error_keeps_its_own_status() {
     let router = emulator();
 
     // A scaffolded operation answers the framework's 501, not a client error: collapsing
-    // it would tell a client its request was at fault.
-    for operation in ["ListVpcEndpoints", "ListTagsForResource"] {
+    // it would tell a client its request was at fault. `ListTagsForResource` is no longer
+    // one of them — it reads the stored tag set — so the row names operations whose
+    // handlers still carry the scaffold marker.
+    for operation in ["ListVpcEndpoints", "ListLifecyclePolicies"] {
         let request = match operation {
-            "ListTagsForResource" => json!({
-                "resourceArn": format!(
-                    "arn:aws:aoss:us-east-1:{}:collection/aaaaaaaaaaaaaaaaaaaaaaaa",
-                    engine::emulator_account_id()
-                ),
-            }),
+            "ListLifecyclePolicies" => json!({ "type": "retention" }),
             _ => json!({}),
         };
         let (status, code, answer) = call(&router, operation, request).await;
@@ -503,10 +513,19 @@ async fn a_conflict_names_the_requested_name_and_no_minted_id() {
     // @length(min: 3, max: 64) and `^[a-z][a-z0-9-]+$`: the minimum, a mixed
     // letter/digit/dash name, and the maximum.
     for name in ["abc", "a-b-c-1-2-3", &"a".repeat(64)] {
-        let created = accepted(&router, "CreateCollection", json!({ "name": name })).await;
+        let created = accepted(
+            &router,
+            "CreateCollection",
+            json!({ "name": name, "encryptionConfig": { "aWSOwnedKey": true } }),
+        )
+        .await;
         let id = text(at(&created, "createCollectionDetail"), "id");
-        let (status, code, answer) =
-            call(&router, "CreateCollection", json!({ "name": name })).await;
+        let (status, code, answer) = call(
+            &router,
+            "CreateCollection",
+            json!({ "name": name, "encryptionConfig": { "aWSOwnedKey": true } }),
+        )
+        .await;
         assert_eq!(
             (status, code.as_str()),
             (CLIENT_ERROR, "ConflictException"),
@@ -564,7 +583,10 @@ async fn a_conflict_names_the_requested_name_and_no_minted_id() {
     let created = accepted(
         &router,
         "CreateCollection",
-        json!({ "name": "not-yet-deletable" }),
+        json!({
+            "name": "not-yet-deletable",
+            "encryptionConfig": { "aWSOwnedKey": true },
+        }),
     )
     .await;
     let id = text(at(&created, "createCollectionDetail"), "id");

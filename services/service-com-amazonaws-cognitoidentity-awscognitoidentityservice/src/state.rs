@@ -61,6 +61,32 @@ pub struct IdentityPool {
     pub identity_pool_tags: Option<BTreeMap<String, String>>,
 }
 
+/// The most tags one identity pool can carry, from the model's own doc for `TagResource`:
+/// "An identity pool can have as many as 50 tags"
+/// (`smithy_query(query="doc",shape="TagResource")`). An AWS-published ceiling on the
+/// resource, so it bounds the tag set a pool ends up with however the tags got there, and
+/// a call that would take a pool past it is refused with the modelled
+/// `InvalidParameterException` — the only client-input error the tagging operations model
+/// for a quota of the resource.
+pub const MAX_TAGS_PER_IDENTITY_POOL: usize = 50;
+
+/// The tag-key prefix AWS reserves for its own tags. AWS's tagging rules state that the
+/// `aws:` prefix is reserved for AWS use and that a user cannot create, edit or delete a
+/// tag whose key carries it, so a request assigning such a key is a bad input parameter
+/// rather than a tag this service stores.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Whether `tag_key` lies in the AWS-reserved tag namespace ([`RESERVED_TAG_KEY_PREFIX`]).
+///
+/// The prefix is matched case-insensitively — the reservation is on the namespace, not on
+/// one spelling of it — and on BYTES, so a key whose first characters are multi-byte is
+/// compared without slicing inside a character.
+pub fn is_reserved_tag_key(tag_key: &str) -> bool {
+    let prefix = RESERVED_TAG_KEY_PREFIX.as_bytes();
+    let key = tag_key.as_bytes();
+    key.len() >= prefix.len() && key[..prefix.len()].eq_ignore_ascii_case(prefix)
+}
+
 /// The most mapping rules one identity provider may carry, from the model's own doc for
 /// `RulesConfigurationType$Rules`: "An array of rules. You can specify up to 25 rules per
 /// identity provider." (`smithy_query(query="shape",shape="RulesConfigurationType")`).

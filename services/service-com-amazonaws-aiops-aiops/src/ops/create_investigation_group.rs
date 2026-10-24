@@ -11,6 +11,11 @@
 //! is refused with the modelled `ServiceQuotaExceededException` (402) under the same
 //! lock the insert takes.
 //!
+//! The `tags` map is a tag write, so the tagging frontend's own 400
+//! `BadRequestException` refuses a key in the reserved
+//! [`crate::state::RESERVED_TAG_KEY_PREFIX`] namespace or a map past
+//! [`crate::state::MAX_TAGS`], before any group is minted.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -242,11 +247,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The `tags` map is a tag write, so it is bounded by the published per-resource
-        // tag maximum and refused the way the tagging frontend refuses one.
-        if let Some(why) = crate::state::tag_capacity_rejection(
-            input.tags.as_ref().map_or(0, std::collections::HashMap::len),
-        ) {
+        // The `tags` map is a tag write, so the rules a tag write follows apply to it:
+        // a key in the reserved `aws:` namespace is Amazon Web Services' own and a
+        // caller may not create one, and the set is bounded by the published
+        // per-resource tag maximum. Both are refused the way the tagging frontend
+        // refuses a tag write, and both are checked before the group is minted so a
+        // refused create stores nothing.
+        if let Some(why) = crate::state::reserved_tag_key_rejection(
+            input
+                .tags
+                .iter()
+                .flat_map(std::collections::HashMap::keys)
+                .map(String::as_str),
+        )
+        .or_else(|| {
+            crate::state::tag_capacity_rejection(
+                input.tags.as_ref().map_or(0, std::collections::HashMap::len),
+            )
+        }) {
             return Err(crate::scaffolded::Scaffolded::bad_request(why));
         }
 

@@ -147,7 +147,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut state = state.lock();
 
-        let Some(record) = state.instances.get_mut(&input.workspace_instance_id) else {
+        let Some(record) = state.settled_mut(&input.workspace_instance_id, std::time::Instant::now())
+        else {
             return Err(crate::state::instance_not_found_error(
                 &input.workspace_instance_id,
                 TagResourceErrorModeled::ResourceNotFoundException,

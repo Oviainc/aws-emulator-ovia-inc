@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListMessageMoveTasks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListMessageMoveTasks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: this operation reports the message movement tasks `StartMessageMoveTask`
+//! recorded in [`crate::state`] under the source queue the request names, most recent
+//! first. It is the ONLY file to touch for `ListMessageMoveTasks`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListMessageMoveTasks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What it reports, and what it does not change
+//!
+//! This is a reporting operation: it writes nothing. Each entry is projected from the
+//! task record and the clock by
+//! [`crate::state::ComAmazonawsSqsAmazonsqsState::reported_message_move_tasks`] — the
+//! status and both `ApproximateNumberOfMessages*` counts are functions of when the task
+//! started, how many messages it took and its rate — so two readers of one task always
+//! agree and a listing never moves a task on.
+//!
+//! `FailureReason` is never set and no entry is ever `CANCELLING`, `CANCELLED` or
+//! `FAILED`: a task this store records takes its messages when it starts, so none of them
+//! can fail later, and cancelling one is `CancelMessageMoveTask`'s to record.
 //!
 //! ## Shape of an operation
 //!
@@ -83,6 +90,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state as sqs;
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -156,18 +165,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListMessageMoveTasks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListMessageMoveTasksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListMessageMoveTasks"))
+        // The region every reported ARN carries is the one this request is scoped to,
+        // which is the region a queue's own record was minted in.
+        let region = sqs::request_region(ctx.parts());
+
+        // "The maximum number of results to include in the response. The default is 1,
+        // which provides the most recent message movement task. The upper limit is 10."
+        // A request for fewer than one result asks for no result at all and one past the
+        // upper limit asks for more than the service keeps, so both are refused rather
+        // than quietly clamped to a page size the caller did not ask for.
+        let upper_limit = i32::try_from(sqs::MAX_MESSAGE_MOVE_TASKS_PER_QUEUE).unwrap_or(i32::MAX);
+        let max_results = match input.max_results {
+            None => sqs::DEFAULT_MESSAGE_MOVE_TASK_RESULTS,
+            Some(max) if (1..=upper_limit).contains(&max) => {
+                usize::try_from(max).unwrap_or(sqs::DEFAULT_MESSAGE_MOVE_TASK_RESULTS)
+            }
+            Some(max) => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "MaxResults must be an integer from 1 to {upper_limit}; got {max}."
+                )))
+            }
+        };
+
+        // The ARN is classified BEFORE the store is reached, as every operation taking one
+        // does: a value that names no queue in any account is not an address this service
+        // can resolve, which is what the modelled `InvalidAddress` ("The specified ID is
+        // invalid.") refuses, while a well-formed ARN of another account or another
+        // service names a resource that simply does not exist here.
+        let source_name = match sqs::parse_queue_arn(&input.source_arn) {
+            sqs::QueueArn::OfThisAccount(name) => name.to_string(),
+            sqs::QueueArn::Elsewhere => {
+                return Err(ListMessageMoveTasksErrorModeled::ResourceNotFoundException(
+                    sqs::resource_not_found("SourceArn"),
+                )
+                .into())
+            }
+            sqs::QueueArn::Malformed => {
+                return Err(ListMessageMoveTasksErrorModeled::InvalidAddress(
+                    sqs::invalid_address("SourceArn"),
+                )
+                .into())
+            }
+        };
+
+        let store = sqs::service_state(&*self.engine).ok_or_else(|| {
+            ListMessageMoveTasksErrorModeled::UnsupportedOperation(sqs::store_unavailable())
+        })?;
+        let state = store.lock();
+
+        // "One or more specified resources don't exist" (`ResourceNotFoundException`): the
+        // queue whose message movement tasks are to be listed has to be one of this
+        // account's.
+        if !state.queues.contains_key(&source_name) {
+            return Err(ListMessageMoveTasksErrorModeled::ResourceNotFoundException(
+                sqs::resource_not_found("SourceArn"),
+            )
+            .into());
+        }
+
+        let results =
+            state.reported_message_move_tasks(&source_name, SystemTime::now(), &region, max_results);
+
+        // A source queue with no task recorded under it answers with the member absent,
+        // which is how every listing in this service reports an empty result.
+        Ok(ListMessageMoveTasksOutput {
+            results: (!results.is_empty()).then_some(results),
+        })
     }
 }

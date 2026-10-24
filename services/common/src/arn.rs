@@ -35,6 +35,12 @@
 //! resource field ([`resource`]), the resource TYPE ([`resource_type`]) and the id
 //! of a resource of a given type ([`resource_id_of_type`]) from here, so the
 //! `<type>/<id>` and `<type>:<id>` forms are read in one place too.
+//!
+//! [`Requirement`] is the form above that: what a member the model DOCUMENTS as the ARN of
+//! a particular AWS resource has to name (an IAM role, a Secrets Manager secret, an S3
+//! object, an ACM certificate), with the constants for the resources several services bind.
+//! A service reads its own model's ARN members against those, so no two services disagree
+//! about what "the ARN of an IAM role" is, and keeps only the refusal's envelope to itself.
 
 /// The six fields of a well-formed resource ARN, as a caller submitted them.
 ///
@@ -190,10 +196,103 @@ pub fn region_of<'value>(value: &'value str, expected_vendor: &str) -> Option<&'
     well_formed.then_some(region)
 }
 
+/// What an input member a model DOCUMENTS as an ARN of a particular AWS resource has to
+/// name.
+///
+/// Several services bind a member whose documentation says it is "the ARN of" something
+/// specific — an IAM role they assume, a Secrets Manager secret they read, an S3 object
+/// they fetch — and the models target those members at a bare string with no `@pattern`,
+/// so the boundary validator admits any text at all and reading the ARN form is the
+/// handler's job. It has to be read: the service RESOLVES what the member names, and a
+/// value that is not an ARN of the documented service names nothing, so the request is a
+/// parameter violation (attributed to the member) rather than a resource that happens to
+/// be missing.
+///
+/// The requirement is "which vendor, and optionally which resource type", because that is
+/// what the documentation fixes; everything else about an ARN (partition, Region, account,
+/// the resource name itself) varies per resource and is not the service's business. The
+/// six fields come from [`parse_of`], this module's one caller-supplied-ARN parse, so an
+/// ARN whose Region and account fields are empty (`arn:aws:s3:::bucket/key`,
+/// `arn:aws:iam::000000000000:role/r`) is as well formed here as anywhere else.
+///
+/// The WORDING of a refusal stays with the service, which owns its error envelope:
+/// [`Requirement::phrase`] states the rule as a verb phrase about the member, which each
+/// service keys by that member in its own body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Requirement {
+    /// The ARN's third field — the service namespace that says whose resource the value
+    /// names (`iam`, `secretsmanager`, `s3`, `acm`).
+    pub vendor: &'static str,
+    /// The resource type the ARN's resource field must name, for a member whose
+    /// documentation names the KIND of resource as well as the service (an IAM *role*, a
+    /// Secrets Manager *secret*); `None` where it names only the service.
+    pub resource_type: Option<&'static str>,
+    /// What a refusal calls the resource this member must name, so the sentence reads as
+    /// the member's own documentation does.
+    pub label: &'static str,
+}
+
+impl Requirement {
+    /// Whether `value` is a well-formed resource ARN that satisfies this requirement.
+    ///
+    /// A value that is not an ARN at all — the empty string included — satisfies nothing,
+    /// and the vendor comparison is exact, because an ARN namespace is a fixed lowercase
+    /// token.
+    #[must_use]
+    pub fn admits(self, value: &str) -> bool {
+        parse_of(value, self.vendor)
+            .is_some_and(|arn| self.resource_type.is_none_or(|kind| arn.resource_type() == kind))
+    }
+
+    /// The constraint phrase a member violating this requirement is refused with — a verb
+    /// phrase about the member, with no trailing period, so a service can key it by the
+    /// member in its own envelope.
+    #[must_use]
+    pub fn phrase(self) -> String {
+        format!("must be the ARN of {}", self.label)
+    }
+}
+
+/// An IAM role a service assumes: `arn:aws:iam::<account>:role/<name>` — vendor `iam`,
+/// resource type `role` — so an ARN of an IAM user or policy names no role to assume.
+pub const IAM_ROLE: Requirement = Requirement {
+    vendor: "iam",
+    resource_type: Some("role"),
+    label: "an IAM role",
+};
+
+/// A secret in AWS Secrets Manager:
+/// `arn:aws:secretsmanager:<region>:<account>:secret:<name>`, so the resource type is
+/// `secret`.
+pub const SECRETS_MANAGER_SECRET: Requirement = Requirement {
+    vendor: "secretsmanager",
+    resource_type: Some("secret"),
+    label: "a secret in AWS Secrets Manager",
+};
+
+/// An object in Amazon S3. Only the vendor is fixed: an S3 object ARN's resource field
+/// opens with the BUCKET name (`arn:aws:s3:::bucket/key`), which differs per bucket, so
+/// there is no fixed resource type to require.
+pub const S3_OBJECT: Requirement = Requirement {
+    vendor: "s3",
+    resource_type: None,
+    label: "an object in Amazon S3",
+};
+
+/// A certificate in AWS Certificate Manager:
+/// `arn:aws:acm:<region>:<account>:certificate/<id>`, so the resource type is
+/// `certificate`.
+pub const ACM_CERTIFICATE: Requirement = Requirement {
+    vendor: "acm",
+    resource_type: Some("certificate"),
+    label: "a Certificate Manager certificate",
+};
+
 #[cfg(test)]
 mod tests {
     use super::{
         is_resource_arn_of, parse, parse_of, region_of, resource_id_of_type, resource_type, vendor,
+        Requirement, ACM_CERTIFICATE, IAM_ROLE, S3_OBJECT, SECRETS_MANAGER_SECRET,
     };
 
     /// The vendor field is read from the third position, whatever the resource
@@ -528,5 +627,135 @@ mod tests {
             None,
             "a value that is not an ARN is nobody's resource ARN"
         );
+    }
+
+    /// A requirement admits exactly the ARNs of its vendor that name its resource type,
+    /// whatever the partition, Region, account and resource name are — and admits nothing
+    /// that is not a resource ARN.
+    #[test]
+    fn a_requirement_admits_its_vendors_arns_of_its_resource_type() {
+        // (case, the requirement, the value, whether it is admitted)
+        let rows: &[(&str, Requirement, &str, bool)] = &[
+            (
+                "a role ARN, as IAM writes one",
+                IAM_ROLE,
+                "arn:aws:iam::000000000000:role/mediapackage",
+                true,
+            ),
+            (
+                "a role ARN carrying a path",
+                IAM_ROLE,
+                "arn:aws:iam::000000000000:role/service-role/Harvester",
+                true,
+            ),
+            (
+                "a role ARN in the colon form, in another partition",
+                IAM_ROLE,
+                "arn:aws-cn:iam:cn-north-1:000000000000:role:r",
+                true,
+            ),
+            (
+                "an IAM user, which is not a role",
+                IAM_ROLE,
+                "arn:aws:iam::000000000000:user/bob",
+                false,
+            ),
+            (
+                "another vendor's ARN",
+                IAM_ROLE,
+                "arn:aws:s3:::bucket/key",
+                false,
+            ),
+            (
+                "the vendor in another case",
+                IAM_ROLE,
+                "arn:aws:IAM::000000000000:role/r",
+                false,
+            ),
+            ("not an ARN at all", IAM_ROLE, "my-role", false),
+            ("the empty string", IAM_ROLE, "", false),
+            (
+                "a secret ARN, as Secrets Manager writes one",
+                SECRETS_MANAGER_SECRET,
+                "arn:aws:secretsmanager:us-east-1:000000000000:secret:cdn-AbCdEf",
+                true,
+            ),
+            (
+                "a secret ARN with an empty Region",
+                SECRETS_MANAGER_SECRET,
+                "arn:aws:secretsmanager::000000000000:secret/cdn",
+                true,
+            ),
+            (
+                "another resource type of the same vendor",
+                SECRETS_MANAGER_SECRET,
+                "arn:aws:secretsmanager:us-east-1:000000000000:rotation/cdn",
+                false,
+            ),
+            (
+                "an object ARN, whose resource opens with the bucket",
+                S3_OBJECT,
+                "arn:aws:s3:::my-bucket/path/to/object",
+                true,
+            ),
+            (
+                "a bucket ARN, which the vendor-only requirement also admits",
+                S3_OBJECT,
+                "arn:aws:s3:::my-bucket",
+                true,
+            ),
+            (
+                "another vendor, for a vendor-only requirement",
+                S3_OBJECT,
+                "arn:aws:s3-outposts:::my-bucket/key",
+                false,
+            ),
+            (
+                "a certificate ARN",
+                ACM_CERTIFICATE,
+                "arn:aws:acm:us-east-1:000000000000:certificate/12345678-1234-1234-1234-123456789012",
+                true,
+            ),
+            (
+                "an ACM private-CA ARN, which is not a certificate",
+                ACM_CERTIFICATE,
+                "arn:aws:acm:us-east-1:000000000000:certificate-authority/ca-1",
+                false,
+            ),
+        ];
+        for (case, requirement, value, admitted) in rows {
+            let answered = requirement.admits(value);
+            assert_eq!(
+                answered, *admitted,
+                "case {case:?}: expected {admitted}, got {answered} for {value:?}"
+            );
+        }
+    }
+
+    /// The phrase states the rule as a verb phrase about the member, naming the resource
+    /// the member's own documentation names.
+    #[test]
+    fn a_requirements_phrase_names_the_resource_it_requires() {
+        // (the requirement, the phrase it states)
+        let rows: &[(Requirement, &str)] = &[
+            (IAM_ROLE, "must be the ARN of an IAM role"),
+            (
+                SECRETS_MANAGER_SECRET,
+                "must be the ARN of a secret in AWS Secrets Manager",
+            ),
+            (S3_OBJECT, "must be the ARN of an object in Amazon S3"),
+            (
+                ACM_CERTIFICATE,
+                "must be the ARN of a Certificate Manager certificate",
+            ),
+        ];
+        for (requirement, expected) in rows {
+            let phrase = requirement.phrase();
+            assert_eq!(
+                phrase, *expected,
+                "case {:?}: expected {expected:?}, got {phrase:?}",
+                requirement.label
+            );
+        }
     }
 }

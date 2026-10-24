@@ -162,9 +162,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut state = state.lock();
 
-        // `@readonly`: the only write this reporting call makes is materialising the
-        // `ALLOCATING -> ALLOCATED` move the clock already owed — a change that was due
-        // at the same instant whether or not anybody read the instance.
+        // `@readonly`: the only writes this reporting call makes are materialising
+        // the moves the clock already owed — `ALLOCATING -> ALLOCATED`,
+        // `DEALLOCATING -> DEALLOCATED`, and dropping a torn-down record whose
+        // retention has run out — each of which was due at the same instant whether
+        // or not anybody read the instance.
         let Some(record) = state.settled(&input.workspace_instance_id, std::time::Instant::now())
         else {
             return Err(crate::state::instance_not_found_error(

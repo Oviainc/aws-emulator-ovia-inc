@@ -543,26 +543,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::parse_task_definition_reference(reference)
                 else {
                     return Err(UpdateServiceErrorModeled::ClientException(ClientException {
-                        message: Some(format!(
-                            "taskDefinition must be a family, family:revision or \
-                             task-definition ARN; got {reference:?}"
-                        )),
+                        message: Some(crate::state::task_definition_reference_message(reference)),
                     })
                     .into());
                 };
-                let found = match revision {
-                    Some(revision) => guard.task_definitions.get(&(family.clone(), revision)),
-                    None => guard.latest_active_revision(&family),
+                let definition = match guard.usable_revision(&family, revision) {
+                    Ok(definition) => definition.clone(),
+                    Err(message) => {
+                        // "You can't update an existing service to reference an INACTIVE
+                        // task definition", and a reference that resolves to nothing is
+                        // the same refusal it always is. The service's OWN revision is
+                        // untouched by this: the `None` arm below keeps the key it
+                        // stored, so a service whose revision was deregistered can still
+                        // be scaled.
+                        return Err(UpdateServiceErrorModeled::ClientException(
+                            ClientException {
+                                message: Some(message.to_string()),
+                            },
+                        )
+                        .into());
+                    }
                 };
-                let Some(found) = found.cloned() else {
-                    return Err(UpdateServiceErrorModeled::ClientException(ClientException {
-                        message: Some(
-                            crate::state::TASK_DEFINITION_NOT_FOUND_MESSAGE.to_string(),
-                        ),
-                    })
-                    .into());
-                };
-                Some(found)
+                Some(definition)
             }
             None => snapshot
                 .task_definition

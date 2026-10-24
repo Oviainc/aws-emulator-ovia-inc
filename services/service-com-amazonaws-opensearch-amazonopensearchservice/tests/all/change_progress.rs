@@ -1,0 +1,522 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! End-to-end tests for `DescribeDomainChangeProgress`.
+//!
+//! Every case drives the real wire path — a `restJson1` HTTP request through the
+//! multi-service router into the mounted service — so what is asserted is what a
+//! client sees. The harness, the baseline `CreateDomain` body and the table of
+//! option containers come from [`super::domain_lifecycle`]; this suite adds no second
+//! copy of them.
+//!
+//! The rule under test: a domain's configuration change is a RECORD written by the
+//! call that starts it, addressed by its own `ChangeId`, reporting the options that
+//! call set as pending while the change is in flight and as completed once the clock
+//! has made it due. So the assertions span a SET of inputs — every option container
+//! in the shared change table, change histories of one, two, three and six records,
+//! the change addressed by id and the change left implicit, and both sides of the
+//! provisioning span.
+
+use serde_json::{json, Value};
+
+use super::domain_lifecycle::{
+    baseline_create, change_rows, create_baseline, error_code, string_member, Answer, Emulator,
+    PREFIX, SETTLE_WAIT,
+};
+
+/// A well-formed `GUID` that names no change: the id space is 128 bits wide and the
+/// store mints v4 UUIDs, so the nil-shaped id below is never one of them.
+const ABSENT_CHANGE_ID: &str = "00000000-0000-4000-8000-000000000000";
+
+/// The two `DomainConfig` members `CreateDomain` always sets even when the request
+/// names neither: "If you don't specify a use case, `MIXED` is used" and "If you
+/// don't specify an engine mode, `GENERAL` is used".
+const CREATE_DEFAULTED_OPTIONS: [&str; 2] = ["EngineMode", "UseCase"];
+
+/// `GET /2021-01-01/opensearch/domain/{DomainName}/progress`, with the `changeid`
+/// query parameter when `change_id` is given.
+async fn progress(emulator: &Emulator, name: &str, change_id: Option<&str>) -> Answer {
+    let uri = match change_id {
+        None => format!("{PREFIX}/opensearch/domain/{name}/progress"),
+        Some(change_id) => {
+            format!("{PREFIX}/opensearch/domain/{name}/progress?changeid={change_id}")
+        }
+    };
+    emulator.call("GET", &uri, None).await
+}
+
+/// The `ChangeProgressStatus` of an accepted progress call.
+async fn progress_status(emulator: &Emulator, name: &str, change_id: Option<&str>) -> Value {
+    let answer = progress(emulator, name, change_id).await;
+    assert_eq!(
+        answer.status, 200,
+        "case DescribeDomainChangeProgress({name:?}, {change_id:?}): expected 200, got {} with {:?}",
+        answer.status, answer.body
+    );
+    answer.body["ChangeProgressStatus"].clone()
+}
+
+/// The string members of a list member of a response body.
+fn string_list(body: &Value, member: &str, case: &str) -> Vec<String> {
+    body[member]
+        .as_array()
+        .unwrap_or_else(|| panic!("case {case}: expected a list {member}, got {body:?}"))
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .unwrap_or_else(|| panic!("case {case}: expected strings in {member}, got {body:?}"))
+                .to_owned()
+        })
+        .collect()
+}
+
+/// Assert `value` satisfies `GUID`'s own constraint: `@length(min: 36, max: 36)` with
+/// `@pattern("^\p{XDigit}{8}-\p{XDigit}{4}-\p{XDigit}{4}-\p{XDigit}{4}-\p{XDigit}{12}$")`.
+fn assert_guid(value: &str, case: &str) {
+    assert_eq!(
+        value.len(),
+        36,
+        "case {case}: a GUID is 36 characters, got {value:?} of {}",
+        value.len()
+    );
+    let groups: Vec<&str> = value.split('-').collect();
+    let widths: Vec<usize> = groups.iter().map(|group| group.len()).collect();
+    assert_eq!(
+        widths,
+        vec![8, 4, 4, 4, 12],
+        "case {case}: expected hex groups of 8-4-4-4-12, got {value:?} with {widths:?}"
+    );
+    assert!(
+        groups
+            .iter()
+            .all(|group| group.chars().all(|c| c.is_ascii_hexdigit())),
+        "case {case}: every GUID group is hexadecimal, got {value:?}"
+    );
+}
+
+/// The `DomainConfig` member names a [`baseline_create`] body sets: the containers it
+/// carries, plus the two members that default when omitted. Derived from the body the
+/// harness sends, so it cannot drift from it.
+fn created_properties(name: &str) -> Vec<String> {
+    let body = baseline_create(name);
+    let mut properties: Vec<String> = body
+        .as_object()
+        .expect("the baseline create body is an object")
+        .keys()
+        // `DomainName` is the domain's identity, not one of its options.
+        .filter(|member| *member != "DomainName")
+        .map(|member| member.to_owned())
+        .chain(CREATE_DEFAULTED_OPTIONS.iter().map(|opt| opt.to_string()))
+        .collect();
+    properties.sort();
+    properties.dedup();
+    properties
+}
+
+#[tokio::test]
+async fn a_change_reports_the_option_it_sets_pending_then_completed() {
+    let emulator = Emulator::new();
+    // One row per kind of option container the shared change table spans: a cluster
+    // structure, an EBS structure, a policy string, a free-form map, a snapshot
+    // structure, an enum, a `LogType`-keyed map and a software-update structure.
+    for (index, (option, value, _)) in change_rows().into_iter().enumerate() {
+        let name = format!("progress-{index}");
+        create_baseline(&emulator, &name).await;
+
+        let updated = emulator
+            .update_config(&name, json!({ option: value.clone() }))
+            .await;
+        assert_eq!(
+            updated.status, 200,
+            "case UpdateDomainConfig({option}): expected 200, got {} with {:?}",
+            updated.status, updated.body
+        );
+
+        let in_flight = progress_status(&emulator, &name, None).await;
+        let case = format!("DescribeDomainChangeProgress({option}, in flight)");
+        let change_id = string_member(&in_flight, "ChangeId", &case);
+        assert_guid(&change_id, &case);
+        assert_eq!(
+            (
+                in_flight["Status"].as_str(),
+                in_flight["ConfigChangeStatus"].as_str(),
+                in_flight["InitiatedBy"].as_str(),
+            ),
+            (Some("PROCESSING"), Some("ApplyingChanges"), Some("CUSTOMER")),
+            "case {case}: a change in flight is PROCESSING/ApplyingChanges, started by the \
+             CUSTOMER, got {in_flight:?}"
+        );
+        assert_eq!(
+            string_list(&in_flight, "PendingProperties", &case),
+            vec![option.to_string()],
+            "case {case}: the option this change set is its one pending property, got {in_flight:?}"
+        );
+        assert!(
+            string_list(&in_flight, "CompletedProperties", &case).is_empty(),
+            "case {case}: nothing has completed yet, got {in_flight:?}"
+        );
+        let start_time = in_flight["StartTime"].clone();
+        assert!(
+            start_time.is_number() && in_flight["LastUpdatedTime"].is_number(),
+            "case {case}: expected StartTime/LastUpdatedTime timestamps, got {in_flight:?}"
+        );
+
+        // A read does not move the record: the second answer is the first.
+        let again = progress_status(&emulator, &name, None).await;
+        assert_eq!(
+            again, in_flight,
+            "case {case}: a read must not change the change record: {in_flight:?} then {again:?}"
+        );
+
+        // The clock, not the reader, completes the change.
+        tokio::time::sleep(SETTLE_WAIT).await;
+        let settled = progress_status(&emulator, &name, None).await;
+        let case = format!("DescribeDomainChangeProgress({option}, settled)");
+        assert_eq!(
+            (
+                settled["ChangeId"].as_str(),
+                settled["Status"].as_str(),
+                settled["ConfigChangeStatus"].as_str(),
+            ),
+            (
+                Some(change_id.as_str()),
+                Some("COMPLETED"),
+                Some("Completed")
+            ),
+            "case {case}: the same change is now COMPLETED/Completed, got {settled:?}"
+        );
+        assert_eq!(
+            string_list(&settled, "CompletedProperties", &case),
+            vec![option.to_string()],
+            "case {case}: the option this change set has completed, got {settled:?}"
+        );
+        assert!(
+            string_list(&settled, "PendingProperties", &case).is_empty(),
+            "case {case}: nothing is pending once the change has landed, got {settled:?}"
+        );
+        assert_eq!(
+            settled["StartTime"], start_time,
+            "case {case}: the start of a change does not move, got {:?} after {start_time:?}",
+            settled["StartTime"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_change_a_create_starts_reports_every_option_the_create_set() {
+    let emulator = Emulator::new();
+    // The rule holds whatever the create carried, so the names span three bodies:
+    // the baseline with every container, and two created with fewer members.
+    let rows: Vec<(&str, Value, Vec<String>)> = vec![
+        (
+            "full-create",
+            baseline_create("full-create"),
+            created_properties("full-create"),
+        ),
+        (
+            "bare-create",
+            json!({ "DomainName": "bare-create" }),
+            // Nothing but the members every domain holds: the engine version and
+            // cluster configuration a domain always has, the advanced options map
+            // that is empty rather than absent, and the two defaulted members.
+            vec![
+                "AdvancedOptions".to_string(),
+                "ClusterConfig".to_string(),
+                "EngineMode".to_string(),
+                "EngineVersion".to_string(),
+                "UseCase".to_string(),
+            ],
+        ),
+        (
+            "one-option-create",
+            json!({
+                "DomainName": "one-option-create",
+                "EngineVersion": "Elasticsearch_7.10",
+                "AccessPolicies": "{\"Version\":\"2012-10-17\"}",
+            }),
+            vec![
+                "AccessPolicies".to_string(),
+                "AdvancedOptions".to_string(),
+                "ClusterConfig".to_string(),
+                "EngineMode".to_string(),
+                "EngineVersion".to_string(),
+                "UseCase".to_string(),
+            ],
+        ),
+    ];
+
+    for (name, body, expected) in rows {
+        let created = emulator.create(body).await;
+        assert_eq!(
+            created.status, 200,
+            "case CreateDomain({name:?}): expected 200, got {} with {:?}",
+            created.status, created.body
+        );
+
+        let status = progress_status(&emulator, name, None).await;
+        let case = format!("DescribeDomainChangeProgress({name:?}, create)");
+        assert_eq!(
+            string_list(&status, "PendingProperties", &case),
+            expected,
+            "case {case}: expected the options the create set, got {status:?}"
+        );
+        assert_eq!(
+            status["Status"].as_str(),
+            Some("PROCESSING"),
+            "case {case}: a domain being created has a change in flight, got {status:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn every_change_keeps_its_own_id_and_the_latest_is_the_implicit_one() {
+    let emulator = Emulator::new();
+    // Spans the length of a domain's change history: the create alone (one change),
+    // then one, two and five updates on top of it (two, three and six changes).
+    for updates in [0usize, 1, 2, 5] {
+        let name = format!("history-{updates}");
+        create_baseline(&emulator, &name).await;
+
+        // (change id, the properties that change set) in the order they were started.
+        let mut history: Vec<(String, Vec<String>)> = vec![(
+            string_member(
+                &progress_status(&emulator, &name, None).await,
+                "ChangeId",
+                &format!("history-{updates}: create"),
+            ),
+            created_properties(&name),
+        )];
+
+        for (option, value, _) in change_rows().into_iter().take(updates) {
+            let answer = emulator
+                .update_config(&name, json!({ option: value }))
+                .await;
+            assert_eq!(
+                answer.status, 200,
+                "case UpdateDomainConfig({name:?}, {option}): expected 200, got {} with {:?}",
+                answer.status, answer.body
+            );
+            let status = progress_status(&emulator, &name, None).await;
+            history.push((
+                string_member(&status, "ChangeId", &format!("{name}: {option}")),
+                vec![option.to_string()],
+            ));
+        }
+
+        let ids: Vec<&String> = history.iter().map(|(id, _)| id).collect();
+        let mut distinct = ids.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(
+            distinct.len(),
+            ids.len(),
+            "case {name}: every change has its own id, got {ids:?}"
+        );
+
+        // Each change stays addressable by its own id, reporting the properties it
+        // set and not another change's.
+        for (change_id, properties) in &history {
+            let status = progress_status(&emulator, &name, Some(change_id)).await;
+            let case = format!("{name}: by id {change_id}");
+            assert_eq!(
+                status["ChangeId"].as_str(),
+                Some(change_id.as_str()),
+                "case {case}: expected the change that was asked for, got {status:?}"
+            );
+            let reported: Vec<String> = string_list(&status, "PendingProperties", &case)
+                .into_iter()
+                .chain(string_list(&status, "CompletedProperties", &case))
+                .collect();
+            assert_eq!(
+                reported, *properties,
+                "case {case}: expected the properties this change set, got {status:?}"
+            );
+        }
+
+        // "If omitted, the request returns information about the most recent
+        // configuration change."
+        let implicit = progress_status(&emulator, &name, None).await;
+        let (latest, _) = history
+            .last()
+            .expect("the create alone leaves one change in the history");
+        assert_eq!(
+            implicit["ChangeId"].as_str(),
+            Some(latest.as_str()),
+            "case {name}: a call naming no ChangeId reports the most recent change, got {implicit:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_absent_domain_or_change_is_the_modelled_not_found() {
+    let emulator = Emulator::new();
+    create_baseline(&emulator, "present-domain").await;
+    let known = string_member(
+        &progress_status(&emulator, "present-domain", None).await,
+        "ChangeId",
+        "present-domain",
+    );
+
+    // Rows: a domain that was never created, a domain that was deleted, a well-formed
+    // change id no change carries, and another domain's change id.
+    create_baseline(&emulator, "other-domain").await;
+    let other = string_member(
+        &progress_status(&emulator, "other-domain", None).await,
+        "ChangeId",
+        "other-domain",
+    );
+    let deleted = emulator
+        .call(
+            "DELETE",
+            &format!("{PREFIX}/opensearch/domain/other-domain"),
+            None,
+        )
+        .await;
+    assert_eq!(
+        deleted.status, 200,
+        "case DeleteDomain(other-domain): expected 200, got {} with {:?}",
+        deleted.status, deleted.body
+    );
+
+    for (name, change_id) in [
+        ("absent-domain", None),
+        ("absent-domain", Some(ABSENT_CHANGE_ID)),
+        ("other-domain", None),
+        ("present-domain", Some(ABSENT_CHANGE_ID)),
+        ("present-domain", Some(other.as_str())),
+    ] {
+        let answer = progress(&emulator, name, change_id).await;
+        assert_eq!(
+            answer.status, 409,
+            "case DescribeDomainChangeProgress({name:?}, {change_id:?}): expected 409, got {} \
+             with {:?}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            error_code(&answer),
+            "ResourceNotFoundException",
+            "case DescribeDomainChangeProgress({name:?}, {change_id:?}): expected \
+             ResourceNotFoundException, got {:?}",
+            answer.body
+        );
+    }
+
+    // The change that does exist is still reported: a refusal for one id does not
+    // disturb the record.
+    let status = progress_status(&emulator, "present-domain", Some(&known)).await;
+    assert_eq!(
+        status["ChangeId"].as_str(),
+        Some(known.as_str()),
+        "case DescribeDomainChangeProgress(present-domain, known): expected the stored change, \
+         got {status:?}"
+    );
+}
+
+#[tokio::test]
+async fn every_descriptor_of_a_domain_names_the_same_change() {
+    let emulator = Emulator::new();
+    let name = "descriptor-domain";
+    let created = create_baseline(&emulator, name).await;
+
+    // Both sides of the provisioning span, and after a second change: the change a
+    // full descriptor carries is always the one the progress call reports.
+    for stage in ["create", "create settled", "update"] {
+        if stage == "create settled" {
+            tokio::time::sleep(SETTLE_WAIT).await;
+        }
+        if stage == "update" {
+            let answer = emulator
+                .update_config(name, json!({ "SnapshotOptions": { "AutomatedSnapshotStartHour": 7 } }))
+                .await;
+            assert_eq!(
+                answer.status, 200,
+                "case UpdateDomainConfig({name:?}): expected 200, got {} with {:?}",
+                answer.status, answer.body
+            );
+        }
+
+        let progress = progress_status(&emulator, name, None).await;
+        let described = emulator.describe(name).await;
+        let configured = emulator.describe_config(name).await;
+        let descriptors = [
+            ("DescribeDomain", &described.body["DomainStatus"]["ChangeProgressDetails"]),
+            (
+                "DescribeDomainConfig",
+                &configured.body["DomainConfig"]["ChangeProgressDetails"],
+            ),
+        ];
+        for (reader, details) in descriptors {
+            let case = format!("{reader}({name:?}, {stage})");
+            for member in [
+                "ChangeId",
+                "ConfigChangeStatus",
+                "InitiatedBy",
+                "StartTime",
+                "LastUpdatedTime",
+            ] {
+                assert_eq!(
+                    details[member], progress[member],
+                    "case {case}: {member} must be the change DescribeDomainChangeProgress \
+                     reports ({:?}), got {:?}",
+                    progress[member], details[member]
+                );
+            }
+        }
+    }
+
+    // The create answer named a change too, and it is the one that was stored.
+    assert_guid(
+        &string_member(
+            &created["ChangeProgressDetails"],
+            "ChangeId",
+            "CreateDomain(ChangeProgressDetails)",
+        ),
+        "CreateDomain(ChangeProgressDetails)",
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_change_id_is_refused_by_the_modelled_constraint() {
+    let emulator = Emulator::new();
+    let name = "constrained-domain";
+    create_baseline(&emulator, name).await;
+
+    // `GUID` is `@length(min: 36, max: 36)` with the 8-4-4-4-12 hex pattern: each
+    // published bound and one past it, plus one row per character class the pattern
+    // refuses.
+    for change_id in [
+        // 35 characters: one short of the bound.
+        "00000000-0000-4000-8000-00000000000",
+        // 37 characters: one past it.
+        "00000000-0000-4000-8000-0000000000000",
+        // 36 characters, but not hexadecimal.
+        "zzzzzzzz-0000-4000-8000-000000000000",
+        // 36 characters, hexadecimal, but not grouped 8-4-4-4-12.
+        "000000000-000-4000-8000-000000000000",
+    ] {
+        let answer = progress(&emulator, name, Some(change_id)).await;
+        assert_eq!(
+            answer.status, 400,
+            "case DescribeDomainChangeProgress(changeid={change_id:?}): expected 400, got {} \
+             with {:?}",
+            answer.status, answer.body
+        );
+        assert_eq!(
+            error_code(&answer),
+            "ValidationException",
+            "case DescribeDomainChangeProgress(changeid={change_id:?}): expected \
+             ValidationException, got {:?}",
+            answer.body
+        );
+    }
+
+    // The bound itself is accepted: 36 hexadecimal characters in the published
+    // groups reach the handler, which answers for the change they name.
+    let answer = progress(&emulator, name, Some(ABSENT_CHANGE_ID)).await;
+    assert_eq!(
+        answer.status, 409,
+        "case DescribeDomainChangeProgress(changeid={ABSENT_CHANGE_ID:?}): a well-formed id \
+         reaches the handler, got {} with {:?}",
+        answer.status, answer.body
+    );
+}

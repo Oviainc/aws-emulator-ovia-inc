@@ -81,3 +81,5 @@ mod update_flow_media_stream;
 mod update_flow_output;
 #[path = "all/update_flow_source.rs"]
 mod update_flow_source;
+#[path = "all/update_router_output.rs"]
+mod update_router_output;

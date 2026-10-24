@@ -13,7 +13,7 @@
 use crate::ops::types::{
     Authorization, Channel, CmafPackage, CmafPackageCreateOrUpdateParameters, DashPackage,
     EgressAccessLogs, HarvestJob, HlsIngest, HlsManifest, HlsPackage, IngestEndpoint,
-    IngressAccessLogs, MssPackage, OriginEndpoint, S3Destination,
+    IngressAccessLogs, MssPackage, OriginEndpoint, S3Destination, SpekeKeyProvider,
 };
 use crate::scaffolded::ServiceError;
 use aws_smithy_schema_server::constraints::{Violation, ViolationKind};
@@ -609,6 +609,313 @@ pub fn bound_origin_endpoint_members(
         }
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// What an endpoint's access-control and packaging members have to NAME
+//
+// The bounds above judge a member by SIZE; the rules below judge it by CONTENT. Each of
+// these members names something OUTSIDE the request that the egress tier or the packager
+// has to act on — an address range to admit, a secret to read, a role to assume, the
+// manifests to publish — so a value this service could never act on is refused with
+// `UnprocessableEntityException` (422) before anything is stored, instead of being kept
+// and reported as live configuration that silently matches, reads or publishes nothing.
+//
+// The model targets every one of them at the bare `__string` (or at an unbounded list)
+// and publishes no `@pattern` on any of them
+// (`smithy_query(query="shape",shape="com.amazonaws.mediapackage#Authorization,com.amazonaws.mediapackage#SpekeKeyProvider,com.amazonaws.mediapackage#CmafPackageCreateOrUpdateParameters",model_path="services/service-com-amazonaws-mediapackage-mediapackage/smithy-model/com-amazonaws-mediapackage-mediapackage.json")`),
+// so the framework's constraint walk cannot refuse any of it: the rule is the service's
+// own, enforced here for EVERY member of each class rather than for the one a client
+// happened to get wrong, and by the one function both the create and the update call.
+// ---------------------------------------------------------------------------
+
+/// Whether `value` is an IP CIDR block: an IP address, `/`, and a prefix length no wider
+/// than that address family allows (32 bits for IPv4, 128 for IPv6).
+///
+/// `Whitelist` is "a list of source IP CIDR blocks that will be allowed to access the
+/// OriginEndpoint" (`smithy_query(query="operation",operation="CreateOriginEndpoint")`),
+/// and that documentation names no address family, so an address of EITHER family names a
+/// source range the egress tier could match and is admitted. Host bits are not required to
+/// be zero: `10.0.0.1/32` and `10.0.0.1/8` each name a range that contains the address,
+/// which is how AWS writes a single-host rule.
+///
+/// The address itself is parsed by `std::net::IpAddr`, so no hand-written address grammar
+/// decides what an address is — which is what refuses an octet out of range, an address
+/// with too few octets, and a prefix length that is not a number or is wider than the
+/// family. A value carrying no `/` at all names one address rather than a range, so it is
+/// not a CIDR block either, and the prefix length has to be DECIMAL DIGITS: a sign or a
+/// leading zero is not how a CIDR block is written, and `u8::from_str` alone would admit
+/// both.
+pub fn is_cidr_block(value: &str) -> bool {
+    let Some((address, prefix_length)) = value.split_once('/') else {
+        return false;
+    };
+    let written_as_digits = !prefix_length.is_empty()
+        && prefix_length.bytes().all(|byte| byte.is_ascii_digit())
+        && (prefix_length == "0" || !prefix_length.starts_with('0'));
+    if !written_as_digits {
+        return false;
+    }
+    let Ok(address) = address.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    let Ok(prefix_length) = prefix_length.parse::<u8>() else {
+        return false;
+    };
+    let bits = match address {
+        std::net::IpAddr::V4(_) => 32,
+        std::net::IpAddr::V6(_) => 128,
+    };
+    prefix_length <= bits
+}
+
+/// The member a refused `Whitelist` entry is reported against, as the wire names it.
+pub const WHITELIST_MEMBER: &str = "whitelist";
+
+/// Refuse a `Whitelist` carrying an entry that is not an address range at all.
+///
+/// An entry is an access-control rule the egress tier matches a request's source address
+/// against, so a value that is not a CIDR block ([`is_cidr_block`]) could never admit
+/// anybody: it is refused rather than stored as a rule that matches nothing. The refusal
+/// is keyed by the member and NAMES the entry that failed, so the caller can fix the
+/// request from the error alone; entries are judged in the request's own order, so one
+/// request is always refused by the same entry.
+pub fn check_whitelist(whitelist: Option<&[String]>) -> Result<(), ServiceError> {
+    for entry in whitelist.into_iter().flatten() {
+        if !is_cidr_block(entry) {
+            return Err(member_invalid(
+                WHITELIST_MEMBER,
+                format!("must carry source IP CIDR blocks; {entry:?} is not one"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// What a member DOCUMENTED as the ARN of a particular AWS resource has to name.
+///
+/// MediaPackage resolves such a member up front — it READS the secret and ASSUMES the role
+/// the value names — so a value that is not an ARN of the documented service, or names
+/// another kind of resource in it, names nothing this service could act on: the request is
+/// a parameter violation (422, keyed by the member) rather than a resource that happens to
+/// be missing.
+///
+/// The type, the rule and the constants below are the SHARED ones
+/// ([`::service_common::arn::Requirement`]): every service that binds a caller-supplied
+/// resource ARN reads it against the same requirement, so no two of them disagree about
+/// what "the ARN of an IAM role" is. What stays here is which of THIS model's members are
+/// ARNs ([`origin_endpoint_arn_members`]) and the envelope the refusal travels in.
+pub type ArnRequirement = ::service_common::arn::Requirement;
+
+/// An IAM role MediaPackage assumes: `Authorization$SecretsRoleArn` is "the ARN for the IAM
+/// role that allows MediaPackage to communicate with AWS Secrets Manager",
+/// `SpekeKeyProvider$RoleArn` "an ARN of an IAM role that AWS Elemental MediaPackage will
+/// assume when accessing the key provider service", and `S3Destination$RoleArn` "the IAM
+/// role used to write to the specified S3 bucket".
+pub const IAM_ROLE_ARN: ArnRequirement = ::service_common::arn::IAM_ROLE;
+
+/// A secret in AWS Secrets Manager: `Authorization$CdnIdentifierSecret` is "the ARN for the
+/// secret in Secrets Manager that your Content Distribution Network (CDN) uses for
+/// authorization to access your endpoint".
+pub const SECRETS_MANAGER_SECRET_ARN: ArnRequirement =
+    ::service_common::arn::SECRETS_MANAGER_SECRET;
+
+/// A certificate in AWS Certificate Manager: `SpekeKeyProvider$CertificateArn` is "an ARN
+/// of a Certificate Manager certificate that MediaPackage will use for enforcing secure
+/// end-to-end data transfer with the key provider service".
+pub const ACM_CERTIFICATE_ARN: ArnRequirement = ::service_common::arn::ACM_CERTIFICATE;
+
+/// Refuse a member whose value is not the ARN its documentation requires, keyed by the
+/// member path the wire names.
+pub fn check_arn_member(
+    member: &str,
+    value: &str,
+    requirement: ArnRequirement,
+) -> Result<(), ServiceError> {
+    if requirement.admits(value) {
+        return Ok(());
+    }
+    Err(member_invalid(member, requirement.phrase()))
+}
+
+/// One ARN-documented member of a request: the wire path it travels under, the value it
+/// carries, and the ARN it has to be.
+type ArnMember<'a> = (String, &'a str, ArnRequirement);
+
+/// The ARN-documented members of one packaging block's SPEKE key provider, under that
+/// block's own wire path.
+///
+/// The provider sits at the same place under all four packaging formats, so the same two
+/// requirements are read under each one's path rather than once per format.
+fn speke_arn_members<'a>(block: &str, provider: &'a SpekeKeyProvider) -> Vec<ArnMember<'a>> {
+    let path = format!("{block}.encryption.spekeKeyProvider");
+    let mut members = vec![(
+        format!("{path}.roleArn"),
+        provider.role_arn.as_str(),
+        IAM_ROLE_ARN,
+    )];
+    if let Some(certificate_arn) = provider.certificate_arn.as_deref() {
+        members.push((
+            format!("{path}.certificateArn"),
+            certificate_arn,
+            ACM_CERTIFICATE_ARN,
+        ));
+    }
+    members
+}
+
+/// EVERY member of an OriginEndpoint create or update request that the model documents as
+/// an ARN, with the requirement each one has to satisfy.
+///
+/// The complete set, from
+/// `smithy_query(query="shape",shape="com.amazonaws.mediapackage#Authorization,com.amazonaws.mediapackage#SpekeKeyProvider",model_path="services/service-com-amazonaws-mediapackage-mediapackage/smithy-model/com-amazonaws-mediapackage-mediapackage.json")`:
+/// the two members of a CDN `Authorization` block, and the role and certificate of the
+/// SPEKE key provider inside whichever packaging block carries an `Encryption`. Both the
+/// create and the update read the same list, so neither can store an ARN the other would
+/// have refused.
+fn origin_endpoint_arn_members<'a>(
+    authorization: Option<&'a Authorization>,
+    hls_package: Option<&'a HlsPackage>,
+    dash_package: Option<&'a DashPackage>,
+    cmaf_package: Option<&'a CmafPackageCreateOrUpdateParameters>,
+    mss_package: Option<&'a MssPackage>,
+) -> Vec<ArnMember<'a>> {
+    let mut members: Vec<ArnMember<'a>> = Vec::new();
+    if let Some(authorization) = authorization {
+        members.push((
+            "authorization.cdnIdentifierSecret".to_string(),
+            authorization.cdn_identifier_secret.as_str(),
+            SECRETS_MANAGER_SECRET_ARN,
+        ));
+        members.push((
+            "authorization.secretsRoleArn".to_string(),
+            authorization.secrets_role_arn.as_str(),
+            IAM_ROLE_ARN,
+        ));
+    }
+    let providers = [
+        hls_package
+            .and_then(|package| package.encryption.as_ref())
+            .map(|encryption| ("hlsPackage", &encryption.speke_key_provider)),
+        dash_package
+            .and_then(|package| package.encryption.as_ref())
+            .map(|encryption| ("dashPackage", &encryption.speke_key_provider)),
+        cmaf_package
+            .and_then(|package| package.encryption.as_ref())
+            .map(|encryption| ("cmafPackage", &encryption.speke_key_provider)),
+        mss_package
+            .and_then(|package| package.encryption.as_ref())
+            .map(|encryption| ("mssPackage", &encryption.speke_key_provider)),
+    ];
+    for (block, provider) in providers.into_iter().flatten() {
+        members.extend(speke_arn_members(block, provider));
+    }
+    members
+}
+
+/// The fewest child HLS manifests a CMAF package may publish.
+///
+/// `CmafPackage$HlsManifests` is "a list of HLS manifest configurations" and an endpoint's
+/// CMAF playback URL ends in one of those child manifests
+/// ([`cmaf_manifest_url`]), so a package carrying none publishes nothing for the playback
+/// URL to serve. One is therefore the minimum, and the model's own absence of a `@length`
+/// on the list is why this is the service's rule rather than a modelled constraint.
+pub const MIN_CMAF_HLS_MANIFESTS: usize = 1;
+
+/// The member a refused CMAF manifest list is reported against, as the wire names it.
+pub const CMAF_HLS_MANIFESTS_MEMBER: &str = "cmafPackage.hlsManifests";
+
+/// The requirement a CMAF manifest list carrying `count` manifests failed: the minimum, in
+/// the wording every other bounded collection here uses.
+///
+/// Built here rather than written at the one call site, so the sentence and the minimum
+/// cannot disagree and the suite asserting it reads the service's own words. The noun agrees
+/// with the minimum, so raising [`MIN_CMAF_HLS_MANIFESTS`] does not produce
+/// "at least 2 manifest".
+pub fn cmaf_manifests_requirement(count: usize) -> String {
+    let manifests = if MIN_CMAF_HLS_MANIFESTS == 1 {
+        "manifest"
+    } else {
+        "manifests"
+    };
+    format!("must carry at least {MIN_CMAF_HLS_MANIFESTS} {manifests}, got {count}")
+}
+
+/// Refuse a `CmafPackage` that publishes no child manifest at all — an empty
+/// `HlsManifests` list, or none.
+///
+/// Judged only when the request names a CMAF package: a request that names another
+/// packaging format carries no CMAF manifest list to be short.
+pub fn require_cmaf_hls_manifests(
+    cmaf_package: Option<&CmafPackageCreateOrUpdateParameters>,
+) -> Result<(), ServiceError> {
+    let Some(package) = cmaf_package else {
+        return Ok(());
+    };
+    let count = package.hls_manifests.as_ref().map_or(0, Vec::len);
+    if count < MIN_CMAF_HLS_MANIFESTS {
+        return Err(member_invalid(
+            CMAF_HLS_MANIFESTS_MEMBER,
+            cmaf_manifests_requirement(count),
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse an OriginEndpoint create or update whose access-control or packaging members name
+/// something this service could not act on.
+///
+/// Both handlers call this, so the rules one enforces cannot drift from the other's: an
+/// update must not be able to store a whitelist entry, an ARN or a packaging block a create
+/// of it would have refused. Nothing here reads state, so a refused request is refused
+/// before anything is written.
+pub fn check_origin_endpoint_members(
+    whitelist: Option<&[String]>,
+    authorization: Option<&Authorization>,
+    hls_package: Option<&HlsPackage>,
+    dash_package: Option<&DashPackage>,
+    cmaf_package: Option<&CmafPackageCreateOrUpdateParameters>,
+    mss_package: Option<&MssPackage>,
+) -> Result<(), ServiceError> {
+    check_whitelist(whitelist)?;
+    for (member, value, requirement) in origin_endpoint_arn_members(
+        authorization,
+        hls_package,
+        dash_package,
+        cmaf_package,
+        mss_package,
+    ) {
+        check_arn_member(&member, value, requirement)?;
+    }
+    require_cmaf_hls_manifests(cmaf_package)
+}
+
+/// Every IAM role an OriginEndpoint create or update asks MediaPackage to ASSUME, by the
+/// wire path of the member naming it.
+///
+/// The CDN authorization secrets role (MediaPackage reads the CDN secret as it) and the
+/// SPEKE key provider's role (MediaPackage reaches the key provider as it) — the subset of
+/// [`origin_endpoint_arn_members`] whose requirement is [`IAM_ROLE_ARN`], so a role member
+/// added to the list above is pre-flighted here without being named twice. Owned values, so
+/// the caller can hold them across taking the IAM store's guard.
+pub fn origin_endpoint_assumed_roles(
+    authorization: Option<&Authorization>,
+    hls_package: Option<&HlsPackage>,
+    dash_package: Option<&DashPackage>,
+    cmaf_package: Option<&CmafPackageCreateOrUpdateParameters>,
+    mss_package: Option<&MssPackage>,
+) -> Vec<(String, String)> {
+    origin_endpoint_arn_members(
+        authorization,
+        hls_package,
+        dash_package,
+        cmaf_package,
+        mss_package,
+    )
+    .into_iter()
+    .filter(|(_, _, requirement)| *requirement == IAM_ROLE_ARN)
+    .map(|(member, value, _)| (member, value.to_string()))
+    .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1440,12 +1747,14 @@ pub fn service_state<Eng: Send + Sync + 'static>(
 // record's own section, because neither is a property of a stored job.
 // ---------------------------------------------------------------------------
 
-/// The service principal MediaPackage assumes a harvest job's `S3Destination.RoleArn` as.
+/// The service principal MediaPackage assumes a CALLER-SUPPLIED role as — a harvest job's
+/// `S3Destination.RoleArn`, a CDN authorization's `SecretsRoleArn`, a SPEKE key provider's
+/// `RoleArn`.
 ///
-/// A harvest writes to the caller's bucket as that role, so the role's trust policy has to
-/// let this principal assume it — the same up-front check every service that acts as a
-/// caller-supplied role makes.
-pub const HARVEST_SERVICE_PRINCIPAL: &str = "mediapackage.amazonaws.com";
+/// The service acts as that role (writing to the caller's bucket, reading the CDN secret,
+/// reaching the key provider), so the role's trust policy has to let this principal assume
+/// it — the same up-front check every service that acts as a caller-supplied role makes.
+pub const SERVICE_PRINCIPAL: &str = "mediapackage.amazonaws.com";
 
 /// The instant an ISO-8601 date-time names, in NANOSECONDS since the epoch.
 ///
@@ -1531,34 +1840,46 @@ pub fn iam_state<Eng: Send + Sync + 'static>(
     ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state::service_state(engine)
 }
 
-/// `None` when this emulator has no reason to think MediaPackage could not write to the
-/// destination as `role_arn`; otherwise the refusal that answers the submission.
+/// The member a harvest job's destination role travels under, which its refusal is keyed
+/// by (`S3Destination$RoleArn` is `@jsonName("roleArn")` inside `s3Destination`).
+pub const HARVEST_ROLE_MEMBER: &str = "s3Destination.roleArn";
+
+/// `None` when this emulator has no reason to think MediaPackage could not act as the role
+/// `role_arn` that `member` names; otherwise the refusal that answers the request.
 ///
-/// A harvest job writes the exported content to the caller's bucket AS that role, so the
-/// service checks up front that the role's trust policy lets
-/// [`HARVEST_SERVICE_PRINCIPAL`] assume it and refuses the submission when it does not.
-/// The role is resolved against the account's IAM records — the same records `CreateRole`
-/// wrote — by its ARN. An ARN the IAM store holds no role for is NOT evidence of a missing
-/// trust (the role may belong to another account, or to a client that never told this
-/// emulator about it), so the submission goes ahead; only a role this emulator holds and
-/// whose trust policy withholds the grant is refused.
-pub fn harvest_role_refusal(role_arn: &str, iam: &IamState) -> Option<ServiceError> {
+/// MediaPackage acts AS a caller-supplied role — it writes a harvest to the caller's bucket
+/// as the destination role, reads the CDN secret as the authorization role, reaches the key
+/// provider as the SPEKE role — so the service checks up front that the role's trust policy
+/// lets [`SERVICE_PRINCIPAL`] assume it and refuses the request when it does not. The role
+/// is resolved against the account's IAM records — the same records `CreateRole` wrote — by
+/// its ARN. An ARN the IAM store holds no role for is NOT evidence of a missing trust (the
+/// role may belong to another account, or to a client that never told this emulator about
+/// it), so the request goes ahead; only a role this emulator holds and whose trust policy
+/// withholds the grant is refused.
+///
+/// ONE function for every such member: the rule is about the role, not about the operation
+/// that named it, so `member` is the only thing that differs between its callers.
+pub fn assume_role_refusal(member: &str, role_arn: &str, iam: &IamState) -> Option<ServiceError> {
     let role = iam.roles.values().find(|role| role.arn == role_arn)?;
     let document = role.assume_role_policy_document.as_deref()?;
-    match ::service_common::iam_trust_policy::admits_service_principal(
-        document,
-        HARVEST_SERVICE_PRINCIPAL,
-    ) {
+    let admits =
+        ::service_common::iam_trust_policy::admits_service_principal(document, SERVICE_PRINCIPAL);
+    match admits {
         // A document this emulator cannot read as a policy is no evidence either way.
         None | Some(true) => None,
         Some(false) => Some(member_invalid(
-            "s3Destination.roleArn",
+            member,
             format!(
-                "names a role {HARVEST_SERVICE_PRINCIPAL} cannot assume: check the trust \
+                "names a role {SERVICE_PRINCIPAL} cannot assume: check the trust \
                  policy grants it sts:AssumeRole"
             ),
         )),
     }
+}
+
+/// [`assume_role_refusal`] for a harvest job's destination role.
+pub fn harvest_role_refusal(role_arn: &str, iam: &IamState) -> Option<ServiceError> {
+    assume_role_refusal(HARVEST_ROLE_MEMBER, role_arn, iam)
 }
 
 /// The modelled `Tags` map (`map<string,string>`) for a stored tag set.

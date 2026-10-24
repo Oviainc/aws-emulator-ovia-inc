@@ -17,6 +17,10 @@
 //! `TagValue` 256). Every case drives the real wire path through the shared `Harness`
 //! (see `workflow_lifecycle`), so what is asserted is what a client sees.
 
+use std::time::Duration;
+
+use service_com_amazonaws_mwaaserverless_amazonmwaaserverless::state::WORKFLOW_DELETED_AFTER;
+
 use crate::missing_resource_lookups::{ghost_arns, LOOKUP_MISS_STATUS, WORKFLOW_MISSING};
 use crate::workflow_lifecycle::{role_arn, Harness};
 
@@ -337,6 +341,10 @@ async fn an_arn_no_resource_has_is_a_lookup_miss() {
         "case stored resource: expected DeleteWorkflow to succeed, got {status} {deleted:?}"
     );
 
+    // `DeleteWorkflow` starts an asynchronous teardown: the workflow (and so its tags)
+    // is still readable while it reports `DELETING`, and goes once the removal the
+    // clock owes falls due (`workflow_deletion_teardown` asserts both phases).
+    tokio::time::sleep(WORKFLOW_DELETED_AFTER + Duration::from_millis(200)).await;
     let (status, answered) = harness
         .call(
             "ListTagsForResource",

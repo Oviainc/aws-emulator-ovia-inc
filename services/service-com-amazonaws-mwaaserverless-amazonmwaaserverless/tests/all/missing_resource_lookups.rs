@@ -11,6 +11,10 @@
 //! called, which reference is absent (workflow / version / run), and the form, length
 //! and region of the absent identifier. The fixture's own request is one row of it.
 
+use std::time::Duration;
+
+use service_com_amazonaws_mwaaserverless_amazonmwaaserverless::state::WORKFLOW_DELETED_AFTER;
+
 use crate::workflow_lifecycle::{role_arn, Harness};
 
 /// The status the recorded service answers a lookup miss with (fixture
@@ -336,6 +340,10 @@ async fn a_resolvable_reference_still_succeeds_after_the_refusals() {
     );
 
     // And once it is gone, the very same ARN is refused like any other absent one.
+    // `DeleteWorkflow` starts an asynchronous teardown and the workflow reports
+    // `DELETING` while it runs, so "gone" is what the store holds once the removal the
+    // clock owes has fallen due (`workflow_deletion_teardown` asserts that phase).
+    tokio::time::sleep(WORKFLOW_DELETED_AFTER + Duration::from_millis(200)).await;
     for (operation, body, expected) in [
         (
             "GetWorkflow",

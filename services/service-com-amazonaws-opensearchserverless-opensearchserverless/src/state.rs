@@ -27,7 +27,8 @@ use crate::ops::types::{
     FipsEndpoints, IamFederationConfigOptions, IamIdentityCenterConfigOptions,
     LifecyclePolicyDetail, LifecyclePolicyErrorDetail, SamlConfigOptions, SecurityConfigDetail,
     SecurityConfigSummary, SecurityPolicyDetail, SecurityPolicySummary, Tag,
-    UpdateCollectionGroupDetail, UpdateIamIdentityCenterConfigOptions, VectorOptions,
+    UpdateCollectionDetail, UpdateCollectionGroupDetail, UpdateIamIdentityCenterConfigOptions,
+    VectorOptions,
 };
 
 /// This service's ARN namespace, from the model's `aws.api#service` trait
@@ -61,6 +62,8 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 pub const COLLECTION_CREATING: &str = "CREATING";
 /// `CollectionStatus$ACTIVE` — "Collection resource is ready to use".
 pub const COLLECTION_ACTIVE: &str = "ACTIVE";
+/// `CollectionStatus$UPDATING` — "Updating collection resource".
+pub const COLLECTION_UPDATING: &str = "UPDATING";
 /// `CollectionStatus$DELETING` — "Deleting collection resource".
 pub const COLLECTION_DELETING: &str = "DELETING";
 /// `CollectionStatus$FAILED` — "Collection resource create or delete failed".
@@ -157,13 +160,15 @@ pub const ERROR_MESSAGE_NOT_FOUND: &str = "The specified Collection is not found
 pub const ERROR_MESSAGE_LIFECYCLE_POLICY_NOT_FOUND: &str =
     "The specified Lifecycle Policy is not found.";
 
-/// How long after `CreateCollection` the `CREATING -> ACTIVE` transition falls due.
+/// How long after the call that starts it a collection's clock-owed transition falls due:
+/// `CREATING -> ACTIVE` after a create, `UPDATING -> ACTIVE` after an update, and the
+/// PURGE of a `DELETING` collection after a delete.
 ///
 /// A span this emulator chooses, not a duration the service documents: a collection is
-/// returned in the non-terminal `CREATING` status, so it reaches `ACTIVE` on its own a
-/// moment later with nobody calling. It only has to be long enough that a caller acting
-/// straight after the create still observes `CREATING` and the state errors that go with
-/// it, and short enough to poll through.
+/// returned in a non-terminal status, so it settles on its own a moment later with nobody
+/// calling. It only has to be long enough that a caller acting straight after the call
+/// still observes the transient status and the state errors that go with it, and short
+/// enough to poll through.
 const SETTLE_AFTER: Duration = Duration::from_millis(500);
 
 /// The account's collection quota in one Region, from AWS's "Quotas for Amazon OpenSearch
@@ -174,6 +179,21 @@ pub const MAX_COLLECTIONS: usize = 50;
 /// The account's quota for security policies of ONE type in one Region, from the same
 /// quota page: 20 encryption policies and 20 network policies per account.
 pub const MAX_SECURITY_POLICIES_PER_TYPE: usize = 20;
+
+/// The most tags one resource carries, from `Tags`' own `@length(min: 0, max: 50)` — the
+/// bound `TagResource` is refused past, since that write can take a resource over a
+/// maximum no single request's `tags` list breaks.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
+/// The most indexes this emulator stores in one collection.
+///
+/// Emulator resource guard, NOT a quota AWS publishes: the OpenSearch Serverless quota
+/// page lists no per-collection index limit, and `CreateIndex` adds one caller-named entry
+/// per request to a collection that may live forever, so this bound is what keeps that
+/// store finite. It is answered with the modelled `ServiceQuotaExceededException`'s
+/// stand-in for this operation — `CreateIndex` declares no quota error, so the refusal is
+/// its `ValidationException` — and it is set far above any realistic client workflow.
+pub const MAX_INDEXES_PER_COLLECTION: usize = 100;
 
 /// The account's quota for security configurations of ONE type in one Region: 50
 /// (adjustable on request, so this is the DEFAULT quota), which is what the real service's
@@ -421,6 +441,23 @@ pub struct PendingStatus {
     pub status: &'static str,
 }
 
+/// One index stored inside a collection, keyed by its `IndexName`.
+///
+/// An index belongs to exactly one collection (`CreateIndex` addresses it by the
+/// collection's `id` plus the index name), so it is held ON the collection record: a
+/// purged collection takes its indexes with it and no second map can outlive it.
+///
+/// Only the members an operation of this slice REPORTS are held: `GetIndex` answers
+/// `indexSchema`, the index's name is the key it is stored under, and the model gives an
+/// index no timestamps.
+#[derive(Debug, Clone)]
+pub struct IndexRecord {
+    /// `IndexSchema`, held as the document the create carried — `GetIndex` reports it
+    /// back. `None` for an index created without one, which the model allows
+    /// (`indexSchema` is not `@required`).
+    pub index_schema: Option<::aws_smithy_types::Document>,
+}
+
 /// One stored collection. Every field a reader reports is held here; nothing is
 /// recomputed from a request.
 #[derive(Debug, Clone)]
@@ -449,8 +486,14 @@ pub struct CollectionRecord {
     /// so they are reached through the tagging operations (still stubs) rather than
     /// echoed on a read.
     pub tags: Vec<Tag>,
+    /// The indexes this collection holds, by `IndexName`.
+    pub indexes: BTreeMap<String, IndexRecord>,
     /// The transition the clock owes this collection, while one is outstanding.
     pub pending_status: Option<PendingStatus>,
+    /// When this collection's accepted deletion is due to be PURGED — the instant from
+    /// which it stops being a collection any read reports at all. Set by
+    /// [`Self::begin_deletion`], which is also what moves it to `DELETING`.
+    pub purge_at: Option<Instant>,
 }
 
 impl CollectionRecord {
@@ -472,6 +515,43 @@ impl CollectionRecord {
         if let Some(pending) = self.pending_status.take_if(|pending| now >= pending.due_at) {
             self.status = pending.status.to_string();
         }
+    }
+
+    /// Accept this collection's deletion: report it `DELETING` from now, and owe its PURGE
+    /// from [`SETTLE_AFTER`] onwards.
+    ///
+    /// `DeleteCollection` answers `deleteCollectionDetail` with status `DELETING`, and the
+    /// collection stays readable in that status until the purge, so a caller polling the
+    /// deletion observes it rather than seeing the resource vanish in one step.
+    pub fn begin_deletion(&mut self, deleted_at: i64) {
+        self.status = COLLECTION_DELETING.to_string();
+        // A delete supersedes whatever transition was outstanding: the only thing still
+        // owed on this collection is the purge.
+        self.pending_status = None;
+        self.purge_at = Some(Instant::now() + SETTLE_AFTER);
+        self.last_modified_date = deleted_at;
+    }
+
+    /// Whether this collection's deletion has been accepted, so the only thing still owed
+    /// on it is the purge.
+    ///
+    /// Read off `purge_at`, the ONE record of an accepted deletion:
+    /// [`Self::begin_deletion`] is what sets it, and it sets the `DELETING` status with it.
+    pub fn is_deleting(&self) -> bool {
+        self.purge_at.is_some()
+    }
+
+    /// Whether the clock has already made this collection's purge due at `now`.
+    pub fn is_purge_due(&self, now: Instant) -> bool {
+        self.purge_at.is_some_and(|due_at| now >= due_at)
+    }
+
+    /// Accept an update of this collection: report it `UPDATING` from now, settling back
+    /// to `ACTIVE` once the clock makes that due. `CollectionStatus` models `UPDATING`
+    /// beside `ACTIVE` for exactly this span.
+    pub fn begin_update(&mut self, updated_at: i64) {
+        self.begin_transition(COLLECTION_UPDATING, COLLECTION_ACTIVE);
+        self.last_modified_date = updated_at;
     }
 
     /// The `CreateCollectionDetail` body for this record — the one place this crate
@@ -539,13 +619,31 @@ impl CollectionRecord {
         }
     }
 
-    /// The `DeleteCollectionDetail` body for this record, as the delete that removed it
+    /// The `DeleteCollectionDetail` body for this record, as the delete that accepted it
     /// reports it.
     pub fn delete_detail(&self) -> DeleteCollectionDetail {
         DeleteCollectionDetail {
             id: Some(self.id.clone()),
             name: Some(self.name.clone()),
             status: Some(self.status.clone()),
+            deletion_protection: Some(self.deletion_protection.clone()),
+        }
+    }
+
+    /// The `UpdateCollectionDetail` body for this record — the one place this crate
+    /// renders that shape. The shape models no endpoints and no `standbyReplicas`, so it
+    /// reports the members the model declares and nothing else.
+    pub fn update_detail(&self) -> UpdateCollectionDetail {
+        UpdateCollectionDetail {
+            id: Some(self.id.clone()),
+            name: Some(self.name.clone()),
+            status: Some(self.status.clone()),
+            r#type: Some(self.kind.clone()),
+            description: self.description.clone(),
+            vector_options: self.vector_options.clone(),
+            arn: Some(self.arn.clone()),
+            created_date: Some(self.created_date),
+            last_modified_date: Some(self.last_modified_date),
             deletion_protection: Some(self.deletion_protection.clone()),
         }
     }
@@ -1575,6 +1673,158 @@ pub fn collection_error_for_name(name: &str) -> CollectionErrorDetail {
     }
 }
 
+/// The `SecurityPolicyType` whose policies say how a collection is encrypted
+/// (`smithy_query(query="shape", shape="SecurityPolicyType")` -> `encryption`).
+pub const SECURITY_POLICY_TYPE_ENCRYPTION: &str = "encryption";
+
+/// The `resourceType` a quota refusal names for a TAGGED resource: the collections this
+/// slice tags are `collection` resources (the segment their ARN carries,
+/// `…:collection/<id>`).
+pub const TAGGED_RESOURCE_TYPE: &str = "collection";
+
+/// The `ResourceType` a security-policy rule carries for a rule about collections, and the
+/// prefix its `Resource` patterns are written with: AWS's security-policy documentation
+/// spells those patterns `collection/<name>`.
+pub const POLICY_COLLECTION_RESOURCE_TYPE: &str = "collection";
+
+/// The key an encryption policy assigns to the collection it covers.
+#[derive(Debug, Clone)]
+pub struct PolicyEncryption {
+    /// The customer managed key the policy names, or `None` when it assigns the
+    /// AWS-owned key — the case [`AWS_OWNED_KEY`] is reported for.
+    pub kms_key_arn: Option<String>,
+}
+
+/// The statement of `policy` whose `Rules` cover `resource`, if one does.
+///
+/// A policy document is either one statement object or a list of them (a network policy is
+/// written as a list; an encryption policy as a single object), so both spellings are
+/// walked. The statement is answered rather than a bare `bool` because the key the policy
+/// assigns sits on the SAME statement as the rule that matched.
+fn covering_statement<'a>(
+    policy: &'a ::aws_smithy_types::Document,
+    resource: &str,
+) -> Option<&'a ::aws_smithy_types::Document> {
+    use ::aws_smithy_types::Document;
+
+    let statements: Vec<&Document> = match policy {
+        Document::Array(items) => items.iter().collect(),
+        single => vec![single],
+    };
+    statements
+        .into_iter()
+        .find(|statement| statement_covers(statement, resource))
+}
+
+/// Whether one policy statement's `Rules` cover `resource`.
+fn statement_covers(statement: &::aws_smithy_types::Document, resource: &str) -> bool {
+    use ::aws_smithy_types::Document;
+
+    let Document::Object(members) = statement else {
+        return false;
+    };
+    let rules: Vec<&Document> = match members.get("Rules") {
+        Some(Document::Array(items)) => items.iter().collect(),
+        Some(single) => vec![single],
+        None => Vec::new(),
+    };
+    rules.into_iter().any(|rule| rule_covers(rule, resource))
+}
+
+/// Whether one `Rules` entry applies to `resource`: a rule about collections, naming a
+/// `Resource` pattern that matches.
+///
+/// AWS's security-policy documentation writes such a pattern as `collection/<name>`, with
+/// a wildcard allowed to match a prefix (`collection/log*`, `collection/*`); the match
+/// itself is [`resource_pattern_matches`], the one `*` walk this module has, so a policy's
+/// rule and a listing's filter cannot read the same pattern differently.
+fn rule_covers(rule: &::aws_smithy_types::Document, resource: &str) -> bool {
+    use ::aws_smithy_types::Document;
+
+    let Document::Object(members) = rule else {
+        return false;
+    };
+    let about_collections = matches!(
+        members.get("ResourceType"),
+        Some(Document::String(kind)) if kind == POLICY_COLLECTION_RESOURCE_TYPE
+    );
+    if !about_collections {
+        return false;
+    }
+    let patterns: Vec<&Document> = match members.get("Resource") {
+        Some(Document::Array(items)) => items.iter().collect(),
+        Some(single) => vec![single],
+        None => Vec::new(),
+    };
+    patterns.into_iter().any(|pattern| match pattern {
+        Document::String(pattern) => resource_pattern_matches(pattern, resource),
+        _ => false,
+    })
+}
+
+/// How this service words a collection that is not there, from its id.
+pub fn collection_not_found_message(id: &str) -> String {
+    format!("Collection with ID {id} is not found")
+}
+
+/// How the index operations word a collection id that names no collection. `CreateIndex`
+/// and `GetIndex` address the COLLECTION by id, so the refusal names that collection.
+pub fn index_collection_not_found_message(id: &str) -> String {
+    format!("The Collection with Id '{id}' does not exist.")
+}
+
+/// Hold an `IndexName` to the rule `CreateIndexRequest$indexName` documents: "Index names
+/// must be lowercase and can't begin with underscores (_) or hyphens (-)".
+///
+/// `IndexName` carries no `@length` and no `@pattern`, so the boundary validator narrows
+/// nothing here; an empty name is refused too, since an index has to be named to be
+/// addressable at all. The message names the member and the constraint it failed, the way
+/// the validation layer words one.
+pub fn validate_index_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("indexName must not be empty".to_string());
+    }
+    if name.starts_with('_') || name.starts_with('-') {
+        return Err(format!(
+            "Value '{name}' at 'indexName' failed to satisfy constraint: Member must not begin \
+             with an underscore (_) or a hyphen (-)"
+        ));
+    }
+    if name.chars().any(char::is_uppercase) {
+        return Err(format!(
+            "Value '{name}' at 'indexName' failed to satisfy constraint: Member must be lowercase"
+        ));
+    }
+    Ok(())
+}
+
+/// How this service words a RESOURCE ARN that names no collection this account holds: by
+/// the collection id the ARN carries where it carries one (`…:collection/<id>`), and by
+/// the ARN itself otherwise, since there is no id in it to name.
+pub fn resource_not_found_message(arn: &str) -> String {
+    match arn
+        .rsplit_once(':')
+        .and_then(|(_, resource)| resource.strip_prefix("collection/"))
+    {
+        Some(id) if !id.is_empty() => collection_not_found_message(id),
+        _ => format!("Resource {arn} is not found"),
+    }
+}
+
+/// The customer managed key a policy statement assigns, if it names one. A statement that
+/// selects the AWS-owned key (`AWSOwnedKey: true`) names no key ARN.
+fn statement_kms_key(statement: &::aws_smithy_types::Document) -> Option<String> {
+    use ::aws_smithy_types::Document;
+
+    let Document::Object(members) = statement else {
+        return None;
+    };
+    match members.get("KmsARN") {
+        Some(Document::String(arn)) if !arn.is_empty() => Some(arn.clone()),
+        _ => None,
+    }
+}
+
 /// A `CollectionGroupErrorDetail` for an `ids` entry that names no stored collection
 /// group.
 pub fn collection_group_error_for_id(id: &str) -> CollectionGroupErrorDetail {
@@ -1664,14 +1914,65 @@ pub struct ComAmazonawsOpensearchserverlessOpensearchserverlessState {
 }
 
 impl ComAmazonawsOpensearchserverlessOpensearchserverlessState {
-    /// Apply every collection status transition the clock has already made due. Call it
+    /// Apply every collection transition the clock has already made due: a status a
+    /// collection settles into, and the PURGE of one whose deletion was accepted. Call it
     /// before reading or writing a collection, so no caller observes a status the service
-    /// has already moved on from. See [`CollectionRecord::settle`].
+    /// has already moved on from. See [`CollectionRecord::settle`] and
+    /// [`CollectionRecord::begin_deletion`].
     pub fn settle_due_transitions(&mut self) {
         let now = Instant::now();
         for record in self.collections.values_mut() {
             record.settle(now);
         }
+        // The purge was owed at `now` whether or not anybody called, so applying it here
+        // is what a later caller sees rather than a change this read made.
+        let purged: Vec<String> = self
+            .collections
+            .values()
+            .filter(|record| record.is_purge_due(now))
+            .map(|record| record.id.clone())
+            .collect();
+        for id in purged {
+            self.remove_collection(&id);
+        }
+    }
+
+    /// The collection whose ARN is `arn`, if one is stored under it.
+    ///
+    /// Matched on the STORED ARN, so a resource ARN naming another account or another
+    /// Region resolves to nothing rather than to this account's collection of that id.
+    pub fn collection_by_arn(&self, arn: &str) -> Option<&CollectionRecord> {
+        self.collections.values().find(|record| record.arn == arn)
+    }
+
+    /// [`Self::collection_by_arn`], mutably.
+    pub fn collection_by_arn_mut(&mut self, arn: &str) -> Option<&mut CollectionRecord> {
+        self.collections
+            .values_mut()
+            .find(|record| record.arn == arn)
+    }
+
+    /// The encryption setting a stored `encryption` security policy assigns to the
+    /// collection `name`, or `None` when no stored policy covers it.
+    ///
+    /// An encryption policy's document carries `Rules`, each a `ResourceType` plus the
+    /// `Resource` patterns it applies to, beside the key that policy assigns
+    /// (`AWSOwnedKey: true`, or a `KmsARN`) — AWS's "Encryption policies for Amazon
+    /// OpenSearch Serverless" documents that shape, that a collection is covered when a
+    /// rule of `ResourceType` `collection` names `collection/<name>` (optionally with a
+    /// trailing wildcard), and that such a policy is what encrypts a collection whose
+    /// create request carries no `encryptionConfig`.
+    pub fn policy_encryption_for(&self, name: &str) -> Option<PolicyEncryption> {
+        let resource = format!("{POLICY_COLLECTION_RESOURCE_TYPE}/{name}");
+        self.security_policies
+            .iter()
+            .filter(|((kind, _), _)| kind == SECURITY_POLICY_TYPE_ENCRYPTION)
+            .find_map(|(_, record)| {
+                let statement = covering_statement(&record.policy, &resource)?;
+                Some(PolicyEncryption {
+                    kms_key_arn: statement_kms_key(statement),
+                })
+            })
     }
 
     /// Mint a fresh `CollectionId`: [`ID_LEN`] lowercase alphanumeric characters, the
@@ -2100,6 +2401,44 @@ pub fn page<'a, T: Paged>(
         .and_then(|_| items.last().map(|record| encode_page_token(record.page_cursor())));
 
     Ok(Page { items, next_token })
+}
+
+/// The most values a stored `indexSchema` may carry.
+///
+/// EMULATOR RESOURCE GUARD, not an AWS limit: `CreateIndex` stores one CALLER-SUPPLIED
+/// document per index and a collection may hold [`MAX_INDEXES_PER_COLLECTION`] of them, so
+/// the size of ONE schema is the other half of what keeps that store finite. 10 000 values
+/// is far past any real index mapping (a mapping of a few hundred fields), so a schema
+/// past it is refused with the modelled `ValidationException` rather than stored.
+pub const MAX_INDEX_SCHEMA_NODES: usize = 10_000;
+
+/// Whether `document` is within the bounds this emulator stores a caller-supplied document
+/// under: no deeper than [`MAX_DOCUMENT_DEPTH`] and no more than `max_nodes` values.
+///
+/// Walked with an EXPLICIT stack rather than by recursion, so a deeply nested document
+/// cannot overflow the thread's stack before the depth check refuses it.
+pub fn document_within_bounds(
+    document: &::aws_smithy_types::Document,
+    max_nodes: usize,
+) -> bool {
+    use ::aws_smithy_types::Document;
+
+    let mut pending = vec![(document, 1usize)];
+    let mut nodes = 0usize;
+    while let Some((value, depth)) = pending.pop() {
+        nodes += 1;
+        if depth > MAX_DOCUMENT_DEPTH || nodes > max_nodes {
+            return false;
+        }
+        match value {
+            Document::Array(items) => pending.extend(items.iter().map(|item| (item, depth + 1))),
+            Document::Object(members) => {
+                pending.extend(members.values().map(|member| (member, depth + 1)));
+            }
+            _ => {}
+        }
+    }
+    true
 }
 
 /// The deepest JSON nesting this emulator converts into an `aws_smithy_types::Document`.

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListReviewTemplates
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListReviewTemplates`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListReviewTemplates::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: pages over the stored review templates, projected to
+//! `ReviewTemplateSummary`. Reporting only — the `NextToken` it emits carries the whole
+//! cursor, so listing never writes to state.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +140,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListReviewTemplates` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListReviewTemplatesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListReviewTemplates"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListReviewTemplatesErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool review template store is unavailable"
+                    .to_string(),
+            })
+        })?;
+
+        // `MaxResults` is modelled `@range(min: 1, max: 50)`; a request that omits it asks
+        // for a full page, so the modelled maximum is the default.
+        let page_size = crate::state::page_size(input.max_results);
+
+        // An opaque token this service did not issue is a bad request, not an empty page.
+        // A token is this service's own cursor, not a value a caller composes: it cannot
+        // be corrected, only obtained again, so the refusal is classified `CANNOT_PARSE`
+        // ("restart the pagination") rather than as a field rule to fix — and it still
+        // names the member whose value could not be decoded.
+        let cursor = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_review_template_next_token(token) {
+                Some(cursor) => Some(cursor),
+                None => {
+                    return Err(ListReviewTemplatesErrorModeled::ValidationException(
+                        crate::state::cannot_parse_exception(
+                            crate::state::NEXT_TOKEN_MEMBER,
+                            crate::state::INVALID_NEXT_TOKEN_MESSAGE,
+                        ),
+                    )
+                    .into());
+                }
+            },
+        };
+
+        let store = state.lock();
+        let order = store.review_template_order();
+        // The cursor is start-EXCLUSIVE: the page resumes just past the ARN already
+        // served, so every template is enumerated exactly once across the pages, and a
+        // template created or deleted between two pages moves nothing already served.
+        let start = match &cursor {
+            Some(template_arn) => order.partition_point(|candidate| candidate <= template_arn),
+            None => 0,
+        };
+
+        let remaining = &order[start.min(order.len())..];
+        let page = &remaining[..remaining.len().min(page_size)];
+        let next_token = match page.last() {
+            Some(template_arn) if remaining.len() > page.len() => {
+                Some(crate::state::encode_review_template_next_token(template_arn))
+            }
+            _ => None,
+        };
+
+        let review_templates = page
+            .iter()
+            .filter_map(|template_arn| store.review_templates.get(template_arn))
+            .map(crate::state::ReviewTemplateRecord::to_summary)
+            .collect();
+
+        Ok(ListReviewTemplatesOutput {
+            review_templates: Some(review_templates),
+            next_token,
+        })
     }
 }

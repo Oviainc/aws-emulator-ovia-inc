@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/catalog_fidelity.rs"]
 mod catalog_fidelity;
+#[path = "all/instance_deletion_lifecycle.rs"]
+mod instance_deletion_lifecycle;
 #[path = "all/instance_type_catalog.rs"]
 mod instance_type_catalog;
 #[path = "all/region_catalog.rs"]

@@ -672,6 +672,20 @@
 //! to `included` apply to the instance", and no two operations can disagree about one
 //! instance's status.
 //!
+//! ## EBS encryption by default: a setting of a Region, not a resource
+//!
+//! EBS encryption by default has no resource and no id: it is one boolean "for your
+//! account in the current Region" (`GetEbsEncryptionByDefault`), which
+//! `EnableEbsEncryptionByDefault` turns on and `DisableEbsEncryptionByDefault` turns off.
+//! So it is stored as the set of Regions it is ON in (a private field of
+//! [`ComAmazonawsEc2Amazonec2State`]), keyed by the
+//! Region of the request that set it, written through
+//! [`ComAmazonawsEc2Amazonec2State::set_ebs_encryption_by_default`] and read through
+//! [`ComAmazonawsEc2Amazonec2State::ebs_encryption_by_default`] — by the reporting
+//! operation and by every handler that creates an EBS volume (`CreateVolume`,
+//! `CopyVolumes`), which raise a new volume's encryption state to it ("the EBS volumes
+//! that you create are always encrypted", `EnableEbsEncryptionByDefault`).
+//!
 //! ## Scheduled event notification tag keys are a fact of a REGION
 //!
 //! [`ComAmazonawsEc2Amazonec2State::instance_event_tag_registrations`] holds, per Region, the tag
@@ -2133,6 +2147,23 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// [`Self::set_snapshot_block_public_access_state`], so the operations that report and
     /// the operations that change it cannot disagree.
     snapshot_block_public_access: &'static str,
+    /// The Regions this account has EBS encryption by default turned ON in.
+    ///
+    /// The setting is an account-level fact OF A REGION — "whether EBS encryption by
+    /// default is enabled for your account in the current Region"
+    /// (`GetEbsEncryptionByDefault`) — so it is keyed by the Region of the request that
+    /// set it ([`request_region`]) rather than held once for the whole account, the way
+    /// the single-word setting above is.
+    /// A Region that is absent is a Region the account has never enabled it in, which is
+    /// OFF; disabling REMOVES the entry, so the set only ever holds the Regions the
+    /// setting is currently on in, bounded by [`MAX_ENCRYPTION_BY_DEFAULT_REGIONS`].
+    ///
+    /// Reached through [`ComAmazonawsEc2Amazonec2State::ebs_encryption_by_default`] and
+    /// [`ComAmazonawsEc2Amazonec2State::set_ebs_encryption_by_default`], so the three
+    /// operations that report and set it and the volume creators that read it cannot
+    /// disagree about one Region. PRIVATE, like the single-word setting above, so those
+    /// accessors are the only way in.
+    ebs_encryption_by_default_regions: BTreeSet<String>,
     /// The longer-ID (17-character ID) preference each principal has EXPLICITLY set, by
     /// principal ARN and then by resource type — see the module docs.
     ///
@@ -2258,6 +2289,9 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             // "Public sharing is not blocked" is where an account that has never called
             // `EnableSnapshotBlockPublicAccess` sits.
             snapshot_block_public_access: SNAPSHOT_BLOCK_PUBLIC_ACCESS_UNBLOCKED,
+            // No Region has EBS encryption by default turned on until something enables
+            // it there, so a fresh account holds the empty set.
+            ebs_encryption_by_default_regions: BTreeSet::new(),
             // No principal has overridden its ID format settings yet, so every one of
             // them follows the root user, which follows `DEFAULT_USE_LONG_IDS`.
             id_format_overrides: BTreeMap::new(),
@@ -17478,6 +17512,57 @@ impl ComAmazonawsEc2Amazonec2State {
     pub fn set_snapshot_block_public_access_state(&mut self, state: &'static str) -> &'static str {
         self.snapshot_block_public_access = state;
         self.snapshot_block_public_access
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EBS encryption by default (the account-level setting of a Region)
+// ---------------------------------------------------------------------------
+
+/// How many Regions this emulator holds the EBS encryption-by-default setting for.
+///
+/// CHOSEN, like [`MAX_STORED_VOLUMES`] and for the same reason: the Region comes from the
+/// caller's SigV4 credential scope, so without a ceiling a caller could enable the setting
+/// in unboundedly many Region names and nothing would ever reclaim the entries. It is well
+/// above the number of Regions AWS publishes. An emulator storage bound, not an AWS-modelled
+/// refusal — `EnableEbsEncryptionByDefault` models no error at all.
+pub const MAX_ENCRYPTION_BY_DEFAULT_REGIONS: usize = 128;
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether EBS encryption by default is enabled for this account in `region`.
+    ///
+    /// A Region the account has never enabled it in is a Region it is OFF in: the setting
+    /// is off until `EnableEbsEncryptionByDefault` turns it on for that Region (Amazon EBS
+    /// User Guide, "Encryption by default"), which is exactly why the store holds the
+    /// Regions it is on in. Reporting only: this is the read `GetEbsEncryptionByDefault`
+    /// answers with, and the encryption state no volume created in `region` can fall below.
+    pub fn ebs_encryption_by_default(&self, region: &str) -> bool {
+        self.ebs_encryption_by_default_regions.contains(region)
+    }
+
+    /// Turn EBS encryption by default on or off for this account in `region`, and answer
+    /// the setting as it now stands — "the updated status of encryption by default"
+    /// (`EnableEbsEncryptionByDefaultResult$EbsEncryptionByDefault`).
+    ///
+    /// Idempotent: enabling a Region it is already on in, or disabling one it is already
+    /// off in, changes nothing and answers the same value.
+    pub fn set_ebs_encryption_by_default(&mut self, region: &str, enabled: bool) -> bool {
+        if enabled {
+            self.ebs_encryption_by_default_regions
+                .insert(region.to_string());
+        } else {
+            self.ebs_encryption_by_default_regions.remove(region);
+        }
+        self.ebs_encryption_by_default(region)
+    }
+
+    /// Would enabling the setting in `region` take the store past
+    /// [`MAX_ENCRYPTION_BY_DEFAULT_REGIONS`]?
+    ///
+    /// A Region the store already holds costs nothing, so re-enabling one is never refused.
+    pub fn would_exceed_encryption_by_default_regions(&self, region: &str) -> bool {
+        !self.ebs_encryption_by_default_regions.contains(region)
+            && self.ebs_encryption_by_default_regions.len() >= MAX_ENCRYPTION_BY_DEFAULT_REGIONS
     }
 }
 

@@ -17,6 +17,8 @@ mod access_point_deletion;
 mod access_point_lifecycle;
 #[path = "all/delete_access_point.rs"]
 mod delete_access_point;
+#[path = "all/error_document_message.rs"]
+mod error_document_message;
 #[path = "all/error_message_construction.rs"]
 mod error_message_construction;
 #[path = "all/file_system_lifecycle.rs"]

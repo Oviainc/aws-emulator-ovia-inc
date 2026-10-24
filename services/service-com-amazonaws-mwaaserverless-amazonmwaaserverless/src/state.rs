@@ -14,7 +14,9 @@
 //! create, a run start or an update past the ceiling is refused with the modelled
 //! `ServiceQuotaExceededException`, so the workflows x runs and workflows x versions
 //! products are finite and so is the caller-supplied data each record holds); `workflow_names` holds exactly one
-//! key per stored workflow, released by the delete that removes the record; and the
+//! key per stored workflow, released when the delete's teardown removes the record
+//! ([`ComAmazonawsMwaaserverlessAmazonmwaaserverlessState::reap_deleted_workflows`]);
+//! and the
 //! idempotency ledger is capped and evicted on its own terms (see [`IdempotencyLedger`]).
 //! A listing's response is bounded too, by the modelled `MaxResults` range.
 //! A run's `task_instances` ([`TaskInstance`]) is NOT caller-driven growth: no modelled
@@ -66,8 +68,30 @@ pub const NO_AIRFLOW_ENGINE: &str =
     "The emulator accepted this run but has no Apache Airflow execution engine, \
      so the workflow definition was never executed.";
 
-/// `WorkflowStatus` as the model spells it.
+/// `WorkflowStatus` as the model spells it
+/// (`smithy_query(query="shape", shape="WorkflowStatus")` declares `READY | DELETING`).
+///
+/// "workflow is ready to run": the status a stored workflow reports until its
+/// deletion starts.
 pub const WORKFLOW_STATUS_READY: &str = "READY";
+
+/// "workflow is being deleted": the status a workflow reports while the teardown
+/// `DeleteWorkflow` started is still running. The ONLY other `WorkflowStatus` the
+/// model declares, so a delete that removed the record synchronously would make it
+/// unreachable.
+pub const WORKFLOW_STATUS_DELETING: &str = "DELETING";
+
+/// How long after `DeleteWorkflow` the workflow's teardown finishes and the record
+/// disappears.
+///
+/// `DeleteWorkflow` is documented as a cleanup over the workflow's associated
+/// resources — "stopping any running executions, removing scheduled triggers, and
+/// cleaning up execution history" — which is the span `DELETING` covers. The length
+/// is the emulator's own choice, not a fidelity claim about how long AWS takes, and
+/// it is deliberately non-zero so a caller that describes or lists straight after
+/// the delete still observes `DELETING` (and the workflow's name still taken) before
+/// the record goes.
+pub const WORKFLOW_DELETED_AFTER: Duration = Duration::from_millis(500);
 
 /// `WorkflowRunStatus` values this slice uses.
 ///
@@ -313,6 +337,11 @@ pub struct Workflow {
     pub versions: Vec<WorkflowVersionRecord>,
     pub tags: BTreeMap<String, String>,
     pub runs: BTreeMap<String, WorkflowRun>,
+    /// The instant the clock owes this workflow's removal, once its teardown has
+    /// been started by `DeleteWorkflow`, and `None` for a workflow no delete has
+    /// touched. Stored, never slept on, and materialised by
+    /// [`ComAmazonawsMwaaserverlessAmazonmwaaserverlessState::reap_deleted_workflows`].
+    pub deletion_due_at: Option<SystemTime>,
 }
 
 impl Workflow {
@@ -328,6 +357,29 @@ impl Workflow {
     /// The configuration this workflow currently reports.
     pub fn current_snapshot(&self) -> Option<&WorkflowSnapshot> {
         self.version(None).map(|rec| &rec.snapshot)
+    }
+
+    /// Whether this workflow's teardown has already been started, so it is on its
+    /// way out and no longer accepts a change.
+    pub fn is_deleting(&self) -> bool {
+        self.deletion_due_at.is_some()
+    }
+
+    /// Start the teardown `DeleteWorkflow` describes: the workflow moves to
+    /// [`WORKFLOW_STATUS_DELETING`] and its removal falls due
+    /// [`WORKFLOW_DELETED_AFTER`] later. Nothing else is dropped here — the
+    /// versions, runs, name and tokens go with the record when the removal lands,
+    /// so a read during the teardown still reports the workflow.
+    ///
+    /// Idempotent: a second delete of a workflow already tearing down neither
+    /// restarts the teardown nor moves its deadline.
+    pub fn begin_deletion(&mut self, now: SystemTime) {
+        if self.is_deleting() {
+            return;
+        }
+        self.status = WORKFLOW_STATUS_DELETING.to_string();
+        self.modified_at = now;
+        self.deletion_due_at = Some(now + WORKFLOW_DELETED_AFTER);
     }
 }
 
@@ -429,7 +481,8 @@ pub struct ComAmazonawsMwaaserverlessAmazonmwaaserverlessState {
     /// most [`MAX_RUNS_PER_WORKFLOW`] runs inside each.
     pub workflows: BTreeMap<String, Workflow>,
     /// `Name` -> `WorkflowArn`, the uniqueness index `CreateWorkflow` conflicts on. One
-    /// key per stored workflow, so [`MAX_WORKFLOWS`] bounds this map too.
+    /// key per stored workflow — including one that is `DELETING`, whose name stays
+    /// taken until its teardown completes — so [`MAX_WORKFLOWS`] bounds this map too.
     pub workflow_names: BTreeMap<String, String>,
     /// `<operation>:<ClientToken>` -> what that token already produced. Capped and
     /// evicted on its own terms; see [`IdempotencyLedger`].
@@ -454,6 +507,38 @@ impl ComAmazonawsMwaaserverlessAmazonmwaaserverlessState {
     /// replayed token can never resolve to a workflow that no longer exists.
     pub fn forget_tokens_for(&mut self, workflow_arn: &str) {
         self.idempotency.forget_workflow(workflow_arn);
+    }
+
+    /// Finish every workflow teardown the clock has already made due, and report
+    /// whether anything was removed.
+    ///
+    /// This is the one write a reporting operation may make: the removal of a
+    /// workflow whose [`Workflow::deletion_due_at`] has passed was owed at that
+    /// instant whether or not anybody called, so what a reader reports is what the
+    /// store would hold unpolled. Removing the record releases the name
+    /// `CreateWorkflow` conflicts on and forgets the tokens that replayed onto it,
+    /// and takes the workflow's versions and runs with it.
+    ///
+    /// Every handler that touches [`Self::workflows`] calls this first, so a
+    /// workflow never outlives its teardown just because the next request happened
+    /// to be a different operation.
+    pub fn reap_deleted_workflows(&mut self, now: SystemTime) -> bool {
+        let due: Vec<(String, String)> = self
+            .workflows
+            .values()
+            .filter(|workflow| workflow.deletion_due_at.is_some_and(|at| now >= at))
+            .map(|workflow| (workflow.arn.clone(), workflow.name.clone()))
+            .collect();
+        for (arn, name) in &due {
+            self.workflows.remove(arn);
+            // Only if the name still points at THIS workflow: the index is keyed by
+            // name, and a workflow removed earlier may have freed it already.
+            if self.workflow_names.get(name).is_some_and(|held| held == arn) {
+                self.workflow_names.remove(name);
+            }
+            self.forget_tokens_for(arn);
+        }
+        !due.is_empty()
     }
 }
 
