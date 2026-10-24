@@ -215,23 +215,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .image_tag_mutability
             .unwrap_or_else(|| crate::state::DEFAULT_IMAGE_TAG_MUTABILITY.to_string());
 
+        // `EncryptionConfigurationForRepositoryCreationTemplate$encryptionType` is a
+        // required member, so a template has a resolved encryption posture either way:
+        // repositories created from a template that named no configuration are encrypted
+        // with the service default type, as `CreateRepository` resolves it for a
+        // repository, and that resolved value is what the template stores and reports.
+        let encryption = input
+            .encryption_configuration
+            .unwrap_or_else(crate::state::default_template_encryption);
+
         // Only the KMS encryption types take a key of the caller's: AES256 encrypts with
         // Amazon S3-managed keys, so a `kmsKey` beside it cannot be honoured. The model
         // cannot express the pairing, so it is checked here — as `CreateRepository` does.
-        if let Some(encryption) = input.encryption_configuration.as_ref() {
-            if encryption
-                .kms_key
-                .as_ref()
-                .is_some_and(|key| !key.is_empty())
-                && encryption.encryption_type == crate::state::S3_MANAGED_ENCRYPTION_TYPE
-            {
-                return Err(invalid_parameter(
-                    "encryptionConfiguration.kmsKey cannot be specified with the AES256 \
-                     encryption type"
-                        .to_string(),
-                )
-                .into());
-            }
+        if encryption
+            .kms_key
+            .as_ref()
+            .is_some_and(|key| !key.is_empty())
+            && encryption.encryption_type == crate::state::S3_MANAGED_ENCRYPTION_TYPE
+        {
+            return Err(invalid_parameter(
+                "encryptionConfiguration.kmsKey cannot be specified with the AES256 \
+                 encryption type"
+                    .to_string(),
+            )
+            .into());
         }
 
         // The tags a created repository is to be given are repository tags, so they go
@@ -285,7 +292,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let template = crate::state::CreationTemplate {
             prefix: prefix.clone(),
             description: input.description,
-            encryption_config: input.encryption_configuration,
+            encryption_config: encryption,
             resource_tags,
             image_tag_mutability,
             image_tag_mutability_exclusion_filters: input
