@@ -40,8 +40,8 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     Assessment, AssessmentSummary, Attribute, ClientAuthenticationSettingInfo, Computer,
-    DirectoryDescription, DirectoryLimits, DirectoryVpcSettingsDescription, EventTopic, IpRouteInfo,
-    LDAPSSettingInfo, Snapshot, SnapshotLimits, Tag,
+    ConditionalForwarder, DirectoryDescription, DirectoryLimits, DirectoryVpcSettingsDescription,
+    EventTopic, IpRouteInfo, LDAPSSettingInfo, Snapshot, SnapshotLimits, Tag,
 };
 
 /// How long a status transition a create owes takes to fall due.
@@ -366,6 +366,31 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// bound, enforced at the single insert site in `register_event_topic.rs`.
 pub const MAX_EVENT_TOPICS_PER_DIRECTORY: usize = 50;
 
+/// The `ReplicationScope` every stored conditional forwarder carries: the only value the
+/// modelled `ReplicationScope` enum declares, as the
+/// `ConditionalForwarder$ReplicationScope` member's own documentation states — "The only
+/// allowed value is `Domain`, which will replicate the conditional forwarder to all of
+/// the domain controllers for your Amazon Web Services directory."
+pub const REPLICATION_SCOPE_DOMAIN: &str = "Domain";
+
+/// The most conditional forwarders this emulator will store on one directory.
+///
+/// NOT an AWS quota: a resource guard. `CreateConditionalForwarder` is a write a caller
+/// can repeat with a fresh remote domain name forever, so the per-directory index carries
+/// its own bound, enforced at the single insert site in
+/// `create_conditional_forwarder.rs`.
+pub const MAX_CONDITIONAL_FORWARDERS_PER_DIRECTORY: usize = 50;
+
+/// The most `RemoteDomainNames` entries a single `DescribeConditionalForwarders` will
+/// resolve.
+///
+/// NOT an AWS quota: a resource guard, deliberately well above any list a caller has
+/// reason to send — a directory holds at most
+/// [`MAX_CONDITIONAL_FORWARDERS_PER_DIRECTORY`] forwarders, so a longer list can only
+/// repeat names — and it is what keeps the caller-chosen filter from being allocated and
+/// scanned unbounded.
+pub const MAX_REMOTE_DOMAIN_NAMES_PER_REQUEST: usize = 100;
+
 /// The most `TopicNames` entries a single `DescribeEventTopics` will resolve.
 ///
 /// NOT an AWS quota: a resource guard, deliberately well above any list a caller has
@@ -629,6 +654,42 @@ impl EventTopicRegistration {
     }
 }
 
+/// One stored conditional forwarder of a directory: what `CreateConditionalForwarder`
+/// persisted and `DescribeConditionalForwarders` reports.
+///
+/// A forwarder is identified by the remote domain it points to, which is why the
+/// per-directory index is keyed by [`Directory::conditional_forwarder_key`] of that name
+/// rather than by this record.
+#[derive(Debug, Clone)]
+pub struct ConditionalForwarderRecord {
+    /// The remote domain name as the request spelled it, so the report gives the caller
+    /// back its own spelling even though the lookup folds it.
+    pub remote_domain_name: String,
+    /// The IPv4 addresses of the remote DNS server the forwarder points to, in the order
+    /// the request listed them.
+    pub dns_ip_addrs: Vec<String>,
+    /// The IPv6 addresses of the remote DNS server the forwarder points to, in the order
+    /// the request listed them.
+    pub dns_ipv6_addrs: Vec<String>,
+    /// One of the modelled `ReplicationScope` values; [`REPLICATION_SCOPE_DOMAIN`] here.
+    pub replication_scope: String,
+}
+
+impl ConditionalForwarderRecord {
+    /// This forwarder as the modelled `ConditionalForwarder`.
+    ///
+    /// The one place a stored forwarder is rendered, so every operation that reports one
+    /// reports exactly what was persisted.
+    pub fn to_conditional_forwarder(&self) -> ConditionalForwarder {
+        ConditionalForwarder {
+            remote_domain_name: Some(self.remote_domain_name.clone()),
+            dns_ip_addrs: optional_list(&self.dns_ip_addrs),
+            dns_ipv6_addrs: optional_list(&self.dns_ipv6_addrs),
+            replication_scope: Some(self.replication_scope.clone()),
+        }
+    }
+}
+
 /// One stored directory: what `CreateDirectory` persisted and `DescribeDirectories`
 /// reports.
 #[derive(Debug, Clone)]
@@ -690,6 +751,12 @@ pub struct Directory {
     /// associations live on the directory record, so deleting the directory takes its
     /// associations with it.
     pub event_topics: BTreeMap<String, EventTopicRegistration>,
+    /// The conditional forwarders `CreateConditionalForwarder` created on this directory,
+    /// keyed by [`Directory::conditional_forwarder_key`] — a directory points at a given
+    /// remote domain at most once. The forwarders live on the directory record, so
+    /// deleting the directory takes them with it, and two directories can each point at
+    /// the same remote domain.
+    pub conditional_forwarders: BTreeMap<String, ConditionalForwarderRecord>,
     /// The computer accounts `CreateComputer` created in this directory, keyed by the
     /// account name folded to lower case: an Active Directory account name is
     /// case-insensitive, so that fold is what makes the duplicate check agree with the
@@ -748,6 +815,32 @@ impl Directory {
                 wanted.is_none_or(|names| names.contains(&registration.topic_name))
             })
             .map(|registration| registration.to_event_topic(&self.directory_id))
+            .collect()
+    }
+
+    /// The key [`Self::conditional_forwarders`] holds `remote_domain_name` under: the
+    /// name folded to lower case with the trailing root label dropped, so a lookup agrees
+    /// with DNS, where a domain name is compared case-insensitively and the fully
+    /// qualified `example.com.` names the same domain as `example.com` (the modelled
+    /// `RemoteDomainName` pattern `^([a-zA-Z0-9]+[\.-])+([a-zA-Z0-9])+[.]?$` admits both
+    /// forms and either case).
+    pub fn conditional_forwarder_key(remote_domain_name: &str) -> String {
+        remote_domain_name.trim_end_matches('.').to_lowercase()
+    }
+
+    /// This directory's conditional forwarders as the modelled `ConditionalForwarders`
+    /// list, in remote-domain order, narrowed to `wanted` when the request asked for
+    /// particular remote domains. `wanted` holds the domains folded through
+    /// [`Self::conditional_forwarder_key`], so a filter matches a stored forwarder the
+    /// same way a second create of it would.
+    pub fn conditional_forwarder_list(
+        &self,
+        wanted: Option<&BTreeSet<String>>,
+    ) -> Vec<ConditionalForwarder> {
+        self.conditional_forwarders
+            .iter()
+            .filter(|(key, _)| wanted.is_none_or(|keys| keys.contains(*key)))
+            .map(|(_, record)| record.to_conditional_forwarder())
             .collect()
     }
 

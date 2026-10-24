@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeConditionalForwarders
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeConditionalForwarders`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeConditionalForwarders::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the conditional forwarders a directory holds, narrowed to the remote domains
+//! the request names. Implemented here — this is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +145,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeConditionalForwarders` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeConditionalForwardersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeConditionalForwarders"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // Nothing caller-sized reaches the store, or the store LOCK, unchecked: the
+        // filter is bounded here — before anything is allocated from it — by a guard set
+        // well above any list a caller has reason to send.
+        if let Some(requested) = input.remote_domain_names.as_ref() {
+            if requested.len() > crate::state::MAX_REMOTE_DOMAIN_NAMES_PER_REQUEST {
+                return Err(invalid_parameter(format!(
+                    "RemoteDomainNames may carry at most {max} entries, got {got}",
+                    max = crate::state::MAX_REMOTE_DOMAIN_NAMES_PER_REQUEST,
+                    got = requested.len()
+                )));
+            }
+        }
+
+        // `RemoteDomainNames`' own documentation: "If this member is null, all
+        // conditional forwarders are returned." A filter that names domains narrows the
+        // report to those domains, folded the way a stored forwarder is keyed, so the
+        // filter matches a domain the same way a second create of it would. Built ONCE
+        // as a set, so narrowing is one lookup per stored forwarder rather than a scan of
+        // the caller's list per forwarder.
+        let wanted: Option<::std::collections::BTreeSet<String>> = input
+            .remote_domain_names
+            .as_ref()
+            .map(|names| {
+                names
+                    .iter()
+                    .map(|name| crate::state::Directory::conditional_forwarder_key(name))
+                    .collect()
+            });
+
+        let mut store = state.lock();
+        store.advance_clock(::std::time::SystemTime::now());
+
+        // The forwarders hang off the directory, so an id naming no stored directory is
+        // reported rather than answered with an empty list.
+        let directory = store.directories.get(&input.directory_id).ok_or_else(|| {
+            DescribeConditionalForwardersErrorModeled::EntityDoesNotExistException(
+                crate::state::refusal(crate::state::no_such_directory(&input.directory_id)),
+            )
+        })?;
+
+        // Every member reported comes off the stored forwarder, so one nothing created
+        // cannot appear and one that was created cannot be missing.
+        Ok(DescribeConditionalForwardersOutput {
+            conditional_forwarders: Some(directory.conditional_forwarder_list(wanted.as_ref())),
+        })
     }
+}
+
+/// Refuse the request with the modelled `InvalidParameterException`, naming the member
+/// and the rule it broke so the caller can fix the request from the message alone.
+fn invalid_parameter(message: String) -> DescribeConditionalForwardersError {
+    DescribeConditionalForwardersErrorModeled::InvalidParameterException(crate::state::refusal(
+        message,
+    ))
+    .into()
 }
