@@ -175,18 +175,22 @@ pub(crate) use alarm_templates::alarm_template_output;
 /// The multiplex slice: its record, its bounds, its refusals, the store's
 /// methods and its output projection, in one module of its own for the same
 /// reason as the alarm template group slice above. The PROGRAMS a multiplex
-/// holds are part of that slice: they live on the multiplex record that owns
-/// them. What stays in this file is the part the rest of the state needs: the
-/// store members on [`ComAmazonawsMedialiveMedialiveState`].
+/// holds are part of that slice, and so are the ALERTS raised on it: both live
+/// on the multiplex record that owns them. What stays in this file is the part
+/// the rest of the state needs: the store members on
+/// [`ComAmazonawsMedialiveMedialiveState`].
 pub mod multiplexes;
 
 pub use multiplexes::{
-    multiplex_state, MultiplexProgramRecord, MultiplexProgramRefusal,
+    multiplex_alert_state, multiplex_alert_type, multiplex_state,
+    MultiplexProgramRecord, MultiplexProgramRefusal,
     MultiplexProgramSettingsRefusal, MultiplexProgramUpdateRefusal, MultiplexRecord,
     MultiplexRefusal, MultiplexStartRefusal, MultiplexStopRefusal, MAX_MULTIPLEXES,
+    MAX_MULTIPLEX_ALERTS,
     MAX_MULTIPLEX_PROGRAMS,
     MAX_MULTIPLEX_PROGRAM_TOKENS,
-    MAX_MULTIPLEX_TOKENS, MAX_SERVICE_DESCRIPTOR_NAME_LEN, MULTIPLEX_AVAILABILITY_ZONES,
+    MAX_MULTIPLEX_TOKENS, MAX_SERVICE_DESCRIPTOR_NAME_LEN, MULTIPLEX_ALERT_STATE_FILTERS,
+    MULTIPLEX_ALERT_STATE_FILTER_ALL, MULTIPLEX_AVAILABILITY_ZONES,
 };
 
 pub(crate) use multiplexes::{multiplex_description_output, multiplex_program_description_output};
@@ -209,6 +213,17 @@ pub use event_bridge_rule_templates::{
 };
 
 pub(crate) use event_bridge_rule_templates::event_bridge_rule_template_output;
+
+/// The alert vocabulary every alert surface of this service shares: the two
+/// states an alert is in, the `StateFilter` values each listing documents, and
+/// the two derivations (`State` out of the cleared instant, and which alerts a
+/// filter admits) the cluster slice and the multiplex slice both delegate to.
+pub mod alerts;
+
+pub use alerts::{
+    alert_admitted_by, alert_state, alert_state_of, ALERT_STATE_FILTERS,
+    ALERT_STATE_FILTER_ALL,
+};
 
 /// The input device slice: the record `ClaimDevice` registers, the device-id
 /// form it accepts, the maintenance window
@@ -597,6 +612,23 @@ const FIRST_INPUT_ID: u64 = 1_000_000;
 /// its own modelled `BadRequestException`, because the request is what is out of
 /// bounds.
 pub const MAX_INPUT_ATTACHMENTS: usize = 32;
+
+/// The most `Destinations` entries this emulator accepts on one channel.
+///
+/// A ceiling, not a guess at AWS's published quota, and the same kind of bound
+/// as [`MAX_INPUT_ATTACHMENTS`] above: the list is caller-chosen and every read
+/// that walks it costs work per entry — a signal map's discovery, and the
+/// multiplex slice's feeder index, which `settle` builds out of these
+/// destinations on every request that could raise a multiplex alert. Bounding it
+/// keeps that per-request work a function of the emulator's own ceilings rather
+/// than of one caller's request body. `CreateChannel` refuses a longer list with
+/// its own modelled `BadRequestException`, because the request is what is out of
+/// bounds. Enforced where a caller's destinations are STORED, which today is
+/// `CreateChannel` alone (`UpdateChannel` is still a scaffold and writes none):
+/// a handler that starts storing them has to apply this bound too, or the
+/// per-request cost the multiplex slice's feeder index pays stops being bounded
+/// by this constant.
+pub const MAX_CHANNEL_DESTINATIONS: usize = 32;
 
 /// The most inputs this emulator stores for one account.
 ///
@@ -1479,6 +1511,11 @@ pub struct ComAmazonawsMedialiveMedialiveState {
     pub multiplexes: BTreeMap<String, MultiplexRecord>,
     /// Mint counter behind the multiplex slice's `mint_multiplex_id`.
     pub next_multiplex_id: u64,
+    /// Mint counter behind the alert ids the multiplex slice's `apply_alerts`
+    /// hands out. It lives on the store rather than on one multiplex because
+    /// `MultiplexAlert$Id` is "The unique ID for this alert instance": two
+    /// multiplexes cannot raise an alert under the same id.
+    pub next_multiplex_alert_id: u64,
     /// `CreateMultiplex`'s `RequestId` (`@idempotencyToken`) -> the multiplex it
     /// created. PRIVATE for the same reason as [`Self::channel_tokens`].
     multiplex_tokens: IdempotencyTokens,

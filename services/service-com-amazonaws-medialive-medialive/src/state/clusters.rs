@@ -72,26 +72,26 @@ pub mod cluster_state {
 /// (`smithy_query(query="shape", shape="ClusterAlertState")`: SET | CLEARED —
 /// "SET - The alert is actively happening. CLEARED - The alert is no longer
 /// happening").
-pub mod cluster_alert_state {
-    pub const SET: &str = "SET";
-    pub const CLEARED: &str = "CLEARED";
-}
+///
+/// The same two values every alert-state enum of this service declares, so they
+/// live once in [`super::alerts`] and this is the cluster slice's name for them.
+pub use super::alerts::alert_state as cluster_alert_state;
 
 /// The `StateFilter` value that asks for every alert whatever its state, from
 /// `ListClusterAlertsRequest$StateFilter`'s own documentation: "SET - Return
 /// only alerts with SET state. CLEARED - Return only alerts with CLEARED state.
-/// ALL - Return all alerts."
-pub const CLUSTER_ALERT_FILTER_ALL: &str = "ALL";
+/// ALL - Return all alerts." Shared with every other alert listing of this
+/// service ([`super::alerts::ALERT_STATE_FILTER_ALL`]), whose member documents
+/// the same set.
+pub const CLUSTER_ALERT_FILTER_ALL: &str = super::alerts::ALERT_STATE_FILTER_ALL;
 
 /// Every `StateFilter` value that request member documents, in the order it
 /// documents them. The member targets `__string`, which carries no enum trait,
-/// so the request boundary cannot refuse any other value and this slice is where
-/// the documented value set lives.
-pub const CLUSTER_ALERT_FILTERS: [&str; 3] = [
-    cluster_alert_state::SET,
-    cluster_alert_state::CLEARED,
-    CLUSTER_ALERT_FILTER_ALL,
-];
+/// so the request boundary cannot refuse any other value and this is the
+/// documented value set `ListClusterAlerts` refuses against — the shared
+/// [`super::alerts::ALERT_STATE_FILTERS`], so two alert listings of this service
+/// cannot accept different values.
+pub const CLUSTER_ALERT_FILTERS: [&str; 3] = super::alerts::ALERT_STATE_FILTERS;
 
 /// The id the first cluster of a process gets.
 ///
@@ -180,23 +180,18 @@ impl ClusterAlertRecord {
     }
 
     /// "The state of the alert": `SET` while it is actively happening, `CLEARED`
-    /// once it is not. Derived from [`Self::cleared_at`], never stored.
+    /// once it is not. Derived from [`Self::cleared_at`], never stored, through
+    /// the one derivation every alert surface of this service shares.
     pub fn state(&self) -> &'static str {
-        if self.cleared_at.is_none() {
-            cluster_alert_state::SET
-        } else {
-            cluster_alert_state::CLEARED
-        }
+        super::alerts::alert_state_of(self.cleared_at)
     }
 
     /// Whether `ListClusterAlerts`' `StateFilter` admits this alert: `SET` and
     /// `CLEARED` admit the alerts in that state, `ALL` admits every one, and a
-    /// request that named no filter is not filtered at all.
+    /// request that named no filter is not filtered at all — the one predicate
+    /// every alert listing of this service shares.
     pub fn admitted_by(&self, filter: Option<&str>) -> bool {
-        match filter {
-            None | Some(CLUSTER_ALERT_FILTER_ALL) => true,
-            Some(state) => self.state() == state,
-        }
+        super::alerts::alert_admitted_by(self.cleared_at, filter)
     }
 }
 

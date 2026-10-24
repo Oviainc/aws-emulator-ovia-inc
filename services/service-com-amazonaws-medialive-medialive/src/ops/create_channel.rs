@@ -208,6 +208,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // `Destinations` is a caller-chosen list too, and the multiplex slice
+        // builds its feeder index out of the multiplex destinations of every
+        // live channel on each request that could raise a multiplex alert, so
+        // its length is bounded for the same reason and refused the same way.
+        let destination_count = input.destinations.as_ref().map_or(0, Vec::len);
+        if destination_count > crate::state::MAX_CHANNEL_DESTINATIONS {
+            return Err(CreateChannelErrorModeled::BadRequestException(BadRequestException {
+                message: Some(format!(
+                    "destinations carries {destination_count} destinations; this emulator accepts at most {}",
+                    crate::state::MAX_CHANNEL_DESTINATIONS
+                )),
+            })
+            .into());
+        }
+
         // The model gives `ChannelClass` no default, and MediaLive's own default
         // is STANDARD — the two-pipeline class the `ChannelClass` doc describes.
         let channel_class = input
