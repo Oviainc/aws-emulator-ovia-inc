@@ -256,10 +256,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
         let mut store = state.lock();
 
-        // A read reports the mapping as of now, so the record is first brought up to
-        // whatever the clock already made due — the move out of `Creating` it owed — and
-        // nothing else is changed by reading.
-        let Some(record) = store.event_source_mappings.get_mut(&input.uuid) else {
+        // A read reports the mapping as of now, so the store is first brought up to
+        // whatever the clock already made due — the move out of `Creating` a mapping owed,
+        // and the removal a mapping already being deleted owed — and nothing else is
+        // changed by reading.
+        store.materialize_all(now);
+
+        let Some(record) = store.event_source_mappings.get(&input.uuid) else {
             return Err(GetEventSourceMappingErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     r#type: None,
@@ -271,7 +274,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        record.materialize(now);
         Ok(event_source_mapping_configuration(record.reported()))
     }
 }

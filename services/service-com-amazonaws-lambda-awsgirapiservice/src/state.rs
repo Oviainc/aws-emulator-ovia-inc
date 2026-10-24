@@ -1928,6 +1928,10 @@ pub const EVENT_SOURCE_MAPPING_STATE_CREATING: &str = "Creating";
 pub const EVENT_SOURCE_MAPPING_STATE_ENABLED: &str = "Enabled";
 /// See [`EVENT_SOURCE_MAPPING_STATE_CREATING`].
 pub const EVENT_SOURCE_MAPPING_STATE_DISABLED: &str = "Disabled";
+/// See [`EVENT_SOURCE_MAPPING_STATE_CREATING`]. `DeleteEventSourceMapping` is the one
+/// call that moves a mapping into it: "When you delete an event source mapping, it
+/// enters a Deleting state and might not be completely deleted for several seconds."
+pub const EVENT_SOURCE_MAPPING_STATE_DELETING: &str = "Deleting";
 
 /// `StateTransitionReason`: "Indicates whether a user or Lambda made the last change to
 /// the event source mapping." A mapping this store holds only ever changes because a
@@ -1942,6 +1946,17 @@ pub const EVENT_SOURCE_MAPPING_USER_INITIATED: &str = "USER_INITIATED";
 /// create answered with. The instant it becomes due is stored on the record and nothing
 /// sleeps for it.
 pub const EVENT_SOURCE_MAPPING_SETTLE_DELAY: Duration = Duration::from_millis(500);
+
+/// How long after `DeleteEventSourceMapping` the mapping's REMOVAL becomes due.
+///
+/// That operation documents the wait itself — "When you delete an event source mapping,
+/// it enters a Deleting state and might not be completely deleted for several seconds" —
+/// without stating a duration, so the span is EMULATOR-CHOSEN, and deliberately non-zero
+/// for the same reason as [`EVENT_SOURCE_MAPPING_SETTLE_DELAY`]: a caller that reads the
+/// mapping straight after deleting it sees the `Deleting` state the delete answered with.
+/// The instant the removal becomes due is stored on the record and nothing sleeps for it
+/// (see [`EventSourceMappingRecord::begin_delete`]).
+pub const EVENT_SOURCE_MAPPING_DELETE_DELAY: Duration = Duration::from_millis(500);
 
 /// The most event source mappings this emulator keeps.
 ///
@@ -1992,6 +2007,8 @@ pub const EVENT_SOURCE_VENDOR_DYNAMODB: &str = "dynamodb";
 /// The ARN vendor field of an Amazon MSK cluster ("Amazon Managed Streaming for Apache
 /// Kafka – The ARN of the cluster").
 pub const EVENT_SOURCE_VENDOR_KAFKA: &str = "kafka";
+/// The ARN vendor field of an Amazon MQ broker ("Amazon MQ – The ARN of the broker").
+pub const EVENT_SOURCE_VENDOR_MQ: &str = "mq";
 /// The ARN vendor field of an Amazon DocumentDB cluster ("Amazon DocumentDB – The ARN of
 /// the DocumentDB change stream"), whose ARNs are in the `rds` namespace.
 pub const EVENT_SOURCE_VENDOR_DOCUMENT_DB: &str = "rds";
@@ -2089,6 +2106,80 @@ pub fn default_batch_size(vendor: Option<&str>) -> i32 {
 pub fn default_batching_window_seconds(vendor: Option<&str>) -> Option<i32> {
     (is_shard_source(vendor) || vendor == Some(EVENT_SOURCE_VENDOR_QUEUE))
         .then_some(DEFAULT_BATCHING_WINDOW_SECONDS)
+}
+
+/// The ARN resource type of an Amazon Kinesis data stream, which is also the type a
+/// stream CONSUMER's ARN carries (`stream/<name>/consumer/<name>/<id>`): "Amazon Kinesis
+/// – The ARN of the data stream or a stream consumer."
+pub const EVENT_SOURCE_RESOURCE_STREAM: &str = "stream";
+
+/// The ARN resource type an Amazon DynamoDB STREAM is written under: the stream of a
+/// table, `table/<name>/stream/<label>`.
+pub const EVENT_SOURCE_RESOURCE_TABLE: &str = "table";
+
+/// The segment that makes a DynamoDB `table/…` ARN name the table's STREAM rather than
+/// the table itself, which is what "Amazon DynamoDB Streams – The ARN of the stream"
+/// asks for.
+pub const DYNAMODB_STREAM_SEGMENT: &str = "/stream/";
+
+/// The ARN resource type of an Amazon MSK cluster ("the ARN of the cluster") and of an
+/// Amazon DocumentDB cluster ("The ARN of the DocumentDB change stream").
+pub const EVENT_SOURCE_RESOURCE_CLUSTER: &str = "cluster";
+
+/// The ARN resource type of the Amazon MSK VPC connection the member documents as the
+/// cross-account form: "the ARN of the VPC connection (for cross-account event source
+/// mappings)".
+pub const EVENT_SOURCE_RESOURCE_VPC_CONNECTION: &str = "vpc-connection";
+
+/// The ARN resource type of an Amazon MQ broker ("Amazon MQ – The ARN of the broker").
+pub const EVENT_SOURCE_RESOURCE_BROKER: &str = "broker";
+
+/// Whether `arn` names one of the resources `EventSourceArn` says an event source mapping
+/// polls, as that member enumerates them: "Amazon Kinesis – The ARN of the data stream or
+/// a stream consumer. Amazon DynamoDB Streams – The ARN of the stream. Amazon Simple Queue
+/// Service – The ARN of the queue. Amazon Managed Streaming for Apache Kafka – The ARN of
+/// the cluster or the ARN of the VPC connection (for cross-account event source mappings).
+/// Amazon MQ – The ARN of the broker. Amazon DocumentDB – The ARN of the DocumentDB change
+/// stream."
+///
+/// Each entry of that list is a resource of ONE vendor namespace and ONE resource type, so
+/// an ARN naming any other vendor (a bucket, a topic, a function) or another resource type
+/// of one of these vendors (a DynamoDB table rather than its stream) names nothing a
+/// mapping can poll, however well formed the ARN is.
+#[must_use]
+pub fn names_event_source(arn: &::service_common::arn::Arn<'_>) -> bool {
+    let resource_type = arn.resource_type();
+    match arn.vendor {
+        EVENT_SOURCE_VENDOR_KINESIS => resource_type == EVENT_SOURCE_RESOURCE_STREAM,
+        EVENT_SOURCE_VENDOR_DYNAMODB => {
+            resource_type == EVENT_SOURCE_RESOURCE_TABLE
+                && arn.resource.contains(DYNAMODB_STREAM_SEGMENT)
+        }
+        // A queue's ARN carries the queue NAME as its whole resource field, and a queue
+        // name admits neither separator, so a resource field carrying one names no queue.
+        EVENT_SOURCE_VENDOR_QUEUE => !arn.resource.contains(['/', ':']),
+        EVENT_SOURCE_VENDOR_KAFKA => matches!(
+            resource_type,
+            EVENT_SOURCE_RESOURCE_CLUSTER | EVENT_SOURCE_RESOURCE_VPC_CONNECTION
+        ),
+        EVENT_SOURCE_VENDOR_MQ => resource_type == EVENT_SOURCE_RESOURCE_BROKER,
+        EVENT_SOURCE_VENDOR_DOCUMENT_DB => resource_type == EVENT_SOURCE_RESOURCE_CLUSTER,
+        _ => false,
+    }
+}
+
+/// Whether the event source `arn` names belongs to the account whose resources this
+/// emulator holds.
+///
+/// A mapping polls the caller's own event source: the ONE cross-account form
+/// `EventSourceArn` documents is the Amazon MSK VPC connection ("the ARN of the VPC
+/// connection (for cross-account event source mappings)"), so an ARN of any other source
+/// carrying another account's id names a resource this account cannot map.
+#[must_use]
+pub fn event_source_is_mappable_by_this_account(arn: &::service_common::arn::Arn<'_>) -> bool {
+    arn.account == ::engine::emulator_account_id()
+        || (arn.vendor == EVENT_SOURCE_VENDOR_KAFKA
+            && arn.resource_type() == EVENT_SOURCE_RESOURCE_VPC_CONNECTION)
 }
 
 /// One event source mapping this emulator holds.
@@ -2200,6 +2291,10 @@ pub struct EventSourceMappingRecord {
     /// When the move out of `Creating` becomes due; see
     /// [`EventSourceMappingRecord::materialize`].
     pub settled_due: SystemTime,
+    /// When this mapping's REMOVAL becomes due, once a `DeleteEventSourceMapping` has
+    /// asked for it; `None` for a mapping nobody has deleted. See
+    /// [`EventSourceMappingRecord::begin_delete`].
+    pub removal_due: Option<SystemTime>,
     /// `LastModified`: "The date that the event source mapping was last updated or that
     /// its state changed."
     pub last_modified: SystemTime,
@@ -2227,6 +2322,37 @@ impl EventSourceMappingRecord {
             // the record, so that is what is stored.
             self.last_modified = self.settled_due;
         }
+    }
+
+    /// Accept a `DeleteEventSourceMapping` of this mapping.
+    ///
+    /// "When you delete an event source mapping, it enters a Deleting state and might not
+    /// be completely deleted for several seconds", so what the call persists is that
+    /// state and the instant the removal becomes due
+    /// ([`EVENT_SOURCE_MAPPING_DELETE_DELAY`]); the removal itself is owed by the CLOCK
+    /// and applied by [`ComAmazonawsLambdaAwsgirapiserviceState::materialize_all`].
+    /// Nothing sleeps for it.
+    pub fn begin_delete(&mut self, now: SystemTime) {
+        self.state = EVENT_SOURCE_MAPPING_STATE_DELETING.to_string();
+        self.state_transition_reason = EVENT_SOURCE_MAPPING_USER_INITIATED.to_string();
+        // "The date that the event source mapping was last updated or that its state
+        // changed": the move into `Deleting` is a state change, and it happened now.
+        self.last_modified = now;
+        self.removal_due = Some(now + EVENT_SOURCE_MAPPING_DELETE_DELAY);
+    }
+
+    /// Whether this mapping is being deleted, which is what makes a second delete of it a
+    /// conflict with "the resource's availability" rather than another accepted delete.
+    #[must_use]
+    pub fn is_deleting(&self) -> bool {
+        self.removal_due.is_some()
+    }
+
+    /// Whether the clock has already made this mapping's removal due; see
+    /// [`EventSourceMappingRecord::begin_delete`].
+    #[must_use]
+    pub fn is_removed_by(&self, now: SystemTime) -> bool {
+        self.removal_due.is_some_and(|due| now >= due)
     }
 
     /// The `EventSourceMappingConfiguration` the wire reports for this record, built
@@ -2392,7 +2518,9 @@ impl ComAmazonawsLambdaAwsgirapiserviceState {
     /// Bring every function, every capacity provider and every event source mapping up
     /// to whatever the clock has already made due; see [`FunctionRecord::materialize`],
     /// [`CapacityProviderRecord::materialize`] and
-    /// [`EventSourceMappingRecord::materialize`].
+    /// [`EventSourceMappingRecord::materialize`]. A mapping a `DeleteEventSourceMapping`
+    /// asked for is removed once that removal is due
+    /// ([`EventSourceMappingRecord::begin_delete`]).
     pub fn materialize_all(&mut self, now: SystemTime) {
         for function in self.functions.values_mut() {
             function.materialize(now);
@@ -2400,6 +2528,11 @@ impl ComAmazonawsLambdaAwsgirapiserviceState {
         for provider in self.capacity_providers.values_mut() {
             provider.materialize(now);
         }
+        // A mapping whose removal the clock already made due is gone: it would have been
+        // gone at the same instant even if nobody had called, so dropping it here reports
+        // the truth rather than deleting anything a read was not owed.
+        self.event_source_mappings
+            .retain(|_, mapping| !mapping.is_removed_by(now));
         for mapping in self.event_source_mappings.values_mut() {
             mapping.materialize(now);
         }
@@ -3127,13 +3260,15 @@ pub fn resolve_resource_tags<'a>(
             Ok(&mut record.tags)
         }
         TaggableResourceRef::EventSourceMapping(uuid) => {
+            // A mapping whose removal the clock already made due is gone, so it holds no
+            // tag set either: what the clock owes is applied in ONE place.
+            store.materialize_all(now);
             let record = store.event_source_mappings.get_mut(&uuid).ok_or_else(|| {
                 TagResolveFailure::NotFound(format!(
                     "The resource you requested does not exist: no event source mapping is \
                      held for '{resource}'"
                 ))
             })?;
-            record.materialize(now);
             Ok(&mut record.tags)
         }
         TaggableResourceRef::CodeSigningConfig(arn) => {

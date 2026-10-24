@@ -39,7 +39,7 @@ const FUNCTIONS_URI: &str = "/2015-03-31/functions";
 /// Where `CreateEventSourceMapping` and `ListEventSourceMappings` are bound, from
 /// `smithy_query(query="operation", operation="CreateEventSourceMapping")`
 /// (`POST /2015-03-31/event-source-mappings`).
-const MAPPINGS_URI: &str = "/2015-03-31/event-source-mappings";
+pub(crate) const MAPPINGS_URI: &str = "/2015-03-31/event-source-mappings";
 
 /// Where `ListTags` is bound (`GET /2017-03-31/tags/{Resource}`), which is how a
 /// mapping's tags are read back.
@@ -64,14 +64,14 @@ const ROLE: &str = "arn:aws:iam::000000000000:role/service-role/lambda-exec";
 /// The `State` a freshly created mapping carries, and the two it settles into, from
 /// `EventSourceMappingConfiguration$State`: "It can be one of the following: Creating,
 /// Enabling, Enabled, Disabling, Disabled, Updating, or Deleting."
-const STATE_CREATING: &str = "Creating";
+pub(crate) const STATE_CREATING: &str = "Creating";
 /// See [`STATE_CREATING`].
 const STATE_ENABLED: &str = "Enabled";
 /// See [`STATE_CREATING`].
 const STATE_DISABLED: &str = "Disabled";
 
 /// `StateTransitionReason` for a change a caller asked for.
-const USER_INITIATED: &str = "USER_INITIATED";
+pub(crate) const USER_INITIATED: &str = "USER_INITIATED";
 
 /// The bounds the model puts on `EventSourceMappingArn` (`@length(min: 85, max: 120)`),
 /// from `smithy_query(query="shape", shape="EventSourceMappingArn")`.
@@ -80,7 +80,7 @@ const MAPPING_ARN_MIN_LEN: usize = 85;
 const MAPPING_ARN_MAX_LEN: usize = 120;
 
 /// The length the model puts on `UUIDString` (`@length(min: 36, max: 36)`).
-const UUID_LEN: usize = 36;
+pub(crate) const UUID_LEN: usize = 36;
 
 /// The published bounds of `MaximumBatchingWindowInSeconds` (`@range(min: 0, max: 300)`),
 /// `ParallelizationFactor` (`@range(min: 1, max: 10)`), `BatchSize`
@@ -107,15 +107,15 @@ const PAGE_CAP: usize = 100;
 const MAX_ITEMS_MAX: usize = 10_000;
 
 /// An Amazon SQS queue, "Amazon Simple Queue Service – The ARN of the queue".
-const QUEUE_SOURCE: &str = "arn:aws:sqs:us-east-1:000000000000:order-intake";
+pub(crate) const QUEUE_SOURCE: &str = "arn:aws:sqs:us-east-1:000000000000:order-intake";
 /// An Amazon Kinesis data stream, "Amazon Kinesis – The ARN of the data stream".
-const KINESIS_SOURCE: &str = "arn:aws:kinesis:us-east-1:000000000000:stream/order-events";
+pub(crate) const KINESIS_SOURCE: &str = "arn:aws:kinesis:us-east-1:000000000000:stream/order-events";
 /// An Amazon DynamoDB stream, "Amazon DynamoDB Streams – The ARN of the stream".
-const DYNAMODB_SOURCE: &str =
+pub(crate) const DYNAMODB_SOURCE: &str =
     "arn:aws:dynamodb:us-east-1:000000000000:table/orders/stream/2026-10-23T11:46:49.000";
 /// An Amazon MSK cluster, "Amazon Managed Streaming for Apache Kafka – The ARN of the
 /// cluster".
-const MSK_SOURCE: &str =
+pub(crate) const MSK_SOURCE: &str =
     "arn:aws:kafka:us-east-1:000000000000:cluster/order-events/11111111-2222-3333-4444-555555555555-1";
 /// An Amazon MQ broker, "Amazon MQ – The ARN of the broker".
 const MQ_SOURCE: &str = "arn:aws:mq:us-east-1:000000000000:broker:order-broker:b-1111";
@@ -132,15 +132,15 @@ const KMS_KEY: &str = "arn:aws:kms:us-east-1:000000000000:key/0b1c2d3e-4f56-7890
 const FAILURE_DESTINATION: &str = "arn:aws:sqs:us-east-1:000000000000:order-dlq";
 
 /// What a dispatched request answered.
-struct Answer {
-    status: u16,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
     headers: http::HeaderMap,
     body: bytes::Bytes,
 }
 
 impl Answer {
     /// The body as JSON, or `Value::Null` for an empty body.
-    fn json(&self) -> Value {
+    pub(crate) fn json(&self) -> Value {
         if self.body.is_empty() {
             return Value::Null;
         }
@@ -153,7 +153,7 @@ impl Answer {
     }
 
     /// A `String` member of the JSON body.
-    fn string(&self, member: &str) -> Option<String> {
+    pub(crate) fn string(&self, member: &str) -> Option<String> {
         self.json()
             .get(member)
             .and_then(Value::as_str)
@@ -161,7 +161,7 @@ impl Answer {
     }
 
     /// The `EventSourceMappings` the body lists, as JSON objects.
-    fn mappings(&self) -> Vec<Value> {
+    pub(crate) fn mappings(&self) -> Vec<Value> {
         self.json()
             .get("EventSourceMappings")
             .and_then(Value::as_array)
@@ -170,7 +170,7 @@ impl Answer {
     }
 
     /// The UUIDs the listed mappings carry, in the order they were reported.
-    fn listed_uuids(&self) -> Vec<String> {
+    pub(crate) fn listed_uuids(&self) -> Vec<String> {
         self.mappings()
             .iter()
             .map(|mapping| {
@@ -184,7 +184,7 @@ impl Answer {
     }
 
     /// The wire error code (`__type`, or the `x-amzn-errortype` header).
-    fn error_code(&self) -> String {
+    pub(crate) fn error_code(&self) -> String {
         self.string("__type")
             .or_else(|| {
                 self.headers
@@ -196,14 +196,14 @@ impl Answer {
     }
 
     /// The body text, for a failure message.
-    fn text(&self) -> String {
+    pub(crate) fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).to_string()
     }
 }
 
 /// One service mounted on its own engine, reached the way the production router reaches
 /// it.
-fn router_on(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
+pub(crate) fn router_on(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(Arc::clone(engine)));
@@ -211,7 +211,7 @@ fn router_on(engine: &Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
 }
 
 /// Dispatch one JSON request.
-async fn call(router: &MultiServiceRouter, method: &str, uri: &str, body: &Value) -> Answer {
+pub(crate) async fn call(router: &MultiServiceRouter, method: &str, uri: &str, body: &Value) -> Answer {
     let payload = if body.is_null() {
         Vec::new()
     } else {
@@ -235,12 +235,12 @@ async fn call(router: &MultiServiceRouter, method: &str, uri: &str, body: &Value
 }
 
 /// `CreateEventSourceMapping`.
-async fn create_mapping(router: &MultiServiceRouter, body: &Value) -> Answer {
+pub(crate) async fn create_mapping(router: &MultiServiceRouter, body: &Value) -> Answer {
     call(router, "POST", MAPPINGS_URI, body).await
 }
 
 /// `GetEventSourceMapping` on the mapping `uuid` names.
-async fn get_mapping(router: &MultiServiceRouter, uuid: &str) -> Answer {
+pub(crate) async fn get_mapping(router: &MultiServiceRouter, uuid: &str) -> Answer {
     call(
         router,
         "GET",
@@ -251,7 +251,7 @@ async fn get_mapping(router: &MultiServiceRouter, uuid: &str) -> Answer {
 }
 
 /// `ListEventSourceMappings` with the query parameters `query` names (already joined).
-async fn list_mappings(router: &MultiServiceRouter, query: &str) -> Answer {
+pub(crate) async fn list_mappings(router: &MultiServiceRouter, query: &str) -> Answer {
     let uri = if query.is_empty() {
         MAPPINGS_URI.to_string()
     } else {
@@ -305,13 +305,13 @@ async fn create_function_publishing(router: &MultiServiceRouter, name: &str, pub
 }
 
 /// Create a function for a mapping to invoke.
-async fn create_function(router: &MultiServiceRouter, name: &str) {
+pub(crate) async fn create_function(router: &MultiServiceRouter, name: &str) {
     create_function_publishing(router, name, false).await;
 }
 
 /// The `CreateEventSourceMapping` body for `function` and `event_source`, plus whatever
 /// `extras` states.
-fn create_request(function: &str, event_source: Option<&str>, extras: &Value) -> Value {
+pub(crate) fn create_request(function: &str, event_source: Option<&str>, extras: &Value) -> Value {
     let mut body = Map::new();
     body.insert("FunctionName".to_string(), json!(function));
     if let Some(event_source) = event_source {
@@ -1121,6 +1121,239 @@ async fn tags_a_mapping_was_created_with_are_reported_for_its_arn() {
             tagged.text()
         );
     }
+}
+
+/// One event-source row: the `EventSourceArn` a create names, what else that source
+/// requires the create to state, and whether a mapping of it can be created at all.
+struct EventSourceCase {
+    name: &'static str,
+    event_source: &'static str,
+    request_extras: Value,
+    /// Whether this account can map the resource the ARN names.
+    mappable: bool,
+}
+
+/// The rows. The accepted ones are the catalogue the `EventSourceArn` member itself
+/// enumerates — `smithy_query(query="doc", shape="CreateEventSourceMappingRequest",
+/// member="EventSourceArn")`: "Amazon Kinesis – The ARN of the data stream or a stream
+/// consumer. Amazon DynamoDB Streams – The ARN of the stream. Amazon Simple Queue Service
+/// – The ARN of the queue. Amazon Managed Streaming for Apache Kafka – The ARN of the
+/// cluster or the ARN of the VPC connection (for cross-account event source mappings).
+/// Amazon MQ – The ARN of the broker. Amazon DocumentDB – The ARN of the DocumentDB change
+/// stream." The refused ones are well-formed ARNs outside it: another vendor's resource,
+/// another resource type of one of these vendors, and one of these resources in another
+/// account (which only the documented MSK VPC connection form may be). A value that is no
+/// ARN at all is refused by the modelled `Arn` pattern before the handler runs, so it is
+/// not a row here.
+fn event_source_cases() -> Vec<EventSourceCase> {
+    vec![
+        EventSourceCase {
+            name: "a kinesis data stream",
+            event_source: "arn:aws:kinesis:us-east-1:000000000000:stream/catalog-events",
+            request_extras: json!({ "StartingPosition": "LATEST" }),
+            mappable: true,
+        },
+        EventSourceCase {
+            name: "a kinesis stream consumer",
+            event_source:
+                "arn:aws:kinesis:us-east-1:000000000000:stream/catalog-events/consumer/analytics:1700000000",
+            request_extras: json!({ "StartingPosition": "TRIM_HORIZON" }),
+            mappable: true,
+        },
+        EventSourceCase {
+            name: "a dynamodb stream",
+            event_source:
+                "arn:aws:dynamodb:us-east-1:000000000000:table/catalog/stream/2026-10-23T11:46:49.000",
+            request_extras: json!({ "StartingPosition": "LATEST" }),
+            mappable: true,
+        },
+        EventSourceCase {
+            name: "a queue",
+            event_source: "arn:aws:sqs:us-east-1:000000000000:catalog-intake",
+            request_extras: json!({}),
+            mappable: true,
+        },
+        EventSourceCase {
+            name: "an msk cluster",
+            event_source:
+                "arn:aws:kafka:us-east-1:000000000000:cluster/catalog-events/11111111-2222-3333-4444-555555555555-1",
+            request_extras: json!({ "Topics": ["catalog"] }),
+            mappable: true,
+        },
+        EventSourceCase {
+            name: "an msk vpc connection of another account, the documented cross-account form",
+            event_source:
+                "arn:aws:kafka:us-east-1:999999999999:vpc-connection/11111111-2222-3333-4444-555555555555-1/22222222-3333-4444-5555-666666666666",
+            request_extras: json!({ "Topics": ["catalog"] }),
+            mappable: true,
+        },
+        EventSourceCase {
+            name: "an amazon mq broker",
+            event_source: "arn:aws:mq:us-east-1:000000000000:broker:catalog-broker:b-1111",
+            request_extras: json!({ "Queues": ["catalog"] }),
+            mappable: true,
+        },
+        EventSourceCase {
+            name: "a documentdb change stream cluster",
+            event_source: "arn:aws:rds:us-east-1:000000000000:cluster:catalog-docdb",
+            request_extras: json!({}),
+            mappable: true,
+        },
+        EventSourceCase {
+            name: "a bucket, which is no event source",
+            event_source: "arn:aws:s3:::catalog-dropbox",
+            request_extras: json!({}),
+            mappable: false,
+        },
+        EventSourceCase {
+            name: "a topic, which is no event source",
+            event_source: "arn:aws:sns:us-east-1:000000000000:catalog-events",
+            request_extras: json!({}),
+            mappable: false,
+        },
+        EventSourceCase {
+            name: "a function, which is no event source",
+            event_source: "arn:aws:lambda:us-east-1:000000000000:function:catalog-fn",
+            request_extras: json!({}),
+            mappable: false,
+        },
+        EventSourceCase {
+            name: "a dynamodb table rather than its stream",
+            event_source: "arn:aws:dynamodb:us-east-1:000000000000:table/catalog",
+            request_extras: json!({ "StartingPosition": "LATEST" }),
+            mappable: false,
+        },
+        EventSourceCase {
+            name: "a database instance rather than a documentdb cluster",
+            event_source: "arn:aws:rds:us-east-1:000000000000:db:catalog-db",
+            request_extras: json!({}),
+            mappable: false,
+        },
+        EventSourceCase {
+            name: "an msk configuration rather than a cluster",
+            event_source:
+                "arn:aws:kafka:us-east-1:000000000000:configuration/catalog/11111111-2222-3333-4444-555555555555-1",
+            request_extras: json!({}),
+            mappable: false,
+        },
+        EventSourceCase {
+            name: "an mq configuration rather than a broker",
+            event_source: "arn:aws:mq:us-east-1:000000000000:configuration:catalog-config:c-1111",
+            request_extras: json!({}),
+            mappable: false,
+        },
+        EventSourceCase {
+            name: "a queue of another account",
+            event_source: "arn:aws:sqs:us-east-1:999999999999:catalog-foreign",
+            request_extras: json!({}),
+            mappable: false,
+        },
+        EventSourceCase {
+            name: "a kinesis data stream of another account",
+            event_source: "arn:aws:kinesis:us-east-1:999999999999:stream/catalog-foreign",
+            request_extras: json!({ "StartingPosition": "LATEST" }),
+            mappable: false,
+        },
+        EventSourceCase {
+            name: "an msk cluster of another account, which is not the cross-account form",
+            event_source:
+                "arn:aws:kafka:us-east-1:999999999999:cluster/catalog-foreign/11111111-2222-3333-4444-555555555555-1",
+            request_extras: json!({ "Topics": ["catalog"] }),
+            mappable: false,
+        },
+        EventSourceCase {
+            name: "a queue with no account at all",
+            event_source: "arn:aws:sqs:us-east-1::catalog-accountless",
+            request_extras: json!({}),
+            mappable: false,
+        },
+    ]
+}
+
+/// The event source of a mapping is one of the resources `EventSourceArn` enumerates, in
+/// this account: a resource of another vendor, another resource type of one of those
+/// vendors, or one of them in another account (which only the documented MSK VPC
+/// connection may be) names nothing a poller could read, so it is refused with the
+/// modelled 400 and no mapping is stored for it.
+#[tokio::test]
+async fn only_an_arn_naming_an_event_source_of_this_account_is_mapped() {
+    let engine = Arc::new(engine::InMemoryEngine::new());
+    let router = router_on(&engine);
+    let function = "esm-source-catalog-fn";
+    create_function(&router, function).await;
+
+    let cases = event_source_cases();
+    for case in &cases {
+        let label = case.name;
+        let answer = create_mapping(
+            &router,
+            &create_request(function, Some(case.event_source), &case.request_extras),
+        )
+        .await;
+        if case.mappable {
+            assert_eq!(
+                answer.status,
+                202,
+                "case {label:?}: {} names an event source, so the create must be accepted, \
+                 got {} {}",
+                case.event_source,
+                answer.status,
+                answer.text()
+            );
+            let uuid = answer
+                .string("UUID")
+                .unwrap_or_else(|| panic!("case {label:?}: the create answers a UUID"));
+            // Read back through the Get: the mapping is a stored record of that source.
+            let fetched = get_mapping(&router, &uuid).await;
+            assert_eq!(
+                (fetched.status, fetched.string("EventSourceArn")),
+                (200, Some(case.event_source.to_string())),
+                "case {label:?}: the stored mapping must report the event source it was \
+                 created against, got {} {}",
+                fetched.status,
+                fetched.text()
+            );
+        } else {
+            assert_eq!(
+                (
+                    answer.status,
+                    answer
+                        .error_code()
+                        .contains("InvalidParameterValueException")
+                ),
+                (400, true),
+                "case {label:?}: {} names no event source this account can map, so the \
+                 create must be refused with the modelled 400, got {} {}",
+                case.event_source,
+                answer.status,
+                answer.text()
+            );
+        }
+    }
+
+    // Exactly the mappable rows are held, so no refusal stored a mapping of a source
+    // nothing could poll.
+    let listed = list_mappings(&router, "").await;
+    let stored: BTreeSet<String> = listed
+        .mappings()
+        .iter()
+        .filter_map(|mapping| {
+            mapping
+                .get("EventSourceArn")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect();
+    let expected: BTreeSet<String> = cases
+        .iter()
+        .filter(|case| case.mappable)
+        .map(|case| case.event_source.to_string())
+        .collect();
+    assert_eq!(
+        stored, expected,
+        "the store must hold exactly the mappings of the sources that can be mapped, got {}",
+        listed.text()
+    );
 }
 
 /// One refusal row: what to send, and the status (and modelled error code) it must be
