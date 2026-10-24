@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteBudgetAction
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteBudgetAction`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteBudgetAction::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes one budget action from the budget that owns it — named by the `ActionId`
+//! `CreateBudgetAction` minted for it — and reports the action it removed, so the caller
+//! sees exactly what went away. The action goes with the `ResourceTags` and the history
+//! held alongside it, and the budget's other actions keep their order.
+//!
+//! A budget this account does not hold, or an id no action of that budget carries, is a
+//! `NotFoundException`. An action whose work this service has started and not settled
+//! yet is the locked resource `ResourceLockedException` names
+//! ([`crate::state::action_is_in_progress`]): the delete is refused until the clock
+//! settles that status, which is also why a settle already due is materialised before
+//! this call judges it.
 //!
 //! ## Shape of an operation
 //!
@@ -166,17 +169,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteBudgetAction` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteBudgetActionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteBudgetAction"))
+        // request metadata.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteBudgetActionErrorModeled::InternalErrorException(InternalErrorException {
+                message: Some(
+                    "budgets is mounted on an engine that holds no state for it".to_string(),
+                ),
+            })
+        })?;
+
+        // The modelled `BudgetName` `@pattern` the boundary validator cannot compile —
+        // refused as the request-validation failure it is (HTTP 400
+        // `ValidationException`), naming the member path and the constraint.
+        if let Some(message) =
+            crate::state::budget_name_violation(&["BudgetName"], &input.budget_name)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // An action is a resource OF the budget it names (`Action$BudgetName`), so a
+        // budget this account does not hold holds no action either: an action of another
+        // account, or of another budget of this account, is not this one.
+        let stored = store
+            .budgets
+            .get_mut(&(input.account_id.clone(), input.budget_name.clone()))
+            .ok_or_else(|| {
+                DeleteBudgetActionErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(format!(
+                        "Unable to delete budget action: {} - the budget doesn't exist.",
+                        input.budget_name
+                    )),
+                })
+            })?;
+        // The action the caller named, inside the budget that owns it.
+        let index = stored
+            .actions
+            .iter()
+            .position(|held| held.action.action_id == input.action_id)
+            .ok_or_else(|| {
+                DeleteBudgetActionErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(format!(
+                        "Unable to delete budget action: {} - the action doesn't exist.",
+                        input.action_id
+                    )),
+                })
+            })?;
+        // Materialise a settle the clock had already made due, so the status this call
+        // decides from is the one the action already carried — the same lookup rule the
+        // read paths follow through [`crate::state::find_action_mut`].
+        stored.actions[index].settle_due(now);
+
+        // Work this service started and has not settled yet: the resource is locked
+        // against this method until it does, which is what `ResourceLockedException`
+        // reports ("the server rejected that particular method for the requested
+        // resource").
+        let status = &stored.actions[index].action.status;
+        if crate::state::action_is_in_progress(status) {
+            return Err(DeleteBudgetActionErrorModeled::ResourceLockedException(
+                ResourceLockedException {
+                    message: Some(format!(
+                        "Unable to delete budget action: {} - the action is {status} and \
+                         cannot be deleted until that completes.",
+                        input.action_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The action goes with the tags and the history held alongside it; the budget's
+        // other actions keep their relative order, which is the order a paginated read
+        // indexes into.
+        let removed = stored.actions.remove(index);
+
+        Ok(DeleteBudgetActionOutput {
+            account_id: input.account_id,
+            budget_name: input.budget_name,
+            // `DeleteBudgetActionResponse$Action` is the action as it stood when it was
+            // removed, which is the last thing anybody can read about it.
+            action: removed.action,
+        })
     }
 }

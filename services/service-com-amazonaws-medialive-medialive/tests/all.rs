@@ -77,6 +77,9 @@ mod input_device_listing;
 #[path = "all/input_device_maintenance_window.rs"]
 mod input_device_maintenance_window;
 
+#[path = "all/input_device_streaming.rs"]
+mod input_device_streaming;
+
 #[path = "all/input_device_transfers.rs"]
 mod input_device_transfers;
 

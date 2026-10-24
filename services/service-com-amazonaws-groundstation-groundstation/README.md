@@ -113,9 +113,10 @@ service's operations.
 | `GROUNDSTATION_APPROVED_UPLINK_BANDS_MHZ` | The uplink frequency bands this emulated account is approved to transmit on, as comma-separated `<low>-<high>` pairs in MHz (`2025-2120` approves the whole band the service operates). Read ONCE, when this service's store is first created, so setting it after the first request has no effect. |
 | `GROUNDSTATION_RESERVED_MINUTES` | The reserved-minutes pricing plan this account holds, as comma-separated entries: a bare minute count is a standing monthly commitment (`500`) and `<year>-<month>=<minutes>` is one calendar month's own allocation (`500,2026-02=750`). Read once, with the same timing. |
 | `GROUNDSTATION_SATELLITES` | The satellites this account is on-boarded to, as comma-separated entries: a bare NORAD catalogue number (`25994`) or `<norad>=<ground station>+<ground station>…` naming the ground stations the satellite is on-boarded to (`25994=Ohio 1+Oregon 1,27424`). Read once, with the same timing. |
+| `GROUNDSTATION_GROUND_STATIONS` | The ground stations this account is served by and the antennas at each, as comma-separated entries: a bare ground-station name (`Oregon 1`) or `<ground station>=<antenna>+<antenna>…` naming the antennas at it (`Ohio 1=Antenna 1+Antenna 2,Oregon 1`). Read once, with the same timing. |
 
-Both settings stand for something that happens OUTSIDE the Ground Station API, which is
-why they are settings rather than operations:
+Each of these settings stands for something that happens OUTSIDE the Ground Station API,
+which is why they are settings rather than operations:
 
 - Uplink approval is granted by AWS after spectrum coordination — the model has no
   operation that grants one and none that reports one — so an account starts with none
@@ -136,9 +137,17 @@ why they are settings rather than operations:
   onboarding is listed here; each entry is minted a `satelliteId` and a region-less
   `satelliteArn` when the store is created.
 
-`src/state.rs`'s `APPROVED_UPLINK_BANDS_ENV`, `RESERVED_MINUTES_ENV` and `SATELLITES_ENV`
-are the three readers, and all land in this service's own state, where a test seeds them
-directly.
+- A ground station and its antennas are built and operated by AWS, and an account reaches
+  the ones it has been granted: the model declares no operation that creates either and
+  none that reports one other than the listings themselves. So an account starts knowing
+  only the ground stations its satellite onboardings name, none of which lists an antenna,
+  until an inventory is listed here; `ListAntennas` then reports the antennas at the named
+  ground station and refuses a `groundStationId` no onboarding and no inventory records
+  with `InvalidParameterException`.
+
+`src/state.rs`'s `APPROVED_UPLINK_BANDS_ENV`, `RESERVED_MINUTES_ENV`, `SATELLITES_ENV`
+and `GROUND_STATIONS_ENV` are the four readers, and all land in this service's own state,
+where a test seeds them directly.
 
 An `s3RecordingConfig`'s recording bucket needs NO setting: Ground Station resolves the
 bucket the `bucketArn` names against the emulator's own S3 (`HeadBucket` over the
