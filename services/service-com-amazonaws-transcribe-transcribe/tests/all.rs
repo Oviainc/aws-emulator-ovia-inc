@@ -29,6 +29,8 @@ mod medical_scribe_jobs;
 mod medical_transcription_jobs;
 #[path = "all/medical_vocabularies.rs"]
 mod medical_vocabularies;
+#[path = "all/medical_vocabulary_constraints.rs"]
+mod medical_vocabulary_constraints;
 #[path = "all/rpc_success_status.rs"]
 mod rpc_success_status;
 #[path = "all/service_claim.rs"]
