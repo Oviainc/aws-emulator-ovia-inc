@@ -378,7 +378,11 @@ async fn get_network_serves_the_aws_owned_public_networks() {
         "/networks/n-ethereum-mainnet/nodes",
         Some(json!({
             "ClientRequestToken": "public-node-1",
-            "NodeConfiguration": { "InstanceType": "bc.t3.large" }
+            // `NodeConfiguration$AvailabilityZone` is "Required for Ethereum nodes".
+            "NodeConfiguration": {
+                "InstanceType": "bc.t3.large",
+                "AvailabilityZone": format!("{REGION}a"),
+            }
         })),
     )
     .await;
@@ -445,7 +449,11 @@ async fn get_network_serves_the_aws_owned_public_networks() {
         "/networks/n-ethereum-mainnet/nodes",
         Some(json!({
             "ClientRequestToken": "public-node-statedb",
-            "NodeConfiguration": { "InstanceType": "bc.t3.large", "StateDB": "CouchDB" }
+            "NodeConfiguration": {
+                "InstanceType": "bc.t3.large",
+                "AvailabilityZone": format!("{REGION}a"),
+                "StateDB": "CouchDB"
+            }
         })),
     )
     .await;

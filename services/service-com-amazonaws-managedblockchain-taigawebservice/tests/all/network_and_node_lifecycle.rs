@@ -753,8 +753,8 @@ async fn create_node_persists_its_configuration() {
     let router = new_router();
     let (network_id, member_id) = available_network(&router, "nodes-1", "node-net").await;
 
-    // Rows differ along the instance type (`InstanceTypeString` carries no modelled
-    // constraint, so these are example sizes), the presence of an Availability Zone, the
+    // Rows differ along the instance type (one size from each `bc.*` family the catalog
+    // in `state::INSTANCE_TYPES` publishes), the presence of an Availability Zone, the
     // `StateDB` value (smithy_query: shape StateDBType = CouchDB | LevelDB) and its
     // omission, and the tag count.
     let cases: &[NodeCase] = &[

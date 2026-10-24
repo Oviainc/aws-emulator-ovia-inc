@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateNode
-//! Implemented: mints a node id under a stored network (and, on Hyperledger Fabric,
+//! Implemented: validates the node configuration against the network's framework and
+//! edition, then mints a node id under a stored network (and, on Hyperledger Fabric,
 //! under one of that network's members) and persists the node in [`crate::state`];
 //! `GetNode` and `ListNodes` project the same record.
 //!
@@ -280,12 +281,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|member_id| network.members.get(member_id))
             .map(|member| member.kms_key_arn.clone());
 
-        let node_id = guard.mint_id("nd");
+        // Which node sizes the network can run depends on its edition
+        // (`NetworkFabricAttributes$Edition`), so it is read off the stored network while
+        // the record is still in hand.
+        let fabric_edition = network.fabric_edition.clone();
+
+        let configuration = input.node_configuration;
         // `NodeConfiguration$StateDB` "Applies only to Hyperledger Fabric": a node on a
         // framework that has no state database cannot take one, so a request that names
         // one is refused rather than silently ignored.
-        if framework != crate::state::FRAMEWORK_HYPERLEDGER_FABRIC
-            && input.node_configuration.state_db.is_some()
+        if framework != crate::state::FRAMEWORK_HYPERLEDGER_FABRIC && configuration.state_db.is_some()
         {
             return Err(CreateNodeErrorModeled::InvalidRequestException(
                 InvalidRequestException {
@@ -298,6 +303,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+
+        // `NodeConfiguration$AvailabilityZone` is "The Availability Zone in which the node
+        // exists. Required for Ethereum nodes.": on a framework that requires one, a
+        // request that names none (or names an empty one) describes a node the service
+        // could not place, so it is refused before anything is minted rather than stored
+        // with no zone at all.
+        if crate::state::availability_zone_required(&framework)
+            && configuration
+                .availability_zone
+                .as_deref()
+                .is_none_or(|zone| zone.trim().is_empty())
+        {
+            return Err(CreateNodeErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "AvailabilityZone is required on a {} network; network {} is {framework}",
+                        crate::state::FRAMEWORK_ETHEREUM,
+                        input.network_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // `NodeConfiguration$InstanceType` is "The Amazon Managed Blockchain instance type
+        // for the node": only a type the service offers for this network's framework and
+        // edition names a node that can exist, so any other is refused. The catalog is not
+        // an enum in the model, so it lives in `crate::state::supported_instance_types`.
+        if !crate::state::instance_type_supported(
+            &framework,
+            fabric_edition.as_deref(),
+            &configuration.instance_type,
+        ) {
+            return Err(CreateNodeErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "Invalid instance type {} requested for network {}; supported instance \
+                         types are {}.",
+                        configuration.instance_type,
+                        input.network_id,
+                        crate::state::supported_instance_types(
+                            &framework,
+                            fabric_edition.as_deref()
+                        )
+                        .join(", ")
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let node_id = guard.mint_id("nd");
         // The endpoints a node reports are the ones its network's framework publishes:
         // peer endpoints on Hyperledger Fabric, JSON-RPC endpoints on Ethereum.
         let endpoints = crate::state::node_endpoints(
@@ -307,7 +364,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             member_id.as_deref(),
             &node_id,
         );
-        let configuration = input.node_configuration;
         let node = crate::state::StoredNode {
             id: node_id.clone(),
             network_id: input.network_id.clone(),
