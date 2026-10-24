@@ -157,6 +157,20 @@ pub const MAX_BASELINE_OPERATIONS: usize = 1024;
 /// [`settle`]: ComAmazonawsControltowerAwscontroltowerapisState::settle
 pub const MAX_ENABLED_BASELINES: usize = 512;
 
+/// The most bytes one baseline enablement's `parameters` may weigh, keys and documents
+/// together.
+///
+/// The declared-key check below already bounds the parameter COUNT of an enablement (a
+/// baseline declares a handful of keys and each may be given once), but an
+/// `EnabledBaselineParameter$value` is an unconstrained `Document`, so one parameter can
+/// still carry a whole body. The weight is measured with [`document_weight_within`],
+/// which stops as soon as this cap is exceeded, and a request above it is refused with
+/// the modelled `ValidationException`. CHOSEN, for the same reason and at the same size
+/// as [`MAX_ENABLED_CONTROL_PARAMETER_BYTES`]: orders of magnitude above any real
+/// baseline configuration, and small enough that [`MAX_ENABLED_BASELINES`] records bound
+/// the store's size in bytes as well as in entries.
+pub const MAX_ENABLED_BASELINE_PARAMETER_BYTES: usize = 64 * 1024;
+
 /// The landing zone versions this service OFFERS, oldest first.
 ///
 /// `LandingZoneVersion` (len 3..10, pattern `^\d+.\d+$`) bounds the SHAPE of a version
@@ -1608,6 +1622,47 @@ pub struct CatalogBaseline {
     /// `GetBaselineOutput$description` / `BaselineSummary$description` — "A summary
     /// description of a Baseline."
     pub description: &'static str,
+    /// The `baselineVersion`s this baseline OFFERS, oldest first.
+    ///
+    /// `BaselineVersion` (len 1..10, pattern `^\d+(?:\.\d+){0,2}$`) bounds the SHAPE of a
+    /// version string, not the set of versions a baseline has, and the member is "the
+    /// specific version to be enabled of the specified baseline" (model docs): a baseline
+    /// is enabled at a version it offers, so a value outside this set names no deployable
+    /// configuration and is refused rather than persisted — the same rule
+    /// [`CATALOG_LANDING_ZONE_VERSIONS`] carries one level up.
+    ///
+    /// Like the ids, these sets are this emulator's own publication: nothing published
+    /// derives a baseline id, and a baseline's version list moves with AWS's releases.
+    /// The `4.0` of AWS's own `EnableBaseline` example is kept for the baseline that
+    /// example enables, every baseline starts at `1.0`, and each entry satisfies
+    /// `BaselineVersion`.
+    pub versions: &'static [&'static str],
+    /// The `EnabledBaselineParameter` keys this baseline DECLARES, in a stable order.
+    ///
+    /// `EnabledBaselineParameter$key` is "a string denoting the parameter applied to the
+    /// Baseline" — a parameter the baseline itself declares, not a name the caller
+    /// invents, so a key outside this set configures nothing and is refused.
+    /// `IdentityCenterEnabledForBaseline` is the one the AWS Control Tower documentation
+    /// publishes, on the baseline that governs an organizational unit's accounts; a
+    /// baseline that declares none carries an EMPTY set, and any `parameters` entry at
+    /// all is then refused for it.
+    pub parameters: &'static [&'static str],
+}
+
+impl CatalogBaseline {
+    /// Whether this baseline offers `version`.
+    ///
+    /// The membership test behind every `baselineVersion` refusal. Matched exactly, like
+    /// a landing zone version: a baseline publishes version strings, and one differing in
+    /// a character names a version it does not have.
+    pub fn offers_version(&self, version: &str) -> bool {
+        self.versions.contains(&version)
+    }
+
+    /// Whether this baseline declares `key` as an enablement parameter.
+    pub fn declares_parameter(&self, key: &str) -> bool {
+        self.parameters.contains(&key)
+    }
 }
 
 /// The baselines this emulator publishes, in a stable order.
@@ -1629,42 +1684,56 @@ pub const BASELINE_CATALOG: &[CatalogBaseline] = &[
         name: "AWSControlTowerBaseline",
         description: "Sets up the resources and permissions AWS Control Tower requires \
                       to govern the accounts of a target organizational unit.",
+        versions: &["1.0", "2.0", "3.0", "4.0"],
+        parameters: &["IdentityCenterEnabledForBaseline"],
     },
     CatalogBaseline {
         id: "4T4HA1KMO10S6311",
         name: "AuditBaseline",
         description: "Sets up the cross-account audit resources AWS Control Tower \
                       requires in the audit account.",
+        versions: &["1.0"],
+        parameters: &[],
     },
     CatalogBaseline {
         id: "TR7NC4VPG9DH2KLM",
         name: "BackupAdminBaseline",
         description: "Sets up the backup administration resources AWS Control Tower \
                       requires in the backup administration account.",
+        versions: &["1.0"],
+        parameters: &[],
     },
     CatalogBaseline {
         id: "QXK3R9ZB7PN5TD2H",
         name: "BackupBaseline",
         description: "Sets up the backup plans and roles AWS Control Tower applies to \
                       the accounts of a target organizational unit.",
+        versions: &["1.0"],
+        parameters: &[],
     },
     CatalogBaseline {
         id: "WM8FJ6YHL3QS5XKB",
         name: "BackupCentralVaultBaseline",
         description: "Sets up the central backup vault AWS Control Tower requires in \
                       the backup central vault account.",
+        versions: &["1.0"],
+        parameters: &[],
     },
     CatalogBaseline {
         id: "LN25R72TTG6IGPTQ",
         name: "IdentityCenterBaseline",
         description: "Sets up the AWS IAM Identity Center resources that are a \
                       prerequisite for the AWSControlTowerBaseline.",
+        versions: &["1.0", "4.0"],
+        parameters: &[],
     },
     CatalogBaseline {
         id: "2V6DZ8QKR4JT7MWN",
         name: "LogArchiveBaseline",
         description: "Sets up the centralized log storage AWS Control Tower requires in \
                       the log archive account.",
+        versions: &["1.0"],
+        parameters: &[],
     },
 ];
 
@@ -1686,18 +1755,214 @@ pub fn baseline_arn(region: &str, baseline_id: &str) -> String {
     format!("arn:aws:{ARN_NAMESPACE}:{region}::baseline/{baseline_id}")
 }
 
-/// The catalog entry a `baselineIdentifier` names, or `None` when the catalog holds no
-/// baseline with that resource id.
+/// The catalog entry a `baselineIdentifier` names, or `None` when the identifier is not a
+/// baseline ARN or the catalog holds no baseline with its resource id.
 ///
 /// A baseline's identity is the 16-character resource id after `baseline/`: the same
 /// catalog is published in every partition, region and account, so the segments before
-/// it select nothing and are not compared. The id itself is matched exactly, so a value
-/// differing from a catalog id in one character names no baseline.
+/// it select nothing and are not compared beyond being the ones a baseline ARN carries
+/// ([`is_baseline_arn`]). The id itself is matched exactly, so a value differing from a
+/// catalog id in one character names no baseline.
 pub fn resolve_baseline(baseline_identifier: &str) -> Option<&'static CatalogBaseline> {
+    if !is_baseline_arn(baseline_identifier) {
+        return None;
+    }
     let (_, baseline_id) = baseline_identifier.rsplit_once(":baseline/")?;
     BASELINE_CATALOG
         .iter()
         .find(|baseline| baseline.id == baseline_id)
+}
+
+/// Whether `identifier` is a baseline ARN at all.
+///
+/// The model's own `BaselineArn` form,
+/// `^arn:[a-z-]+:controltower:[a-z0-9-]*:[0-9]{0,12}:baseline/[A-Z0-9]{16}$`, checked
+/// segment by segment. `GetBaseline$baselineIdentifier` carries that type so its front
+/// door answers this question, but `EnableBaseline$baselineIdentifier` is typed as the
+/// generic `Arn` (pattern `^arn:aws[0-9a-zA-Z_\-:\/]+$`), which cannot express "is a
+/// baseline" — so an ARN of some other service, or one naming some other kind of
+/// resource, reaches a handler and is told apart here.
+pub fn is_baseline_arn(identifier: &str) -> bool {
+    let Some((partition, service, region, account, resource)) = arn_segments(identifier) else {
+        return false;
+    };
+    !partition.is_empty()
+        && partition
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte == b'-')
+        && service == ARN_NAMESPACE
+        && region
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        && account.len() <= 12
+        && account.bytes().all(|byte| byte.is_ascii_digit())
+        && resource.strip_prefix("baseline/").is_some_and(|id| {
+            id.len() == 16
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+        })
+}
+
+/// Whether `target` is the ARN of an AWS Organizations organizational unit.
+///
+/// `EnableBaseline$targetIdentifier` is "the ARN of the target on which the baseline will
+/// be enabled. Only OUs are supported as targets" (model docs), and its `Arn` type cannot
+/// express that, so the semantic check is here: the ARN must be an Organizations ARN
+/// (`arn:<partition>:organizations::<12-digit account>:ou/<organization>/<unit>`) whose
+/// resource is an organizational unit, with the `o-` / `ou-` identifier forms the AWS
+/// Organizations documentation publishes. The published LENGTH windows of those
+/// identifiers are not imposed — the identifiers AWS's own examples carry are shorter
+/// than the windows — so what is checked is the structure: an ARN of another service,
+/// another resource type, or a value that is not an organizational unit identifier at all
+/// names no target a baseline can be applied to.
+pub fn is_organizational_unit_arn(target: &str) -> bool {
+    let Some((partition, service, region, account, resource)) = arn_segments(target) else {
+        return false;
+    };
+    if partition.is_empty() || service != "organizations" || !region.is_empty() {
+        return false;
+    }
+    if account.len() != 12 || !account.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    let Some((organization, organizational_unit)) = resource
+        .strip_prefix("ou/")
+        .and_then(|rest| rest.split_once('/'))
+    else {
+        return false;
+    };
+    organization.strip_prefix("o-").is_some_and(is_lower_alnum)
+        && organizational_unit
+            .strip_prefix("ou-")
+            .and_then(|rest| rest.split_once('-'))
+            .is_some_and(|(root, unit)| is_lower_alnum(root) && is_lower_alnum(unit))
+}
+
+/// An ARN's partition, service, region, account and resource segments, or `None` when
+/// `value` is not six colon-separated segments beginning with `arn`.
+///
+/// The resource segment keeps whatever colons it contains, so a caller that expects a
+/// slash-delimited resource rejects a colon-delimited one by matching on it.
+fn arn_segments(value: &str) -> Option<(&str, &str, &str, &str, &str)> {
+    let mut segments = value.splitn(6, ':');
+    let (
+        Some("arn"),
+        Some(partition),
+        Some(service),
+        Some(region),
+        Some(account),
+        Some(resource),
+    ) = (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    )
+    else {
+        return None;
+    };
+    Some((partition, service, region, account, resource))
+}
+
+/// Whether `value` is a non-empty run of lowercase letters and digits — the character
+/// class an AWS Organizations entity identifier is made of.
+fn is_lower_alnum(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+}
+
+/// Why `target` cannot have a baseline enabled on it, or `None` when it is an
+/// organizational unit ARN.
+///
+/// The one place that refusal's wording is built. The message is built from the request
+/// and from the rule, so it tells the caller what kind of target it may name.
+pub fn non_organizational_unit_target_message(target: &str) -> Option<String> {
+    if is_organizational_unit_arn(target) {
+        return None;
+    }
+    Some(format!(
+        "targetIdentifier {target:?} is not the ARN of an organizational unit; only \
+         organizational units are supported as targets, named as \
+         arn:aws:organizations::<account>:ou/<organization>/<organizational unit>"
+    ))
+}
+
+/// Why `version` cannot be enabled of `baseline`, or `None` when that baseline offers it.
+///
+/// The one place this refusal's wording is built, so `EnableBaseline` and
+/// `UpdateEnabledBaseline` refuse an unoffered version in the same words, and the message
+/// is built from the request and the catalog so it tells the caller which versions it may
+/// ask for.
+pub fn unsupported_baseline_version_message(
+    baseline: &CatalogBaseline,
+    version: &str,
+) -> Option<String> {
+    if baseline.offers_version(version) {
+        return None;
+    }
+    Some(format!(
+        "baselineVersion {version:?} is not a version baseline {} offers; the available \
+         versions are {}",
+        baseline.name,
+        baseline.versions.join(", ")
+    ))
+}
+
+/// Why `parameters` does not configure `baseline`, or `None` when it does.
+///
+/// The one place a baseline enablement's parameter list is checked, so `EnableBaseline`
+/// and `UpdateEnabledBaseline` refuse the same lists in the same words. A list is
+/// unacceptable when it names a key the baseline does not declare (it would configure
+/// nothing), repeats a key (one key addresses one parameter, so a list carrying it twice
+/// does not describe one configuration) or weighs more than
+/// [`MAX_ENABLED_BASELINE_PARAMETER_BYTES`].
+pub fn unacceptable_parameters_message(
+    baseline: &CatalogBaseline,
+    parameters: &[(String, ::aws_smithy_types::Document)],
+) -> Option<String> {
+    let mut seen: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
+    let mut weight = 0usize;
+    for (key, value) in parameters {
+        if !baseline.declares_parameter(key) {
+            return Some(if baseline.parameters.is_empty() {
+                format!(
+                    "parameters names {key:?}, which baseline {} does not declare; that \
+                     baseline declares no enablement parameters",
+                    baseline.name
+                )
+            } else {
+                format!(
+                    "parameters names {key:?}, which baseline {} does not declare; the \
+                     parameters it declares are {}",
+                    baseline.name,
+                    baseline.parameters.join(", ")
+                )
+            });
+        }
+        if !seen.insert(key.as_str()) {
+            return Some(format!(
+                "parameters carries key {key:?} more than once; each enablement parameter \
+                 key may be given at most once"
+            ));
+        }
+        // The budget left for this value, so the whole list is measured once and the walk
+        // stops at the first node that takes it past the cap.
+        let budget =
+            MAX_ENABLED_BASELINE_PARAMETER_BYTES.saturating_sub(weight.saturating_add(key.len()));
+        let Some(value_weight) = document_weight_within(value, budget) else {
+            return Some(format!(
+                "parameters weighs more than the {MAX_ENABLED_BASELINE_PARAMETER_BYTES} \
+                 bytes a baseline enablement's parameters may hold"
+            ));
+        };
+        weight = weight.saturating_add(key.len()).saturating_add(value_weight);
+    }
+    None
 }
 
 /// A fresh landing zone resource id, used as the ARN's resource segment.

@@ -13,9 +13,8 @@
 //!   against the `EnabledBaseline` its identifier names, and once the clock has made that
 //!   operation due the enablement's applied `baselineVersion` is the requested one and its
 //!   applied parameters are the requested list when the request carried a `parameters`
-//!   member and the ones already applied when it did not — for any version inside
-//!   `BaselineVersion`'s pattern and length, any parameter list, and either identifier
-//!   form (the full ARN or the bare resource id);
+//!   member and the ones already applied when it did not — for any version the enablement's
+//!   baseline offers and any list of the parameters that baseline declares;
 //! * while that operation is in flight the enablement reads as `UNDER_CHANGE` with the new
 //!   operation as its `lastOperationIdentifier` and the values it had still applied, so
 //!   the update really is asynchronous;
@@ -65,70 +64,69 @@ impl UpdateCase {
     }
 }
 
-/// The update table: rows differ along what the rule generalises over — the shape of the
-/// requested `BaselineVersion` (one, two and three components, and both published
-/// `@length` bounds of 1 and 10), the `parameters` member of the update (absent, empty,
-/// one entry, several entries covering every `Document` kind), the parameters already
-/// applied (absent, empty, present). `enabledBaselineIdentifier` is always the full ARN:
-/// the model constrains it to `Arn` (pattern `^arn:aws[0-9a-zA-Z_\-:\/]+$`, length
-/// 20..2048) and documents it "in ARN format", so a bare resource id is refused at the
-/// boundary before any handler runs.
+/// The update table: rows differ along what the rule generalises over — the direction the
+/// version moves (to a newer offered version, to an older one, and to the one already
+/// applied), the `parameters` member of the update (absent, empty, and the declared key
+/// with several `Document` kinds — the value is "a document of any type") and the
+/// parameters already applied (absent, empty, present). The versions are the ones
+/// `AWSControlTowerBaseline` offers and the key is the one it declares, both read off
+/// `service_..._awscontroltowerapis::state::BASELINE_CATALOG`.
+/// `enabledBaselineIdentifier` is always the full ARN: the model constrains it to `Arn`
+/// (pattern `^arn:aws[0-9a-zA-Z_\-:\/]+$`, length 20..2048) and documents it "in ARN
+/// format", so a bare resource id is refused at the boundary before any handler runs.
 fn update_cases() -> Vec<UpdateCase> {
     vec![
         UpdateCase {
             case: "a version-only update, with no parameters applied before or asked for",
-            initial_version: "4.0",
+            initial_version: "1.0",
             initial_parameters: None,
-            new_version: "4.1",
+            new_version: "4.0",
             new_parameters: None,
         },
         UpdateCase {
             case: "a version-only update must not clear the parameters already applied",
-            initial_version: "3.1",
+            initial_version: "2.0",
             initial_parameters: Some(serde_json::json!([
                 { "key": "IdentityCenterEnabledForBaseline", "value": "true" }
             ])),
-            new_version: "3.2.1",
+            new_version: "3.0",
             new_parameters: None,
         },
         UpdateCase {
             case: "an empty parameter list clears the parameters already applied",
-            initial_version: "2",
+            initial_version: "3.0",
             initial_parameters: Some(serde_json::json!([
-                { "key": "RetentionDays", "value": 35 }
+                { "key": "IdentityCenterEnabledForBaseline", "value": true }
             ])),
-            new_version: "2.1",
+            new_version: "4.0",
             new_parameters: Some(serde_json::json!([])),
         },
         UpdateCase {
-            case: "parameters covering every Document kind replace the applied ones",
-            initial_version: "1",
-            initial_parameters: Some(serde_json::json!([
-                { "key": "RetentionDays", "value": 7 }
-            ])),
-            new_version: "10.10.1000",
-            new_parameters: Some(serde_json::json!([
-                { "key": "RetentionDays", "value": 3650 },
-                { "key": "Enabled", "value": true },
-                { "key": "Regions", "value": ["us-west-2", "eu-west-1"] },
-                { "key": "Nested", "value": { "level": { "deeper": [1, 2, 3] } } },
-                { "key": "Unset", "value": null }
-            ])),
-        },
-        UpdateCase {
-            case: "the shortest version the model admits",
-            initial_version: "4.0.2",
-            initial_parameters: Some(serde_json::json!([])),
-            new_version: "9",
-            new_parameters: Some(serde_json::json!([
-                { "key": "Only", "value": "one" }
-            ])),
-        },
-        UpdateCase {
-            case: "the longest version the model admits",
+            case: "a parameter of another Document kind replaces the applied one",
             initial_version: "1.0",
+            initial_parameters: Some(serde_json::json!([
+                { "key": "IdentityCenterEnabledForBaseline", "value": false }
+            ])),
+            new_version: "2.0",
+            new_parameters: Some(serde_json::json!([
+                { "key": "IdentityCenterEnabledForBaseline",
+                  "value": { "enabled": true, "regions": ["us-west-2"] } }
+            ])),
+        },
+        UpdateCase {
+            case: "an update back to the oldest version the baseline offers",
+            initial_version: "4.0",
+            initial_parameters: Some(serde_json::json!([])),
+            new_version: "1.0",
+            new_parameters: Some(serde_json::json!([
+                { "key": "IdentityCenterEnabledForBaseline", "value": "false" }
+            ])),
+        },
+        UpdateCase {
+            case: "an update to the version already applied",
+            initial_version: "2.0",
             initial_parameters: None,
-            new_version: "1000.10.10",
+            new_version: "2.0",
             new_parameters: None,
         },
     ]
@@ -243,7 +241,8 @@ async fn an_update_applies_the_requested_version_and_parameters() {
     // Every row is its own enablement on its own target, so the rows do not interact.
     let mut rows: Vec<(UpdateCase, String, String)> = Vec::new();
     for (index, row) in update_cases().into_iter().enumerate() {
-        let target = format!("arn:aws:organizations::123456789012:ou/o-exampleorg/ou-up{index:04}");
+        let target =
+            format!("arn:aws:organizations::123456789012:ou/o-exampleorg/ou-up11-{index:04}");
         let enabled = enable(
             &router,
             baseline,
@@ -479,7 +478,7 @@ async fn a_version_outside_the_modelled_bounds_is_refused() {
 /// change is not lost or applied twice.
 #[tokio::test]
 async fn updates_apply_in_order_one_after_the_other() {
-    let baseline = "arn:aws:controltower:eu-west-1::baseline/LN25R72TTG6IGPTQ";
+    let baseline = "arn:aws:controltower:us-west-2::baseline/17BSJV3IGJ2QSGA2";
     let target = "arn:aws:organizations::123456789012:ou/o-exampleorg/ou-seq1-1a";
 
     let router = emulator();
@@ -496,20 +495,30 @@ async fn updates_apply_in_order_one_after_the_other() {
         (
             "the first update",
             "2.0",
-            Some(serde_json::json!([{ "key": "A", "value": 1 }])),
-            serde_json::json!([{ "key": "A", "value": 1 }]),
+            Some(serde_json::json!([
+                { "key": "IdentityCenterEnabledForBaseline", "value": true }
+            ])),
+            serde_json::json!([
+                { "key": "IdentityCenterEnabledForBaseline", "value": true }
+            ]),
         ),
         (
             "a second update, version only",
-            "2.1",
+            "3.0",
             None,
-            serde_json::json!([{ "key": "A", "value": 1 }]),
+            serde_json::json!([
+                { "key": "IdentityCenterEnabledForBaseline", "value": true }
+            ]),
         ),
         (
             "a third update, replacing the parameters",
-            "3",
-            Some(serde_json::json!([{ "key": "B", "value": "two" }])),
-            serde_json::json!([{ "key": "B", "value": "two" }]),
+            "4.0",
+            Some(serde_json::json!([
+                { "key": "IdentityCenterEnabledForBaseline", "value": "false" }
+            ])),
+            serde_json::json!([
+                { "key": "IdentityCenterEnabledForBaseline", "value": "false" }
+            ]),
         ),
     ] {
         let updated = update(&router, &arn, version, params).await;
@@ -535,7 +544,7 @@ async fn updates_apply_in_order_one_after_the_other() {
 /// that operation; once the clock has made it due the same request is accepted.
 #[tokio::test]
 async fn an_update_overlapping_an_operation_in_flight_is_a_conflict() {
-    let baseline = "arn:aws:controltower:us-east-1::baseline/J8HX46AHS5MIKQPD";
+    let baseline = "arn:aws:controltower:us-east-1::baseline/17BSJV3IGJ2QSGA2";
     let router = emulator();
 
     for (case, start_a_second_operation) in [
@@ -543,7 +552,7 @@ async fn an_update_overlapping_an_operation_in_flight_is_a_conflict() {
         ("while another update is in flight", true),
     ] {
         let target = format!(
-            "arn:aws:organizations::123456789012:ou/o-exampleorg/ou-cf{}",
+            "arn:aws:organizations::123456789012:ou/o-exampleorg/ou-cf11-case{}",
             u8::from(start_a_second_operation)
         );
         let enabled = enable(&router, baseline, &target, "1.0", None).await;
@@ -567,7 +576,7 @@ async fn an_update_overlapping_an_operation_in_flight_is_a_conflict() {
             );
         }
 
-        let refused = update(&router, &arn, "9.9", None).await;
+        let refused = update(&router, &arn, "3.0", None).await;
         assert_eq!(
             (refused.status, refused.error_code.as_deref()),
             (409, Some("ConflictException")),
@@ -590,7 +599,7 @@ async fn an_update_overlapping_an_operation_in_flight_is_a_conflict() {
 
         // Once everything in flight is due, the SAME request is accepted.
         tokio::time::sleep(past_the_settle_span()).await;
-        let accepted = update(&router, &arn, "9.9", None).await;
+        let accepted = update(&router, &arn, "3.0", None).await;
         assert_eq!(
             accepted.status, 200,
             "case {case:?}: the same update once nothing is in flight: expected 200, got \
@@ -601,7 +610,7 @@ async fn an_update_overlapping_an_operation_in_flight_is_a_conflict() {
         let (_, applied) = get_enabled_baseline(&router, &arn).await;
         assert_eq!(
             member(&applied, "baselineVersion"),
-            Some("9.9"),
+            Some("3.0"),
             "case {case:?}: expected the accepted update applied, got {applied:?}"
         );
     }
@@ -613,7 +622,7 @@ async fn an_update_overlapping_an_operation_in_flight_is_a_conflict() {
 /// the clock has made due.
 #[tokio::test]
 async fn an_identifier_no_enablement_matches_is_not_found() {
-    let baseline = "arn:aws:controltower:ap-south-1::baseline/QQ1234567890ABCD";
+    let baseline = "arn:aws:controltower:ap-south-1::baseline/QXK3R9ZB7PN5TD2H";
     let target = "arn:aws:organizations::123456789012:ou/o-exampleorg/ou-nf11-1a";
 
     let router = emulator();
@@ -694,7 +703,9 @@ async fn reading_an_enablement_changes_nothing() {
         baseline,
         target,
         "1.0",
-        Some(serde_json::json!([{ "key": "Keep", "value": "me" }])),
+        Some(serde_json::json!([
+            { "key": "IdentityCenterEnabledForBaseline", "value": "keep me" }
+        ])),
     )
     .await;
     assert_eq!(
@@ -751,7 +762,9 @@ async fn reading_an_enablement_changes_nothing() {
     // changed them.
     assert_eq!(
         parameters(&settled),
-        serde_json::json!([{ "key": "Keep", "value": "me" }]),
+        serde_json::json!([
+            { "key": "IdentityCenterEnabledForBaseline", "value": "keep me" }
+        ]),
         "once the update is due: expected the enable's parameters still applied, got \
          {settled:?}"
     );
