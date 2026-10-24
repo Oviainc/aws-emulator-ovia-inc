@@ -6,6 +6,12 @@
 //! `createdAt = now`, plus every member the request carried. A replayed `clientToken`
 //! (`@idempotencyToken`) returns the cluster the first call minted, not a second one.
 //!
+//! Both references the request carries are resolved out of state first: a
+//! `securityConfigurationId` that names no stored security configuration is refused with
+//! `ResourceNotFoundException`, and a `containerProvider` namespace another live virtual
+//! cluster is already registered with is refused with `ValidationException`, since a
+//! virtual cluster maps 1:1 onto a Kubernetes namespace.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -172,6 +178,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = store.lock();
         state.settle();
 
+        // Every resource this request REFERENCES is resolved out of state before anything
+        // is minted: `securityConfigurationId` is the id of a security configuration this
+        // service stores, and an id that names none is refused with the modelled
+        // `ResourceNotFoundException` rather than persisted as a dangling reference that
+        // every later read would report as live. Resolved BEFORE the idempotency replay
+        // below, on the same terms as `StartJobRun`: which requests this operation refuses
+        // does not depend on whether one of them was retried.
+        if let Some(configuration_id) = input.security_configuration_id.as_deref() {
+            if !state.security_configurations.contains_key(configuration_id) {
+                return Err(CreateVirtualClusterErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "Security configuration {configuration_id} doesn't exist."
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
         // `clientToken` is `@idempotencyToken`: the same token replayed names the
         // cluster the first call minted, so a retried create never doubles the resource.
         let replayed = state
@@ -183,6 +209,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 name: Some(existing.name.clone()),
                 arn: Some(existing.arn.clone()),
             });
+        }
+
+        // A virtual cluster IS the registration of one Kubernetes namespace, and "a single
+        // virtual cluster maps to a single Kubernetes namespace", so a namespace of a
+        // container cluster that is already registered cannot be registered a second time.
+        // Checked AFTER the replay above, because a retried create names the very cluster
+        // that holds the namespace and must still be answered with it rather than refused
+        // by itself. A request whose `containerProvider` names no namespace claims none,
+        // so there is nothing for it to collide with.
+        if let Some(namespace) = crate::state::provider_namespace(&input.container_provider) {
+            if let Some(holder) = state
+                .cluster_mapped_to_namespace(&input.container_provider.id, namespace)
+                .map(|record| record.id.clone())
+            {
+                return Err(CreateVirtualClusterErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "A virtual cluster already exists in the namespace {namespace} of container provider {}: {holder}",
+                            input.container_provider.id
+                        )),
+                    },
+                )
+                .into());
+            }
         }
 
         // The store is capped, and a retired cluster is reclaimed to make room. Once
@@ -213,10 +263,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             container_provider: input.container_provider,
             created_at_millis: crate::state::now_millis(),
             tags: input.tags.unwrap_or_default(),
-            // Persisted as submitted, and read back by `DescribeVirtualCluster`. Whether
-            // a virtual-cluster create resolves this reference against the
-            // security-configuration store is `CreateVirtualCluster`'s own question, not
-            // part of minting a security configuration.
+            // Resolved against the security-configuration store above, so what a later
+            // `DescribeVirtualCluster` reports is a reference that existed when the
+            // cluster was created rather than an unchecked echo of the request.
             security_configuration_id: input.security_configuration_id,
             session_enabled: input.session_enabled,
             // Normalised to what it actually configures: a configuration whose every
