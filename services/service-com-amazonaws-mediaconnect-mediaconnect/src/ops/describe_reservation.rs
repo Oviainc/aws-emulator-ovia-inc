@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeReservation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeReservation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeReservation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored reservation the request names, or `NotFoundException` when no
+//! reservation has that ARN: the record comes from [`crate::state`], projected through the
+//! same [`crate::state::StoredReservation::to_reservation`] every reservation operation
+//! answers from, so this operation and ListReservations cannot report one reservation
+//! differently.
+//!
+//! A reservation the store holds is reported whatever state the clock has brought it to,
+//! including the terminal `EXPIRED` and `CANCELED` ones: a client polls this operation to
+//! watch a purchase settle and a reservation run out, so a retired reservation answers 200
+//! with its state rather than a not-found.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +157,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeReservation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeReservationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeReservation"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeReservationErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: "the mediaconnect reservation store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        // The ONLY write this reporting operation makes: a reservation state change the
+        // clock already made due — a purchase settling, or a reservation reaching its `End`
+        // and expiring (see `crate::state::StoredReservation::settle`) — was owed at that
+        // instant whether or not anybody called, so the reported state is the current one.
+        store.settle_due_transitions(::std::time::SystemTime::now());
+
+        // A reservation is addressed by the ARN this service minted for it, which is the key
+        // the store holds it under. Any other identifier — an ARN of another resource or
+        // account, or a string that is no ARN at all — resolves no reservation, and the
+        // modelled `NotFoundException` is what says so; its message is derived from the
+        // REQUEST, never from the store.
+        let Some(reservation) = store.reservations.get(&input.reservation_arn) else {
+            return Err(DescribeReservationErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: crate::state::not_found_message(&input.reservation_arn),
+                },
+            )
+            .into());
+        };
+
+        Ok(DescribeReservationOutput {
+            reservation: Some(reservation.to_reservation()),
+        })
     }
 }
