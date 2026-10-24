@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateExperimentDefinition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateExperimentDefinition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateExperimentDefinition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -181,20 +172,156 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateExperimentDefinition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateExperimentDefinitionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateExperimentDefinitionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("AppConfig state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        let now = std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // Both identifiers are `Identifier` members, documented as the resource's "ID or
+        // name", so either addresses the record — and both are resolved BEFORE anything
+        // is written, so a refused update leaves the stored definition exactly as it was.
+        let Some(application_id) = store.resolve_application_id(&input.application_identifier)
+        else {
+            return Err(UpdateExperimentDefinitionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "No application with id or name {} exists.",
+                        input.application_identifier
+                    )),
+                    resource_name: Some(input.application_identifier),
+                },
+            )
+            .into());
+        };
+        let Some(application) = store.applications.get_mut(&application_id) else {
+            return Err(UpdateExperimentDefinitionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "The application could not be read while updating the experiment \
+                         definition"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        let Some(definition_id) =
+            application.resolve_experiment_definition_id(&input.experiment_definition_identifier)
+        else {
+            return Err(UpdateExperimentDefinitionErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "No experiment definition with id or name {} exists in application {}.",
+                        input.experiment_definition_identifier, application_id
+                    )),
+                    resource_name: Some(input.experiment_definition_identifier),
+                },
+            )
+            .into());
+        };
+        let Some(definition) = application.experiment_definitions.get_mut(&definition_id) else {
+            return Err(UpdateExperimentDefinitionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "The experiment definition could not be read after it was resolved"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // "You cannot update an experiment definition while an experiment run is active"
+        // (this operation's own documentation), and a definition with a run in flight is
+        // the one reporting `ACTIVE` — so such an update conflicts with the current state
+        // of the resource and writes nothing. No other status is refused: a definition
+        // that is IDLE has no run in flight, and nothing is documented about updating an
+        // archived one.
+        if definition.status == crate::state::EXPERIMENT_DEFINITION_ACTIVE {
+            return Err(UpdateExperimentDefinitionErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "Experiment definition {} cannot be updated while an experiment run is \
+                         active.",
+                        definition.id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A PATCH over the stored record: a member the request carries replaces the stored
+        // one, a member it omits keeps the value the definition already holds. The empty
+        // string is a value the caller sent, not an omission (`Description` is len
+        // 0..1024), so it replaces the stored text with the empty one.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateExperimentDefinition"))
+        // `Name`, `FlagKey`, the environment and the configuration profile are not members
+        // of this request — what an experiment is called, and which flag in which
+        // environment it runs, are fixed when it is created — so each is reported back out
+        // of the stored record untouched, as are `Id`, `CreatedAt`, `Status`, the
+        // definition's tags and the `KmsKeyIdentifier` a run supplies.
+        if let Some(hypothesis) = input.hypothesis {
+            definition.hypothesis = Some(hypothesis);
+        }
+        if let Some(audience_rule) = input.audience_rule {
+            definition.audience_rule = audience_rule;
+        }
+        if let Some(audience_description) = input.audience_description {
+            definition.audience_description = Some(audience_description);
+        }
+        if let Some(launch_criteria) = input.launch_criteria {
+            definition.launch_criteria = Some(launch_criteria);
+        }
+        // Supplying `Control` or `Treatments` replaces the treatment, or the whole list,
+        // rather than editing it: the member is the treatment list itself. `TreatmentInput`
+        // carries no key and `Treatment` does, so each key is minted here exactly as a
+        // create mints it — from the treatment's place in the definition — which keeps a
+        // replaced list's keys contiguous from `T1` rather than leaving the keys of a
+        // longer previous list behind.
+        if let Some(control) = input.control {
+            definition.control =
+                crate::state::keyed_treatment(crate::state::CONTROL_TREATMENT_KEY.to_string(), &control);
+        }
+        if let Some(treatments) = input.treatments {
+            definition.treatments = treatments
+                .iter()
+                .enumerate()
+                .map(|(index, treatment)| {
+                    crate::state::keyed_treatment(crate::state::treatment_key(index), treatment)
+                })
+                .collect();
+        }
+        // This call wrote the record, so the record was last updated now; `CreatedAt` is
+        // the instant the definition was created and does not move.
+        definition.updated_at = now;
+
+        // Answered from the updated record, so this response and a later
+        // `GetExperimentDefinition` report the same definition.
+        Ok(UpdateExperimentDefinitionOutput {
+            application_id: Some(definition.application_id.clone()),
+            id: Some(definition.id.clone()),
+            name: Some(definition.name.clone()),
+            hypothesis: definition.hypothesis.clone(),
+            status: Some(definition.status.clone()),
+            configuration_profile_id: Some(definition.configuration_profile_id.clone()),
+            environment_id: Some(definition.environment_id.clone()),
+            flag_key: Some(definition.flag_key.clone()),
+            audience_rule: Some(definition.audience_rule.clone()),
+            audience_description: definition.audience_description.clone(),
+            launch_criteria: definition.launch_criteria.clone(),
+            treatments: Some(definition.treatments.clone()),
+            control: Some(definition.control.clone()),
+            created_at: Some(crate::state::to_date_time(definition.created_at)),
+            updated_at: Some(crate::state::to_date_time(definition.updated_at)),
+            kms_key_identifier: definition.kms_key_identifier.clone(),
+        })
     }
 }
