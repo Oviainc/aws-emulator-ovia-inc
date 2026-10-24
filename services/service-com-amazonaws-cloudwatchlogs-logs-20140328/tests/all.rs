@@ -51,6 +51,8 @@ mod log_group_fields;
 mod log_group_name_pattern_lists;
 #[path = "all/log_stream_removal.rs"]
 mod log_stream_removal;
+#[path = "all/lookup_tables.rs"]
+mod lookup_tables;
 #[path = "all/metric_filters.rs"]
 mod metric_filters;
 #[path = "all/query_definitions.rs"]

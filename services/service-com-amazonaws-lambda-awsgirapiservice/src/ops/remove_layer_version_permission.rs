@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RemoveLayerVersionPermission
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RemoveLayerVersionPermission`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Removes one statement from a layer version's resource-based policy: "Removes a
+//! statement from the permissions policy for a version of an Lambda layer."
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RemoveLayerVersionPermission::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The statement is addressed by the `StatementId` it was added under, so this takes at
+//! most one statement out of [`crate::state::LayerVersionRecord::policy`] and leaves a
+//! new revision behind. A statement id the policy does not hold, like an unknown layer
+//! or version, is the modelled `ResourceNotFoundException`, and a `RevisionId` that does
+//! not match the policy's current revision is a `PreconditionFailedException`. A policy
+//! whose last statement is removed is no policy at all, which is what
+//! `GetLayerVersionPolicy`'s 404 reports.
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +179,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RemoveLayerVersionPermission` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RemoveLayerVersionPermissionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RemoveLayerVersionPermission"))
+        // The statement is removed from the stored layer version, so no request metadata
+        // takes part in the answer.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(RemoveLayerVersionPermissionErrorModeled::ServiceException(
+                ServiceException {
+                    r#type: None,
+                    message: Some("Lambda state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        let resolved = crate::state::resolve_layer_version(
+            &mut store,
+            &input.layer_name,
+            input.version_number,
+        )
+        .map_err(|failure| match failure {
+            crate::state::ResolveFailure::Malformed(message) => {
+                RemoveLayerVersionPermissionErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        r#type: None,
+                        message: Some(message),
+                    },
+                )
+            }
+            crate::state::ResolveFailure::NotFound(message) => {
+                RemoveLayerVersionPermissionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        r#type: None,
+                        message: Some(message),
+                    },
+                )
+            }
+        })?;
+
+        let resource = resolved.arn;
+        let Some(policy) = resolved.version.policy.as_mut() else {
+            return Err(
+                RemoveLayerVersionPermissionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        r#type: None,
+                        message: Some(format!(
+                            "The resource you requested does not exist. Resource: {resource}"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "Only update the policy if the revision ID matches the ID specified." The id
+        // to match is the policy's own, which is the one `GetLayerVersionPolicy`
+        // reports.
+        if let Some(expected) = input.revision_id.as_deref() {
+            if policy.revision_id != expected {
+                return Err(
+                    RemoveLayerVersionPermissionErrorModeled::PreconditionFailedException(
+                        PreconditionFailedException {
+                            r#type: None,
+                            message: Some(format!(
+                                "The RevisionId ({expected}) provided does not match the latest \
+                                 RevisionId for the resource {resource}. Call \
+                                 GetLayerVersionPolicy to retrieve the latest RevisionId for \
+                                 your resource."
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // "The identifier that was specified when the statement was added" addresses one
+        // statement, so this removes at most one.
+        let before = policy.statements.len();
+        policy
+            .statements
+            .retain(|statement| statement.sid != input.statement_id);
+        if policy.statements.len() == before {
+            return Err(
+                RemoveLayerVersionPermissionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        r#type: None,
+                        message: Some(format!(
+                            "The statement id ({}) provided does not exist on the policy of \
+                             {resource}.",
+                            input.statement_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A policy with no statements is no policy: the version goes back to holding
+        // none, which is what `GetLayerVersionPolicy`'s 404 reports.
+        if policy.statements.is_empty() {
+            resolved.version.policy = None;
+        } else {
+            policy.revision_id = crate::state::mint_revision_id();
+        }
+
+        Ok(RemoveLayerVersionPermissionOutput)
     }
 }

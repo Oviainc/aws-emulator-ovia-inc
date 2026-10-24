@@ -397,7 +397,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.materialize_due_transitions(now);
 
         // The idempotency rule: "Otherwise, this operation returns a
-        // FileSystemAlreadyExists error with the ID of the existing file system."
+        // FileSystemAlreadyExists error with the ID of the existing file system" — which
+        // the modelled `FileSystemId` member carries, and the shared message
+        // constructor names in the text.
         if let Some(existing) = state.creation_tokens.get(&input.creation_token) {
             return Err(CreateFileSystemErrorModeled::FileSystemAlreadyExists(
                 FileSystemAlreadyExists {

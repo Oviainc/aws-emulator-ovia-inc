@@ -1158,7 +1158,7 @@ async fn pagination_token_of_another_listing_is_refused() {
 }
 
 /// A delete of a challenge removes the record, so the next reader cannot see it; a repeat
-/// delete of the same ARN still succeeds, which is what `@idempotent` promises. Deleting a
+/// delete of the same ARN now names no record and is refused with 404. Deleting a
 /// connector is accepted (202) and takes its challenges with it once the teardown is due.
 #[tokio::test]
 async fn deletes_are_observable_and_idempotent() {
@@ -1204,10 +1204,12 @@ async fn deletes_are_observable_and_idempotent() {
         );
         let again = delete_challenge(&router, &doomed).await;
         assert_eq!(
-            again.status, 202,
-            "case {challenges_per_connector} challenges: an @idempotent DeleteChallenge must \
-             still succeed on a repeat, got {} / {:?}",
-            again.status, again.body
+            (again.status, again.error_type.as_str()),
+            (404, "ResourceNotFoundException"),
+            "case {challenges_per_connector} challenges: a repeated DeleteChallenge names a \
+             challenge that is gone, so it must answer 404, got {} / {:?}",
+            again.status,
+            again.body
         );
 
         // Delete the connector: it reports DELETING while the teardown runs, then stops
