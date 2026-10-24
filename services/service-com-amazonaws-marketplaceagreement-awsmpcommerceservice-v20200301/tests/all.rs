@@ -23,6 +23,8 @@ mod agreement_lifecycle;
 mod billing_adjustments;
 #[path = "all/cancellation_request_decisions.rs"]
 mod cancellation_request_decisions;
+#[path = "all/charge_amounts.rs"]
+mod charge_amounts;
 #[path = "all/error_bodies.rs"]
 mod error_bodies;
 #[path = "all/payment_request_cancellation.rs"]
