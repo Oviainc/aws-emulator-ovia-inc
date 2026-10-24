@@ -35,3 +35,5 @@ mod satellite_catalog;
 mod scheduling_loop;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/tag_rules.rs"]
+mod tag_rules;

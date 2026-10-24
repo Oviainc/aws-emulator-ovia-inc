@@ -153,6 +153,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // The platform's tagging rules, refused before a contact id is minted and
+        // before the store is read: the model's `TagsMap` carries no constraint, so this
+        // is the only gate (see `crate::state::validate_tags`).
+        crate::state::validate_tags(input.tags.as_ref())
+            .map_err(ReserveContactErrorModeled::InvalidParameterException)?;
+
         let mut guard = state.lock();
 
         let profile = guard
