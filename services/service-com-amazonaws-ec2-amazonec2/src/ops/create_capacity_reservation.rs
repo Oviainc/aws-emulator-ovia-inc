@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCapacityReservation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCapacityReservation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCapacityReservation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reserves capacity for immediate use and stores it in [`crate::state`], so
+//! every reader of a Capacity Reservation reports what this wrote. A request for a
+//! FUTURE-DATED reservation, one on an Outpost or one in a cluster placement group is
+//! answered with a 501 naming that shape — this emulator holds no state for any of them.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -230,18 +226,321 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCapacityReservation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCapacityReservationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCapacityReservation"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state;
+
+        // Request shapes this emulator holds no state for at all, so a 501 ("nobody has
+        // written this yet") is the honest answer rather than a refusal that blames the
+        // caller — the same treatment `CreateSubnet` gives an IPAM-allocated block or an
+        // Outpost. A future-dated reservation is a delivery schedule and a commitment
+        // (`StartDate`, `CommitmentDuration`, `DeliveryPreference`, and the `scheduled` /
+        // `delayed` / `payment-pending` states that go with them); there is no Outpost
+        // resource to create a reservation on; and a cluster placement group reservation is
+        // capacity inside a group, which nothing here holds.
+        if input.start_date.is_some()
+            || input.commitment_duration.is_some()
+            || input.delivery_preference.is_some()
+        {
+            return Err(Scaffolded::not_implemented(
+                "CreateCapacityReservation for a future-dated Capacity Reservation",
+            ));
+        }
+        if input.outpost_arn.is_some() {
+            return Err(Scaffolded::not_implemented(
+                "CreateCapacityReservation on an Outpost",
+            ));
+        }
+        if input.placement_group_arn.is_some() {
+            return Err(Scaffolded::not_implemented(
+                "CreateCapacityReservation in a cluster placement group",
+            ));
+        }
+
+        let region = state::request_region(ctx.parts());
+
+        // "The Availability Zone in which to create the Capacity Reservation"
+        // (`AvailabilityZone`) or "The ID of the Availability Zone"
+        // (`AvailabilityZoneId`) — one of the two, and a zone the Region has. The naming
+        // rule for those zones lives in one place, `availability_zones_in_region`.
+        let zones = state::availability_zones_in_region(&region);
+        let zone = match (
+            input.availability_zone.as_deref(),
+            input.availability_zone_id.as_deref(),
+        ) {
+            (Some(_), Some(_)) => {
+                return Err(Scaffolded::invalid_parameter_combination(
+                    "Either availabilityZone or availabilityZoneId may be specified, not both",
+                ));
+            }
+            (None, None) => {
+                return Err(Scaffolded::missing_parameter(
+                    "Either availabilityZone or availabilityZoneId must be specified",
+                ));
+            }
+            (Some(zone_name), None) => zones
+                .iter()
+                .find(|zone| zone.zone_name == zone_name)
+                .ok_or_else(|| {
+                    Scaffolded::invalid_parameter_value(format!(
+                        "Invalid value '{zone_name}' for availabilityZone. \
+                         Region '{region}' has no such Availability Zone"
+                    ))
+                })?,
+            (None, Some(zone_id)) => zones
+                .iter()
+                .find(|zone| zone.zone_id == zone_id)
+                .ok_or_else(|| {
+                    Scaffolded::invalid_parameter_value(format!(
+                        "Invalid value '{zone_id}' for availabilityZoneId. \
+                         Region '{region}' has no such Availability Zone"
+                    ))
+                })?,
+        };
+
+        // "The instance type for which to reserve capacity" (`InstanceType`): the member is
+        // a plain string, so the catalog the model publishes as the `InstanceType` enum is
+        // what says whether a type exists at all — the same check every other operation of
+        // this crate that takes an instance type makes.
+        if !state::instance_type_is_modelled(&input.instance_type) {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{}' for instanceType",
+                input.instance_type
+            )));
+        }
+
+        // "The number of instances for which to reserve capacity … Valid range: 1 - 1000"
+        // (`InstanceCount`). The model puts no range on the member, so this is the only
+        // place the published one is enforced.
+        if !state::CAPACITY_RESERVATION_INSTANCE_COUNT_RANGE.contains(&input.instance_count) {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{}' for instanceCount: the valid range is {}-{}",
+                input.instance_count,
+                state::CAPACITY_RESERVATION_INSTANCE_COUNT_RANGE.start(),
+                state::CAPACITY_RESERVATION_INSTANCE_COUNT_RANGE.end(),
+            )));
+        }
+
+        // "You must provide an EndDate value if EndDateType is limited. Omit EndDate if
+        // EndDateType is unlimited" (`EndDate`), with `unlimited` the end type of a request
+        // that names neither: "The Capacity Reservation remains active until you explicitly
+        // cancel it" (`EndDateType`).
+        let end_date_type = input
+            .end_date_type
+            .as_deref()
+            .unwrap_or(state::END_DATE_TYPE_UNLIMITED);
+        let now = ::std::time::SystemTime::now();
+        let end_date = match (end_date_type, input.end_date) {
+            (state::END_DATE_TYPE_UNLIMITED, Some(_)) => {
+                return Err(Scaffolded::invalid_parameter_combination(
+                    "endDate may not be specified when endDateType is 'unlimited'",
+                ));
+            }
+            (state::END_DATE_TYPE_LIMITED, None) => {
+                return Err(Scaffolded::missing_parameter(
+                    "endDate must be specified when endDateType is 'limited'",
+                ));
+            }
+            (state::END_DATE_TYPE_UNLIMITED, None) => None,
+            (state::END_DATE_TYPE_LIMITED, Some(end_date)) => {
+                let end_date = ::std::time::SystemTime::try_from(end_date).map_err(|_| {
+                    Scaffolded::invalid_parameter_value(
+                        "Invalid value for endDate: it is not a representable date and time",
+                    )
+                })?;
+                // A reservation that ends before it starts would be `expired` the moment it
+                // was created ([`crate::state::CapacityReservationRecord::state_at`]), which
+                // is not a reservation of anything.
+                if end_date <= now {
+                    return Err(Scaffolded::invalid_parameter_value(
+                        "Invalid value for endDate: it must be in the future",
+                    ));
+                }
+                Some(end_date)
+            }
+            // Unreachable: `EndDateType` targets a modelled enum of exactly those two
+            // members, so the boundary validator has already refused anything else.
+            (other, _) => {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "Invalid value '{other}' for endDateType"
+                )));
+            }
+        };
+
+        // "The tags to apply to the Capacity Reservation during launch"
+        // (`TagSpecifications`): the reservation is the only resource this call creates, so
+        // a specification naming any other resource type is refused rather than accepted
+        // and discarded.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_CAPACITY_RESERVATION,
+            Self::NAME,
+        )?;
+
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > state::MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "clientToken accepts at most {} characters",
+                state::MAX_CLIENT_TOKEN_CHARS
+            )));
+        }
+
+        // The members a reservation is created with, each defaulted to the word its own
+        // documentation publishes, resolved HERE so the idempotency check below and the
+        // record written further down are the same decision.
+        let tenancy = input
+            .tenancy
+            .clone()
+            .unwrap_or_else(|| state::DEFAULT_CAPACITY_RESERVATION_TENANCY.to_string());
+        let instance_match_criteria = input
+            .instance_match_criteria
+            .clone()
+            .unwrap_or_else(|| state::DEFAULT_INSTANCE_MATCH_CRITERIA.to_string());
+        let ebs_optimized = input.ebs_optimized.unwrap_or(false);
+        let ephemeral_storage = input.ephemeral_storage.unwrap_or(false);
+
+        let payload_bytes = state::tag_list_bytes(&tags)
+            .saturating_add(input.instance_type.len())
+            .saturating_add(input.client_token.as_deref().map_or(0, str::len));
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+        store.materialize_due_transitions();
+
+        // Idempotency: "Unique, case-sensitive identifier that you provide to ensure the
+        // idempotency of the request" (`ClientToken`) — one token names the one reservation
+        // it minted, so a replay reports that reservation and reserves nothing more. A
+        // repeat that carries the same token but asks for a DIFFERENT reservation is not a
+        // replay: what the first request stored is compared against this one member by
+        // member, and a difference is answered with `IdempotentParameterMismatch`. A token
+        // whose reservation the store no longer holds is a MISS, not a mismatch: there is
+        // nothing left to answer with, so the request is served as a fresh create.
+        let replayed = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.capacity_reservation_client_tokens.get(token).cloned())
+            .filter(|first_id| store.capacity_reservations.contains_key(first_id));
+        if let Some(first_id) = replayed.as_deref() {
+            let timestamp = |at: Option<::aws_smithy_types::DateTime>| {
+                at.map(|at| (at.secs(), at.subsec_nanos()))
+            };
+            let identical = store
+                .capacity_reservations
+                .get(first_id)
+                .is_some_and(|record| {
+                    let view = &record.view;
+                    view.instance_type.as_deref() == Some(input.instance_type.as_str())
+                        && view.instance_platform.as_deref()
+                            == Some(input.instance_platform.as_str())
+                        && view.total_instance_count == Some(input.instance_count)
+                        && view.availability_zone.as_deref() == Some(zone.zone_name.as_str())
+                        && view.tenancy.as_deref() == Some(tenancy.as_str())
+                        && view.instance_match_criteria.as_deref()
+                            == Some(instance_match_criteria.as_str())
+                        && view.ebs_optimized == Some(ebs_optimized)
+                        && view.ephemeral_storage == Some(ephemeral_storage)
+                        && timestamp(view.end_date)
+                            == timestamp(end_date.map(state::system_time_to_date_time))
+                        && state::tag_pairs(view.tags.as_deref().unwrap_or_default())
+                            == state::tag_pairs(&tags)
+                });
+            if !identical {
+                // EC2's own wording for the code, from the one place this crate words it.
+                return Err(state::idempotent_parameter_mismatch());
+            }
+        }
+        // A count ceiling first, then the byte budget; a replay stores nothing, so it is
+        // charged nothing and clears both.
+        if replayed.is_none() && !store.has_capacity_reservation_capacity(1) {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "This emulator holds {} Capacity Reservations, which is as many as it stores",
+                state::MAX_STORED_CAPACITY_RESERVATIONS
+            )));
+        }
+        if replayed.is_none() && store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(Scaffolded::tag_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied \
+                 data, so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // DryRun sits AFTER every parameter has been validated and BEFORE the first write:
+        // "If you have the required permissions, the error response is DryRunOperation"
+        // (`DryRun`), so a request that would have been refused is refused with that reason
+        // instead, and one that would have succeeded leaves the store untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        let capacity_reservation_id = match replayed {
+            Some(capacity_reservation_id) => capacity_reservation_id,
+            None => {
+                let Some(capacity_reservation_id) =
+                    store.insert_capacity_reservation(state::CapacityReservationSpec {
+                        instance_type: input.instance_type.clone(),
+                        instance_platform: input.instance_platform.clone(),
+                        availability_zone: zone.zone_name.clone(),
+                        availability_zone_id: zone.zone_id.clone(),
+                        region,
+                        tenancy,
+                        instance_count: input.instance_count,
+                        ebs_optimized,
+                        ephemeral_storage,
+                        end_date,
+                        instance_match_criteria,
+                        created_at: now,
+                        // Capacity for immediate use: the reservation is usable as soon as
+                        // the request is accepted, so "the capacity is available for use"
+                        // (`CapacityReservationState`'s `active`) is where it starts and
+                        // the clock owes it nothing. Its `expired` move is a fact of its
+                        // end date, derived on read.
+                        state: state::CAPACITY_RESERVATION_STATE_ACTIVE,
+                        tags,
+                        // Allocated from nothing: this is a reservation of its own, not
+                        // capacity taken out of another one.
+                        interruption_info: None,
+                        zero_size_preference: None,
+                        pending: None,
+                    })
+                else {
+                    // The store refused the write at one of its own ceilings: a quota, not
+                    // something the request got wrong.
+                    return Err(Scaffolded::request_limit_exceeded(format!(
+                        "This emulator holds {} Capacity Reservations and {} bytes of \
+                         caller-supplied data, which is as much as it stores",
+                        state::MAX_STORED_CAPACITY_RESERVATIONS,
+                        state::MAX_STORED_BYTES,
+                    )));
+                };
+                // The token's own bytes, which `insert_capacity_reservation` does not know
+                // about: charged here so no path can store them uncharged.
+                store.add_stored_bytes(input.client_token.as_deref().map_or(0, str::len));
+                if let Some(token) = input.client_token.clone() {
+                    store
+                        .capacity_reservation_client_tokens
+                        .insert(token, capacity_reservation_id.clone());
+                }
+                capacity_reservation_id
+            }
+        };
+
+        // The answer is read back OUT of the store, so this call and every reader of the
+        // reservation cannot report it differently.
+        store
+            .capacity_reservations
+            .get(&capacity_reservation_id)
+            .map(|record| CreateCapacityReservationOutput {
+                capacity_reservation: Some(record.view_at(now)),
+            })
+            .ok_or_else(|| {
+                Scaffolded::internal_error(format!(
+                    "the newly created Capacity Reservation '{capacity_reservation_id}' \
+                     could not be read back"
+                ))
+            })
     }
 }

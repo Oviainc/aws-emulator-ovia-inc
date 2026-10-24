@@ -1018,6 +1018,51 @@ pub fn invalid_resource_arn(member: &str, value: &str) -> ValidationException {
     )
 }
 
+/// The member a witness-Region refusal names, spelled with its path from the
+/// request root the way the operation's own documentation spells it
+/// (`multiRegionProperties.witnessRegion`), so a caller reading `fieldList` knows
+/// which nested member to fix.
+pub const WITNESS_REGION_MEMBER: &str = "multiRegionProperties.witnessRegion";
+
+/// The requirement a `multiRegionProperties.witnessRegion` has to satisfy, as the
+/// refusal words it.
+const WITNESS_REGION_REQUIREMENT: &str = "must name a Region other than the cluster's own Region";
+
+/// Check a `multiRegionProperties` against the one constraint this service enforces
+/// on it itself: a multi-Region cluster's WITNESS Region is a third Region that
+/// holds a quorum vote outside the cluster's own, so it can never be the cluster's
+/// own Region.
+///
+/// Both operations that accept the member document the constraint in the same
+/// sentence — "The witness Region specified in multiRegionProperties.witnessRegion
+/// cannot be the same as the cluster's Region" (`smithy_query(query="operation",
+/// operation="CreateCluster,UpdateCluster")`) — and the model cannot express it (it
+/// compares one member against the cluster's Region), so the boundary validator
+/// passes such a request through and the handler refuses it here, identically for
+/// both. A request carrying no `multiRegionProperties`, or one carrying no
+/// `witnessRegion` to compare, names no witness and so satisfies it.
+///
+/// Region names are compared ignoring surrounding whitespace and ASCII case: those
+/// differences spell the same Region, and a refusal that a different spelling slips
+/// past would persist exactly the configuration the constraint forbids.
+pub fn validate_witness_region(
+    properties: Option<&MultiRegionProperties>,
+    cluster_region: &str,
+) -> Result<(), ValidationException> {
+    let Some(witness) = properties.and_then(|properties| properties.witness_region.as_deref())
+    else {
+        return Ok(());
+    };
+    if witness.trim().eq_ignore_ascii_case(cluster_region.trim()) {
+        return Err(invalid_member_value(
+            WITNESS_REGION_MEMBER,
+            WITNESS_REGION_REQUIREMENT,
+            witness,
+        ));
+    }
+    Ok(())
+}
+
 /// The modelled `ValidationException` for a `nextToken` this service never issued,
 /// as [`decode_pagination_cursor`] reads it.
 ///

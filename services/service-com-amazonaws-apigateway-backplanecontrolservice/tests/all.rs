@@ -35,6 +35,8 @@ mod delete_integration;
 mod delete_lifecycle;
 #[path = "all/delete_method_response.rs"]
 mod delete_method_response;
+#[path = "all/delete_stage.rs"]
+mod delete_stage;
 #[path = "all/documentation_part_import_bulk.rs"]
 mod documentation_part_import_bulk;
 #[path = "all/documentation_parts.rs"]

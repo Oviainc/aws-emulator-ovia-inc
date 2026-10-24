@@ -8,6 +8,9 @@
 //! / `policy` the caller supplied. A repeated `clientToken` with the same
 //! parameters returns the cluster the first call minted rather than minting a
 //! second one; the same token with different parameters is refused as a conflict.
+//! A `multiRegionProperties.witnessRegion` naming the request's OWN Region — the
+//! Region the minted cluster belongs to — is refused with `ValidationException`
+//! (400) and nothing is created.
 //!
 //! ## Shape of an operation
 //!
@@ -216,6 +219,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = std::time::SystemTime::now();
         let mut state = state.lock();
         state.settle(now);
+
+        // A multi-Region configuration's WITNESS Region cannot be the cluster's own
+        // Region (this operation's documented constraint), and the cluster this call
+        // mints belongs to the request's Region — so a request naming that Region as
+        // the witness is refused with the modelled 400 and nothing is created, ahead
+        // of the idempotency ledger and the quota check, which decide what to do with
+        // a request whose input is valid in the first place.
+        if let Err(invalid) = crate::state::validate_witness_region(
+            input.multi_region_properties.as_ref(),
+            &region,
+        ) {
+            return Err(CreateClusterErrorModeled::ValidationException(invalid).into());
+        }
 
         // `@idempotencyToken`: a repeat of the SAME request returns the result of
         // the original call and has no additional effect; the same token with
