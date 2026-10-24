@@ -33,7 +33,10 @@ use crate::schema_mapping_workflow_lifecycle::{
 
 /// `GET /idmappingworkflows` — `ListIdMappingWorkflows`'s modelled HTTP binding
 /// (`smithy_query(query="operation",operation="ListIdMappingWorkflows")`).
-async fn list_id_mapping_workflows(emulator: &Emulator, query: &str) -> Reply {
+///
+/// `pub(crate)` so the sibling delete suite asserts that a deleted workflow leaves the
+/// listing through the SAME path instead of cloning a second listing helper.
+pub(crate) async fn list_id_mapping_workflows(emulator: &Emulator, query: &str) -> Reply {
     emulator
         .call("GET", &format!("/idmappingworkflows{query}"), None)
         .await
@@ -251,7 +254,7 @@ async fn seed_matching_workflow(emulator: &Emulator, name: &str) {
 }
 
 /// The `workflowName`s of one page, in the order the page listed them.
-fn page_names(reply: &Reply) -> Vec<String> {
+pub(crate) fn page_names(reply: &Reply) -> Vec<String> {
     list_member(&reply.body, "workflowSummaries")
         .iter()
         .map(|entry| string_member(entry, "workflowName"))

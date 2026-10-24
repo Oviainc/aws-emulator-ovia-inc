@@ -27,7 +27,10 @@ use service_com_amazonaws_medicalimaging_ahigatewayservice::state::{
 };
 
 use crate::datastore_lifecycle::{Answer, Emulator, ACCOUNT};
-use crate::resource_tagging::{list_tags, tag, tag_object, untag};
+use crate::resource_tagging::{
+    illegal_tag_keys, list_tags, tag, tag_object, unanchored_tag_key_pattern, untag,
+    VALIDATION_ENVELOPE,
+};
 
 /// A tag map holding exactly `key`, with a value every row shares (the rule under test
 /// is about the KEY; `TagValue` is the map's element, which the boundary validator
@@ -203,41 +206,14 @@ async fn every_tag_key_the_model_admits_is_accepted_on_every_write_path() {
 // The keys the model refuses
 // ---------------------------------------------------------------------------
 
-/// One illegal key per clause of `TagKey` a key can break: the reserved prefix the
-/// pattern's negative lookahead excludes, a character outside the class, and each
-/// `@length` bound. Only the first row is the one the issue cited.
+/// The illegal keys this suite drives: the one corpus `resource_tagging` holds, one row
+/// per clause of `TagKey` a key can break. Reduced to (case, key) — the write paths
+/// assert the constraint TEXT in the wording case below rather than per row.
 fn rejected_keys() -> Vec<(&'static str, String)> {
-    vec![
-        (
-            "the reserved aws: prefix",
-            format!("{TAG_KEY_RESERVED_PREFIX}owner"),
-        ),
-        (
-            "the reserved prefix alone",
-            TAG_KEY_RESERVED_PREFIX.to_string(),
-        ),
-        (
-            "the reserved prefix followed by more colon-separated parts",
-            format!("{TAG_KEY_RESERVED_PREFIX}cloudformation:stack-name"),
-        ),
-        ("a space, outside the class", "owning team".to_string()),
-        ("an exclamation mark, below the range", "team!".to_string()),
-        ("a hash, below the range", "team#1".to_string()),
-        ("a dollar sign, below the range", "team$".to_string()),
-        ("a percent sign, below the range", "team%".to_string()),
-        ("an asterisk, below the range", "team*".to_string()),
-        ("a parenthesis, below the range", "(team)".to_string()),
-        ("a question mark, just past the range", "team?".to_string()),
-        ("an at sign, just past the range", "team@acme".to_string()),
-        ("a backslash, past the range", "team\\acme".to_string()),
-        ("a brace, past the range", "{team}".to_string()),
-        ("a tab, a control character", "team\tone".to_string()),
-        ("a non-ASCII letter", "équipe".to_string()),
-        (
-            "one character past the 128-character upper length bound",
-            "k".repeat(TAG_KEY_MAX_LENGTH + 1),
-        ),
-    ]
+    illegal_tag_keys()
+        .into_iter()
+        .map(|row| (row.case, row.key))
+        .collect()
 }
 
 /// RULE: a tag key outside `TagKey`'s modelled constraints is refused with HTTP 400
@@ -387,9 +363,7 @@ async fn the_refusal_quotes_the_modelled_tag_key_pattern() {
     assert_refused("the reserved aws: prefix", &refused);
 
     let message = refused.string(&["message"]);
-    let unanchored = TAG_KEY_PATTERN
-        .trim_start_matches('^')
-        .trim_end_matches('$');
+    let unanchored = unanchored_tag_key_pattern();
     assert!(
         message.contains(unanchored),
         "expected the message to quote the modelled pattern {unanchored:?}, got {message:?}"
@@ -399,7 +373,7 @@ async fn the_refusal_quotes_the_modelled_tag_key_pattern() {
         "expected the pattern quoted without its anchors, got {message:?}"
     );
     assert!(
-        message.contains("1 validation error detected"),
+        message.contains(VALIDATION_ENVELOPE),
         "expected this service's validation envelope, got {message:?}"
     );
 }

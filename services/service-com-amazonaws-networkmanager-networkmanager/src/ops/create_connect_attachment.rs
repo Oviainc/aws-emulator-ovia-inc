@@ -290,7 +290,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             *transport_attachment_id == input.transport_attachment_id
                                 && crate::state::same_connect_options(options, &input.options)
                         }
-                        crate::state::AttachmentDetail::Vpc { .. } => false,
+                        crate::state::AttachmentDetail::Vpc { .. }
+                        | crate::state::AttachmentDetail::SiteToSiteVpn => false,
                     }
                     && crate::state::same_tags(
                         &existing.tags,

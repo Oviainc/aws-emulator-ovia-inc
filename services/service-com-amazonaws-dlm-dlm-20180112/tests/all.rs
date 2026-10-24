@@ -21,6 +21,8 @@ mod execution_role_pass_role;
 mod interval_validation;
 #[path = "all/lifecycle_policy_crud.rs"]
 mod lifecycle_policy_crud;
+#[path = "all/policy_configuration_validation.rs"]
+mod policy_configuration_validation;
 #[path = "all/policy_read_projection.rs"]
 mod policy_read_projection;
 #[path = "all/state_roundtrip.rs"]

@@ -23,6 +23,8 @@ mod code_binding_lifecycle;
 mod code_bindings;
 #[path = "all/discovered_schema_inference.rs"]
 mod discovered_schema_inference;
+#[path = "all/discoverer_state.rs"]
+mod discoverer_state;
 #[path = "all/empty_response_framing.rs"]
 mod empty_response_framing;
 #[path = "all/error_body_codes.rs"]

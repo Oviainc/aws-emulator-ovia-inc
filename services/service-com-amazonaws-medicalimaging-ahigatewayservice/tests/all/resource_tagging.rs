@@ -21,7 +21,8 @@
 use serde_json::{json, Value};
 
 use service_com_amazonaws_medicalimaging_ahigatewayservice::state::{
-    DATASTORE_DELETION_DELAY, MAX_TAGS_PER_RESOURCE,
+    DATASTORE_DELETION_DELAY, MAX_TAGS_PER_RESOURCE, TAG_KEY_MAX_LENGTH, TAG_KEY_PATTERN,
+    TAG_KEY_RESERVED_PREFIX,
 };
 
 use crate::datastore_lifecycle::{Answer, Emulator, ACCOUNT, SETTLE_MULTIPLE};
@@ -122,6 +123,133 @@ pub(crate) fn tag_object(pairs: &[(String, String)]) -> Value {
         map.insert(key.clone(), Value::String(value.clone()));
     }
     Value::Object(map)
+}
+
+// ---------------------------------------------------------------------------
+// The tag-key corpus the tag-key suites share
+//
+// One table and one wording helper, reached by every suite that drives a tag key —
+// the two WRITE paths (`tag_map_validation`) and the REMOVAL path
+// (`untag_key_validation`) — so a change to `com.amazonaws.medicalimaging#TagKey`
+// updates one list rather than three.
+// ---------------------------------------------------------------------------
+
+/// The envelope every `ValidationException` this service states opens with
+/// (`crate::state::validation_envelope`), for a single violation.
+pub(crate) const VALIDATION_ENVELOPE: &str = "1 validation error detected";
+
+/// `TagKey`'s `@pattern` as a REFUSAL quotes it: without the `^` / `$` anchors the model
+/// spells it with (this service's wording rule — AWS advertises the expression a value
+/// must satisfy, not the anchoring that makes the match total).
+pub(crate) fn unanchored_tag_key_pattern() -> &'static str {
+    TAG_KEY_PATTERN
+        .trim_start_matches('^')
+        .trim_end_matches('$')
+}
+
+/// One illegal tag key: which clause of `com.amazonaws.medicalimaging#TagKey` it breaks,
+/// the key itself, and the text a refusal about it must state as the constraint it
+/// failed.
+#[derive(Debug)]
+pub(crate) struct IllegalTagKey {
+    pub(crate) case: &'static str,
+    pub(crate) key: String,
+    pub(crate) constraint: String,
+}
+
+/// Every illegal tag key these suites drive: one row per clause of `TagKey` a key can
+/// break, sourced from `smithy_query(query="shape",shape="TagMap,TagKey")` — the
+/// `@pattern` `^(?!aws:)[a-zA-Z+-=._:/]+$` (its reserved-namespace lookahead and its
+/// character class) and the `@length` maximum (128). Only the first row is the one the
+/// issues cited.
+///
+/// Inside a character class `+-=` is the RANGE from `+` (0x2B) to `=` (0x3D), so the rows
+/// below name characters on BOTH sides of it as well as inside the admitted set's gaps.
+/// The `@length` MINIMUM (1) has no row: an empty key cannot be carried on
+/// `UntagResource`'s `tagKeys` query parameter at all, so it is driven on its own by the
+/// write-path suite.
+pub(crate) fn illegal_tag_keys() -> Vec<IllegalTagKey> {
+    let pattern = || unanchored_tag_key_pattern().to_string();
+    let row = |case: &'static str, key: String, constraint: String| IllegalTagKey {
+        case,
+        key,
+        constraint,
+    };
+    vec![
+        row(
+            "the reserved aws: prefix",
+            format!("{TAG_KEY_RESERVED_PREFIX}owner"),
+            pattern(),
+        ),
+        row(
+            "the reserved prefix alone",
+            TAG_KEY_RESERVED_PREFIX.to_string(),
+            pattern(),
+        ),
+        row(
+            "the reserved prefix followed by more colon-separated parts",
+            format!("{TAG_KEY_RESERVED_PREFIX}cloudformation:stack-name"),
+            pattern(),
+        ),
+        row(
+            "a space, outside the class",
+            "owning team".to_string(),
+            pattern(),
+        ),
+        row(
+            "an exclamation mark, below the range",
+            "team!".to_string(),
+            pattern(),
+        ),
+        row("a hash, below the range", "team#1".to_string(), pattern()),
+        row(
+            "a dollar sign, below the range",
+            "team$".to_string(),
+            pattern(),
+        ),
+        row(
+            "a percent sign, below the range",
+            "team%".to_string(),
+            pattern(),
+        ),
+        row(
+            "an asterisk, below the range",
+            "my key *".to_string(),
+            pattern(),
+        ),
+        row(
+            "a parenthesis, below the range",
+            "(team)".to_string(),
+            pattern(),
+        ),
+        row(
+            "a question mark, just past the range",
+            "team?".to_string(),
+            pattern(),
+        ),
+        row(
+            "an at sign, just past the range",
+            "team@acme".to_string(),
+            pattern(),
+        ),
+        row(
+            "a backslash, past the range",
+            "team\\acme".to_string(),
+            pattern(),
+        ),
+        row("a brace, past the range", "{team}".to_string(), pattern()),
+        row(
+            "a tab, a control character",
+            "team\tone".to_string(),
+            pattern(),
+        ),
+        row("a non-ASCII letter", "équipe".to_string(), pattern()),
+        row(
+            "one character past the 128-character upper length bound",
+            "k".repeat(TAG_KEY_MAX_LENGTH + 1),
+            TAG_KEY_MAX_LENGTH.to_string(),
+        ),
+    ]
 }
 
 // ---------------------------------------------------------------------------

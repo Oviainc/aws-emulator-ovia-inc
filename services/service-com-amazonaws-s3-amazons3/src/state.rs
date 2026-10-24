@@ -1266,21 +1266,67 @@ impl std::fmt::Display for NotificationConfigurationRejection {
 
 impl std::error::Error for NotificationConfigurationRejection {}
 
-/// Whether `arn` is an ARN of `service`.
+/// What one field of an ARN carries for the service that owns the resource.
 ///
-/// The ARN grammar AWS publishes: `arn:<partition>:<service>:<region>:<account-id>:<resource>`,
-/// so the first field is the literal `arn`, the third IS the service, and the partition,
-/// Region, account and resource fields are non-empty. A Lambda function ARN carries extra
-/// `:`-separated fields in its resource part, which is why only the first six are examined.
-fn is_arn_of_service(arn: &str, service: &str) -> bool {
+/// The Region and the account-id fields are the two that differ between services: a
+/// regional, account-owned resource names both, a GLOBAL service's ARN leaves the Region
+/// out (`arn:aws:iam::<account>:role/<name>`) and an Amazon S3 bucket's ARN leaves both out
+/// (`arn:aws:s3:::<bucket>`), because a bucket name is globally unique.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArnField {
+    /// The field carries a value.
+    Present,
+    /// The field is EMPTY — the `::` an ARN of such a service spells.
+    Empty,
+}
+
+impl ArnField {
+    /// Whether one ARN field as written satisfies this expectation.
+    fn holds(self, field: &str) -> bool {
+        match self {
+            Self::Present => !field.is_empty(),
+            Self::Empty => field.is_empty(),
+        }
+    }
+}
+
+/// Whether `arn` is an ARN of `service` whose Region and account-id fields are as that
+/// service writes them, and whose resource part starts with `resource_prefix` and carries
+/// something past it.
+///
+/// The ARN grammar AWS publishes:
+/// `arn:<partition>:<service>:<region>:<account-id>:<resource>`, so the first field is the
+/// literal `arn`, the third IS the service and the partition is non-empty. A Lambda
+/// function ARN carries extra `:`-separated fields in its resource part, which is why only
+/// the first six are examined. `resource_prefix` is the leading segment the resource KIND
+/// is named by where one exists (`role/` for an IAM role) and empty for a service whose
+/// resource part is the bare name (an S3 bucket, an SQS queue).
+///
+/// This is the one ARN grammar this crate reads: every member that takes an ARN —
+/// a notification destination, a replication role, a replication destination bucket —
+/// is judged through it rather than through a parser of its own.
+pub fn is_arn_of(
+    arn: &str,
+    service: &str,
+    region: ArnField,
+    account: ArnField,
+    resource_prefix: &str,
+) -> bool {
     let fields: Vec<&str> = arn.splitn(6, ':').collect();
     fields.len() == 6
         && fields[0] == "arn"
         && !fields[1].is_empty()
         && fields[2] == service
-        && !fields[3].is_empty()
-        && !fields[4].is_empty()
-        && !fields[5].is_empty()
+        && region.holds(fields[3])
+        && account.holds(fields[4])
+        && fields[5].len() > resource_prefix.len()
+        && fields[5].starts_with(resource_prefix)
+}
+
+/// Whether `arn` is an ARN of `service` for a regional, account-owned resource named by its
+/// bare resource part — the form every notification destination takes.
+fn is_arn_of_service(arn: &str, service: &str) -> bool {
+    is_arn_of(arn, service, ArnField::Present, ArnField::Present, "")
 }
 
 /// Whether `configuration` is one S3 applies to a bucket, and what is wrong with it when
@@ -2156,6 +2202,21 @@ pub struct Bucket {
     /// Private, like `tags` and `ownership_controls`, so the accessor pair below is the
     /// only way in or out.
     encryption: Option<Vec<BucketEncryptionRule>>,
+    /// The replication configuration the last `PutBucketReplication` associated with the
+    /// bucket, or `None` while the bucket has none — the state a bucket is created in, and
+    /// what makes `GetBucketReplication` answer
+    /// [`REPLICATION_CONFIGURATION_NOT_FOUND_CODE`] until a put sets one.
+    ///
+    /// The MODELLED container is stored whole, because that is exactly what the operation
+    /// takes and what `GetBucketReplication` reports back: "Specify the replication
+    /// configuration in the request body", and the read's payload is the same
+    /// `ReplicationConfiguration` shape. Keeping the submitted container means a later read
+    /// answers with the configuration the bucket actually carries rather than with a
+    /// re-derived copy of it.
+    ///
+    /// Private, like `tags` and `encryption`, so the accessor pair below is the only way in
+    /// or out.
+    replication: Option<crate::ops::types::ReplicationConfiguration>,
     /// The bucket's website configuration, as `PutBucketWebsite` last set it, or `None`
     /// while no website configuration is associated with the bucket.
     ///
@@ -2404,6 +2465,25 @@ impl Bucket {
     /// names becomes the bucket's configuration in full.
     pub fn set_encryption(&mut self, rules: Vec<BucketEncryptionRule>) {
         self.encryption = Some(rules);
+    }
+
+    /// The bucket's replication configuration, or `None` while no configuration is
+    /// associated with it.
+    pub fn replication(&self) -> Option<&crate::ops::types::ReplicationConfiguration> {
+        self.replication.as_ref()
+    }
+
+    /// Associate `configuration` with the bucket as its whole replication configuration.
+    ///
+    /// A replacement, not a merge: `PutBucketReplication` "creates a replication
+    /// configuration or replaces an existing one" from the complete
+    /// `ReplicationConfiguration` it carries as its payload, so what the request names
+    /// becomes the bucket's configuration in full.
+    pub fn set_replication(
+        &mut self,
+        configuration: crate::ops::types::ReplicationConfiguration,
+    ) {
+        self.replication = Some(configuration);
     }
 
     /// The default encryption rules IN FORCE on the bucket: the ones a
@@ -3993,6 +4073,31 @@ pub const INTERNAL_ERROR_STATUS: u16 = 500;
 /// the list a request may send, and a bucket's rules live in this process's memory. A put
 /// past this ceiling is refused rather than recorded.
 pub const MAX_SERVER_SIDE_ENCRYPTION_RULES: usize = 10;
+
+/// How many replication rules one configuration may carry.
+///
+/// AWS publishes the bound on the operation itself: "A replication configuration must
+/// include at least one rule, and can contain a maximum of 1,000"
+/// (`PutBucketReplication`'s own documentation). The lower end is the same sentence: a
+/// configuration naming no rule is not one S3 records.
+pub const MAX_REPLICATION_RULES: usize = 1_000;
+
+/// The code S3 answers a `GetBucketReplication` for a bucket that has no replication
+/// configuration with: "ReplicationConfigurationNotFoundError - There is no replication
+/// configuration for this bucket" (Amazon S3 "Error responses", list of error codes), with
+/// HTTP 404.
+pub const REPLICATION_CONFIGURATION_NOT_FOUND_CODE: &str = "ReplicationConfigurationNotFoundError";
+/// See [`REPLICATION_CONFIGURATION_NOT_FOUND_CODE`].
+pub const REPLICATION_CONFIGURATION_NOT_FOUND_MESSAGE: &str =
+    "There is no replication configuration for this bucket";
+/// The HTTP status [`REPLICATION_CONFIGURATION_NOT_FOUND_CODE`] is rendered with: 404,
+/// from the same list.
+pub const REPLICATION_CONFIGURATION_NOT_FOUND_STATUS: u16 = 404;
+
+/// The HTTP status [`INVALID_REQUEST_CODE`] is rendered with: 400, from Amazon S3's "Error
+/// responses" list of error codes. It is the status the replication prerequisite is refused
+/// under: a replication configuration applies only to a bucket whose versioning is enabled.
+pub const INVALID_REQUEST_STATUS: u16 = 400;
 
 /// "The bucket policy does not exist."
 pub const NO_SUCH_BUCKET_POLICY_CODE: &str = "NoSuchBucketPolicy";

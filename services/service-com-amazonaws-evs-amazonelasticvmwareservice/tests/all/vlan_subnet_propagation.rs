@@ -38,7 +38,7 @@ use std::sync::Arc;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::environment_lifecycle::call_in_region;
+use crate::environment_lifecycle::{call_in_region, PAST_THE_TRANSITION};
 
 /// The EC2 API version a client sends in an ec2Query body.
 const EC2_API_VERSION: &str = "2016-11-15";
@@ -376,6 +376,9 @@ async fn the_vlan_subnets_an_environment_provisions_exist_in_ec2_and_go_away_wit
             .unwrap_or_else(|| panic!("case {case:?}: no environmentId in {created}"))
             .to_string();
 
+        // Once the create has settled, the environment is no longer initializing and
+        // its VLANs are listable.
+        std::thread::sleep(PAST_THE_TRANSITION);
         let (status, listed) = call_in_region(
             &router,
             row.region,

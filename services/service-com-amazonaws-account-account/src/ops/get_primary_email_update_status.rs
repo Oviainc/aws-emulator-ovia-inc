@@ -172,9 +172,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let account_id = crate::state::resolve_account_id(input.account_id.as_deref());
         // A REPORTING operation (`@readonly`): the store is read, never written, so
         // no record is created here and a later caller sees exactly what this one
-        // saw. `PENDING` is not a status the clock moves on either (see
-        // `state::PENDING_PRIMARY_EMAIL_UPDATE_STATUS`), so there is nothing a read
-        // could be owed to materialise.
+        // saw. A completion the CLOCK already owes an accepted update is still
+        // reported from that instant on, because
+        // `PrimaryEmailUpdate::settled_status` is a pure function of the record
+        // and the clock.
         let store = state.lock();
         let Some(account) = store.account(&account_id) else {
             // Naming another account requires the caller to be an identity in the
@@ -202,9 +203,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        let now = ::std::time::SystemTime::now();
         Ok(GetPrimaryEmailUpdateStatusOutput {
-            status: update.status.clone(),
-            updated_at: Some(::aws_smithy_types::DateTime::from(update.updated_at)),
+            status: update.settled_status(now).to_string(),
+            updated_at: Some(::aws_smithy_types::DateTime::from(
+                update.settled_updated_at(now),
+            )),
         })
     }
 }

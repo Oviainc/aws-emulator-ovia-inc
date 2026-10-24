@@ -220,10 +220,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(arn) if !crate::state::is_principal_arn(arn) => {
                 return Err(ListAccountSettingsErrorModeled::InvalidParameterException(
                     InvalidParameterException {
-                        message: Some(format!(
-                            "principalArn must be the ARN of an IAM user, role or the root \
-                             user; got {arn:?}"
-                        )),
+                        message: Some(crate::state::invalid_principal_arn_message(arn)),
                     },
                 )
                 .into())

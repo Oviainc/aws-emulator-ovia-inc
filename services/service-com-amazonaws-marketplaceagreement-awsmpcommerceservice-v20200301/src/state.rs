@@ -52,13 +52,13 @@ use crate::ops::types::{
     AgreementViewSummary, BatchCreateBillingAdjustmentRequestEntry, BillingAdjustmentSummary,
     ByolPricingTerm, Charge, ChargeSummary, ConfigurableUpfrontPricingTerm, ConflictException,
     DescribeAgreementOutput, EndTimeBehavior, Entitlement, EstimatedCharges, ExpectedCharge,
-    Filter, FixedUpfrontPricingTerm, FreeTrialPricingTerm, GetBillingAdjustmentRequestOutput,
-    InternalServerException, ItemizedCharge, LegalTerm, NetPaymentTerm, PaymentRequestSummary,
-    PaymentScheduleTerm, ProposalSummary, Proposer, PurchaseOrder, RecurringPaymentTerm,
-    RenewalTerm, RequestedTerm, RequestedTermConfiguration, Resource, ResourceNotFoundException,
-    SendAgreementPaymentRequestInput, SupportTerm, TaxConfiguration, ThrottlingException,
-    UsageBasedPricingTerm, ValidationException, ValidationExceptionField, ValidityTerm,
-    VariablePaymentTerm,
+    Filter, FixedUpfrontPricingTerm, FreeTrialPricingTerm, GetAgreementPaymentRequestOutput,
+    GetBillingAdjustmentRequestOutput, InternalServerException, ItemizedCharge, LegalTerm,
+    NetPaymentTerm, PaymentRequestSummary, PaymentScheduleTerm, ProposalSummary, Proposer,
+    PurchaseOrder, RecurringPaymentTerm, RenewalTerm, RequestedTerm, RequestedTermConfiguration,
+    Resource, ResourceNotFoundException, SendAgreementPaymentRequestInput, SupportTerm,
+    TaxConfiguration, ThrottlingException, UsageBasedPricingTerm, ValidationException,
+    ValidationExceptionField, ValidityTerm, VariablePaymentTerm,
 };
 
 /// The `agreementType` every agreement this slice mints carries.
@@ -1144,6 +1144,42 @@ impl PaymentRequest {
             updated_at: Some(::aws_smithy_types::DateTime::from(self.updated_at)),
         }
     }
+
+    /// The whole payment request, as `GetAgreementPaymentRequest` reports it:
+    /// "the current status, charge details, timestamps, and the charge ID if the
+    /// request has been approved".
+    ///
+    /// Every member is read from this one stored record, so the detail and the
+    /// [`PaymentRequest::to_summary`] a list reports can never disagree about
+    /// the same request.
+    pub fn to_detail(&self) -> GetAgreementPaymentRequestOutput {
+        GetAgreementPaymentRequestOutput {
+            payment_request_id: Some(self.id.clone()),
+            agreement_id: Some(self.agreement_id.clone()),
+            status: Some(self.status.clone()),
+            // `statusMessage` is "an optional message providing additional
+            // context about the payment request status, such as a rejection
+            // reason or validation failure details", which only the calls that
+            // supply one give a value to: the buyer's `rejectionReason`
+            // (`RejectAgreementPaymentRequest`) and the seller's
+            // `cancellationReason` (`CancelAgreementPaymentRequest`). Both are
+            // still scaffolds with issues of their own, so no stored request
+            // carries a message and the member is reported absent rather than
+            // invented.
+            status_message: None,
+            name: Some(self.name.clone()),
+            description: self.description.clone(),
+            // Only an approved request has a charge; see `charge_id`.
+            charge_id: self
+                .charge_id
+                .clone()
+                .filter(|_| self.status == PAYMENT_REQUEST_STATUS_APPROVED),
+            charge_amount: Some(self.charge_amount.clone()),
+            currency_code: self.currency_code.clone(),
+            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            updated_at: Some(::aws_smithy_types::DateTime::from(self.updated_at)),
+        }
+    }
 }
 
 /// Whether the caller is the `party_type` party of `request`.
@@ -2158,6 +2194,17 @@ pub fn billing_adjustment_not_found(id: &str) -> ResourceNotFoundException {
         message: Some(does_not_exist("billing adjustment request")),
         resource_id: Some(id.to_string()),
         resource_type: Some(RESOURCE_TYPE_BILLING_ADJUSTMENT_REQUEST.to_string()),
+    }
+}
+
+/// The `ResourceNotFoundException` for an agreement and payment request id pair
+/// that names no stored payment request.
+pub fn payment_request_not_found(id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        request_id: Some(next_request_id()),
+        message: Some(does_not_exist("payment request")),
+        resource_id: Some(id.to_string()),
+        resource_type: Some(RESOURCE_TYPE_PAYMENT_REQUEST.to_string()),
     }
 }
 

@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/address_validation.rs"]
 mod address_validation;
+#[path = "all/cluster_cancellation.rs"]
+mod cluster_cancellation;
 #[path = "all/cluster_updates.rs"]
 mod cluster_updates;
 #[path = "all/export_job_parts.rs"]

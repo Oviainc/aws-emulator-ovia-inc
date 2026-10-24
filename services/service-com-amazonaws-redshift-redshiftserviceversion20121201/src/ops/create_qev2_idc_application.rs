@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateQev2IdcApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateQev2IdcApplication`'s real behaviour. Implement it here — this is
+//! IMPLEMENTED: registers one Query Editor (QEV2) IAM Identity Center application. This is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateQev2IdcApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -97,13 +90,23 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `CreateQev2IdcApplicationError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#CreateQev2IdcApplication")]
+// `LimitExceededFault` and `TagLimitExceededFault` are widened in: the model does
+// not list them for this operation, but the service declares both shapes, and they
+// are the modelled ways to say "the store already holds as many applications as it
+// may" (see `crate::state::QEV2_IDC_APPLICATION_QUOTA`) and "the request carries
+// more tags than a resource may" (see `crate::state::MAX_TAGS_PER_RESOURCE`).
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#CreateQev2IdcApplication",
+    extra_errors = ["LimitExceededFault", "TagLimitExceededFault"]
+)]
 #[derive(Debug)]
 pub enum CreateQev2IdcApplicationErrorModeled {
     DependentServiceAccessDeniedFault(DependentServiceAccessDeniedFault),
     DependentServiceUnavailableFault(DependentServiceUnavailableFault),
     Qev2IdcApplicationAlreadyExistsFault(Qev2IdcApplicationAlreadyExistsFault),
     UnsupportedOperationFault(UnsupportedOperationFault),
+    LimitExceededFault(LimitExceededFault),
+    TagLimitExceededFault(TagLimitExceededFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -157,18 +160,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateQev2IdcApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateQev2IdcApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateQev2IdcApplication"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                CreateQev2IdcApplicationErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The request's own values first: `IdcInstanceArn` names an IAM Identity
+        // Center instance, so a value that is not an ARN at all names none and is
+        // refused before anything is stored. The application name and the display
+        // name carry modelled length and pattern constraints, which the boundary
+        // validator already refused by the time this handler runs.
+        if input.idc_instance_arn.len() > st::MAX_ARN_LENGTH {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(format!(
+                "Invalid value for IdcInstanceArn: the value is {} characters long; an Amazon Resource Name (ARN) is at most {} characters.",
+                input.idc_instance_arn.len(),
+                st::MAX_ARN_LENGTH
+            )));
+        }
+        if !st::is_arn(&input.idc_instance_arn) {
+            return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(format!(
+                "Invalid value for IdcInstanceArn: '{}'. The value must be the Amazon Resource Name (ARN) of an IAM Identity Center instance.",
+                input.idc_instance_arn
+            )));
+        }
+
+        // An application carries the tags the request gives it, and no resource
+        // holds more than the documented 50.
+        let tags = input.tags.clone().unwrap_or_default();
+        if tags.len() > st::MAX_TAGS_PER_RESOURCE {
+            return Err(CreateQev2IdcApplicationErrorModeled::TagLimitExceededFault(
+                TagLimitExceededFault {
+                    message: Some(format!(
+                        "The request carries {} tags; a resource can have up to {} tags.",
+                        tags.len(),
+                        st::MAX_TAGS_PER_RESOURCE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let region = st::request_region(ctx);
+        let mut store = state.lock();
+
+        // "Use a different application name or describe existing applications to
+        // find the ARN": the NAME is what an account's applications are unique
+        // on, so a second create of a registered name registers nothing.
+        if store
+            .qev2_idc_application_named(&input.qev2_idc_application_name)
+            .is_some()
+        {
+            return Err(
+                CreateQev2IdcApplicationErrorModeled::Qev2IdcApplicationAlreadyExistsFault(
+                    Qev2IdcApplicationAlreadyExistsFault {
+                        message: Some(format!(
+                            "Amazon Redshift Query Editor (QEV2) IAM Identity Center application already exists: {}",
+                            input.qev2_idc_application_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Identity before capacity: a request that would register nothing keeps
+        // the more specific fault even when the store is at its bound. Past that
+        // bound the collection may not grow: a name is all an application's
+        // identity is, and names are unlimited in number, so this bound is what
+        // keeps the collection finite. `LimitExceededFault` is the modelled
+        // capacity refusal this crate already answers its other store bounds
+        // with (see `create_usage_limit.rs`).
+        if store.qev2_idc_applications.len() >= st::QEV2_IDC_APPLICATION_QUOTA {
+            return Err(CreateQev2IdcApplicationErrorModeled::LimitExceededFault(
+                LimitExceededFault {
+                    message: Some(format!(
+                        "The request would exceed the allowed number of Amazon Redshift Query Editor (QEV2) IAM Identity Center applications ({}).",
+                        st::QEV2_IDC_APPLICATION_QUOTA
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The record every later `DescribeQev2IdcApplications` reports verbatim:
+        // the instance, name and display name the request carried, the tags it
+        // carried (an empty list when it carried none, which is what the
+        // application then has), the ARN this Region mints for that name and the
+        // IAM Identity Center managed application that backs it.
+        let application = Qev2IdcApplication {
+            idc_instance_arn: Some(input.idc_instance_arn.clone()),
+            qev2_idc_application_name: Some(input.qev2_idc_application_name.clone()),
+            qev2_idc_application_arn: Some(st::qev2_idc_application_arn(
+                &input.qev2_idc_application_name,
+                &region,
+            )),
+            idc_managed_application_arn: Some(st::idc_managed_application_arn(
+                &input.idc_instance_arn,
+                &input.qev2_idc_application_name,
+            )),
+            idc_onboard_status: Some(st::QEV2_IDC_ONBOARD_STATUS.to_string()),
+            idc_display_name: Some(input.idc_display_name.clone()),
+            tags: Some(tags),
+        };
+        store.qev2_idc_applications.push(application.clone());
+
+        Ok(CreateQev2IdcApplicationOutput {
+            qev2_idc_application: Some(application),
+        })
     }
 }

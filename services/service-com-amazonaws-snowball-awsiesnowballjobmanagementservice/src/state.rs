@@ -142,6 +142,17 @@ impl ClusterState {
     pub fn is_updatable(self) -> bool {
         matches!(self, Self::AwaitingQuorum)
     }
+
+    /// Whether `CancelCluster` is permitted in this state.
+    ///
+    /// The model documents the window on `CancelCluster`: "You can only cancel a cluster
+    /// job while it's in the `AwaitingQuorum` status." So `AwaitingQuorum` — the state a
+    /// cluster is created in, and the one it stays in until its node jobs are all created
+    /// — is the only one a cluster can be cancelled from, `Cancelled` (the state a cluster
+    /// that was already cancelled is in) included.
+    pub fn is_cancellable(self) -> bool {
+        matches!(self, Self::AwaitingQuorum)
+    }
 }
 
 /// How long the update file a `GetSoftwareUpdates` call answers with stays available.

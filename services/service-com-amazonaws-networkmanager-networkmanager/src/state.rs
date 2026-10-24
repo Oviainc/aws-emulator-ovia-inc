@@ -33,8 +33,8 @@ use crate::ops::types::{
     Connection, ConnectionHealth, CoreNetwork, CoreNetworkEdge, CoreNetworkNetworkFunctionGroup,
     CoreNetworkPolicyError, CoreNetworkPolicyException, CoreNetworkSegment, Device, GlobalNetwork,
     Link, LinkAssociation, Location, NetworkTelemetry, OrganizationStatus,
-    ResourceNotFoundException, Site, Tag, ValidationException, ValidationExceptionField,
-    VpcAttachment, VpcOptions,
+    ResourceNotFoundException, Site, SiteToSiteVpnAttachment, Tag, ValidationException,
+    ValidationExceptionField, VpcAttachment, VpcOptions,
 };
 
 /// Members of `GlobalNetworkState` / `SiteState` / `LinkState` this slice uses. All three
@@ -106,13 +106,15 @@ pub const CORE_NETWORK_KIND: &str = "core-network";
 /// the ARN resource type and the network-resource inventory.
 pub const ATTACHMENT_KIND: &str = "attachment";
 
-/// The two `AttachmentType`s this service mints, of the five the model enumerates
+/// The three `AttachmentType`s this service mints, of the five the model enumerates
 /// (CONNECT, DIRECT_CONNECT_GATEWAY, SITE_TO_SITE_VPN, TRANSIT_GATEWAY_ROUTE_TABLE, VPC:
 /// `smithy_query shape=AttachmentType`, mirrored in `ops::types::ATTACHMENT_TYPE_VALUES`).
-/// The other three belong to creates that are still scaffold stubs.
+/// The other two belong to creates that are still scaffold stubs.
 pub const ATTACHMENT_TYPE_VPC: &str = "VPC";
 /// See [`ATTACHMENT_TYPE_VPC`].
 pub const ATTACHMENT_TYPE_CONNECT: &str = "CONNECT";
+/// See [`ATTACHMENT_TYPE_VPC`].
+pub const ATTACHMENT_TYPE_SITE_TO_SITE_VPN: &str = "SITE_TO_SITE_VPN";
 
 /// Network Manager is a global (partition-scoped) service, so its ARNs carry an empty
 /// region segment: `arn:aws:networkmanager::<account>:global-network/<id>`.
@@ -189,6 +191,8 @@ pub const FIELD_EDGE_LOCATION: &str = "edgeLocation";
 pub const FIELD_VPC_ARN: &str = "vpcArn";
 /// See [`FIELD_CORE_NETWORK_ID`].
 pub const FIELD_SUBNET_ARNS: &str = "subnetArns";
+/// See [`FIELD_CORE_NETWORK_ID`].
+pub const FIELD_VPN_CONNECTION_ARN: &str = "vpnConnectionArn";
 /// See [`FIELD_GLOBAL_NETWORK_ID`]: the same lowerCamelCase spelling of the request
 /// member, for the device and link references a connection carries.
 pub const FIELD_DEVICE_ID: &str = "deviceId";
@@ -461,9 +465,10 @@ pub const MAX_CORE_NETWORKS_PER_GLOBAL_NETWORK: usize = 1;
 /// CHOSEN, like [`MAX_SITES_PER_GLOBAL_NETWORK`]: Cloud WAN publishes a per-account
 /// adjustable quota for attachments per core network and the model carries no number, so
 /// this bound exists only so that a repeated create cannot grow the store without end.
-/// Neither attachment create models a `ServiceQuotaExceededException` (`smithy_query
-/// query="operation" operation="CreateVpcAttachment,CreateConnectAttachment"`), so
-/// reaching it is refused with the modelled `ValidationException` (HTTP 400) carrying
+/// No attachment create models a `ServiceQuotaExceededException` (`smithy_query
+/// query="operation"
+/// operation="CreateVpcAttachment,CreateConnectAttachment,CreateSiteToSiteVpnAttachment"`),
+/// so reaching it is refused with the modelled `ValidationException` (HTTP 400) carrying
 /// [`VALIDATION_REASON_OTHER`] — the request is invalid against stored state, no single
 /// member is at fault — and stores nothing.
 pub const MAX_ATTACHMENTS_PER_CORE_NETWORK: usize = 100;
@@ -990,9 +995,10 @@ impl TelemetryResourceRecord {
 /// shape=Attachment`) — the core network it belongs to, its type, its state, its edge
 /// location, the ARN of the resource it attaches and its tags — and each kind adds its own
 /// members on top, which is what [`AttachmentDetail`] holds. One record and one map
-/// therefore serve every kind: `GetConnectAttachment` and `GetVpcAttachment` read the same
-/// store the quota, the inventory count and the core-network delete refusal are computed
-/// from, so no two operations can disagree about which attachments exist.
+/// therefore serve every kind: `GetConnectAttachment`, `GetVpcAttachment` and
+/// `GetSiteToSiteVpnAttachment` read the same store the quota, the inventory count and the
+/// core-network delete refusal are computed from, so no two operations can disagree about
+/// which attachments exist.
 ///
 /// Like the records above, `state` is not a field but a function of what is stored and the
 /// clock ([`Self::state_at`]), so reporting an attachment never writes. The one thing the
@@ -1007,15 +1013,16 @@ pub struct AttachmentRecord {
     /// The ARN of [`Self::core_network_id`], kept so a read never has to resolve the
     /// parent to report `Attachment$CoreNetworkArn`.
     pub core_network_arn: String,
-    /// One of `ops::types::ATTACHMENT_TYPE_VALUES` — [`ATTACHMENT_TYPE_VPC`] or
-    /// [`ATTACHMENT_TYPE_CONNECT`] for the two kinds this slice mints.
+    /// One of `ops::types::ATTACHMENT_TYPE_VALUES` — [`ATTACHMENT_TYPE_VPC`],
+    /// [`ATTACHMENT_TYPE_CONNECT`] or [`ATTACHMENT_TYPE_SITE_TO_SITE_VPN`] for the three
+    /// kinds this slice mints.
     pub attachment_type: &'static str,
     /// The edge location the attachment sits at: one of the locations the core network's
     /// policy configures ([`PolicyTopology::has_edge_location`]).
     pub edge_location: String,
-    /// The ARN of the resource this attachment attaches: the VPC for a VPC attachment,
-    /// and for a Connect attachment the transport attachment it is carried over, which is
-    /// the resource it is built on.
+    /// The ARN of the resource this attachment attaches: the VPC for a VPC attachment, the
+    /// VPN connection for a site-to-site VPN attachment, and for a Connect attachment the
+    /// transport attachment it is carried over, which is the resource it is built on.
     pub resource_arn: String,
     /// The `RoutingPolicyLabel` the create carried, stored because the request supplied
     /// it. The modelled `Attachment` has no member for it (`smithy_query shape=Attachment`)
@@ -1052,7 +1059,7 @@ pub struct AttachmentRecord {
 
 /// What one attachment kind adds to the shared [`AttachmentRecord`] envelope: exactly the
 /// members its own wrapper shape carries beside `Attachment` (`smithy_query
-/// shape=VpcAttachment,ConnectAttachment`).
+/// shape=VpcAttachment,ConnectAttachment,SiteToSiteVpnAttachment`).
 #[derive(Debug, Clone)]
 pub enum AttachmentDetail {
     /// A VPC attachment: the subnets it reaches the VPC through, in the order the request
@@ -1067,6 +1074,12 @@ pub enum AttachmentDetail {
         transport_attachment_id: String,
         options: ConnectAttachmentOptions,
     },
+    /// A site-to-site VPN attachment. It carries NO member of its own: beside
+    /// `Attachment`, `SiteToSiteVpnAttachment` holds only `VpnConnectionArn`
+    /// (`smithy_query shape=SiteToSiteVpnAttachment`), and that is the ARN of the resource
+    /// this attachment attaches — [`AttachmentRecord::resource_arn`] — so storing it here
+    /// would be a second copy of one value.
+    SiteToSiteVpn,
 }
 
 impl AttachmentRecord {
@@ -1130,7 +1143,7 @@ impl AttachmentRecord {
             state: Some(self.state_at(now).to_string()),
             edge_location: Some(self.edge_location.clone()),
             // `EdgeLocations` reports the several edges a multi-edge attachment spans.
-            // Both kinds stored here sit at exactly one edge, which `EdgeLocation` above
+            // Every kind stored here sits at exactly one edge, which `EdgeLocation` above
             // carries, so this member is absent rather than a one-entry copy of it.
             edge_locations: None,
             resource_arn: Some(self.resource_arn.clone()),
@@ -1167,7 +1180,7 @@ impl AttachmentRecord {
                 transport_attachment_id: Some(transport_attachment_id.clone()),
                 options: Some(options.clone()),
             }),
-            AttachmentDetail::Vpc { .. } => None,
+            AttachmentDetail::Vpc { .. } | AttachmentDetail::SiteToSiteVpn => None,
         }
     }
 
@@ -1183,7 +1196,26 @@ impl AttachmentRecord {
                 subnet_arns: Some(subnet_arns.clone()),
                 options: options.clone(),
             }),
-            AttachmentDetail::Connect { .. } => None,
+            AttachmentDetail::Connect { .. } | AttachmentDetail::SiteToSiteVpn => None,
+        }
+    }
+
+    /// The modelled `SiteToSiteVpnAttachment` for this record as of `now`, or `None` when
+    /// the record is not a site-to-site VPN attachment. See
+    /// [`Self::to_connect_attachment`].
+    ///
+    /// `VpnConnectionArn` is [`Self::resource_arn`]: the resource a site-to-site VPN
+    /// attachment attaches IS the VPN connection.
+    pub fn to_site_to_site_vpn_attachment(
+        &self,
+        now: SystemTime,
+    ) -> Option<SiteToSiteVpnAttachment> {
+        match &self.detail {
+            AttachmentDetail::SiteToSiteVpn => Some(SiteToSiteVpnAttachment {
+                attachment: Some(self.to_attachment(now)),
+                vpn_connection_arn: Some(self.resource_arn.clone()),
+            }),
+            AttachmentDetail::Vpc { .. } | AttachmentDetail::Connect { .. } => None,
         }
     }
 }
@@ -3230,8 +3262,9 @@ pub fn same_vpc_options(left: Option<&VpcOptions>, right: Option<&VpcOptions>) -
 /// non-empty one.
 ///
 /// A VPC attachment's edge location is not a request member: it is the Region the VPC is
-/// in, which only the VPC's ARN names. The modelled patterns for `VpcArn` and `SubnetArn`
-/// allow an EMPTY Region segment
+/// in, which only the VPC's ARN names; the same holds for a site-to-site VPN attachment
+/// and the VPN connection it attaches. The modelled patterns for `VpcArn`, `SubnetArn` and
+/// `VpnConnectionArn` all allow an EMPTY Region segment
 /// (`^arn:[^:]{1,63}:ec2:[^:]{0,63}:[^:]{0,63}:vpc\/vpc-[0-9a-f]{8,17}$`, `smithy_query
 /// shape=VpcArn`), so an ARN that names none is refused by the caller rather than stored
 /// with an edge location no edge has.

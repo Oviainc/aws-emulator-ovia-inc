@@ -67,7 +67,11 @@ const ALL_CLUSTER_STATES: &[ClusterState] = &[
 ];
 
 /// The `ClusterMetadata` `DescribeCluster` reports for `cluster_id`.
-async fn cluster_metadata(router: &MultiServiceRouter, cluster_id: &str, case: &str) -> Value {
+pub(crate) async fn cluster_metadata(
+    router: &MultiServiceRouter,
+    cluster_id: &str,
+    case: &str,
+) -> Value {
     let described = ok(
         router,
         "DescribeCluster",
@@ -79,7 +83,7 @@ async fn cluster_metadata(router: &MultiServiceRouter, cluster_id: &str, case: &
 }
 
 /// The `JobMetadata` `DescribeJob` reports for `job_id`.
-async fn job_metadata(router: &MultiServiceRouter, job_id: &str, case: &str) -> Value {
+pub(crate) async fn job_metadata(router: &MultiServiceRouter, job_id: &str, case: &str) -> Value {
     let described = ok(router, "DescribeJob", json!({ "JobId": job_id }), case).await;
     described["JobMetadata"].clone()
 }
@@ -88,7 +92,7 @@ async fn job_metadata(router: &MultiServiceRouter, job_id: &str, case: &str) -> 
 /// update can replace, so a row that names one member proves the others were left alone.
 /// Only members `ClusterMetadata` reports are here; the ones a cluster keeps for its node
 /// jobs alone are exercised by the inheritance suite below.
-fn base_cluster(address_id: &str) -> Value {
+pub(crate) fn base_cluster(address_id: &str) -> Value {
     json!({
         "JobType": "LOCAL_USE",
         "SnowballType": "EDGE",
@@ -255,7 +259,7 @@ fn assert_cluster_metadata_matches(metadata: &Value, submitted: &Value, state: &
 
 /// Create a cluster from `body` and return the `ClusterId` the service minted, together
 /// with the `JobListEntries` the create reported.
-async fn create_cluster(
+pub(crate) async fn create_cluster(
     router: &MultiServiceRouter,
     body: Value,
     case: &str,

@@ -21,6 +21,8 @@ mod change_set_lifecycle;
 mod change_set_preview;
 #[path = "all/cognito_resource_types.rs"]
 mod cognito_resource_types;
+#[path = "all/content_delivery_stack_outputs.rs"]
+mod content_delivery_stack_outputs;
 #[path = "all/drift_and_resource_reads.rs"]
 mod drift_and_resource_reads;
 #[path = "all/ecs_elbv2_stack_identifiers.rs"]
