@@ -85,7 +85,14 @@ async fn wait_for_disk_state(emulator: &Emulator, name: &str, want: &str) -> Val
 }
 
 /// Poll `GetInstance` until the instance reports `want`, answering the instance.
-async fn wait_for_instance_state(emulator: &Emulator, name: &str, want: &str) -> Value {
+///
+/// `pub(crate)` so a sibling suite in this test target waits on an instance the
+/// same way rather than writing the poll a second time.
+pub(crate) async fn wait_for_instance_state(
+    emulator: &Emulator,
+    name: &str,
+    want: &str,
+) -> Value {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let instance = instance(emulator, name).await;
@@ -102,7 +109,10 @@ async fn wait_for_instance_state(emulator: &Emulator, name: &str, want: &str) ->
 }
 
 /// Create the instance `name` in `zone` and wait until it is running.
-async fn create_running_instance(emulator: &Emulator, name: &str, zone: &str) {
+///
+/// `pub(crate)` so a sibling suite in this test target stands an instance up the
+/// same way rather than writing the create a second time.
+pub(crate) async fn create_running_instance(emulator: &Emulator, name: &str, zone: &str) {
     emulator
         .ok(
             "CreateInstances",
