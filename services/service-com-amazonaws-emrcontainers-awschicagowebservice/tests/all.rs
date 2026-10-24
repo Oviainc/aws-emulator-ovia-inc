@@ -17,6 +17,8 @@ mod created_metadata_wire_form;
 mod job_template_idempotency;
 #[path = "all/job_template_lifecycle.rs"]
 mod job_template_lifecycle;
+#[path = "all/resource_tag_removal.rs"]
+mod resource_tag_removal;
 #[path = "all/security_configuration.rs"]
 mod security_configuration;
 #[path = "all/security_configuration_delete.rs"]
