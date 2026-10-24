@@ -459,8 +459,12 @@ async fn a_tag_value_is_stored_as_the_request_gave_it() {
 
     // The axis: the FORM of the value — its length (none, one character, the published
     // bound), whether the request named `Value` at all, and which characters it
-    // carries (ASCII, non-ASCII, the characters the XML envelope has to escape).
+    // carries (ASCII, non-ASCII, every symbol the published tag character set allows).
+    // The characters the XML envelope escapes are OUTSIDE that character set, so they
+    // belong to the refusal table in
+    // [`a_tag_outside_the_published_character_set_is_refused`] rather than here.
     let at_bound = "v".repeat(state::MAX_TAG_VALUE_LEN);
+    let symbols: String = state::TAG_SYMBOLS.iter().collect();
     let cases: [(&str, Option<&str>, &str); 7] = [
         ("an ASCII value", Some("cache"), "cache"),
         ("one character", Some("x"), "x"),
@@ -474,9 +478,9 @@ async fn a_tag_value_is_stored_as_the_request_gave_it() {
             "déjà-vu-日本語-ß",
         ),
         (
-            "characters the XML envelope escapes",
-            Some("a&b<c>\"d'e"),
-            "a&b<c>\"d'e",
+            "every symbol the published character set allows",
+            Some(symbols.as_str()),
+            symbols.as_str(),
         ),
         (
             "a value at the published length bound",
@@ -659,6 +663,134 @@ async fn a_tag_a_caller_may_not_use_is_refused_and_changes_nothing() {
             reply.body
         );
     }
+}
+
+/// The character set a tag key or a tag value may use: "unicode letters, digits,
+/// whitespace, or one of these symbols: `_ . : / = + \ - @`", the set ElastiCache
+/// names in its own refusal and this crate states once as
+/// `state::is_tag_character` / `state::TAG_SYMBOLS`. Neither `Tag$Key` nor
+/// `Tag$Value` carries a modelled `@pattern`, so nothing before the handler refuses a
+/// character outside it.
+///
+/// The table's axes: WHICH class of character the text carries (letters of several
+/// scripts, digits, whitespace, each permitted symbol — and, on the refusal side, a
+/// pictograph, the characters the XML envelope escapes, and punctuation the set omits),
+/// WHICH half of the pair carries it (the key or the value), and WHICH entry point the
+/// request came through (a create's own `Tags` and `AddTagsToResource`). The recorded
+/// emoji-in-a-value case is one row of it.
+#[tokio::test]
+async fn a_tag_outside_the_published_character_set_is_refused() {
+    let emulator = Emulator::new();
+    let arn = create_resource(&emulator, "cluster", "charset", &[("keep", Some("me"))]).await;
+
+    // Every class the published set names, one row each, plus one row per symbol in
+    // it — so a validator that refused a legal character fails here.
+    let mut accepted: Vec<(String, String)> = vec![
+        (
+            "unicode letters of three scripts".to_string(),
+            "Ünicode-日本語-Кириллица".to_string(),
+        ),
+        ("digits".to_string(), "0123456789".to_string()),
+        (
+            "letters, digits and whitespace".to_string(),
+            "cost centre 42".to_string(),
+        ),
+        (
+            "whitespace that is not a space".to_string(),
+            "two\twords".to_string(),
+        ),
+    ];
+    for symbol in state::TAG_SYMBOLS {
+        accepted.push((format!("the symbol {symbol:?}"), format!("a{symbol}b")));
+    }
+    for (index, (case, text)) in accepted.iter().enumerate() {
+        let key = format!("ok{index}");
+        let added = add_tags(&emulator, &arn, &[(key.as_str(), Some(text.as_str()))]).await;
+        assert_eq!(
+            added.status, 200,
+            "case {case:?}: AddTagsToResource must answer 200, got {} {}",
+            added.status, added.body
+        );
+        let listed = list_tags(&emulator, &arn).await;
+        let held = tag_list(&listed, case);
+        assert!(
+            held.contains(&(key.clone(), text.clone())),
+            "case {case:?}: expected {text:?} to be stored under {key}, got {held:?}"
+        );
+    }
+
+    // The refused side: one row per kind of character the set leaves out.
+    let refused: [(&str, &str); 7] = [
+        ("a pictograph", "party-\u{1F389}-time"),
+        ("an ampersand", "a&b"),
+        ("angle brackets", "a<b>c"),
+        ("a double quote", "say-\"what\""),
+        ("a percent sign", "100%-cache"),
+        ("a comma", "one,two"),
+        ("a parenthesis", "cache-(prod)"),
+    ];
+    let before = tag_list(&list_tags(&emulator, &arn).await, "before the refusals");
+    for (case, text) in refused {
+        // Both halves of the pair carry the same rule, and so does every entry point
+        // that names tags: `AddTagsToResource` and a create's own `Tags`.
+        for (member, key, value) in [("Value", "charset-key", text), ("Key", text, "v")] {
+            let added = add_tags(&emulator, &arn, &[(key, Some(value))]).await;
+            assert_eq!(
+                (added.status, added.error_code()),
+                (400, "InvalidParameterValue"),
+                "case {case:?} in the tag {member}: AddTagsToResource must answer 400 \
+                 InvalidParameterValue, got {} {}",
+                added.status,
+                added.body
+            );
+
+            // The same text through a CREATE's `Tags`: refused, and the resource the
+            // create named is not stored either.
+            let name = "charset-group";
+            let created = emulator
+                .call(
+                    "CreateCacheParameterGroup",
+                    &[
+                        params(&[
+                            ("CacheParameterGroupName", name),
+                            ("CacheParameterGroupFamily", FAMILY),
+                            ("Description", "the tagging suite"),
+                        ]),
+                        tag_form(1, key, Some(value)),
+                    ]
+                    .concat(),
+                )
+                .await;
+            assert_eq!(
+                (created.status, created.error_code()),
+                (400, "InvalidParameterValue"),
+                "case {case:?} in the tag {member}: CreateCacheParameterGroup must answer 400 \
+                 InvalidParameterValue, got {} {}",
+                created.status,
+                created.body
+            );
+            let described = emulator
+                .call(
+                    "DescribeCacheParameterGroups",
+                    &params(&[("CacheParameterGroupName", name)]),
+                )
+                .await;
+            assert_eq!(
+                (described.status, described.error_code()),
+                (404, "CacheParameterGroupNotFound"),
+                "case {case:?} in the tag {member}: the refused create must have stored no \
+                 group, got {} {}",
+                described.status,
+                described.body
+            );
+        }
+    }
+    // Not one refusal changed the tags the resource holds.
+    let after = tag_list(&list_tags(&emulator, &arn).await, "after the refusals");
+    assert_eq!(
+        after, before,
+        "the refused requests must change nothing, got {after:?} against {before:?}"
+    );
 }
 
 #[tokio::test]

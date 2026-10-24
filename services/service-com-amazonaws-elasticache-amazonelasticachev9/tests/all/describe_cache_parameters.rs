@@ -341,6 +341,176 @@ async fn every_group_reports_the_published_catalog_of_its_family() {
     }
 }
 
+/// One term of a numeric `AllowedValues`, in the forms the published catalog
+/// writes them in.
+#[derive(Debug)]
+enum Term {
+    /// A single permitted value — the `0` of `0,20-`.
+    Literal(f64),
+    /// A range bounded only at the bottom: `20-`.
+    From(f64),
+    /// A range bounded at BOTH ends: `1048576-536870912`.
+    Closed(f64, f64),
+}
+
+/// `allowed` split into its comma-separated terms, or `None` when it is not a
+/// numeric value set at all (an enumeration of words, say).
+fn numeric_terms(allowed: &str) -> Option<Vec<Term>> {
+    allowed
+        .split(',')
+        .map(|term| match term.split_once('-') {
+            Some((low, "")) => Some(Term::From(low.parse().ok()?)),
+            Some((low, high)) => Some(Term::Closed(low.parse().ok()?, high.parse().ok()?)),
+            None => Some(Term::Literal(term.parse().ok()?)),
+        })
+        .collect()
+}
+
+/// The widest closed integer range `reply` publishes for a MODIFIABLE parameter,
+/// as (the parameter, the span it covers) — what a client scanning the catalog
+/// for a parameter it may tune, and for the bounds to validate against, finds.
+fn widest_modifiable_integer_range(reply: &Reply) -> Option<(String, f64)> {
+    let mut widest: Option<(String, f64)> = None;
+    for parameter in reported(reply) {
+        if parameter.field("IsModifiable") != Some("true")
+            || parameter.field("DataType") != Some("integer")
+        {
+            continue;
+        }
+        let Some(terms) = parameter.field("AllowedValues").and_then(numeric_terms) else {
+            continue;
+        };
+        let [Term::Closed(low, high)] = terms[..] else {
+            continue;
+        };
+        if widest.as_ref().is_none_or(|(_, span)| high - low > *span) {
+            widest = Some((parameter.name.clone(), high - low));
+        }
+    }
+    widest
+}
+
+/// A parameter a customer may SET is published with the value set it may be set
+/// to: `Parameter$AllowedValues` carries the engine's own constraint, so a client
+/// that reads the catalog to decide what to tune — and to what — has the bounds
+/// to validate against instead of an empty element.
+///
+/// The axes: the FAMILY (both engine catalogs, every published version line) and
+/// the kind of group it is reached through (a family default and a custom group),
+/// and within each answer every numeric parameter the catalog publishes rather
+/// than the one a recorded request happened to look at.
+#[tokio::test]
+async fn every_modifiable_numeric_parameter_publishes_the_values_it_may_take() {
+    let emulator = Emulator::new();
+
+    let mut cases: Vec<(String, String)> = state::PARAMETER_GROUP_FAMILIES
+        .iter()
+        .map(|family| (format!("default.{family}"), (*family).to_string()))
+        .collect();
+    for family in ["redis7", "memcached1.6", "valkey8"] {
+        let name = format!("{CUSTOM_GROUP}-ranges-{}", family.replace('.', "-"));
+        create_group(&emulator, &name, family).await;
+        cases.push((name, family.to_string()));
+    }
+
+    // The engine lines whose catalog bounds a modifiable integer parameter at
+    // both ends widely enough to tune against: Redis OSS 2.8 brought the sparse
+    // HyperLogLog's byte bound, 4.0 active defragmentation's scan bound and 5.0
+    // the protocol element's. A client discovering a parameter to tune on one of
+    // these families must find such a range.
+    let wide_ranges = [
+        "redis2.8",
+        "redis3.2",
+        "redis4.0",
+        "redis5.0",
+        "redis6.x",
+        "redis7",
+        "valkey7",
+        "valkey8",
+    ];
+    // The span the discovery case needs: a range of at least a thousand values,
+    // which is what distinguishes a tunable range from a flag's `0,1`.
+    const WIDE_SPAN: f64 = 1000.0;
+
+    for (group, family) in cases {
+        let reply = describe_ok(&emulator, &group, &[]).await;
+        for parameter in reported(&reply) {
+            let case = format!("{group}/{}", parameter.name);
+            let numeric = matches!(parameter.field("DataType"), Some("integer" | "float"));
+            // A parameter the engine or the node type fixes cannot be set at all,
+            // so it has no set for a caller to discover.
+            if !numeric || parameter.field("IsModifiable") != Some("true") {
+                continue;
+            }
+            let allowed = parameter.field("AllowedValues").unwrap_or_default();
+            assert!(
+                !allowed.is_empty(),
+                "case {case}: a modifiable numeric parameter must publish the values it may \
+                 take, got {allowed:?}"
+            );
+            let terms = numeric_terms(allowed).unwrap_or_else(|| {
+                panic!("case {case}: expected a numeric value set, got {allowed:?}")
+            });
+            for term in &terms {
+                match term {
+                    // Every bound the published catalog states is a finite,
+                    // non-negative number: a parameter's floor is a count, a size
+                    // or a percentage.
+                    Term::Literal(value) | Term::From(value) => assert!(
+                        value.is_finite() && *value >= 0.0,
+                        "case {case}: expected a finite, non-negative bound, got {allowed:?}"
+                    ),
+                    Term::Closed(low, high) => assert!(
+                        *low >= 0.0 && low <= high && high.is_finite(),
+                        "case {case}: a closed range must run upwards from a non-negative \
+                         bound, got {allowed:?}"
+                    ),
+                }
+            }
+        }
+
+        let widest = widest_modifiable_integer_range(&reply);
+        if wide_ranges.contains(&family.as_str()) {
+            let (parameter, span) = widest.unwrap_or_else(|| {
+                panic!(
+                    "case {group}: expected a modifiable integer parameter with a closed range, \
+                     got {:?}",
+                    names(&reply)
+                )
+            });
+            assert!(
+                span >= WIDE_SPAN,
+                "case {group}: expected a closed range spanning at least {WIDE_SPAN} values, got \
+                 {span} on {parameter}"
+            );
+        }
+
+        // Reading the catalog twice reports the same value sets: a describe is a
+        // read, so nothing about it is minted per call.
+        let again = describe_ok(&emulator, &group, &[]).await;
+        let (before, after) = (reported(&reply), reported(&again));
+        let allowed_values = |parameters: &[Reported]| -> Vec<(String, String)> {
+            parameters
+                .iter()
+                .map(|parameter| {
+                    (
+                        parameter.name.clone(),
+                        parameter
+                            .field("AllowedValues")
+                            .unwrap_or_default()
+                            .to_string(),
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(
+            allowed_values(&after),
+            allowed_values(&before),
+            "case {group}: a read must not change the value sets the next caller sees"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_group_is_resolved_by_name_however_it_is_cased() {
     let emulator = Emulator::new();

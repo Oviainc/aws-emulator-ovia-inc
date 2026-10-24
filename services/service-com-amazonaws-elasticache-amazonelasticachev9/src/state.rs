@@ -460,6 +460,35 @@ pub enum TagRefusal {
     TooMany(usize),
 }
 
+/// The symbols a tag key or value may carry besides letters, digits and
+/// whitespace, from the character set ElastiCache publishes for tags and names
+/// in its own refusal ("Tag values may only contain unicode letters, digits,
+/// whitespace, or one of these symbols: `_ . : / = + \ - @`"). The
+/// letters-and-digits half is UNICODE-wide, which is why
+/// [`is_tag_character`] asks [`char::is_alphabetic`] / [`char::is_numeric`]
+/// rather than their ASCII-only forms.
+pub const TAG_SYMBOLS: [char; 9] = ['_', '.', ':', '/', '=', '+', '\\', '-', '@'];
+
+/// Whether `character` is one a tag key or a tag value may carry; see
+/// [`TAG_SYMBOLS`]. Neither `Tag$Key` nor `Tag$Value` carries a modelled
+/// `@pattern`, so the boundary validator passes any string and the character set
+/// is enforced here — once, for every request that names a tag.
+pub fn is_tag_character(character: char) -> bool {
+    character.is_alphabetic()
+        || character.is_numeric()
+        || character.is_whitespace()
+        || TAG_SYMBOLS.contains(&character)
+}
+
+/// The sentence a charset refusal carries for `member` ("keys" or "values"),
+/// in the service's own wording; see [`TAG_SYMBOLS`].
+fn tag_charset_message(member: &str) -> String {
+    format!(
+        "Tag {member} may only contain unicode letters, digits, whitespace, or one of these \
+         symbols: _ . : / = + \\ - @"
+    )
+}
+
 /// What is wrong with a caller-supplied tag KEY, or `None` when the caller may
 /// use it — the one statement of the rule, so a create's `Tags`,
 /// `AddTagsToResource` and `RemoveTagsFromResource` cannot disagree about which
@@ -473,6 +502,9 @@ pub fn tag_key_rejection(key: &str) -> Option<String> {
             "Invalid value {key} for Tags: a tag's Key may contain no more than \
              {MAX_TAG_KEY_LEN} characters."
         ));
+    }
+    if !key.chars().all(is_tag_character) {
+        return Some(tag_charset_message("keys"));
     }
     // Sliced with `get`, which answers `None` rather than panicking when the
     // key's first bytes are the middle of a multi-byte character.
@@ -489,15 +521,17 @@ pub fn tag_key_rejection(key: &str) -> Option<String> {
 }
 
 /// What is wrong with a caller-supplied tag VALUE, or `None` when the caller may
-/// use it; see [`tag_key_rejection`]. Only the length is bounded: the empty
-/// value is permitted, and the model puts no character class on `Tag$Value`.
+/// use it; see [`tag_key_rejection`]. The empty value is permitted — `Tag$Value`
+/// "may be null" — and what a non-empty one may contain is the character set
+/// [`TAG_SYMBOLS`] states, which the model puts no `@pattern` on.
 pub fn tag_value_rejection(value: &str) -> Option<String> {
-    (value.chars().count() > MAX_TAG_VALUE_LEN).then(|| {
-        format!(
+    if value.chars().count() > MAX_TAG_VALUE_LEN {
+        return Some(format!(
             "Invalid value for Tags: a tag's Value may contain no more than \
              {MAX_TAG_VALUE_LEN} characters."
-        )
-    })
+        ));
+    }
+    (!value.chars().all(is_tag_character)).then(|| tag_charset_message("values"))
 }
 
 /// The tags a request was given as stored pairs, or why they are refused.
@@ -1010,10 +1044,21 @@ fn version_rank(version: &str) -> (i32, i32) {
 
 /// One row of an engine's parameter catalog, in column order: the parameter's
 /// name, the engine's default value for it, its description, its data type, the
-/// values it may take (empty where the engine constrains it to none), whether a
-/// customer may modify it, the earliest engine version it applies to, whether a
-/// change to it is immediate or needs a reboot, and whether its value depends on
-/// the cache node type.
+/// values it may take, whether a customer may modify it, the earliest engine
+/// version it applies to, whether a change to it is immediate or needs a reboot,
+/// and whether its value depends on the cache node type.
+///
+/// The allowed-values column is the `Parameter$AllowedValues` the catalog
+/// publishes, in the three forms ElastiCache writes it in: an enumeration of the
+/// literal values (`yes,no`), a numeric RANGE as `<lo>-<hi>` where the engine
+/// bounds the value at both ends and `<lo>-` where it bounds only the bottom
+/// (optionally with the discrete values that sit outside the range in front of
+/// it, `0,20-`), and the EMPTY string only where a customer cannot set the
+/// parameter at all — a value the engine or the node type fixes
+/// (`IsModifiable: false`), which is the one case there is no set to discover.
+/// So every MODIFIABLE numeric parameter publishes its range: a client that
+/// reads the catalog to decide what it may set finds the bounds to validate
+/// against.
 struct ParameterRow(
     &'static str,
     &'static str,
@@ -1038,6 +1083,14 @@ struct ParameterRow(
 /// Redis OSS-compatible engine defaults ARE; it is deliberately a representative
 /// catalog rather than every parameter AWS ships, and every family that draws on
 /// it reports exactly the rows whose minimum engine version its line covers.
+///
+/// The allowed-values column follows [`ParameterRow`]: each numeric parameter a
+/// customer may modify carries the range the ENGINE constrains it to, as the
+/// Redis OSS / Valkey configuration reference bounds it (for example active
+/// defragmentation's effort is a percentage, `maxmemory-samples` is 1 to 64, a
+/// replication backlog is at least 16 KiB, and a protocol element is 1 MiB to
+/// 512 MiB), so a client scanning the catalog for what it may tune finds both
+/// bounds wherever the engine publishes both.
 const REDIS_PARAMETERS: &[ParameterRow] = &[
     ParameterRow(
         "acl-pubsub-default",
@@ -1047,6 +1100,86 @@ const REDIS_PARAMETERS: &[ParameterRow] = &[
         "allchannels,resetchannels",
         true,
         "6.2.6",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "active-defrag-cycle-max",
+        "75",
+        "The largest share of CPU, as a percentage, active defragmentation may use.",
+        "integer",
+        "1-75",
+        true,
+        "4.0.9",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "active-defrag-cycle-min",
+        "5",
+        "The smallest share of CPU, as a percentage, active defragmentation uses once it \
+         starts.",
+        "integer",
+        "1-75",
+        true,
+        "4.0.9",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "active-defrag-ignore-bytes",
+        "104857600",
+        "How much fragmentation, in bytes, is tolerated before active defragmentation starts.",
+        "integer",
+        "1048576-",
+        true,
+        "4.0.9",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "active-defrag-max-scan-fields",
+        "1000",
+        "The largest number of fields of a hash, set, sorted set or list active \
+         defragmentation processes in one scan.",
+        "integer",
+        "1-1000000",
+        true,
+        "4.0.9",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "active-defrag-threshold-lower",
+        "10",
+        "The fragmentation, as a percentage, at which active defragmentation starts.",
+        "integer",
+        "1-100",
+        true,
+        "4.0.9",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "active-defrag-threshold-upper",
+        "100",
+        "The fragmentation, as a percentage, at which active defragmentation uses its \
+         largest share of CPU.",
+        "integer",
+        "1-100",
+        true,
+        "4.0.9",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "active-expire-effort",
+        "1",
+        "How much effort the node spends expiring keys, from the least to the most eager.",
+        "integer",
+        "1-10",
+        true,
+        "7.0.0",
         CHANGE_TYPE_IMMEDIATE,
         false,
     ),
@@ -1077,7 +1210,7 @@ const REDIS_PARAMETERS: &[ParameterRow] = &[
         "33554432",
         "The output buffer size, in bytes, a pub/sub client is disconnected at.",
         "integer",
-        "",
+        "0-",
         true,
         "2.6.13",
         CHANGE_TYPE_IMMEDIATE,
@@ -1089,7 +1222,7 @@ const REDIS_PARAMETERS: &[ParameterRow] = &[
         "The output buffer size, in bytes, a pub/sub client may stay above only for \
          client-output-buffer-limit-pubsub-soft-seconds.",
         "integer",
-        "",
+        "0-",
         true,
         "2.6.13",
         CHANGE_TYPE_IMMEDIATE,
@@ -1100,7 +1233,7 @@ const REDIS_PARAMETERS: &[ParameterRow] = &[
         "60",
         "How long, in seconds, a pub/sub client may stay above the soft limit.",
         "integer",
-        "",
+        "0-",
         true,
         "2.6.13",
         CHANGE_TYPE_IMMEDIATE,
@@ -1133,7 +1266,7 @@ const REDIS_PARAMETERS: &[ParameterRow] = &[
         "128",
         "The largest hash, in entries, kept in the memory-efficient listpack encoding.",
         "integer",
-        "",
+        "0-",
         true,
         "7.0.0",
         CHANGE_TYPE_IMMEDIATE,
@@ -1144,7 +1277,7 @@ const REDIS_PARAMETERS: &[ParameterRow] = &[
         "512",
         "The largest hash, in entries, kept in the memory-efficient ziplist encoding.",
         "integer",
-        "",
+        "0-",
         true,
         "2.6.13",
         CHANGE_TYPE_IMMEDIATE,
@@ -1155,9 +1288,21 @@ const REDIS_PARAMETERS: &[ParameterRow] = &[
         "64",
         "The largest hash value, in bytes, kept in the memory-efficient ziplist encoding.",
         "integer",
-        "",
+        "0-",
         true,
         "2.6.13",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "hll-sparse-max-bytes",
+        "3000",
+        "The largest HyperLogLog, in bytes, kept in the memory-efficient sparse \
+         representation.",
+        "integer",
+        "1-16000",
+        true,
+        "2.8.6",
         CHANGE_TYPE_IMMEDIATE,
         false,
     ),
@@ -1188,7 +1333,7 @@ const REDIS_PARAMETERS: &[ParameterRow] = &[
         "128",
         "The largest list, in entries, kept in the memory-efficient ziplist encoding.",
         "integer",
-        "",
+        "0-",
         true,
         "2.6.13",
         CHANGE_TYPE_IMMEDIATE,
@@ -1234,7 +1379,7 @@ const REDIS_PARAMETERS: &[ParameterRow] = &[
         "3",
         "How many keys an approximated eviction policy samples before it picks one.",
         "integer",
-        "",
+        "1-64",
         true,
         "2.6.13",
         CHANGE_TYPE_IMMEDIATE,
@@ -1246,7 +1391,7 @@ const REDIS_PARAMETERS: &[ParameterRow] = &[
         "How long, in seconds, a replica may lag before it stops counting towards \
          min-replicas-to-write.",
         "integer",
-        "",
+        "0-",
         true,
         "5.0.0",
         CHANGE_TYPE_IMMEDIATE,
@@ -1257,7 +1402,7 @@ const REDIS_PARAMETERS: &[ParameterRow] = &[
         "0",
         "How many connected replicas the primary needs before it accepts writes.",
         "integer",
-        "",
+        "0-",
         true,
         "5.0.0",
         CHANGE_TYPE_IMMEDIATE,
@@ -1275,12 +1420,23 @@ const REDIS_PARAMETERS: &[ParameterRow] = &[
         false,
     ),
     ParameterRow(
+        "proto-max-bulk-len",
+        "536870912",
+        "The largest single protocol element, in bytes, a request may carry.",
+        "integer",
+        "1048576-536870912",
+        true,
+        "5.0.0",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
         "repl-backlog-size",
         "1048576",
         "The size, in bytes, of the replication backlog a disconnected replica resynchronises \
          from.",
         "integer",
-        "",
+        "16384-",
         true,
         "2.6.13",
         CHANGE_TYPE_IMMEDIATE,
@@ -1292,7 +1448,7 @@ const REDIS_PARAMETERS: &[ParameterRow] = &[
         "How long, in seconds, the primary keeps the replication backlog after the last \
          replica disconnects.",
         "integer",
-        "",
+        "0-",
         true,
         "2.8.6",
         CHANGE_TYPE_IMMEDIATE,
@@ -1315,7 +1471,7 @@ const REDIS_PARAMETERS: &[ParameterRow] = &[
         "The largest set of integers, in entries, kept in the memory-efficient intset \
          encoding.",
         "integer",
-        "",
+        "0-",
         true,
         "2.6.13",
         CHANGE_TYPE_IMMEDIATE,
@@ -1326,7 +1482,7 @@ const REDIS_PARAMETERS: &[ParameterRow] = &[
         "10000",
         "How long, in microseconds, a command must take to be recorded in the slow log.",
         "integer",
-        "",
+        "0-",
         true,
         "2.6.13",
         CHANGE_TYPE_IMMEDIATE,
@@ -1337,9 +1493,31 @@ const REDIS_PARAMETERS: &[ParameterRow] = &[
         "128",
         "How many entries the slow log keeps.",
         "integer",
-        "",
+        "0-",
         true,
         "2.6.13",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "stream-node-max-bytes",
+        "4096",
+        "The largest stream macro node, in bytes.",
+        "integer",
+        "0-",
+        true,
+        "5.0.0",
+        CHANGE_TYPE_IMMEDIATE,
+        false,
+    ),
+    ParameterRow(
+        "stream-node-max-entries",
+        "100",
+        "The largest stream macro node, in entries.",
+        "integer",
+        "0-",
+        true,
+        "5.0.0",
         CHANGE_TYPE_IMMEDIATE,
         false,
     ),
@@ -1348,7 +1526,7 @@ const REDIS_PARAMETERS: &[ParameterRow] = &[
         "300",
         "How often, in seconds, a TCP ACK is sent to an idle client, or 0 to send none.",
         "integer",
-        "",
+        "0-",
         true,
         "2.6.13",
         CHANGE_TYPE_IMMEDIATE,
@@ -1371,7 +1549,7 @@ const REDIS_PARAMETERS: &[ParameterRow] = &[
         "128",
         "The largest sorted set, in entries, kept in the memory-efficient ziplist encoding.",
         "integer",
-        "",
+        "0-",
         true,
         "2.6.13",
         CHANGE_TYPE_IMMEDIATE,
@@ -1383,7 +1561,7 @@ const REDIS_PARAMETERS: &[ParameterRow] = &[
         "The largest sorted set value, in bytes, kept in the memory-efficient ziplist \
          encoding.",
         "integer",
-        "",
+        "0-",
         true,
         "2.6.13",
         CHANGE_TYPE_IMMEDIATE,
@@ -1446,7 +1624,7 @@ const MEMCACHED_PARAMETERS: &[ParameterRow] = &[
         "48",
         "The smallest chunk size, in bytes, a key-value pair is stored in.",
         "integer",
-        "",
+        "1-",
         true,
         "1.4.5",
         CHANGE_TYPE_REQUIRES_REBOOT,
@@ -1457,7 +1635,7 @@ const MEMCACHED_PARAMETERS: &[ParameterRow] = &[
         "1.25",
         "The growth factor between the chunk sizes of consecutive slab classes.",
         "float",
-        "",
+        "1.0-",
         true,
         "1.4.5",
         CHANGE_TYPE_REQUIRES_REBOOT,
@@ -1490,7 +1668,7 @@ const MEMCACHED_PARAMETERS: &[ParameterRow] = &[
         "0",
         "The initial size of the hash table, as a power of two.",
         "integer",
-        "",
+        "0-",
         true,
         "1.4.14",
         CHANGE_TYPE_REQUIRES_REBOOT,
@@ -1523,7 +1701,7 @@ const MEMCACHED_PARAMETERS: &[ParameterRow] = &[
         "1048576",
         "The largest item, in bytes, that may be stored.",
         "integer",
-        "",
+        "1024-",
         true,
         "1.4.14",
         CHANGE_TYPE_REQUIRES_REBOOT,
@@ -1545,7 +1723,7 @@ const MEMCACHED_PARAMETERS: &[ParameterRow] = &[
         "100",
         "The memory, in megabytes, reserved for connection overhead.",
         "integer",
-        "",
+        "0-",
         true,
         "1.4.5",
         CHANGE_TYPE_REQUIRES_REBOOT,
@@ -1556,7 +1734,7 @@ const MEMCACHED_PARAMETERS: &[ParameterRow] = &[
         "20",
         "How many requests one connection is served per event before the next is served.",
         "integer",
-        "",
+        "1-",
         true,
         "1.4.5",
         CHANGE_TYPE_REQUIRES_REBOOT,
@@ -1578,7 +1756,7 @@ const MEMCACHED_PARAMETERS: &[ParameterRow] = &[
         "524288",
         "The largest chunk size, in bytes, a slab page is divided into.",
         "integer",
-        "",
+        "1-",
         true,
         "1.5.10",
         CHANGE_TYPE_REQUIRES_REBOOT,
@@ -5754,14 +5932,18 @@ pub const MAX_PASSWORDS_PER_USER: usize = 2;
 /// reason [`CLUSTER_QUOTA`] gives.
 pub const USER_QUOTA: usize = 100;
 
-/// The length a `UserId` must stay UNDER, in the service's own words: a user id
-/// of this length or more is refused with "User id length must be less than
-/// 40." The model constrains `UserId` with `@length(min: 1)` and a pattern only,
-/// so the upper bound is enforced here, by every operation that NAMES a user and
-/// can report the modelled `InvalidParameterValueException` — before the id is
-/// looked up, because an id the service would never have stored names no user to
-/// look up.
-pub const USER_ID_LENGTH_LIMIT: usize = 40;
+/// The LONGEST `UserId` the service accepts: ElastiCache documents an RBAC user
+/// id as 1 to 40 characters, so an id of exactly this length is ACCEPTED and
+/// only a longer one is refused. The model constrains `UserId` with
+/// `@length(min: 1)` and a pattern only, so the upper bound is enforced here, by
+/// every operation that NAMES a user and can report the modelled
+/// `InvalidParameterValueException` — before the id is looked up, because an id
+/// the service would never have stored names no user to look up.
+///
+/// The refusal carries the service's own recorded wording, "User id length must
+/// be less than 40.", which states the bound loosely; the BOUND is the
+/// documented maximum rather than that sentence read literally.
+pub const MAX_USER_ID_LEN: usize = 40;
 
 /// Why `user_id` cannot name a user, or `None` when it can.
 ///
@@ -5769,8 +5951,8 @@ pub const USER_ID_LENGTH_LIMIT: usize = 40;
 /// service accepts: a create that stores an id and a delete that refuses the
 /// same one would leave a user nothing could remove.
 pub fn user_id_rejection(user_id: &str) -> Option<String> {
-    (user_id.chars().count() >= USER_ID_LENGTH_LIMIT)
-        .then(|| format!("User id length must be less than {USER_ID_LENGTH_LIMIT}."))
+    (user_id.chars().count() > MAX_USER_ID_LEN)
+        .then(|| format!("User id length must be less than {MAX_USER_ID_LEN}."))
 }
 
 /// `User$MinimumEngineVersion` of a user that authenticates with a password or
