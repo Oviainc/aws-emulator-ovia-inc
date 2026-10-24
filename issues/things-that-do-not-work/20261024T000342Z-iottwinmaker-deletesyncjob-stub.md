@@ -23,3 +23,16 @@ The handler carries the scaffold marker `//! SCAFFOLDED, NOT IMPLEMENTED:` at th
 
 1. Boot the iottwinmaker emulator
 2. Call DeleteSyncJob and observe HTTP 501 with no state persisted
+
+## Note added while fixing GetSyncJob (2026-10-24)
+
+`CreateSyncJob` and `GetSyncJob` are now implemented, and sync jobs live in
+`Workspace::sync_jobs` keyed by their `syncSource`. `DeleteWorkspace` refuses a
+workspace that still holds sync jobs, exactly as it already refuses one that
+still holds entities, component types or scenes, so until this operation is
+implemented a workspace that ever had a sync job created in it cannot be deleted
+over the wire. Implementing this handler closes that dead end: remove the job
+from its workspace's `sync_jobs` and its ARN from `state.arn_index` (the ARN is
+indexed because a sync job carries `tags`), and report the `DELETING` state the
+operation's output models.
+

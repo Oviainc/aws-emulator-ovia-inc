@@ -20,6 +20,12 @@
 //! strategy option the account prefers for it — what `UpdateServerConfig` writes and
 //! `GetServerStrategies` reports.
 //!
+//! Beside the servers, the account's **application components**
+//! ([`ApplicationComponentRecord`]) — the processes and databases the assessment found
+//! running on those servers — which `GetApplicationComponentDetails` reports one at a
+//! time: every member of the `ApplicationComponentDetail` it answers comes from that
+//! record, and the association counts it reports are counted off the record's own lists.
+//!
 //! And beside those, the account's one **portfolio preferences** record
 //! ([`PortfolioPreferences`]): what `PutPortfolioPreferences` saves and
 //! `GetPortfolioPreferences` reports, member for member.
@@ -34,10 +40,11 @@ use std::ops::Bound;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    ApplicationPreferences, AssessmentTarget, AssociatedApplication, DataCollectionDetails,
-    DatabasePreferences, GetImportFileTaskOutput, GetPortfolioPreferencesOutput, Group,
-    ImportFileTaskInformation, OSInfo, PrioritizeBusinessGoals, RecommendationReportDetails,
-    RecommendationSet, ResourceNotFoundException, ServerDetail, ServerError, ServerStrategy,
+    AppUnitError, ApplicationComponentDetail, ApplicationPreferences, AssessmentTarget,
+    AssociatedApplication, DataCollectionDetails, DatabaseConfigDetail, DatabasePreferences,
+    GetImportFileTaskOutput, GetPortfolioPreferencesOutput, Group, ImportFileTaskInformation,
+    OSInfo, PrioritizeBusinessGoals, RecommendationReportDetails, RecommendationSet,
+    ResourceNotFoundException, ServerDetail, ServerError, ServerStrategy, SourceCodeRepository,
     StrategyOption, SystemInfo, TransformationTool, ValidationException,
 };
 
@@ -741,6 +748,153 @@ impl ServerRecord {
     }
 }
 
+/// One application component of this account's portfolio, as this emulator persists it.
+///
+/// An application component is "the process or database running on a server" that the
+/// portfolio holds a recommendation for, so it is a resource of its own beside
+/// [`ServerRecord`] rather than a member of it. Like a server it enters this service
+/// through the data the account brings in (an import file task's ingestion, filed
+/// separately as the import-loop issue), which is why a freshly booted emulator holds no
+/// application component at all.
+///
+/// Every member below is what that ingestion stored, so nothing in a read is derived from
+/// the request that reads it: `GetApplicationComponentDetails` reports this record as the
+/// `ApplicationComponentDetail` the model declares ([`Self::to_detail`]) beside the
+/// associations it holds.
+#[derive(Debug, Clone, Default)]
+pub struct ApplicationComponentRecord {
+    /// `ApplicationComponentDetail$id` — a `ResourceId` (`^[0-9a-b]+`, up to 44
+    /// characters). It is also this component's key in
+    /// [`ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendationState::application_components`],
+    /// which is what gives a list over them a stable total order.
+    pub id: String,
+    /// `ApplicationComponentDetail$name`.
+    pub name: Option<String>,
+    /// `ApplicationComponentDetail$appType` — one of `AppType`'s values
+    /// ([`APP_TYPE_VALUES`](crate::ops::types::APP_TYPE_VALUES)).
+    pub app_type: Option<String>,
+    /// `ApplicationComponentDetail$resourceSubType` — one of `ResourceSubType`'s values.
+    pub resource_sub_type: Option<String>,
+    /// `ApplicationComponentDetail$inclusionStatus` — one of `InclusionStatus`'s values:
+    /// whether the component is included in server recommendation.
+    pub inclusion_status: Option<String>,
+    /// `ApplicationComponentDetail$analysisStatus` — one of
+    /// `SrcCodeOrDbAnalysisStatus`'s values, for a component with source code or a
+    /// database attached.
+    pub analysis_status: Option<String>,
+    /// `ApplicationComponentDetail$statusMessage`.
+    pub status_message: Option<String>,
+    /// `RecommendationSet$strategy` — one of `Strategy`'s values, once an analysis
+    /// recommended one for this component.
+    pub strategy: Option<String>,
+    /// `RecommendationSet$targetDestination` — one of `TargetDestination`'s values.
+    pub target_destination: Option<String>,
+    /// `ApplicationComponentDetail$osVersion`.
+    pub os_version: Option<String>,
+    /// `ApplicationComponentDetail$osDriver`.
+    pub os_driver: Option<String>,
+    /// `ApplicationComponentDetail$lastAnalyzedTimestamp`.
+    pub last_analyzed: Option<SystemTime>,
+    /// `DatabaseConfigDetail$secretName` — the Secrets Manager secret the component's
+    /// database is reached with, for a component that has one.
+    pub database_secret_name: Option<String>,
+    /// `ApplicationComponentDetail$sourceCodeRepositories`, in the order they were
+    /// stored. Empty for a component no repository was recorded for.
+    pub source_code_repositories: Vec<SourceCodeRepository>,
+    /// `ApplicationComponentDetail$runtimeStatus` — one of `RuntimeAnalysisStatus`'s
+    /// values.
+    pub runtime_status: Option<String>,
+    /// `ApplicationComponentDetail$runtimeStatusMessage`.
+    pub runtime_status_message: Option<String>,
+    /// `AppUnitError$appUnitErrorCategory` — one of `AppUnitErrorCategory`'s values, for
+    /// a component whose source-code or database analysis failed.
+    pub app_unit_error_category: Option<String>,
+    /// The ids of the servers this component runs on, in the order they were stored —
+    /// `GetApplicationComponentDetailsResponse$associatedServerIds`, "a list of the IDs of
+    /// the servers on which the application component is running".
+    ///
+    /// The detail's own `associatedServerId` ("the ID of the server that the application
+    /// component is running on") is the first of them and
+    /// `moreServerAssociationExists` is whether there is more than one, so the single
+    /// member and the list can never disagree. Empty for a component no server
+    /// association was recorded for.
+    pub associated_server_ids: Vec<String>,
+    /// The application groups this component belongs to, as defined in Application
+    /// Discovery Service, in the order they were stored —
+    /// `GetApplicationComponentDetailsResponse$associatedApplications`.
+    ///
+    /// `moreApplicationResource` ("set to true if the application component belongs to
+    /// more than one application group") is whether there is more than one, counted off
+    /// this list.
+    pub associated_applications: Vec<AssociatedApplication>,
+}
+
+impl ApplicationComponentRecord {
+    /// The `ApplicationComponentDetail` a read reports for this component: this record's
+    /// own members, and nothing for the ones no part of this emulator produces.
+    ///
+    /// `listAntipatternSeveritySummary` and `antipatternReport*` are left unset rather
+    /// than filled with a shape nothing computed — this emulator generates no
+    /// anti-pattern report — and so is `resultList`, the list of analysis results, since
+    /// nothing here analyses source code or a database. The nested structures are
+    /// reported only when the record holds something to put in them, so a component the
+    /// ingestion knew little about does not come back as a tree of empty objects.
+    pub fn to_detail(&self) -> ApplicationComponentDetail {
+        let recommendation_set = (self.strategy.is_some() || self.target_destination.is_some())
+            .then(|| RecommendationSet {
+                // No transformation tool is recommended: nothing in this emulator picks
+                // one.
+                transformation_tool: None,
+                target_destination: self.target_destination.clone(),
+                strategy: self.strategy.clone(),
+            });
+        ApplicationComponentDetail {
+            id: Some(self.id.clone()),
+            name: self.name.clone(),
+            recommendation_set,
+            analysis_status: self.analysis_status.clone(),
+            status_message: self.status_message.clone(),
+            list_antipattern_severity_summary: None,
+            database_config_detail: self.database_secret_name.clone().map(|secret_name| {
+                DatabaseConfigDetail {
+                    secret_name: Some(secret_name),
+                }
+            }),
+            source_code_repositories: (!self.source_code_repositories.is_empty())
+                .then(|| self.source_code_repositories.clone()),
+            app_type: self.app_type.clone(),
+            resource_sub_type: self.resource_sub_type.clone(),
+            inclusion_status: self.inclusion_status.clone(),
+            antipattern_report_s3_object: None,
+            antipattern_report_status: None,
+            antipattern_report_status_message: None,
+            os_version: self.os_version.clone(),
+            os_driver: self.os_driver.clone(),
+            last_analyzed_timestamp: self.last_analyzed.map(::aws_smithy_types::DateTime::from),
+            associated_server_id: self.associated_server_ids.first().cloned(),
+            more_server_association_exists: Some(self.associated_server_ids.len() > 1),
+            runtime_status: self.runtime_status.clone(),
+            runtime_status_message: self.runtime_status_message.clone(),
+            app_unit_error: self
+                .app_unit_error_category
+                .clone()
+                .map(|category| AppUnitError {
+                    app_unit_error_category: Some(category),
+                }),
+            result_list: None,
+        }
+    }
+
+    /// Whether this component belongs to more than one application group —
+    /// `GetApplicationComponentDetailsResponse$moreApplicationResource`.
+    ///
+    /// Counted off [`Self::associated_applications`], the very list the same answer
+    /// reports, so the flag and the list cannot drift apart.
+    pub fn more_application_resource(&self) -> bool {
+        self.associated_applications.len() > 1
+    }
+}
+
 /// The account's migration and modernization preferences, as `PutPortfolioPreferences`
 /// saved them and `GetPortfolioPreferences` reports them.
 ///
@@ -790,6 +944,12 @@ pub struct ComAmazonawsMigrationhubstrategyAwsmigrationhubstrategyrecommendation
     /// `ListServers` reports. A `BTreeMap` is what gives that list a stable total order
     /// to sort and paginate over, and it is empty until an import ingests a server.
     pub servers: BTreeMap<String, ServerRecord>,
+    /// Every application component of this account's portfolio, keyed by its id — the
+    /// processes and databases running on the servers above, which
+    /// `GetApplicationComponentDetails` reports one at a time. A `BTreeMap` is what gives
+    /// a list over them a stable total order, and it is empty until the account's data is
+    /// brought in.
+    pub application_components: BTreeMap<String, ApplicationComponentRecord>,
     /// Every recommendation report generation task, keyed by its id: what
     /// `StartRecommendationReportGeneration` mints and `GetRecommendationReportDetails`
     /// reports.
@@ -1185,6 +1345,20 @@ pub fn recommendation_report_not_found() -> ResourceNotFoundException {
 /// Takes no id: like every other refusal of this service it interpolates nothing from the
 /// request — the caller already holds the id it sent.
 pub fn server_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(INVALID_RESOURCE_ID.to_string()),
+    }
+}
+
+/// The refusal of an `applicationComponentId` that names no application component of
+/// this account's portfolio: the not-found this operation's error list carries
+/// (`ResourceNotFoundException`, HTTP 404, "The specified ID in the request is not
+/// found."), worded with the service's [`INVALID_RESOURCE_ID`] sentence — the same
+/// refusal its sibling reads answer for an id of their own that resolves to nothing.
+///
+/// Takes no id: like every other refusal of this service it interpolates nothing from the
+/// request — the caller already holds the id it sent.
+pub fn application_component_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(INVALID_RESOURCE_ID.to_string()),
     }
