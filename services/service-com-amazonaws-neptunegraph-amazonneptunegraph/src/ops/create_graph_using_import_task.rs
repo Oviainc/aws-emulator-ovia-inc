@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateGraphUsingImportTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateGraphUsingImportTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateGraphUsingImportTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints a graph AND the import task that is to populate it into the
+//! shared store, and reports the stored task record.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -216,18 +210,268 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateGraphUsingImportTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateGraphUsingImportTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateGraphUsingImportTask"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateGraphUsingImportTaskErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the neptune-graph store is not mounted on this engine".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // Every refusal below is a constraint the BOUNDARY validator cannot check, so
+        // this is where it is enforced; each is worded by the same builders in
+        // `crate::state` the boundary refusal renderer uses, so a caller cannot tell
+        // which side of the boundary caught the violation.
+        let mut violations: Vec<String> = Vec::new();
+
+        // `graphName`'s modelled pattern opens with a negative lookahead, which the
+        // boundary validator's regex engine cannot compile — and an uncompilable
+        // `@pattern` is treated as matching — so the name rule is enforced here, the
+        // same way `CreateGraph` and `CreateGraphSnapshot` enforce it. Length (1..63) is
+        // already refused at the boundary by the `@length` trait.
+        if !crate::state::resource_name_is_well_formed(&input.graph_name, GRAPH_ID_PREFIX) {
+            violations.push(crate::state::constraint_clause(
+                "graphName",
+                Some(&input.graph_name),
+                &crate::state::pattern_requirement(GRAPH_NAME_PATTERN),
+            ));
+        }
+
+        // `source` is a bare `String` in the model — no `@length`, no `@pattern` — so
+        // it is the one caller-sized member that reaches the store unchecked, and the
+        // only one whose emptiness nothing refuses at the boundary. The rule is stated
+        // ONCE, in `crate::state::import_source_requirement`, and reached by every
+        // operation that accepts an import `source` (`StartImportTask` too), so the two
+        // cannot drift into different acceptance sets.
+        if let Some(requirement) = crate::state::import_source_requirement(&input.source) {
+            violations.push(crate::state::length_clause("source", &requirement));
+        }
+
+        // The documented dependency between `format` and `blankNodeHandling` is stated
+        // ONCE, in `crate::state::blank_node_handling_clause`, and reached by every
+        // operation that accepts an import `format` (`StartImportTask` too).
+        if let Some(clause) = crate::state::blank_node_handling_clause(
+            input.format.as_deref(),
+            input.blank_node_handling.as_deref(),
+        ) {
+            violations.push(clause);
+        }
+
+        // Both memory members bound ONE chosen value
+        // (`crate::state::import_provisioned_memory`), so a minimum above the maximum
+        // bounds nothing: there is no value the request admits. Each member's own
+        // 16..24576 range is already refused at the boundary.
+        if let (Some(min), Some(max)) = (input.min_provisioned_memory, input.max_provisioned_memory)
+        {
+            if min > max {
+                violations.push(crate::state::constraint_clause(
+                    "minProvisionedMemory",
+                    Some(&min.to_string()),
+                    &format!(
+                        "Member must be less than or equal to maxProvisionedMemory ({max})"
+                    ),
+                ));
+            }
+        }
+
+        // Nothing caller-sized reaches the store unchecked — the bound on what one
+        // record's tags may hold is stated once, in `crate::state`, and is reached by
+        // every operation that accepts a `tags` map.
+        if let Some(tags) = input.tags.as_ref() {
+            if let Err(message) = crate::state::bound_tags(tags) {
+                violations.push(message);
+            }
+        }
+
+        if !violations.is_empty() {
+            return Err(CreateGraphUsingImportTaskErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::validation_envelope(&violations),
+                    reason: Some("CONSTRAINT_VIOLATION".to_string()),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx);
+        let now = ::std::time::Instant::now();
+        let mut store = state.lock();
+
+        // `graphName` is unique: a second graph by the same name conflicts with the
+        // stored one, exactly as it does for `CreateGraph`.
+        if let Some(existing) = store.graph_names.get(&input.graph_name) {
+            return Err(CreateGraphUsingImportTaskErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "a graph named '{}' already exists with id {existing}",
+                        input.graph_name
+                    ),
+                    reason: None,
+                },
+            )
+            .into());
+        }
+
+        // This call grows BOTH stores by one record, and each has a ceiling
+        // (`crate::state::MAX_GRAPHS`, `crate::state::MAX_IMPORT_TASKS`). Reaching
+        // either is the condition the model's `ServiceQuotaExceededException` (402)
+        // describes, so neither record is minted unless both have room.
+        for (reached, resource_type, message) in [
+            (
+                store.graphs.len() >= crate::state::MAX_GRAPHS,
+                "Graph",
+                format!(
+                    "this emulator holds at most {} graphs; delete a graph before \
+                     creating another",
+                    crate::state::MAX_GRAPHS
+                ),
+            ),
+            (
+                store.import_tasks.len() >= crate::state::MAX_IMPORT_TASKS,
+                "ImportTask",
+                format!(
+                    "this emulator holds at most {} import tasks",
+                    crate::state::MAX_IMPORT_TASKS
+                ),
+            ),
+        ] {
+            if reached {
+                return Err(
+                    CreateGraphUsingImportTaskErrorModeled::ServiceQuotaExceededException(
+                        ServiceQuotaExceededException {
+                            message,
+                            resource_id: None,
+                            resource_type: Some(resource_type.to_string()),
+                            service_code: Some(crate::state::ARN_NAMESPACE.to_string()),
+                            quota_code: None,
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let graph_id = store.next_graph_id();
+        let graph = crate::state::Graph {
+            arn: ::engine::emulator_arn(
+                crate::state::ARN_NAMESPACE,
+                &region,
+                &format!("graph/{graph_id}"),
+            ),
+            endpoint: format!(
+                "{graph_id}.{region}.{}.amazonaws.com",
+                crate::state::ARN_NAMESPACE
+            ),
+            id: graph_id.clone(),
+            name: input.graph_name,
+            // The graph is provisioned AND loaded by this one call, so it reports the
+            // modelled IMPORTING status while the task it started is in flight — the
+            // same status `StartImportTask` puts a graph into — and the clock owes it
+            // AVAILABLE a span later. The import itself is what fails here (see the
+            // task below): a graph this emulator provisioned is a real control-plane
+            // record, so it comes into service empty rather than claiming data.
+            status: crate::state::GraphStatus::Importing,
+            pending: Some(crate::state::PendingTransition::owed(
+                crate::state::GraphStatus::Available,
+                now,
+            )),
+            status_reason: None,
+            create_time: ::std::time::SystemTime::now(),
+            // Neither memory member IS the provisioned memory: they bound the value the
+            // service chooses (`crate::state::import_provisioned_memory`).
+            provisioned_memory: crate::state::import_provisioned_memory(
+                input.min_provisioned_memory,
+                input.max_provisioned_memory,
+            ),
+            // Absent means "not enabled": the model declares no default for either
+            // boolean, so an unsupplied member is stored as `false`.
+            public_connectivity: input.public_connectivity.unwrap_or(false),
+            deletion_protection: input.deletion_protection.unwrap_or(false),
+            replica_count: input.replica_count.unwrap_or(DEFAULT_REPLICA_COUNT),
+            kms_key_identifier: input.kms_key_identifier,
+            vector_search_configuration: input.vector_search_configuration,
+            // The graph is populated from `source`, not restored from a snapshot of
+            // another graph, and `buildNumber` is the version of the graph software the
+            // real service runs, which this emulator does not have.
+            source_snapshot_id: None,
+            build_number: None,
+            // "Adds metadata tags to the new GRAPH"
+            // (`smithy_query(query="doc",shape="CreateGraphUsingImportTaskInput",
+            // member="tags")`), so the tags live on the graph record and the tagging
+            // surface reads them back through the graph's ARN.
+            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            // Nothing has deleted this graph.
+            deletes_at: None,
+        };
+
+        let task_id = store.next_import_task_id();
+        let mut task = crate::state::ImportTask {
+            id: task_id,
+            graph_id,
+            role_arn: input.role_arn,
+            source: input.source,
+            format: input.format,
+            parquet_type: input.parquet_type,
+            blank_node_handling: input.blank_node_handling,
+            // "If set to true, the task halts when an import error is encountered" —
+            // documented as the default ("whereas if set to true, the default, or if
+            // omitted, the import operation halts immediately",
+            // `smithy_query(query="doc",shape="CreateGraphUsingImportTaskInput",
+            // member="importOptions")`), so an absent member is stored as `true`.
+            fail_on_error: input.fail_on_error.unwrap_or(DEFAULT_FAIL_ON_ERROR),
+            import_options: input.import_options,
+            status: crate::state::ImportTaskStatus::Initializing,
+            status_reason: None,
+            // The task is run once and nothing retries it.
+            attempt_number: FIRST_ATTEMPT,
+            pending: None,
+        };
+        // The load has not begun when the call returns, and nothing here can perform
+        // it, so the clock owes the task the modelled FAILED status a fixed span later,
+        // carrying `crate::state::IMPORT_NOT_RUN_REASON` — exactly what an import
+        // `StartImportTask` accepts is owed, because the same (absent) loader would have
+        // to run it.
+        task.begin_transition(
+            crate::state::ImportTaskStatus::Initializing,
+            crate::state::ImportTaskStatus::Failed,
+            Some(crate::state::IMPORT_NOT_RUN_REASON.to_string()),
+            now,
+        );
+
+        // Report the records that were stored, so this response cannot drift from what
+        // a later GetImportTask or GetGraph answers.
+        let output = Self::Output::from(&task);
+        store.insert_graph(graph);
+        store.insert_import_task(task);
+        Ok(output)
     }
 }
+
+/// The number of replicas a graph gets when `replicaCount` is not supplied.
+///
+/// From the member's own documentation: "The number of replicas in other AZs to
+/// provision on the new graph after import. Default = 1, Min = 0, Max = 2."
+const DEFAULT_REPLICA_COUNT: i32 = 1;
+
+/// The `attemptNumber` a newly minted import task reports: it has been run once, and
+/// nothing in this emulator retries a task.
+const FIRST_ATTEMPT: i32 = 1;
+
+/// Whether an import halts on the first error when `failOnError` is not supplied.
+///
+/// From the documentation of the import options: the import halts "if set to true, the
+/// default, or if omitted"
+/// (`smithy_query(query="doc",shape="CreateGraphUsingImportTaskInput",
+/// member="importOptions")`).
+const DEFAULT_FAIL_ON_ERROR: bool = true;
+
+/// The modelled `GraphName` pattern, exactly as the model spells it
+/// (`smithy_query(query="shape",shape="GraphName")`): the expression a refusal reports,
+/// enforced by `crate::state::resource_name_is_well_formed` because the boundary
+/// validator's regex engine cannot compile its leading negative lookahead.
+const GRAPH_NAME_PATTERN: &str = "^(?!g-)[a-z][a-z0-9]*(-[a-z0-9]+)*$";
+
+/// The prefix a `graphName` may therefore not take — the `(?!g-)` clause of
+/// [`GRAPH_NAME_PATTERN`], which is also the prefix the modelled `GraphId` requires.
+const GRAPH_ID_PREFIX: &str = "g-";

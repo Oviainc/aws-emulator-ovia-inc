@@ -202,25 +202,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `source` is a bare `String` in the model — no `@length`, no `@pattern` — so
         // it is the one caller-sized member that reaches the store unchecked, and the
-        // only one whose emptiness nothing refuses at the boundary. A required
-        // location cannot be the empty string, and the upper bound lives beside the
-        // write that stores it (`crate::state::MAX_IMPORT_SOURCE_CHARS`). Neither
-        // refusal echoes the value: the one that broke the upper bound is exactly the
-        // value that must not be sent back. The scheme is NOT constrained here,
-        // because `source` is documented as "an Amazon S3 path, or ... a Neptune
-        // database endpoint or snapshot", so no one scheme is required.
-        let source_chars = input.source.chars().count();
-        let source_requirement = if source_chars == 0 {
-            Some("Member must have length greater than or equal to 1".to_string())
-        } else if source_chars > crate::state::MAX_IMPORT_SOURCE_CHARS {
-            Some(format!(
-                "Member must have length less than or equal to {}, got {source_chars}",
-                crate::state::MAX_IMPORT_SOURCE_CHARS
-            ))
-        } else {
-            None
-        };
-        if let Some(requirement) = source_requirement {
+        // only one whose emptiness nothing refuses at the boundary. The rule is stated
+        // ONCE, in `crate::state::import_source_requirement`, and reached by every
+        // operation that accepts an import `source` (`CreateGraphUsingImportTask` too),
+        // so the two cannot drift into different acceptance sets. Neither refusal
+        // echoes the value: the one that broke the upper bound is exactly the value
+        // that must not be sent back.
+        if let Some(requirement) = crate::state::import_source_requirement(&input.source) {
             return Err(StartImportTaskErrorModeled::ValidationException(
                 ValidationException {
                     message: crate::state::validation_envelope(&[crate::state::length_clause(
@@ -233,22 +221,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // Documented member dependency: `blankNodeHandling` "must be provided when
-        // format is ntriples", because an NTRIPLES load has to be told what to do with
-        // the dataset's blank nodes. No modelled trait can express it, so it is
-        // refused here rather than accepted and silently ignored.
-        if input.format.as_deref() == Some(NTRIPLES_FORMAT) && input.blank_node_handling.is_none() {
+        // The documented dependency between `format` and `blankNodeHandling` is stated
+        // ONCE, in `crate::state::blank_node_handling_clause`, and reached by every
+        // operation that accepts an import `format` (`CreateGraphUsingImportTask` too),
+        // so neither the rule nor its wording can drift between them.
+        if let Some(clause) = crate::state::blank_node_handling_clause(
+            input.format.as_deref(),
+            input.blank_node_handling.as_deref(),
+        ) {
             return Err(StartImportTaskErrorModeled::ValidationException(
                 ValidationException {
-                    message: crate::state::validation_envelope(&[
-                        crate::state::constraint_clause(
-                            "blankNodeHandling",
-                            None,
-                            &format!(
-                                "Member must be provided when format is {NTRIPLES_FORMAT}"
-                            ),
-                        ),
-                    ]),
+                    message: crate::state::validation_envelope(&[clause]),
                     reason: Some("CONSTRAINT_VIOLATION".to_string()),
                 },
             )
@@ -356,8 +339,3 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(output)
     }
 }
-
-/// The modelled `Format` value for RDF N-Triples data
-/// (`smithy_query(query="shape",shape="Format")`), the one format whose load needs
-/// `blankNodeHandling`.
-const NTRIPLES_FORMAT: &str = "NTRIPLES";

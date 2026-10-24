@@ -93,8 +93,9 @@ pub enum GraphStatus {
     /// `CreateGraphSnapshot` has accepted a snapshot of the graph; the graph is
     /// being snapshotted and is not reconfigurable until that finishes.
     Snapshotting,
-    /// `StartImportTask` has accepted a bulk import into the graph; the graph is
-    /// loading data and is not reconfigurable until the task stops.
+    /// `StartImportTask` or `CreateGraphUsingImportTask` has accepted a bulk import
+    /// into the graph; the graph is loading data and is not reconfigurable until the
+    /// task stops.
     Importing,
     /// `StopGraph` has accepted the stop; the graph is winding down.
     Stopping,
@@ -567,6 +568,41 @@ impl ExportTask {
     }
 }
 
+/// The `minProvisionedMemory` a request that names none gets, from the member's own
+/// documentation: "The minimum provisioned memory-optimized Neptune Capacity Units
+/// (m-NCUs) to use for the graph. Default: 16"
+/// (`smithy_query(query="doc",shape="CreateGraphUsingImportTaskInput",
+/// member="minProvisionedMemory")`).
+pub const DEFAULT_MIN_PROVISIONED_MEMORY: i32 = 16;
+
+/// The provisioned memory a graph gets when the request bounds it NEITHER way, from
+/// `maxProvisionedMemory`'s own documentation: "If neither value is specified, 128
+/// m-NCUs are used" (`smithy_query(query="doc",
+/// shape="CreateGraphUsingImportTaskInput",member="maxProvisionedMemory")`).
+pub const UNBOUNDED_IMPORT_PROVISIONED_MEMORY: i32 = 128;
+
+/// The provisioned memory a graph created together with an import task gets, from the
+/// bounds the request put on it.
+///
+/// `minProvisionedMemory` and `maxProvisionedMemory` are bounds on a value the service
+/// CHOOSES, not the value itself: "If both the minimum and maximum values are
+/// specified, the final provisioned-memory will be chosen per the actual size of your
+/// imported data. If neither value is specified, 128 m-NCUs are used"
+/// (`smithy_query(query="doc",shape="CreateGraphUsingImportTaskInput",
+/// member="maxProvisionedMemory")`). So the chosen value is the FLOOR of the range the
+/// request allows — the supplied minimum, or [`DEFAULT_MIN_PROVISIONED_MEMORY`] when
+/// only a maximum is given — because what would push it above that floor is the size of
+/// the imported data, and [`IMPORT_NOT_RUN_REASON`] says no data is ever imported here.
+/// With neither bound supplied the documented [`UNBOUNDED_IMPORT_PROVISIONED_MEMORY`]
+/// stands.
+pub fn import_provisioned_memory(min: Option<i32>, max: Option<i32>) -> i32 {
+    match (min, max) {
+        (Some(min), _) => min,
+        (None, Some(_)) => DEFAULT_MIN_PROVISIONED_MEMORY,
+        (None, None) => UNBOUNDED_IMPORT_PROVISIONED_MEMORY,
+    }
+}
+
 /// The states this slice of the emulator puts an in-flight query into.
 ///
 /// Every variant's wire form is one of the modelled `QueryState` values
@@ -909,6 +945,9 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
 
     /// Mint an id no task in this store holds, matching the modelled
     /// `ExportTaskId` pattern `^t-[a-z0-9]{10}$`.
+    ///
+    /// The task-id space is shared with the import tasks, so an id either map already
+    /// holds is skipped (see [`Self::holds_task_id`]).
     pub fn next_export_task_id(&mut self) -> String {
         loop {
             self.export_task_id_counter = self.export_task_id_counter.wrapping_add(1);
@@ -916,8 +955,6 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
                 EXPORT_TASK_ID_PREFIX,
                 scramble(self.export_task_id_counter) % BASE36_POW10,
             );
-            // The task-id space is shared with the import tasks, so an id either map
-            // already holds is skipped (see `holds_task_id`).
             if !self.holds_task_id(&id) {
                 return id;
             }
@@ -1238,9 +1275,11 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
     /// Tags live on the resource record itself, which is what makes a tag supplied at
     /// create time and one written later by `TagResource` the same bytes, read back by
     /// this one lookup. Graphs, snapshots and export tasks are the taggable resources
-    /// this slice stores; import tasks join this lookup with the operation that would
-    /// tag them. A private graph endpoint never does: the model gives it neither an ARN
-    /// nor a `tags` member, so the tagging surface has nothing to address it by.
+    /// this slice stores; an import task holds no tags of its own (the `tags` of
+    /// `CreateGraphUsingImportTask` are documented as metadata "to the new graph", so
+    /// they live on the graph that call creates). A private graph endpoint never joins
+    /// this lookup either: the model gives it neither an ARN nor a `tags` member, so the
+    /// tagging surface has nothing to address it by.
     pub fn tags_of(&self, arn: &str) -> Option<&BTreeMap<String, String>> {
         self.graphs
             .values()
@@ -1330,11 +1369,14 @@ pub const FINAL_SNAPSHOT_SUFFIX: &str = "-final-snapshot";
 ///
 /// Emulator resource guard, NOT a quota AWS publishes, and the same bound
 /// [`MAX_GRAPHS`] puts on the graph map: the store is shared process-wide and grows
-/// by one entry per `StartImportTask`, and a task is never reclaimed, so without a
-/// ceiling repeated calls grow the emulator's memory without bound. `StartImportTask`
+/// by one entry per `StartImportTask` or `CreateGraphUsingImportTask`, and a task is
+/// never reclaimed, so without a ceiling repeated calls grow the emulator's memory
+/// without bound. `StartImportTask`
 /// models no quota error, so reaching the ceiling is reported with the
 /// `ConflictException` (409) it does model — the request conflicts with what the store
-/// already holds. Set well above any realistic use of a local emulator.
+/// already holds; `CreateGraphUsingImportTask` reports it with the
+/// `ServiceQuotaExceededException` (402) its own model declares. Set well above any
+/// realistic use of a local emulator.
 pub const MAX_IMPORT_TASKS: usize = 100;
 
 /// The most characters an import task's `source` may carry.
@@ -1345,6 +1387,68 @@ pub const MAX_IMPORT_TASKS: usize = 100;
 /// service's other S3-location members are modelled with (`NeptuneImportOptions`'s
 /// `s3ExportPath`, `s3ExportKmsKeyId`: `@length(1..1024)`).
 pub const MAX_IMPORT_SOURCE_CHARS: usize = 1024;
+
+/// The modelled `Format` value for RDF N-Triples data
+/// (`smithy_query(query="shape",shape="Format")`), the one format whose load needs
+/// `blankNodeHandling`.
+pub const NTRIPLES_FORMAT: &str = "NTRIPLES";
+
+/// The `ValidationException` clause a request that omits `blankNodeHandling` beside an
+/// `NTRIPLES` format fails, or `None` when the pair holds.
+///
+/// Documented member dependency: `blankNodeHandling` "must be provided when format is
+/// ntriples" (`smithy_query(query="doc",shape="StartImportTaskInput",
+/// member="blankNodeHandling")`), because an N-Triples dataset is the one whose load has
+/// to be told what to do with its blank nodes. No modelled trait can express a
+/// dependency between two members, so it is refused by hand — stated ONCE here and
+/// reached by every operation that accepts an import `format` (`StartImportTask`,
+/// `CreateGraphUsingImportTask`), so the two cannot drift into different acceptance
+/// sets or different wording for one documented rule.
+pub fn blank_node_handling_clause(
+    format: Option<&str>,
+    blank_node_handling: Option<&str>,
+) -> Option<String> {
+    if format == Some(NTRIPLES_FORMAT) && blank_node_handling.is_none() {
+        return Some(constraint_clause(
+            "blankNodeHandling",
+            None,
+            &format!("Member must be provided when format is {NTRIPLES_FORMAT}"),
+        ));
+    }
+    None
+}
+
+/// The requirement an import task's `source` fails, or `None` when it satisfies both
+/// bounds the store puts on that member.
+///
+/// Stated ONCE, and reached by every operation that accepts an import `source`
+/// (`StartImportTask`, `CreateGraphUsingImportTask`), so no two of them can drift into
+/// different acceptance sets for one documented member:
+///
+/// * A required LOCATION cannot be blank. The member is modelled as a bare `String` —
+///   no `@length`, no `@pattern` — so neither emptiness nor a value of nothing but
+///   whitespace is refused at the boundary, and neither locates any data.
+/// * The upper bound ([`MAX_IMPORT_SOURCE_CHARS`]) is measured on the value that would
+///   be STORED, so no stored record ever holds more than the bound a refusal
+///   advertises.
+///
+/// The SCHEME is deliberately not constrained: `source` is documented as "an Amazon S3
+/// path, or ... a Neptune database endpoint or snapshot", so no one scheme is required.
+/// The returned requirement never echoes the value — the one that broke the upper bound
+/// is exactly the value that must not be sent back.
+pub fn import_source_requirement(source: &str) -> Option<String> {
+    if source.trim().is_empty() {
+        return Some("Member must have length greater than or equal to 1".to_string());
+    }
+    let stored_chars = source.chars().count();
+    if stored_chars > MAX_IMPORT_SOURCE_CHARS {
+        return Some(format!(
+            "Member must have length less than or equal to {MAX_IMPORT_SOURCE_CHARS}, \
+             got {stored_chars}"
+        ));
+    }
+    None
+}
 
 /// The prefix the service reserves for import- and export-task ids, from the modelled
 /// `TaskId` pattern `^t-[a-z0-9]{10}$`.
@@ -1940,6 +2044,11 @@ import_task_record_output!(
     // `CancelImportTaskOutput` carries only the shared members.
     CancelImportTaskOutput(task) {},
     StartImportTaskOutput(task) {
+        import_options: task.import_options.clone(),
+    },
+    // `CreateGraphUsingImportTask` reports the task it stored, with the graph it
+    // created named by the shared `graphId` member.
+    CreateGraphUsingImportTaskOutput(task) {
         import_options: task.import_options.clone(),
     },
     // `GetImportTaskOutput` is the only projection that reports the task's progress.
@@ -2898,6 +3007,13 @@ mod tests {
                 "case {status:?}: {wire:?} is not a modelled GraphStatus value"
             );
         }
+        for status in [ExportTaskStatus::Initializing, ExportTaskStatus::Failed] {
+            let wire = status.as_wire();
+            assert!(
+                crate::ops::types::EXPORT_TASK_STATUS_VALUES.contains(&wire),
+                "case {status:?}: {wire:?} is not a modelled ExportTaskStatus value"
+            );
+        }
         for status in [SnapshotStatus::Creating, SnapshotStatus::Available] {
             let wire = status.as_wire();
             assert!(
@@ -3086,6 +3202,99 @@ mod tests {
             assert!(
                 seen.insert(id.clone()),
                 "case {kind} ({id:?}): minted twice across the shared task-id space"
+            );
+        }
+    }
+
+    /// The provisioned memory a graph created with an import gets, over a row per form
+    /// the request's bounds can take (neither, one, both, equal) — including the
+    /// published range's own bounds.
+    #[test]
+    fn import_provisioned_memory_is_the_floor_of_the_range_the_request_allows() {
+        // (case, minProvisionedMemory, maxProvisionedMemory, the chosen value)
+        let cases: [(&str, Option<i32>, Option<i32>, i32); 7] = [
+            (
+                "neither bound supplied",
+                None,
+                None,
+                UNBOUNDED_IMPORT_PROVISIONED_MEMORY,
+            ),
+            ("only a minimum", Some(128), None, 128),
+            (
+                "only a maximum",
+                None,
+                Some(2048),
+                DEFAULT_MIN_PROVISIONED_MEMORY,
+            ),
+            ("both bounds", Some(256), Some(1024), 256),
+            ("both bounds equal", Some(512), Some(512), 512),
+            // The published range of `ProvisionedMemory` is 16..24576
+            // (`smithy_query(query="shape",shape="ProvisionedMemory")`).
+            ("at the bottom of the published range", Some(16), None, 16),
+            (
+                "at the top of the published range",
+                Some(24_576),
+                Some(24_576),
+                24_576,
+            ),
+        ];
+        for (case, min, max, expected) in cases {
+            let actual = import_provisioned_memory(min, max);
+            assert_eq!(
+                actual, expected,
+                "case {case:?} (min={min:?}, max={max:?}): expected {expected}, \
+                 got {actual}"
+            );
+        }
+    }
+
+    /// The one rule every operation that accepts an import `source` enforces, over a
+    /// row per clause: what a location may look like, blankness in each of its forms,
+    /// and the stored length at the bound and one character past it.
+    #[test]
+    fn the_import_source_rule_bounds_blankness_and_the_stored_length() {
+        let prefix = "s3://example-bucket/";
+        let filler = MAX_IMPORT_SOURCE_CHARS - prefix.len();
+        // (case, the candidate source, whether the rule accepts it)
+        let cases: Vec<(&str, String, bool)> = vec![
+            (
+                "an S3 prefix",
+                "s3://example-bucket/data/".to_string(),
+                true,
+            ),
+            (
+                "a Neptune database endpoint",
+                "neptune-db://cluster.example.com:8182".to_string(),
+                true,
+            ),
+            (
+                "a Neptune snapshot ARN",
+                "arn:aws:rds:us-east-1:000000000000:cluster-snapshot:nightly".to_string(),
+                true,
+            ),
+            ("a single character", "s".to_string(), true),
+            (
+                "at the stored-length bound",
+                format!("{prefix}{}", "d".repeat(filler)),
+                true,
+            ),
+            (
+                "one character past the stored-length bound",
+                format!("{prefix}{}", "d".repeat(filler + 1)),
+                false,
+            ),
+            ("the empty string", String::new(), false),
+            ("nothing but spaces", "   ".to_string(), false),
+            ("nothing but a tab and a newline", "\t\n".to_string(), false),
+        ];
+        for (case, candidate, accepted) in cases {
+            let requirement = import_source_requirement(&candidate);
+            assert_eq!(
+                requirement.is_none(),
+                accepted,
+                "case {case:?} ({} characters): expected accepted={accepted}, got {:?}",
+                candidate.chars().count(),
+                requirement
             );
         }
     }
