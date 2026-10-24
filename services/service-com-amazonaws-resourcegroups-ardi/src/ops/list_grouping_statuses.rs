@@ -171,8 +171,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // centrally but holds no principals or policies, so the modelled
         // `ForbiddenException` is deliberately unreachable here and a success says
         // nothing about the caller's permissions. This operation reports stored state
-        // and changes none, so it emits no audit record either.
-        let _ = ctx;
+        // and changes none, so it emits no audit record either; `ctx` is read below
+        // for the region the request addressed.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListGroupingStatusesErrorModeled::InternalServerErrorException(
                 InternalServerErrorException {
@@ -224,17 +224,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
         // `Group` is the only identifier this operation models, and it carries either
-        // a bare group name or a group ARN; `lookup` resolves both. This operation
-        // models no `NotFoundException`, so an identifier that resolves to no stored
-        // group is refused with the modelled `BadRequestException`.
+        // a bare group name or a group ARN; `lookup` resolves both, within the region
+        // the request addressed, since a group of another region is another region's
+        // resource. This operation models no `NotFoundException`, so an identifier
+        // that resolves to no stored group is refused with the modelled
+        // `BadRequestException`.
         let not_found = || bad_request(crate::state::GROUP_NOT_FOUND_MESSAGE);
-        let name = store.lookup(input.group.as_str()).ok_or_else(not_found)?;
-        let group = store.groups.get(&name).ok_or_else(not_found)?;
+        let region = crate::state::request_region(ctx.parts());
+        let key = store.lookup(&region, input.group.as_str()).ok_or_else(not_found)?;
+        let group = store.groups.get(&key).ok_or_else(not_found)?;
 
         // The token is this service's own opaque encoding of the resource ARN the
         // previous page stopped at, scoped to THIS listing of THIS group; anything
         // else cannot name a resume point in it.
-        let listing = listing_of(&name);
+        let listing = listing_of(&key.name);
         let resume_after = match input.next_token.as_deref() {
             None | Some("") => None,
             Some(token) => match crate::state::decode_page_token(&listing, token) {

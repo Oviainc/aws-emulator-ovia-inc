@@ -186,10 +186,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut store = state.lock();
         // `Arn` is a group ARN (the modelled `GroupArnV2`), so it resolves only
-        // against a group's own STORED ARN: an ARN for another region or account
-        // addresses no group here.
-        let name = store.lookup(&input.arn).ok_or_else(not_found)?;
-        let record = store.groups.get_mut(&name).ok_or_else(not_found)?;
+        // against a group's own STORED ARN, and only within the region the request
+        // addressed: an ARN for another region or account addresses no group here.
+        let region = crate::state::request_region(ctx.parts());
+        let key = store.lookup(&region, &input.arn).ok_or_else(not_found)?;
+        let record = store.groups.get_mut(&key).ok_or_else(not_found)?;
         // The removal lives on the record: the keys that come back are the ones the
         // stored map actually LOST, so a key the group did not carry is reported in
         // nothing and an empty batch is a no-op success.
@@ -206,8 +207,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             target: crate::state::AUDIT_TARGET,
             operation = Self::NAME,
             caller = ?crate::state::request_caller(ctx.parts()),
-            region = ?crate::state::request_region(ctx.parts()),
-            group = ?name,
+            region = ?region,
+            group = ?key.name,
             tags = removed.len(),
             outcome = "untagged",
             "resource group untagged",
