@@ -3,10 +3,10 @@
 //! Engine state for the com-amazonaws-supportapp-supportapp service.
 //!
 //! Besides the state struct itself this module holds the few rules the Support App
-//! handlers share — the stored-record-to-modelled-shape conversion, the list cursor
-//! codec, the documented `notifyOnCaseSeverity` consistency rule and the wording of
-//! the failures several operations can answer with — so the operation files agree on
-//! one implementation of each instead of carrying copies that can drift apart.
+//! handlers share — the stored-record-to-modelled-shape conversion, the listing
+//! pagination rule, the documented `notifyOnCaseSeverity` consistency rule and the
+//! wording of the failures several operations can answer with — so the operation files
+//! agree on one implementation of each instead of carrying copies that can drift apart.
 
 use std::collections::BTreeMap;
 
@@ -20,14 +20,6 @@ use crate::ops::types::{SlackChannelConfiguration, SlackWorkspaceConfiguration};
 /// `ServiceQuotaExceededException`, so no caller can grow this map without end.
 pub const MAX_SLACK_CHANNEL_CONFIGURATIONS: usize = 20;
 
-/// How many Slack channel configurations one `ListSlackChannelConfigurations` page
-/// reports.
-///
-/// The service publishes no page size, so this is a CHOSEN value: half the documented
-/// account quota above, which keeps the modelled `nextToken` path reachable for an
-/// account that is within its quota instead of making it dead code.
-pub const CHANNEL_PAGE_SIZE: usize = 10;
-
 /// The most Slack workspaces this account can have registered.
 ///
 /// Documented on `CreateSlackChannelConfiguration`: "You can add up to 5 Slack
@@ -38,15 +30,6 @@ pub const CHANNEL_PAGE_SIZE: usize = 10;
 /// `ValidationException`), so a registration past this quota is refused with that
 /// operation's modelled `ValidationException`.
 pub const MAX_SLACK_WORKSPACE_CONFIGURATIONS: usize = 5;
-
-/// How many Slack workspace configurations one `ListSlackWorkspaceConfigurations`
-/// page reports.
-///
-/// The service publishes no page size, so this is a CHOSEN value, picked the same way
-/// [`CHANNEL_PAGE_SIZE`] is: half the documented quota above, which keeps the modelled
-/// `nextToken` path reachable for an account that is within its quota instead of
-/// making it dead code.
-pub const WORKSPACE_PAGE_SIZE: usize = MAX_SLACK_WORKSPACE_CONFIGURATIONS / 2;
 
 /// Whether the single account this emulator presents is an organization's management
 /// or member account, as `RegisterSlackWorkspaceForOrganization` reports it in
@@ -149,33 +132,24 @@ pub fn workspace_not_registered_message(team_id: &str) -> String {
     )
 }
 
-/// The pagination cursor for a page that resumes after `reported_so_far` records of a
-/// listing, shared by every paginated operation of this service.
+/// Why the `nextToken` a listing request carried must be refused, or `None` when the
+/// request carried none — the pagination rule both listings of this service follow.
 ///
-/// Hex of the count rather than the count itself, so a caller cannot read structure
-/// into the token and has nothing to build one from: a `nextToken` is opaque and only
-/// ever travels back unchanged.
+/// Neither listing splits its answer. Each reports a collection the service's own
+/// documented account quota bounds ([`MAX_SLACK_CHANNEL_CONFIGURATIONS`],
+/// [`MAX_SLACK_WORKSPACE_CONFIGURATIONS`]) and neither operation takes a page size
+/// member, so the whole collection fits the one response and there is never a further
+/// page to point at: the output `nextToken` stays absent, exactly as the member
+/// documents for the last set of results.
 ///
-/// A COUNT is what the token can carry, rather than the start key itself: every
-/// `nextToken` targets `paginationToken`, which is `len 1..256`, while a key-derived
-/// token costs two characters per key byte and a `teamId` alone is `len 1..256`
-/// (`smithy_query(query="operation",operation="ListSlackWorkspaceConfigurations")`),
-/// so a token built from a key leaves the modelled constraint for ids this API
-/// accepts. Each listing walks its store in key order (a `BTreeMap`), so the count
-/// names the position the next page resumes at.
-pub fn encode_cursor(reported_so_far: usize) -> String {
-    ::hex::encode(reported_so_far.to_string().as_bytes())
-}
-
-/// How many records a cursor minted by [`encode_cursor`] skips, or `None` when the
-/// token was not minted by this service.
-///
-/// Only the canonical spelling this service mints decodes: `parse` alone would also
-/// accept a leading `+` or `007`, which no minted token carries.
-pub fn decode_cursor(token: &str) -> Option<usize> {
-    let decoded = String::from_utf8(::hex::decode(token).ok()?).ok()?;
-    let position: usize = decoded.parse().ok()?;
-    (position.to_string() == decoded).then_some(position)
+/// A listing that mints no token therefore has no position any token could name, so a
+/// request that carries one is refused rather than silently read as "from the
+/// beginning" — the caller is told the member is wrong instead of being handed a page
+/// it did not ask for. Neither paginated operation models a client-input error, so the
+/// refusal travels through the scaffold's 400 `ValidationException` channel, worded by
+/// [`invalid_pagination_token_message`]; `operation` is the caller's `Operation::NAME`.
+pub fn pagination_token_refusal(operation: &str, next_token: Option<&str>) -> Option<String> {
+    next_token.map(|_| invalid_pagination_token_message(operation))
 }
 
 /// The three notification flags as this service's PROSE names them.
@@ -206,8 +180,8 @@ pub fn invalid_request_message(operation: &str, rule: &str) -> String {
     format!("Your {operation} request isn't valid. {rule} Try your request again.")
 }
 
-/// The `ValidationException` message for a `nextToken` that is not a cursor this
-/// service minted, shared by every paginated operation of this service.
+/// The `ValidationException` message for a `nextToken` no response of this service
+/// returned, shared by every paginated operation of this service.
 ///
 /// Stated through [`invalid_request_message`], like every other request-validation
 /// refusal this service raises from a handler, so a caller reading only the `message`
