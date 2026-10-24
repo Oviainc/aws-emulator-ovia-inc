@@ -29,7 +29,7 @@ use crate::rest_api_lifecycle::{
 };
 
 /// The modelled error codes these cases assert.
-const BAD_REQUEST: &str = "BadRequestException";
+pub(crate) const BAD_REQUEST: &str = "BadRequestException";
 const CONFLICT: &str = "ConflictException";
 const NOT_FOUND: &str = "NotFoundException";
 
@@ -77,7 +77,7 @@ const EXPLICIT_MEMBERS: &[(&str, &str)] = &[
 
 /// A content map, as the JSON string `DocumentationPart$properties` documents ("The map
 /// must be encoded as a JSON string").
-fn content_map(description: &str) -> String {
+pub(crate) fn content_map(description: &str) -> String {
     json!({ "description": description }).to_string()
 }
 
@@ -119,7 +119,7 @@ async fn create_part(gateway: &Gateway, api: &str, location: Value, properties: 
 }
 
 /// `CreateDocumentationPart`, asserting the modelled 201 and returning the part's id.
-async fn created_part_id(
+pub(crate) async fn created_part_id(
     gateway: &Gateway,
     api: &str,
     location: Value,
@@ -146,7 +146,12 @@ async fn get_parts(gateway: &Gateway, api: &str, query: &str) -> Answer {
 }
 
 /// The ids `GetDocumentationParts` reports for `query`, asserting the modelled 200.
-async fn listed_ids(gateway: &Gateway, api: &str, query: &str, case: &str) -> Vec<String> {
+pub(crate) async fn listed_ids(
+    gateway: &Gateway,
+    api: &str,
+    query: &str,
+    case: &str,
+) -> Vec<String> {
     let answer = get_parts(gateway, api, query).await;
     assert_eq!(
         answer.status, 200,
@@ -160,7 +165,7 @@ async fn listed_ids(gateway: &Gateway, api: &str, query: &str, case: &str) -> Ve
 }
 
 /// `GetDocumentationPart` for one part.
-async fn get_part(gateway: &Gateway, api: &str, id: &str) -> Answer {
+pub(crate) async fn get_part(gateway: &Gateway, api: &str, id: &str) -> Answer {
     gateway
         .call(
             "GET",
@@ -173,7 +178,7 @@ async fn get_part(gateway: &Gateway, api: &str, id: &str) -> Answer {
 /// An import body: an OpenAPI document carrying the documentation set in API Gateway's
 /// `x-amazon-apigateway-documentation` extension, each entry's content map written as the
 /// JSON OBJECT an OpenAPI document writes it as.
-fn import_body(entries: &[(Value, Value)]) -> String {
+pub(crate) fn import_body(entries: &[(Value, Value)]) -> String {
     let parts: Vec<Value> = entries
         .iter()
         .map(|(location, properties)| json!({ "location": location, "properties": properties }))
@@ -190,7 +195,7 @@ fn import_body(entries: &[(Value, Value)]) -> String {
 }
 
 /// `ImportDocumentationParts` with `body` sent verbatim as the payload.
-async fn import_parts(
+pub(crate) async fn import_parts(
     gateway: &Gateway,
     api: &str,
     mode: Option<&str>,
@@ -214,7 +219,11 @@ async fn import_parts(
 
 /// The `(location, content map)` pairs `GetDocumentationParts` reports, so a case can
 /// assert the documentation set an import left behind whatever ids it minted.
-async fn listed_entities(gateway: &Gateway, api: &str, case: &str) -> Vec<(Value, Value)> {
+pub(crate) async fn listed_entities(
+    gateway: &Gateway,
+    api: &str,
+    case: &str,
+) -> Vec<(Value, Value)> {
     let answer = get_parts(gateway, api, "limit=500").await;
     assert_eq!(
         answer.status, 200,

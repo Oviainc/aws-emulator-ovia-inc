@@ -167,6 +167,24 @@
 //! volume stores are kept in, so a pagination token can name the id the next page starts
 //! at.
 //!
+//! ## Network interfaces
+//!
+//! [`ComAmazonawsEc2Amazonec2State::network_interfaces`] holds the account's elastic
+//! network interfaces as the modelled [`NetworkInterface`] shape itself — the one
+//! `CreateNetworkInterface` answers with and `DescribeNetworkInterfaces` reports — keyed by
+//! `NetworkInterfaceId` in a [`BTreeMap`], the same stable order the VPC and subnet stores
+//! are kept in, so a pagination token can name the id the next page starts at. The shape
+//! carries the one fact a delete turns on itself, its `Attachment`: "you must detach the
+//! network interface before you can delete it" (`DeleteNetworkInterface`), so nothing is
+//! stored beside the record.
+//!
+//! An interface AWS hands back is ready (`available`, or `in-use` once something holds it),
+//! so the clock owes it no transition and there is nothing to derive on read.
+//! [`ComAmazonawsEc2Amazonec2State::insert_network_interface`] is the writer seam, ahead of
+//! the operation that will call it — `CreateNetworkInterface` is still a scaffold stub with
+//! its own open issue — so the create lands on this one record rather than on a second copy
+//! of an interface beside it.
+//!
 //! ## BYOIP address ranges
 //!
 //! [`ComAmazonawsEc2Amazonec2State::byoip_cidrs`] holds the address ranges the account has
@@ -1561,6 +1579,14 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// Monotonic source of the Elastic IP addresses [`Self::mint_elastic_ip`] hands out,
     /// so one allocation can never be given an address another still holds.
     next_elastic_ip: u64,
+    /// Every elastic network interface the account holds, by `NetworkInterfaceId`, as the
+    /// modelled [`NetworkInterface`] shape itself — so a member a writer sets round-trips
+    /// through `DescribeNetworkInterfaces` without a field-by-field copy. Ordered by id,
+    /// which is the order the describe reports and pages over. See the module docs.
+    ///
+    /// Starts EMPTY: a fresh account holds no interface of its own until something creates
+    /// one through [`Self::insert_network_interface`].
+    pub network_interfaces: BTreeMap<String, NetworkInterface>,
     /// Every route server the account holds, by `RouteServerId` — see the module docs.
     /// Ordered by id, which is the order `DescribeRouteServers` reports and pages over.
     pub route_servers: BTreeMap<String, RouteServerRecord>,
@@ -1833,6 +1859,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             fast_launch_images: BTreeMap::new(),
             addresses: BTreeMap::new(),
             next_elastic_ip: 0,
+            network_interfaces: BTreeMap::new(),
             route_servers: BTreeMap::new(),
             route_server_client_tokens: HashMap::new(),
             address_transfers: BTreeMap::new(),
@@ -11852,6 +11879,250 @@ pub fn invalid_network_interface_id_not_found<E>(network_interface_id: &str) -> 
         400,
         format!("The networkInterface ID '{network_interface_id}' does not exist"),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Network interfaces: the account's own elastic network interfaces, the writer
+// seam a create lands on, and what a delete refuses
+// ---------------------------------------------------------------------------
+
+// Imported here rather than in this module's shared import list, beside the only
+// code that names these shapes, the way the import tasks' shapes are imported
+// with their own section further up.
+use crate::ops::types::{
+    NetworkInterface, NetworkInterfaceAttachment, NetworkInterfacePrivateIpAddress,
+};
+
+/// The id prefix EC2 mints a network interface with, as
+/// [`network_interface_id_is_well_formed`] reads one: `eni-`, carried here without the
+/// separator [`ComAmazonawsEc2Amazonec2State::next_id`] adds.
+pub const NETWORK_INTERFACE_ID_PREFIX: &str = "eni";
+
+/// The id prefix EC2 mints the attachment of a network interface to an instance with, which
+/// is what `NetworkInterfaceAttachment$AttachmentId` names (`eni-attach-…`, as the
+/// `NetworkInterfaceAttachmentId` ids in EC2's own documentation read).
+pub const NETWORK_INTERFACE_ATTACHMENT_ID_PREFIX: &str = "eni-attach";
+
+/// "The type of network interface. The default is interface"
+/// (`CreateNetworkInterfaceRequest$InterfaceType`) — the `NetworkInterfaceType` member an
+/// interface a caller creates without asking for another type carries
+/// (`smithy_query(query="shape",shape="NetworkInterfaceType")`).
+pub const NETWORK_INTERFACE_TYPE_INTERFACE: &str = "interface";
+
+/// The status of a network interface nothing holds: the `NetworkInterfaceStatus` enum's
+/// `available` member (`smithy_query(query="shape",shape="NetworkInterfaceStatus")`), which
+/// is where an interface with no attachment sits — and the one state a delete accepts.
+pub const NETWORK_INTERFACE_STATUS_AVAILABLE: &str = "available";
+
+/// The status of a network interface something holds: the `NetworkInterfaceStatus` enum's
+/// `in-use` member, which is where an interface with an attachment sits.
+pub const NETWORK_INTERFACE_STATUS_IN_USE: &str = "in-use";
+
+/// The `AttachmentStatus` of an attachment that has been taken away
+/// (`smithy_query(query="shape",shape="AttachmentStatus")`): the one attachment status that
+/// leaves the interface holding nothing, so it is the one a delete does not refuse.
+pub const ATTACHMENT_STATUS_DETACHED: &str = "detached";
+
+/// The `AttachmentStatus` of a finished attachment: the state an attachment the clock has
+/// completed sits in.
+pub const ATTACHMENT_STATUS_ATTACHED: &str = "attached";
+
+/// `InvalidNetworkInterface.InUse` (HTTP 400): the request asked for something that cannot
+/// be done to a network interface while it is still attached. "The specified interface is
+/// currently in use and cannot be deleted or attached to another instance. Ensure that you
+/// have detached the network interface first" (EC2 API error codes,
+/// "InvalidNetworkInterface.InUse").
+pub const INVALID_NETWORK_INTERFACE_IN_USE: &str = "InvalidNetworkInterface.InUse";
+
+/// Refuse an action on a network interface something still holds: HTTP 400
+/// `InvalidNetworkInterface.InUse`. "You must detach the network interface before you can
+/// delete it" (`DeleteNetworkInterface`).
+pub fn network_interface_in_use<E>(network_interface_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_NETWORK_INTERFACE_IN_USE,
+        400,
+        format!(
+            "The network interface '{network_interface_id}' is currently in use and must be \
+             detached first"
+        ),
+    )
+}
+
+/// One network interface as a writer asks for it: the members a creator chooses.
+///
+/// Everything the service itself owns — the `NetworkInterfaceId`, the owning account, the
+/// primary private address entry and the `Status` that follows from the attachment — is
+/// derived by [`ComAmazonawsEc2Amazonec2State::insert_network_interface`], so two writers
+/// cannot report the same interface differently.
+#[derive(Debug, Clone, Default)]
+pub struct NetworkInterfaceSpec {
+    /// "The ID of the subnet" the interface sits in (`NetworkInterface$SubnetId`).
+    pub subnet_id: String,
+    /// "The ID of the VPC" that subnet belongs to (`NetworkInterface$VpcId`).
+    pub vpc_id: String,
+    /// "The Availability Zone" of that subnet (`NetworkInterface$AvailabilityZone`).
+    pub availability_zone: String,
+    /// "The ID of the Availability Zone" (`NetworkInterface$AvailabilityZoneId`).
+    pub availability_zone_id: String,
+    /// "A description" (`NetworkInterface$Description`).
+    pub description: String,
+    /// "Any security groups for the network interface" (`NetworkInterface$Groups`).
+    pub groups: Vec<GroupIdentifier>,
+    /// "The IPv4 address of the network interface within the subnet"
+    /// (`NetworkInterface$PrivateIpAddress`) — the interface's primary private address.
+    pub private_ip_address: Option<String>,
+    /// "The type of network interface" (`NetworkInterface$InterfaceType`), one of the
+    /// `NetworkInterfaceType` values; [`NETWORK_INTERFACE_TYPE_INTERFACE`] is the default.
+    pub interface_type: String,
+    /// "The network interface attachment" (`NetworkInterface$Attachment`), for an interface
+    /// that is already held by something; `None` for one that is attached to nothing.
+    pub attachment: Option<NetworkInterfaceAttachment>,
+    /// "Any tags assigned to the network interface" (`NetworkInterface$TagSet`).
+    pub tags: Vec<Tag>,
+}
+
+/// The caller-chosen bytes a stored network interface retains: its tags, its description
+/// and the addresses it holds. The same quantity
+/// [`ComAmazonawsEc2Amazonec2State::insert_network_interface`] charged against the store's
+/// budget, so [`ComAmazonawsEc2Amazonec2State::remove_network_interface`] gives back
+/// exactly what was taken.
+///
+/// The primary address is charged ONCE though the record names it twice: it is both
+/// `PrivateIpAddress` and an entry of `PrivateIpAddresses`, so the SET is what is counted
+/// when the record carries one and the scalar only when it does not.
+pub fn network_interface_payload_bytes(interface: &NetworkInterface) -> usize {
+    let address_bytes: usize = match interface.private_ip_addresses.as_deref() {
+        Some(addresses) => addresses
+            .iter()
+            .map(|address| address.private_ip_address.as_deref().map_or(0, str::len))
+            .sum(),
+        None => interface.private_ip_address.as_deref().map_or(0, str::len),
+    };
+    tag_list_bytes(interface.tag_set.as_deref().unwrap_or_default())
+        .saturating_add(interface.description.as_deref().map_or(0, str::len))
+        .saturating_add(address_bytes)
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Insert a network interface, and answer the `NetworkInterfaceId` it was given.
+    ///
+    /// The writer seam for the network interface store, ahead of the operation that will
+    /// call it: `CreateNetworkInterface` is still a scaffold stub with its own open issue,
+    /// so for now this is reached only from this crate's tests, which seed interfaces the
+    /// way that create will. It lives here rather than in a test so the create lands on
+    /// this one record instead of a second copy of an interface beside it, exactly as
+    /// [`Self::insert_coip_pool`] does for a CoIP pool.
+    ///
+    /// The `Status` is derived from the attachment rather than taken from the writer, so a
+    /// stored interface cannot claim to be `available` while something holds it. The
+    /// caller-chosen bytes are charged against the store's byte budget here, so a writer
+    /// cannot store them uncharged. `None` means the store is at
+    /// [`MAX_STORED_RECORDS_PER_STORE`] and NOTHING was stored: the ceiling is enforced
+    /// here so a writer that forgets to ask cannot grow the store without bound.
+    pub fn insert_network_interface(&mut self, spec: NetworkInterfaceSpec) -> Option<String> {
+        if self.network_interfaces.len() >= MAX_STORED_RECORDS_PER_STORE {
+            return None;
+        }
+        let network_interface_id = self.next_id(NETWORK_INTERFACE_ID_PREFIX);
+        // "The status of the network interface" (`NetworkInterface$Status`): an interface
+        // something holds is `in-use`, one that is attached to nothing is `available`. A
+        // detached attachment holds nothing, so it leaves the interface `available`.
+        let held = spec
+            .attachment
+            .as_ref()
+            .is_some_and(|attachment| !attachment_is_detached(attachment));
+        let status = if held {
+            NETWORK_INTERFACE_STATUS_IN_USE
+        } else {
+            NETWORK_INTERFACE_STATUS_AVAILABLE
+        };
+        let interface = NetworkInterface {
+            attachment: spec.attachment,
+            availability_zone: Some(spec.availability_zone),
+            availability_zone_id: Some(spec.availability_zone_id),
+            description: Some(spec.description),
+            groups: Some(spec.groups),
+            interface_type: Some(spec.interface_type),
+            network_interface_id: Some(network_interface_id.clone()),
+            owner_id: Some(::engine::emulator_account_id().to_string()),
+            // "The private IPv4 addresses associated with the network interface"
+            // (`NetworkInterface$PrivateIpAddresses`): the primary one is one of them, so
+            // it appears in both members rather than only in the scalar. An interface
+            // stored without a private address reports NO set rather than an empty one:
+            // AWS never reports an interface that holds no address at all.
+            private_ip_addresses: spec.private_ip_address.as_ref().map(|address| {
+                vec![NetworkInterfacePrivateIpAddress {
+                    primary: Some(true),
+                    private_ip_address: Some(address.clone()),
+                    ..NetworkInterfacePrivateIpAddress::default()
+                }]
+            }),
+            private_ip_address: spec.private_ip_address,
+            // An interface a caller creates is the account's own, not one Amazon manages
+            // on its behalf ("Indicates whether the network interface is being managed by
+            // Amazon Web Services" — `NetworkInterface$RequesterManaged`).
+            requester_managed: Some(false),
+            // "Indicates whether source/destination checking is enabled"
+            // (`NetworkInterface$SourceDestCheck`): on, which is where AWS starts an
+            // interface until `ModifyNetworkInterfaceAttribute` turns it off.
+            source_dest_check: Some(true),
+            status: Some(status.to_string()),
+            subnet_id: Some(spec.subnet_id),
+            tag_set: Some(spec.tags),
+            vpc_id: Some(spec.vpc_id),
+            ..NetworkInterface::default()
+        };
+        // [`STORED_RECORD_OVERHEAD_BYTES`] beside the caller-chosen bytes, so an interface
+        // with no description and no tags is not free against the byte budget either.
+        self.add_stored_bytes(
+            network_interface_payload_bytes(&interface)
+                .saturating_add(STORED_RECORD_OVERHEAD_BYTES),
+        );
+        self.network_interfaces
+            .insert(network_interface_id.clone(), interface);
+        Some(network_interface_id)
+    }
+
+    /// Remove the network interface `network_interface_id` and answer it as it was last
+    /// reported, or `None` when the store holds no such interface. The bytes the record
+    /// held go back to the store's budget on exactly the terms
+    /// [`Self::insert_network_interface`] took them on.
+    pub fn remove_network_interface(
+        &mut self,
+        network_interface_id: &str,
+    ) -> Option<NetworkInterface> {
+        let interface = self.network_interfaces.remove(network_interface_id)?;
+        self.release_stored_bytes(
+            network_interface_payload_bytes(&interface)
+                .saturating_add(STORED_RECORD_OVERHEAD_BYTES),
+        );
+        Some(interface)
+    }
+
+    /// The attachment that still holds the network interface `network_interface_id`, or
+    /// `None` when nothing holds it — either because the store has no such interface or
+    /// because its attachment has been taken away.
+    ///
+    /// A READ ONLY: this is what "you must detach the network interface before you can
+    /// delete it" (`DeleteNetworkInterface`) asks, so every operation that must refuse a
+    /// held interface asks it the same way.
+    pub fn network_interface_attachment(
+        &self,
+        network_interface_id: &str,
+    ) -> Option<&NetworkInterfaceAttachment> {
+        self.network_interfaces
+            .get(network_interface_id)?
+            .attachment
+            .as_ref()
+            .filter(|attachment| !attachment_is_detached(attachment))
+    }
+}
+
+/// Whether `attachment` holds nothing any more: its `Status` has reached
+/// [`ATTACHMENT_STATUS_DETACHED`]. Every other status — including an attachment that
+/// carries none at all — still holds the interface.
+fn attachment_is_detached(attachment: &NetworkInterfaceAttachment) -> bool {
+    attachment.status.as_deref() == Some(ATTACHMENT_STATUS_DETACHED)
 }
 
 /// Refuse an association the resource already has with something else, which the request
