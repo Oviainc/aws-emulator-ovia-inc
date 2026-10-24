@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetOriginRequestPolicyConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetOriginRequestPolicyConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetOriginRequestPolicyConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the CONFIGURATION of the origin request policy an id names — the same stored
+//! record `GetOriginRequestPolicy` reports, without the identity and `LastModifiedTime`
+//! around it — beside the version token the last mutation handed back. A REPORTING
+//! operation: it writes nothing, so what a later caller reads is what the last mutation
+//! stored, down to the list wrappers a request left out.
+//!
+//! An id no stored policy holds is `NoSuchOriginRequestPolicy` (HTTP 404). `AccessDenied`
+//! is unreachable here, as it is from every other operation in this service: the emulator
+//! authorizes no caller.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +147,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetOriginRequestPolicyConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetOriginRequestPolicyConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetOriginRequestPolicyConfig"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+        let store = state.lock();
+
+        let Some(stored) = store.origin_request_policy(&input.id) else {
+            return Err(
+                GetOriginRequestPolicyConfigErrorModeled::NoSuchOriginRequestPolicy(
+                    crate::state::no_such_origin_request_policy(),
+                )
+                .into(),
+            );
+        };
+
+        Ok(GetOriginRequestPolicyConfigOutput {
+            // "The origin request policy configuration" — the configuration as stored, not
+            // as any request describes it.
+            origin_request_policy_config: Some(stored.config.clone()),
+            // "The current version of the origin request policy": the token the last
+            // mutation handed back, the same one `GetOriginRequestPolicy` reports.
+            e_tag: Some(stored.etag.clone()),
+        })
     }
 }

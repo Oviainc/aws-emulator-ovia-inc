@@ -47,7 +47,7 @@ use crate::response_headers_policy_lifecycle::{assert_absent, escape, is_policy_
 
 /// `POST /2020-05-31/origin-request-policy` with the `OriginRequestPolicyConfig` document
 /// `body` — the member the operation binds to the HTTP payload.
-async fn create_policy(router: &MultiServiceRouter, body: &str) -> Answer {
+pub(crate) async fn create_policy(router: &MultiServiceRouter, body: &str) -> Answer {
     call(
         router,
         "POST",
@@ -59,7 +59,7 @@ async fn create_policy(router: &MultiServiceRouter, body: &str) -> Answer {
 }
 
 /// `GET /2020-05-31/origin-request-policy/{Id}`.
-async fn get_policy(router: &MultiServiceRouter, id: &str) -> Answer {
+pub(crate) async fn get_policy(router: &MultiServiceRouter, id: &str) -> Answer {
     call(
         router,
         "GET",
@@ -80,19 +80,19 @@ async fn get_policy(router: &MultiServiceRouter, id: &str) -> Answer {
 /// makes "the record reports what was submitted" testable for absent members too;
 /// `Some(vec![])` is the wrapper carrying a `Quantity` of zero and no items.
 #[derive(Debug, Clone)]
-struct Policy {
-    case: &'static str,
-    name: String,
-    comment: Option<String>,
+pub(crate) struct Policy {
+    pub(crate) case: &'static str,
+    pub(crate) name: String,
+    pub(crate) comment: Option<String>,
     /// A value of `OriginRequestPolicyHeaderBehavior`.
-    header_behavior: String,
-    headers: Option<Vec<String>>,
+    pub(crate) header_behavior: String,
+    pub(crate) headers: Option<Vec<String>>,
     /// A value of `OriginRequestPolicyCookieBehavior`.
-    cookie_behavior: String,
-    cookies: Option<Vec<String>>,
+    pub(crate) cookie_behavior: String,
+    pub(crate) cookies: Option<Vec<String>>,
     /// A value of `OriginRequestPolicyQueryStringBehavior`.
-    query_string_behavior: String,
-    query_strings: Option<Vec<String>>,
+    pub(crate) query_string_behavior: String,
+    pub(crate) query_strings: Option<Vec<String>>,
 }
 
 impl Default for Policy {
@@ -117,7 +117,7 @@ impl Default for Policy {
 impl Policy {
     /// The `OriginRequestPolicyConfig` XML a client sends for this configuration, in the
     /// model's member declaration order.
-    fn xml(&self) -> String {
+    pub(crate) fn xml(&self) -> String {
         let mut out = format!(
             "<OriginRequestPolicyConfig \
              xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">"
@@ -181,7 +181,7 @@ const COOKIE_BEHAVIORS: &[&str] = ORIGIN_REQUEST_POLICY_COOKIE_BEHAVIOR_VALUES;
 const QUERY_STRING_BEHAVIORS: &[&str] = ORIGIN_REQUEST_POLICY_QUERY_STRING_BEHAVIOR_VALUES;
 
 /// A list of owned strings from string literals, for the table below.
-fn strings(values: &[&str]) -> Vec<String> {
+pub(crate) fn strings(values: &[&str]) -> Vec<String> {
     values.iter().map(|value| (*value).to_string()).collect()
 }
 
@@ -191,7 +191,7 @@ fn strings(values: &[&str]) -> Vec<String> {
 /// comment that is empty, ASCII or non-ASCII, each of the three name lists absent, carrying
 /// no items, one item and many, behaviours drawn from every value of the three model-derived
 /// catalogs, and names carrying XML metacharacters.
-fn policy_table() -> Vec<Policy> {
+pub(crate) fn policy_table() -> Vec<Policy> {
     vec![
         Policy {
             case: "the name alone: no comment and no name list",
@@ -280,7 +280,7 @@ fn policy_table() -> Vec<Policy> {
 
 /// Assert the `OriginRequestPolicyConfig` element `config` reports exactly what `policy`
 /// submitted: every member it carried, and no element for a member it left out.
-fn assert_config(config: &Node, policy: &Policy, context: &str, raw: &str) {
+pub(crate) fn assert_config(config: &Node, policy: &Policy, context: &str, raw: &str) {
     let case = policy.case;
 
     match &policy.comment {

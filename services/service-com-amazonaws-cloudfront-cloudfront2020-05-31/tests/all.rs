@@ -61,6 +61,8 @@ mod origin_access_control_lifecycle;
 mod origin_access_identity_lifecycle;
 #[path = "all/origin_access_identity_list.rs"]
 mod origin_access_identity_list;
+#[path = "all/origin_request_policy_config_read.rs"]
+mod origin_request_policy_config_read;
 #[path = "all/origin_request_policy_lifecycle.rs"]
 mod origin_request_policy_lifecycle;
 #[path = "all/public_key_lifecycle.rs"]
