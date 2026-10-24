@@ -7,7 +7,7 @@
 //! conversions and the list cursor codec — so the handlers agree on one implementation
 //! of each instead of carrying a copy apiece that can drift apart.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
@@ -106,6 +106,76 @@ pub const MAX_STORED_CLUSTERS: usize = 1_000;
 /// "Currently, clusters support five nodes … create jobs until your cluster has exactly
 /// five nodes."
 pub const CLUSTER_NODE_QUORUM: usize = 5;
+
+/// The `JobType` values a device can be ordered for, for each `SnowballType` whose
+/// documented description shows a job type it does NOT serve.
+///
+/// Source: the Snow Family device table in `CreateJob`'s own documentation
+/// (`smithy_query(query="doc", shape="CreateJob")`), which pairs each device type with a
+/// description of what that device is, together with the Snow Family device-type pages
+/// that table links (the Snowball Edge Developer Guide and the Snowcone User Guide). A
+/// row is written only where the description names a job type the device cannot serve:
+///
+/// * `EDGE_S` is described as "Snowball Edge Storage Optimized for data transfer only", so
+///   the one thing it is ordered for is a transfer into or out of Amazon S3;
+/// * `STANDARD` is "Original Snowball device", the data-transfer-only device that predates
+///   on-device compute, so it is ordered for a transfer too;
+/// * `SNC1_SSD` and `SNC1_HDD` are Snowcone, which the Snowcone User Guide offers as an
+///   import or a local compute-and-storage order and not as an export one.
+///
+/// Every other device type is deliberately absent, which accepts every job type for it:
+/// their descriptions ("Compute Optimized", "Snowblade", "Storage Optimized with EC2
+/// Compute", "Storage Optimized 210TB") name a capacity rather than a job type the device
+/// cannot be ordered for. This emulator declines a combination it can show the device does
+/// not serve, never one it merely holds no record for — the same way `create_address.rs`
+/// declines only a destination it can show a Region does not ship to.
+pub const DEVICE_JOB_TYPES: &[(&str, &[&str])] = &[
+    ("STANDARD", &["IMPORT", "EXPORT"]),
+    ("EDGE_S", &["IMPORT", "EXPORT"]),
+    ("SNC1_SSD", &["IMPORT", "LOCAL_USE"]),
+    ("SNC1_HDD", &["IMPORT", "LOCAL_USE"]),
+];
+
+/// The `JobType` values whose order moves data between Amazon S3 and the device.
+///
+/// `CreateJobRequest$Resources`: "With IMPORT jobs, you specify the bucket or buckets
+/// that your transferred data will be imported into. With EXPORT jobs, you specify the
+/// bucket or buckets that your transferred data will be exported from" — so an order of
+/// one of these types is the transfer of named buckets, which `RoleARN` ("The RoleARN
+/// that you want to associate with this job") is the identity the service transfers them
+/// under. An order for local use moves nothing to or from S3 and names neither.
+pub const S3_TRANSFER_JOB_TYPES: &[&str] = &["IMPORT", "EXPORT"];
+
+/// Whether a device of type `snowball_type` can be ordered for a `job_type` job, per
+/// [`DEVICE_JOB_TYPES`].
+///
+/// A device type with no row supports everything, so a device this emulator holds no
+/// capability record for is never what refuses an order.
+pub fn device_supports_job_type(snowball_type: &str, job_type: &str) -> bool {
+    DEVICE_JOB_TYPES
+        .iter()
+        .find(|(device, _)| *device == snowball_type)
+        .is_none_or(|(_, job_types)| job_types.contains(&job_type))
+}
+
+/// Whether an order of type `job_type` moves data between Amazon S3 and the device, per
+/// [`S3_TRANSFER_JOB_TYPES`].
+pub fn transfers_s3_data(job_type: &str) -> bool {
+    S3_TRANSFER_JOB_TYPES.contains(&job_type)
+}
+
+/// Whether `resources` names at least one Amazon S3 bucket for a transfer to move.
+///
+/// An absent `Resources`, one carrying no `S3Resources` list and one carrying an empty
+/// list all name no bucket, so all three read the same way here.
+pub fn names_s3_bucket(resources: Option<&JobResource>) -> bool {
+    resources.is_some_and(|resources| {
+        resources
+            .s3_resources
+            .as_ref()
+            .is_some_and(|buckets| !buckets.is_empty())
+    })
+}
 
 /// The lifecycle states a cluster can be in: the whole `ClusterState` enum
 /// (`shared_types::CLUSTER_STATE_VALUES`), so the update rule below is expressed over the
@@ -1018,6 +1088,14 @@ pub struct ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
     pub jobs: HashMap<String, StoredJob>,
     /// Every cluster `CreateCluster` stored, keyed by the `ClusterId` it minted.
     pub clusters: HashMap<String, StoredCluster>,
+    /// The `LongTermPricingId` of every long-term pricing record this store holds — the
+    /// ids a job or cluster order can be billed under.
+    ///
+    /// A record is created by `CreateLongTermPricing`, which is what puts an id here, so
+    /// a store in which none has been created holds none and no id names a record. An
+    /// order naming one is checked against this set rather than against the id's form,
+    /// so exactly the ids this emulator minted are the ones it accepts.
+    pub long_term_pricing_ids: BTreeSet<String>,
     /// The ids in `jobs` in creation order, so `ListJobs` pages deterministically.
     pub job_order: Vec<String>,
     /// The versions of each Snow on-device service this emulator supports, keyed by the
@@ -1060,6 +1138,7 @@ impl Default for ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
             addresses: HashMap::new(),
             jobs: HashMap::new(),
             clusters: HashMap::new(),
+            long_term_pricing_ids: BTreeSet::new(),
             job_order: Vec::new(),
             service_versions: seed_service_versions(),
             software_update_grants: Vec::new(),
@@ -1079,6 +1158,12 @@ impl ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
     /// `None` when this store holds no such service.
     pub fn service_versions(&self, service_name: &str) -> Option<&[StoredServiceVersion]> {
         self.service_versions.get(service_name).map(Vec::as_slice)
+    }
+
+    /// Whether this store holds the long-term pricing record `long_term_pricing_id`
+    /// names.
+    pub fn holds_long_term_pricing(&self, long_term_pricing_id: &str) -> bool {
+        self.long_term_pricing_ids.contains(long_term_pricing_id)
     }
 
     /// Whether this store can hold another address, i.e. is below

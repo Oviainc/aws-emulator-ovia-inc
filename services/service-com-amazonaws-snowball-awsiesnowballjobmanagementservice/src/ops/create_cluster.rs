@@ -185,6 +185,22 @@ impl From<CreateClusterErrorModeled> for CreateClusterError {
     }
 }
 
+/// The only `JobType` a cluster can be ordered for, spelled as `JobType` spells it
+/// (`shared_types::JOB_TYPE_VALUES`).
+///
+/// `CreateClusterRequest$JobType`: "The type of job for this cluster. Currently, the only
+/// job type supported for clusters is LOCAL_USE."
+pub const CLUSTER_JOB_TYPE: &str = "LOCAL_USE";
+
+/// The only `SnowballType` a cluster's devices can be, spelled as `SnowballType` spells it
+/// (`shared_types::SNOWBALL_TYPE_VALUES`).
+///
+/// `CreateClusterRequest$SnowballType`: "The type of Snow Family devices to use for this
+/// cluster. For cluster jobs, Amazon Web Services Snow Family currently supports only the
+/// EDGE device type", which `CreateJob` repeats for a job ordered into a cluster: "Only
+/// the Snowball; Edge device type is supported when ordering clustered jobs."
+pub const CLUSTER_SNOWBALL_TYPE: &str = "EDGE";
+
 /// The `CreateCluster` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -247,6 +263,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                              you provided in your last request, and try again."
                         )),
                         resource_type: Some("address".to_string()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The long-term pricing a cluster's jobs are billed under is a record of this
+        // service too ("Lists long-term pricing id that will be used to associate with
+        // jobs automatically created for the new cluster"), so each id in the list has to
+        // name one the store holds, exactly as the address above does: an id that names
+        // no record is the `InvalidResourceException` this operation declares.
+        for long_term_pricing_id in input.long_term_pricing_ids.iter().flatten() {
+            if !store.holds_long_term_pricing(long_term_pricing_id) {
+                return Err(CreateClusterErrorModeled::InvalidResourceException(
+                    InvalidResourceException {
+                        message: Some(format!(
+                            "The long-term pricing ID {long_term_pricing_id} can't be found. \
+                             Check the information you provided in your last request, and try \
+                             again."
+                        )),
+                        resource_type: Some("longTermPricing".to_string()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // A cluster is not ordered out of the whole device catalog: "Currently, the only
+        // job type supported for clusters is LOCAL_USE" (`CreateClusterRequest$JobType`)
+        // and "For cluster jobs, Amazon Web Services Snow Family currently supports only
+        // the EDGE device type" (`CreateClusterRequest$SnowballType`), which `CreateJob`
+        // repeats for a job ordered into a cluster ("Only the Snowball; Edge device type
+        // is supported when ordering clustered jobs"). So a cluster asked for in any
+        // other job or device type is a set of inputs that cannot hold together, which is
+        // what `InvalidInputCombinationException` ("One or more inputs were invalid")
+        // says.
+        for (member, requested, supported) in [
+            ("JobType", input.job_type.as_str(), CLUSTER_JOB_TYPE),
+            (
+                "SnowballType",
+                input.snowball_type.as_str(),
+                CLUSTER_SNOWBALL_TYPE,
+            ),
+        ] {
+            if requested != supported {
+                return Err(CreateClusterErrorModeled::InvalidInputCombinationException(
+                    InvalidInputCombinationException {
+                        message: Some(format!(
+                            "Cluster creation failed. One or more inputs were invalid: \
+                             {supported} is currently the only {member} value a cluster \
+                             supports, and this request asked for {requested}."
+                        )),
                     },
                 )
                 .into());

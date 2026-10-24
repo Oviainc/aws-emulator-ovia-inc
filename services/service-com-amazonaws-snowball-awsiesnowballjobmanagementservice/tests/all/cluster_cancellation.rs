@@ -12,9 +12,12 @@
 //! The rows differ along what the rule generalises over: how many node jobs the cluster
 //! holds (none, the smallest initial size the model admits, one, one short of the quorum),
 //! which optional members the cluster carries (none beyond the required four, one, all of
-//! them), the enum values from the modelled catalogs (`JOB_TYPE_VALUES`,
-//! `SNOWBALL_TYPE_VALUES`, `SHIPPING_OPTION_VALUES`, read from the crate rather than
-//! restated), and the length of `Description` at each published bound.
+//! them), every value the modelled `ShippingOption` catalog admits (`SHIPPING_OPTION_VALUES`,
+//! read from the crate rather than restated), and the length of `Description` at each
+//! published bound. The job and device type are not axes a cluster varies along: a cluster
+//! is ordered only in the pair its own documentation names (`CLUSTER_JOB_TYPE`,
+//! `CLUSTER_SNOWBALL_TYPE`, also read from the crate), which `job_order_validation`
+//! asserts over the whole cross product of the two modelled enums.
 //!
 //! The harness (`router`, `ok`, `refused`, `create_address`, `deliverable_address`,
 //! `string`) and the cluster helpers (`base_cluster`, `create_cluster`,
@@ -23,12 +26,14 @@
 //! client uses and nothing reaches into the state struct.
 
 use serde_json::{json, Value};
-// The catalogs the modelled enums admit and the quorum this service holds a cluster to,
-// read from the crate rather than restated, so a row cannot drift from the values the
-// model allows or from the bound the handler enforces.
-use service_com_amazonaws_snowball_awsiesnowballjobmanagementservice::ops::types::{
-    JOB_TYPE_VALUES, SHIPPING_OPTION_VALUES, SNOWBALL_TYPE_VALUES,
+// The catalog the modelled `ShippingOption` admits, the one job and device type a cluster
+// is ordered in, and the quorum this service holds a cluster to, read from the crate rather
+// than restated, so a row cannot drift from the values the service accepts or from the
+// bound the handler enforces.
+use service_com_amazonaws_snowball_awsiesnowballjobmanagementservice::ops::create_cluster::{
+    CLUSTER_JOB_TYPE, CLUSTER_SNOWBALL_TYPE,
 };
+use service_com_amazonaws_snowball_awsiesnowballjobmanagementservice::ops::types::SHIPPING_OPTION_VALUES;
 use service_com_amazonaws_snowball_awsiesnowballjobmanagementservice::state::CLUSTER_NODE_QUORUM;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -51,16 +56,12 @@ const INITIAL_CLUSTER_SIZE_MAX: i64 = 16;
 const UNKNOWN_CLUSTER_ID: &str = "CID00000000-0000-0000-0000-000000000000";
 
 /// The four members `CreateCluster` makes required, and nothing else: the smallest cluster
-/// a row can be built from (`smithy_query(query="operation", operation="CreateCluster")`).
-fn required_members_only(
-    address_id: &str,
-    job_type: &str,
-    snowball_type: &str,
-    shipping: &str,
-) -> Value {
+/// a row can be built from (`smithy_query(query="operation", operation="CreateCluster")`),
+/// ordered in the one job and device type a cluster supports.
+fn required_members_only(address_id: &str, shipping: &str) -> Value {
     json!({
-        "JobType": job_type,
-        "SnowballType": snowball_type,
+        "JobType": CLUSTER_JOB_TYPE,
+        "SnowballType": CLUSTER_SNOWBALL_TYPE,
         "ShippingOption": shipping,
         "AddressId": address_id,
     })
@@ -87,14 +88,12 @@ async fn cluster_state(router: &MultiServiceRouter, cluster_id: &str, case: &str
 }
 
 /// Every cluster a cancellation row creates: each one still awaiting its quorum, differing
-/// along the number of node jobs it holds, which optional members it carries, the enum
-/// value it takes from the modelled catalog and the length of its description.
+/// along the number of node jobs it holds, which optional members it carries, the shipping
+/// speed it takes from the modelled catalog and the length of its description.
 fn cancellable_rows(address_id: &str) -> Vec<(String, Value)> {
-    // One row per shipping speed, device type and job type the model admits, so the rows
-    // span the catalogs rather than one recorded value.
+    // One row per shipping speed the model admits, so the rows span that catalog rather
+    // than one recorded value.
     let shipping = SHIPPING_OPTION_VALUES;
-    let devices = SNOWBALL_TYPE_VALUES;
-    let job_types = JOB_TYPE_VALUES;
 
     let mut rows: Vec<(String, Value)> = vec![
         (
@@ -103,7 +102,7 @@ fn cancellable_rows(address_id: &str) -> Vec<(String, Value)> {
         ),
         (
             "the required members alone".to_string(),
-            required_members_only(address_id, job_types[0], devices[0], shipping[0]),
+            required_members_only(address_id, shipping[0]),
         ),
     ];
 
@@ -122,17 +121,15 @@ fn cancellable_rows(address_id: &str) -> Vec<(String, Value)> {
         rows.push((format!("a cluster holding {size} node jobs"), body));
     }
 
-    // One row per entry of each modelled catalog, on a cluster that also holds a node job,
-    // so the rule is exercised on values the issue did not cite.
-    for (index, device) in devices.iter().enumerate() {
-        let mut body = required_members_only(
-            address_id,
-            job_types[index % job_types.len()],
-            device,
-            shipping[index % shipping.len()],
-        );
+    // One row per entry of the modelled shipping catalog, on a cluster that also holds a
+    // node job, so the rule is exercised on values the issue did not cite.
+    for speed in shipping {
+        let mut body = required_members_only(address_id, speed);
         body["InitialClusterSize"] = json!(1);
-        rows.push((format!("a {device} cluster with one node job"), body));
+        rows.push((
+            format!("a cluster shipped {speed} with one node job"),
+            body,
+        ));
     }
 
     // Each published bound of `Description`.

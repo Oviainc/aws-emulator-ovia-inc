@@ -43,7 +43,9 @@ use service_com_amazonaws_snowball_awsiesnowballjobmanagementservice::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::job_lifecycle::{create_address, deliverable_address, ok, refused, string};
+use super::job_lifecycle::{
+    complete_order, create_address, deliverable_address, ok, refused, string,
+};
 
 /// The one state a job's unlock code is released from.
 const RELEASING_STATE: &str = "WithCustomer";
@@ -123,16 +125,18 @@ async fn unlock_code(router: &MultiServiceRouter, job_id: &str, case: &str) -> S
 }
 
 /// Create one job of `submitted`'s shape against a deliverable address and return its
-/// `JobId`.
-async fn create_job(router: &MultiServiceRouter, mut submitted: Value, case: &str) -> String {
+/// `JobId`. The row's members are merged over the harness's order defaults
+/// (`job_lifecycle::complete_order`), so a row states only the axis it varies.
+async fn create_job(router: &MultiServiceRouter, submitted: Value, case: &str) -> String {
     let address_id = create_address(
         router,
         deliverable_address(case, "123 Main Street", json!({})),
         case,
     )
     .await;
-    submitted["AddressId"] = json!(address_id);
-    let created = ok(router, "CreateJob", submitted, case).await;
+    let mut body = complete_order(&submitted);
+    body["AddressId"] = json!(address_id);
+    let created = ok(router, "CreateJob", body, case).await;
     string(&created, "JobId", case)
 }
 
@@ -169,7 +173,7 @@ fn order_rows() -> Vec<(&'static str, Value)> {
             }),
         ),
         (
-            "the smallest job the service accepts",
+            "an order naming only its job type",
             json!({ "JobType": "IMPORT" }),
         ),
         (

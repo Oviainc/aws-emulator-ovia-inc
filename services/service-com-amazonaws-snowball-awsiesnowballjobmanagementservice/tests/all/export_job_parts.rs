@@ -11,8 +11,10 @@
 //! (`JobListEntry$IsMaster`, `DescribeJobResult$SubJobMetadata`).
 //!
 //! The rows differ along what the rule generalises over: the `JobType` from the modelled
-//! catalog including a create that names none, the device type, the resources the order
-//! covers, and the number of orders the store holds.
+//! catalog, the device type, the resources the order covers, and the number of orders the
+//! store holds. Each row names only what it varies; the rest of the order it describes —
+//! the members a standalone job cannot be created without — comes from the harness's
+//! `complete_order`.
 //!
 //! The harness (`router`, `ok`, `create_address`, `deliverable_address`, `string`,
 //! `assert_prefixed_uuid`) is the one `job_lifecycle` already drives the service with, so
@@ -29,7 +31,7 @@ use service_com_amazonaws_snowball_awsiesnowballjobmanagementservice::ops::creat
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::job_lifecycle::{
-    assert_prefixed_uuid, create_address, deliverable_address, ok, router, string,
+    assert_prefixed_uuid, complete_order, create_address, deliverable_address, ok, router, string,
 };
 
 /// `IsMaster` is modelled with a `false` default, which the protocol may leave off the
@@ -81,13 +83,16 @@ fn entry_for<'a>(entries: &'a [Value], job_id: &str, case: &str) -> &'a Value {
 }
 
 /// Create an order on `address_id` and return the `JobId` the service answered with.
+///
+/// The row's members are merged over the harness's order defaults
+/// (`job_lifecycle::complete_order`), so a row states only the axis it varies.
 async fn create_order(
     router: &MultiServiceRouter,
     address_id: &str,
     submitted: &Value,
     case: &str,
 ) -> String {
-    let mut body = submitted.clone();
+    let mut body = complete_order(submitted);
     body["AddressId"] = json!(address_id);
     let created = ok(router, "CreateJob", body, case).await;
     string(&created, "JobId", case)
@@ -103,9 +108,9 @@ async fn export_address(router: &MultiServiceRouter) -> String {
     .await
 }
 
-/// Every create row: one per `JobType` the modelled catalog admits plus a create that
-/// names none, differing in device type and in the resources the order covers. The
-/// `EXPORT` + `EDGE_S` row with one bucket is the one the issue recorded.
+/// Every create row: one per `JobType` the modelled catalog admits, differing in device
+/// type and in the resources the order covers. The `EXPORT` + `EDGE_S` row with one bucket
+/// is the one the issue recorded.
 fn order_rows() -> Vec<(&'static str, Value)> {
     vec![
         (
@@ -139,8 +144,17 @@ fn order_rows() -> Vec<(&'static str, Value)> {
             }),
         ),
         (
-            "an export order naming no resources at all",
+            "an export order naming only its job type",
             json!({ "JobType": "EXPORT" }),
+        ),
+        (
+            "an export order on the largest storage device",
+            json!({
+                "JobType": "EXPORT",
+                "SnowballType": "V3_5S",
+                "ShippingOption": "NEXT_DAY",
+                "SnowballCapacityPreference": "T240",
+            }),
         ),
         (
             "an import order over one bucket",
@@ -162,8 +176,12 @@ fn order_rows() -> Vec<(&'static str, Value)> {
             }),
         ),
         (
-            "an order that names no job type",
-            json!({ "SnowballType": "EDGE_C" }),
+            "a local-use order on a compute-optimized device",
+            json!({
+                "JobType": "LOCAL_USE",
+                "SnowballType": "EDGE_C",
+                "ShippingOption": "EXPRESS",
+            }),
         ),
     ]
 }

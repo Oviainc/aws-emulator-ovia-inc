@@ -50,7 +50,9 @@ use service_com_amazonaws_snowball_awsiesnowballjobmanagementservice::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use super::job_lifecycle::{call_in_region, create_address, deliverable_address, ok, refused, string};
+use super::job_lifecycle::{
+    call_in_region, complete_order, create_address, deliverable_address, ok, refused, string,
+};
 
 /// `ReturnShippingLabelURI` is modelled `len 1..1024`
 /// (`smithy_query(query="operation", operation="DescribeReturnShippingLabel")`).
@@ -129,16 +131,18 @@ fn wait_for_the_label() {
 }
 
 /// Create one job of `submitted`'s shape against a deliverable address and return its
-/// `JobId`.
-async fn create_job(router: &MultiServiceRouter, mut submitted: Value, case: &str) -> String {
+/// `JobId`. The row's members are merged over the harness's order defaults
+/// (`job_lifecycle::complete_order`), so a row states only the axis it varies.
+async fn create_job(router: &MultiServiceRouter, submitted: Value, case: &str) -> String {
     let address_id = create_address(
         router,
         deliverable_address(case, "123 Main Street", json!({})),
         case,
     )
     .await;
-    submitted["AddressId"] = json!(address_id);
-    let created = ok(router, "CreateJob", submitted, case).await;
+    let mut body = complete_order(&submitted);
+    body["AddressId"] = json!(address_id);
+    let created = ok(router, "CreateJob", body, case).await;
     string(&created, "JobId", case)
 }
 
@@ -215,18 +219,22 @@ fn rows() -> Vec<Row> {
             expected: Some("SECOND_DAY"),
         },
         Row {
-            case: "the smallest job the service accepts, returned EXPRESS",
+            case: "an order naming only its job type, returned EXPRESS",
             submitted: json!({ "JobType": "IMPORT" }),
             use_job_part: false,
             asked: Some("EXPRESS"),
             expected: Some("EXPRESS"),
         },
         Row {
-            case: "a job with no shipping speed anywhere",
-            submitted: json!({ "JobType": "IMPORT", "SnowballType": "EDGE_C" }),
+            case: "an import job on a compute-optimized device, returned at the job's own speed",
+            submitted: json!({
+                "JobType": "IMPORT",
+                "SnowballType": "EDGE_C",
+                "ShippingOption": "STANDARD",
+            }),
             use_job_part: false,
             asked: None,
-            expected: None,
+            expected: Some("STANDARD"),
         },
         Row {
             case: "a job part of an export order, returned STANDARD",

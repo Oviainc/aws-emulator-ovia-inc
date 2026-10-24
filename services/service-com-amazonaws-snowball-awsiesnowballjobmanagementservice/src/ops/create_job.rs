@@ -283,6 +283,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut store = state.lock();
 
+        // Every resource an order names has to be one this service holds, whichever
+        // member names it: "The specified resource can't be found. Check the information
+        // you provided in your last request, and try again" (`InvalidResourceException`)
+        // is what this operation answers for an id that resolves to no record. The
+        // long-term pricing a device is billed under is such a record —
+        // `CreateLongTermPricing` is what creates one and puts its id in the store — so
+        // an id is checked against what the store holds rather than against the id's
+        // form, exactly as the address and the cluster below are.
+        if let Some(long_term_pricing_id) = input.long_term_pricing_id.as_deref() {
+            if !store.holds_long_term_pricing(long_term_pricing_id) {
+                return Err(CreateJobErrorModeled::InvalidResourceException(
+                    InvalidResourceException {
+                        message: Some(format!(
+                            "The long-term pricing ID {long_term_pricing_id} can't be found. \
+                             Check the information you provided in your last request, and try \
+                             again."
+                        )),
+                        resource_type: Some("longTermPricing".to_string()),
+                    },
+                )
+                .into());
+            }
+        }
+
         // A job is built from a resource it names: the address its device ships to, or
         // the cluster it joins — "If you're creating a job for a node in a cluster, you
         // only need to provide the clusterId value; the other job attributes are
@@ -413,6 +437,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                              information you provided in your last request, and try again."
                         )),
                         resource_type: Some("address".to_string()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // A job that joins no cluster IS its own order, so the request has to describe
+        // the device order itself: "If you're creating a job for a node in a cluster, you
+        // need to provide only this clusterId value. The other job attributes are
+        // inherited from the cluster" (`CreateJobRequest$ClusterId`) is why these members
+        // are modelled optional here at all, and `CreateClusterRequest` — the same order
+        // placed for a cluster — models exactly `JobType`, `SnowballType`,
+        // `ShippingOption` and `AddressId` as required
+        // (`smithy_query(query="operation", operation="CreateCluster")`). With no cluster
+        // to inherit from there is nothing to fall back on, so an order short of one of
+        // them is a set of inputs that cannot hold together, which is what
+        // `InvalidInputCombinationException` ("One or more inputs were invalid") says. A
+        // member supplied empty names nothing either, so it counts as missing.
+        let missing: Vec<&str> = [
+            ("JobType", input.job_type.as_deref()),
+            ("SnowballType", input.snowball_type.as_deref()),
+            ("ShippingOption", input.shipping_option.as_deref()),
+        ]
+        .into_iter()
+        .filter(|(_, supplied)| supplied.is_none_or(str::is_empty))
+        .map(|(member, _)| member)
+        .collect();
+        if !missing.is_empty() {
+            return Err(CreateJobErrorModeled::InvalidInputCombinationException(
+                InvalidInputCombinationException {
+                    message: Some(format!(
+                        "Job creation failed. One or more inputs were invalid: a job that is \
+                         not a node of a cluster must provide {}.",
+                        missing.join(", ")
+                    )),
+                },
+            )
+            .into());
+        }
+        // Both members are present, so the order names a device and what it is ordered
+        // for, and the two have to be a pair the device serves: "Confirm that the
+        // CreateClusterRequest$SnowballType value supports your CreateJobRequest$JobType,
+        // and try again" (`InvalidInputCombinationException`). Which job types a device
+        // serves is `crate::state::DEVICE_JOB_TYPES`, read from the device table in this
+        // operation's own documentation.
+        //
+        // The value is read exactly as it was submitted, here and in the record stored
+        // below: whether a string is one the modelled enum admits at all is the request
+        // walk's to decide, so nothing here rewrites what the caller sent.
+        let job_type = input.job_type.clone().unwrap_or_default();
+        let snowball_type = input.snowball_type.clone().unwrap_or_default();
+        if !crate::state::device_supports_job_type(&snowball_type, &job_type) {
+            return Err(CreateJobErrorModeled::InvalidInputCombinationException(
+                InvalidInputCombinationException {
+                    message: Some(format!(
+                        "Job creation failed. One or more inputs were invalid. Confirm that the \
+                         SnowballType value {snowball_type} supports your JobType value \
+                         {job_type}, and try again."
+                    )),
+                },
+            )
+            .into());
+        }
+        // An order that moves data between Amazon S3 and the device is the transfer of
+        // named buckets under a named role (`crate::state::S3_TRANSFER_JOB_TYPES`), so it
+        // cannot be placed without either: with no bucket there is nothing to transfer,
+        // and with no role the service has no identity to read or write one under. An
+        // order for local use transfers nothing to or from S3 and needs neither.
+        if crate::state::transfers_s3_data(&job_type) {
+            let missing_transfer_member = if !crate::state::names_s3_bucket(input.resources.as_ref())
+            {
+                Some("the Amazon S3 buckets it transfers, in Resources")
+            } else if input.role_arn.as_deref().is_none_or(str::is_empty) {
+                Some("the RoleARN the transfer is performed under")
+            } else {
+                None
+            };
+            if let Some(missing_transfer_member) = missing_transfer_member {
+                return Err(CreateJobErrorModeled::InvalidInputCombinationException(
+                    InvalidInputCombinationException {
+                        message: Some(format!(
+                            "Job creation failed. One or more inputs were invalid: a {job_type} \
+                             job must provide {missing_transfer_member}."
+                        )),
                     },
                 )
                 .into());

@@ -54,6 +54,12 @@ const JOB_TYPES: &[&str] = &["EXPORT", "IMPORT", "LOCAL_USE"];
 
 /// A router with just this service mounted on a fresh engine.
 pub(crate) fn router() -> MultiServiceRouter {
+    router_with_engine().0
+}
+
+/// The same router, together with the engine it was built on, so a case can seed a record
+/// whose own create operation is not implemented yet. Every request still goes over HTTP.
+pub(crate) fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Signatures are not what these tests are about; the router still routes by the
@@ -61,10 +67,10 @@ pub(crate) fn router() -> MultiServiceRouter {
     router.set_request_authentication(false);
     router.register_service(
         service_com_amazonaws_snowball_awsiesnowballjobmanagementservice::EmulatedService::new(
-            engine,
+            Arc::clone(&engine),
         ),
     );
-    router
+    (router, engine)
 }
 
 /// One `awsJson1_1` call signed for [`SIGNED_REGION`].
@@ -215,6 +221,35 @@ pub(crate) fn deliverable_address(name: &str, street1: &str, extra: Value) -> Va
         address[member] = value.clone();
     }
     address
+}
+
+/// The order every `CreateJob` and `CreateCluster` row in this crate's suites is completed
+/// with: an order that joins no cluster describes itself — the job type, the device type
+/// and the shipping speed — and an order that moves data between Amazon S3 and the device
+/// names the buckets it transfers and the role it transfers them under. A row that varies
+/// one of these overrides it.
+pub(crate) fn order_defaults() -> Value {
+    json!({
+        "JobType": "IMPORT",
+        "SnowballType": "EDGE",
+        "ShippingOption": "SECOND_DAY",
+        "RoleARN": "arn:aws:iam::123456789012:role/snowball-order",
+        "Resources": {
+            "S3Resources": [{ "BucketArn": "arn:aws:s3:::snowball-order-bucket" }]
+        },
+    })
+}
+
+/// `submitted` merged over [`order_defaults`], so a row states only the axis it varies.
+pub(crate) fn complete_order(submitted: &Value) -> Value {
+    let mut body = order_defaults();
+    for (member, value) in submitted
+        .as_object()
+        .expect("the submitted order is a JSON object")
+    {
+        body[member] = value.clone();
+    }
+    body
 }
 
 /// Every address row: one per combination of present members, value length, `Type` from
@@ -561,13 +596,17 @@ fn job_rows() -> Vec<(&'static str, Value)> {
             }),
         ),
         (
-            "the smallest job the service accepts",
-            json!({ "JobType": "IMPORT" }),
+            "the smallest order the service accepts",
+            json!({
+                "JobType": "LOCAL_USE",
+                "SnowballType": "SNC1_HDD",
+                "ShippingOption": "STANDARD"
+            }),
         ),
         (
             "job with tax documents, impact level and pickup details",
             json!({
-                "JobType": "IMPORT",
+                "JobType": "LOCAL_USE",
                 "SnowballType": "RACK_5U_C",
                 "ShippingOption": "STANDARD",
                 "Description": "x".repeat(1024),
@@ -816,6 +855,13 @@ async fn router_with_jobs(count: usize) -> (MultiServiceRouter, Vec<String>) {
                 "ShippingOption": "SECOND_DAY",
                 "AddressId": address_id,
                 "Description": format!("job {index}"),
+                // An IMPORT or EXPORT order names the buckets it transfers and the role
+                // it transfers them under; a LOCAL_USE order needs neither, and carrying
+                // them is not an error.
+                "RoleARN": "arn:aws:iam::000000000000:role/snowball-listed",
+                "Resources": {
+                    "S3Resources": [{ "BucketArn": format!("arn:aws:s3:::listed-{index}") }]
+                },
             }),
             &case,
         )
@@ -1180,7 +1226,7 @@ async fn a_create_past_the_store_ceiling_is_refused() {
     .await;
 
     let job = json!({
-        "JobType": "IMPORT",
+        "JobType": "LOCAL_USE",
         "SnowballType": "EDGE",
         "ShippingOption": "SECOND_DAY",
         "AddressId": address_id,
