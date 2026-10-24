@@ -136,6 +136,39 @@ pub fn filters(entries: &[(&str, &[&str])]) -> Vec<(String, String)> {
         .collect()
 }
 
+/// The XML namespace this service's response envelopes carry, as the model binds it
+/// (`smithy_query(query="service_info")`'s `xmlNamespace`).
+pub const XML_NAMESPACE: &str = "http://ec2.amazonaws.com/doc/2016-11-15";
+
+/// The text of every DIRECT child of an operation's `<{action}Response>` envelope named
+/// `name`, in document order, having first pinned that the envelope's root is that element
+/// in [`XML_NAMESPACE`].
+///
+/// Direct children only: a `<return>` or a `<requestId>` nested inside a reported resource
+/// would be that resource's member, not the envelope's. Lives here, beside the plumbing
+/// every suite shares, so the envelope is read one way rather than once per suite.
+pub fn envelope_children(case: &str, body: &str, action: &str, name: &str) -> Vec<String> {
+    let parsed = super::wire::document(case, body);
+    let root = parsed.root_element();
+    let expected = format!("{action}Response");
+    assert_eq!(
+        root.tag_name().name(),
+        expected,
+        "case {case:?}: expected a <{expected}> root, got {body}"
+    );
+    assert_eq!(
+        root.tag_name().namespace(),
+        Some(XML_NAMESPACE),
+        "case {case:?}: expected the <{expected}> root in the namespace {XML_NAMESPACE:?}, \
+         got {:?} in {body}",
+        root.tag_name().namespace()
+    );
+    root.children()
+        .filter(|node| node.is_element() && node.tag_name().name() == name)
+        .map(|node| node.text().unwrap_or_default().to_string())
+        .collect()
+}
+
 /// The text of the first `<name>…</name>` element in `xml`.
 pub fn element(xml: &str, name: &str) -> Option<String> {
     let open = format!("<{name}>");

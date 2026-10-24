@@ -70,17 +70,6 @@ const UNKNOWN_ATTACHMENT_ID: &str = "tgw-attach-00000000000000000";
 /// The HTTP status EC2 answers `DryRunOperation` with.
 const DRY_RUN_STATUS: u16 = 412;
 
-/// The XML namespace every EC2 envelope is stamped with — the service shape's
-/// `@xmlNamespace` URI:
-///
-/// ```text
-/// smithy_query(query="service_info",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
-/// ```
-///
-/// Asserted on every row below, so a response envelope that lost it — or carries one that
-/// drifted from the model — fails here rather than silently reaching a client.
-const XML_NAMESPACE: &str = "http://ec2.amazonaws.com/doc/2016-11-15";
-
 /// One row's response: the operation it called (which names the response's root element),
 /// the HTTP status, the response's `content-type` and the XML body.
 struct Answer {
@@ -443,33 +432,11 @@ async fn perform(case: &str, call: Call) -> Answer {
 }
 
 /// The text of every DIRECT child of the response envelope named `name`, in document
-/// order, having first pinned that the envelope's root is `<{action}Response>` in the
-/// model's XML namespace.
-///
-/// Direct children only: a `<return>` nested inside a reported resource would be that
-/// resource's member, not the envelope's flag.
+/// order, as [`super::ec2_query::envelope_children`] reads it off the shared harness —
+/// which is also where the root's element name and the model's XML namespace are pinned,
+/// so a response envelope that lost either fails on every row below.
 fn envelope_children(case: &str, answered: &Answer, name: &str) -> Vec<String> {
-    let parsed = document(case, &answered.body);
-    let root = parsed.root_element();
-    let expected = format!("{}Response", answered.action);
-    assert_eq!(
-        root.tag_name().name(),
-        expected,
-        "case {case:?}: expected a <{expected}> root, got {}",
-        answered.body
-    );
-    assert_eq!(
-        root.tag_name().namespace(),
-        Some(XML_NAMESPACE),
-        "case {case:?}: expected the <{expected}> root in the namespace {XML_NAMESPACE:?}, \
-         got {:?} in {}",
-        root.tag_name().namespace(),
-        answered.body
-    );
-    root.children()
-        .filter(|node| node.is_element() && node.tag_name().name() == name)
-        .map(|node| node.text().unwrap_or_default().to_string())
-        .collect()
+    super::ec2_query::envelope_children(case, &answered.body, answered.action, name)
 }
 
 /// The text of every DIRECT child named `name` of a REFUSAL's `<Response>` envelope, in
