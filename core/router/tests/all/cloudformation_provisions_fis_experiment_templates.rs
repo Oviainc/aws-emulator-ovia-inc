@@ -283,6 +283,9 @@ async fn create_and_settle(
 struct Declared {
     /// The output key whose value is the template's id.
     id_output: &'static str,
+    /// The logical id the template declares the resource under, which CloudFormation
+    /// records on it as the `aws:cloudformation:logical-id` tag.
+    logical_id: &'static str,
     /// The `description` FIS must report for it, which is what the template declared.
     description: &'static str,
     /// The `actionId` of the one action the declaration carries.
@@ -334,6 +337,7 @@ fn rows(role_arn: &str) -> Vec<Row> {
             parameters: Vec::new(),
             declared: vec![Declared {
                 id_output: "TemplateId",
+                logical_id: "FisTemplate",
                 description: "a wait experiment",
                 action: ("waitAction", "aws:fis:wait"),
                 target: None,
@@ -388,6 +392,7 @@ Outputs:
             parameters: vec![("ExperimentRole", "")],
             declared: vec![Declared {
                 id_output: "TemplateId",
+                logical_id: "Experiment",
                 description: "an instance experiment",
                 action: ("stopInstances", "aws:ec2:stop-instances"),
                 target: Some((
@@ -449,6 +454,7 @@ Outputs:
             declared: vec![
                 Declared {
                     id_output: "FirstId",
+                    logical_id: "First",
                     description: "the first experiment",
                     action: ("waitAction", "aws:fis:wait"),
                     target: None,
@@ -456,6 +462,7 @@ Outputs:
                 },
                 Declared {
                     id_output: "SecondId",
+                    logical_id: "Second",
                     description: "the second experiment",
                     action: ("waitAction", "aws:fis:wait"),
                     target: None,
@@ -572,12 +579,31 @@ async fn every_declared_output_carries_the_experiment_template_id_fis_minted() {
                      got {reported}"
                 );
             }
-            if declared.tags != json!({}) {
-                assert_eq!(
-                    &template["tags"], &declared.tags,
-                    "case {case:?}: expected the declared tags, got {reported}"
-                );
-            }
+            // The tags the declaration asked for, PLUS the three CloudFormation records on
+            // every resource it provisions: `aws:cloudformation:stack-name`,
+            // `aws:cloudformation:stack-id` and `aws:cloudformation:logical-id` (these rows
+            // supply no stack-level `Tags`, which would be here too). The whole set is held
+            // to by
+            // `services/service-com-amazonaws-cloudformation-cloudformation/tests/all/stack_tag_propagation.rs`.
+            let mut expected_tags = declared.tags.as_object().cloned().unwrap_or_default();
+            expected_tags.insert(
+                "aws:cloudformation:stack-name".to_string(),
+                json!(row.stack_name),
+            );
+            expected_tags.insert(
+                "aws:cloudformation:stack-id".to_string(),
+                json!(xml_text(&body, "StackId").unwrap_or_default()),
+            );
+            expected_tags.insert(
+                "aws:cloudformation:logical-id".to_string(),
+                json!(declared.logical_id),
+            );
+            assert_eq!(
+                template["tags"],
+                Value::Object(expected_tags),
+                "case {case:?}: expected the declared tags beside the aws:cloudformation \
+                 ones, got {reported}"
+            );
         }
     }
 }

@@ -463,7 +463,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The preconditions are re-asserted HERE, under the writing lock, rather than
         // trusted from the read above: between the two, another request may have deleted
         // the stack or started an operation on it, and only one update may be in flight.
-        let (stack_id, region, declared, previous_resources) = {
+        let (stack_id, region, declared, previous_resources, provenance) = {
             let mut store = state.lock();
             let stack = store
                 .resolve_mut(&input.stack_name)
@@ -525,6 +525,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 stack.region.clone(),
                 stack.current_resources().to_vec(),
                 previous_resources,
+                stack.provenance(),
             )
         };
 
@@ -534,6 +535,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let materialised = crate::state::provisioning::reconcile(
             ctx,
             &region,
+            &provenance,
             declared,
             &previous_resources,
         )
