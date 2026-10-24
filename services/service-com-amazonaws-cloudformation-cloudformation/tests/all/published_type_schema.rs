@@ -70,10 +70,28 @@ struct SchemaCase {
 
 fn table() -> Vec<SchemaCase> {
     vec![
-        // The recorded row: two published properties, `Arn` and `DomainName`.
+        // The recorded row: the five DNS/identity properties an S3 bucket publishes.
         SchemaCase {
             type_name: "AWS::S3::Bucket",
-            properties: vec!["/properties/Arn", "/properties/DomainName"],
+            properties: vec![
+                "/properties/Arn",
+                "/properties/DomainName",
+                "/properties/DualStackDomainName",
+                "/properties/RegionalDomainName",
+                "/properties/WebsiteURL",
+            ],
+        },
+        // A type whose two published properties are both SERVICE-ASSIGNED: a CloudFront
+        // distribution's id and the `cloudfront.net` domain name it is served on.
+        SchemaCase {
+            type_name: "AWS::CloudFront::Distribution",
+            properties: vec!["/properties/DomainName", "/properties/Id"],
+        },
+        // An API Gateway REST API publishes its own id and the id of the root resource
+        // created with it.
+        SchemaCase {
+            type_name: "AWS::ApiGateway::RestApi",
+            properties: vec!["/properties/RestApiId", "/properties/RootResourceId"],
         },
         // A single published property.
         SchemaCase {

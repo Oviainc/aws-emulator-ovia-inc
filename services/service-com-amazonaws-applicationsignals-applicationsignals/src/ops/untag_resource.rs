@@ -149,7 +149,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+
         let mut store = state.lock();
+
+        // A resource whose lifetime the clock has ended is gone, tags included, so the pass
+        // that materialises the lapse runs first and this removal is refused for it exactly
+        // as for an ARN that never named a resource.
+        store.expire_instrumentation_configurations(&now);
+
         // The tag set is keyed by the STORED resource's own ARN, so it is resolved before
         // anything is removed — and copied out, since the removal borrows the store mutably.
         let Some(arn) = store

@@ -399,6 +399,14 @@ fn output_for(rule: &crate::state::StoredRule) -> CreateAutomationRuleOutput {
 /// * `organizationConfiguration` — "Required for OrganizationRule type."
 /// * `priority` — "a decimal number between 0 and 1 (having up to 30 digits
 ///   after the decimal point)"; the member is a plain `String`.
+/// * `recommendedActionTypes` — the action types the rule executes, so an empty
+///   list automates nothing ([`crate::state::recommended_action_types_violation`]).
+/// * `schedule` — "The expression that defines when the schedule runs", with
+///   specific (non-wildcard) minutes and hours
+///   ([`crate::state::schedule_violation`]).
+/// * `criteria` — a condition the service could not evaluate
+///   ([`crate::state::criteria_violation`]), which is what the preview
+///   operations refuse the same value set with.
 fn invalid_parameter(input: &CreateAutomationRuleInput) -> Option<String> {
     if input.name.is_empty() {
         return Some(crate::state::constraint_report(
@@ -412,14 +420,25 @@ fn invalid_parameter(input: &CreateAutomationRuleInput) -> Option<String> {
             "Member is required for the OrganizationRule rule type",
         ));
     }
-    match input.priority.as_deref() {
-        Some(priority) if !crate::state::priority_is_valid(priority) => {
-            Some(crate::state::constraint_report(
+    if let Some(priority) = input.priority.as_deref() {
+        if !crate::state::priority_is_valid(priority) {
+            return Some(crate::state::constraint_report(
                 "priority",
                 "Member must be a decimal number between 0 and 1 with up to 30 digits after the \
                  decimal point",
-            ))
+            ));
         }
-        _ => None,
     }
+    if let Some(report) =
+        crate::state::recommended_action_types_violation(&input.recommended_action_types)
+    {
+        return Some(report);
+    }
+    if let Some(report) = crate::state::schedule_violation(&input.schedule) {
+        return Some(report);
+    }
+    input
+        .criteria
+        .as_ref()
+        .and_then(crate::state::criteria_violation)
 }

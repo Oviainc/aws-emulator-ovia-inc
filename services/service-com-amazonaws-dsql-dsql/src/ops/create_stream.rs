@@ -417,28 +417,30 @@ fn cross_account_denial(target: &TargetDefinition) -> Option<AccessDeniedExcepti
 /// `crate::service`'s `override_operation`.
 ///
 /// Nothing else is re-implemented. A request it does not refuse is handed to the
-/// generated [`ErasedOperation::run`], which owns deserialize -> validate ->
-/// handle -> serialize, telemetry and every modelled error — the cluster lookup,
-/// the idempotency ledger and the quota included. The cost is that such a
-/// request is read twice, once here and once in the operation's own sequence,
-/// because the framework hands no already-built input to an operation.
-pub struct PassRoleGate<Eng> {
-    operation: CreateStream<Eng>,
+/// operation it wraps, whose [`ErasedOperation::run`] owns deserialize ->
+/// validate -> handle -> serialize, telemetry and every modelled error — the
+/// cluster lookup, the idempotency ledger and the quota included. The cost is
+/// that such a request is read twice, once here and once in the operation's own
+/// sequence, because the framework hands no already-built input to an operation.
+///
+/// Generic over what it wraps, which is `CreateStream` as the service serves it:
+/// `crate::service` wires it around that operation inside the service's own
+/// constraint-refusal envelope, so the decision this gate takes is reached before
+/// that envelope's model-constraint validation as well as before the handler's.
+pub struct PassRoleGate<Inner> {
+    operation: Inner,
 }
 
-impl<Eng> PassRoleGate<Eng> {
-    /// Wrap this operation, constructed from the shared engine the way the
-    /// generated routing table constructs it.
-    pub fn new(engine: ::std::sync::Arc<Eng>) -> Self {
-        Self {
-            operation: CreateStream::new(engine),
-        }
+impl<Inner> PassRoleGate<Inner> {
+    /// Gate `operation` — the `CreateStream` this service serves, already
+    /// constructed from the shared engine and behind whatever else the service
+    /// puts in front of its handler.
+    pub fn over(operation: Inner) -> Self {
+        Self { operation }
     }
 }
 
-impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ErasedOperation
-    for PassRoleGate<Eng>
-{
+impl<Inner: ErasedOperation> ErasedOperation for PassRoleGate<Inner> {
     fn run<'r>(
         &'r self,
         svc: &'r dyn Service,

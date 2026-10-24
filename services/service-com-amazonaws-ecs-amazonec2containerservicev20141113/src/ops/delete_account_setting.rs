@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteAccountSetting
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteAccountSetting`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteAccountSetting::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Clears one account setting of ONE principal from this service's account-settings
+//! store, so the account-wide default applies to that principal again — the store
+//! `PutAccountSetting` writes and `ListAccountSettings` reports
+//! ([`crate::state::ComAmazonawsEcsAmazonec2containerservicev20141113State::delete_account_setting`]).
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +157,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteAccountSetting` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteAccountSettingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteAccountSetting"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteAccountSettingErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+        let _ = ctx;
+
+        // "`aws_managed` account settings are read-only, as Amazon Web Services manages
+        // such on the customer's behalf" (`Setting$type`) — so disabling one is refused
+        // for the same reason writing one is: nobody but Amazon Web Services sets it.
+        if crate::state::account_setting_spec(&input.name)
+            .is_some_and(|spec| spec.setting_type == crate::state::SETTING_TYPE_AWS_MANAGED)
+        {
+            return Err(DeleteAccountSettingErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(format!(
+                        "{} is managed by Amazon Web Services and is read-only",
+                        input.name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "If this field is omitted, the setting is changed only for the authenticated
+        // user" — the one identity this emulator authenticates every request as. "If you
+        // specify the root user, it disables the account setting for all users, roles,
+        // and the root user of the account", which is what the store's defaults map
+        // holds.
+        let principal_arn = match input.principal_arn.as_deref() {
+            Some(arn) if !crate::state::is_principal_arn(arn) => {
+                return Err(DeleteAccountSettingErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(crate::state::invalid_principal_arn_message(arn)),
+                    },
+                )
+                .into())
+            }
+            Some(arn) => arn.to_string(),
+            None => crate::state::caller_identity_arn(),
+        };
+
+        // `setting`: "The account setting for the specified principal ARN" — the one
+        // this call disabled, so the caller sees which value stopped applying to that
+        // principal. A name the principal held no setting of leaves nothing to report
+        // but the account setting already in effect for it, which is also what still
+        // applies afterwards.
+        let setting = {
+            let mut guard = state.lock();
+            match guard.delete_account_setting(&principal_arn, &input.name) {
+                Some(value) => crate::state::setting_view(&input.name, &value, &principal_arn),
+                None => {
+                    let resolved = guard.effective_account_setting(&principal_arn, &input.name);
+                    crate::state::setting_view(&input.name, &resolved.value, &resolved.principal_arn)
+                }
+            }
+        };
+
+        Ok(DeleteAccountSettingOutput {
+            setting: Some(setting),
+        })
     }
 }

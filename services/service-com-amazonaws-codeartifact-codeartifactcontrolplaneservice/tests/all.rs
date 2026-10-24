@@ -61,3 +61,5 @@ mod update_operations_persist;
 mod package_group_arn_encoding;
 #[path = "all/package_version_asset_download.rs"]
 mod package_version_asset_download;
+#[path = "all/package_group_allowed_repositories.rs"]
+mod package_group_allowed_repositories;

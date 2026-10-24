@@ -21,13 +21,15 @@
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly, or serve a modelled operation WRAPPED. This service wraps one:
-//!   `CreateStream` is served behind
+//!   correctly, or serve a modelled operation WRAPPED. This service wraps every
+//!   one of them in [`InModelledEnvelope`], so a request refused before its
+//!   handler runs is refused in this service's own modelled `ValidationException`
+//!   rather than in the framework's pre-dispatch envelope (see the section below),
+//!   and `CreateStream` additionally behind
 //!   [`crate::ops::create_stream::PassRoleGate`], because the pass-role
 //!   authorization decision on its `targetDefinition` has to be reached before
 //!   the framework's model-constraint validation, and this is the only seam
-//!   handed the request. Every other key resolves through the generated routing
-//!   table.
+//!   handed the request.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -44,118 +46,36 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! # How this service refuses a request it never ran
+//!
+//! `ValidationException` is one of the errors this model binds to EVERY operation,
+//! and it declares `message` AND `reason` as `@required`
+//! (`smithy_query(query="shape", shape="ValidationException")`), so a request refused
+//! for a modelled constraint is answered with that whole body — `reason`, and
+//! `fieldList` naming the members that failed — exactly as this service's handler-side
+//! refusals are. The framework's pre-dispatch renderer cannot: its only seam,
+//! `override_refusal`, carries a code and a sentence, so the body it writes is
+//! `message` alone and a `@required` member is missing from it.
+//!
+//! Every operation is therefore served through [`InModelledEnvelope`], which states
+//! that refusal itself — from the framework's own deserializer and constraint walk —
+//! before the handler runs. [`validation`] owns the wording and the modelled body, and
+//! `override_refusal` words any refusal the framework still renders from the same
+//! helpers so the two paths cannot disagree.
 
+use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
+    http, BoxFuture, ErasedOperation, Operation, OperationContext, OperationRoutingTable, Refusal,
+    Refused, ServerHttpProtocol, Service,
 };
 use std::sync::Arc;
 
-/// `TagMap`'s modelled maximum entry count (`smithy_query(query="shape",
-/// shape="TagMap")`: `@length(min: 0, max: 200)`), read from the one place this
-/// crate spells that bound. A request carrying more tags than this is a bad
-/// request BODY, not a member-level constraint failure — see [`refused_for`].
-const TAG_MAP_MAX_ENTRIES: i64 = crate::state::MAX_TAGS_PER_RESOURCE as i64;
-
-/// The member every `TagMap` in this service is bound to (`tags` on
-/// `CreateCluster`, `CreateStream` and `TagResource`:
-/// `smithy_query(query="operation", operation="CreateCluster,CreateStream,TagResource")`).
-const TAG_MAP_MEMBER: &str = "tags";
-
-/// The error code Aurora DSQL refuses a malformed request body with, and the
-/// sentence it carries. Not a modelled shape: the service's REST frontend
-/// answers it before any operation's own errors are reachable.
-const BAD_REQUEST_CODE: &str = "BadRequestException";
-/// See [`BAD_REQUEST_CODE`].
-const BAD_REQUEST_MESSAGE: &str = "Invalid request body";
-
-/// How this service states a set of constraint violations.
-///
-/// Two refusals, told apart by WHAT failed:
-///
-/// * a tag map over [`TAG_MAP_MAX_ENTRIES`] is a bad request body, so the answer
-///   is [`BAD_REQUEST_CODE`] with [`BAD_REQUEST_MESSAGE`] — the whole batch is
-///   refused and none of it is applied;
-/// * everything else is a `ValidationException` whose message is the AWS
-///   envelope built from the member and its modelled constraint. DSQL's
-///   construction states the requirement ONLY: it does not echo the rejected
-///   value back to the caller, and it quotes a `@pattern` as modelled minus the
-///   `^`/`$` anchors.
-fn refused_for(violations: &[Violation]) -> Refused {
-    if violations.iter().any(is_tag_map_overflow) {
-        return Refused {
-            code: BAD_REQUEST_CODE.to_string(),
-            message: BAD_REQUEST_MESSAGE.to_string(),
-        };
-    }
-    Refused {
-        code: "ValidationException".to_string(),
-        message: validation_envelope(violations),
-    }
-}
-
-/// Whether `violation` is a tag map carrying more entries than `TagMap` allows.
-fn is_tag_map_overflow(violation: &Violation) -> bool {
-    violation.path.rsplit('.').next() == Some(TAG_MAP_MEMBER)
-        && matches!(violation.kind, ViolationKind::MaxLength(max) if max == TAG_MAP_MAX_ENTRIES)
-}
-
-/// `1 validation error detected: <clause>` / `N validation errors detected:
-/// <clause>; <clause>`, each clause as [`clause_for`] words it.
-fn validation_envelope(violations: &[Violation]) -> String {
-    let clauses: Vec<String> = violations.iter().map(clause_for).collect();
-    match clauses.len() {
-        // The framework only calls this with at least one violation; an empty
-        // set still has to read as a refusal rather than as an empty sentence.
-        0 => "1 validation error detected".to_string(),
-        1 => format!("1 validation error detected: {}", clauses[0]),
-        n => format!("{n} validation errors detected: {}", clauses.join("; ")),
-    }
-}
-
-/// One violation as DSQL states it: the member and the requirement it failed,
-/// with no echo of the value the caller sent.
-fn clause_for(violation: &Violation) -> String {
-    let path = &violation.path;
-    let requirement = match &violation.kind {
-        // An absent member has no value to withhold, so the clause names the
-        // absence itself.
-        ViolationKind::MissingRequiredMember => {
-            return format!("Value null at '{path}' failed to satisfy constraint: Member must not be null")
-        }
-        ViolationKind::MinLength(min) => {
-            format!("Member must have length greater than or equal to {min}")
-        }
-        ViolationKind::MaxLength(max) => {
-            format!("Member must have length less than or equal to {max}")
-        }
-        ViolationKind::MinValue(min) => {
-            format!("Member must have value greater than or equal to {min}")
-        }
-        ViolationKind::MaxValue(max) => {
-            format!("Member must have value less than or equal to {max}")
-        }
-        ViolationKind::Pattern(pattern) => format!(
-            "Member must satisfy regular expression pattern: {}",
-            unanchored(pattern)
-        ),
-        ViolationKind::EnumValue(allowed) => {
-            format!("Member must satisfy enum value set: [{}]", allowed.join(", "))
-        }
-        ViolationKind::UniqueItems => "Member must have unique values".to_string(),
-        // `ViolationKind` is `#[non_exhaustive]`: a class this service has no
-        // wording for keeps the framework's own clause rather than being dropped.
-        _ => return violation.message(),
-    };
-    format!("Value at '{path}' failed to satisfy constraint: {requirement}")
-}
-
-/// A `@pattern` as DSQL quotes it: the modelled regex without its leading `^`
-/// and trailing `$`, which are the anchors Smithy's find-semantics make
-/// redundant and which AWS does not print.
-fn unanchored(pattern: &str) -> &str {
-    let without_caret = pattern.strip_prefix('^').unwrap_or(pattern);
-    without_caret.strip_suffix('$').unwrap_or(without_caret)
-}
+/// The refusal layer: how this service words a request it never ran, and the modelled
+/// `ValidationException` body it answers with. Internal to this crate — what a client
+/// sees of it is the error on the wire, which the crate's tests assert through the
+/// router.
+mod validation;
 
 /// The `com-amazonaws-dsql-dsql` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -164,11 +84,31 @@ fn unanchored(pattern: &str) -> &str {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
-    /// `CreateStream` as this service serves it: the generated operation behind
-    /// its pass-role gate, so the authorization decision on the target's role is
-    /// reached ahead of the framework's model-constraint validation. See
-    /// [`crate::ops::create_stream::PassRoleGate`] and [`Self::override_operation`].
-    create_stream: crate::ops::create_stream::PassRoleGate<Eng>,
+    /// The same modelled operations the generated table holds, each wrapped in
+    /// [`InModelledEnvelope`] so a request refused before its handler runs is refused
+    /// in this service's own modelled `ValidationException` — and `CreateStream`
+    /// wrapped once more in [`crate::ops::create_stream::PassRoleGate`], outside that
+    /// envelope, so the authorization decision on the target's role is reached ahead
+    /// of the model-constraint validation. Keyed by the routing key the protocol
+    /// resolves — the key the generated table uses — and built from the SAME shared
+    /// engine, so a wrapped operation reads and writes the one store.
+    in_modelled_envelope: OperationRoutingTable,
+}
+
+/// Wire one `crate::ops::<module>::<Operation>` per line into `table`, each wrapped in
+/// [`InModelledEnvelope`] and keyed by its operation shape name — the routing key
+/// `ServerProtocol::routing_key` resolves and the generated table is keyed by.
+macro_rules! wrap_operations {
+    ($table:expr, $engine:expr, $($module:ident :: $operation:ident),+ $(,)?) => {
+        $(
+            $table.add_operation(
+                stringify!($operation),
+                ::std::boxed::Box::new(InModelledEnvelope::new(
+                    crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
+                )) as ::std::boxed::Box<dyn ErasedOperation>,
+            );
+        )+
+    };
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -176,12 +116,115 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
+        // EVERY operation of the model, because `ValidationException` is a
+        // service-COMMON error: the constraint refusal each one owes is the same
+        // refusal, so none of them may answer it in a different body. The list is
+        // hand-maintained — `OperationRoutingTable` exposes only `add_operation` /
+        // `get`, so this crate cannot walk the generated table to wrap whatever it
+        // holds — and an operation added to the model and not added here would fall
+        // back to the framework's `message`-only envelope;
+        // `tests/all/boundary_validation_exception.rs` names every operation the model
+        // declares and is what catches the omission.
+        let mut in_modelled_envelope = OperationRoutingTable::new();
+        wrap_operations!(
+            in_modelled_envelope,
+            engine,
+            create_cluster::CreateCluster,
+            delete_cluster::DeleteCluster,
+            delete_cluster_policy::DeleteClusterPolicy,
+            delete_stream::DeleteStream,
+            get_cluster::GetCluster,
+            get_cluster_policy::GetClusterPolicy,
+            get_stream::GetStream,
+            get_vpc_endpoint_service_name::GetVpcEndpointServiceName,
+            list_clusters::ListClusters,
+            list_streams::ListStreams,
+            list_tags_for_resource::ListTagsForResource,
+            put_cluster_policy::PutClusterPolicy,
+            tag_resource::TagResource,
+            untag_resource::UntagResource,
+            update_cluster::UpdateCluster,
+        );
+        // `CreateStream` is the one operation with a decision AHEAD of the
+        // constraint refusal: being allowed to pass the role its `targetDefinition`
+        // names is an authorization decision about the caller and that one member, so
+        // the pass-role gate wraps the envelope rather than the other way round — a
+        // request naming a role this account cannot pass is 403 whichever other
+        // constraint it breaks.
+        in_modelled_envelope.add_operation(
+            <crate::ops::create_stream::CreateStream<Eng> as Operation>::NAME,
+            Box::new(crate::ops::create_stream::PassRoleGate::over(
+                InModelledEnvelope::new(crate::ops::create_stream::CreateStream::new(Arc::clone(
+                    &engine,
+                ))),
+            )) as Box<dyn ErasedOperation>,
+        );
         Self {
-            // The SAME engine, so the gated `CreateStream` reads and writes the one
-            // shared store every other operation does.
-            create_stream: crate::ops::create_stream::PassRoleGate::new(Arc::clone(&engine)),
             entry: crate::ServiceDefinition::new(engine),
+            in_modelled_envelope,
         }
+    }
+}
+
+/// One modelled operation, served with the refusal it owes stated in this service's
+/// own modelled `ValidationException`.
+///
+/// The framework's pre-dispatch renderer gets the status (400) and the wire code
+/// (`ValidationException`) right and the BODY wrong: `Service::override_refusal`, the
+/// only seam it consults, carries a code and a sentence, so the body is `message`
+/// alone — while this model declares `reason` `@required` on that shape and binds it
+/// to every operation. A client branching on `reason` finds it absent for the most
+/// common failure of the whole service.
+///
+/// So this wrapper collects the refusal itself — the very classes the framework's own
+/// walk collects, from the framework's own deserializer and constraint walk — and
+/// renders it through the model's `ValidationException` schema, built from the
+/// structured violations rather than from a rendered response. Nothing else is
+/// re-implemented: a request it does not refuse is handed to the generated
+/// `ErasedOperation::run`, which owns deserialize -> validate -> handle -> serialize,
+/// telemetry and every modelled error. The cost is that such a request is read twice,
+/// once here and once in the operation's own sequence, because the framework hands no
+/// already-built input to an operation.
+struct InModelledEnvelope<O> {
+    operation: O,
+}
+
+impl<O> InModelledEnvelope<O> {
+    /// Wrap one operation, already constructed from the shared engine.
+    fn new(operation: O) -> Self {
+        Self { operation }
+    }
+}
+
+impl<O> ErasedOperation for InModelledEnvelope<O>
+where
+    O: Operation + ErasedOperation,
+{
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        Box::pin(async move {
+            // Scoped so the borrowed `&dyn ErasedServiceDefinition` — which is not
+            // `Sync`, while this future is — is dropped before the await below. The
+            // protocol itself is.
+            let refusal = {
+                let protocol: &dyn ServerHttpProtocol = svc.definition().protocol();
+                validation::modeled_refusal::<O>(protocol, req)
+            };
+            if let Some(refusal) = refusal {
+                return refusal;
+            }
+            self.operation.run(svc, req, ctx).await
+        })
+    }
+
+    /// The wrapped operation's modelled auth schemes: wrapping an operation must not
+    /// change which schemes sign it.
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        self.operation.auth_schemes()
     }
 }
 
@@ -208,26 +251,32 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
         // NOT a re-route: the key is the one the generated table's own protocol
-        // resolves, and for `CreateStream` the operation served is that same
-        // operation — wrapped so the pass-role authorization decision on
-        // `targetDefinition` is reached ahead of the framework's model-constraint
-        // validation, which no other seam is handed the request to do (see
-        // `PassRoleGate`). Every other key answers `None` here and resolves through
-        // the generated routing table exactly as it did before.
+        // resolves, and the operation it names is the one served — wrapped in
+        // `InModelledEnvelope` so a request refused before the handler runs is refused
+        // in this service's modelled `ValidationException`, which carries the
+        // `@required` `reason` the framework's pre-dispatch envelope cannot, and
+        // `CreateStream` wrapped once more in `PassRoleGate` so the pass-role
+        // authorization decision on `targetDefinition` is reached ahead of that
+        // validation, which no other seam is handed the request to do. A key the model
+        // does not name resolves to `None` here exactly as it does in the generated
+        // table, so the router's routing-error path is unchanged.
         let key = self.entry.protocol().routing_key(req).ok()?;
-        let create_stream =
-            <crate::ops::create_stream::CreateStream<Eng> as smithy_server_runtime::Operation>::NAME;
-        (key == create_stream).then_some(&self.create_stream as &dyn ErasedOperation)
+        self.in_modelled_envelope.get(key)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service state it the way Aurora DSQL states it. Both halves below
-        // replace the code AND the message together, because a client branches on
-        // the code.
+        // service state it the way Aurora DSQL states it. `InModelledEnvelope`
+        // answers a refusal it can state in the modelled `ValidationException`
+        // BODY, so what reaches here is what the framework still renders: a tag
+        // map over its modelled maximum (a bad request body, which is not a
+        // modelled shape), and the fallback when the modelled error cannot be
+        // serialized. Worded from the same helpers, so the two paths cannot
+        // disagree. Both halves replace the code AND the message together, because
+        // a client branches on the code.
         match refusal {
-            Refusal::Invalid(violations) => Some(refused_for(violations)),
+            Refusal::Invalid(violations) => Some(validation::refused_for(violations)),
             // Authentication is the framework's answer to give; DSQL words it no
             // differently.
             _ => None,

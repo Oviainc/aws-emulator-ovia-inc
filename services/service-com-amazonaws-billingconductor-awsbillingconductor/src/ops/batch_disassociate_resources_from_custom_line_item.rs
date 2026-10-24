@@ -1,15 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchDisassociateResourcesFromCustomLineItem
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchDisassociateResourcesFromCustomLineItem`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! REMOVES the association of each requested resource from a percentage custom line
+//! item, and reports the outcome PER RESOURCE: the ones it disassociated in
+//! `SuccessfullyDisassociatedResources`, the ones it could not in
+//! `FailedDisassociatedResources` with the modelled `AssociateResourceErrorReason`.
+//! `ListResourcesAssociatedToCustomLineItem` reads back what is left.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchDisassociateResourcesFromCustomLineItem::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A fault of the REQUEST as a whole — a target that does not exist, a target that is
+//! not a percentage custom line item, a billing period range that covers no period —
+//! is a modelled error for the whole call; a fault of ONE named resource is that
+//! element's `Error`, because the batch's other elements still succeed.
+//!
+//! The operation is `@idempotent`, so a resource the item does not hold an association
+//! for is already disassociated: that element succeeds and changes nothing, and a retry
+//! of a call that succeeded answers the same way.
+//!
+//! `BillingPeriodRange` is "the billing period range in which the custom line item
+//! request will be applied", and an association is stored over the half-open range
+//! `[InclusiveStartBillingPeriod, ExclusiveEndBillingPeriod)`. So a request that names
+//! no range disassociates the resource in every billing period and the association is
+//! dropped, while one that names a range takes effect FROM its inclusive start: the
+//! association keeps the earlier periods it applied in and ENDS there, which is the
+//! `EndBillingPeriod` a later read reports. An association left covering no period at
+//! all is dropped. Nothing re-associates a resource but
+//! `BatchAssociateResourcesToCustomLineItem`, so the range's exclusive end does not
+//! restore the association after it — it is checked for order and bounds nothing else.
 //!
 //! ## Shape of an operation
 //!
@@ -124,6 +140,89 @@ impl From<BatchDisassociateResourcesFromCustomLineItemErrorModeled> for BatchDis
     }
 }
 
+/// Refuse the request with this operation's modelled 400 `ValidationException`,
+/// naming the `ValidationExceptionReason` the model enumerates and the member at
+/// fault.
+fn validation(
+    reason: &str,
+    field: &str,
+    message: String,
+) -> BatchDisassociateResourcesFromCustomLineItemError {
+    BatchDisassociateResourcesFromCustomLineItemErrorModeled::ValidationException(
+        crate::state::validation_exception(reason, field, message),
+    )
+    .into()
+}
+
+/// Why one requested resource cannot be disassociated: the modelled
+/// `AssociateResourceErrorReason` that classifies it, and the text that says which
+/// resource and why.
+type DisassociationRefusal = (&'static str, String);
+
+/// One requested resource resolved against the store: what the caller named, and
+/// either the full ARN of the resource it names or the refusal its element reports.
+type ResolvedResource<'a> = (&'a String, Result<String, DisassociationRefusal>);
+
+/// One element of `FailedDisassociatedResources`: the resource as the CALLER named
+/// it, and why its disassociation failed, classified by the
+/// `AssociateResourceErrorReason` the model enumerates.
+fn failed(arn: &str, reason: &str, message: String) -> DisassociateResourceResponseElement {
+    DisassociateResourceResponseElement {
+        arn: Some(arn.to_string()),
+        error: Some(AssociateResourceError {
+            message: Some(message),
+            reason: Some(reason.to_string()),
+        }),
+    }
+}
+
+/// Apply a disassociation that takes effect from `effective_from` to the stored
+/// association at `index`, and report whether the stored state CHANGED.
+///
+/// `None` disassociates the resource in every billing period, so the association is
+/// dropped. A billing period ends the association there: the periods before it are
+/// ones the association applied in, and the ones from it on are the ones the request
+/// disassociates. An association that would then cover no period at all — one that
+/// starts at or after the disassociation, or already ends at or before it — is
+/// dropped, and one that already ends there is left exactly as it is, so a retry of
+/// the same request changes nothing.
+fn apply_disassociation(
+    associations: &mut Vec<crate::state::ResourceAssociationRecord>,
+    index: usize,
+    effective_from: Option<&str>,
+) -> bool {
+    let Some(from) = effective_from.and_then(|from| {
+        crate::state::billing_period_key(from).map(|key| (from.to_string(), key))
+    }) else {
+        // No range, or a range whose start is no billing period at all (which the
+        // modelled `BillingPeriod` pattern already refuses before this handler runs):
+        // the disassociation is not bounded to any period.
+        associations.remove(index);
+        return true;
+    };
+    let (from_period, from_key) = from;
+    let association = &mut associations[index];
+    let starts_at_or_after = association
+        .inclusive_start_billing_period
+        .as_deref()
+        .and_then(crate::state::billing_period_key)
+        .is_some_and(|start| start >= from_key);
+    if starts_at_or_after {
+        associations.remove(index);
+        return true;
+    }
+    let already_ended = association
+        .exclusive_end_billing_period
+        .as_deref()
+        .and_then(crate::state::billing_period_key)
+        .is_some_and(|end| end <= from_key);
+    if already_ended {
+        return false;
+    }
+    association.exclusive_end_billing_period = Some(from_period);
+    true
+}
+
 /// The `BatchDisassociateResourcesFromCustomLineItem` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -160,18 +259,145 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchDisassociateResourcesFromCustomLineItem` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchDisassociateResourcesFromCustomLineItemErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchDisassociateResourcesFromCustomLineItem"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                BatchDisassociateResourcesFromCustomLineItemErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the billingconductor store is unavailable".to_string(),
+                        retry_after_seconds: 0,
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut state = state.lock();
+
+        // "A percentage custom line item ARN to disassociate the resources from" — the
+        // pattern accepts the full ARN or the bare id, and both name one stored item.
+        let target_arn = crate::state::normalize_custom_line_item_arn(&input.target_arn);
+        let Some(target) = state.custom_line_items.get(&target_arn) else {
+            return Err(
+                BatchDisassociateResourcesFromCustomLineItemErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: "the custom line item does not exist".to_string(),
+                        resource_id: target_arn,
+                        resource_type: "customlineitem".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Only a PERCENTAGE custom line item has associated resources at all — a flat
+        // item's charge is a fixed value that no association enters into — so a flat
+        // target is not an item this operation can disassociate anything from.
+        if !target.is_percentage() {
+            return Err(validation(
+                "ILLEGAL_CUSTOMLINEITEM",
+                "TargetArn",
+                format!("the custom line item {target_arn} is not a percentage custom line item"),
+            ));
+        }
+
+        // The range the disassociation applies in: the start is inclusive and the end
+        // exclusive, so an end at or before the start would cover no billing period.
+        if let Some(range) = &input.billing_period_range {
+            if !crate::state::billing_period_range_is_ordered(range) {
+                return Err(validation(
+                    "ILLEGAL_BILLING_PERIOD_RANGE",
+                    "BillingPeriodRange.ExclusiveEndBillingPeriod",
+                    "the exclusive end billing period must be later than the inclusive \
+                     start billing period"
+                        .to_string(),
+                ));
+            }
+        }
+        let effective_from = input
+            .billing_period_range
+            .as_ref()
+            .map(|range| range.inclusive_start_billing_period.clone());
+
+        // EVERY requested resource is resolved against the store FIRST, so the
+        // outcomes are decided on one consistent view and the stored item is borrowed
+        // exactly once below. `Ok` is the resource's full ARN, `Err` the reason its
+        // disassociation cannot be made.
+        let resolved: Vec<ResolvedResource<'_>> = input
+            .resource_arns
+            .iter()
+            .map(|requested| {
+                let outcome = match state.resolve_association_element(requested) {
+                    // The ARN has to name a resource that exists: a billing group or
+                    // another custom line item, in the full-ARN or the bare-id form.
+                    None => Err((
+                        "INVALID_ARN",
+                        format!("the resource {requested} does not exist"),
+                    )),
+                    // A custom line item is never a resource of itself, so naming the
+                    // target as its own resource is a fault of that element whatever
+                    // the store holds.
+                    Some(arn) if arn == target_arn => Err((
+                        "ILLEGAL_CUSTOMLINEITEM",
+                        "a custom line item cannot be disassociated from itself".to_string(),
+                    )),
+                    Some(arn) => Ok(arn),
+                };
+                (requested, outcome)
+            })
+            .collect();
+
+        // The target was read above under the same lock this handler still holds, so
+        // it is still stored. Answering the modelled server error rather than skipping
+        // the resource keeps the promise the output shape makes: every requested
+        // resource is reported in one of the two lists.
+        let now = crate::state::now_millis();
+        let Some(target) = state.custom_line_items.get_mut(&target_arn) else {
+            return Err(
+                BatchDisassociateResourcesFromCustomLineItemErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the custom line item could not be read for writing".to_string(),
+                        retry_after_seconds: 0,
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut disassociated = Vec::new();
+        let mut failures = Vec::new();
+        for (requested, outcome) in resolved {
+            let resource_arn = match outcome {
+                Err((reason, message)) => {
+                    failures.push(failed(requested, reason, message));
+                    continue;
+                }
+                Ok(resource_arn) => resource_arn,
+            };
+            // `@idempotent`: an item that holds no association for the resource is
+            // already disassociated from it, so the element succeeds and nothing is
+            // written — which is also how a retry of a call that succeeded answers.
+            if let Some(index) = target
+                .associated_resources
+                .iter()
+                .position(|association| association.arn == resource_arn)
+            {
+                if apply_disassociation(
+                    &mut target.associated_resources,
+                    index,
+                    effective_from.as_deref(),
+                ) {
+                    target.last_modified_time_millis = now;
+                }
+            }
+            disassociated.push(DisassociateResourceResponseElement {
+                arn: Some(requested.clone()),
+                error: None,
+            });
+        }
+
+        Ok(BatchDisassociateResourcesFromCustomLineItemOutput {
+            successfully_disassociated_resources: Some(disassociated),
+            failed_disassociated_resources: Some(failures),
+        })
     }
 }

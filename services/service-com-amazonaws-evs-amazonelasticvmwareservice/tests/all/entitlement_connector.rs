@@ -31,7 +31,7 @@
 
 use serde_json::{json, Value};
 
-use crate::environment_lifecycle::{call, create, emulator, error_type, Emulator};
+use crate::environment_lifecycle::{call, create_settled, emulator, error_type, Emulator};
 
 /// Every `ConnectorType` the model declares, from the catalog this crate generated from
 /// the model (`smithy_query(query="shape", shape="ConnectorType")`).
@@ -83,11 +83,14 @@ pub(crate) async fn connector_in(
 
 /// A fresh environment with its own vCenter Server connector: the setup every
 /// entitlement test needs, because an entitlement is created through such a connector.
+///
+/// The environment is SETTLED, because a list addressed to one that is still
+/// initializing is refused (`tests/all/list_while_initializing.rs`).
 pub(crate) async fn environment_with_vcenter_connector(
     router: &Emulator,
     case: &str,
 ) -> (String, String) {
-    let environment = create(router, None).await;
+    let environment = create_settled(router, None).await;
     let connector = connector_in(router, case, &environment, VCENTER).await;
     (environment, connector)
 }

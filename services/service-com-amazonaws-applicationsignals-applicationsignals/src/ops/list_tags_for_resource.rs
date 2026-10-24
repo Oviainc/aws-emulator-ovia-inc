@@ -131,11 +131,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
     /// Report the tags attached to the resource the `ResourceArn` names.
     ///
-    /// A read (`@readonly`): it reports what the tag writers stored and writes nothing, so
-    /// two calls for one resource answer identically. A resource with no tags reports the
-    /// empty list rather than a failure — the resource exists, it just carries nothing —
-    /// while an ARN that names no resource this service holds is the modelled
-    /// `ResourceNotFoundException` (404).
+    /// A read (`@readonly`): it reports what the tag writers stored and writes nothing of
+    /// its own, so two calls for one resource answer identically. A resource with no tags
+    /// reports the empty list rather than a failure — the resource exists, it just carries
+    /// nothing — while an ARN that names no resource this service holds is the modelled
+    /// `ResourceNotFoundException` (404). Which ARNs name a resource this service holds is
+    /// [`crate::state::ComAmazonawsApplicationsignalsApplicationsignalsState::tagged_resource_arn`]'s
+    /// rule, over every taggable resource kind, so a tag set a writer persisted under a
+    /// resource's own ARN is readable by that ARN.
+    ///
+    /// The one write it performs is the expiry the CLOCK already made due: a lapsed
+    /// instrumentation configuration is no longer served, so neither is its tag set — the
+    /// same answer this call would give had nobody ever made it.
     async fn handle(
         &self,
         input: Self::Input,
@@ -150,7 +157,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let store = state.lock();
+        let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+
+        let mut store = state.lock();
+
+        // A resource whose lifetime the clock has ended is gone, tags included, so the pass
+        // that materialises the lapse runs before the ARN is resolved. Without it this read
+        // would report the tags of a configuration a Get already answers 404 for.
+        store.expire_instrumentation_configurations(&now);
+
         let Some(arn) = store.tagged_resource_arn(&input.resource_arn) else {
             return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
                 crate::state::tagged_resource_not_found(&input.resource_arn),
