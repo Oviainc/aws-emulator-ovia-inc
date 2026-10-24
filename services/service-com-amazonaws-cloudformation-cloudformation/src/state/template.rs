@@ -1928,6 +1928,13 @@ fn naming_rules(resource_type: &str) -> Option<NameRules> {
         // Amazon EC2 `CreateSecurityGroup.GroupName`: "Up to 255 characters in length"
         // (Amazon EC2 API reference) — EC2's model carries no `@length` for it.
         "AWS::EC2::SecurityGroup" => rules(255, Characters::AsGenerated),
+        // Amazon EventBridge `PutRule.Name`: `RuleName`, `@length(min: 1, max: 64)` with
+        // pattern `^[\.\-_A-Za-z0-9]+$` (EventBridge's own Smithy model), which a
+        // generated name is already inside but may be longer than.
+        EVENTS_RULE => rules(64, Characters::AsGenerated),
+        // Systems Manager `PutParameter.Name`: `PSParameterName`,
+        // `@length(min: 1, max: 2048)` (the SSM model's own bound).
+        SSM_PARAMETER => rules(2048, Characters::AsGenerated),
         _ => None,
     }
 }
@@ -2313,6 +2320,7 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     ELB_LISTENER_RULE,
     ELB_LOAD_BALANCER,
     ELB_TARGET_GROUP,
+    EVENTS_RULE,
     FIS_EXPERIMENT_TEMPLATE,
     GUARDDUTY_DETECTOR,
     "AWS::IAM::Role",
@@ -2326,6 +2334,7 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     SNS_TOPIC,
     SQS_QUEUE,
     "AWS::SecretsManager::Secret",
+    SSM_PARAMETER,
     "AWS::Transfer::Server",
     "AWS::Transfer::Workflow",
 ];
@@ -2560,6 +2569,38 @@ fn return_values(
                 "Arn".to_string(),
                 ::emulator_server::emulator_arn("iam", "", &format!("role/{name}")),
             );
+            (name.to_string(), attributes)
+        }
+        // "Ref returns the rule name"; Fn::GetAtt: Arn. An EventBridge rule ARN names the
+        // bus the rule is bound to unless that is the account's `default` bus
+        // (`arn:aws:events:<region>:<account>:rule/[<bus>/]<name>`), which is the form the
+        // `events` service mints for the rule this stack provisions.
+        EVENTS_RULE => {
+            let bus = properties
+                .get("EventBusName")
+                .and_then(|value| text(value, scope, 0, budget))
+                .map(|bus| event_bus_name(&bus))
+                .filter(|bus| !bus.is_empty() && bus != DEFAULT_EVENT_BUS)
+                .map(|bus| format!("{bus}/"))
+                .unwrap_or_default();
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn("events", region, &format!("rule/{bus}{name}")),
+            );
+            (name.to_string(), attributes)
+        }
+        // "Ref returns the name of the parameter"; Fn::GetAtt: Type, Value — the two
+        // required properties of the declaration, which is what the parameter Systems
+        // Manager holds carries.
+        SSM_PARAMETER => {
+            for attribute in ["Type", "Value"] {
+                if let Some(declared) = properties
+                    .get(attribute)
+                    .and_then(|value| text(value, scope, 0, budget))
+                {
+                    attributes.insert(attribute.to_string(), declared);
+                }
+            }
             (name.to_string(), attributes)
         }
         // "Ref returns the repository name"; Fn::GetAtt: Arn. Amazon ECR Public is a
@@ -3146,6 +3187,8 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         APIGATEWAY_RESOURCE => &["ResourceId"],
         APIGATEWAY_DEPLOYMENT => &["DeploymentId"],
         GUARDDUTY_DETECTOR => &["Id"],
+        EVENTS_RULE => &["Arn"],
+        SSM_PARAMETER => &["Type", "Value"],
         _ => &[],
     }
 }
@@ -3270,6 +3313,35 @@ pub const WAF_REGIONAL_IP_SET: &str = "AWS::WAFRegional::IPSet";
 /// identifier and MINTS one — so the id a stack's output reports for it is the one that
 /// service answered with.
 pub const GUARDDUTY_DETECTOR: &str = "AWS::GuardDuty::Detector";
+
+/// An Amazon EventBridge rule's resource type (the EventBridge model:
+/// `cloudFormationName: Events`). This is a type `super::provisioning` creates in
+/// EventBridge itself, and "Ref returns the rule name", so the rule a stack's output names
+/// is the one `events DescribeRule` answers with.
+pub const EVENTS_RULE: &str = "AWS::Events::Rule";
+
+/// The event bus a rule declaring none is bound to — "if you omit this, the default event
+/// bus is used" (`PutRule$EventBusName`) — and the one bus whose name a rule ARN does not
+/// carry a segment for.
+const DEFAULT_EVENT_BUS: &str = "default";
+
+/// The bus NAME an `EventBusName` property names.
+///
+/// EventBridge's `EventBusNameOrArn` admits either a bare name or an event-bus ARN, so an
+/// ARN is reduced to everything after its `event-bus/` resource-type segment — the whole
+/// remainder, not the text after the last `/`, because a bus name may itself carry `/`.
+fn event_bus_name(declared: &str) -> String {
+    match declared.split_once(":event-bus/") {
+        Some((_, name)) => name.to_string(),
+        None => declared.to_string(),
+    }
+}
+
+/// A Systems Manager Parameter Store parameter's resource type (the SSM model:
+/// `cloudFormationName: SSM`). This is a type `super::provisioning` creates in Systems
+/// Manager itself, and "Ref returns the name of the parameter", so the parameter a stack
+/// declares is the one `ssm GetParameter` answers with.
+pub const SSM_PARAMETER: &str = "AWS::SSM::Parameter";
 
 /// How many characters the id Amazon GuardDuty mints for a detector carries: 32 lowercase
 /// hexadecimal, the form that service's own `mint_id` produces (`DETECTOR_ID_LEN` in
@@ -4407,6 +4479,10 @@ mod tests {
             resource_type: resource_type.to_string(),
             properties: ::serde_json::json!({
                 "Engine": "aurora-mysql",
+                // The two required properties of an `AWS::SSM::Parameter`, which are also
+                // the two values that type publishes.
+                "Type": "String",
+                "Value": "a-value",
                 "LoadBalancerArn": format!(
                     "arn:{PARTITION}:elasticloadbalancing:us-east-1:000000000000:\
                      loadbalancer/app/a-name/0123456789abcdef"

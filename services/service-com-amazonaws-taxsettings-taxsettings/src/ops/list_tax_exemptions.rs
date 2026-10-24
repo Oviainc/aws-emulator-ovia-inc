@@ -1,15 +1,35 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTaxExemptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTaxExemptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTaxExemptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages through the exemptions every account holds, in account-id order, as a
+//! map of account id to that account's `TaxExemptionDetails`. Purely reporting:
+//! it changes nothing a later caller sees.
+//!
+//! An account appears only when it holds at least one exemption
+//! `PutTaxExemption` recorded for it, so the map is the exemptions the store
+//! holds rather than a row per account id a caller has ever named. Each account's
+//! details come from the same
+//! [`crate::state::ComAmazonawsTaxsettingsTaxsettingsState::exemption_details`]
+//! projection `BatchGetTaxExemptions` reports, so the two readers cannot describe
+//! one account's exemptions differently.
+//!
+//! The cursor is opaque and names the account id the previous page stopped
+//! after, so resuming means "the first account strictly greater than it" — well
+//! defined because the store is ordered. It is the same cursor
+//! `ListTaxRegistrations` issues ([`crate::state::encode_page_token`]), because
+//! both page by account id.
+//!
+//! The page size is the SERVER's decision: `maxResults` when the request names
+//! one, [`crate::state::DEFAULT_PAGE_SIZE`] when it does not, capped at
+//! [`crate::state::MAX_PAGE_SIZE`] — so a request that names no page size cannot
+//! ask for the whole store in one response, and the work done while the state
+//! lock is held is bounded by the page.
+//!
+//! Enumerating the exemptions reports each record as the projection renders it
+//! at this instant, so an exemption whose expiration date has passed is reported
+//! `Expired` whether or not anybody called — the transition the clock owes a
+//! stored exemption. The listing itself writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +168,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTaxExemptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTaxExemptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTaxExemptions"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListTaxExemptionsErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+        })?;
+
+        // The page size is the server's decision: what `maxResults` asked for,
+        // else the emulator's default, and never more than its ceiling. The
+        // request's own 1..=1000 range is a modelled constraint the boundary
+        // already refused outside, but a request that names NO page size must
+        // still get a bounded page.
+        let page_size = crate::state::page_size(input.max_results);
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => Some(
+                crate::state::decode_page_token(token)
+                    .map_err(ListTaxExemptionsErrorModeled::ValidationException)?,
+            ),
+            None => None,
+        };
+
+        // The page is built while the state lock is held, so the work done under
+        // it is bounded by `page_size` accounts, not by the size of the store;
+        // the guard is released before the response is assembled. Resuming uses
+        // the ordered map's own `range`, so a cursor's page costs a lookup rather
+        // than a scan of everything before it.
+        let now = ::std::time::SystemTime::now();
+        let (page, more_remain) = {
+            let store = state.lock();
+            let lower = match resume_after.as_deref() {
+                Some(after) => ::std::ops::Bound::Excluded(after),
+                None => ::std::ops::Bound::Unbounded,
+            };
+            let mut remaining = store
+                .exemptions
+                .range::<str, _>((lower, ::std::ops::Bound::Unbounded))
+                // An account's entry is created by the write that records its
+                // first exemption, so every entry holds at least one record; the
+                // projection answers `None` for an empty one, which this skips
+                // rather than reporting an account with nothing to report.
+                .filter_map(|(account_id, _)| {
+                    store
+                        .exemption_details(account_id, now)
+                        .map(|details| (account_id.clone(), details))
+                })
+                .peekable();
+            let page: Vec<(String, TaxExemptionDetails)> =
+                remaining.by_ref().take(page_size).collect();
+            let more_remain = remaining.peek().is_some();
+            (page, more_remain)
+        };
+
+        // A cursor is issued only when a further account remains, so the last
+        // page carries none. It names the LAST account of this page, which is the
+        // greatest account id in it because the store is enumerated in order —
+        // the reported map itself is unordered, so the cursor is taken from the
+        // page before it becomes one.
+        let next_token = if more_remain {
+            page.last()
+                .map(|(account_id, _)| crate::state::encode_page_token(account_id))
+        } else {
+            None
+        };
+
+        Ok(ListTaxExemptionsOutput {
+            // Always reported, even when this page carries no account: the member
+            // IS this listing's payload, so an empty map says "no exemptions",
+            // while an absent one would leave a client unable to tell that from a
+            // response that forgot to answer.
+            tax_exemption_details_map: Some(page.into_iter().collect()),
+            next_token,
+        })
     }
 }

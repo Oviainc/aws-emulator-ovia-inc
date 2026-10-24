@@ -60,6 +60,15 @@ pub const PIPE_RESOURCE_TYPE: &str = "pipe";
 /// declares for exactly this case, `ServiceQuotaExceededException` (402).
 pub const MAX_PIPES: usize = 100;
 
+/// The most tags one pipe carries.
+///
+/// Source: the `TagResource` documentation in `smithy-model/com-amazonaws-pipes-pipes.json`
+/// — "You can associate as many as 50 tags with a pipe." — the same bound as `TagMap`'s
+/// `@length(max: 50)`. A single request past the bound is already refused by the boundary
+/// validator; `TagResource` re-checks the bound against the tags ALREADY on the pipe, which
+/// no per-request constraint can express.
+pub const MAX_TAGS_PER_PIPE: usize = 50;
+
 /// The region an ARN carries when the request names none.
 const DEFAULT_REGION: &str = "us-east-1";
 
@@ -189,6 +198,21 @@ pub struct ComAmazonawsPipesPipesState {
 }
 
 impl ComAmazonawsPipesPipesState {
+    /// The stored pipe whose ARN is `arn`, if this account holds one.
+    ///
+    /// The tagging operations address a pipe by its `PipeArn` rather than by name, so the
+    /// lookup is over the ARN each record minted at create time. A pipe that was never
+    /// created — or that `DeletePipe` has removed — is simply absent here, which is the
+    /// 404 those operations model.
+    pub fn pipe_by_arn(&self, arn: &str) -> Option<&PipeRecord> {
+        self.pipes.values().find(|pipe| pipe.arn == arn)
+    }
+
+    /// [`Self::pipe_by_arn`] for the operations that write the record's tags.
+    pub fn pipe_by_arn_mut(&mut self, arn: &str) -> Option<&mut PipeRecord> {
+        self.pipes.values_mut().find(|pipe| pipe.arn == arn)
+    }
+
     /// Apply every state move the clock has already made due. Call this after locking,
     /// before reading any pipe's `CurrentState`: it writes only what was owed at this
     /// instant even if nobody had called, so a reporting operation may do it too.
