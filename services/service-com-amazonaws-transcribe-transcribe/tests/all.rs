@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/call_analytics_categories.rs"]
 mod call_analytics_categories;
+#[path = "all/call_analytics_category_updates.rs"]
+mod call_analytics_category_updates;
 #[path = "all/client_error_wire_status.rs"]
 mod client_error_wire_status;
 #[path = "all/medical_vocabularies.rs"]

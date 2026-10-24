@@ -10,9 +10,8 @@
 //! to a client: not-found invites a create-then-retry, a validation failure says the ARN
 //! itself is unusable. Deciding a foreign ARN without a lookup is also what keeps the
 //! answer from depending on what this account holds, which is the cross-tenant probe the
-//! ordering rules out. It holds for every tagging operation this service serves —
-//! `ListTagsForResource` and `TagResource` below; `UntagResource` is still a 501 stub under
-//! its own issue and will call the same check.
+//! ordering rules out. It holds for every tagging operation this service serves — all
+//! three of `ListTagsForResource`, `TagResource` and `UntagResource` below.
 //!
 //! It is asserted over a TABLE of ARNs that all satisfy the modelled `Arn` constraints
 //! (`@length 20..2048`, `@pattern ^arn:aws[-a-z0-9]*:(bcm-data-exports):[-a-z0-9]*:[0-9]{12}:[-a-zA-Z0-9/:_]+$`
@@ -116,9 +115,7 @@ async fn a_tagging_arn_of_another_account_is_refused_before_any_lookup() {
 
     let mut refusals: Vec<Value> = Vec::new();
     for (label, foreign) in foreign_arns(&own_resource) {
-        // Both tagging operations this service serves read the ARN the same way. (The
-        // third, `UntagResource`, is still a 501 stub under its own issue and will call
-        // the same check.)
+        // Every tagging operation this service serves reads the ARN the same way.
         for (operation, request) in [
             (
                 "ListTagsForResource",
@@ -130,6 +127,10 @@ async fn a_tagging_arn_of_another_account_is_refused_before_any_lookup() {
                     "ResourceArn": foreign,
                     "ResourceTags": [{ "Key": "env", "Value": "dev" }],
                 }),
+            ),
+            (
+                "UntagResource",
+                json!({ "ResourceArn": foreign, "ResourceTagKeys": ["env"] }),
             ),
         ] {
             let label = format!("{label} / {operation}");

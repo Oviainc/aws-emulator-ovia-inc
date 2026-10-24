@@ -2,14 +2,15 @@
 
 //! Engine state for the com-amazonaws-kafkaconnect-kafkaconnect service.
 //!
-//! Three resources live here — custom plugins, connectors and worker
-//! configurations — beside the conversions from the shapes a create request
-//! carries to the `*Description` shapes the read operations answer with, and the
-//! paging helper the list operations share. Every handler in `src/ops/` reaches
-//! this ONE struct through [`service_state`], so no two operations can read two
+//! Four resources live here — custom plugins, connectors, worker
+//! configurations and the connector operations a call against a connector
+//! starts — beside the conversions from the shapes a create request carries to
+//! the `*Description` shapes the read operations answer with, and the paging
+//! helper the list operations share. Every handler in `src/ops/` reaches this
+//! ONE struct through [`service_state`], so no two operations can read two
 //! copies of one resource.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
 
 use sha2::Digest;
@@ -83,6 +84,33 @@ pub const CONNECTOR_CREATING: &str = "CREATING";
 pub const CONNECTOR_RUNNING: &str = "RUNNING";
 /// `ConnectorState` between `DeleteConnector` and the connector's removal.
 pub const CONNECTOR_DELETING: &str = "DELETING";
+
+/// `ConnectorState` while a connector that was asked to restart is bringing its
+/// workers back; one of [`CONNECTOR_STATE_VALUES`]. The clock, not the next
+/// call, is what returns it to [`CONNECTOR_RUNNING`].
+pub const CONNECTOR_RESTARTING: &str = "RESTARTING";
+
+/// `ConnectorOperationType` of the operation a restart starts; one of
+/// [`CONNECTOR_OPERATION_TYPE_VALUES`].
+pub const CONNECTOR_OPERATION_RESTART: &str = "RESTART_CONNECTOR";
+
+/// `ConnectorOperationState` every connector operation starts in — the work is
+/// recorded and has not begun; one of [`CONNECTOR_OPERATION_STATE_VALUES`].
+pub const CONNECTOR_OPERATION_PENDING: &str = "PENDING";
+
+/// `ConnectorOperationState` while a restart is running.
+pub const CONNECTOR_OPERATION_RESTART_IN_PROGRESS: &str = "RESTART_IN_PROGRESS";
+
+/// `ConnectorOperationState` a restart that finished ends in.
+pub const CONNECTOR_OPERATION_RESTART_COMPLETE: &str = "RESTART_COMPLETE";
+
+/// The states a restart passes through after [`CONNECTOR_OPERATION_PENDING`],
+/// in order: the model's own two restart states, the last of which is terminal.
+/// Each step is owed [`TRANSITION_SPAN`] after the one before it.
+pub const RESTART_PROGRESSION: &[&str] = &[
+    CONNECTOR_OPERATION_RESTART_IN_PROGRESS,
+    CONNECTOR_OPERATION_RESTART_COMPLETE,
+];
 
 /// The version a freshly created connector is at. `currentVersion` is an opaque
 /// string to a client, which only ever echoes it back on an update or a delete.
@@ -164,13 +192,17 @@ impl PendingChange {
     }
 }
 
-/// The two changes the clock owes a kafkaconnect resource.
+/// The changes the clock owes a kafkaconnect resource.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PendingKind {
-    /// Leave the transient creating state for the resource's running state.
+    /// Leave the transient creating (or restarting) state for the resource's
+    /// running state.
     Settle,
     /// Finish a delete: drop the resource.
     Remove,
+    /// Move a connector operation to the next state of its own progression
+    /// ([`ConnectorOperationRecord::remaining_states`]).
+    Advance,
 }
 
 /// One stored custom plugin: the whole `CreateCustomPlugin` request plus the
@@ -399,6 +431,124 @@ impl ConnectorRecord {
     }
 }
 
+/// One stored connector operation: the asynchronous work a call against a
+/// connector started, with the progression the clock walks it along.
+///
+/// Nothing creates one directly: `RestartConnector` mints one per restart (as
+/// `UpdateConnector` will per update), and `ListConnectorOperations` and
+/// `DescribeConnectorOperation` report it. An operation belongs to its
+/// connector, so it is dropped with it.
+#[derive(Debug, Clone)]
+pub struct ConnectorOperationRecord {
+    pub arn: String,
+    /// The connector this operation runs against — the ARN
+    /// `ListConnectorOperations` lists by.
+    pub connector_arn: String,
+    /// `ConnectorOperationType`: which kind of work this is.
+    pub operation_type: String,
+    /// `ConnectorOperationState`: where in its progression this operation is.
+    pub state: String,
+    /// The states this operation has still to pass through, in order; empty
+    /// once it has reached its terminal state.
+    pub remaining_states: VecDeque<String>,
+    pub creation_time: SystemTime,
+    /// When this operation reaches its terminal state. Fixed when it starts (it
+    /// is [`TRANSITION_SPAN`] per step of the progression), because the clock
+    /// alone decides it; [`Self::end_time`] reports it only once it is reached,
+    /// so a running operation carries no `endTime`.
+    pub ends_at: SystemTime,
+    /// Whether the restart that started this operation asked for only the
+    /// connector's failed tasks (`RestartConnector$onlyFailedTasks`). Stored
+    /// because it is what the caller asked for; no modelled response member of
+    /// this service reports it.
+    pub only_failed_tasks: bool,
+    pub pending: Option<PendingChange>,
+}
+
+impl ConnectorOperationRecord {
+    /// The operation a `RestartConnector` call against `connector_arn` starts:
+    /// `PENDING`, with the whole [`RESTART_PROGRESSION`] still ahead of it.
+    pub fn restart(arn: String, connector_arn: String, only_failed_tasks: bool) -> Self {
+        let creation_time = SystemTime::now();
+        let steps = u32::try_from(RESTART_PROGRESSION.len()).unwrap_or(1);
+        Self {
+            arn,
+            connector_arn,
+            operation_type: CONNECTOR_OPERATION_RESTART.to_string(),
+            state: CONNECTOR_OPERATION_PENDING.to_string(),
+            remaining_states: RESTART_PROGRESSION
+                .iter()
+                .map(|state| (*state).to_string())
+                .collect(),
+            creation_time,
+            ends_at: creation_time + TRANSITION_SPAN * steps,
+            only_failed_tasks,
+            pending: Some(PendingChange::in_a_moment(PendingKind::Advance)),
+        }
+    }
+
+    /// Whether this operation has reached its terminal state.
+    pub fn has_ended(&self) -> bool {
+        self.remaining_states.is_empty()
+    }
+
+    /// `endTime`: when this operation ended, or `None` while it is still
+    /// running — the member is modelled optional precisely because an operation
+    /// that has not finished has no end.
+    pub fn end_time(&self) -> Option<::aws_smithy_types::DateTime> {
+        self.has_ended().then(|| date_time(self.ends_at))
+    }
+
+    /// Apply every step of this operation's progression the clock already owes
+    /// at `now`.
+    ///
+    /// Each step falls due [`TRANSITION_SPAN`] after the one before it, counted
+    /// from the instant that one fell due rather than from this call, so where
+    /// an operation is depends on the clock alone and not on when anybody
+    /// happened to read it.
+    fn advance_due(&mut self, now: Instant) {
+        while let Some(change) = self.pending.filter(|change| change.is_due(now)) {
+            let Some(next) = self.remaining_states.pop_front() else {
+                self.pending = None;
+                break;
+            };
+            self.state = next;
+            self.pending = (!self.remaining_states.is_empty()).then(|| PendingChange {
+                kind: change.kind,
+                due: change.due + TRANSITION_SPAN,
+            });
+        }
+    }
+
+    /// The key this operation pages under.
+    ///
+    /// The model documents no order for `connectorOperations`, so the
+    /// requirement on the key is the one [`page`] rests on: unique and stable.
+    /// The creation instant with the ARN as tie-break is both, and it lists a
+    /// connector's operations oldest first — the order they happened in.
+    pub fn page_key(&self) -> String {
+        let nanos = self
+            .creation_time
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        // Zero-padded to the width of `u128::MAX`, so the keys of two
+        // operations compare by instant rather than by digit count.
+        format!("{nanos:039}/{}", self.arn)
+    }
+
+    /// This operation as `ListConnectorOperations` reports it.
+    pub fn summary(&self) -> ConnectorOperationSummary {
+        ConnectorOperationSummary {
+            connector_operation_arn: Some(self.arn.clone()),
+            connector_operation_type: Some(self.operation_type.clone()),
+            connector_operation_state: Some(self.state.clone()),
+            creation_time: Some(date_time(self.creation_time)),
+            end_time: self.end_time(),
+        }
+    }
+}
+
 /// One stored worker configuration: the whole `CreateWorkerConfiguration`
 /// request plus the identity and lifecycle the service assigned it.
 #[derive(Debug, Clone)]
@@ -450,6 +600,8 @@ pub struct ComAmazonawsKafkaconnectKafkaconnectState {
     pub connectors: HashMap<String, ConnectorRecord>,
     /// Stored worker configurations, keyed by `workerConfigurationArn`.
     pub worker_configurations: HashMap<String, WorkerConfigurationRecord>,
+    /// Stored connector operations, keyed by `connectorOperationArn`.
+    pub connector_operations: HashMap<String, ConnectorOperationRecord>,
     /// How many resources this service has minted an id for. Feeds the ARN
     /// suffix, so two resources of one name (one created after the other was
     /// deleted) never share an ARN.
@@ -491,6 +643,18 @@ impl ComAmazonawsKafkaconnectKafkaconnectState {
         // change the clock can owe one is the end of a delete.
         self.worker_configurations
             .retain(|_, worker| !removal_due(worker.pending, now));
+
+        // A connector operation walks its own progression on the clock, from
+        // `PENDING` to the state its type ends in.
+        for operation in self.connector_operations.values_mut() {
+            operation.advance_due(now);
+        }
+        // An operation belongs to the connector it ran against: once that
+        // connector is gone (the delete the clock has just finished above),
+        // there is no resource left for it to report an operation of.
+        let connectors = &self.connectors;
+        self.connector_operations
+            .retain(|_, operation| connectors.contains_key(&operation.connector_arn));
     }
 
     /// Whether this store already holds as many custom plugins as it may
@@ -527,6 +691,37 @@ impl ComAmazonawsKafkaconnectKafkaconnectState {
         self.connectors
             .values()
             .find(|connector| connector.name == name)
+    }
+
+    /// Whether this store already holds as many operations against the
+    /// connector `connector_arn` names as it may ([`RESOURCE_QUOTA`]), so the
+    /// next call that would start one must be refused.
+    ///
+    /// AWS publishes no quota for connector operations, but a connector can be
+    /// restarted and updated over and over and each such call records one more
+    /// operation: this is the bound that keeps that caller-driven dimension of
+    /// the store from growing without limit, answered — like the two resource
+    /// quotas above — with the modelled `TooManyRequestsException`.
+    pub fn connector_operation_quota_reached(&self, connector_arn: &str) -> bool {
+        self.connector_operations
+            .values()
+            .filter(|operation| operation.connector_arn == connector_arn)
+            .count()
+            >= RESOURCE_QUOTA
+    }
+
+    /// The operations stored against the connector `connector_arn` names, each
+    /// behind the key it pages under ([`ConnectorOperationRecord::page_key`]),
+    /// ready for [`page`].
+    pub fn connector_operations_of(
+        &self,
+        connector_arn: &str,
+    ) -> Vec<(String, &ConnectorOperationRecord)> {
+        self.connector_operations
+            .values()
+            .filter(|operation| operation.connector_arn == connector_arn)
+            .map(|operation| (operation.page_key(), operation))
+            .collect()
     }
 
     /// The tags stored on the resource `arn` names, or `None` when this
@@ -659,6 +854,21 @@ fn removal_due(pending: Option<PendingChange>, now: Instant) -> bool {
 /// Whether `pending` is a move out of the creating state that is already owed.
 fn settling_due(pending: Option<PendingChange>, now: Instant) -> bool {
     pending.is_some_and(|change| change.kind == PendingKind::Settle && change.is_due(now))
+}
+
+/// The ARN of an operation against the connector `connector_arn` names, or
+/// `None` when that value is not a connector ARN this service minted.
+///
+/// An operation belongs to its connector, so its ARN is the connector's own —
+/// same partition, region and account, so neither the region of the call that
+/// started the operation nor anything else can move it to another connector's
+/// scope — with the `connector/<name>/<id>` resource re-typed
+/// `connector-operation/<name>/<id>` and the operation's own minted id
+/// appended.
+pub fn connector_operation_arn(connector_arn: &str, operation_id: &str) -> Option<String> {
+    let (scope, resource) = connector_arn.rsplit_once(":connector/")?;
+    (!resource.is_empty())
+        .then(|| format!("{scope}:connector-operation/{resource}/{operation_id}"))
 }
 
 /// `at` as the `__timestampIso8601` the read operations carry.

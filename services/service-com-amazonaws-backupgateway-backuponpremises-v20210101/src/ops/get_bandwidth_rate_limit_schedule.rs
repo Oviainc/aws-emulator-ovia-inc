@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetBandwidthRateLimitSchedule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetBandwidthRateLimitSchedule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the bandwidth rate-limit schedule PERSISTED on the gateway its `GatewayArn`
+//! names ([`crate::state::StoredGateway::bandwidth_rate_limit_intervals`]), and refuses
+//! an ARN the store holds no gateway under with the modelled
+//! `ResourceNotFoundException`. @readonly: it writes nothing — a gateway that has never
+//! had a schedule set reports the EMPTY array the modelled output documents, it does not
+//! acquire one by being read. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetBandwidthRateLimitSchedule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `PutBandwidthRateLimitSchedule` is the operation that SETS the schedule and is still a
+//! scaffold answering 501 under its own stub issue
+//! (`issues/things-that-do-not-work/20261024T030827Z-backup-gateway-putbandwidthratelimitschedule-stub.md`),
+//! so until it lands the store is the only place a non-empty schedule can come from —
+//! this handler reads the very field that handler will write, so neither the shape nor
+//! the ordering can drift between them.
 //!
 //! ## Shape of an operation
 //!
@@ -89,10 +93,14 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-backupgateway-backuponp
 // here — hence the `GetBandwidthRateLimitScheduleError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.backupgateway#GetBandwidthRateLimitSchedule")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.backupgateway#GetBandwidthRateLimitSchedule",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum GetBandwidthRateLimitScheduleErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
+    InternalServerException(InternalServerException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -146,18 +154,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetBandwidthRateLimitSchedule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetBandwidthRateLimitScheduleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetBandwidthRateLimitSchedule"))
+        // Request metadata only; the store is reached through `self.engine`.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetBandwidthRateLimitScheduleErrorModeled::InternalServerException(
+                InternalServerException {
+                    error_code: None,
+                    message: Some(
+                        "Backup gateway state is unavailable on this engine.".to_string(),
+                    ),
+                },
+            )
+        })?;
+        let state = state.lock();
+
+        // `GatewayArn`'s length and pattern are refused by the boundary validator before
+        // `handle` runs, so reaching here means the ARN is well formed; whether it names a
+        // gateway is a fact of the STORE. A gateway that was never created, or one already
+        // deleted, is simply absent — refused the way every other gateway operation of
+        // this service refuses one.
+        let Some(gateway) = state.gateway(&input.gateway_arn) else {
+            return Err(
+                GetBandwidthRateLimitScheduleErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        error_code: None,
+                        message: Some(format!(
+                            "The gateway '{}' was not found.",
+                            input.gateway_arn
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Both members come off the record the store holds: the ARN is the store's own key
+        // (not the string the request carried), and the intervals are the ones last set for
+        // that record, in the stored order. A gateway with no schedule reports the empty
+        // array the modelled output documents ("When no bandwidth rate limit intervals have
+        // been scheduled, the array is empty") rather than omitting the member.
+        Ok(GetBandwidthRateLimitScheduleOutput {
+            gateway_arn: Some(gateway.arn.clone()),
+            bandwidth_rate_limit_intervals: Some(gateway.bandwidth_rate_limit_intervals.clone()),
+        })
     }
 }

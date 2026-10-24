@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteNetworkInterface
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteNetworkInterface`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: removes a stored network interface once nothing is attached to it any
+//! more, and refuses the id of an interface the account does not hold.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteNetworkInterface::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Deletes the network interface the request names, which is a resource of the account:
+//! the store ([`crate::state::ComAmazonawsEc2Amazonec2State::network_interfaces`]) is what
+//! says whether the id names one, and the delete removes the record so a later reader and
+//! a second delete both refuse the id rather than answering as a no-op.
+//!
+//! What it refuses, and why:
+//!
+//! * `InvalidNetworkInterfaceID.Malformed` (400) — the value is not a network interface id
+//!   at all, so there is nothing to look up
+//!   ([`crate::state::network_interface_id_is_well_formed`]).
+//! * `InvalidNetworkInterfaceID.NotFound` (400) — a well-formed id the account holds no
+//!   interface for.
+//! * `InvalidNetworkInterface.InUse` (400) — "You must detach the network interface before
+//!   you can delete it" (below), so an interface something still holds is refused.
+//! * `DryRunOperation` (412) — a request that would have succeeded, with `DryRun` set.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +161,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteNetworkInterface` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteNetworkInterfaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteNetworkInterface"))
+        // `ctx` carries request metadata only; this operation reads none of it — a network
+        // interface is named by id. The store is reached through the engine held on `self`.
+        let _ = ctx;
+        use crate::state;
+
+        let network_interface_id = input.network_interface_id.as_str();
+
+        // A value that is not a network interface id at all is refused BEFORE the store is
+        // asked about it, the way the service orders the two: there is nothing to look up.
+        if !state::network_interface_id_is_well_formed(network_interface_id) {
+            return Err(state::invalid_network_interface_id_malformed(
+                network_interface_id,
+            ));
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+
+        // "Deletes the specified network interface": an id this account holds no interface
+        // for is a refusal, not a no-op — a caller that deletes twice has to be able to
+        // tell the deletion it performed from one it did not.
+        if !store.network_interfaces.contains_key(network_interface_id) {
+            return Err(state::invalid_network_interface_id_not_found(
+                network_interface_id,
+            ));
+        }
+        // "You must detach the network interface before you can delete it"
+        // (`DeleteNetworkInterface`), so an interface an attachment still holds is refused
+        // and stays exactly where it was.
+        if store
+            .network_interface_attachment(network_interface_id)
+            .is_some()
+        {
+            return Err(state::network_interface_in_use(network_interface_id));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (`DryRun`).
+        // Nothing has been removed yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // The bytes the record held go back to the store's budget with it, which is what
+        // `remove_network_interface` is for.
+        if store.remove_network_interface(network_interface_id).is_none() {
+            return Err(state::internal_error(
+                "the network interface checked a moment ago could not be removed",
+            ));
+        }
+        Ok(DeleteNetworkInterfaceOutput)
     }
 }
