@@ -54,7 +54,7 @@ fn label(value: &str) -> String {
 }
 
 /// `POST /tags/{resourceArn}` — `TagResource`.
-async fn tag(router: &MultiServiceRouter, arn: &str, tags: Value) -> Answer {
+pub(crate) async fn tag(router: &MultiServiceRouter, arn: &str, tags: Value) -> Answer {
     call(
         router,
         "POST",
@@ -65,7 +65,7 @@ async fn tag(router: &MultiServiceRouter, arn: &str, tags: Value) -> Answer {
 }
 
 /// `DELETE /tags/{resourceArn}?tagKeys=…` — `UntagResource`.
-async fn untag(router: &MultiServiceRouter, arn: &str, tag_keys: &[&str]) -> Answer {
+pub(crate) async fn untag(router: &MultiServiceRouter, arn: &str, tag_keys: &[&str]) -> Answer {
     let query: Vec<String> = tag_keys
         .iter()
         .map(|key| format!("tagKeys={}", label(key)))
@@ -80,7 +80,7 @@ async fn untag(router: &MultiServiceRouter, arn: &str, tag_keys: &[&str]) -> Ans
 }
 
 /// `GET /tags/{resourceArn}` — `ListTagsForResource`.
-async fn list_tags(router: &MultiServiceRouter, arn: &str) -> Answer {
+pub(crate) async fn list_tags(router: &MultiServiceRouter, arn: &str) -> Answer {
     call(router, "GET", &format!("/tags/{}", label(arn)), None).await
 }
 
@@ -99,7 +99,7 @@ async fn tagging_call(router: &MultiServiceRouter, route: &str, arn: &str) -> An
 }
 
 /// A JSON object from key/value pairs, for comparing a reported tag map whole.
-fn tag_object(pairs: &[(String, String)]) -> Value {
+pub(crate) fn tag_object(pairs: &[(String, String)]) -> Value {
     let mut map = serde_json::Map::new();
     for (key, value) in pairs {
         map.insert(key.clone(), Value::String(value.clone()));
@@ -108,7 +108,11 @@ fn tag_object(pairs: &[(String, String)]) -> Value {
 }
 
 /// Create a scan named `scan_name` carrying `tags`, and answer with its `scanNameArn`.
-async fn scan_with_tags(router: &MultiServiceRouter, scan_name: &str, tags: Value) -> String {
+pub(crate) async fn scan_with_tags(
+    router: &MultiServiceRouter,
+    scan_name: &str,
+    tags: Value,
+) -> String {
     let artifact = artifact_for(router, scan_name).await;
     let created = create_scan(
         router,

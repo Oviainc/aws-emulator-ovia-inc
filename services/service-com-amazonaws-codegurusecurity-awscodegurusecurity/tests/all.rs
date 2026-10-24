@@ -19,6 +19,8 @@ mod batch_get_findings_classification;
 mod findings_metrics;
 #[path = "all/metrics_summary.rs"]
 mod metrics_summary;
+#[path = "all/reserved_tag_keys.rs"]
+mod reserved_tag_keys;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/scan_completion.rs"]

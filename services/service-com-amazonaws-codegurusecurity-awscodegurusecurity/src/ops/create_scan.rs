@@ -6,6 +6,11 @@
 //! `CreateUploadUrl` minted, and answers from that record. `GetScan`, `ListScans`,
 //! `GetFindings` and `BatchGetFindings` all read what this writes.
 //!
+//! The `tags` this call carries land in the same tag store the tagging operations write,
+//! so the reserved `aws:` namespace ([`crate::state::RESERVED_TAG_KEY_PREFIX`]) is closed
+//! here too: a request naming such a key is refused with the modelled
+//! `ValidationException` (HTTP 400) and starts no scan.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -175,6 +180,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // `tags` here writes the same tag store the tagging operations write, so the
+        // reserved `aws:` namespace is closed to this request too — judged before any
+        // state is read or written, so a refused request starts no scan.
+        if let Some(reserved) = input
+            .tags
+            .as_ref()
+            .and_then(|tags| crate::state::first_reserved_tag_key(tags.keys().map(String::as_str)))
+        {
+            return Err(CreateScanErrorModeled::ValidationException(
+                crate::state::reserved_tag_key_refusal("tags", reserved),
+            )
+            .into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateScanErrorModeled::InternalServerException(
                 InternalServerException {

@@ -7,6 +7,11 @@
 //! `@idempotent`: a key the scan does not carry is already removed, so naming it
 //! succeeds and changes nothing.
 //!
+//! A key in the reserved `aws:` namespace ([`crate::state::RESERVED_TAG_KEY_PREFIX`],
+//! matched however it is cased) names a tag AWS applies itself, which a caller may no
+//! more delete than create: naming one is refused with the modelled
+//! `ValidationException` (HTTP 400) and nothing is removed.
+//!
 //! A `resourceArn` label that is not a scan ARN never reaches here — the boundary
 //! validator refuses it against the `ScanNameArn` `@pattern`, and `crate::service`
 //! answers that refusal with HTTP 400 `BadRequestException`, the ARN parser's own code
@@ -152,6 +157,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // A tag in the `aws:` namespace is AWS's own: a caller can no more delete one
+        // than create it, so naming such a key is refused before anything is removed.
+        if let Some(reserved) =
+            crate::state::first_reserved_tag_key(input.tag_keys.iter().map(String::as_str))
+        {
+            return Err(UntagResourceErrorModeled::ValidationException(
+                crate::state::reserved_tag_key_refusal("tagKeys", reserved),
+            )
+            .into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UntagResourceErrorModeled::InternalServerException(
                 InternalServerException {
