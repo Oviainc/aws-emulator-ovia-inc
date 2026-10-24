@@ -1012,6 +1012,16 @@ pub struct StoredEnvironment {
     pub hosts: BTreeMap<String, StoredHost>,
     /// The lifecycle transition the clock owes this environment, if any.
     pub pending: Option<PendingTransition>,
+    /// The authentication token this environment's Amazon EVS Custom Addon depot is
+    /// reached with (`GetDepotUrlResponse$token`, "The authentication token for depot
+    /// access"), or `None` while no token has been issued for the environment.
+    ///
+    /// Held on the environment because the depot is an environment's own: the token one
+    /// call reports is the token the next call reports — "The depot URL remains active
+    /// until you rotate the authentication token by calling this action with rotate set
+    /// to true" (`GetDepotUrl` doc) — and `GetDepotUrl` is the one action that issues it
+    /// and the one that replaces it.
+    pub depot_token: Option<String>,
 }
 
 impl StoredEnvironment {
@@ -2114,6 +2124,55 @@ fn is_region_token(region: &str) -> bool {
 /// the modelled `Arn` pattern spells it.
 pub fn environment_arn(region: &str, environment_id: &str) -> String {
     ::engine::emulator_arn("evs", region, &format!("environment/{environment_id}"))
+}
+
+/// How many characters a depot authentication token carries: the length of the secret
+/// the emulator's credential store mints, which is the material the token is cut from.
+pub const DEPOT_TOKEN_LENGTH: usize = 40;
+
+/// A fresh authentication token for one environment's Amazon EVS Custom Addon depot.
+///
+/// The token authenticates requests to the DEPOT, not to this emulator, so it must never
+/// be accepted as a SigV4 credential — but it is still a secret handed to a caller, and
+/// nothing in a service may construct a secret itself. It is therefore cut from a secret
+/// minted by the one component that generates secrets, the emulator's credential store,
+/// which is then removed from that store again: the caller gets the secret, and the
+/// emulator keeps no credential it would accept.
+///
+/// Only the alphanumeric characters of that secret are kept, because the token travels as
+/// a path component of the depot URL ("This URL includes the authentication token as a
+/// path component", `GetDepotUrlResponse$depotUrl` doc) while the store's secret alphabet
+/// also holds `+` and `/`, which no path carries unescaped.
+///
+/// `None` when the store minted no secret with [`DEPOT_TOKEN_LENGTH`] usable characters,
+/// which leaves the operation to refuse rather than report a token it made up.
+pub fn mint_depot_token(store: &::emulator_server::CredentialStore) -> Option<String> {
+    let minted = store.create(&::emulator_server::aws_credentials::AWS_SESSION);
+    let token: String = minted
+        .secret(::emulator_server::aws_credentials::SESSION_TOKEN)
+        .unwrap_or_default()
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(DEPOT_TOKEN_LENGTH)
+        .collect();
+    // The token is not a credential of this emulator; see above.
+    let _ = store.delete(&minted.id);
+    (token.chars().count() == DEPOT_TOKEN_LENGTH).then_some(token)
+}
+
+/// The URL that reaches one environment's Amazon EVS Custom Addon depot, carrying the
+/// depot authentication token.
+///
+/// Three facts fix its shape: the depot is served over HTTPS from the endpoint of the
+/// Region the environment lives in; it is the depot OF one environment, so the
+/// environment id names which one; and the token is carried as a PATH COMPONENT ("This
+/// URL includes the authentication token as a path component",
+/// `GetDepotUrlResponse$depotUrl` doc) rather than as a query parameter or a header. The
+/// last segment is the depot's index document, because the URL is configured "as a
+/// download source in vSphere Lifecycle Manager (vLCM)" (`GetDepotUrl` doc) and a vLCM
+/// online download source addresses the depot index.
+pub fn depot_url(region: &str, environment_id: &str, token: &str) -> String {
+    format!("https://depot.evs.{region}.amazonaws.com/{environment_id}/{token}/index.xml")
 }
 
 /// The live connector of `connector_type` this environment holds, if any: the record

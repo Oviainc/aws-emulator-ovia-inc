@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetInfrastructureConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetInfrastructureConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetInfrastructureConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored infrastructure configuration the request's ARN names, so what
+//! `CreateInfrastructureConfiguration` wrote is what this reports. A READ: it answers
+//! from the store and writes nothing.
+//!
+//! This service is regional, so a configuration is reachable only through the Region
+//! its ARN names; an ARN naming no configuration of this Region is reported absent
+//! with `ResourceNotFoundException` (widened in through `extra_errors` below).
 //!
 //! ## Shape of an operation
 //!
@@ -81,6 +80,8 @@
 //!   processed the request. Retrying the request may succeed.
 //! * `ServiceUnavailableException` (HTTP 503) — The service is unable to process your request
 //!   at this time.
+//! * `ResourceNotFoundException` (HTTP 404) — widened in through `extra_errors` (see below):
+//!   "At least one of the resources referenced by your request does not exist."
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -96,13 +97,26 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-imagebuilder-imagebuild
 // here — hence the `GetInfrastructureConfigurationError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.imagebuilder#GetInfrastructureConfiguration")]
+//
+// `ResourceNotFoundException` is widened in through `extra_errors`:
+// `infrastructureConfigurationArn` is an `@httpQuery` member naming a configuration
+// that may not exist, this SERVICE models that shape for exactly that case
+// (`com.amazonaws.imagebuilder#ResourceNotFoundException`, HTTP 404, "At least one of
+// the resources referenced by your request does not exist", declared in
+// `types/shared_types.rs`), and this operation's own `errors` list omits it. So an ARN
+// that names no configuration is reported MISSING rather than dressed up as an
+// invalid request, which is a different claim a client branches on.
+#[smithy_macros::operation_error(
+    "com.amazonaws.imagebuilder#GetInfrastructureConfiguration",
+    extra_errors = ["ResourceNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum GetInfrastructureConfigurationErrorModeled {
     CallRateLimitExceededException(CallRateLimitExceededException),
     ClientException(ClientException),
     ForbiddenException(ForbiddenException),
     InvalidRequestException(InvalidRequestException),
+    ResourceNotFoundException(ResourceNotFoundException),
     ServiceException(ServiceException),
     ServiceUnavailableException(ServiceUnavailableException),
 }
@@ -158,18 +172,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetInfrastructureConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetInfrastructureConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetInfrastructureConfiguration"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetInfrastructureConfigurationErrorModeled::ServiceException(ServiceException {
+                message: Some(crate::state::store_unavailable_message()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+
+        // A pure read: the guard is taken, the record is copied out as the modelled
+        // view, and nothing is written — so this call changes nothing a later caller
+        // sees.
+        let view = state
+            .lock()
+            .infrastructure_configuration(&input.infrastructure_configuration_arn, &region)
+            .map(crate::state::InfrastructureConfigurationRecord::view);
+
+        let Some(infrastructure_configuration) = view else {
+            return Err(
+                GetInfrastructureConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(
+                            crate::state::infrastructure_configuration_not_found_message(
+                                &input.infrastructure_configuration_arn,
+                            ),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(GetInfrastructureConfigurationOutput {
+            request_id: Some(crate::state::new_request_id()),
+            infrastructure_configuration: Some(infrastructure_configuration),
+        })
     }
 }

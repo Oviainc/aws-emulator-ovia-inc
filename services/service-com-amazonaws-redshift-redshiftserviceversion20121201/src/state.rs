@@ -4,8 +4,9 @@
 //!
 //! One store per emulator, holding the provisioned-cluster control plane: the
 //! clusters, the snapshots taken of them, the cluster parameter groups and
-//! cluster subnet groups they are configured from, the usage limits set on
-//! their features, and the Query Editor (QEV2) IAM Identity Center
+//! cluster subnet groups they are configured from, the HSM configurations that
+//! tell a cluster where to store its database encryption keys, the usage limits
+//! set on their features, and the Query Editor (QEV2) IAM Identity Center
 //! applications the account registered. Every collection keeps
 //! INSERTION ORDER, so the `Marker`
 //! cursor the paginated `Describe*` operations hand out is a stable, resumable
@@ -27,10 +28,9 @@
 use crate::ops::types::{
     AccountWithRestoreAccess, AquaConfiguration, AvailabilityZone, Cluster, ClusterIamRole,
     ClusterNode, ClusterParameterGroup, ClusterParameterGroupStatus, ClusterParameterStatus,
-    ClusterSubnetGroup,
-    ClusterVersion, CreateUsageLimitOutput, MaintenanceTrack, NetworkInterface, Parameter,
-    PendingModifiedValues, Qev2IdcApplication, Snapshot, Subnet, SupportedOperation,
-    SupportedPlatform, UpdateTarget, VpcEndpoint, VpcSecurityGroupMembership,
+    ClusterSubnetGroup, ClusterVersion, CreateUsageLimitOutput, HsmConfiguration, MaintenanceTrack,
+    NetworkInterface, Parameter, PendingModifiedValues, Qev2IdcApplication, Snapshot, Subnet,
+    SupportedOperation, SupportedPlatform, UpdateTarget, VpcEndpoint, VpcSecurityGroupMembership,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1166,6 +1166,19 @@ pub const USAGE_LIMIT_QUOTA: usize = 10_000;
 /// `DeleteQev2IdcApplication`.
 pub const QEV2_IDC_APPLICATION_QUOTA: usize = 10_000;
 
+/// How many HSM configurations the store holds before `CreateHsmConfiguration`
+/// refuses with the modelled `HsmConfigurationQuotaExceededFault`.
+///
+/// The same reasoning as [`QEV2_IDC_APPLICATION_QUOTA`]: the emulator's own
+/// bound on
+/// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::hsm_configurations`],
+/// not a claim about an account's published limit. An HSM configuration's
+/// identity is the identifier its create names, and identifiers are unlimited in
+/// number, so this bound is what stops the collection growing without end; it is
+/// set far above any workflow an emulator serves, and every record it holds is
+/// released by `DeleteHsmConfiguration`.
+pub const HSM_CONFIGURATION_QUOTA: usize = 10_000;
+
 /// How many tags one resource may carry before a create that would exceed it
 /// refuses with the modelled `TagLimitExceededFault`.
 ///
@@ -1439,6 +1452,27 @@ pub struct StoredSnapshot {
     pub source: Option<StoredCluster>,
 }
 
+/// An HSM configuration as this service stores it: the modelled projection a
+/// response is built from, plus the two request values the `HsmConfiguration`
+/// shape models no member for.
+#[derive(Debug, Clone)]
+pub struct StoredHsmConfiguration {
+    /// Exactly what `DescribeHsmConfigurations` reports, so a read never
+    /// recomputes it.
+    pub configuration: HsmConfiguration,
+    /// The HSM's public certificate file, kept verbatim — a cluster configured
+    /// with this HSM connects to the HSM with it.
+    ///
+    /// Held here and NEVER on [`StoredHsmConfiguration::configuration`]: the
+    /// `HsmConfiguration` shape models no certificate member, so it can never
+    /// reach the wire, exactly as [`StoredCluster::master_user_password`] holds
+    /// a cluster's admin password.
+    pub hsm_server_public_certificate: String,
+    /// The password that unlocks the HSM partition, held for the same reason and
+    /// in the same place as [`StoredHsmConfiguration::hsm_server_public_certificate`].
+    pub hsm_partition_password: String,
+}
+
 /// Per-service state for com-amazonaws-redshift-redshiftserviceversion20121201. A handler reaches it through [`service_state`].
 #[derive(Debug)]
 pub struct ComAmazonawsRedshiftRedshiftserviceversion20121201State {
@@ -1467,6 +1501,9 @@ pub struct ComAmazonawsRedshiftRedshiftserviceversion20121201State {
     /// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::subnet_groups`],
     /// this collection needs no `Stored*` wrapper.
     pub usage_limits: Vec<CreateUsageLimitOutput>,
+    /// Every HSM configuration, keyed by `HsmConfigurationIdentifier`, in
+    /// creation order.
+    pub hsm_configurations: Vec<StoredHsmConfiguration>,
     /// Every Query Editor (QEV2) IAM Identity Center application the account
     /// registered, keyed by `Qev2IdcApplicationArn`, in creation order.
     ///
@@ -1502,6 +1539,7 @@ enum ResourceSlot {
     Snapshot(usize),
     ParameterGroup(usize),
     SubnetGroup(usize),
+    HsmConfiguration(usize),
 }
 
 /// A fresh store already holds what exists before any caller writes anything:
@@ -1521,6 +1559,7 @@ impl Default for ComAmazonawsRedshiftRedshiftserviceversion20121201State {
             snapshots: Vec::new(),
             parameter_groups: default_parameter_groups(),
             usage_limits: Vec::new(),
+            hsm_configurations: Vec::new(),
             qev2_idc_applications: Vec::new(),
             cluster_versions: published_cluster_versions(),
             maintenance_tracks: published_maintenance_tracks(),
@@ -1637,6 +1676,20 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
         self.usage_limits
             .iter()
             .position(|limit| limit.usage_limit_id.as_deref() == Some(usage_limit_id))
+    }
+
+    /// The stored HSM configuration with this `HsmConfigurationIdentifier`, if
+    /// any.
+    ///
+    /// The identifier is compared exactly as the request that created the record
+    /// spelled it: the model documents no folding for it
+    /// (`smithy_query(query="doc", shape="CreateHsmConfigurationMessage",
+    /// member="HsmConfigurationIdentifier")` — "The identifier to be assigned to
+    /// the new Amazon Redshift HSM configuration"), so nothing here invents one.
+    pub fn hsm_configuration(&self, identifier: &str) -> Option<&StoredHsmConfiguration> {
+        self.hsm_configurations.iter().find(|stored| {
+            stored.configuration.hsm_configuration_identifier.as_deref() == Some(identifier)
+        })
     }
 
     /// The position of the registered QEV2 IAM Identity Center application with
@@ -1847,7 +1900,7 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
     /// The tags of a resource live ON that resource — the `Tags` member every one
     /// of these shapes already publishes — so tagging one is a write to the
     /// record a `Describe*` of it reads, and there is no second place a tag could
-    /// be. Four of the published types ([`TAGGABLE_RESOURCE_TYPES`]) name a
+    /// be. Five of the published types ([`TAGGABLE_RESOURCE_TYPES`]) name a
     /// resource this store holds; a resource of any other type exists in no
     /// account here, because the operations that would create one are still
     /// scaffolds.
@@ -1880,6 +1933,9 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
             ResourceSlot::Snapshot(position) => &self.snapshots[position].snapshot.tags,
             ResourceSlot::ParameterGroup(position) => &self.parameter_groups[position].group.tags,
             ResourceSlot::SubnetGroup(position) => &self.subnet_groups[position].tags,
+            ResourceSlot::HsmConfiguration(position) => {
+                &self.hsm_configurations[position].configuration.tags
+            }
         };
         Some(tags.as_deref().unwrap_or_default())
     }
@@ -1907,6 +1963,9 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
                 &mut self.parameter_groups[position].group.tags
             }
             ResourceSlot::SubnetGroup(position) => &mut self.subnet_groups[position].tags,
+            ResourceSlot::HsmConfiguration(position) => {
+                &mut self.hsm_configurations[position].configuration.tags
+            }
         };
         // A resource that carries no `Tags` member and is given no tag keeps the
         // member absent: writing `Some([])` would change what its own
@@ -1940,6 +1999,9 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
                 ARN_SEGMENT_SUBNET_GROUP => {
                     slots.extend((0..self.subnet_groups.len()).map(ResourceSlot::SubnetGroup))
                 }
+                ARN_SEGMENT_HSM_CONFIGURATION => slots.extend(
+                    (0..self.hsm_configurations.len()).map(ResourceSlot::HsmConfiguration),
+                ),
                 _ => {}
             }
         }
@@ -1997,6 +2059,17 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
                     ARN_SEGMENT_SUBNET_GROUP,
                     subnet_group_arn(group.cluster_subnet_group_name.as_deref()?, region),
                     group.tags.as_deref().unwrap_or_default(),
+                ))
+            }
+            ResourceSlot::HsmConfiguration(position) => {
+                let stored = &self.hsm_configurations[position];
+                Some((
+                    ARN_SEGMENT_HSM_CONFIGURATION,
+                    hsm_configuration_arn(
+                        stored.configuration.hsm_configuration_identifier.as_deref()?,
+                        region,
+                    ),
+                    stored.configuration.tags.as_deref().unwrap_or_default(),
                 ))
             }
         }
@@ -2548,6 +2621,19 @@ pub fn subnet_group_arn(subnet_group_name: &str, region: &str) -> String {
         "redshift",
         region,
         &format!("{ARN_SEGMENT_SUBNET_GROUP}:{subnet_group_name}"),
+    )
+}
+
+/// The ARN of an HSM configuration:
+/// `arn:aws:redshift:<region>:<account>:hsmconfiguration:<identifier>`.
+///
+/// Source: as [`cluster_arn`] —
+/// `arn:aws:redshift:region:account-id:hsmconfiguration:hsm-configuration-name`.
+pub fn hsm_configuration_arn(hsm_configuration_identifier: &str, region: &str) -> String {
+    engine::emulator_arn(
+        "redshift",
+        region,
+        &format!("{ARN_SEGMENT_HSM_CONFIGURATION}:{hsm_configuration_identifier}"),
     )
 }
 
@@ -3389,6 +3475,9 @@ pub const ARN_SEGMENT_SNAPSHOT: &str = "snapshot";
 pub const ARN_SEGMENT_PARAMETER_GROUP: &str = "parametergroup";
 /// The ARN resource-type segment of a cluster subnet group.
 pub const ARN_SEGMENT_SUBNET_GROUP: &str = "subnetgroup";
+/// The ARN resource-type segment of an HSM configuration (the "HSM connection"
+/// the API publishes).
+pub const ARN_SEGMENT_HSM_CONFIGURATION: &str = "hsmconfiguration";
 
 /// One resource type a Redshift tag can be attached to: the segment its ARN
 /// carries and the name the API publishes for it.
@@ -3448,7 +3537,7 @@ pub const TAGGABLE_RESOURCE_TYPES: [TaggableResourceType; 11] = [
         documented_name: "Subnet group",
     },
     TaggableResourceType {
-        arn_segment: "hsmconfiguration",
+        arn_segment: ARN_SEGMENT_HSM_CONFIGURATION,
         documented_name: "HSM connection",
     },
     TaggableResourceType {

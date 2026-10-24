@@ -17,10 +17,13 @@
 //!   desired capacity — so any other `(ServiceNamespace, ScalableDimension)` pair, and a
 //!   resource id that does not identify a resource of that kind, is refused with the
 //!   modelled `ValidationException` (HTTP 400);
-//! * an accepted request answers HTTP 200 with the required `Datapoints` member, which
-//!   carries no data point: this emulator ingests no CloudWatch metric data, so no load
-//!   metric has a history for a predicted value to be calculated from — for a plan it
-//!   holds and for one it does not alike.
+//! * an accepted request answers HTTP 200 with the required `Datapoints` member.
+//!
+//! Every plan these tests store configures DYNAMIC scaling only — its instruction carries
+//! no load metric specification, which is what "configur[es] predictive scaling" — so it
+//! has no forecast and its accepted answers carry no data point, whatever the window or
+//! the forecast data type. What a plan that DOES configure predictive scaling forecasts is
+//! pinned in [`crate::forecast_datapoints`].
 //!
 //! The harness (router, dispatch, error-body readers) is reused from
 //! [`crate::scaling_plan_lifecycle`]; nothing here builds a second one.
@@ -155,7 +158,8 @@ fn datapoints(body: &Value) -> &Vec<Value> {
 /// What the window rules answer for one row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Verdict {
-    /// HTTP 200 carrying the required — and empty — `Datapoints` list.
+    /// HTTP 200 carrying the required `Datapoints` list, which is empty because the
+    /// stored plan configures no predictive scaling.
     Accepted,
     /// HTTP 400 `ValidationException`, because the window spans more than the documented
     /// maximum duration.
@@ -615,7 +619,7 @@ async fn a_forecast_data_type_outside_the_modelled_enum_is_refused() {
 }
 
 #[tokio::test]
-async fn every_modelled_forecast_data_type_reports_an_empty_forecast() {
+async fn a_plan_configuring_no_predictive_scaling_reports_an_empty_forecast() {
     let emulator = with_stored_plan().await;
     // A second plan, covering a DIFFERENT Auto Scaling group, so a request for the
     // covered resource reaches a plan that does not cover it.
@@ -640,7 +644,9 @@ async fn every_modelled_forecast_data_type_reports_an_empty_forecast() {
     emulator.make_all_due();
 
     // Rows differ along what the lookup generalises over: whether the plan is held and
-    // whether the plan that is held covers the named resource.
+    // whether the plan that is held covers the named resource. Neither plan's instruction
+    // carries a load metric specification, so neither configures predictive scaling and
+    // neither has a forecast — the covered resource included.
     let lookups: [(&str, &str); 3] = [
         ("a plan that covers the resource", STORED_PLAN),
         ("a plan this service does not hold", ABSENT_PLAN),
