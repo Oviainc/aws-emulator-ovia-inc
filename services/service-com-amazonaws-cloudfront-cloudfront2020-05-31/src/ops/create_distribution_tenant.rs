@@ -375,7 +375,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let connection_group_id = match input.connection_group_id {
             Some(named) => named,
-            None => store.default_connection_group(),
+            None => store.default_connection_group(now),
         };
         let id = store.allocate_distribution_tenant_id();
         let etag = store.next_etag();

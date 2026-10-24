@@ -423,8 +423,8 @@ impl ::aws_smithy_schema_server::DeserializableStruct for DatasourcePackageUsage
 }
 
 /// When data collection began for a source package, as `ListDatasourcePackages`'
-/// `LastIngestStateChange` and `BatchGetMembershipDatasources`'
-/// `DatasourcePackageIngestHistory` report it.
+/// `LastIngestStateChange` and the `DatasourcePackageIngestHistory` of
+/// `BatchGetGraphMemberDatasources` / `BatchGetMembershipDatasources` report it.
 #[derive(Debug, Clone, Default)]
 pub struct TimestampForCollection {
     pub timestamp: Option<::aws_smithy_types::DateTime>,

@@ -111,6 +111,14 @@ impl Emulator {
 /// environment is deployed into the caller's existing VPC), so every test that expects
 /// a create to be accepted registers the VPC and subnet it names here first. The other
 /// suites of this target use it for the fixed ids their requests carry.
+///
+/// The service access subnet is placed high in the VPC's range, clear of the blocks
+/// [`vlans_with_prefix`] gives the VLAN subnets: an environment's VLAN subnet blocks
+/// "must not overlap with other subnets in the VPC" (`InitialVlans` doc), and the
+/// service access subnet is one of those other subnets. It carries an Availability
+/// Zone because every subnet EC2 creates has one, and it is the zone the environment's
+/// VLAN subnets are provisioned in ("all VPC subnets exist in a single Availability
+/// Zone", `vpcId` doc).
 pub(crate) fn register_network(
     engine: &engine::InMemoryEngine,
     vpc_id: &str,
@@ -124,7 +132,7 @@ pub(crate) fn register_network(
         ec2::ops::types::Vpc {
             vpc_id: Some(vpc_id.to_string()),
             state: Some(ec2::state::VPC_STATE_AVAILABLE.to_string()),
-            cidr_block: Some("10.0.0.0/16".to_string()),
+            cidr_block: Some(VPC_CIDR.to_string()),
             ..Default::default()
         },
     );
@@ -134,11 +142,27 @@ pub(crate) fn register_network(
             subnet_id: Some(subnet_id.to_string()),
             vpc_id: Some(vpc_id.to_string()),
             state: Some(ec2::state::SUBNET_STATE_AVAILABLE.to_string()),
-            cidr_block: Some("10.0.0.0/24".to_string()),
+            cidr_block: Some(SERVICE_ACCESS_SUBNET_CIDR.to_string()),
+            availability_zone: Some(ZONE.to_string()),
+            availability_zone_id: ec2::state::zone_id_for_zone_name(ZONE),
             ..Default::default()
         },
     );
 }
+
+/// The IPv4 CIDR block of the VPC [`register_network`] writes: every VLAN subnet block
+/// a test uses is a block OF it, because Amazon EVS provisions the VLAN subnets inside
+/// that VPC.
+pub(crate) const VPC_CIDR: &str = "10.0.0.0/16";
+
+/// The block of the service access subnet [`register_network`] writes — clear of every
+/// block [`vlans_with_prefix`] hands the VLAN subnets.
+pub(crate) const SERVICE_ACCESS_SUBNET_CIDR: &str = "10.0.240.0/24";
+
+/// The Availability Zone the registered network is in, and so the zone the
+/// environment's VLAN subnets are provisioned in. A zone of [`REGION`], which is what
+/// EC2's own zone list reports for it.
+pub(crate) const ZONE: &str = "us-west-2a";
 
 /// The emulator a test drives: one shared engine, this service mounted on it.
 pub(crate) fn emulator() -> Emulator {

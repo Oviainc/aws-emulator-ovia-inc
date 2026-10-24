@@ -51,40 +51,13 @@ impl Tagging {
 
     /// Create a data store and return its `DatastoreArn`.
     async fn datastore(&self, tags: &Value) -> String {
-        let (_, arn) = self
-            .service
-            .create(&json!({
-                "DatastoreTypeVersion": "R4",
-                "DatastoreName": "tagged store",
-                "Tags": tags,
-            }))
-            .await;
-        arn
+        create_datastore(&self.service, "tagged store", Some(tags)).await
     }
 
     /// Create a data transformation profile and return its `ProfileId`.
-    ///
-    /// `CreateDataTransformationProfile` answers the modelled `@http(code: 201)`,
-    /// so this does not go through the harness's 200-only `ok`. `Tags` is the
-    /// modelled `TagMap` here, not the `TagList` the tagging operations take.
     async fn profile(&self, tags: &Value) -> String {
-        let mut request = json!({
-            "ProfileName": "tagged profile",
-            "SourceFormat": "CCDA",
-            "Source": { "ProfileMapping": { "ProfileMapping": { "a.map": "Patient.id <- id" } } },
-        });
-        if !tags.is_null() {
-            request["Tags"] = tags.clone();
-        }
-        let (status, payload) = self
-            .service
-            .call("CreateDataTransformationProfile", &request)
-            .await;
-        assert!(
-            (200..300).contains(&status),
-            "CreateDataTransformationProfile must succeed, got {status}: {payload}"
-        );
-        string_at(&payload, "ProfileId")
+        let tags = (!tags.is_null()).then_some(tags);
+        create_profile(&self.service, "tagged profile", tags).await
     }
 
     /// `TagResource` with `tags`, which must succeed.
@@ -119,21 +92,17 @@ impl Tagging {
             .service
             .ok("ListTagsForResource", &json!({ "ResourceARN": arn }))
             .await;
-        payload["Tags"]
-            .as_array()
-            .unwrap_or_else(|| {
-                panic!("case {case:?}: ListTagsForResource must carry a Tags list: {payload}")
-            })
-            .iter()
-            .map(|tag| (string_at(tag, "Key"), string_at(tag, "Value")))
-            .collect()
+        crate::list_tags_for_resource::reported_tags(case, &payload)
     }
 }
 
 /// The ARN of the data transformation profile `profile_id`, in the partition,
 /// region and account this emulator mints its own ARNs in — read off an ARN the
 /// service minted, so no test names an account id of its own.
-fn profile_arn(minted_arn: &str, profile_id: &str) -> String {
+///
+/// `pub(crate)` so the sibling suites address a profile through the same
+/// builder rather than each spelling the ARN form out.
+pub(crate) fn profile_arn(minted_arn: &str, profile_id: &str) -> String {
     let fields: Vec<&str> = minted_arn.split(':').collect();
     assert_eq!(
         fields.len(),
@@ -147,13 +116,64 @@ fn profile_arn(minted_arn: &str, profile_id: &str) -> String {
 }
 
 /// One `TagList` from `(key, value)` pairs.
-fn tag_list(pairs: &[(&str, &str)]) -> Value {
+///
+/// `pub(crate)` so the sibling suites build the modelled `TagList` through one
+/// builder rather than each spelling the `{Key, Value}` form out.
+pub(crate) fn tag_list(pairs: &[(&str, &str)]) -> Value {
     Value::Array(
         pairs
             .iter()
             .map(|(key, value)| json!({ "Key": key, "Value": value }))
             .collect(),
     )
+}
+
+/// Create a data store named `name`, carrying `tags` (the modelled `TagList`,
+/// the member omitted when `None`), and return its `DatastoreArn`.
+///
+/// `pub(crate)`: the one create the tagging suites write a data store through.
+pub(crate) async fn create_datastore(
+    service: &HealthLake,
+    name: &str,
+    tags: Option<&Value>,
+) -> String {
+    let mut request = json!({ "DatastoreTypeVersion": "R4", "DatastoreName": name });
+    if let Some(tags) = tags {
+        request["Tags"] = tags.clone();
+    }
+    let (_, arn) = service.create(&request).await;
+    arn
+}
+
+/// Create a data transformation profile named `name`, carrying `tags` (the
+/// member omitted when `None`), and return its `ProfileId`.
+///
+/// `CreateDataTransformationProfile` answers the modelled `@http(code: 201)`,
+/// so this does not go through the harness's 200-only `ok`. Its `Tags` is the
+/// modelled `TagMap` — a map, not the `TagList` the tagging operations take.
+///
+/// `pub(crate)`: the one create the tagging suites write a profile through.
+pub(crate) async fn create_profile(
+    service: &HealthLake,
+    name: &str,
+    tags: Option<&Value>,
+) -> String {
+    let mut request = json!({
+        "ProfileName": name,
+        "SourceFormat": "CCDA",
+        "Source": { "ProfileMapping": { "ProfileMapping": { "a.map": "Patient.id <- id" } } },
+    });
+    if let Some(tags) = tags {
+        request["Tags"] = tags.clone();
+    }
+    let (status, payload) = service
+        .call("CreateDataTransformationProfile", &request)
+        .await;
+    assert!(
+        (200..300).contains(&status),
+        "CreateDataTransformationProfile must succeed, got {status}: {payload}"
+    );
+    string_at(&payload, "ProfileId")
 }
 
 /// `count` distinct tags, for the per-resource cap.

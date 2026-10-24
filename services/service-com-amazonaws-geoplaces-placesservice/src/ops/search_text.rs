@@ -3,7 +3,8 @@
 //! @op SearchText
 //! Searches the seeded place catalog in [`crate::state`] by free-form text and
 //! pages the matches — the same records GetPlace, Geocode, ReverseGeocode and
-//! SearchNearby answer from.
+//! SearchNearby answer from. A `QueryId` minted by Suggest is resolved to the
+//! query term it carries and searched for in place of a `QueryText`.
 //!
 //! ## Shape of an operation
 //!
@@ -217,15 +218,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "Exactly one of the following fields must be set: QueryText or QueryId"
-        // (`SearchTextRequest$QueryText`). A `QueryId` is minted by Suggest, which
-        // this emulator does not implement, so no id it was handed can be resolved.
+        // (`SearchTextRequest$QueryText`). "The query Id returned by the suggest
+        // API. If passed in the request, the SearchText API will preform a
+        // SearchText query with the improved query terms for the original query
+        // made to the suggest API" (`SearchTextRequest$QueryId`): a `QueryId` is
+        // minted by Suggest for a query TERM — a category or a business chain — and
+        // carries that term, so resolving one searches for the term it names. An id
+        // this service never minted names no query.
         let query_text = input
             .query_text
             .as_deref()
             .map(str::trim)
             .filter(|text| !text.is_empty());
         let query_text = match (query_text, input.query_id.as_deref()) {
-            (Some(text), None) => text,
+            (Some(text), None) => text.to_string(),
             (None, None) => {
                 return Err(SearchTextErrorModeled::ValidationException(
                     crate::state::validation_exception_for(
@@ -246,17 +252,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into())
             }
-            (None, Some(_)) => {
-                return Err(SearchTextErrorModeled::ValidationException(
-                    crate::state::validation_exception(
-                        crate::state::REASON_CANNOT_PARSE,
-                        "QueryId",
-                        crate::state::must_be_valid_id("QueryId"),
-                    ),
-                )
-                .into())
-            }
+            (None, Some(query_id)) => match crate::state::decode_query_id(query_id.trim()) {
+                Some((_, term)) => term,
+                None => {
+                    return Err(SearchTextErrorModeled::ValidationException(
+                        crate::state::validation_exception(
+                            crate::state::REASON_CANNOT_PARSE,
+                            "QueryId",
+                            crate::state::must_be_valid_id("QueryId"),
+                        ),
+                    )
+                    .into())
+                }
+            },
         };
+        let query_text = query_text.as_str();
 
         let filter = input.filter.as_ref();
         let bounding_box = filter.and_then(|filter| filter.bounding_box.as_deref());

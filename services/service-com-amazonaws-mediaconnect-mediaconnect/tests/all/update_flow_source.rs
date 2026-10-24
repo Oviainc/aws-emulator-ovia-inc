@@ -498,8 +498,7 @@ async fn update_flow_source_refuses_what_it_cannot_apply() {
         "flow-update-source-refusals",
         json!([
             { "name": "primary", "protocol": "rtp", "whitelistCidr": "10.4.0.0/16" },
-            { "name": "doomed", "protocol": "rtp", "whitelistCidr": "10.5.0.0/16" },
-            { "name": "bare", "whitelistCidr": "10.6.0.0/16" }
+            { "name": "doomed", "protocol": "rtp", "whitelistCidr": "10.5.0.0/16" }
         ]),
     )
     .await;
@@ -512,7 +511,6 @@ async fn update_flow_source_refuses_what_it_cannot_apply() {
     .await;
     let held = described_sources(&emulator, "refusals", &flow_arn).await;
     let source_arn = held[0]["sourceArn"].as_str().unwrap_or_default().to_string();
-    let bare_arn = held[2]["sourceArn"].as_str().unwrap_or_default().to_string();
     let other_source = described_sources(&emulator, "refusals", &other_flow).await[0]["sourceArn"]
         .as_str()
         .unwrap_or_default()
@@ -525,6 +523,26 @@ async fn update_flow_source_refuses_what_it_cannot_apply() {
         status, 202,
         "the fixture removal must succeed, got {status}: {body}"
     );
+
+    // The freed slot takes a source with no protocol at all, so one row can address a
+    // source that carries no transport. The flow holds the failover pair again, which is
+    // every source a flow can hold ("if the state is active, the flow can have one or two
+    // sources", `FailoverConfig$State`).
+    let (status, code, added) = crate::flow_sources::add_flow_sources(
+        &emulator,
+        &flow_arn,
+        json!([{ "name": "bare", "whitelistCidr": "10.6.0.0/16" }]),
+    )
+    .await;
+    assert_eq!(
+        (status, code.as_deref()),
+        (201, None),
+        "the fixture source with no transport must be added, got {status} {code:?}: {added}"
+    );
+    let bare_arn = added["sources"][0]["sourceArn"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
 
     let before = described_sources(&emulator, "refusals", &flow_arn).await;
     let rows = vec![
@@ -688,11 +706,12 @@ async fn update_flow_source_refuses_what_it_cannot_apply() {
 async fn an_added_source_is_updated_then_gone_once_removed() {
     let emulator = Emulator::new();
     let case = "an added source round trip";
-    let flow_arn = create_flow_with_sources(
+    let flow_arn = crate::flow_sources::create_flow_with_sources_and_failover(
         &emulator,
         case,
         "flow-add-then-update",
         json!([{ "name": "source1", "protocol": "rtp", "whitelistCidr": "0.0.0.0/0", "ingestPort": 5001 }]),
+        Some(crate::flow_sources::failover_active()),
     )
     .await;
     let (status, code, added) = crate::flow_sources::add_flow_sources(

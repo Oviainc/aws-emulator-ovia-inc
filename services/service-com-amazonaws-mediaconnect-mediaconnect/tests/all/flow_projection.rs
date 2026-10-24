@@ -334,6 +334,9 @@ async fn each_source_of_a_failover_pair_keeps_its_own_transport() {
         case,
         json!({
             "name": "transport-flow-pair",
+            // A pair of sources needs source failover ACTIVE: "if the state is active,
+            // the flow can have one or two sources" (`FailoverConfig$State`).
+            "sourceFailoverConfig": { "state": STATE_ENABLED },
             "sources": [
                 { "name": "primary", "protocol": "rtp", "whitelistCidr": "10.1.0.0/16", "maxBitrate": 40_000_000 },
                 { "name": "backup", "protocol": "rist", "whitelistCidr": "10.2.0.0/16", "maxBitrate": 70_000_000 }
@@ -436,6 +439,7 @@ async fn router_integration_state_is_reported_on_every_source_and_output() {
             case,
             json!({
                 "name": format!("router-flow-{index}"),
+                "sourceFailoverConfig": { "state": STATE_ENABLED },
                 "sources": [
                     with_router_integration(
                         json!({ "name": "primary", "protocol": "rtp", "whitelistCidr": "10.0.0.0/16" }),

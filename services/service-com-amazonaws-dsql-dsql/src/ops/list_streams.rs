@@ -86,17 +86,21 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-dsql-dsql.json");
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
 // The operation's MODELED errors, plus the service-common `InternalServerException`
-// widened in with `extra_errors`: the service declares it for every operation (its
-// `common_errors` are AccessDenied / InternalServer / Throttling / Validation), but the
-// per-operation list the macro checks against does not repeat it.
+// and `ValidationException` widened in with `extra_errors`: the service declares both
+// for every operation (its `common_errors` are AccessDenied / InternalServer /
+// Throttling / Validation), but the per-operation list the macro checks against does
+// not repeat them. `ValidationException` is what refuses a `nextToken` this service
+// never issued — the MODELED shape, which carries the `@required` `reason` a client
+// branches on, rather than the synthetic single-member one.
 #[smithy_macros::operation_error(
     "com.amazonaws.dsql#ListStreams",
-    extra_errors = ["InternalServerException"]
+    extra_errors = ["InternalServerException", "ValidationException"]
 )]
 #[derive(Debug)]
 pub enum ListStreamsErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
     InternalServerException(InternalServerException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -165,8 +169,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let resume_after = match input.next_token.as_deref() {
             Some(token) => Some(crate::state::decode_pagination_cursor(token).ok_or_else(
                 || {
-                    crate::scaffolded::Scaffolded::validation(format!(
-                        "nextToken is not a cursor this service issued: {token}"
+                    // The service's OWN `ValidationException`, so the refusal carries
+                    // the modelled members a client reads — `message`, the `@required`
+                    // `reason` and the `fieldList` naming `nextToken`.
+                    ListStreamsError::from(ListStreamsErrorModeled::ValidationException(
+                        crate::state::unissued_pagination_token(token),
                     ))
                 },
             )?),

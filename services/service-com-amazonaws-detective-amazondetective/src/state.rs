@@ -19,8 +19,8 @@ use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    DatasourcePackageIngestDetail, Graph as GraphDetail, MemberDetail, ResourceNotFoundException,
-    TimestampForCollection, UnprocessedAccount,
+    DatasourcePackageIngestDetail, Graph as GraphDetail, MemberDetail, MembershipDatasources,
+    ResourceNotFoundException, TimestampForCollection, UnprocessedAccount,
 };
 
 /// Characters a behavior-graph id is built from.
@@ -294,10 +294,10 @@ impl Member {
 /// it, and when it last entered each ingest state it has been in.
 #[derive(Debug, Clone)]
 pub struct DatasourcePackageIngest {
-    /// One of `DATASOURCE_PACKAGE_INGEST_STATE_VALUES`.
+    /// One of `DATASOURCE_PACKAGE_INGEST_STATE_VALUES`: the state ingest is in now.
     pub state: String,
     /// When this package last entered each ingest state, keyed by that state, in
-    /// epoch milliseconds — the record the modelled `LastIngestStateChange` map
+    /// epoch milliseconds — the record the modelled `LastIngestStateChangeDates` map
     /// (`map<DatasourcePackageIngestState, TimestampForCollection>`) reports, so a
     /// package that has been started and later stopped keeps the instant of each.
     pub last_state_change_millis: BTreeMap<String, i64>,
@@ -327,25 +327,33 @@ impl DatasourcePackageIngest {
             .insert(state.to_string(), now_millis);
     }
 
+    /// This package's history as the modelled `LastIngestStateChangeDates` reports it:
+    /// one `TimestampForCollection` per ingest state the package has entered. The one
+    /// renderer of that map, so `ListDatasourcePackages`' `DatasourcePackageIngestDetail`
+    /// and `BatchGetGraphMemberDatasources`' `DatasourcePackageIngestHistory` cannot
+    /// drift apart.
+    pub fn state_change_dates(&self) -> ::std::collections::HashMap<String, TimestampForCollection>
+    {
+        self.last_state_change_millis
+            .iter()
+            .map(|(state, millis)| {
+                (
+                    state.clone(),
+                    TimestampForCollection {
+                        timestamp: Some(millis_to_date_time(*millis)),
+                    },
+                )
+            })
+            .collect()
+    }
+
     /// This package as `ListDatasourcePackages`' `DatasourcePackageIngestDetail`
     /// reports it: its ingest state, and the instant it entered each state it has been
     /// in as a `date-time` timestamp.
     pub fn detail(&self) -> DatasourcePackageIngestDetail {
         DatasourcePackageIngestDetail {
             datasource_package_ingest_state: Some(self.state.clone()),
-            last_ingest_state_change: Some(
-                self.last_state_change_millis
-                    .iter()
-                    .map(|(state, millis)| {
-                        (
-                            state.clone(),
-                            TimestampForCollection {
-                                timestamp: Some(millis_to_date_time(*millis)),
-                            },
-                        )
-                    })
-                    .collect(),
-            ),
+            last_ingest_state_change: Some(self.state_change_dates()),
         }
     }
 }
@@ -416,6 +424,36 @@ impl Graph {
         GraphDetail {
             arn: Some(self.arn.clone()),
             created_time: Some(millis_to_date_time(self.created_time_millis)),
+        }
+    }
+
+    /// Whether this graph ingests data for `account_id`.
+    ///
+    /// Two kinds of account contribute to a behavior graph: the ADMINISTRATOR account,
+    /// which `CreateGraph` "creates a new behavior graph for ... and sets as the
+    /// administrator account" and whose own data the graph ingests from the moment it
+    /// exists, and every account with a MEMBERSHIP in it. An account that is neither is
+    /// one the graph holds no data source package information for at all.
+    pub fn ingests_for(&self, account_id: &str) -> bool {
+        self.administrator_id == account_id || self.members.contains_key(account_id)
+    }
+
+    /// One account of this graph as `MembershipDatasources` reports it.
+    ///
+    /// Ingest is recorded per GRAPH — `UpdateDatasourcePackages` names the graph, not an
+    /// account, and "starts a data source package for the Detective behavior graph" — so
+    /// every account contributing to the graph contributes under the graph's packages,
+    /// and the history reported for one account is the graph's own package history.
+    pub fn membership_datasources(&self, account_id: &str) -> MembershipDatasources {
+        MembershipDatasources {
+            account_id: Some(account_id.to_string()),
+            graph_arn: Some(self.arn.clone()),
+            datasource_package_ingest_history: Some(
+                self.datasource_packages
+                    .iter()
+                    .map(|(package, ingest)| (package.clone(), ingest.state_change_dates()))
+                    .collect(),
+            ),
         }
     }
 
@@ -772,6 +810,16 @@ pub fn decode_page_token(token: &str) -> Option<String> {
         .ok()
         .and_then(|bytes| String::from_utf8(bytes).ok())
 }
+
+/// Why an account a batch named is reported unprocessed when the behavior graph ingests
+/// no data for it at all: it neither administers the graph nor holds a membership in it,
+/// so the graph stores no data source package information of it to report.
+pub const NOT_INGESTED_FOR_REASON: &str = "The account is not an account of the behavior graph.";
+
+/// Why an account a batch named is reported unprocessed when the behavior graph holds no
+/// MEMBERSHIP for it: a membership is the record `MemberDetail` reports, so an account
+/// without one — the administrator included — has no member details in this graph.
+pub const NOT_A_MEMBER_REASON: &str = "The account is not a member account in the behavior graph.";
 
 /// An `UnprocessedAccount` naming `account_id` and why it was not processed.
 pub fn unprocessed(account_id: &str, reason: String) -> UnprocessedAccount {

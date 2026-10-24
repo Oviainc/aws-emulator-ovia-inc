@@ -436,17 +436,86 @@ pub const MAX_FLOW_ENTITLEMENTS: usize = 50;
 /// the request.
 pub const MAX_FLOW_MEDIA_STREAMS: usize = MAX_FLOW_COLLECTION_ENTRIES;
 
-/// The ceiling on how many sources ONE FLOW holds, however many calls fill it.
+/// The ceiling on how many sources ONE FLOW holds while its source failover is ACTIVE,
+/// however many calls fill it.
 ///
-/// AWS publishes no count for a flow's sources, so the number is
-/// [`MAX_FLOW_COLLECTION_ENTRIES`] — the bound CreateFlow applies to one request's
-/// `Sources` — named once so the create side and the add side cannot drift apart. Like
-/// [`MAX_FLOW_MEDIA_STREAMS`] it is a different RULE from that per-request bound: this
-/// one bounds the STORED flow, so a sequence of adds cannot grow one past what a single
-/// create could store. AddFlowSources models no 420, so it refuses past this bound with
+/// `FailoverConfig$State` (`smithy_query(query="doc",shape="FailoverConfig",member="State")`)
+/// publishes the count: "The state of source failover on the flow. If the state is
+/// inactive, the flow can have only one source. If the state is active, the flow can have
+/// one or two sources." So a flow's sources are bounded by its own failover state, not by
+/// a generic collection bound — see [`max_flow_sources`], the one place that resolves the
+/// bound, and [`MAX_FLOW_SOURCES_FAILOVER_INACTIVE`] for the other half.
+///
+/// Like [`MAX_FLOW_MEDIA_STREAMS`] this bounds the STORED flow, so a sequence of adds
+/// cannot grow one past what a single create could store. Neither CreateFlow nor
+/// AddFlowSources models a count exception for it, so both refuse past the bound with
 /// `BadRequestException`, the error the model describes for "a semantic error" in the
 /// request.
-pub const MAX_FLOW_SOURCES: usize = MAX_FLOW_COLLECTION_ENTRIES;
+pub const MAX_FLOW_SOURCES: usize = 2;
+
+/// The ceiling on how many sources ONE FLOW holds while its source failover is INACTIVE:
+/// "if the state is inactive, the flow can have only one source" (`FailoverConfig$State`).
+/// See [`MAX_FLOW_SOURCES`] and [`max_flow_sources`].
+pub const MAX_FLOW_SOURCES_FAILOVER_INACTIVE: usize = 1;
+
+/// Whether source failover is ACTIVE on a resource holding `config`.
+///
+/// `FailoverConfig$State` targets the `State` enum (ENABLED | DISABLED), so failover is
+/// active exactly while that state is [`STATE_ENABLED`]: a resource that holds no failover
+/// config at all, and one whose config leaves `State` unset, has failover inactive —
+/// a setting nothing turned on is off, the same reading
+/// [`reported_router_integration_state`] applies to the other members of this enum.
+pub fn source_failover_is_active(config: Option<&FailoverConfig>) -> bool {
+    config.and_then(|config| config.state.as_deref()) == Some(STATE_ENABLED)
+}
+
+/// How many sources a flow whose source failover config is `config` may hold:
+/// [`MAX_FLOW_SOURCES`] while failover is active, and
+/// [`MAX_FLOW_SOURCES_FAILOVER_INACTIVE`] while it is not.
+///
+/// Every operation that decides a flow's source count reads the bound HERE — CreateFlow's
+/// `Sources`/`Source`, AddFlowSources' append and UpdateFlow's `SourceFailoverConfig`
+/// (which moves the bound under the sources the flow already holds) — so the add side, the
+/// create side and the failover side cannot drift apart.
+pub fn max_flow_sources(config: Option<&FailoverConfig>) -> usize {
+    if source_failover_is_active(config) {
+        MAX_FLOW_SOURCES
+    } else {
+        MAX_FLOW_SOURCES_FAILOVER_INACTIVE
+    }
+}
+
+/// The detail a request is refused with when it would leave a flow holding more sources
+/// than its failover state allows: `held` sources already stored, `adding` more requested
+/// (zero on a request that only moves the failover state), under `config`.
+///
+/// Both halves of the rule are worded here once, so the create path, the add path and
+/// UpdateFlow state the same bound for the same reason.
+pub fn flow_source_bound_rejection(
+    config: Option<&FailoverConfig>,
+    held: usize,
+    adding: usize,
+) -> Option<String> {
+    let bound = max_flow_sources(config);
+    let total = held + adding;
+    if total <= bound {
+        return None;
+    }
+    let state = if source_failover_is_active(config) {
+        format!("{STATE_ENABLED} (active)")
+    } else {
+        match config.and_then(|config| config.state.as_deref()) {
+            Some(state) => format!("{state} (inactive)"),
+            None => "unset (inactive)".to_string(),
+        }
+    };
+    Some(format!(
+        "A flow whose source failover state is {state} can hold at most {bound} \
+         source(s); this request would leave it with {total} ({held} already stored, \
+         {adding} requested). If the state is inactive, the flow can have only one \
+         source; if the state is active, the flow can have one or two sources."
+    ))
+}
 
 /// The first port handed to a source that did not ask for one. MediaConnect assigns an
 /// ingest port from its own pool when the request omits `IngestPort`; the emulator

@@ -2,11 +2,18 @@
 
 //! @op DeleteEnvironment
 //! Moves the stored environment into `DELETING` and records the `DELETED` the clock
-//! then owes it, stamping `modifiedAt`. An environment that still holds ESX hosts is
-//! not enabled for deletion: it is refused with `ValidationException` and nothing about
-//! it changes. `@idempotent`: deleting an environment that is already going away
-//! reports the record as it stands and starts nothing new. An id this service holds no
-//! environment for is a `ResourceNotFoundException`.
+//! then owes it, stamping `modifiedAt`, and removes the environment's VLAN subnets
+//! from the account's own Amazon EC2 store — "environment deletion also deletes the
+//! associated Amazon EVS VLAN subnets", and those are real subnets of the caller's VPC
+//! ([`crate::state::ec2_resources::release_vlan_subnets`]). The other half of that
+//! sentence, the "Amazon Web Services Secrets Manager secrets that Amazon EVS created",
+//! has nothing to delete: this emulator creates no VCF credential secret, which is why
+//! `Environment$credentials` is absent (see [`crate::state::StoredEnvironment`]).
+//! An environment that still holds ESX hosts is not enabled for deletion: it is refused
+//! with `ValidationException` and nothing about it changes. `@idempotent`: deleting an
+//! environment that is already going away reports the record as it stands and starts
+//! nothing new. An id this service holds no environment for is a
+//! `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -214,6 +221,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The EC2 subnets this deletion releases — only on the call that starts the
+        // deletion, so a repeat releases nothing a second time.
+        let mut vlan_subnet_ids: Vec<String> = Vec::new();
         if !already_going_away {
             environment.state = crate::state::STATE_DELETING.to_string();
             environment.modified_at_ms = crate::state::now_ms();
@@ -227,6 +237,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::STATE_DELETED,
                 crate::state::STATE_DELETED,
             ));
+            vlan_subnet_ids = environment
+                .vlans
+                .iter()
+                .map(|vlan| vlan.subnet_id.clone())
+                .collect();
         }
 
         let transition_due_at = environment.pending.as_ref().map(|pending| pending.due_at);
@@ -234,6 +249,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(due_at) = transition_due_at {
             state.note_transition_due(due_at);
         }
+        // "Environment deletion also deletes the associated Amazon EVS VLAN subnets":
+        // the subnets this service provisioned in the account's own Amazon EC2 store
+        // are removed from it here, so no other service is left holding a subnet of a
+        // deleted environment and the VPC's address space is free for the next one.
+        // The deletion is what releases them, so this runs on the call that starts it —
+        // the VLAN records then report `DELETING` until the clock settles them, as the
+        // environment's own state does. The EC2 store is written while this service's
+        // lock is held, the same order `CreateEnvironment` takes the two locks in.
+        crate::state::ec2_resources::release_vlan_subnets(&*self.engine, &vlan_subnet_ids);
 
         Ok(DeleteEnvironmentOutput {
             environment: Some(deleted),

@@ -253,10 +253,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        // One request may not store an arbitrarily large flow record: every collection
-        // it can fill is bounded (see `crate::state::MAX_FLOW_COLLECTION_ENTRIES`).
+        // How many of them a flow may hold is its FAILOVER state's rule: "If the state is
+        // inactive, the flow can have only one source. If the state is active, the flow
+        // can have one or two sources." (`FailoverConfig$State`). The bound is resolved
+        // through the one function AddFlowSources and UpdateFlow read it from, so a flow
+        // this create stores can hold exactly what a later add could grow one to (see
+        // `crate::state::max_flow_sources`).
+        if let Some(rejection) = crate::state::flow_source_bound_rejection(
+            input.source_failover_config.as_ref(),
+            0,
+            requested_sources.len(),
+        ) {
+            return Err(bad_request(rejection));
+        }
+
+        // One request may not store an arbitrarily large flow record: every other
+        // collection it can fill is bounded (see
+        // `crate::state::MAX_FLOW_COLLECTION_ENTRIES`).
         for (member, len) in [
-            ("Sources", requested_sources.len()),
             ("Outputs", input.outputs.iter().flatten().count()),
             ("Entitlements", input.entitlements.iter().flatten().count()),
             ("MediaStreams", input.media_streams.iter().flatten().count()),

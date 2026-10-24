@@ -157,6 +157,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // The tokens were issued against this stage, so they go with it.
         store.participant_tokens.remove(&input.arn);
+        // So does every replication the stage is an end of: a replica is a participant
+        // of its source stage replicated into its destination stage, so neither end can
+        // outlive the stage it names. The replicas sourced from this stage go with its
+        // key; the ones replicated INTO it are dropped from the stages that source them.
+        store.participant_replicas.remove(&input.arn);
+        for replicas in store.participant_replicas.values_mut() {
+            replicas.retain(|replica| replica.destination_stage_arn != input.arn);
+        }
         Ok(DeleteStageOutput {})
     }
 }

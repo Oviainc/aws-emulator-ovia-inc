@@ -190,7 +190,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             catalog: state.catalog.clone(),
             product_name: text.name.clone(),
             manufacturer: product.manufacturer.clone(),
-            deployed_on_aws: product.deployed_on_aws.clone(),
+            // Derived from the product's fulfillment options, the single record of how it
+            // is delivered, so the deployment it reports cannot contradict them.
+            deployed_on_aws: product.deployed_on_aws().to_string(),
             short_description: text.short_description.clone(),
             long_description: text.long_description.clone(),
             logo_thumbnail_url: product.logo_thumbnail_url.clone(),

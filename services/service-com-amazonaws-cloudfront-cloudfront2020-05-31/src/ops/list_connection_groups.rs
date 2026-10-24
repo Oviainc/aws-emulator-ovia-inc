@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListConnectionGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListConnectionGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Enumerates the persisted connection groups, one page at a time: `MaxItems` is the page
+//! size, `Marker` is the connection group id the previous page ended at, `NextMarker`
+//! arrives exactly when groups remain, and `AssociationFilter` narrows the listing to the
+//! groups associated with one Anycast static IP list.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListConnectionGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Every summary is read from the stored record the create persisted, so a listing and a
+//! `GetConnectionGroup` can never disagree about one group. The account's automatically
+//! created DEFAULT group is one of them: it is a record like any other, carrying
+//! `IsDefault`.
 //!
 //! ## Shape of an operation
 //!
@@ -74,6 +74,9 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::ops::Bound;
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -145,18 +148,117 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListConnectionGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListConnectionGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListConnectionGroups"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+
+        // "The maximum number of connection groups to return" — a page holds at least one
+        // item, so a non-positive size names no page at all. The size served is bounded
+        // above by this emulator's own page ceiling, the same one every listing of this
+        // service is bounded by.
+        let Some(page_size) = crate::state::page_size(input.max_items) else {
+            return Err(ListConnectionGroupsErrorModeled::InvalidArgument(
+                crate::state::invalid_max_items(),
+            )
+            .into());
+        };
+
+        // "Filter by associated Anycast IP list ID": the groups kept are the ones whose
+        // stored `AnycastIpListId` is the one the filter names; a filter element that names
+        // no list narrows nothing.
+        let anycast_filter = input
+            .association_filter
+            .as_ref()
+            .and_then(|filter| filter.anycast_ip_list_id.as_deref());
+
+        let mut store = state.lock();
+        // Materialise whatever the clock already owes this service's state, so no summary
+        // reports a stale status.
+        store.settle(SystemTime::now());
+
+        // The filter names an Anycast static IP list, so a value this service cannot
+        // resolve to one is an invalid argument — what the recorded contract answers for
+        // it, rather than an empty page over a filter that matched nothing. The sentence is
+        // the filter's own, so it says nothing about the value submitted.
+        if let Some(wanted) = anycast_filter {
+            if !store.holds_anycast_ip_list(wanted) {
+                return Err(ListConnectionGroupsErrorModeled::InvalidArgument(
+                    crate::state::invalid_association_filter(),
+                )
+                .into());
+            }
+        }
+
+        // "A token used for pagination of results returned in the response. You can use the
+        // token from the previous request to define where the current request should
+        // begin": the marker is a connection group id this service handed out. A value that
+        // is not one was never a resume point (`InvalidArgument`), and one that is but names
+        // no stored group names no entity, which is what this listing's `EntityNotFound`
+        // is about.
+        if let Some(marker) = input.marker.as_deref() {
+            if !crate::state::is_connection_group_id(marker) {
+                return Err(ListConnectionGroupsErrorModeled::InvalidArgument(
+                    InvalidArgument {
+                        message: Some(format!(
+                            "Marker {marker} is not a connection group id returned by \
+                             ListConnectionGroups"
+                        )),
+                    },
+                )
+                .into());
+            }
+            if !store.holds_connection_group(marker) {
+                return Err(ListConnectionGroupsErrorModeled::EntityNotFound(
+                    crate::state::connection_group_not_found(marker),
+                )
+                .into());
+            }
+        }
+
+        // `Marker` names where the previous page ENDED, so this page starts after it:
+        // walking the pages enumerates every group that passes the filter exactly once.
+        // The store is ordered by id, so the resume point is a range bound rather than a
+        // scan.
+        let start = match input.marker.as_deref() {
+            Some(marker) => Bound::Excluded(marker),
+            None => Bound::Unbounded,
+        };
+        let mut groups: Vec<ConnectionGroupSummary> = Vec::new();
+        let mut more_remain = false;
+        for (_, stored) in store
+            .connection_groups
+            .range::<str, _>((start, Bound::Unbounded))
+        {
+            // "Filter by associated Anycast IP list ID": a group whose stored id is not the
+            // filtered one is not part of this listing. Reached once an Anycast static IP
+            // list can be resolved at all — `State::holds_anycast_ip_list` is the one place
+            // that makes this branch live, and until then the refusal above answers every
+            // filtered request — and stated here so the rule lives with the listing it
+            // governs rather than with that surface.
+            if anycast_filter
+                .is_some_and(|wanted| stored.anycast_ip_list_id.as_deref() != Some(wanted))
+            {
+                continue;
+            }
+            if groups.len() >= page_size {
+                more_remain = true;
+                break;
+            }
+            groups.push(stored.to_summary());
+        }
+
+        Ok(ListConnectionGroupsOutput {
+            // The resume point the next request carries as its `Marker`: present exactly
+            // when groups remain, carrying the id this page ended at.
+            next_marker: if more_remain {
+                groups.last().map(|summary| summary.id.clone())
+            } else {
+                None
+            },
+            // "The list of connection groups that you retrieved" — every one of them read
+            // from its stored record.
+            connection_groups: Some(groups),
+        })
     }
 }

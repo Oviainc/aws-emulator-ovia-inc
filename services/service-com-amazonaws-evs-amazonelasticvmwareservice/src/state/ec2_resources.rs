@@ -17,15 +17,44 @@
 //! is EVIDENCE OF NOTHING and so refuses nothing: every function here answers `None`
 //! for that case, and the callers treat `None` as "no failure to report".
 //!
-//! The same store is also WRITTEN here, for the one resource Amazon EVS creates in the
-//! account on the caller's behalf: an Amazon EVS host IS an EC2 bare metal instance
-//! (`Host` doc), so [`launch_host_instance`] puts that instance in EC2's own store
-//! through EC2's own state API, and the host reports the id EC2 minted for it. Nothing
-//! else is written: the VPC, the subnets and the Elastic IP addresses an environment is
-//! deployed into belong to the caller and are only read.
+//! The same store is also WRITTEN here, for the resources Amazon EVS creates in the
+//! account on the caller's behalf:
+//!
+//! * an Amazon EVS host IS an EC2 bare metal instance (`Host` doc), so
+//!   [`launch_host_instance`] puts that instance in EC2's own store through EC2's own
+//!   state API, and the host reports the id EC2 minted for it;
+//! * Amazon EVS "provisions the VLAN subnets" of an environment inside the VPC the
+//!   request names, and "environment deletion also deletes the associated Amazon EVS
+//!   VLAN subnets" (`CreateEnvironment` / `DeleteEnvironment` docs) — those subnets are
+//!   EC2 subnets of the caller's account, so they are created in and removed from EC2's
+//!   own store through EC2's own writers ([`provision_vlan_subnets`],
+//!   [`release_vlan_subnets`]) rather than existing only inside this service's records:
+//!   an id no other service holds would name nothing.
+//!
+//! Nothing else is written: the VPC, the service access subnet and the Elastic IP
+//! addresses an environment is deployed into belong to the caller and are only read.
+//!
+//! Nothing in this module does arithmetic on an address or a prefix length of its own:
+//! every judgement about a CIDR block a caller supplied is EC2's own published helper
+//! (`canonical_subnet_ipv4_cidr`, `ipv4_cidr_block_contains`,
+//! `ipv4_cidr_blocks_overlap`), so one reading of a block serves both services, and a
+//! block those cannot read is skipped rather than guessed at. There is no indexing or
+//! slicing of a caller-supplied string here, and no `unwrap`, `expect` or `panic!`: a
+//! request cannot panic a handler through this module.
+//!
+//! LOCKING. Each function takes EC2's store lock for the shortest span that answers it,
+//! does a bounded amount of work under it (at most one pass over the VPC's subnets, or
+//! the ten subnets of one environment), and never awaits while holding it. The lock is
+//! `engine::ServiceState::lock`, which recovers from poisoning rather than propagating a
+//! panic, so a panicking request cannot wedge either store. The callers hold this
+//! service's own lock across these calls, so the order is always EVS-then-EC2; EC2 never
+//! reaches this service, so no cycle exists.
+
+use std::time::Instant;
 
 use crate::ops::types::ValidationExceptionField;
 
+use ::service_com_amazonaws_ec2_amazonec2::ops::types as ec2_types;
 use ::service_com_amazonaws_ec2_amazonec2::state as ec2;
 
 /// The account's EC2 store in the shared engine, through EC2's own accessor.
@@ -279,4 +308,312 @@ pub fn elastic_ip_address<Eng: Send + Sync + 'static>(
         .addresses
         .get(allocation_id)
         .and_then(|address| address.public_ip.clone())
+}
+
+/// The `Subnet$Type` Amazon EC2 reports for a subnet Amazon EVS provisioned:
+/// "Indicates if this is a subnet used with Amazon Elastic VMware Service (EVS).
+/// Possible values are `Elastic VMware Service` or no value" (`Subnet$Type` doc, EC2's
+/// own model). It is what marks a subnet of the account's EC2 store as one of an
+/// environment's VLAN subnets, so [`release_vlan_subnets`] removes only the subnets
+/// this service provisioned and never one the caller created.
+pub const EVS_SUBNET_TYPE: &str = "Elastic VMware Service";
+
+/// One VLAN subnet of an environment, as the request described it: the `initialVlans`
+/// member it came from (so a refusal names the member the caller sent) and the CIDR
+/// block supplied for it.
+#[derive(Debug, Clone, Copy)]
+pub struct VlanSubnetRequest<'a> {
+    /// The path of the `initialVlans` member this VLAN subnet came from.
+    pub member: &'a str,
+    /// The CIDR block the request supplied for it.
+    pub cidr: &'a str,
+}
+
+/// One VLAN subnet as Amazon EC2 provisioned it: the id EC2 minted for it, the block it
+/// stored, and the Availability Zone the subnet is in.
+#[derive(Debug, Clone)]
+pub struct ProvisionedVlanSubnet {
+    /// The `SubnetId` EC2's own id minter gave the subnet.
+    pub subnet_id: String,
+    /// The IPv4 CIDR block EC2 stored for the subnet — the requested block in the
+    /// canonical form EC2 holds one in, so the VLAN and the subnet report ONE block.
+    pub cidr_block: String,
+    /// The zone name of the subnet (`us-west-2a`), as EC2 holds it.
+    pub availability_zone: String,
+}
+
+/// What came of asking Amazon EC2 to provision an environment's VLAN subnets.
+#[derive(Debug)]
+pub enum VlanSubnetProvisioning {
+    /// EC2 created one subnet per requested VLAN, in the order they were asked for.
+    Provisioned(Vec<ProvisionedVlanSubnet>),
+    /// There is no readable EC2 store on this engine, so nothing was created and
+    /// nothing is known: the caller falls back to ids of its own, exactly as the
+    /// read-side functions above treat an unreadable store as evidence of nothing.
+    NoEc2Store,
+    /// No Availability Zone could be named for the environment's subnets, so NOTHING
+    /// was created: a subnet of no zone is a record EC2 itself never produces, and the
+    /// caller answers the server error EC2's own `CreateSubnet` answers for a Region
+    /// with no zone rather than storing one.
+    ZoneUnknown,
+    /// The account's EC2 store cannot hold that many more subnets, so NOTHING was
+    /// created: the environment's VLAN subnets are provisioned together or not at all.
+    SubnetLimitExceeded {
+        /// How many subnets the store already holds.
+        held: usize,
+        /// The ceiling it holds them under (EC2's own `MAX_SUBNETS`).
+        limit: usize,
+    },
+}
+
+/// The IPv4 CIDR blocks associated with one VPC: its primary block and every block a
+/// later association added, which together are the address space a subnet of that VPC
+/// has to come out of.
+fn vpc_ipv4_blocks(vpc: &ec2_types::Vpc) -> Vec<String> {
+    let mut blocks: Vec<String> = vpc.cidr_block.clone().into_iter().collect();
+    for association in vpc.cidr_block_association_set.iter().flatten() {
+        if let Some(block) = association.cidr_block.clone() {
+            if !blocks.contains(&block) {
+                blocks.push(block);
+            }
+        }
+    }
+    blocks
+}
+
+/// Every failure of the preconditions an environment's VLAN subnet blocks must meet
+/// AGAINST THE VPC they are provisioned inside: each block is a block of the VPC's own
+/// address space, and overlaps no subnet that VPC already holds ("Amazon EVS VLAN
+/// subnet CIDR blocks must not overlap with other subnets in the VPC", `InitialVlans`
+/// doc).
+///
+/// This is the same overlap rule `CreateEnvironment` applies among an environment's own
+/// ten blocks, at the scope the doc states it: the whole VPC. It has to hold, because
+/// each block becomes a real EC2 subnet of that VPC, and EC2 holds no two overlapping
+/// subnets in one VPC.
+///
+/// An unknown VPC leaves nothing to judge the blocks against, so nothing is reported —
+/// [`invalid_vpc_clause`] is the clause for that — and so does an unreadable EC2 store.
+pub fn vlan_placement_failures<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    vpc_id: &str,
+    planned: &[VlanSubnetRequest<'_>],
+) -> Vec<ValidationExceptionField> {
+    let Some(state) = ec2_state(engine) else {
+        return Vec::new();
+    };
+    let store = state.lock();
+    let Some(vpc) = store.vpcs.get(vpc_id) else {
+        return Vec::new();
+    };
+    let vpc_blocks = vpc_ipv4_blocks(vpc);
+    let mut failures = Vec::new();
+    for vlan in planned {
+        // A block the subnet rules cannot read or size is already refused by the
+        // operation's own CIDR clauses, so it is not judged a second time here.
+        let Ok(canonical) = ec2::canonical_subnet_ipv4_cidr(vlan.cidr) else {
+            continue;
+        };
+        if !vpc_blocks
+            .iter()
+            .any(|block| ec2::ipv4_cidr_block_contains(block, &canonical))
+        {
+            failures.push(super::field_failure(
+                vlan.member,
+                &format!(
+                    "must be a block of the CIDR of VPC {vpc_id} ({blocks}), because \
+                     Amazon EVS provisions the VLAN subnet inside that VPC",
+                    blocks = vpc_blocks.join(", "),
+                ),
+            ));
+            continue;
+        }
+        let conflicting = store
+            .subnets
+            .iter()
+            .filter(|(_, subnet)| subnet.vpc_id.as_deref() == Some(vpc_id))
+            .find(|(_, subnet)| {
+                subnet
+                    .cidr_block
+                    .as_deref()
+                    .is_some_and(|held| ec2::ipv4_cidr_blocks_overlap(held, &canonical))
+            })
+            .map(|(subnet_id, _)| subnet_id.clone());
+        if let Some(conflicting) = conflicting {
+            failures.push(super::field_failure(
+                vlan.member,
+                &format!("overlaps the CIDR block of subnet {conflicting} in VPC {vpc_id}"),
+            ));
+        }
+    }
+    failures
+}
+
+/// The single Availability Zone every subnet of the environment's VPC is in — its zone
+/// name and that zone's id.
+///
+/// "Amazon EVS requires that all VPC subnets exist in a single Availability Zone in a
+/// Region where the service is available" (`vpcId` doc), and the service access subnet
+/// is one of those subnets, so ITS zone is the environment's zone and the VLAN subnets
+/// are provisioned there. A service access subnet the store holds without a zone leaves
+/// the Region's first zone, which is the zone `CreateSubnet` itself picks for a request
+/// that names none; `None` when neither names one, which is no zone to put a subnet in.
+fn environment_zone(
+    store: &ec2::ComAmazonawsEc2Amazonec2State,
+    region: &str,
+    service_access_subnet_id: &str,
+) -> Option<(String, String)> {
+    let held = store
+        .subnets
+        .get(service_access_subnet_id)
+        .and_then(|subnet| {
+            let zone_name = subnet.availability_zone.clone()?;
+            let zone_id = subnet
+                .availability_zone_id
+                .clone()
+                .or_else(|| ec2::zone_id_for_zone_name(&zone_name))
+                .unwrap_or_default();
+            Some((zone_name, zone_id))
+        });
+    held.or_else(|| {
+        ec2::availability_zones_in_region(region)
+            .into_iter()
+            .next()
+            .map(|zone| (zone.zone_name, zone.zone_id))
+    })
+    .filter(|(zone_name, _)| !zone_name.is_empty())
+}
+
+/// How many subnets the account's EC2 store holds and the ceiling it holds them under,
+/// when it cannot take `count` more — `None` when there is room (or no readable store,
+/// which refuses nothing).
+///
+/// A READ, so a create can refuse on the EC2 subnet ceiling BEFORE it reserves anything
+/// of its own: [`provision_vlan_subnets`] enforces the same ceiling, and writes nothing
+/// when it is reached, but by then the create has already taken an environment slot.
+pub fn subnet_room_shortfall<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    count: usize,
+) -> Option<(usize, usize)> {
+    let state = ec2_state(engine)?;
+    let held = state.lock().subnets.len();
+    (held + count > ec2::MAX_SUBNETS).then_some((held, ec2::MAX_SUBNETS))
+}
+
+/// Provision one EC2 subnet per requested VLAN in the account's own Amazon EC2 store,
+/// inside `vpc_id`, and report what EC2 made of each.
+///
+/// "When you specify SELF_DEPLOYED for vcfVersion, Amazon EVS provisions only the VLAN
+/// subnets" and provisions them in every other mode too, so these are real subnets of
+/// the caller's VPC: EC2's own [`ec2::ComAmazonawsEc2Amazonec2State::insert_subnet`]
+/// mints each id, ARN and available-address count, so `DescribeSubnets` reports a VLAN
+/// subnet exactly as it reports one `CreateSubnet` created, and each carries the
+/// [`EVS_SUBNET_TYPE`] that marks it as an Amazon EVS subnet.
+///
+/// Each subnet starts `pending` and the clock owes it `available` one EC2
+/// `TRANSITION_DELAY` later, the same span on the same monotonic clock as a subnet
+/// `CreateSubnet` created — EC2 owns its own resource's lifecycle, so the span is EC2's
+/// and not this service's.
+///
+/// NOTHING is written when the store cannot hold them all, or when no Availability Zone
+/// can be named for them: an environment's VLAN subnets are provisioned together or not
+/// at all, and never as a subnet of no zone.
+pub fn provision_vlan_subnets<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    region: &str,
+    vpc_id: &str,
+    service_access_subnet_id: &str,
+    planned: &[VlanSubnetRequest<'_>],
+) -> VlanSubnetProvisioning {
+    let Some(state) = ec2_state(engine) else {
+        return VlanSubnetProvisioning::NoEc2Store;
+    };
+    let mut store = state.lock();
+    let held = store.subnets.len();
+    if held + planned.len() > ec2::MAX_SUBNETS {
+        return VlanSubnetProvisioning::SubnetLimitExceeded {
+            held,
+            limit: ec2::MAX_SUBNETS,
+        };
+    }
+    let Some((zone_name, zone_id)) = environment_zone(&store, region, service_access_subnet_id)
+    else {
+        return VlanSubnetProvisioning::ZoneUnknown;
+    };
+    let available_at = Instant::now() + ec2::TRANSITION_DELAY;
+    let mut provisioned = Vec::with_capacity(planned.len());
+    for vlan in planned {
+        // "We modify the specified CIDR block to its canonical form"
+        // (`CreateSubnetRequest$CidrBlock`): the subnet is stored the way EC2 stores
+        // one. A block EC2 cannot canonicalise cannot reach here — the operation's own
+        // CIDR clauses refuse it — so the request's own text is the honest fallback.
+        let cidr_block = ec2::canonical_subnet_ipv4_cidr(vlan.cidr)
+            .unwrap_or_else(|_| vlan.cidr.to_string());
+        let subnet_id = store.insert_subnet(ec2::SubnetSpec {
+            vpc_id: vpc_id.to_string(),
+            cidr_block,
+            availability_zone: zone_name.clone(),
+            availability_zone_id: zone_id.clone(),
+            region: region.to_string(),
+            state: ec2::SUBNET_STATE_PENDING.to_string(),
+            // Only a default VPC's own subnets are the default for their zone, and a
+            // VLAN subnet does not auto-assign a public IPv4 address: a public VLAN is
+            // reached through the Elastic IP addresses `AssociateEipToVlan` associates.
+            default_for_az: false,
+            map_public_ip_on_launch: false,
+            // Tags "don't propagate to any other cluster or Amazon Web Services
+            // resources" (`CreateEnvironmentRequest$tags` doc), so the VLAN subnets
+            // carry none of the environment's.
+            tags: Vec::new(),
+        });
+        if let Some(subnet) = store.subnets.get_mut(&subnet_id) {
+            subnet.r#type = Some(EVS_SUBNET_TYPE.to_string());
+        }
+        store
+            .subnet_available_at
+            .insert(subnet_id.clone(), available_at);
+        let cidr_block = store
+            .subnets
+            .get(&subnet_id)
+            .and_then(|subnet| subnet.cidr_block.clone())
+            .unwrap_or_else(|| vlan.cidr.to_string());
+        provisioned.push(ProvisionedVlanSubnet {
+            subnet_id,
+            cidr_block,
+            availability_zone: zone_name.clone(),
+        });
+    }
+    VlanSubnetProvisioning::Provisioned(provisioned)
+}
+
+/// Remove the VLAN subnets `subnet_ids` names from the account's own Amazon EC2 store,
+/// and report how many were removed.
+///
+/// "Environment deletion also deletes the associated Amazon EVS VLAN subnets"
+/// (`DeleteEnvironment` doc): the subnets this service provisioned go away with the
+/// environment, so the account is not left holding a subnet of an environment that no
+/// longer exists — and the VPC's address space is free for the next environment.
+///
+/// Only a subnet EC2 reports as an Amazon EVS subnet ([`EVS_SUBNET_TYPE`]) is removed,
+/// so an id that has come to name some other subnet of the account cannot delete it.
+pub fn release_vlan_subnets<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    subnet_ids: &[String],
+) -> usize {
+    let Some(state) = ec2_state(engine) else {
+        return 0;
+    };
+    let mut store = state.lock();
+    let mut removed = 0;
+    for subnet_id in subnet_ids {
+        let is_evs_subnet = store
+            .subnets
+            .get(subnet_id)
+            .and_then(|subnet| subnet.r#type.as_deref())
+            == Some(EVS_SUBNET_TYPE);
+        if is_evs_subnet && store.remove_subnet(subnet_id).is_some() {
+            removed += 1;
+        }
+    }
+    removed
 }

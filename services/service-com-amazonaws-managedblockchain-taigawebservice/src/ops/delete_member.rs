@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteMember
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteMember`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteMember::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: removes a stored member — and "all associated resources", its nodes —
+//! from its network in [`crate::state`], so a later `GetMember` answers
+//! `ResourceNotFoundException` and `ListMembers` no longer reports it. When the member
+//! removed was the last one on the network, the network is deleted with it.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +152,130 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteMember` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteMemberErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteMember"))
+        // The deletion is driven entirely by stored state; the request carries no
+        // region-dependent value to mint.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteMemberErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {},
+            )
+            .into());
+        };
+
+        let mut guard = state.lock();
+        guard.settle(::std::time::SystemTime::now());
+
+        // `DELETE /networks/{NetworkId}/members/{MemberId}` nests the member INSIDE the
+        // network, so the path labels resolve left to right: a `NetworkId` this service
+        // does not hold is itself the missing resource, and nothing inside it is reached.
+        let Some(network) = guard.networks.get(&input.network_id) else {
+            return Err(DeleteMemberErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_NETWORK, &input.network_id),
+            )
+            .into());
+        };
+
+        // This operation "Applies only to Hyperledger Fabric", and a network of any other
+        // framework has no members to delete, so naming one is an invalid request rather
+        // than a missing resource — the same refusal `CreateMember` makes for the same
+        // sentence. It is also what keeps AWS's standing, AWS-owned public networks (all
+        // of them Ethereum) out of every write below, the network deletion included.
+        if network.framework != crate::state::FRAMEWORK_HYPERLEDGER_FABRIC {
+            return Err(DeleteMemberErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "DeleteMember applies only to {} networks; network {} is {}",
+                        crate::state::FRAMEWORK_HYPERLEDGER_FABRIC,
+                        input.network_id,
+                        network.framework
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The network resolved, so the leaf label is next: a member that network does not
+        // hold is the resource the request asked to delete and did not get.
+        let Some(member) = network.members.get(&input.member_id) else {
+            return Err(DeleteMemberErrorModeled::ResourceNotFoundException(
+                crate::state::not_found(crate::state::RESOURCE_MEMBER, &input.member_id),
+            )
+            .into());
+        };
+
+        // "DeleteMember can only be called for a specified MemberId if the principal
+        // performing the action is associated with the Amazon Web Services account that
+        // owns the member. In all other cases, the DeleteMember action is carried out as
+        // the result of an approved proposal to remove a member": a member another
+        // account holds is not this caller's to delete here — removing it is the
+        // `RemoveAction` of an approved proposal, carried out on the voting path, not by
+        // this call.
+        if !member.is_owned() {
+            return Err(DeleteMemberErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(format!(
+                        "member {} is not held by account {} and can only be removed by an \
+                         approved proposal",
+                        member.id,
+                        ::engine::emulator_account_id()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "The requested resource exists but isn't in a status that can complete the
+        // operation" (`ResourceNotReadyException`): a member whose creation has not
+        // finished ("CREATING - The Amazon Web Services account is in the process of
+        // creating a member", `Member$Status`) cannot be deleted yet. Every settled status
+        // can be — `INACCESSIBLE_ENCRYPTION_KEY` explicitly so, "When a resource is in
+        // this state, we recommend deleting and recreating the resource" — so the refusal
+        // names that one transient status rather than everything other than `AVAILABLE`.
+        if member.status == crate::state::STATUS_CREATING {
+            return Err(DeleteMemberErrorModeled::ResourceNotReadyException(
+                ResourceNotReadyException {
+                    message: Some(format!(
+                        "member {} is {} and cannot be deleted until it is {}",
+                        member.id,
+                        member.status,
+                        crate::state::STATUS_AVAILABLE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "Deleting a member removes the member and all associated resources from the
+        // network": `crate::state`'s `remove_member` is the one path that does it — shared
+        // with the approved `RemoveAction` that removes a member this account does not own
+        // — so the member's nodes go with the member either way. It answers `false` only
+        // when the member was not there to remove, which the lookups above ruled out.
+        if !guard.remove_member(&input.network_id, &input.member_id) {
+            return Err(DeleteMemberErrorModeled::InternalServiceErrorException(
+                InternalServiceErrorException {},
+            )
+            .into());
+        }
+
+        // "If MemberId is the last member in a network specified by the last Amazon Web
+        // Services account, the network is deleted also." Every member this store holds
+        // belongs to the account its ARN names, so a network left with no members at all
+        // has lost the last member of its last account, and the network goes with it:
+        // every later read of the network is a `ResourceNotFoundException` too.
+        let emptied = guard
+            .networks
+            .get(&input.network_id)
+            .is_some_and(|network| network.members.is_empty());
+        if emptied {
+            guard.networks.remove(&input.network_id);
+        }
+
+        // The idempotency ledger must not outlive the resources it describes (the same
+        // reason a deleted node releases its create token): a create whose every minted id
+        // has now been deleted could only replay ids nothing holds.
+        guard.forget_dangling_tokens();
+
+        Ok(DeleteMemberOutput {})
     }
 }

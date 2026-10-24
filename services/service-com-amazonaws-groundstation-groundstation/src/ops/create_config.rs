@@ -151,6 +151,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // A `tags` map is checked before anything else about the request: `TagsMap`
+        // carries no constraint in the model, so the boundary validator passed it, and
+        // the platform's tagging rules are the only thing that refuses a reserved
+        // `aws:` key, an out-of-bounds key or value, or more tags than a resource may
+        // carry. Refused HERE, before an id and an ARN are minted, so a caller never
+        // holds a config AWS would not have tagged that way.
+        crate::state::validate_tags(input.tags.as_ref())
+            .map_err(CreateConfigErrorModeled::InvalidParameterException)?;
+
         // What the service will accept in a `configData` — the ranges the model
         // documents for its numeric members and the uplink frequencies this account is
         // authorised to transmit on — is a rule of the service, not of the wire format,

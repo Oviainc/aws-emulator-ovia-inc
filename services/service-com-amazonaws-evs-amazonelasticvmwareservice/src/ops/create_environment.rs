@@ -6,6 +6,13 @@
 //! VLAN subnets materialised from `initialVlans`. Every other operation of this
 //! service reads what this one stored.
 //!
+//! Those ten VLAN subnets are PROVISIONED, not just recorded: "Amazon EVS provisions
+//! only the VLAN subnets" in `SELF_DEPLOYED` mode and provisions them plus VCF
+//! otherwise, and they are subnets of the caller's own VPC — so each is created in the
+//! account's Amazon EC2 store through EC2's own writer
+//! ([`crate::state::ec2_resources::provision_vlan_subnets`]), and the `Vlan` reports
+//! the `subnetId` and `availabilityZone` of the subnet EC2 holds.
+//!
 //! The request-level rules it enforces beyond the modelled constraints, each from the
 //! documentation quoted under "Modeled contract" below:
 //!
@@ -24,6 +31,11 @@
 //!    network, so a request naming a VPC or subnet that does not exist is refused with
 //!    a clause naming the id it gave ([`crate::state::ec2_resources`], which reads
 //!    Amazon EC2's own store).
+//! 8. Each VLAN subnet CIDR block is a block of that VPC's own address space and
+//!    overlaps no subnet the VPC already holds: "Amazon EVS VLAN subnet CIDR blocks
+//!    must not overlap with other subnets in the VPC" (`InitialVlans` doc) — rule 2 at
+//!    the scope the doc states it, which is what lets each block become a real subnet
+//!    of the VPC.
 //!
 //! Supplying a parameter the chosen VCF mode does not support is NOT one of them.
 //! `SELF_DEPLOYED` "does not support" `licenseInfo`, `hosts`, `vcfHostnames`, `siteId`
@@ -202,9 +214,12 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-// The ONE reading of an IPv4 CIDR block this service has, shared with
+// This service's OWN reading of an IPv4 CIDR block, shared with
 // `CreateEnvironmentHost`, which places a host's management address inside the
-// `vmkManagement` block with it.
+// `vmkManagement` block with it. It judges a block the REQUEST supplied, before any
+// subnet exists for it; a block judged against what Amazon EC2 holds goes through EC2's
+// own CIDR helpers instead ([`crate::state::ec2_resources`]), because that is the store
+// the answer comes from.
 use crate::state::Ipv4Cidr;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -307,9 +322,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         failures.extend(host_failures(input.hosts.as_deref().unwrap_or_default()));
         let vlan_plan = plan_vlans(&input.initial_vlans);
         failures.extend(vlan_failures(&input.initial_vlans, &vlan_plan));
-        // The network the environment is deployed into, from Amazon EC2's own store.
-        // Read before this service's own lock is taken, so only one store is ever held
-        // at a time.
+        // The network the environment is deployed into, from Amazon EC2's own store,
+        // read before this service's own lock is taken.
+        //
+        // LOCK ORDER. The checks and the provisioning below DO take EC2's store lock
+        // while this service's guard is held, and `DeleteEnvironment` takes the two the
+        // same way round; EC2 never reaches this service, so the order is consistent and
+        // cannot cycle. Never add an EC2 read that takes the locks the other way round.
         failures.extend(crate::state::ec2_resources::network_failures(
             &*self.engine,
             &input.vpc_id,
@@ -338,6 +357,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // The VLAN subnets are provisioned INSIDE that VPC, so each block must be a
+        // block of the VPC's own address space and overlap no subnet the VPC already
+        // holds ("Amazon EVS VLAN subnet CIDR blocks must not overlap with other
+        // subnets in the VPC", `InitialVlans` doc) — the same overlap rule as among the
+        // environment's own ten blocks, at the scope the doc states it.
+        //
+        // Judged only when there IS a VPC this environment can be deployed into: a
+        // `vpcId` already refused (it names no VPC, or it carries another environment)
+        // leaves nothing to place the blocks in, so the refusal names only the VPC —
+        // exactly as an unresolved VPC leaves no VPC to judge the service access subnet
+        // against. And only for the members no clause above already refuses, so one
+        // member draws one clause.
+        let vpc_refused = failures.iter().any(|failure| failure.name == "vpcId");
+        if !vpc_refused {
+            let placeable: Vec<crate::state::ec2_resources::VlanSubnetRequest<'_>> = {
+                let refused: std::collections::BTreeSet<&str> =
+                    failures.iter().map(|failure| failure.name.as_str()).collect();
+                vlan_plan
+                    .iter()
+                    .filter(|planned| !refused.contains(planned.member))
+                    .map(|planned| crate::state::ec2_resources::VlanSubnetRequest {
+                        member: planned.member,
+                        cidr: planned.cidr,
+                    })
+                    .collect()
+            };
+            failures.extend(crate::state::ec2_resources::vlan_placement_failures(
+                &*self.engine,
+                &input.vpc_id,
+                &placeable,
+            ));
+        }
+
         if !failures.is_empty() {
             return Err(CreateEnvironmentErrorModeled::ValidationException(
                 crate::state::aggregate_validation_error(failures),
@@ -345,6 +397,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         let requested_hosts = input.hosts.unwrap_or_default();
+
+        // The ten VLAN subnets have to fit in the account's EC2 store, and that is
+        // asked BEFORE this service reserves anything of its own: a request that cannot
+        // be served must not consume an environment slot (reserving one can purge the
+        // longest-deleted record) or an environment id.
+        if let Some((held, limit)) =
+            crate::state::ec2_resources::subnet_room_shortfall(&*self.engine, vlan_plan.len())
+        {
+            return Err(subnet_room_refusal(held, limit, vlan_plan.len()));
+        }
 
         // Bound the store before anything is minted: a generated emulator holds its
         // resources for the life of the process, so the create path is the one that
@@ -364,23 +426,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let created_at_ms = crate::state::now_ms();
         let environment_id = state.mint_environment_id();
+
+        // The ten VLAN subnets are REAL subnets of the caller's VPC: Amazon EVS
+        // "provisions the VLAN subnets", so they are created in the account's own
+        // Amazon EC2 store and each VLAN reports the id, the block and the Availability
+        // Zone EC2 gave its subnet. The EC2 store is written while this service's lock
+        // is held, and in the same order by `DeleteEnvironment`, so the two locks are
+        // always taken this way round.
+        let provisioning = {
+            let planned: Vec<crate::state::ec2_resources::VlanSubnetRequest<'_>> = vlan_plan
+                .iter()
+                .map(|planned| crate::state::ec2_resources::VlanSubnetRequest {
+                    member: planned.member,
+                    cidr: planned.cidr,
+                })
+                .collect();
+            crate::state::ec2_resources::provision_vlan_subnets(
+                &*self.engine,
+                &region,
+                &input.vpc_id,
+                &input.service_access_subnet_id,
+                &planned,
+            )
+        };
+        let provisioned = match provisioning {
+            // One subnet per planned VLAN, in the order they were asked for. A shorter
+            // answer than the plan would leave some VLAN naming no subnet, so it is an
+            // internal inconsistency rather than something to paper over: the subnets
+            // that WERE created go back, and nothing is stored.
+            crate::state::ec2_resources::VlanSubnetProvisioning::Provisioned(subnets)
+                if subnets.len() == vlan_plan.len() =>
+            {
+                subnets
+            }
+            crate::state::ec2_resources::VlanSubnetProvisioning::Provisioned(subnets) => {
+                release(&*self.engine, &subnets);
+                return Err(CreateEnvironmentErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: format!(
+                            "Amazon EC2 provisioned {provisioned} of the {planned} VLAN \
+                             subnets the environment needs.",
+                            provisioned = subnets.len(),
+                            planned = vlan_plan.len(),
+                        ),
+                    },
+                )
+                .into());
+            }
+            // No EC2 store to provision them in is evidence of nothing, so the
+            // environment is still created — with ids of this service's own, which is
+            // all there is to name its VLANs by, and no Availability Zone.
+            crate::state::ec2_resources::VlanSubnetProvisioning::NoEc2Store => Vec::new(),
+            // A zone every subnet of the VPC is in is part of what a VLAN subnet IS, so
+            // a Region that names none leaves nothing to provision: the same server
+            // error EC2's own `CreateSubnet` answers for a Region with no zone, and
+            // nothing was written.
+            crate::state::ec2_resources::VlanSubnetProvisioning::ZoneUnknown => {
+                return Err(CreateEnvironmentErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: format!(
+                            "No Availability Zone could be resolved for the VLAN subnets of an \
+                             environment in {region}."
+                        ),
+                    },
+                )
+                .into());
+            }
+            // Asked before the slot was reserved, so this is only reachable if another
+            // request filled the EC2 store in between; nothing was written either way.
+            crate::state::ec2_resources::VlanSubnetProvisioning::SubnetLimitExceeded {
+                held,
+                limit,
+            } => return Err(subnet_room_refusal(held, limit, vlan_plan.len())),
+        };
+
         let vlans = vlan_plan
             .into_iter()
             .enumerate()
-            .map(|(index, planned)| crate::state::StoredVlan {
-                // The 802.1Q tag the traffic type is carried on: unique within the
-                // environment, assigned in the order the `InitialVlans` members are
-                // modelled, and clear of the reserved default VLAN 1.
-                vlan_id: FIRST_VLAN_ID + index as i32,
-                cidr: planned.cidr.to_string(),
-                function_name: planned.function_name.to_string(),
-                subnet_id: state.mint_subnet_id(),
-                vlan_state: crate::state::STATE_CREATING.to_string(),
-                is_public: planned.is_public,
-                network_acl_id: planned.network_acl_id.map(str::to_string),
-                created_at_ms,
-                modified_at_ms: created_at_ms,
-                eip_associations: Vec::new(),
+            .map(|(index, planned)| {
+                let subnet = provisioned.get(index);
+                crate::state::StoredVlan {
+                    // The 802.1Q tag the traffic type is carried on: unique within the
+                    // environment, assigned in the order the `InitialVlans` members are
+                    // modelled, and clear of the reserved default VLAN 1.
+                    vlan_id: FIRST_VLAN_ID + index as i32,
+                    // The block of the subnet EC2 holds, which is the requested block in
+                    // the canonical form EC2 stores one in — so `Vlan$cidr` and the
+                    // subnet's `CidrBlock` are one block and cannot disagree.
+                    cidr: match subnet {
+                        Some(subnet) => subnet.cidr_block.clone(),
+                        None => planned.cidr.to_string(),
+                    },
+                    function_name: planned.function_name.to_string(),
+                    subnet_id: match subnet {
+                        Some(subnet) => subnet.subnet_id.clone(),
+                        None => state.mint_subnet_id(),
+                    },
+                    availability_zone: subnet
+                        .map(|subnet| subnet.availability_zone.clone()),
+                    vlan_state: crate::state::STATE_CREATING.to_string(),
+                    is_public: planned.is_public,
+                    network_acl_id: planned.network_acl_id.map(str::to_string),
+                    created_at_ms,
+                    modified_at_ms: created_at_ms,
+                    eip_associations: Vec::new(),
+                }
             })
             .collect();
 
@@ -424,13 +574,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Unreachable: ids are minted from a strictly increasing seed. Answering
             // honestly beats reporting some other environment as the created one.
             std::collections::btree_map::Entry::Occupied(taken) => {
+                let message =
+                    format!("The environment id {} is already in use.", taken.key());
+                // Nothing of this environment is stored, so the subnets provisioned for
+                // it are released rather than left in the account's EC2 store with no
+                // environment to delete them.
+                release(&*self.engine, &provisioned);
                 return Err(CreateEnvironmentErrorModeled::InternalServerException(
-                    InternalServerException {
-                        message: format!(
-                            "The environment id {} is already in use.",
-                            taken.key()
-                        ),
-                    },
+                    InternalServerException { message },
                 )
                 .into());
             }
@@ -447,6 +598,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The first 802.1Q VLAN tag this service assigns. VLAN 1 is the reserved default
 /// VLAN of an 802.1Q trunk, so an environment's own VLANs start clear of it.
 const FIRST_VLAN_ID: i32 = 100;
+
+/// The refusal for an account whose Amazon EC2 store cannot take the environment's ten
+/// VLAN subnets: a quota condition, not a defect in the request, so it is the
+/// operation's `ServiceQuotaExceededException`. Stated in one place because both the
+/// check before anything is reserved and the writer's own ceiling report it.
+fn subnet_room_refusal(held: usize, limit: usize, planned: usize) -> CreateEnvironmentError {
+    CreateEnvironmentErrorModeled::ServiceQuotaExceededException(ServiceQuotaExceededException {
+        message: format!(
+            "The account's Amazon EC2 store holds {held} of at most {limit} subnets, so the \
+             {planned} VLAN subnets of an environment cannot be provisioned in it."
+        ),
+    })
+    .into()
+}
+
+/// Give the subnets `provisioned` back to the account's Amazon EC2 store, for a create
+/// that is refused after they were written: an environment that is not stored can never
+/// be deleted, so nothing else would ever remove them.
+fn release<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    provisioned: &[crate::state::ec2_resources::ProvisionedVlanSubnet],
+) {
+    let subnet_ids: Vec<String> = provisioned
+        .iter()
+        .map(|subnet| subnet.subnet_id.clone())
+        .collect();
+    crate::state::ec2_resources::release_vlan_subnets(engine, &subnet_ids);
+}
 
 /// The largest VLAN subnet prefix length: "Amazon EVS VLAN subnets have a minimum
 /// CIDR block size of /28 and a maximum size of /24" (`InitialVlans` doc).

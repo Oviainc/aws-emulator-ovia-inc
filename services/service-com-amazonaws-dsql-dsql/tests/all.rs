@@ -21,6 +21,8 @@ mod encryption_key_selection;
 mod error_contract;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/modeled_validation_exception.rs"]
+mod modeled_validation_exception;
 #[path = "all/policy_document_class.rs"]
 mod policy_document_class;
 #[path = "all/policy_version_conflict_and_lockout.rs"]

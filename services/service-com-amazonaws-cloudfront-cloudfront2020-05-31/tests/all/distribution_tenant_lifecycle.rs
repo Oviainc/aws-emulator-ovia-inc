@@ -52,7 +52,11 @@ use crate::distribution_lifecycle::{
 // ---------------------------------------------------------------------------
 
 /// `POST /2020-05-31/distribution-tenant` with the request document `body`.
-async fn create_distribution_tenant(router: &MultiServiceRouter, body: &str) -> Answer {
+///
+/// `pub(crate)` so a sibling suite that needs a tenant — the only thing that makes the
+/// account's DEFAULT connection group exist — creates one over the same wire path rather
+/// than growing a copy of this.
+pub(crate) async fn create_distribution_tenant(router: &MultiServiceRouter, body: &str) -> Answer {
     call(
         router,
         "POST",
@@ -81,7 +85,9 @@ async fn get_distribution_tenant(router: &MultiServiceRouter, identifier: &str) 
 /// Percent-encode the characters an `@httpLabel` may not carry literally. A tenant ARN is
 /// an admissible `Identifier`, and it carries `/`, which would otherwise read as another
 /// path segment.
-fn encode_label(value: &str) -> String {
+///
+/// `pub(crate)` so a sibling suite addressing a resource by ARN encodes it the same way.
+pub(crate) fn encode_label(value: &str) -> String {
     value
         .chars()
         .map(|c| match c {
@@ -142,7 +148,13 @@ fn distribution_config_xml(caller_reference: &str, extra: &str) -> String {
 /// Create the MULTI-TENANT distribution every tenant below is created under, and answer
 /// its id. `ConnectionMode` `tenant-only` selects "a multi-tenant distribution with
 /// distribution tenants".
-async fn multi_tenant_distribution(router: &MultiServiceRouter, caller_reference: &str) -> String {
+///
+/// `pub(crate)` for the same reason [`create_distribution_tenant`] is: a tenant can only
+/// be created under one of these.
+pub(crate) async fn multi_tenant_distribution(
+    router: &MultiServiceRouter,
+    caller_reference: &str,
+) -> String {
     let body = distribution_config_xml(
         caller_reference,
         &format!("<ConnectionMode>tenant-only</ConnectionMode>{TENANT_CONFIG}"),

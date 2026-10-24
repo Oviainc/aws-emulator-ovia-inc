@@ -29,5 +29,7 @@ mod service_managed_catalog;
 mod state_roundtrip;
 #[path = "all/type_lifecycle.rs"]
 mod type_lifecycle;
+#[path = "all/update_keyspace.rs"]
+mod update_keyspace;
 #[path = "all/update_table.rs"]
 mod update_table;

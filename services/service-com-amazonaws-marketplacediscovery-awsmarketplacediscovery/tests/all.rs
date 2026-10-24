@@ -15,6 +15,8 @@
 mod catalog_breadth_and_hierarchy;
 #[path = "all/catalog_drilldown.rs"]
 mod catalog_drilldown;
+#[path = "all/catalog_record_breadth.rs"]
+mod catalog_record_breadth;
 #[path = "all/discovery_ordering_and_refusals.rs"]
 mod discovery_ordering_and_refusals;
 #[path = "all/fulfillment_options.rs"]

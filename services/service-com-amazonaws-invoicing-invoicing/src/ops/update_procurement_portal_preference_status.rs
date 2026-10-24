@@ -1,15 +1,40 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateProcurementPortalPreferenceStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateProcurementPortalPreferenceStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateProcurementPortalPreferenceStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Moves the VERIFICATION STATUS of the procurement portal preference [`crate::state`]
+//! holds for the ARN the request names. A procurement portal preference carries one
+//! status per feature plane — e-invoice delivery and purchase order retrieval — and this
+//! operation states, per plane, the status that plane now holds and the reason that
+//! explains the move:
+//!
+//! * a plane whose status this request STATES takes that status, and its status reason
+//!   becomes the reason stated alongside it — the reason member documents itself as "the
+//!   reason for the … status update, providing context for the change", so the reason a
+//!   plane reports is the context given with the update that set its current status, and
+//!   an update that gives none leaves the plane with no reason rather than with the
+//!   previous status's one;
+//! * a plane whose status this request does NOT state keeps the status and the reason the
+//!   last write left: the same rule `PutProcurementPortalPreference` and
+//!   `UpdateInvoiceUnit` follow for a member the request omits;
+//! * the write advances `Version` and `LastUpdateDate`, as every write of this resource
+//!   does, and leaves the identity members, the configuration and `CreateDate` alone —
+//!   none of them is a member of this input;
+//! * a request that states NO status asks for no status update, and a reason stated for a
+//!   plane whose status it does not state gives context for an update that is not
+//!   happening: both are refused with the modelled `ValidationException`, a combination of
+//!   members the model cannot express (every member of this input is optional on its own),
+//!   the same way `crate::state::marketplace_punch_out_preference_required` refuses the
+//!   one `PutProcurementPortalPreference` cannot express;
+//! * an ARN this service holds no preference for is the modelled
+//!   `ResourceNotFoundException`.
+//!
+//! Which status values a plane may hold is the model's business
+//! (`ProcurementPortalPreferenceStatus`), so the boundary validator refuses a value
+//! outside that enum before this handler runs; nothing here re-states that set. The
+//! operation does not gate a status on the plane's `…Enabled` flag either: the model
+//! documents this call as updating "the activation state of e-invoice delivery and
+//! purchase order retrieval features", and declares no such constraint.
 //!
 //! ## Shape of an operation
 //!
@@ -143,6 +168,71 @@ impl From<UpdateProcurementPortalPreferenceStatusErrorModeled> for UpdateProcure
     }
 }
 
+/// The members of this input that state the e-invoice delivery plane's status update, as
+/// the model spells them (`smithy_query(query="operation",
+/// operation="UpdateProcurementPortalPreferenceStatus")`). Named here so a refusal reports
+/// the member a caller sent rather than this crate's snake-cased field.
+const EINVOICE_DELIVERY_MEMBERS: (&str, &str) = (
+    "EinvoiceDeliveryPreferenceStatus",
+    "EinvoiceDeliveryPreferenceStatusReason",
+);
+
+/// The same pair for the purchase-order-retrieval plane.
+const PURCHASE_ORDER_RETRIEVAL_MEMBERS: (&str, &str) = (
+    "PurchaseOrderRetrievalPreferenceStatus",
+    "PurchaseOrderRetrievalPreferenceStatusReason",
+);
+
+/// The status update this request states for ONE plane: the status it moves to and the
+/// reason stated alongside it, or `None` for a plane the request says nothing about.
+///
+/// A reason without its status is refused: the reason member is "the reason for the …
+/// status update, providing context for the change", so there is no update for it to
+/// explain. The rule is stated once here and applied to both planes, rather than per
+/// plane.
+fn stated_status(
+    status: Option<String>,
+    reason: Option<String>,
+    members: (&str, &str),
+) -> Result<Option<(String, Option<String>)>, ValidationException> {
+    match status {
+        Some(status) => Ok(Some((status, reason))),
+        None if reason.is_some() => Err(reason_without_status(members)),
+        None => Ok(None),
+    }
+}
+
+/// The 400 a request is refused with when it states a plane's status REASON without that
+/// plane's status. Built from the request — it names the two members whose combination was
+/// rejected — and keyed the way this plane's bodies key their text
+/// ([`MessageKey::Capitalised`]).
+fn reason_without_status((status_member, reason_member): (&str, &str)) -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "{reason_member} can only be provided together with {status_member}"
+        )),
+        // `invalidInput` is one of the model's `ValidationExceptionReason` values
+        // ([`crate::ops::types::VALIDATION_EXCEPTION_REASON_VALUES`]).
+        reason: Some("invalidInput".to_string()),
+        message_key: MessageKey::Capitalised,
+        ..Default::default()
+    }
+}
+
+/// The 400 a request is refused with when it states no plane's status at all: this
+/// operation updates a status, and such a request names none to update.
+fn no_status_stated() -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "At least one of {} or {} must be provided",
+            EINVOICE_DELIVERY_MEMBERS.0, PURCHASE_ORDER_RETRIEVAL_MEMBERS.0
+        )),
+        reason: Some("invalidInput".to_string()),
+        message_key: MessageKey::Capitalised,
+        ..Default::default()
+    }
+}
+
 /// The `UpdateProcurementPortalPreferenceStatus` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -179,18 +269,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateProcurementPortalPreferenceStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateProcurementPortalPreferenceStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateProcurementPortalPreferenceStatus"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateProcurementPortalPreferenceStatusErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+        })?;
+        let mut store = state.lock();
+        let client_token = input.client_token.as_deref();
+
+        // The ARN has to name a preference this emulator holds: there is no status to move
+        // on one that does not exist. Checked BEFORE the replay, so a replay against a
+        // preference that is gone reports it gone rather than answering for it.
+        if !store
+            .procurement_portal_preferences
+            .contains_key(&input.procurement_portal_preference_arn)
+        {
+            return Err(
+                UpdateProcurementPortalPreferenceStatusErrorModeled::ResourceNotFoundException(
+                    crate::state::no_such_procurement_portal_preference(
+                        &input.procurement_portal_preference_arn,
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        // What the request states, per plane, refused before anything is written.
+        let einvoice = stated_status(
+            input.einvoice_delivery_preference_status,
+            input.einvoice_delivery_preference_status_reason,
+            EINVOICE_DELIVERY_MEMBERS,
+        )
+        .map_err(UpdateProcurementPortalPreferenceStatusErrorModeled::ValidationException)?;
+        let purchase_order = stated_status(
+            input.purchase_order_retrieval_preference_status,
+            input.purchase_order_retrieval_preference_status_reason,
+            PURCHASE_ORDER_RETRIEVAL_MEMBERS,
+        )
+        .map_err(UpdateProcurementPortalPreferenceStatusErrorModeled::ValidationException)?;
+        if einvoice.is_none() && purchase_order.is_none() {
+            return Err(
+                UpdateProcurementPortalPreferenceStatusErrorModeled::ValidationException(
+                    no_status_stated(),
+                )
+                .into(),
+            );
+        }
+
+        // `@idempotent`: a replay (the same `ClientToken` against the same preference)
+        // answers with the ARN the first call returned and applies the update once — this
+        // request states only the planes it moves, so re-applying it is not the same as
+        // applying it once, and the resource's `Version` counts the writes it took.
+        if let Some(arn) = store.replayed_result(
+            Self::NAME,
+            &input.procurement_portal_preference_arn,
+            client_token,
+        ) {
+            return Ok(UpdateProcurementPortalPreferenceStatusOutput {
+                procurement_portal_preference_arn: arn,
+            });
+        }
+
+        // The write is one scope, so the borrow of the stored preference ends before the
+        // replay record is written.
+        {
+            let stored = store
+                .procurement_portal_preferences
+                .get_mut(&input.procurement_portal_preference_arn)
+                .ok_or_else(|| {
+                    UpdateProcurementPortalPreferenceStatusErrorModeled::ResourceNotFoundException(
+                        crate::state::no_such_procurement_portal_preference(
+                            &input.procurement_portal_preference_arn,
+                        ),
+                    )
+                })?;
+            let preference = &mut stored.preference;
+
+            // A plane the request states takes the stated status, and its reason becomes
+            // the context stated with that update — absent when the request gave none. A
+            // plane the request says nothing about is left exactly as it was.
+            if let Some((status, reason)) = einvoice {
+                preference.einvoice_delivery_preference_status = Some(status);
+                preference.einvoice_delivery_preference_status_reason = reason;
+            }
+            if let Some((status, reason)) = purchase_order {
+                preference.purchase_order_retrieval_preference_status = Some(status);
+                preference.purchase_order_retrieval_preference_status_reason = reason;
+            }
+
+            // Every write of this resource advances its `Version` and stamps
+            // `LastUpdateDate` with the instant it changed at; `CreateDate` is not touched.
+            preference.version = preference.version.saturating_add(1);
+            preference.last_update_date = crate::state::now();
+        }
+
+        store.record_result(
+            Self::NAME,
+            &input.procurement_portal_preference_arn,
+            client_token,
+            &input.procurement_portal_preference_arn,
+        );
+        Ok(UpdateProcurementPortalPreferenceStatusOutput {
+            procurement_portal_preference_arn: input.procurement_portal_preference_arn,
+        })
     }
 }

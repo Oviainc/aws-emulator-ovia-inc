@@ -112,18 +112,22 @@ impl ::aws_smithy_schema::serde::SerializableStruct for TagResourceOutput {
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
 // The operation's MODELED errors, plus the service-common `InternalServerException`
-// widened in with `extra_errors`: the service declares it for every operation (its
-// `common_errors` are AccessDenied / InternalServer / Throttling / Validation), but the
-// per-operation list the macro checks against does not repeat it.
+// and `ValidationException` widened in with `extra_errors`: the service declares both
+// for every operation (its `common_errors` are AccessDenied / InternalServer /
+// Throttling / Validation), but the per-operation list the macro checks against does
+// not repeat them. `ValidationException` is what refuses a `resourceArn` naming no
+// Aurora DSQL resource — the MODELED shape, which carries the `@required` `reason`,
+// exactly as `ListTagsForResource` and `UntagResource` refuse the same value.
 #[smithy_macros::operation_error(
     "com.amazonaws.dsql#TagResource",
-    extra_errors = ["InternalServerException"]
+    extra_errors = ["InternalServerException", "ValidationException"]
 )]
 #[derive(Debug)]
 pub enum TagResourceErrorModeled {
     ResourceNotFoundException(ResourceNotFoundException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
     InternalServerException(InternalServerException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -189,12 +193,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a missing resource: no Aurora DSQL resource can carry such an ARN. Same
         // refusal, in the same words, as `ListTagsForResource`.
         let Some(resource) = crate::state::parse_resource_arn(&input.resource_arn) else {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "resourceArn must be the ARN of an Aurora DSQL resource \
-                 (arn:<partition>:{}:<region>:<account>:<type>/<id>), got {}",
-                crate::state::ARN_SERVICE,
-                input.resource_arn,
-            )));
+            return Err(TagResourceErrorModeled::ValidationException(
+                crate::state::invalid_resource_arn("resourceArn", &input.resource_arn),
+            )
+            .into());
         };
 
         let mut state = state.lock();

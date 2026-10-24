@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetGraphMemberDatasources
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetGraphMemberDatasources`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetGraphMemberDatasources::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: the stored data source package history of the behavior graph, reported
+//! for exactly the accounts asked about that the graph INGESTS FOR — its administrator
+//! account and every account with a membership in it; an account the graph ingests
+//! nothing for is reported as unprocessed, never fabricated as a contributing account. A
+//! pure read: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -151,16 +148,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
         // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetGraphMemberDatasources` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetGraphMemberDatasourcesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetGraphMemberDatasources"))
+        let _ = ctx;
+        // `GraphArn`'s pattern, `AccountIds`' 1..200 length and each entry's 12-digit
+        // `AccountId` pattern are modelled constraints, so the centralized walk has
+        // already refused anything outside them with a 400 before this body runs.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            BatchGetGraphMemberDatasourcesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the behavior graph store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        // A pure read: this operation only "gets data source package information", and
+        // nothing about it is owed by the clock, so the store is taken for reading and
+        // every later caller sees exactly what this one saw.
+        let store = state.lock();
+        let graph = store.graph(&input.graph_arn).ok_or_else(|| {
+            BatchGetGraphMemberDatasourcesErrorModeled::ResourceNotFoundException(
+                crate::state::graph_not_found(),
+            )
+        })?;
+
+        let mut member_datasources = Vec::with_capacity(input.account_ids.len());
+        let mut unprocessed_accounts = Vec::new();
+        let mut seen = ::std::collections::BTreeSet::new();
+
+        for account_id in &input.account_ids {
+            // An account named twice is one account: it is reported once, in the
+            // position it was first asked about.
+            if !seen.insert(account_id.clone()) {
+                continue;
+            }
+            if graph.ingests_for(account_id) {
+                member_datasources.push(graph.membership_datasources(account_id));
+            } else {
+                // The graph ingests nothing for this account, so there is no data source
+                // package information of it to report: it goes in
+                // `UnprocessedAccounts` with the reason, rather than being invented as a
+                // contributing account.
+                unprocessed_accounts.push(crate::state::unprocessed(
+                    account_id,
+                    crate::state::NOT_INGESTED_FOR_REASON.to_string(),
+                ));
+            }
+        }
+
+        Ok(BatchGetGraphMemberDatasourcesOutput {
+            member_datasources: Some(member_datasources),
+            unprocessed_accounts: Some(unprocessed_accounts),
+        })
     }
 }

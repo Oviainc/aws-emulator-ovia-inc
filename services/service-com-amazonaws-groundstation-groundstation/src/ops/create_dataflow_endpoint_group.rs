@@ -171,6 +171,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // The platform's tagging rules, refused before an id and an ARN are minted: the
+        // model's `TagsMap` carries no constraint, so this is the only gate (see
+        // `crate::state::validate_tags`).
+        crate::state::validate_tags(input.tags.as_ref())
+            .map_err(CreateDataflowEndpointGroupErrorModeled::InvalidParameterException)?;
+
         // Every endpoint of the group, as this service will store it: one endpoint per
         // `EndpointDetails`, each carrying the security details Ground Station connects
         // the stream with, and all of them of the same kind.
