@@ -184,6 +184,10 @@ pub mod event_stream;
 pub mod feature_store_groups;
 pub mod front_door;
 pub mod iam_authorization;
+/// The ONE grammar of an IAM JSON resource-based policy document, for every service whose
+/// API takes one as a string and has to decide whether to accept it — so two services
+/// handed the same document cannot disagree about whether it is a policy at all.
+pub mod iam_policy;
 pub mod iam_role;
 pub mod iam_trust_policy;
 pub mod iot_commands;

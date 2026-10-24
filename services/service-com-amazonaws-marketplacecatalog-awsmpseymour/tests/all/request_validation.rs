@@ -82,6 +82,11 @@ const ASSESSMENT_IDENTIFIER_PATTERN: &str = concat!(
 /// The `EntityId` `@pattern` (`smithy_query(query="shape", shape="EntityId")`).
 const ENTITY_ID_PATTERN: &str = "^[a-zA-Z0-9][.a-zA-Z0-9/-]+[a-zA-Z0-9]$";
 
+/// A resource-based policy document `PutResourcePolicy` accepts, so a row below is refused
+/// for the ARN it names rather than for the document it carries.
+const RESOURCE_POLICY_DOCUMENT: &str = "{\"Version\":\"2012-10-17\",\"Statement\":\
+     [{\"Effect\":\"Allow\",\"Principal\":\"*\",\"Action\":\"aws-marketplace:DescribeEntity\"}]}";
+
 /// The entity types this catalog has, written out here from the model rather than read
 /// from the crate: they are `EntitySummary`'s per-type summary members with the `Summary`
 /// suffix dropped (`smithy_query(query="shape", shape="EntitySummary")`), which is the
@@ -1055,7 +1060,7 @@ async fn an_unauthorized_action_names_the_caller_principal_and_the_resource_id()
                 "PutResourcePolicy",
                 "POST",
                 "/PutResourcePolicy".to_string(),
-                Some(json!({"ResourceArn": arn, "Policy": "{}"})),
+                Some(json!({"ResourceArn": arn, "Policy": RESOURCE_POLICY_DOCUMENT})),
             ),
             (
                 "GetResourcePolicy",

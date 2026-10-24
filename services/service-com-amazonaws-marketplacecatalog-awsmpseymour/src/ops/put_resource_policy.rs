@@ -161,16 +161,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // `Policy` is "the policy document to set; formatted in JSON", and
-        // `ResourcePolicyJson` bounds only its length and its characters, so a
-        // body that is not a JSON document is refused here rather than stored as
-        // a policy no reader could parse.
-        if serde_json::from_str::<serde_json::Value>(&input.policy).is_err() {
+        // `Policy` is "the policy document to set; formatted in JSON", and what it
+        // sets is a RESOURCE-BASED POLICY — so the document has to be one.
+        // `ResourcePolicyJson` bounds only its length and its characters, leaving
+        // the IAM JSON policy grammar (a policy object whose every statement
+        // states an effect, an action and the principal it is granted to) to be
+        // checked here: a body outside it is refused rather than stored as a
+        // policy no reader could evaluate.
+        if let Some(defect) = ::service_common::iam_policy::resource_policy_defect(&input.policy) {
             return Err(PutResourcePolicyErrorModeled::ValidationException(
-                crate::state::cannot_parse(
-                    "Policy",
-                    "Policy must be a resource policy document formatted in JSON",
-                ),
+                crate::state::invalid_resource_policy("Policy", defect),
             )
             .into());
         }

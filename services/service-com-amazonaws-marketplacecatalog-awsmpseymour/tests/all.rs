@@ -23,5 +23,7 @@ mod request_validation;
 mod resource_policy_and_tagging;
 #[path = "all/resource_policy_reads.rs"]
 mod resource_policy_reads;
+#[path = "all/resource_policy_validation.rs"]
+mod resource_policy_validation;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
