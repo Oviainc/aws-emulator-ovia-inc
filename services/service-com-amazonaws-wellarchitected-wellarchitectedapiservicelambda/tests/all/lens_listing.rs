@@ -5,8 +5,9 @@
 //!
 //! The rules pinned here, each over a table of inputs rather than one recorded request:
 //!
-//! 1. The catalog is COMPUTED from state: the AWS-official lens whose content this
-//!    emulator ships, plus every custom lens the store holds, each
+//! 1. The catalog is COMPUTED from state and from the AWS-official lens catalog: every
+//!    lens AWS publishes content for here (pinned by `super::official_lens_catalog`), plus
+//!    every custom lens the store holds, each
 //!    summary's members taken from that lens's own record. Rows differ along the shape of
 //!    the imported document — its name, whether it carries a description, how many pillars
 //!    and questions it defines — because every lens in the store has to be reported from
@@ -143,7 +144,7 @@ fn record_shared_lens(client: &Client, owner: &str, document: &Value) -> String 
     lens_arn
 }
 
-/// The `LensArn` the AWS-official lens this emulator ships carries in the Region these
+/// The `LensArn` the AWS Well-Architected Framework lens carries in the Region these
 /// tests sign for: an official lens ARN names no owner account (`LensAlias` doc).
 fn official_lens_arn() -> String {
     format!(
@@ -165,9 +166,30 @@ fn timestamp(summary: &Value, name: &str) -> Option<f64> {
     summary.get(name).and_then(Value::as_f64)
 }
 
+/// The aliases of every AWS-official lens this emulator publishes, in the order the
+/// catalog enumerates them (by alias).
+///
+/// WHAT that catalog publishes — each lens's alias, name, version, description and
+/// question set — is pinned by `super::official_lens_catalog`; the suites here are about
+/// the FILTERING and PAGING over the lenses available to the caller, so they take the
+/// official half of that from the one catalog every reader of a lens goes through.
+fn official_aliases() -> Vec<String> {
+    let mut aliases: Vec<String> = state::OFFICIAL_LENS_CATALOG
+        .iter()
+        .map(|official| official.alias.to_string())
+        .collect();
+    aliases.sort();
+    aliases
+}
+
+/// Every AWS-official lens's alias, plus the custom lenses a row names: the official half
+/// of the catalog is in the selection whenever a row's filters admit it.
+fn with_officials<'a>(officials: &'a [String], extra: &[&'a String]) -> Vec<&'a String> {
+    officials.iter().chain(extra.iter().copied()).collect()
+}
+
 /// Rule 1. Every imported lens is reported from its OWN record, whatever the shape of the
-/// document it carries, and the shipped AWS-official lens is reported from the content
-/// this emulator ships.
+/// document it carries, and every AWS-official lens is reported from its own catalog entry.
 #[tokio::test]
 async fn the_catalog_reports_every_stored_lens_from_its_own_record() {
     let cases: Vec<(&str, Value)> = vec![
@@ -210,15 +232,16 @@ async fn the_catalog_reports_every_stored_lens_from_its_own_record() {
 
     let listed = list(&client, "LensStatus=ALL&MaxResults=50").await;
     let reported = aliases(&listed, "catalog");
+    let official = official_aliases();
     assert_eq!(
         reported.len(),
-        cases.len() + 1,
-        "case \"catalog\": the shipped official lens and every imported lens must be \
+        cases.len() + official.len(),
+        "case \"catalog\": every AWS-official lens and every imported lens must be \
          reported, got {reported:?}"
     );
     assert_eq!(
-        reported.first().map(String::as_str),
-        Some(state::FRAMEWORK_LENS_ALIAS),
+        reported.get(..official.len()).map(<[String]>::to_vec),
+        Some(official.clone()),
         "case \"catalog\": the AWS-official lenses are enumerated first, got {reported:?}"
     );
 
@@ -443,34 +466,29 @@ async fn the_filters_select_within_the_catalog() {
     let shared_arn = record_shared_lens(&client, OTHER_ACCOUNT, &shared_document);
 
     let official = state::FRAMEWORK_LENS_ALIAS.to_string();
+    let officials = official_aliases();
     let cases: Vec<(&str, String, Vec<&String>)> = vec![
         // No filter: no filtering by status either, so every lens the account has.
         (
             "no-filter",
             String::new(),
-            vec![
-                &official,
-                &draft_arn,
-                &published_arn,
-                &republished_arn,
-                &shared_arn,
-            ],
+            with_officials(
+                &officials,
+                &[&draft_arn, &published_arn, &republished_arn, &shared_arn],
+            ),
         ),
         (
             "status-all",
             "LensStatus=ALL".to_string(),
-            vec![
-                &official,
-                &draft_arn,
-                &published_arn,
-                &republished_arn,
-                &shared_arn,
-            ],
+            with_officials(
+                &officials,
+                &[&draft_arn, &published_arn, &republished_arn, &shared_arn],
+            ),
         ),
         (
             "status-published",
             "LensStatus=PUBLISHED".to_string(),
-            vec![&official, &published_arn],
+            with_officials(&officials, &[&published_arn]),
         ),
         (
             "status-draft",
@@ -480,7 +498,7 @@ async fn the_filters_select_within_the_catalog() {
         (
             "type-aws-official",
             "LensStatus=ALL&LensType=AWS_OFFICIAL".to_string(),
-            vec![&official],
+            with_officials(&officials, &[]),
         ),
         (
             "type-custom-self",
@@ -698,18 +716,18 @@ async fn paging_enumerates_every_lens_exactly_once() {
     }
     wait_for_the_import_to_land();
 
-    // The whole catalog on one page: 5 lenses — the shipped official one and four custom.
+    // The whole catalog on one page: every AWS-official lens and the four custom ones.
     let whole = list(&client, "LensStatus=ALL&MaxResults=50").await;
     let order = aliases(&whole, "one-page");
     assert_eq!(
         order.len(),
-        5,
-        "case \"one-page\": expected the official lens and four custom ones, got {order:?}"
+        official_aliases().len() + 4,
+        "case \"one-page\": expected every official lens and four custom ones, got {order:?}"
     );
 
     // The published `@range(1, 50)` minimum, sizes either side of the catalog, the exact
     // count and the modelled maximum.
-    for page_size in [1usize, 2, 3, 4, 5, 50] {
+    for page_size in [1usize, 2, 3, 4, 5, order.len(), 50] {
         let case = format!("page-size-{page_size}");
         let mut seen: Vec<String> = Vec::new();
         let mut token: Option<String> = None;
@@ -808,18 +826,19 @@ async fn a_next_token_this_service_did_not_issue_is_refused() {
     let document = lens_document("Resumed lens", None, &[("governance", 1, 2)]);
     import(&client, &document.to_string(), None, "resume", None).await;
     wait_for_the_import_to_land();
+    let total = official_aliases().len() + 1;
     let first = list(&client, "LensStatus=ALL&MaxResults=1").await;
     let issued = first
         .body
         .get("NextToken")
         .and_then(Value::as_str)
-        .expect("two lenses and a page of one leave a NextToken")
+        .expect("a catalog of more than one lens and a page of one leave a NextToken")
         .to_string();
     let resumed = list(&client, &format!("LensStatus=ALL&NextToken={issued}")).await;
     assert_eq!(
         aliases(&resumed, "resumed").len(),
-        1,
-        "case \"resumed\": the rest of the catalog is one lens, got {resumed:?}"
+        total - 1,
+        "case \"resumed\": the rest of the catalog is every lens but the first, got {resumed:?}"
     );
 }
 

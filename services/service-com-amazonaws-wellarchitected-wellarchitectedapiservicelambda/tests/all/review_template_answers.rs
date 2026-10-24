@@ -43,7 +43,7 @@ const FRAMEWORK_PILLAR_QUESTIONS: [(&str, usize); 6] = [
 /// How many questions that lens asks in all.
 const FRAMEWORK_QUESTIONS: usize = 11 + 11 + 13 + 5 + 11 + 6;
 
-/// The alias of the one lens this emulator ships a question set for.
+/// The alias of the AWS Well-Architected Framework lens.
 const FRAMEWORK_LENS: &str = "wellarchitected";
 
 /// The same lens named by its AWS-official ARN: "this is either the lens alias … or the
@@ -51,8 +51,10 @@ const FRAMEWORK_LENS: &str = "wellarchitected";
 /// doc).
 const FRAMEWORK_LENS_ARN: &str = "arn:aws:wellarchitected:us-east-1::lens/wellarchitected";
 
-/// A lens alias AWS publishes but this emulator ships no question set for.
-const UNSHIPPED_LENS: &str = "serverless";
+/// A lens alias AWS publishes that this emulator's AWS-official lens catalog carries no
+/// content for, so it asks no questions here (the catalog itself is pinned by
+/// `super::official_lens_catalog`).
+const UNSHIPPED_LENS: &str = "mergersandacquisitions";
 
 /// The page a request that omits `MaxResults` gets: the modelled maximum, so the lens's
 /// 57 questions do not fit in one page.
