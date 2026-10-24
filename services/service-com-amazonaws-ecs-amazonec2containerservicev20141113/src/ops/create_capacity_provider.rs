@@ -5,8 +5,9 @@
 //! capacity that runs tasks — a caller's own Auto Scaling group, or capacity Amazon ECS
 //! manages — so the record this writes is what a later `capacityProviderStrategy` entry,
 //! `PutClusterCapacityProviders` association and `DescribeCapacityProviders` read back.
-//! The name and the Auto Scaling group each identify the provider, so neither is shared
-//! with a provider that already exists.
+//! The name and the Auto Scaling group each identify the provider, so neither is given to
+//! a second one — while a REPEAT of the same create (the model's `@idempotent` trait) is
+//! the call already having had its effect, and reports the stored provider unchanged.
 //!
 //! ## Shape of an operation
 //!
@@ -188,14 +189,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // The name is the provider's identifier, so a value outside the one rule the
+        // member documents — its length, its character set, or a prefix Amazon ECS keeps
+        // for its own providers — names no provider this account may create.
         let name = input.name.clone();
         if let Err(message) = crate::state::validate_capacity_provider_name(&name) {
             return Err(
-                CreateCapacityProviderErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(message),
-                    },
-                )
+                CreateCapacityProviderErrorModeled::ClientException(ClientException {
+                    message: Some(message.to_string()),
+                })
                 .into(),
             );
         }
@@ -278,25 +280,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // `CreateManagedInstancesProviderConfiguration` is what the request carries and
+        // `ManagedInstancesProvider` what a response reports: the same configuration,
+        // member for member, so the stored provider reports back what it was created with.
+        let managed_instances_provider =
+            input
+                .managed_instances_provider
+                .as_ref()
+                .map(|requested| ManagedInstancesProvider {
+                    infrastructure_role_arn: Some(requested.infrastructure_role_arn.clone()),
+                    instance_launch_template: Some(requested.instance_launch_template.clone()),
+                    propagate_tags: requested.propagate_tags.clone(),
+                    infrastructure_optimization: requested.infrastructure_optimization.clone(),
+                    auto_repair_configuration: requested.auto_repair_configuration.clone(),
+                });
+        // What this request would bind the provider onto, as the stored record renders its
+        // own binding — the comparison the idempotency rule below is decided on.
+        let requested_binding = crate::state::capacity_provider_binding_fingerprint(
+            cluster_name.as_deref(),
+            input.auto_scaling_group_provider.as_ref(),
+            managed_instances_provider.as_ref(),
+        );
+
         // The name IDENTIFIES the provider — a `capacityProviderStrategy` entry names one
-        // by nothing else — so a second create under a name the account already holds is
-        // not a second provider, and it cannot replace the first either: the configuration
+        // by nothing else — so a name the account already holds cannot be given to a
+        // SECOND provider, and this call cannot replace the first either: the configuration
         // of an existing provider is `UpdateCapacityProvider`'s to change. The model's
-        // `@idempotent` trait says a RETRY of this call is safe (it mints nothing twice),
-        // not that a name already taken is accepted.
-        if guard
+        // `@idempotent` trait decides the remaining case: a repeat that asks for the
+        // provider that is already stored — the same name over the same binding — is the
+        // call already having had its effect, so it reports that provider unchanged and
+        // writes nothing. Only a CONFLICTING request, one that would have to change the
+        // stored binding, is refused.
+        if let Some(existing) = guard
             .capacity_providers
             .get(&name)
-            .is_some_and(|existing| existing.status != crate::state::CAPACITY_PROVIDER_INACTIVE)
+            .filter(|existing| existing.status != crate::state::CAPACITY_PROVIDER_INACTIVE)
         {
+            if existing.binding_fingerprint() == requested_binding {
+                return Ok(CreateCapacityProviderOutput {
+                    capacity_provider: Some(existing.view(true)),
+                });
+            }
             return Err(
                 CreateCapacityProviderErrorModeled::ClientException(ClientException {
-                    message: Some(
-                        "A capacity provider with the specified name already exists. To \
-                         change the configuration of an existing capacity provider, use \
-                         UpdateCapacityProvider."
-                            .to_string(),
-                    ),
+                    message: Some(crate::state::CAPACITY_PROVIDER_EXISTS_MESSAGE.to_string()),
                 })
                 .into(),
             );
@@ -309,20 +336,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the same group.
         if let Some(requested) = requested_group.as_deref() {
             let key = crate::state::auto_scaling_group_key(requested);
-            let conflict = guard.capacity_providers.values().find(|existing| {
+            let taken = guard.capacity_providers.values().any(|existing| {
                 existing.status != crate::state::CAPACITY_PROVIDER_INACTIVE
                     && existing
                         .auto_scaling_group()
                         .is_some_and(|group| crate::state::auto_scaling_group_key(group) == key)
             });
-            if let Some(conflict) = conflict {
+            if taken {
                 return Err(
                     CreateCapacityProviderErrorModeled::ClientException(ClientException {
-                        message: Some(format!(
-                            "The specified Auto Scaling group is already being used by \
-                             capacity provider {}.",
-                            conflict.name
-                        )),
+                        message: Some(
+                            crate::state::AUTO_SCALING_GROUP_IN_USE_MESSAGE.to_string(),
+                        ),
                     })
                     .into(),
                 );
@@ -344,20 +369,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // `CreateManagedInstancesProviderConfiguration` is what the request carries and
-        // `ManagedInstancesProvider` what a response reports: the same configuration,
-        // member for member, so the stored provider reports back what it was created with.
-        let managed_instances_provider =
-            input
-                .managed_instances_provider
-                .as_ref()
-                .map(|requested| ManagedInstancesProvider {
-                    infrastructure_role_arn: Some(requested.infrastructure_role_arn.clone()),
-                    instance_launch_template: Some(requested.instance_launch_template.clone()),
-                    propagate_tags: requested.propagate_tags.clone(),
-                    infrastructure_optimization: requested.infrastructure_optimization.clone(),
-                    auto_repair_configuration: requested.auto_repair_configuration.clone(),
-                });
         let record = crate::state::CapacityProviderRecord {
             arn: crate::state::capacity_provider_arn(&region, &name),
             name: name.clone(),

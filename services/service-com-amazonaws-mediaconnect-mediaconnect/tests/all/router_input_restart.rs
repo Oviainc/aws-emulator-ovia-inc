@@ -41,11 +41,23 @@ pub(crate) fn past_transition_span() -> Duration {
     mc::TRANSITION_SPAN * 2
 }
 
-async fn create_router_input(emulator: &Emulator, body: Value) -> (u16, Option<String>, Value) {
+/// Send one CreateRouterInput request.
+///
+/// `pub(crate)` because `tests/all/router_input_batch_get.rs` creates what it reads back
+/// through the same helper, so the two suites cannot drift.
+pub(crate) async fn create_router_input(
+    emulator: &Emulator,
+    body: Value,
+) -> (u16, Option<String>, Value) {
     emulator.send("POST", "/v1/routerInput", Some(body)).await
 }
 
-async fn get_router_input(emulator: &Emulator, arn: &str) -> (u16, Option<String>, Value) {
+/// Send one GetRouterInput request. `pub(crate)` for the same reason as
+/// [`create_router_input`].
+pub(crate) async fn get_router_input(
+    emulator: &Emulator,
+    arn: &str,
+) -> (u16, Option<String>, Value) {
     emulator
         .send("GET", &format!("/v1/routerInput/{arn}"), None)
         .await
@@ -124,8 +136,9 @@ pub(crate) fn union_member<'a>(payload: &'a Value, member_name: &str, json_name:
 /// than over one configuration.
 ///
 /// `pub(crate)` because the router input START suite spans the same class (see
-/// `tests/all/router_input_start.rs`), so there is one configuration table rather than one
-/// per suite.
+/// `tests/all/router_input_start.rs`), as does the batch read suite (see
+/// `tests/all/router_input_batch_get.rs`), so there is one configuration table rather than
+/// one per suite.
 pub(crate) fn configuration_rows() -> Vec<(
     &'static str,
     &'static str,
@@ -255,8 +268,9 @@ pub(crate) fn configuration_rows() -> Vec<(
 
 /// A minimal valid CreateRouterInput body for `configuration`.
 ///
-/// `pub(crate)` because the router input start suite creates its inputs the same way (see
-/// `tests/all/router_input_start.rs`).
+/// `pub(crate)` because the router input start and batch read suites create their inputs
+/// the same way (see `tests/all/router_input_start.rs` and
+/// `tests/all/router_input_batch_get.rs`).
 pub(crate) fn create_body(name: &str, configuration: Value) -> Value {
     json!({
         "name": name,

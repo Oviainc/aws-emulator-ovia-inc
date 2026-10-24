@@ -1563,6 +1563,39 @@ impl ComAmazonawsEmrcontainersAwschicagowebserviceState {
         }
     }
 
+    /// The tag set of the resource `arn` names, for reporting — the SAME copy
+    /// [`Self::resource_tags_mut`] edits, so a read answers exactly what the resource's
+    /// own record holds and what every other reader of that resource reports.
+    ///
+    /// `None` when this store holds no such resource, on the terms
+    /// [`Self::holds_tagged_resource`] states.
+    pub fn resource_tags(
+        &self,
+        resource: &TaggedResource,
+        arn: &str,
+    ) -> Option<&HashMap<String, String>> {
+        if !self.holds_tagged_resource(resource, arn) {
+            return None;
+        }
+        match resource {
+            TaggedResource::VirtualCluster { id } => {
+                self.virtual_clusters.get(id).map(|record| &record.tags)
+            }
+            TaggedResource::JobRun {
+                virtual_cluster_id,
+                id,
+            } => self
+                .job_run(virtual_cluster_id, id)
+                .map(|record| &record.tags),
+            TaggedResource::ManagedEndpoint {
+                virtual_cluster_id,
+                id,
+            } => self
+                .managed_endpoint(virtual_cluster_id, id)
+                .map(|record| &record.tags),
+        }
+    }
+
     /// This cluster's stored job runs, in creation order.
     pub fn cluster_job_runs(
         &self,

@@ -85,7 +85,7 @@ pub(crate) fn key_of(chars: usize) -> String {
 
 /// `DELETE /tags/{resourceArn}?tagKeys=…` — `tagKeys` is an `@httpQuery` list, so the
 /// request carries one entry per key.
-async fn untag(emr: &Emr, resource_arn: &str, keys: &[&str]) -> Answer {
+pub(crate) async fn untag(emr: &Emr, resource_arn: &str, keys: &[&str]) -> Answer {
     let query = keys
         .iter()
         .map(|key| format!("tagKeys={}", encoded(key)))

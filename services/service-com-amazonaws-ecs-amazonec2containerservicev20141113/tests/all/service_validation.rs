@@ -263,6 +263,16 @@ async fn enabling_execute_command_requires_the_revision_to_declare_a_task_role()
                 "case {case:?}: expected {operation} to name the member at fault, got \
                  {message:?}"
             );
+            // The remediation clause names WHERE the role belongs — in the task
+            // definition, which is the resource the caller has to change — and is the
+            // same clause whichever launch earned the refusal.
+            assert!(
+                message.ends_with(
+                    "Specify a valid task role in your task definition and try again."
+                ),
+                "case {case:?}: expected {operation} to point the caller at the task \
+                 definition, got {message:?}"
+            );
         }
         assert!(
             stored_services(&router, &[&service_name], case).await.is_empty(),
@@ -287,7 +297,7 @@ async fn enabling_execute_command_requires_the_revision_to_declare_a_task_role()
         .await;
         // And turning it ON through UpdateService is refused for the same reason, so the
         // rule cannot be walked around by a second call.
-        let (code, _) = refusal(
+        let (code, message) = refusal(
             &router,
             "UpdateService",
             json!({
@@ -301,6 +311,11 @@ async fn enabling_execute_command_requires_the_revision_to_declare_a_task_role()
         assert_eq!(
             code, "InvalidParameterException",
             "case {case:?}: expected UpdateService to refuse the same pair"
+        );
+        assert!(
+            message.ends_with("Specify a valid task role in your task definition and try again."),
+            "case {case:?}: expected UpdateService to point the caller at the task \
+             definition, got {message:?}"
         );
     }
 }
@@ -731,14 +746,71 @@ async fn a_task_on_an_auto_scaling_group_provider_needs_capacity_unless_it_scale
             "case {case:?}: expected an InvalidParameterException, got {code:?} with \
              {message:?}"
         );
+        // The refusal is built from the request: it names the PROVIDER the placement went
+        // through, which is the Auto Scaling group the caller has to scale, so the
+        // expected sentence differs row by row with the provider's name.
         assert_eq!(
-            message, "No Container Instances were found in your cluster.",
-            "case {case:?}: expected the fixed sentence for a cluster with no capacity"
+            message,
+            format!("The specified capacity provider '{provider}' contains no container instances."),
+            "case {case:?}: expected the refusal to name the empty provider"
         );
         assert_eq!(
             tasks_in(&router, &cluster, case).await,
             before,
             "case {case:?}: a refused RunTask must run no task"
+        );
+    }
+
+    // A cluster can carry SEVERAL providers, and the refusal names the one the placement
+    // asked for — not the cluster, and not whichever provider happens to be first.
+    let cluster = "multiprovider";
+    create_cluster(&router, cluster, "two providers").await;
+    let names = ["alpha", "beta"];
+    for name in names {
+        ok(
+            &router,
+            "CreateCapacityProvider",
+            json!({
+                "name": name,
+                "autoScalingGroupProvider": { "autoScalingGroupArn": format!("asg-{name}") },
+            }),
+            "two providers",
+        )
+        .await;
+    }
+    ok(
+        &router,
+        "PutClusterCapacityProviders",
+        json!({
+            "cluster": cluster,
+            "capacityProviders": names,
+            "defaultCapacityProviderStrategy": [],
+        }),
+        "two providers",
+    )
+    .await;
+    for name in names {
+        let case = &format!("the strategy names {name}");
+        let (code, message) = refusal(
+            &router,
+            "RunTask",
+            json!({
+                "cluster": cluster,
+                "taskDefinition": family,
+                "capacityProviderStrategy": [{ "capacityProvider": name, "weight": 1 }],
+            }),
+            case,
+        )
+        .await;
+        assert_eq!(
+            code, "InvalidParameterException",
+            "case {case:?}: expected an InvalidParameterException, got {code:?} with \
+             {message:?}"
+        );
+        assert_eq!(
+            message,
+            format!("The specified capacity provider '{name}' contains no container instances."),
+            "case {case:?}: expected the refusal to name the provider the placement used"
         );
     }
 }

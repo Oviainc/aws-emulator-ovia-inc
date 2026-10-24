@@ -67,6 +67,8 @@ mod reservation_listing;
 mod resource_tags;
 #[path = "all/revoke_flow_entitlement.rs"]
 mod revoke_flow_entitlement;
+#[path = "all/router_input_batch_get.rs"]
+mod router_input_batch_get;
 #[path = "all/router_input_deletion.rs"]
 mod router_input_deletion;
 #[path = "all/router_input_restart.rs"]
