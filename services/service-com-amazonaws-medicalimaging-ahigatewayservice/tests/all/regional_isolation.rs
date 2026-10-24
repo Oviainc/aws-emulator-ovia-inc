@@ -267,8 +267,8 @@ async fn list_datastores_reports_only_the_data_stores_of_the_region_it_was_addre
 
 /// One row of the id-keyed table: a request that names a data store, as the route and
 /// body an SDK client sends, beside the text this service refuses an absent data store
-/// with on that route — a constant stated by resource KIND on the id-keyed routes, and
-/// the ARN-naming sentence on the three `@httpLabel`-keyed tagging routes.
+/// with on that route — one constant stated by resource KIND, on the id-keyed routes and
+/// on the three `@httpLabel`-keyed tagging routes alike.
 #[derive(Debug)]
 struct OperationCase {
     case: &'static str,
@@ -298,9 +298,7 @@ fn id_keyed_operations(
     datastore_arn: &str,
 ) -> Vec<OperationCase> {
     let tag_label = label(datastore_arn);
-    // The tagging routes name the resource by its ARN, so their refusal does too
-    // (`crate::ops::tag_resource`); every id-keyed route states the resource KIND.
-    let missing_arn = format!("Resource {datastore_arn} was not found");
+    // Every route — id-keyed or ARN-keyed — states the resource KIND that is missing.
     let missing_datastore = DATASTORE_NOT_FOUND_MESSAGE.to_string();
     vec![
         OperationCase {
@@ -359,21 +357,21 @@ fn id_keyed_operations(
             method: "GET",
             uri: format!("/tags/{tag_label}"),
             body: None,
-            missing_message: missing_arn.clone(),
+            missing_message: missing_datastore.clone(),
         },
         OperationCase {
             case: "TagResource",
             method: "POST",
             uri: format!("/tags/{tag_label}"),
             body: Some(json!({ "tags": { "crossregion": "written" } })),
-            missing_message: missing_arn.clone(),
+            missing_message: missing_datastore.clone(),
         },
         OperationCase {
             case: "UntagResource",
             method: "DELETE",
             uri: format!("/tags/{tag_label}?tagKeys={}", label(SEEDED_TAGS[0].0)),
             body: None,
-            missing_message: missing_arn,
+            missing_message: missing_datastore.clone(),
         },
         OperationCase {
             case: "StartDICOMImportJob",

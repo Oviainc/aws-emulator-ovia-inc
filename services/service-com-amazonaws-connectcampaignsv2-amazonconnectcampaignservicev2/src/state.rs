@@ -8,6 +8,11 @@
 //! [`CampaignState`], and `DeleteCampaign` removes it. No handler keeps a copy of
 //! its own, so every response describes what the store holds.
 //!
+//! A campaign's state is owed to the CLOCK as well as to those calls: a campaign
+//! that has entered its run is `Completed` once its schedule's `endTime` has
+//! passed, which [`StoredCampaign::state_at`] derives from the stored schedule on
+//! every read, so no reader reports a state the schedule has already moved past.
+//!
 //! The instance-onboarding store beside it is the single source of truth for which
 //! Connect instances are onboarded to Campaigns: `StartInstanceOnboardingJob` writes a
 //! record here with the encryption config it was given,
@@ -206,6 +211,13 @@ pub fn decode_next_token(token: &str) -> Option<u64> {
         .ok()
 }
 
+/// `at` as the `(seconds, nanoseconds)` pair an `::aws_smithy_types::DateTime`
+/// reports an instant as, so a wall-clock instant and a modelled timestamp compare
+/// exactly rather than through a lossy float.
+fn instant_parts(at: ::aws_smithy_types::DateTime) -> (i64, u32) {
+    (at.secs(), at.subsec_nanos())
+}
+
 /// The lifecycle state of a stored campaign.
 ///
 /// The variants are exactly the `CampaignState` enum the Smithy model declares —
@@ -243,6 +255,10 @@ impl CampaignState {
     /// and from nowhere else; Stop ends one that has not finished. Nothing moves
     /// out of a terminal state (`Completed`, `Failed`), and no action is a no-op:
     /// repeating one is refused rather than silently accepted.
+    ///
+    /// A call is judged against the state the campaign is at NOW, which the clock
+    /// has a say in — see [`StoredCampaign::state_at`], the one place a caller reads
+    /// a campaign's state from.
     pub fn after(self, action: CampaignAction) -> Option<Self> {
         match (self, action) {
             (Self::Initialized | Self::Paused | Self::Stopped, CampaignAction::Start) => {
@@ -318,7 +334,13 @@ pub struct StoredCampaign {
     pub communication_limits_override: Option<CommunicationLimitsConfig>,
     /// Ordered so the tag map a response carries is built deterministically.
     pub tags: BTreeMap<String, String>,
-    pub state: CampaignState,
+    /// The state the lifecycle CALLS left this campaign in
+    /// (`Start`/`Pause`/`Resume`/`StopCampaign`, through [`CampaignState::after`]).
+    ///
+    /// NOT what a reader reports: the campaign's state is owed to the clock as well
+    /// as to those calls, so every reader asks [`Self::state_at`] for the state at
+    /// the instant it is serving.
+    pub lifecycle_state: CampaignState,
     /// When this campaign was created. Part of the record, not of any response:
     /// no modelled member in this slice carries it.
     pub created_at: std::time::SystemTime,
@@ -370,6 +392,40 @@ impl StoredCampaign {
                     .map(|(key, value)| (key.clone(), value.clone()))
                     .collect(),
             )
+        }
+    }
+
+    /// Whether this campaign's scheduled run window has closed at `now`.
+    ///
+    /// A campaign carries a window only when it carries a `Schedule`, whose
+    /// `endTime` is `@required` — so a scheduled campaign always knows the instant
+    /// its window closes, and an unscheduled one has no window to close.
+    pub fn run_window_closed_at(&self, now: SystemTime) -> bool {
+        let now = instant_parts(::aws_smithy_types::DateTime::from(now));
+        self.schedule
+            .as_ref()
+            .is_some_and(|schedule| now >= instant_parts(schedule.end_time))
+    }
+
+    /// This campaign's lifecycle state at `now`.
+    ///
+    /// The state is owed to the clock as well as to the lifecycle calls: a campaign
+    /// that has entered its run — `Running` or `Paused`, the states a
+    /// `StartCampaign` leads to — has run to the end of its schedule once that
+    /// schedule's `endTime` has passed, and a run that has reached its end is the
+    /// terminal `Completed`. A campaign that never entered a run (`Initialized`) or
+    /// whose run a caller ended (`Stopped`) is left where the calls put it, and a
+    /// terminal state moves nowhere.
+    ///
+    /// A pure read of the stored schedule, so reporting the state writes nothing and
+    /// two callers reading at the same instant see the same value — the same way
+    /// [`StoredInstanceOnboarding::status_at`] reports an onboarding job's status.
+    pub fn state_at(&self, now: SystemTime) -> CampaignState {
+        match self.lifecycle_state {
+            CampaignState::Running | CampaignState::Paused if self.run_window_closed_at(now) => {
+                CampaignState::Completed
+            }
+            stored => stored,
         }
     }
 
