@@ -24,10 +24,10 @@
 //! different hypervisor.
 //!
 //! `AssociateGatewayToServer` — the operation that associates a gateway with a hypervisor
-//! — is still a scaffold answering 501 under its own stub issue, so the association is
-//! seeded here through the very `StoredGateway` fields that handler will write and this
-//! one reads ([`associate`]), exactly as the sibling suites seed what another scaffolded
-//! operation owns.
+//! — has its own suite (`gateway_server_association`); the association is seeded here
+//! through the very `StoredGateway` fields it writes and this handler reads
+//! ([`associate`]), so this suite's scene stays independent of that operation. The
+//! workflow driven with wire calls only is covered by `metadata_sync_over_the_wire`.
 
 use std::sync::Arc;
 
