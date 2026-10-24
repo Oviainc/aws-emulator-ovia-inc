@@ -17,6 +17,8 @@ mod check_capacity;
 mod exception_messages;
 #[path = "all/ip_set_mutations.rs"]
 mod ip_set_mutations;
+#[path = "all/list_rule_groups.rs"]
+mod list_rule_groups;
 #[path = "all/managed_rule_groups.rs"]
 mod managed_rule_groups;
 #[path = "all/parameter_validation.rs"]
