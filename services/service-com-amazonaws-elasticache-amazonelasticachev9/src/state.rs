@@ -114,6 +114,17 @@
 //! is made of, and `DescribeReplicationGroups` reports it. Those member clusters
 //! are ordinary [`CacheClusterRecord`]s in the same map as the standalone ones,
 //! so there is one copy of a cluster however it was created.
+//!
+//! A Global datastore ([`GlobalReplicationGroupRecord`]) is built AROUND one
+//! such replication group: `CreateGlobalReplicationGroup` mints it from the
+//! primary that accepts writes, `DescribeGlobalReplicationGroups` reports it,
+//! `ModifyGlobalReplicationGroup`, the failover, the (dis)association and the
+//! slice-group operations change it, and `DeleteGlobalReplicationGroup` takes it
+//! away. Which datastore a replication group belongs to and the role it has
+//! there is held ONCE per record on each side — on the datastore's member list
+//! and on [`ReplicationGroupRecord::global_replication_group_id`] — and every
+//! operation that moves a membership writes both, so the two reads cannot
+//! disagree about what the account runs.
 
 use std::collections::btree_map::Entry;
 use std::collections::BTreeMap;
@@ -4389,9 +4400,10 @@ pub struct ReplicationGroupRecord {
     pub auth_token_last_strategy: Option<String>,
     /// The Global datastore this group is a member of, and its role in it,
     /// which is what `ReplicationGroup$GlobalReplicationGroupInfo` reports.
-    /// `CreateGlobalReplicationGroup` is still a scaffolded 501 with its own
-    /// issue, so today only the Global datastore operations that MOVE a
-    /// membership (associate, disassociate, failover, delete) write these.
+    /// `CreateGlobalReplicationGroup` writes them for the primary it builds a
+    /// datastore around, and the Global datastore operations that MOVE a
+    /// membership (associate, disassociate, failover, delete) write them for
+    /// every other member.
     pub global_replication_group_id: Option<String>,
     /// See [`ReplicationGroupRecord::global_replication_group_id`].
     pub global_member_role: Option<String>,
@@ -8477,8 +8489,7 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
             auth_token_last_strategy: None,
             // A created group belongs to no Global datastore: the Global
             // datastore operations are what make a group a member, and
-            // `CreateReplicationGroup` refuses a `GlobalReplicationGroupId`
-            // because `CreateGlobalReplicationGroup` is still a scaffolded 501.
+            // `CreateReplicationGroup` does not create the secondary of one.
             global_replication_group_id: None,
             global_member_role: None,
         };
@@ -8834,6 +8845,65 @@ pub fn global_replication_group_arn(region: &str, global_replication_group_id: &
     )
 }
 
+/// How many characters the prefix a Global datastore id carries has; see
+/// [`global_datastore_prefix`].
+pub const GLOBAL_ID_PREFIX_LEN: usize = 5;
+
+/// The Global datastore id prefixes this service's own sources name: the one the
+/// model publishes — "a Global datastore ID created in the US-West-1 region will
+/// begin with `dsdfu`"
+/// (`CreateGlobalReplicationGroupMessage$GlobalReplicationGroupIdSuffix`) — and
+/// the one every Global datastore id AWS was recorded answering with in
+/// `us-east-1` carries. Every other region's prefix is minted by
+/// [`global_datastore_prefix`].
+const PUBLISHED_GLOBAL_ID_PREFIXES: [(&str, &str); 2] =
+    [("us-east-1", "ldgnf"), ("us-west-1", "dsdfu")];
+
+/// The prefix a Global datastore id created in `region` begins with.
+///
+/// "Amazon ElastiCache automatically applies a prefix to the Global datastore ID
+/// when it is created. Each Amazon Region has its own prefix … The suffix,
+/// combined with the auto-generated prefix, guarantees uniqueness of the Global
+/// datastore name across multiple regions." The model publishes the prefix of
+/// one region ([`PUBLISHED_GLOBAL_ID_PREFIXES`]); for every other region the
+/// prefix is MINTED here from the region name, so it has the published shape
+/// ([`GLOBAL_ID_PREFIX_LEN`] lowercase letters), differs from region to region,
+/// and is the same every time the same region is asked — which is what makes a
+/// stored id stable across reads.
+pub fn global_datastore_prefix(region: &str) -> String {
+    let region = region.to_ascii_lowercase();
+    if let Some((_, prefix)) = PUBLISHED_GLOBAL_ID_PREFIXES
+        .iter()
+        .find(|(published, _)| *published == region)
+    {
+        return (*prefix).to_string();
+    }
+    // FNV-1a over the region name: a stable, well-spread function of the whole
+    // name, so two regions that differ anywhere get different prefixes.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in region.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    (0..GLOBAL_ID_PREFIX_LEN)
+        .map(|index| {
+            let letter = (hash >> (index * 8)) % 26;
+            char::from(b'a' + u8::try_from(letter).unwrap_or(0))
+        })
+        .collect()
+}
+
+/// The id a Global datastore created in `region` with `suffix` is stored and
+/// reported under: the region's [`global_datastore_prefix`] and the suffix the
+/// request named, lowercased like every other identifier of this service.
+pub fn global_replication_group_id(region: &str, suffix: &str) -> String {
+    format!(
+        "{}-{}",
+        global_datastore_prefix(region),
+        suffix.to_ascii_lowercase()
+    )
+}
+
 /// The keyspace each of `count` node groups owns, as `NodeGroup$Slots` and
 /// `GlobalNodeGroup$Slots` report it.
 ///
@@ -9067,6 +9137,12 @@ pub struct GlobalNodeGroupRecord {
 }
 
 /// The validated values a new Global datastore is built from.
+///
+/// A Global datastore has the configuration of the replication group it is built
+/// around — its engine, engine version, node type, whether its keyspace is
+/// partitioned and over how many slice groups, its encryption and its
+/// auth-token setting — so `CreateGlobalReplicationGroup` reads every one of
+/// those off that group rather than from the request.
 #[derive(Debug, Clone)]
 pub struct NewGlobalReplicationGroup {
     pub global_replication_group_id: String,
@@ -9078,8 +9154,19 @@ pub struct NewGlobalReplicationGroup {
     /// The replication group that accepts writes, which becomes the datastore's
     /// primary member.
     pub primary_replication_group_id: String,
+    /// The primary member's `AutomaticFailover`, which is the primary
+    /// replication group's own: see [`ReplicationGroupRecord::automatic_failover`].
+    pub primary_automatic_failover: String,
     pub node_group_count: i32,
     pub cluster_enabled: bool,
+    /// Whether the primary was created with an `AuthToken`; the token itself is
+    /// a SECRET and is never stored. See
+    /// [`CacheClusterRecord::auth_token_enabled`].
+    pub auth_token_enabled: bool,
+    pub transit_encryption_enabled: Option<bool>,
+    pub at_rest_encryption_enabled: Option<bool>,
+    /// The tags the create was given; see [`CacheClusterRecord::tags`].
+    pub tags: Vec<(String, String)>,
     pub now: SystemTime,
 }
 
@@ -9107,13 +9194,17 @@ pub struct GlobalReplicationGroupRecord {
 impl GlobalReplicationGroupRecord {
     /// A Global datastore with one primary member, in the status a just-created
     /// datastore has.
+    ///
+    /// It answers `creating` until the clock settles it at
+    /// [`Self::settled_status`] — `primary-only` for a datastore that has only
+    /// the primary it was built around, which is what that status means.
     pub fn new(new: NewGlobalReplicationGroup) -> Self {
         let mut record = Self {
             arn: global_replication_group_arn(&new.region, &new.global_replication_group_id),
             global_replication_group_id: new.global_replication_group_id,
             description: new.description,
             status: STATUS_CREATING.to_string(),
-            pending_status: transition_to(STATUS_AVAILABLE, new.now),
+            pending_status: None,
             engine: new.engine,
             engine_version: new.engine_version,
             cache_node_type: new.cache_node_type,
@@ -9121,17 +9212,18 @@ impl GlobalReplicationGroupRecord {
                 replication_group_id: new.primary_replication_group_id,
                 region: new.region.clone(),
                 role: GLOBAL_ROLE_PRIMARY.to_string(),
-                automatic_failover: FAILOVER_DISABLED.to_string(),
+                automatic_failover: new.primary_automatic_failover,
                 status: STATUS_ASSOCIATED.to_string(),
             }],
             cluster_enabled: new.cluster_enabled,
             global_node_groups: Vec::new(),
-            auth_token_enabled: false,
-            transit_encryption_enabled: None,
-            at_rest_encryption_enabled: None,
+            auth_token_enabled: new.auth_token_enabled,
+            transit_encryption_enabled: new.transit_encryption_enabled,
+            at_rest_encryption_enabled: new.at_rest_encryption_enabled,
             region: new.region,
-            tags: Vec::new(),
+            tags: new.tags,
         };
+        record.pending_status = transition_to(record.settled_status(), new.now);
         record.set_node_group_count(new.node_group_count);
         record
     }

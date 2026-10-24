@@ -1,10 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateGlobalReplicationGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateGlobalReplicationGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`CreateGlobalReplicationGroup::handle`] with real behaviour and
 //! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
@@ -174,18 +170,208 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateGlobalReplicationGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateGlobalReplicationGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::STORE_UNAVAILABLE,
+            ));
+        };
+
+        // "The suffix name of a Global datastore … The suffix, combined with the
+        // auto-generated prefix, guarantees uniqueness of the Global datastore
+        // name across multiple regions": the suffix names a resource of this
+        // service, so it goes through the one identifier rule every identifier
+        // of this service is refused by. The STORED id is the region's prefix, a
+        // hyphen and the suffix, so the bound the suffix gets is the one this
+        // service's group identifiers carry
+        // (`crate::state::REPLICATION_GROUP_ID_MAX_LEN`) less those characters —
+        // what is left over for the part a caller chooses.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateGlobalReplicationGroup"))
+        // (`ServiceLinkedRoleNotFoundFault` is the other refusal this operation
+        // models: this emulator provisions the Global datastore service-linked
+        // role for every account it serves, so no request is answered with it.)
+        if let Some(message) = crate::state::identifier_refusal(
+            "Global Replication Group ID Suffix",
+            "GlobalReplicationGroupIdSuffix",
+            &input.global_replication_group_id_suffix,
+            crate::state::REPLICATION_GROUP_ID_MAX_LEN - crate::state::GLOBAL_ID_PREFIX_LEN - 1,
+        ) {
+            return Err(
+                CreateGlobalReplicationGroupErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The tags the datastore is created with, refused through the one helper
+        // every tag-bearing request of this service goes through.
+        let tags = match crate::state::tag_pairs(input.tags) {
+            Ok(tags) => tags,
+            Err(crate::state::TagRefusal::TooMany(count)) => {
+                return Err(
+                    CreateGlobalReplicationGroupErrorModeled::TagQuotaPerResourceExceeded(
+                        TagQuotaPerResourceExceeded {
+                            message: Some(format!(
+                                "{count} tags were supplied; the maximum number of tags permitted \
+                                 on a resource is {}.",
+                                crate::state::MAX_TAGS_PER_RESOURCE
+                            )),
+                        },
+                    )
+                    .into(),
+                )
+            }
+            Err(crate::state::TagRefusal::InvalidTag(message)) => {
+                return Err(
+                    CreateGlobalReplicationGroupErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(message),
+                        },
+                    )
+                    .into(),
+                )
+            }
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Whether the primary below is `available` depends on the status change
+        // the clock may already owe it, so that is materialised before it is
+        // read.
+        store.settle_all(now);
+
+        // "The name of the primary cluster that accepts writes … This value is
+        // stored as a lowercase string", so the group is resolved under the
+        // lowercased id every identifier of this service is stored under. The
+        // datastore is built around this group, so an id the account holds no
+        // group for is the modelled not-found rather than a datastore with no
+        // primary.
+        let primary_key = input.primary_replication_group_id.to_ascii_lowercase();
+        let Some(primary) = store.replication_groups.get(&primary_key) else {
+            return Err(
+                CreateGlobalReplicationGroupErrorModeled::ReplicationGroupNotFoundFault(
+                    ReplicationGroupNotFoundFault {
+                        message: Some(format!(
+                            "Replication group {} not found.",
+                            input.primary_replication_group_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        // `InvalidReplicationGroupStateFault` is "the requested replication
+        // group is not in the available state": a group still being created,
+        // already being changed or on its way out cannot take on the primary
+        // role of a datastore.
+        if primary.status != crate::state::STATUS_AVAILABLE {
+            return Err(
+                CreateGlobalReplicationGroupErrorModeled::InvalidReplicationGroupStateFault(
+                    InvalidReplicationGroupStateFault {
+                        message: Some(format!(
+                            "Replication group {primary_key} is in {} state, not {}.",
+                            primary.status,
+                            crate::state::STATUS_AVAILABLE
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // A replication group has ONE role in ONE Global datastore
+        // (`ReplicationGroup$GlobalReplicationGroupInfo` reports a single
+        // datastore and a single role), so a group that is already a member
+        // cannot be the primary of a second datastore: the request is refused
+        // rather than leaving two datastores claiming the same group.
+        if let Some(existing) = primary.global_replication_group_id.as_deref() {
+            return Err(
+                CreateGlobalReplicationGroupErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(format!(
+                            "Invalid value {} for PrimaryReplicationGroupId: that replication \
+                             group is already a member of Global Replication Group {existing}.",
+                            input.primary_replication_group_id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // The datastore takes its whole configuration from the primary; read
+        // once, so the record stored below and the member row cannot disagree
+        // with the group the account runs.
+        let primary = primary.clone();
+
+        // The id the datastore is stored and reported under: the region's
+        // auto-applied prefix and the suffix the request named. A datastore
+        // already stored under it is the modelled already-exists fault, so a
+        // second create cannot overwrite the first.
+        //
+        // CC-02 growth bound: a datastore can only be created around an
+        // `available` replication group that is not already a member of one, so
+        // the datastores this store can hold are bounded by the replication
+        // groups it holds, which `CreateReplicationGroup` bounds by
+        // `crate::state::CLUSTER_QUOTA`.
+        let global_replication_group_id = crate::state::global_replication_group_id(
+            &region,
+            &input.global_replication_group_id_suffix,
+        );
+        if store
+            .global_replication_groups
+            .contains_key(&global_replication_group_id)
+        {
+            return Err(
+                CreateGlobalReplicationGroupErrorModeled::GlobalReplicationGroupAlreadyExistsFault(
+                    GlobalReplicationGroupAlreadyExistsFault {
+                        message: Some(format!(
+                            "Global Replication Group {global_replication_group_id} already \
+                             exists."
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let stored = store.insert_global_replication_group(crate::state::NewGlobalReplicationGroup {
+            global_replication_group_id: global_replication_group_id.clone(),
+            description: input.global_replication_group_description,
+            region,
+            // The datastore's configuration IS the primary's: "Consists of a
+            // primary cluster that accepts writes and an associated secondary
+            // cluster", and the secondary is created from the datastore, so
+            // every one of these is read off the stored group rather than taken
+            // from a request that has no member to name it.
+            engine: primary.engine,
+            engine_version: primary.engine_version,
+            cache_node_type: primary.cache_node_type,
+            primary_replication_group_id: primary.replication_group_id,
+            primary_automatic_failover: primary.automatic_failover,
+            // One slice group per shard of the primary: a Global datastore's
+            // `GlobalNodeGroups` are the keyspace of the group it replicates.
+            node_group_count: i32::try_from(primary.node_groups.len()).unwrap_or(0),
+            cluster_enabled: primary.cluster_enabled,
+            auth_token_enabled: primary.auth_token_enabled,
+            transit_encryption_enabled: Some(primary.transit_encryption_enabled),
+            at_rest_encryption_enabled: Some(primary.at_rest_encryption_enabled),
+            tags,
+            now,
+        });
+        let answer = stored.to_modeled(true);
+
+        // The primary reports the datastore it now belongs to and the role it
+        // has there, so `ReplicationGroup$GlobalReplicationGroupInfo` and the
+        // datastore's member list are the one statement of this membership.
+        if let Some(group) = store.replication_groups.get_mut(&primary_key) {
+            group.global_replication_group_id = Some(global_replication_group_id);
+            group.global_member_role = Some(crate::state::GLOBAL_ROLE_PRIMARY.to_string());
+        }
+
+        Ok(CreateGlobalReplicationGroupOutput {
+            global_replication_group: Some(answer),
+        })
     }
 }

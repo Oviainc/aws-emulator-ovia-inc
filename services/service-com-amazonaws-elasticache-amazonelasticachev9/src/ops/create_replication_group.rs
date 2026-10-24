@@ -399,20 +399,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_value(message));
         }
 
-        // A Global datastore the group would join has to exist, and none can:
-        // every global-replication-group operation is a scaffolded 501 that owns
-        // its own issue, so there is nothing to join.
-        if let Some(global) = input.global_replication_group_id.as_deref() {
-            return Err(
-                CreateReplicationGroupErrorModeled::GlobalReplicationGroupNotFoundFault(
-                    GlobalReplicationGroupNotFoundFault {
-                        message: Some(format!("Global datastore {global} not found.")),
-                    },
-                )
-                .into(),
-            );
-        }
-
         // Cache security groups are the pre-VPC, EC2-Classic mechanism, and the
         // whole surface is closed for this account — see
         // `crate::state::CACHE_SECURITY_GROUPS_UNSUPPORTED`. A request that
@@ -781,6 +767,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into(),
             );
+        }
+
+        // "The name of the Global datastore": a datastore the group would join
+        // has to be one this account holds, so the id is resolved against the
+        // store — `CreateGlobalReplicationGroup` is what puts one there.
+        // Creating the SECONDARY of a datastore that DOES exist is a path nobody
+        // has written yet: it answers the scaffold's 501, the same way a create
+        // seeded from a snapshot does below, rather than a group that joined
+        // nothing behind a 200.
+        if let Some(global) = input.global_replication_group_id.as_deref() {
+            if !store
+                .global_replication_groups
+                .contains_key(&global.to_ascii_lowercase())
+            {
+                return Err(
+                    CreateReplicationGroupErrorModeled::GlobalReplicationGroupNotFoundFault(
+                        GlobalReplicationGroupNotFoundFault {
+                            message: Some(format!("Global datastore {global} not found.")),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateReplicationGroup as the secondary of a Global datastore",
+            ));
         }
 
         // The parameter group the group's clusters join has to be one this

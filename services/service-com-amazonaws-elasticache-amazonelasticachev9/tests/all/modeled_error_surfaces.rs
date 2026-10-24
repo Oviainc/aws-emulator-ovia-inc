@@ -10,11 +10,12 @@
 //! HTTP status and the XML body are inspected and a response that is not
 //! computed from persisted state cannot pass. A replication group these tests
 //! need is CREATED over the wire through `CreateReplicationGroup`; a Global
-//! datastore is the one resource no implemented operation mints yet
-//! (`CreateGlobalReplicationGroup` is a scaffolded 501 that owns its own
-//! issue), so it is seeded into the one store the handlers read through
-//! [`crate::harness::Emulator::with_state`] — and everything then asserted
-//! about it comes back over the wire.
+//! datastore is seeded into the one store the handlers read through
+//! [`crate::harness::Emulator::with_state`], because these rows name it by its
+//! stored id and give it secondary members only another region's create could
+//! add — and everything then asserted about it comes back over the wire. The
+//! wire path that MINTS one is `CreateGlobalReplicationGroup`, which the
+//! `global_replication_group_create` suite drives end to end.
 //!
 //! The tests are tables: each row is one input along the axis the rule under
 //! test generalises over (the operation, the shape of an unknown id, a password
@@ -78,10 +79,12 @@ fn assert_refused(case: &str, reply: &Reply, status: u16, code: &str) {
 /// Seed one Global datastore with `node_groups` slice groups and one secondary
 /// member per entry in `secondaries`, settled at `available`.
 ///
-/// `CreateGlobalReplicationGroup` is still a scaffolded 501, so the datastore is
-/// built through the state module the handler would use; the status is settled
-/// here rather than slept for, because the transition this test is about is the
-/// one each MUTATION starts.
+/// The datastore is built through the state module `CreateGlobalReplicationGroup`
+/// writes, rather than over the wire, because these suites name the datastore by
+/// its STORED id (prefix and all) and seed secondary members that only another
+/// region's `CreateReplicationGroup` could add; the status is settled here rather
+/// than slept for, because the transition this test is about is the one each
+/// MUTATION starts.
 ///
 /// `pub(crate)` so the sibling suites of this target seed the one store the same
 /// way instead of carrying a second copy of this.
@@ -100,8 +103,13 @@ pub(crate) fn seed_global_datastore(
             engine_version: state::default_engine_version(state::DEFAULT_ENGINE).to_string(),
             cache_node_type: Some("cache.m7g.large".to_string()),
             primary_replication_group_id: format!("{id}-primary"),
+            primary_automatic_failover: state::FAILOVER_DISABLED.to_string(),
             node_group_count: node_groups,
             cluster_enabled: node_groups > 1,
+            auth_token_enabled: false,
+            transit_encryption_enabled: Some(false),
+            at_rest_encryption_enabled: Some(false),
+            tags: Vec::new(),
             now: SystemTime::now(),
         });
         let group = store

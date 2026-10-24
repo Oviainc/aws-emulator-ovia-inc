@@ -179,10 +179,10 @@ struct Kind {
     segment: &'static str,
     status: u16,
     not_found: &'static str,
-    /// Whether this emulator can create a resource of this kind at all. The two it
-    /// cannot — the EC2-Classic cache security group and the serverless cache
-    /// snapshot, whose creates are scaffolded 501s with their own gap issues — have no
-    /// resource an ARN could resolve to, which is exactly what their faults say.
+    /// Whether this emulator can create a resource of this kind at all. The three it
+    /// cannot — the EC2-Classic cache security group, the reserved cache node bought
+    /// from an offering and the serverless cache snapshot — have no resource an ARN
+    /// could resolve to here, which is exactly what their faults say.
     creatable: bool,
 }
 
@@ -240,7 +240,7 @@ const KINDS: &[Kind] = &[
         segment: "globalreplicationgroup",
         status: 404,
         not_found: "GlobalReplicationGroupNotFoundFault",
-        creatable: false,
+        creatable: true,
     },
     Kind {
         segment: "reserved-instance",
@@ -329,6 +329,37 @@ async fn create_resource(
             "CreateServerlessCache",
             params(&[("ServerlessCacheName", name), ("Engine", "redis")]),
         ),
+        "globalreplicationgroup" => {
+            // A Global datastore is built around a replication group that is
+            // `available`, so that primary comes first and the clock is given
+            // its transition span. The datastore's own id is the region's
+            // prefix and this name, which is why every later call in the case
+            // names it by the ARN the create answered with.
+            let primary = format!("{name}-primary");
+            let created = emulator
+                .call(
+                    "CreateReplicationGroup",
+                    &params(&[
+                        ("ReplicationGroupId", primary.as_str()),
+                        ("ReplicationGroupDescription", "the tagging suite"),
+                        ("CacheNodeType", "cache.t3.micro"),
+                    ]),
+                )
+                .await;
+            assert_eq!(
+                created.status, 200,
+                "case {name:?}: the primary must be created, got {} {}",
+                created.status, created.body
+            );
+            std::thread::sleep(PAST_TRANSITION);
+            (
+                "CreateGlobalReplicationGroup",
+                params(&[
+                    ("GlobalReplicationGroupIdSuffix", name),
+                    ("PrimaryReplicationGroupId", &primary),
+                ]),
+            )
+        }
         "user" => (
             "CreateUser",
             params(&[

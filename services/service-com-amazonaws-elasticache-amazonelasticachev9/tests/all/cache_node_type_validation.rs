@@ -367,10 +367,9 @@ async fn a_replication_group_create_follows_the_same_catalogue() {
 async fn a_global_datastore_modify_follows_the_same_catalogue() {
     // `ModifyGlobalReplicationGroup` persists the node type it is given (the
     // datastore reports it back through DescribeGlobalReplicationGroups), so the
-    // same rule holds for it. `CreateGlobalReplicationGroup` is a scaffolded
-    // 501, so the datastore is seeded through the one store the handlers read,
-    // exactly as the sibling Global-datastore suite does, and everything
-    // asserted about it afterwards comes back over the wire.
+    // same rule holds for it. The datastore is seeded through the one store the
+    // handlers read, exactly as the sibling Global-datastore suite does, and
+    // everything asserted about it afterwards comes back over the wire.
     let emulator = Emulator::new();
     seed_global_datastore(&emulator, "ldgnf-node-type", 1, &[]);
 

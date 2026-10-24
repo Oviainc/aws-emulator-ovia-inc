@@ -123,3 +123,7 @@ mod snapshot_delete;
 // suite.
 #[path = "all/modify_replication_group.rs"]
 mod modify_replication_group;
+
+// Appended for the same reason: the `CreateGlobalReplicationGroup` suite.
+#[path = "all/global_replication_group_create.rs"]
+mod global_replication_group_create;
