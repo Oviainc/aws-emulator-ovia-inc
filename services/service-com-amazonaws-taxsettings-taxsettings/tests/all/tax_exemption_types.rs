@@ -42,7 +42,7 @@ fn listed(answer: &Answer) -> Vec<Value> {
 
 /// One catalog entry as the restJson1 wire carries it: every member the entry
 /// sets, and no member it does not.
-fn wire_form(entry: &TaxExemptionType) -> Value {
+pub(crate) fn wire_form(entry: &TaxExemptionType) -> Value {
     let jurisdictions: Vec<Value> = entry
         .applicable_jurisdictions
         .as_ref()
