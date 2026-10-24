@@ -665,6 +665,11 @@ async fn paging_resumes_in_order_when_the_token_s_store_was_deleted() {
                 }))
                 .await;
         }
+        // Wait the activation out before the delete below: a store whose creation is
+        // still in flight refuses the delete with `ConflictException`, and this case is
+        // about the paging token, not about that guard
+        // (`tests/all/datastore_status_guard.rs`).
+        tokio::time::sleep(SETTLE_MULTIPLE * DATASTORE_ACTIVATION_DELAY).await;
 
         let full: Vec<String> = emulator
             .list_datastores("maxResults=50")
@@ -1404,6 +1409,9 @@ async fn the_idempotency_ledger_is_dropped_with_the_resource_it_named() {
             "case cycle={cycle}: expected a NEW datastoreId after the previous store was retired, got the earlier {datastore_id:?}"
         );
 
+        // Only a settled store is deletable, so the creation is waited out first
+        // (`tests/all/datastore_status_guard.rs` is where that guard is asserted).
+        tokio::time::sleep(SETTLE_MULTIPLE * DATASTORE_ACTIVATION_DELAY).await;
         let deleted = emulator.delete_datastore(&datastore_id).await;
         assert_eq!(
             deleted.status, 200,

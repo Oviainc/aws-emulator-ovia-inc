@@ -32,7 +32,8 @@ use service_com_amazonaws_keyspaces_keyspacesservice::ops::types::TABLE_STATUS_V
 use service_com_amazonaws_keyspaces_keyspacesservice::state as keyspaces;
 
 use super::keyspace_table_lifecycle::{
-    assert_failure, assert_ok, error_code, minimal_schema, settle_wait, table_arn, Emulator,
+    assert_failure, assert_ok, epoch_seconds, error_code, minimal_schema, settle_wait, table_arn,
+    Emulator,
 };
 
 /// A KMS key ARN for the `CUSTOMER_MANAGED_KMS_KEY` rows — the form
@@ -81,14 +82,6 @@ async fn get_table(emulator: &Emulator, keyspace: &str, table: &str) -> Value {
             )
             .await,
     )
-}
-
-/// The epoch-seconds window a call ran in, as the JSON timestamps on this protocol are
-/// compared against.
-fn epoch_seconds(at: SystemTime) -> f64 {
-    at.duration_since(SystemTime::UNIX_EPOCH)
-        .expect("the test clock is after the epoch")
-        .as_secs_f64()
 }
 
 /// One row of RULE 1: a table to create, the single setting to update it with, the

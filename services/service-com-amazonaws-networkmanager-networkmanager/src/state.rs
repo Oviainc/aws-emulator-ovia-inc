@@ -9,6 +9,9 @@
 //! and is therefore keyed by that pair. A global network also owns its
 //! CORE network — the Cloud WAN managed network
 //! whose segments and edges are a function of the core network policy document it holds.
+//! A core network in turn owns its ATTACHMENTS: each joins one resource to ONE of the
+//! edge locations that policy configures, and a Connect attachment is carried over
+//! another attachment (its transport) rather than over a resource of its own.
 //! Everything
 //! the implemented operations answer is computed from the records below — no handler
 //! echoes its input back without storing it.
@@ -17,11 +20,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AWSLocation, AccountStatus, Bandwidth, CoreNetwork, CoreNetworkEdge,
-    CoreNetworkNetworkFunctionGroup, CoreNetworkPolicyError, CoreNetworkPolicyException,
-    CoreNetworkSegment, Device, GlobalNetwork, Link, LinkAssociation, Location,
-    OrganizationStatus, ResourceNotFoundException, Site, Tag, ValidationException,
-    ValidationExceptionField,
+    AWSLocation, AccountStatus, Attachment, Bandwidth, ConnectAttachment, ConnectAttachmentOptions,
+    CoreNetwork, CoreNetworkEdge, CoreNetworkNetworkFunctionGroup, CoreNetworkPolicyError,
+    CoreNetworkPolicyException, CoreNetworkSegment, Device, GlobalNetwork, Link, LinkAssociation,
+    Location, OrganizationStatus, ResourceNotFoundException, Site, Tag, ValidationException,
+    ValidationExceptionField, VpcAttachment, VpcOptions,
 };
 
 /// Members of `GlobalNetworkState` / `SiteState` / `LinkState` this slice uses. All three
@@ -68,6 +71,21 @@ pub const LINK_ASSOCIATION_KIND: &str = "link-association";
 /// (`smithy_query shape=CoreNetworkId`), which the 17 hex digits of
 /// [`ComAmazonawsNetworkmanagerNetworkmanagerState::next_id`] satisfy.
 pub const CORE_NETWORK_KIND: &str = "core-network";
+/// See [`GLOBAL_NETWORK_KIND`]. The model constrains an attachment's id too:
+/// `AttachmentId` carries `pattern ^attachment-([0-9a-f]{8,17})$` (`smithy_query
+/// shape=AttachmentId`), which the 17 hex digits of
+/// [`ComAmazonawsNetworkmanagerNetworkmanagerState::next_id`] satisfy. It is also the
+/// `attachment` entry of [`NETWORK_RESOURCE_TYPES`], so one name serves the id prefix,
+/// the ARN resource type and the network-resource inventory.
+pub const ATTACHMENT_KIND: &str = "attachment";
+
+/// The two `AttachmentType`s this service mints, of the five the model enumerates
+/// (CONNECT, DIRECT_CONNECT_GATEWAY, SITE_TO_SITE_VPN, TRANSIT_GATEWAY_ROUTE_TABLE, VPC:
+/// `smithy_query shape=AttachmentType`, mirrored in `ops::types::ATTACHMENT_TYPE_VALUES`).
+/// The other three belong to creates that are still scaffold stubs.
+pub const ATTACHMENT_TYPE_VPC: &str = "VPC";
+/// See [`ATTACHMENT_TYPE_VPC`].
+pub const ATTACHMENT_TYPE_CONNECT: &str = "CONNECT";
 
 /// Network Manager is a global (partition-scoped) service, so its ARNs carry an empty
 /// region segment: `arn:aws:networkmanager::<account>:global-network/<id>`.
@@ -130,6 +148,17 @@ pub fn resource_not_found(kind: &str, id: &str) -> ResourceNotFoundException {
 pub const FIELD_GLOBAL_NETWORK_ID: &str = "globalNetworkId";
 /// See [`FIELD_GLOBAL_NETWORK_ID`].
 pub const FIELD_SITE_ID: &str = "siteId";
+/// See [`FIELD_GLOBAL_NETWORK_ID`]: the same lowerCamelCase spelling of the request
+/// member, for the references and values an attachment create carries.
+pub const FIELD_CORE_NETWORK_ID: &str = "coreNetworkId";
+/// See [`FIELD_CORE_NETWORK_ID`].
+pub const FIELD_TRANSPORT_ATTACHMENT_ID: &str = "transportAttachmentId";
+/// See [`FIELD_CORE_NETWORK_ID`].
+pub const FIELD_EDGE_LOCATION: &str = "edgeLocation";
+/// See [`FIELD_CORE_NETWORK_ID`].
+pub const FIELD_VPC_ARN: &str = "vpcArn";
+/// See [`FIELD_CORE_NETWORK_ID`].
+pub const FIELD_SUBNET_ARNS: &str = "subnetArns";
 
 /// How a resource kind of this service reads in prose: the ARN resource type
 /// ([`GLOBAL_NETWORK_KIND`] and friends) with its hyphens as spaces and a leading
@@ -337,6 +366,18 @@ pub const MAX_DEVICE_DESCRIPTOR_CHARS: usize = 128;
 /// global network is answered with the operation's modelled
 /// `ServiceQuotaExceededException` (HTTP 402) and stores nothing.
 pub const MAX_CORE_NETWORKS_PER_GLOBAL_NETWORK: usize = 1;
+
+/// How many attachments one core network may hold here.
+///
+/// CHOSEN, like [`MAX_SITES_PER_GLOBAL_NETWORK`]: Cloud WAN publishes a per-account
+/// adjustable quota for attachments per core network and the model carries no number, so
+/// this bound exists only so that a repeated create cannot grow the store without end.
+/// Neither attachment create models a `ServiceQuotaExceededException` (`smithy_query
+/// query="operation" operation="CreateVpcAttachment,CreateConnectAttachment"`), so
+/// reaching it is refused with the modelled `ValidationException` (HTTP 400) carrying
+/// [`VALIDATION_REASON_OTHER`] — the request is invalid against stored state, no single
+/// member is at fault — and stores nothing.
+pub const MAX_ATTACHMENTS_PER_CORE_NETWORK: usize = 100;
 
 /// How long after the creating call a `PENDING` resource settles to `AVAILABLE`.
 ///
@@ -688,6 +729,171 @@ impl CoreNetworkRecord {
     }
 }
 
+/// A stored attachment: what joins one resource to ONE edge location of a core network.
+///
+/// Every attachment kind shares the modelled `Attachment` envelope (`smithy_query
+/// shape=Attachment`) — the core network it belongs to, its type, its state, its edge
+/// location, the ARN of the resource it attaches and its tags — and each kind adds its own
+/// members on top, which is what [`AttachmentDetail`] holds. One record and one map
+/// therefore serve every kind: `GetConnectAttachment` and `GetVpcAttachment` read the same
+/// store the quota, the inventory count and the core-network delete refusal are computed
+/// from, so no two operations can disagree about which attachments exist.
+///
+/// Like the records above, `state` is not a field but a function of the clock
+/// ([`Self::state_at`]), so reporting an attachment never writes.
+#[derive(Debug, Clone)]
+pub struct AttachmentRecord {
+    pub id: String,
+    pub arn: String,
+    pub core_network_id: String,
+    /// The ARN of [`Self::core_network_id`], kept so a read never has to resolve the
+    /// parent to report `Attachment$CoreNetworkArn`.
+    pub core_network_arn: String,
+    /// One of `ops::types::ATTACHMENT_TYPE_VALUES` — [`ATTACHMENT_TYPE_VPC`] or
+    /// [`ATTACHMENT_TYPE_CONNECT`] for the two kinds this slice mints.
+    pub attachment_type: &'static str,
+    /// The edge location the attachment sits at: one of the locations the core network's
+    /// policy configures ([`PolicyTopology::has_edge_location`]).
+    pub edge_location: String,
+    /// The ARN of the resource this attachment attaches: the VPC for a VPC attachment,
+    /// and for a Connect attachment the transport attachment it is carried over, which is
+    /// the resource it is built on.
+    pub resource_arn: String,
+    /// The `RoutingPolicyLabel` the create carried, stored because the request supplied
+    /// it. The modelled `Attachment` has no member for it (`smithy_query shape=Attachment`)
+    /// — it is reported by `ListAttachmentRoutingPolicyAssociations`, still a scaffold stub
+    /// — so it is held here rather than dropped.
+    pub routing_policy_label: Option<String>,
+    pub created_at: SystemTime,
+    /// The instant the `CREATING` -> `AVAILABLE` transition the clock owes becomes due.
+    pub available_at: SystemTime,
+    /// The `ClientToken` of the request that minted this record, kept so a retry of that
+    /// request answers this record instead of minting a second attachment.
+    pub client_token: Option<String>,
+    pub tags: Vec<Tag>,
+    /// The members only this attachment's own kind has.
+    pub detail: AttachmentDetail,
+}
+
+/// What one attachment kind adds to the shared [`AttachmentRecord`] envelope: exactly the
+/// members its own wrapper shape carries beside `Attachment` (`smithy_query
+/// shape=VpcAttachment,ConnectAttachment`).
+#[derive(Debug, Clone)]
+pub enum AttachmentDetail {
+    /// A VPC attachment: the subnets it reaches the VPC through, in the order the request
+    /// listed them, and the VPC options it was created with.
+    Vpc {
+        subnet_arns: Vec<String>,
+        options: Option<VpcOptions>,
+    },
+    /// A core network Connect attachment: the attachment carrying it and its tunnel
+    /// options.
+    Connect {
+        transport_attachment_id: String,
+        options: ConnectAttachmentOptions,
+    },
+}
+
+impl AttachmentRecord {
+    /// This attachment's lifecycle state as of `now`.
+    ///
+    /// `AttachmentState` is a wider enum than the resource states above (REJECTED,
+    /// PENDING_ATTACHMENT_ACCEPTANCE, CREATING, FAILED, AVAILABLE, UPDATING,
+    /// PENDING_NETWORK_UPDATE, PENDING_TAG_ACCEPTANCE, DELETING: `smithy_query
+    /// shape=AttachmentState`, mirrored in `ops::types::ATTACHMENT_STATE_VALUES`), but it
+    /// shares the two this slice uses with [`CoreNetworkRecord::state_at`]: an attachment
+    /// waits in [`STATE_CREATING`] until the transition the clock owes falls due and is
+    /// [`STATE_AVAILABLE`] after it. The states that depend on an attachment-acceptance
+    /// rule of the core network policy are not reachable here: nothing in this service
+    /// acts on a policy's `attachment-policies` yet.
+    pub fn state_at(&self, now: SystemTime) -> &'static str {
+        if now >= self.available_at {
+            STATE_AVAILABLE
+        } else {
+            STATE_CREATING
+        }
+    }
+
+    /// When this attachment last changed, as of `now`: the create, or the
+    /// `CREATING` -> `AVAILABLE` transition once that has fallen due. DERIVED from the two
+    /// stored instants, so a read reports a current `UpdatedAt` without writing one.
+    pub fn updated_at(&self, now: SystemTime) -> SystemTime {
+        if now >= self.available_at {
+            self.available_at
+        } else {
+            self.created_at
+        }
+    }
+
+    /// The modelled `Attachment` envelope of this record, as of `now`.
+    pub fn to_attachment(&self, now: SystemTime) -> Attachment {
+        Attachment {
+            core_network_id: Some(self.core_network_id.clone()),
+            core_network_arn: Some(self.core_network_arn.clone()),
+            attachment_id: Some(self.id.clone()),
+            owner_account_id: Some(::engine::emulator_account_id().to_string()),
+            attachment_type: Some(self.attachment_type.to_string()),
+            state: Some(self.state_at(now).to_string()),
+            edge_location: Some(self.edge_location.clone()),
+            // `EdgeLocations` reports the several edges a multi-edge attachment spans.
+            // Both kinds stored here sit at exactly one edge, which `EdgeLocation` above
+            // carries, so this member is absent rather than a one-entry copy of it.
+            edge_locations: None,
+            resource_arn: Some(self.resource_arn.clone()),
+            // Which `attachment-policies` rule of the core network policy claimed the
+            // attachment, and the segment or network function group it put it in, are
+            // decided by that policy — which no operation of this service acts on yet, so
+            // these are absent rather than guessed.
+            attachment_policy_rule_number: None,
+            segment_name: None,
+            network_function_group_name: None,
+            tags: Some(self.tags.clone()),
+            // A proposed change exists only while a tag or segment change is awaiting
+            // acceptance, which nothing here can start.
+            proposed_segment_change: None,
+            proposed_network_function_group_change: None,
+            created_at: Some(epoch_seconds(self.created_at)),
+            updated_at: Some(epoch_seconds(self.updated_at(now))),
+            // No modification of this attachment has failed: the list is empty rather than
+            // carrying an error nothing produced.
+            last_modification_errors: Some(Vec::new()),
+        }
+    }
+
+    /// The modelled `ConnectAttachment` for this record as of `now`, or `None` when the
+    /// record is not a Connect attachment — which is how `GetConnectAttachment` answers
+    /// the id of an attachment of another kind as not found.
+    pub fn to_connect_attachment(&self, now: SystemTime) -> Option<ConnectAttachment> {
+        match &self.detail {
+            AttachmentDetail::Connect {
+                transport_attachment_id,
+                options,
+            } => Some(ConnectAttachment {
+                attachment: Some(self.to_attachment(now)),
+                transport_attachment_id: Some(transport_attachment_id.clone()),
+                options: Some(options.clone()),
+            }),
+            AttachmentDetail::Vpc { .. } => None,
+        }
+    }
+
+    /// The modelled `VpcAttachment` for this record as of `now`, or `None` when the record
+    /// is not a VPC attachment. See [`Self::to_connect_attachment`].
+    pub fn to_vpc_attachment(&self, now: SystemTime) -> Option<VpcAttachment> {
+        match &self.detail {
+            AttachmentDetail::Vpc {
+                subnet_arns,
+                options,
+            } => Some(VpcAttachment {
+                attachment: Some(self.to_attachment(now)),
+                subnet_arns: Some(subnet_arns.clone()),
+                options: options.clone(),
+            }),
+            AttachmentDetail::Connect { .. } => None,
+        }
+    }
+}
+
 /// The two `Action` values `StartOrganizationServiceAccessUpdate` accepts, in the order
 /// its documentation lists them.
 ///
@@ -833,6 +1039,15 @@ pub struct ComAmazonawsNetworkmanagerNetworkmanagerState {
     pub link_associations: BTreeMap<String, LinkAssociationRecord>,
     /// Core networks by `CoreNetworkId`, each carrying its owning `GlobalNetworkId`.
     pub core_networks: BTreeMap<String, CoreNetworkRecord>,
+    /// Attachments by `AttachmentId`, of every kind, each carrying the `CoreNetworkId` it
+    /// belongs to. A `BTreeMap`, so listing order is stable and a pagination token can
+    /// name a key offset into it.
+    ///
+    /// One map for every attachment kind: the kinds share the modelled `Attachment`
+    /// envelope and differ only in [`AttachmentDetail`], and the quota, the
+    /// network-resource inventory and the core-network delete refusal all count
+    /// attachments without caring which kind each is.
+    pub attachments: BTreeMap<String, AttachmentRecord>,
     /// Resource policies by the ARN of the resource they are attached to — the one store
     /// `PutResourcePolicy`, `GetResourcePolicy` and `DeleteResourcePolicy` share, holding
     /// the document exactly as it was accepted so a reader reports what was put.
@@ -980,6 +1195,32 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
             .collect()
     }
 
+    /// How many attachments `core_network_id` holds, across every attachment kind, for the
+    /// per-core-network quota and the core-network delete refusal.
+    pub fn attachment_count_of_core_network(&self, core_network_id: &str) -> usize {
+        self.attachments
+            .values()
+            .filter(|attachment| attachment.core_network_id == core_network_id)
+            .count()
+    }
+
+    /// How many attachments the global network `global_network_id` holds, for the
+    /// network-resource inventory: an attachment hangs off a core network, which hangs off
+    /// a global network, so the count is resolved through that chain rather than stored
+    /// twice.
+    pub fn attachment_count_of_global_network(&self, global_network_id: &str) -> usize {
+        self.attachments
+            .values()
+            .filter(|attachment| {
+                self.core_networks
+                    .get(&attachment.core_network_id)
+                    .is_some_and(|core_network| {
+                        core_network.global_network_id == global_network_id
+                    })
+            })
+            .count()
+    }
+
     /// How many resources of `resource_type` the global network `global_network_id`
     /// holds, for the network-resource inventory.
     ///
@@ -993,6 +1234,7 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
             LINK_KIND => self.link_count_of_network(global_network_id),
             DEVICE_KIND => self.device_count_of(global_network_id),
             CORE_NETWORK_KIND => self.core_network_count_of(global_network_id),
+            ATTACHMENT_KIND => self.attachment_count_of_global_network(global_network_id),
             _ => 0,
         };
         i32::try_from(held).unwrap_or(i32::MAX)
@@ -1049,6 +1291,11 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
                 .get(parts.id)
                 .filter(|record| record.arn == arn)
                 .map(|record| &record.tags),
+            ATTACHMENT_KIND => self
+                .attachments
+                .get(parts.id)
+                .filter(|record| record.arn == arn)
+                .map(|record| &record.tags),
             _ => None,
         }
     }
@@ -1079,6 +1326,11 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
                 .map(|record| &mut record.tags),
             CORE_NETWORK_KIND => self
                 .core_networks
+                .get_mut(parts.id)
+                .filter(|record| record.arn == arn)
+                .map(|record| &mut record.tags),
+            ATTACHMENT_KIND => self
+                .attachments
                 .get_mut(parts.id)
                 .filter(|record| record.arn == arn)
                 .map(|record| &mut record.tags),
@@ -1147,6 +1399,9 @@ pub const REASON_CANNOT_PARSE: &str = "CannotParse";
 pub const FIELD_RESOURCE_ARN: &str = "ResourceArn";
 /// See [`FIELD_RESOURCE_ARN`].
 pub const FIELD_POLICY_DOCUMENT: &str = "PolicyDocument";
+/// The input member every operation that stores tags names in a refusal of them: the
+/// `Tags` list itself, as [`validate_tags`] and [`tag_problem_rejection`] both report it.
+pub const FIELD_TAGS: &str = "Tags";
 
 /// The modelled `ValidationException` (HTTP 400) for a refusal of the single input member
 /// `member`, carrying `reason` and one `Fields` entry explaining `message`.
@@ -1408,6 +1663,26 @@ pub fn check_requested_tags(tags: Option<&Vec<Tag>>) -> Result<(), TagProblem> {
     Ok(())
 }
 
+/// The modelled `ValidationException` (HTTP 400) a [`TagProblem`] becomes on an operation
+/// that models NO `ServiceQuotaExceededException`.
+///
+/// The attachment creates are such operations (`smithy_query query="operation"
+/// operation="CreateVpcAttachment,CreateConnectAttachment"` models AccessDenied, Conflict,
+/// InternalServer, ResourceNotFound, Throttling and Validation only), so a request past
+/// the per-resource tag quota is refused through the one error class they do model,
+/// carrying [`VALIDATION_REASON_OTHER`] — the `Tags` member satisfies every modelled
+/// constraint, it is the resulting tag COUNT that the request cannot have.
+pub fn tag_problem_rejection(problem: TagProblem) -> ValidationException {
+    match problem {
+        TagProblem::Invalid(rejection) => rejection.to_exception(),
+        TagProblem::TooMany(resulting) => field_rejection(
+            FIELD_TAGS,
+            VALIDATION_REASON_OTHER,
+            too_many_tags_message(resulting),
+        ),
+    }
+}
+
 /// The message a refusal past the per-resource tag quota carries, shared by every
 /// operation that stores tags: `resulting` is how many tags the resource would carry if
 /// the request were accepted.
@@ -1423,7 +1698,7 @@ pub fn too_many_tags_message(resulting: usize) -> String {
 /// AWS-reserved prefix. A key repeated inside one request is NOT an error: tag keys are
 /// unique per resource, so the last value for a key wins (see [`merge_tags`]).
 pub fn validate_tags(tags: &[Tag]) -> Result<(), TagRejection> {
-    const MEMBER: &str = "Tags";
+    const MEMBER: &str = FIELD_TAGS;
     for tag in tags {
         let key = tag.key.as_deref().unwrap_or_default();
         check_tag_key(MEMBER, key)?;
@@ -1856,6 +2131,18 @@ impl PolicyTopology {
             .collect()
     }
 
+    /// Whether this core network configures an edge in `location`.
+    ///
+    /// An attachment joins a resource to one of the core network's EDGES, so a create
+    /// naming a location the policy in force configures none for is refused: the edges are
+    /// a function of the stored policy document, so this answer comes from the same
+    /// derived topology a read of the core network reports.
+    pub fn has_edge_location(&self, location: &str) -> bool {
+        self.edges
+            .iter()
+            .any(|edge| edge.edge_location.as_deref() == Some(location))
+    }
+
     /// The modelled `Segments` of this topology.
     pub fn to_segments(&self) -> Vec<CoreNetworkSegment> {
         let everywhere = self.everywhere();
@@ -2105,6 +2392,49 @@ pub fn same_tags(left: &[Tag], right: &[Tag]) -> bool {
             .collect()
     };
     pairs(left) == pairs(right)
+}
+
+/// Whether two `ConnectAttachmentOptions` ask for the same thing, for the idempotency
+/// comparison a repeated `ClientToken` needs: the shape is generated and carries no
+/// `PartialEq`, so the comparison goes through its members (`Protocol` is its only one:
+/// `smithy_query shape=ConnectAttachmentOptions`).
+pub fn same_connect_options(
+    left: &ConnectAttachmentOptions,
+    right: &ConnectAttachmentOptions,
+) -> bool {
+    left.protocol == right.protocol
+}
+
+/// Whether two `VpcOptions` ask for the same thing. See [`same_connect_options`]; an
+/// absent `Options` asks for the modelled defaults, which is what an absent one on the
+/// other side asks for too, so two absent options are the same request.
+pub fn same_vpc_options(left: Option<&VpcOptions>, right: Option<&VpcOptions>) -> bool {
+    let members = |options: Option<&VpcOptions>| {
+        options.map(|options| {
+            (
+                options.ipv6_support,
+                options.appliance_mode_support,
+                options.dns_support,
+                options.security_group_referencing_support,
+            )
+        })
+    };
+    members(left) == members(right)
+}
+
+/// The Region segment of an EC2 resource ARN
+/// (`arn:<partition>:ec2:<region>:<account>:<type>/<id>`), or `None` when it carries no
+/// non-empty one.
+///
+/// A VPC attachment's edge location is not a request member: it is the Region the VPC is
+/// in, which only the VPC's ARN names. The modelled patterns for `VpcArn` and `SubnetArn`
+/// allow an EMPTY Region segment
+/// (`^arn:[^:]{1,63}:ec2:[^:]{0,63}:[^:]{0,63}:vpc\/vpc-[0-9a-f]{8,17}$`, `smithy_query
+/// shape=VpcArn`), so an ARN that names none is refused by the caller rather than stored
+/// with an edge location no edge has.
+pub fn ec2_arn_region(arn: &str) -> Option<&str> {
+    let region = arn.split(':').nth(3)?;
+    (!region.is_empty()).then_some(region)
 }
 
 /// `SystemTime` as a Smithy timestamp (epoch seconds, sub-second part kept).

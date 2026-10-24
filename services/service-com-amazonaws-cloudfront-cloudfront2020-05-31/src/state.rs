@@ -51,6 +51,7 @@ use crate::ops::types::{
     ActiveTrustedKeyGroups, ActiveTrustedSigners, AllowedMethods, CacheBehavior, CacheBehaviors,
     CachePolicy, CachePolicyAlreadyExists, CachePolicyConfig,
     CachedMethods, CloudFrontOriginAccessIdentity, CloudFrontOriginAccessIdentityConfig,
+    CloudFrontOriginAccessIdentitySummary,
     CNAMEAlreadyExists, ConnectionGroup, ConnectionGroupSummary, ContinuousDeploymentPolicy,
     ContinuousDeploymentPolicyConfig,
     ContinuousDeploymentSingleHeaderConfig, ContinuousDeploymentSingleWeightConfig,
@@ -1504,6 +1505,21 @@ impl StoredOriginAccessIdentity {
             id: self.id.clone(),
             s3_canonical_user_id: self.s3_canonical_user_id.clone(),
             cloud_front_origin_access_identity_config: Some(self.config.clone()),
+        }
+    }
+
+    /// The `CloudFrontOriginAccessIdentitySummary` one `ListCloudFrontOriginAccessIdentities`
+    /// page element carries, read from the one stored record.
+    ///
+    /// Every member of the summary is required on the wire, and each is read from this
+    /// record: the minted id, the canonical user id minted with it, and "the comment for
+    /// this origin access identity, as originally specified when created" — the comment
+    /// of the stored configuration rather than anything re-derived per listing.
+    pub fn to_summary(&self) -> CloudFrontOriginAccessIdentitySummary {
+        CloudFrontOriginAccessIdentitySummary {
+            id: self.id.clone(),
+            s3_canonical_user_id: self.s3_canonical_user_id.clone(),
+            comment: self.config.comment.clone(),
         }
     }
 }
@@ -3201,6 +3217,19 @@ pub fn is_version_token(value: &str) -> bool {
 /// service issued from a value a client made up. The same shape
 /// [`is_distribution_id`] describes, because CloudFront draws every entity id from it.
 pub fn is_origin_access_control_id(value: &str) -> bool {
+    is_prefixed_token(value, 'E')
+}
+
+/// Whether `value` has the shape of an origin access identity id this service mints
+/// ([`ComAmazonawsCloudfrontCloudfront20200531State::allocate_origin_access_identity_id`]).
+///
+/// `ListCloudFrontOriginAccessIdentities`'s `Marker` is an origin access identity id —
+/// "set the `Marker` to the value of the `NextMarker` from the current page's response
+/// (which is also the ID of the last identity on that page)" — and the model constrains it
+/// no further than `string`, so this is what tells a resume point the service issued from a
+/// value a client made up. The same shape [`is_distribution_id`] describes, because
+/// CloudFront draws every entity id of this family from it.
+pub fn is_origin_access_identity_id(value: &str) -> bool {
     is_prefixed_token(value, 'E')
 }
 
@@ -4976,6 +5005,25 @@ pub fn invalid_public_key_marker() -> crate::ops::types::InvalidArgument {
 
 /// The message `ListPublicKeys` refuses an unusable `Marker` with, on the wire.
 pub const INVALID_PUBLIC_KEY_MARKER_MESSAGE: &str = "Marker must be a valid CF public key Id";
+
+/// The modelled `InvalidArgument` (HTTP 400) for a `ListCloudFrontOriginAccessIdentities`
+/// `Marker` that is no resume point this service handed out.
+///
+/// ONE CONSTANT for the condition, for the same reason [`invalid_public_key_marker`] is one:
+/// what the refusal states is the CONSTRAINT on the parameter — a marker is an origin access
+/// identity id — which is a property of the parameter rather than of the value submitted, so
+/// nothing from the request belongs in the text.
+pub fn invalid_origin_access_identity_marker() -> crate::ops::types::InvalidArgument {
+    crate::ops::types::InvalidArgument {
+        message: Some(INVALID_ORIGIN_ACCESS_IDENTITY_MARKER_MESSAGE.to_string()),
+    }
+}
+
+/// The message `ListCloudFrontOriginAccessIdentities` refuses an unusable `Marker` with:
+/// the constraint on the parameter, worded as [`INVALID_PUBLIC_KEY_MARKER_MESSAGE`] words
+/// the same constraint on the other listing's marker.
+pub const INVALID_ORIGIN_ACCESS_IDENTITY_MARKER_MESSAGE: &str =
+    "Marker must be a valid CF origin access identity Id";
 
 /// The modelled `TooManyPublicKeys` (HTTP 400) for a create that would take the store past
 /// [`MAX_PUBLIC_KEYS`] — "The maximum number of public keys for field-level encryption have

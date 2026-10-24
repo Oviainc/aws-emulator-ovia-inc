@@ -378,7 +378,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         keyspace.status_due_at = Some(settles_at);
         for table in keyspace.tables.values_mut() {
             if let Some(client_side_timestamps) = input.client_side_timestamps.clone() {
-                table.client_side_timestamps = Some(client_side_timestamps);
+                // A client-side-timestamps change is one of the settings a point-in-time
+                // restore reproduces as of the selected timestamp, so the revision that was
+                // in effect until now is closed before the new value goes in — exactly as
+                // `UpdateTable` does for the settings it changes, and only for a table this
+                // call really changes it on: a table that already holds the value keeps its
+                // history, which nothing has superseded.
+                let changed = table
+                    .client_side_timestamps
+                    .as_ref()
+                    .map(|held| held.status.as_str())
+                    != Some(client_side_timestamps.status.as_str());
+                if changed {
+                    table.supersede_restorable_settings(now);
+                    table.client_side_timestamps = Some(client_side_timestamps);
+                }
             }
             table.status = crate::state::TABLE_STATUS_UPDATING.to_string();
             table.status_due_at = Some(settles_at);

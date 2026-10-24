@@ -29,7 +29,7 @@ use crate::ops::types::{
     Snapshot, Subnet, SupportedPlatform, VpcEndpoint, VpcSecurityGroupMembership,
 };
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant, SystemTime};
 
 /// How long after the call that starts it a provisioning transition falls due:
@@ -1079,6 +1079,20 @@ pub struct ComAmazonawsRedshiftRedshiftserviceversion20121201State {
     pub cluster_versions: Vec<ClusterVersion>,
 }
 
+/// Where in the store one resource an ARN names sits: its collection and its
+/// position in it.
+///
+/// One resolution serves both the read and the write path (see
+/// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::resource_slot`]),
+/// so a tag read and a tag write can never resolve the same ARN differently.
+#[derive(Debug, Clone, Copy)]
+enum ResourceSlot {
+    Cluster(usize),
+    Snapshot(usize),
+    ParameterGroup(usize),
+    SubnetGroup(usize),
+}
+
 /// A fresh store already holds what exists before any caller writes anything:
 /// the published engine-version catalog and, for each of its versions, the
 /// DEFAULT parameter group of that version's family.
@@ -1358,6 +1372,225 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
             .count()
     }
 
+    /// Where in this store the resource one `ResourceName` ARN names sits, or
+    /// `None` when it holds no such resource.
+    ///
+    /// The tags of a resource live ON that resource — the `Tags` member every one
+    /// of these shapes already publishes — so tagging one is a write to the
+    /// record a `Describe*` of it reads, and there is no second place a tag could
+    /// be. Four of the published types ([`TAGGABLE_RESOURCE_TYPES`]) name a
+    /// resource this store holds; a resource of any other type exists in no
+    /// account here, because the operations that would create one are still
+    /// scaffolds.
+    ///
+    /// The ARN is matched EXACTLY, against the ARN the resource itself publishes
+    /// ([`Self::resource_entry`]) — the same way this store already locates a
+    /// snapshot by ARN ([`Self::snapshot_located`]: "the ARN is matched exactly,
+    /// against the `Snapshot$SnapshotArn` the store persists"). So nothing here
+    /// takes an ARN apart: a value that is not this account's ARN for a resource
+    /// IN THIS REGION names no resource, which is what an ARN means — its
+    /// partition, Region and account fields say whose resource it is and which
+    /// endpoint owns it.
+    fn resource_slot(&self, resource_name: &str, region: &str) -> Option<ResourceSlot> {
+        self.resource_slots().into_iter().find(|slot| {
+            self.resource_entry(*slot, region)
+                .is_some_and(|(_, arn, _)| arn == resource_name)
+        })
+    }
+
+    /// The tags the resource `resource_name` names carries, or `None` when this
+    /// store holds no such resource — which is what tells a tag read apart from a
+    /// read of a resource that does not exist. See [`Self::resource_slot`].
+    pub fn resource_tags(
+        &self,
+        resource_name: &str,
+        region: &str,
+    ) -> Option<&[crate::ops::types::Tag]> {
+        let tags = match self.resource_slot(resource_name, region)? {
+            ResourceSlot::Cluster(position) => &self.clusters[position].cluster.tags,
+            ResourceSlot::Snapshot(position) => &self.snapshots[position].snapshot.tags,
+            ResourceSlot::ParameterGroup(position) => &self.parameter_groups[position].group.tags,
+            ResourceSlot::SubnetGroup(position) => &self.subnet_groups[position].tags,
+        };
+        Some(tags.as_deref().unwrap_or_default())
+    }
+
+    /// Write `tags` as the tag list of the resource `resource_name` names, and
+    /// report whether this store holds such a resource at all. See
+    /// [`Self::resource_slot`].
+    ///
+    /// Takes the new list rather than handing out a `&mut`, so the record is
+    /// reached ONCE for a write and an empty list leaves a resource that carries
+    /// no `Tags` member exactly as it was.
+    pub fn set_resource_tags(
+        &mut self,
+        resource_name: &str,
+        region: &str,
+        tags: Vec<crate::ops::types::Tag>,
+    ) -> bool {
+        let Some(slot) = self.resource_slot(resource_name, region) else {
+            return false;
+        };
+        let stored = match slot {
+            ResourceSlot::Cluster(position) => &mut self.clusters[position].cluster.tags,
+            ResourceSlot::Snapshot(position) => &mut self.snapshots[position].snapshot.tags,
+            ResourceSlot::ParameterGroup(position) => {
+                &mut self.parameter_groups[position].group.tags
+            }
+            ResourceSlot::SubnetGroup(position) => &mut self.subnet_groups[position].tags,
+        };
+        // A resource that carries no `Tags` member and is given no tag keeps the
+        // member absent: writing `Some([])` would change what its own
+        // `Describe*` renders without changing a tag.
+        if tags.is_empty() && stored.is_none() {
+            return true;
+        }
+        *stored = Some(tags);
+        true
+    }
+
+    /// Every taggable resource this store holds, in the order
+    /// `DescribeTags` walks them: the resource types in the order the model
+    /// lists them ([`TAGGABLE_RESOURCE_TYPES`]), and the resources of one type
+    /// in the store's stable insertion order.
+    ///
+    /// A type whose resources no implemented operation mints contributes none:
+    /// this account holds no such resource.
+    fn resource_slots(&self) -> Vec<ResourceSlot> {
+        let mut slots = Vec::new();
+        for published in &TAGGABLE_RESOURCE_TYPES {
+            match published.arn_segment {
+                ARN_SEGMENT_CLUSTER => {
+                    slots.extend((0..self.clusters.len()).map(ResourceSlot::Cluster))
+                }
+                ARN_SEGMENT_SNAPSHOT => {
+                    slots.extend((0..self.snapshots.len()).map(ResourceSlot::Snapshot))
+                }
+                ARN_SEGMENT_PARAMETER_GROUP => slots
+                    .extend((0..self.parameter_groups.len()).map(ResourceSlot::ParameterGroup)),
+                ARN_SEGMENT_SUBNET_GROUP => {
+                    slots.extend((0..self.subnet_groups.len()).map(ResourceSlot::SubnetGroup))
+                }
+                _ => {}
+            }
+        }
+        slots
+    }
+
+    /// What one stored resource contributes to a tag report: its type's ARN
+    /// segment, its ARN and the tags it carries.
+    ///
+    /// `region` is the Region the reading request was signed for, which is the
+    /// Region of the ARN this builds — a stored resource's ARN is derived from
+    /// its identifier (see [`cluster_arn`]), except a snapshot, which publishes
+    /// its own `Snapshot$SnapshotArn`.
+    fn resource_entry(
+        &self,
+        slot: ResourceSlot,
+        region: &str,
+    ) -> Option<(&'static str, String, &[crate::ops::types::Tag])> {
+        match slot {
+            ResourceSlot::Cluster(position) => {
+                let stored = &self.clusters[position];
+                Some((
+                    ARN_SEGMENT_CLUSTER,
+                    cluster_arn(stored.cluster.cluster_identifier.as_deref()?, region),
+                    stored.cluster.tags.as_deref().unwrap_or_default(),
+                ))
+            }
+            ResourceSlot::Snapshot(position) => {
+                let stored = &self.snapshots[position];
+                let arn = match stored.snapshot.snapshot_arn.as_deref() {
+                    Some(arn) => arn.to_string(),
+                    None => snapshot_arn(
+                        stored.snapshot.cluster_identifier.as_deref()?,
+                        stored.snapshot.snapshot_identifier.as_deref()?,
+                        region,
+                    ),
+                };
+                Some((
+                    ARN_SEGMENT_SNAPSHOT,
+                    arn,
+                    stored.snapshot.tags.as_deref().unwrap_or_default(),
+                ))
+            }
+            ResourceSlot::ParameterGroup(position) => {
+                let stored = &self.parameter_groups[position];
+                Some((
+                    ARN_SEGMENT_PARAMETER_GROUP,
+                    parameter_group_arn(stored.group.parameter_group_name.as_deref()?, region),
+                    stored.group.tags.as_deref().unwrap_or_default(),
+                ))
+            }
+            ResourceSlot::SubnetGroup(position) => {
+                let group = &self.subnet_groups[position];
+                Some((
+                    ARN_SEGMENT_SUBNET_GROUP,
+                    subnet_group_arn(group.cluster_subnet_group_name.as_deref()?, region),
+                    group.tags.as_deref().unwrap_or_default(),
+                ))
+            }
+        }
+    }
+
+    /// Every tag this store holds, as `DescribeTags` reports them: ONE entry per
+    /// (resource, tag) pair, carrying the tag, the resource's ARN and the
+    /// resource's type — narrowed to one resource type when the request names
+    /// one, and to the resources `filter` selects.
+    ///
+    /// The entries follow [`Self::resource_slots`], with the tags of one resource
+    /// in the order it carries them, so the `Marker` cursor a page hands out
+    /// stays a resumable offset into one sequence.
+    ///
+    /// The `TagKeys` / `TagValues` filter selects RESOURCES, not single tags:
+    /// `smithy_query(query="doc", shape="DescribeTagsMessage", member="TagKeys")`
+    /// — "a tag key or keys for which you want to return all matching RESOURCES
+    /// that are associated with the specified key or keys … Amazon Redshift
+    /// returns a response with all resources that have either or both of these
+    /// tag keys associated with them" — so a resource one of its tags matches
+    /// reports EVERY tag it carries, not only the tag that matched.
+    ///
+    /// A resource carrying no tag contributes NOTHING: a `TaggedResource` is a
+    /// tag paired with the resource it is on, so there is no entry to report for
+    /// a resource that has none.
+    pub fn tagged_resources(
+        &self,
+        resource_type: Option<&TaggableResourceType>,
+        filter: &TagFilter<'_>,
+        region: &str,
+    ) -> Vec<crate::ops::types::TaggedResource> {
+        self.resource_slots()
+            .into_iter()
+            .filter_map(|slot| self.resource_entry(slot, region))
+            .filter(|(segment, _, tags)| {
+                resource_type.is_none_or(|wanted| wanted.arn_segment == *segment)
+                    && filter.matches(tags)
+            })
+            .flat_map(|(segment, arn, tags)| tagged_resource_entries(segment, arn, tags))
+            .collect()
+    }
+
+    /// The tags of the ONE resource `resource` names, as `DescribeTags` reports
+    /// them, or `None` when this store holds no such resource.
+    ///
+    /// `filter` selects the resource exactly as it does in
+    /// [`Self::tagged_resources`]: a resource it does not select reports no tag,
+    /// while a resource that does not EXIST is `None` — a refusal, not an empty
+    /// report.
+    pub fn tagged_resources_of(
+        &self,
+        resource_name: &str,
+        filter: &TagFilter<'_>,
+        region: &str,
+    ) -> Option<Vec<crate::ops::types::TaggedResource>> {
+        let slot = self.resource_slot(resource_name, region)?;
+        let (segment, arn, tags) = self.resource_entry(slot, region)?;
+        if !filter.matches(tags) {
+            return Some(Vec::new());
+        }
+        Some(tagged_resource_entries(segment, arn, tags).collect())
+    }
+
     /// Record, on every cluster configured with the parameter group `group_name`,
     /// that each of these parameters now carries a change the cluster has not
     /// seen.
@@ -1413,6 +1646,21 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
             }
         }
     }
+}
+
+/// One `TaggedResource` per tag of one resource: the tag, the resource's ARN and
+/// the resource's type, which is what `DescribeTags` reports a tag as.
+fn tagged_resource_entries<'a>(
+    resource_type: &'static str,
+    arn: String,
+    tags: &'a [crate::ops::types::Tag],
+) -> impl Iterator<Item = crate::ops::types::TaggedResource> + 'a {
+    tags.iter()
+        .map(move |tag| crate::ops::types::TaggedResource {
+            tag: Some(tag.clone()),
+            resource_name: Some(arn.clone()),
+            resource_type: Some(resource_type.to_string()),
+        })
 }
 
 /// `ClusterAvailabilityStatus` for a `ClusterStatus`.
@@ -1640,21 +1888,65 @@ fn marker_offset(cursor: &str) -> Option<usize> {
     (tag == short_digest(&format!("marker/{offset}"), 8)).then_some(offset)
 }
 
-/// Resolve one page of `total` records from the request's `Marker` / `MaxRecords`.
+/// The `MaxRecords` window one paginated operation accepts: the page size it
+/// uses when the request carries none, and the inclusive bounds a request may
+/// ask for.
+///
+/// A window rather than three bare constants because the operations do NOT all
+/// share one: most Redshift `Describe*` operations publish the 20..100 window of
+/// [`MAX_RECORDS_WINDOW`], while `DescribeTags` publishes its own
+/// ([`TAG_MAX_RECORDS_WINDOW`]).
+#[derive(Debug, Clone, Copy)]
+pub struct MaxRecordsWindow {
+    /// The page size a request that names no `MaxRecords` gets.
+    pub default: i32,
+    /// The smallest `MaxRecords` a request may name.
+    pub min: i32,
+    /// The largest `MaxRecords` a request may name.
+    pub max: i32,
+}
+
+/// The window [`page_bounds`] applies: the one every paginated Redshift
+/// `Describe*` operation but `DescribeTags` publishes. See
+/// [`MAX_RECORDS_DEFAULT`].
+pub const MAX_RECORDS_WINDOW: MaxRecordsWindow = MaxRecordsWindow {
+    default: MAX_RECORDS_DEFAULT,
+    min: MAX_RECORDS_MIN,
+    max: MAX_RECORDS_MAX,
+};
+
+/// `DescribeTags`'s own `MaxRecords` window.
+///
+/// Source: `smithy_query(query="doc", operation="DescribeTags")` — "The
+/// MaxRecords parameter can be a range from 10 to 50 results to return in a
+/// request." The sentence states no default, so the page size a request that
+/// names no `MaxRecords` gets is this window's own MAXIMUM: the ceiling the
+/// service refuses a caller for asking past is also the most it will serve
+/// unasked, so no page can be larger than a caller is allowed to request.
+pub const TAG_MAX_RECORDS_WINDOW: MaxRecordsWindow = MaxRecordsWindow {
+    default: 50,
+    min: 10,
+    max: 50,
+};
+
+/// Resolve one page of `total` records from the request's `Marker` / `MaxRecords`,
+/// under the `MaxRecords` window of the operation serving it.
 ///
 /// Returns the half-open range of the page and the `Marker` to hand back, which
 /// is `Some` only when records remain after it.
-pub fn page_bounds(
+pub fn page_bounds_within(
+    window: MaxRecordsWindow,
     marker: Option<&str>,
     max_records: Option<i32>,
     total: usize,
 ) -> Result<(usize, usize, Option<String>), String> {
     let page_size = match max_records {
-        None => MAX_RECORDS_DEFAULT,
-        Some(value) if (MAX_RECORDS_MIN..=MAX_RECORDS_MAX).contains(&value) => value,
+        None => window.default,
+        Some(value) if (window.min..=window.max).contains(&value) => value,
         Some(value) => {
             return Err(format!(
-                "Invalid value for MaxRecords: {value}. MaxRecords must be between {MAX_RECORDS_MIN} and {MAX_RECORDS_MAX}."
+                "Invalid value for MaxRecords: {value}. MaxRecords must be between {} and {}.",
+                window.min, window.max
             ))
         }
     };
@@ -1672,6 +1964,16 @@ pub fn page_bounds(
     let end = (start + page_size as usize).min(total);
     let next = (end < total).then(|| marker_for(end));
     Ok((start, end, next))
+}
+
+/// Resolve one page of `total` records under the window every paginated Redshift
+/// `Describe*` operation but `DescribeTags` publishes ([`MAX_RECORDS_WINDOW`]).
+pub fn page_bounds(
+    marker: Option<&str>,
+    max_records: Option<i32>,
+    total: usize,
+) -> Result<(usize, usize, Option<String>), String> {
+    page_bounds_within(MAX_RECORDS_WINDOW, marker, max_records, total)
 }
 
 /// The region this request was signed for, from its SigV4 credential scope.
@@ -1734,6 +2036,49 @@ pub fn snapshot_arn(cluster_identifier: &str, snapshot_identifier: &str, region:
         "redshift",
         region,
         &format!("snapshot:{cluster_identifier}/{snapshot_identifier}"),
+    )
+}
+
+/// The ARN of a cluster: `arn:aws:redshift:<region>:<account>:cluster:<cluster>`.
+///
+/// Source: the Amazon Redshift Cluster Management Guide, "Constructing an Amazon
+/// Redshift Amazon Resource Name (ARN)" (the page
+/// `smithy_query(query="doc", shape="TaggedResource", member="ResourceType")`
+/// links to) — `arn:aws:redshift:region:account-id:cluster:cluster-name` — which
+/// is also the example on `smithy_query(query="doc",
+/// shape="CreateTagsMessage", member="ResourceName")`:
+/// "arn:aws:redshift:us-east-2:123456789:cluster:t1".
+pub fn cluster_arn(cluster_identifier: &str, region: &str) -> String {
+    engine::emulator_arn(
+        "redshift",
+        region,
+        &format!("{ARN_SEGMENT_CLUSTER}:{cluster_identifier}"),
+    )
+}
+
+/// The ARN of a cluster parameter group:
+/// `arn:aws:redshift:<region>:<account>:parametergroup:<name>`.
+///
+/// Source: as [`cluster_arn`] —
+/// `arn:aws:redshift:region:account-id:parametergroup:parameter-group-name`.
+pub fn parameter_group_arn(parameter_group_name: &str, region: &str) -> String {
+    engine::emulator_arn(
+        "redshift",
+        region,
+        &format!("{ARN_SEGMENT_PARAMETER_GROUP}:{parameter_group_name}"),
+    )
+}
+
+/// The ARN of a cluster subnet group:
+/// `arn:aws:redshift:<region>:<account>:subnetgroup:<name>`.
+///
+/// Source: as [`cluster_arn`] —
+/// `arn:aws:redshift:region:account-id:subnetgroup:subnet-group-name`.
+pub fn subnet_group_arn(subnet_group_name: &str, region: &str) -> String {
+    engine::emulator_arn(
+        "redshift",
+        region,
+        &format!("{ARN_SEGMENT_SUBNET_GROUP}:{subnet_group_name}"),
     )
 }
 
@@ -2501,35 +2846,312 @@ pub fn resolve_cluster_shape(
     Ok((kind.to_string(), nodes))
 }
 
+/// The ARN resource-type segment of a provisioned cluster.
+pub const ARN_SEGMENT_CLUSTER: &str = "cluster";
+/// The ARN resource-type segment of a cluster snapshot. Its resource id is
+/// `<cluster>/<snapshot>` (see [`snapshot_arn`]).
+pub const ARN_SEGMENT_SNAPSHOT: &str = "snapshot";
+/// The ARN resource-type segment of a cluster parameter group.
+pub const ARN_SEGMENT_PARAMETER_GROUP: &str = "parametergroup";
+/// The ARN resource-type segment of a cluster subnet group.
+pub const ARN_SEGMENT_SUBNET_GROUP: &str = "subnetgroup";
+
+/// One resource type a Redshift tag can be attached to: the segment its ARN
+/// carries and the name the API publishes for it.
+#[derive(Debug, Clone, Copy)]
+pub struct TaggableResourceType {
+    /// The resource-type segment of this type's ARN, which is also the value
+    /// `TaggedResource$ResourceType` reports and the value a
+    /// `DescribeTags$ResourceType` filter names.
+    pub arn_segment: &'static str,
+    /// The human-readable name the model lists for the type, accepted on a
+    /// `DescribeTags$ResourceType` filter beside [`Self::arn_segment`].
+    pub documented_name: &'static str,
+}
+
+/// Every resource type a Redshift tag can be attached to, in the order the model
+/// lists them.
+///
+/// Source for the names and the order: `smithy_query(query="doc",
+/// shape="TaggedResource", member="ResourceType")` — "Valid resource types are:
+/// Cluster, CIDR/IP, EC2 security group, Snapshot, Cluster security group,
+/// Subnet group, HSM connection, HSM certificate, Parameter group" — plus the
+/// two `smithy_query(query="doc", shape="DescribeTagsMessage",
+/// member="ResourceType")` adds at the end of the same list ("Snapshot copy
+/// grant", "Integration"). Source for each ARN segment: the Amazon Redshift
+/// Cluster Management Guide page that same doc links to, "Constructing an Amazon
+/// Redshift Amazon Resource Name (ARN)", which gives one ARN form per resource
+/// type.
+///
+/// Only four of these types name a resource THIS store holds (see
+/// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::set_resource_tags`]);
+/// the rest are listed because they are valid `ResourceType` filters, and an
+/// account that cannot create such a resource yet simply has none of them to
+/// report.
+pub const TAGGABLE_RESOURCE_TYPES: [TaggableResourceType; 11] = [
+    TaggableResourceType {
+        arn_segment: ARN_SEGMENT_CLUSTER,
+        documented_name: "Cluster",
+    },
+    TaggableResourceType {
+        arn_segment: "securitygroupingress-cidr",
+        documented_name: "CIDR/IP",
+    },
+    TaggableResourceType {
+        arn_segment: "securitygroupingress-ec2securitygroup",
+        documented_name: "EC2 security group",
+    },
+    TaggableResourceType {
+        arn_segment: ARN_SEGMENT_SNAPSHOT,
+        documented_name: "Snapshot",
+    },
+    TaggableResourceType {
+        arn_segment: "securitygroup",
+        documented_name: "Cluster security group",
+    },
+    TaggableResourceType {
+        arn_segment: ARN_SEGMENT_SUBNET_GROUP,
+        documented_name: "Subnet group",
+    },
+    TaggableResourceType {
+        arn_segment: "hsmconfiguration",
+        documented_name: "HSM connection",
+    },
+    TaggableResourceType {
+        arn_segment: "hsmclientcertificate",
+        documented_name: "HSM certificate",
+    },
+    TaggableResourceType {
+        arn_segment: ARN_SEGMENT_PARAMETER_GROUP,
+        documented_name: "Parameter group",
+    },
+    TaggableResourceType {
+        arn_segment: "snapshotcopygrant",
+        documented_name: "Snapshot copy grant",
+    },
+    TaggableResourceType {
+        arn_segment: "integration",
+        documented_name: "Integration",
+    },
+];
+
+/// A `ResourceType` or ARN segment folded for comparison: lower-cased with every
+/// separator dropped, so one spelling of a type matches every other the API
+/// publishes for it (`Subnet group`, `subnet-group`, `subnetgroup`).
+fn folded_resource_type(name: &str) -> String {
+    name.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// The taggable resource type a request's `ResourceType` names, by either the
+/// ARN segment or the name the model publishes, in any case or separator
+/// spelling; `None` when it names no published type.
+pub fn resource_type_named(requested: &str) -> Option<&'static TaggableResourceType> {
+    let wanted = folded_resource_type(requested);
+    TAGGABLE_RESOURCE_TYPES.iter().find(|candidate| {
+        folded_resource_type(candidate.arn_segment) == wanted
+            || folded_resource_type(candidate.documented_name) == wanted
+    })
+}
+
+/// Every published `ResourceType` value, for the message that refuses one this
+/// service does not publish.
+pub fn published_resource_types() -> Vec<&'static str> {
+    TAGGABLE_RESOURCE_TYPES
+        .iter()
+        .map(|candidate| candidate.arn_segment)
+        .collect()
+}
+
+/// How many tags one resource may carry.
+///
+/// Source: `smithy_query(query="doc", operation="CreateTags")` — "A resource can
+/// have up to 50 tags. If you try to create more than 50 tags for a resource,
+/// you will receive an error and the attempt will fail."
+pub const TAGS_PER_RESOURCE_QUOTA: usize = 50;
+
+/// The longest a tag key may be, in characters.
+///
+/// Source: the Amazon Redshift Cluster Management Guide, "Tagging resources in
+/// Amazon Redshift" — its tag restrictions give a key a maximum of 128 Unicode
+/// characters and a value a maximum of 256 ([`TAG_VALUE_MAX_LEN`]), and reserve
+/// the [`RESERVED_TAG_PREFIX`] prefix. The model itself bounds neither
+/// (`smithy_query(query="shape", shape="Tag")` targets plain `String` for both),
+/// so the guide is the only published bound.
+pub const TAG_KEY_MAX_LEN: usize = 128;
+
+/// The longest a tag value may be, in characters. See [`TAG_KEY_MAX_LEN`].
+pub const TAG_VALUE_MAX_LEN: usize = 256;
+
+/// The key prefix AWS reserves for its own tags. See [`TAG_KEY_MAX_LEN`].
+pub const RESERVED_TAG_PREFIX: &str = "aws:";
+
+/// Check one request's tags against the published restrictions, naming the tag
+/// and the restriction it breaks. An `Err` is an `InvalidTagFault`.
+///
+/// Length is counted in CHARACTERS, not bytes: the guide bounds a key at 128 and
+/// a value at 256 Unicode characters, so a multi-byte value is bounded by what
+/// it spells and not by how UTF-8 encodes it.
+pub fn check_tags(tags: &[crate::ops::types::Tag]) -> Result<(), String> {
+    for tag in tags {
+        let key = tag.key.as_deref().unwrap_or_default();
+        if key.is_empty() {
+            return Err("Invalid tag: a tag key cannot be null, empty, or blank.".to_string());
+        }
+        if key.chars().count() > TAG_KEY_MAX_LEN {
+            return Err(format!(
+                "Invalid tag key '{key}': a tag key cannot be longer than {TAG_KEY_MAX_LEN} characters."
+            ));
+        }
+        if key.to_lowercase().starts_with(RESERVED_TAG_PREFIX) {
+            return Err(format!(
+                "Invalid tag key '{key}': the prefix '{RESERVED_TAG_PREFIX}' is reserved for Amazon Web Services."
+            ));
+        }
+        let value = tag.value.as_deref().unwrap_or_default();
+        if value.chars().count() > TAG_VALUE_MAX_LEN {
+            return Err(format!(
+                "Invalid tag value for key '{key}': a tag value cannot be longer than {TAG_VALUE_MAX_LEN} characters."
+            ));
+        }
+        if value.to_lowercase().starts_with(RESERVED_TAG_PREFIX) {
+            return Err(format!(
+                "Invalid tag value for key '{key}': the prefix '{RESERVED_TAG_PREFIX}' is reserved for Amazon Web Services."
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The tag list a resource carrying `existing` has after `incoming` is added,
+/// or the message of the `TagLimitExceededFault` the request exceeds.
+///
+/// A key already on the resource keeps its position and takes the new value —
+/// `smithy_query(query="doc", operation="CreateTags")`: "If you specify a key
+/// that already exists for the resource, the value for that key will be updated
+/// with the new value" — which is also what a key repeated WITHIN one request
+/// does, the later pair winning. A key the resource does not carry is appended.
+/// Computed into a new list rather than applied in place because the attempt
+/// must "fail" as a whole when it would exceed [`TAGS_PER_RESOURCE_QUOTA`]:
+/// nothing is persisted on the error path.
+///
+/// A tag whose `Value` the request omits is stored as the EMPTY value, which is
+/// the value such a tag reports: the member is modelled optional but a stored
+/// tag always has one.
+pub fn tags_with(
+    existing: &[crate::ops::types::Tag],
+    incoming: &[crate::ops::types::Tag],
+) -> Result<Vec<crate::ops::types::Tag>, String> {
+    let mut merged = existing.to_vec();
+    // The keys already in `merged`, by position: ONE lookup per incoming tag
+    // rather than a scan of the merged list, so the merge cost grows with the
+    // request rather than with its square.
+    let mut positions: BTreeMap<String, usize> = merged
+        .iter()
+        .enumerate()
+        .filter_map(|(position, tag)| tag.key.clone().map(|key| (key, position)))
+        .collect();
+    for tag in incoming {
+        let key = tag.key.clone().unwrap_or_default();
+        let value = Some(tag.value.clone().unwrap_or_default());
+        match positions.get(&key) {
+            Some(&position) => merged[position].value = value,
+            None => {
+                // Checked as the list GROWS, before the entry past the quota is
+                // allocated, so a request that must fail cannot first do the
+                // work of one that would have succeeded.
+                if merged.len() == TAGS_PER_RESOURCE_QUOTA {
+                    return Err(tag_quota_message(merged.len() + 1));
+                }
+                positions.insert(key.clone(), merged.len());
+                merged.push(crate::ops::types::Tag {
+                    key: Some(key),
+                    value,
+                });
+            }
+        }
+    }
+    Ok(merged)
+}
+
+/// Why a request past [`TAGS_PER_RESOURCE_QUOTA`] is refused, naming the count
+/// the resource would have carried.
+pub fn tag_quota_message(would_carry: usize) -> String {
+    format!(
+        "The request would exceed the allowed number of tags for one resource ({TAGS_PER_RESOURCE_QUOTA}); the resource would carry {would_carry}."
+    )
+}
+
+/// A request's `TagKeys` / `TagValues` filter, indexed once for matching.
+///
+/// Built from the request's own lists BEFORE the store is walked, so testing a
+/// resource against the filter costs one set lookup per tag instead of a scan of
+/// the caller's lists: the work is the SUM of the request and the store rather
+/// than their product, whatever lengths a caller sends.
+#[derive(Debug, Default)]
+pub struct TagFilter<'a> {
+    /// The keys a resource must carry one of, or `None` when the filter does not
+    /// constrain keys.
+    keys: Option<BTreeSet<&'a str>>,
+    /// The values a resource must carry one of, likewise.
+    values: Option<BTreeSet<&'a str>>,
+}
+
+impl<'a> TagFilter<'a> {
+    /// Index one request's `TagKeys` / `TagValues`.
+    ///
+    /// An absent list — and an EMPTY one, which names nothing to match —
+    /// constrains nothing.
+    pub fn new(tag_keys: Option<&'a [String]>, tag_values: Option<&'a [String]>) -> Self {
+        let index = |list: Option<&'a [String]>| {
+            list.filter(|values| !values.is_empty())
+                .map(|values| values.iter().map(String::as_str).collect())
+        };
+        Self {
+            keys: index(tag_keys),
+            values: index(tag_values),
+        }
+    }
+
+    /// Whether `tags` satisfy this filter.
+    ///
+    /// Each filter is independent and inclusive: a resource passes the keys when
+    /// it carries a tag whose key is one of them, and the values when it carries
+    /// a tag whose value is one of them.
+    pub fn matches(&self, tags: &[crate::ops::types::Tag]) -> bool {
+        if let Some(keys) = self.keys.as_ref() {
+            if !tags
+                .iter()
+                .any(|tag| tag.key.as_deref().is_some_and(|key| keys.contains(key)))
+            {
+                return false;
+            }
+        }
+        if let Some(values) = self.values.as_ref() {
+            if !tags.iter().any(|tag| {
+                tag.value
+                    .as_deref()
+                    .is_some_and(|value| values.contains(value))
+            }) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 /// Whether a resource's tags satisfy a request's `TagKeys` / `TagValues` filter.
 ///
-/// Each filter is independent and inclusive: a resource passes `TagKeys` when it
-/// carries a tag whose key is one of them, and `TagValues` when it carries a tag
-/// whose value is one of them. An absent filter constrains nothing.
+/// For the one-resource-at-a-time callers; a caller that walks the store builds
+/// the [`TagFilter`] once and matches through it instead.
 pub fn tags_match(
     tags: &[crate::ops::types::Tag],
     tag_keys: Option<&[String]>,
     tag_values: Option<&[String]>,
 ) -> bool {
-    if let Some(keys) = tag_keys {
-        if !keys.is_empty()
-            && !tags
-                .iter()
-                .any(|t| t.key.as_ref().is_some_and(|k| keys.contains(k)))
-        {
-            return false;
-        }
-    }
-    if let Some(values) = tag_values {
-        if !values.is_empty()
-            && !tags
-                .iter()
-                .any(|t| t.value.as_ref().is_some_and(|v| values.contains(v)))
-        {
-            return false;
-        }
-    }
-    true
+    TagFilter::new(tag_keys, tag_values).matches(tags)
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

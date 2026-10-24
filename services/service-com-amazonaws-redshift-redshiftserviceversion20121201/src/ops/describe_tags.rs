@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeTags
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeTags`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeTags::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tags this account's resources carry, as one `TaggedResource`
+//! entry per (resource, tag) pair: narrowed to one resource by `ResourceName`,
+//! or to one resource type by `ResourceType`, and filtered by the request's
+//! `TagKeys` / `TagValues`.
 //!
 //! ## Shape of an operation
 //!
@@ -123,9 +119,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `DescribeTagsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#DescribeTags")]
+//
+// `DependentServiceUnavailableFault` — the fault this SERVICE models for "a
+// dependent internal service is temporarily unavailable", which every other
+// handler here answers an unreachable shared store with and which this
+// operation's own error list omits — is widened in through `extra_errors`.
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#DescribeTags",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum DescribeTagsErrorModeled {
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
     InvalidTagFault(InvalidTagFault),
     ResourceNotFoundFault(ResourceNotFoundFault),
 }
@@ -176,23 +181,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DESCRIBE_TAGS_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Report tags.
+    ///
+    /// A pure report: a tag changes only when a caller writes one, so there is
+    /// no clock-owed transition to materialise here and nothing this call
+    /// changes for a later caller.
+    ///
+    /// The documented limitations are refused before the store is read: "You
+    /// cannot specify an ARN and a resource-type value together in the same
+    /// request. You cannot use the MaxRecords and Marker parameters together
+    /// with the ARN parameter."
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeTags` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeTagsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeTags"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(DescribeTagsErrorModeled::DependentServiceUnavailableFault(
+                DependentServiceUnavailableFault {
+                    message: Some(st::STORE_UNAVAILABLE.to_string()),
+                },
+            )
+            .into());
+        };
+        let region = st::request_region(ctx);
+
+        if input.resource_name.is_some() && input.resource_type.is_some() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "Invalid combination of ResourceName and ResourceType: an ARN and a resource-type value cannot be specified together in the same request.",
+            ));
+        }
+        if input.resource_name.is_some() && (input.max_records.is_some() || input.marker.is_some())
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "Invalid combination of ResourceName and MaxRecords or Marker: the MaxRecords and Marker parameters cannot be used together with the ARN parameter.",
+            ));
+        }
+        // A resource type the service does not publish names no resource at all,
+        // so it is refused rather than answered with an empty page.
+        let resource_type = match input.resource_type.as_deref() {
+            None => None,
+            Some(requested) => match st::resource_type_named(requested) {
+                Some(published) => Some(published),
+                None => {
+                    return Err(crate::scaffolded::Scaffolded::validation(format!(
+                        "Invalid value for ResourceType: '{requested}'. Valid resource types are: {}.",
+                        st::published_resource_types().join(", ")
+                    )))
+                }
+            },
+        };
+
+        // "If you specify both tag keys and tag values in the same request,
+        // Amazon Redshift returns all resources that match any combination of
+        // the specified keys and values": each filter is independent and
+        // inclusive, an absent one constrains nothing, and what they select is a
+        // RESOURCE — so a resource one of whose tags matches reports every tag
+        // it carries, the same way the other `Describe*` operations report a
+        // resource their tag filter selected. The request's lists are indexed
+        // ONCE, before the store is walked, so the work is the sum of the
+        // request and the store rather than their product.
+        let filter = st::TagFilter::new(input.tag_keys.as_deref(), input.tag_values.as_deref());
+
+        let store = state.lock();
+
+        // Named an ARN, the report is that one resource's tags; the resource must
+        // exist, as it must for the write operations that take the same member.
+        let matched: Vec<TaggedResource> = match input.resource_name.as_deref() {
+            Some(name) => {
+                let not_found = || {
+                    DescribeTagsErrorModeled::ResourceNotFoundFault(ResourceNotFoundFault {
+                        message: Some(format!("The resource could not be found: {name}")),
+                    })
+                };
+                let Some(entries) = store.tagged_resources_of(name, &filter, &region) else {
+                    return Err(not_found().into());
+                };
+                entries
+            }
+            None => store.tagged_resources(resource_type, &filter, &region),
+        };
+
+        let (start, end, next_marker) = match st::page_bounds_within(
+            st::TAG_MAX_RECORDS_WINDOW,
+            input.marker.as_deref(),
+            input.max_records,
+            matched.len(),
+        ) {
+            Ok(page) => page,
+            Err(message) => return Err(crate::scaffolded::Scaffolded::validation(message)),
+        };
+
+        Ok(DescribeTagsOutput {
+            tagged_resources: Some(matched[start..end].to_vec()),
+            marker: next_marker,
+        })
     }
 }

@@ -202,7 +202,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Reporting, not mutating: `settle` only materialises the status changes the clock
         // had already made due at this instant, so this report shows what any caller would
         // have seen now whether or not anybody read the table.
-        store.settle(::std::time::SystemTime::now());
+        let now = ::std::time::SystemTime::now();
+        store.settle(now);
 
         let Some(keyspace) = store.keyspaces.get(&input.keyspace_name) else {
             return Err(GetTableErrorModeled::ResourceNotFoundException(
@@ -273,12 +274,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             point_in_time_recovery: table.point_in_time_recovery.as_ref().map(|recovery| {
                 PointInTimeRecoverySummary {
                     status: recovery.status.clone(),
-                    // The earliest point a restore can target is when continuous backups
-                    // began, which for a table created with PITR enabled is its creation.
-                    earliest_restorable_timestamp: (recovery.status
-                        == crate::state::POINT_IN_TIME_RECOVERY_ENABLED)
-                        .then_some(table.creation_timestamp)
-                        .flatten()
+                    // The earliest point a restore can target, which is the one
+                    // `RestoreTable` checks `restoreTimestamp` against: see
+                    // `crate::state::Table::earliest_restorable_timestamp`, so one rule
+                    // answers both operations.
+                    earliest_restorable_timestamp: table
+                        .earliest_restorable_timestamp(now)
                         .map(::aws_smithy_types::DateTime::from),
                 }
             }),
@@ -309,9 +310,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .collect()
             }),
             // A stream ARN and a CDC stream are never configured by anything this slice
-            // implements: `RestoreTable` is still scaffolded, and `CreateTable` and
-            // `UpdateTable` answer 501 for `cdcSpecification` rather than storing a setting
-            // no operation can report.
+            // implements: `CreateTable`, `UpdateTable` and `RestoreTable` answer 501 for
+            // `cdcSpecification` rather than storing a setting no operation can report.
             latest_stream_arn: None,
             cdc_specification: None,
             warm_throughput_specification,

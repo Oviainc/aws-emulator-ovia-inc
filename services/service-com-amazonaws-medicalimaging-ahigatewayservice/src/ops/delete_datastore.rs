@@ -12,6 +12,12 @@
 //! first delete all image sets within it" — so a store that still owns image sets is
 //! refused with `ConflictException`.
 //!
+//! The same `ConflictException` ("Updating or deleting a resource can cause an
+//! inconsistent state") refuses the delete of a store whose CREATION is still in flight:
+//! a store the service has just answered `CREATING` for is still on its way to `ACTIVE`,
+//! and a delete admitted there would cancel a creation already promised. Every settled
+//! status is deletable, and a repeat delete of a `DELETING` store stays idempotent.
+//!
 //! ---
 //!
 //! # Modeled contract for `DeleteDatastore`
@@ -149,6 +155,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: crate::state::DATASTORE_NOT_FOUND_MESSAGE.to_string(),
             })
         })?;
+
+        // A creation the clock still owes is not something a delete may cancel: the
+        // service has already answered `CREATING` and promised the store, so deleting it
+        // mid-transition is the inconsistent state the modelled `ConflictException`
+        // (HTTP 409) reports. Refused BEFORE anything is written, so the store stays
+        // `CREATING` and still reaches `ACTIVE` ([`crate::state::Datastore::creation_in_flight`]).
+        if datastore.creation_in_flight() {
+            return Err(DeleteDatastoreErrorModeled::ConflictException(ConflictException {
+                message: crate::state::DATASTORE_STILL_CREATING_MESSAGE.to_string(),
+            })
+            .into());
+        }
 
         if !datastore.image_sets.is_empty() {
             return Err(DeleteDatastoreErrorModeled::ConflictException(ConflictException {

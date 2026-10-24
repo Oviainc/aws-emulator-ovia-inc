@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteTags
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteTags`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteTags::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the named keys from the tags of the resource the `ResourceName` ARN
+//! names, leaving every other tag it carries where it was. A key the resource
+//! does not carry removes nothing: the call says which tags must be gone, not
+//! which must have been there.
 //!
 //! ## Shape of an operation
 //!
@@ -97,9 +93,18 @@ impl ::aws_smithy_schema::serde::SerializableStruct for DeleteTagsOutput {
 // here — hence the `DeleteTagsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#DeleteTags")]
+//
+// `DependentServiceUnavailableFault` — the fault this SERVICE models for "a
+// dependent internal service is temporarily unavailable", which every other
+// handler here answers an unreachable shared store with and which this
+// operation's own error list omits — is widened in through `extra_errors`.
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#DeleteTags",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum DeleteTagsErrorModeled {
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
     InvalidTagFault(InvalidTagFault),
     ResourceNotFoundFault(ResourceNotFoundFault),
 }
@@ -150,23 +155,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = DELETE_TAGS_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Untag one resource.
+    ///
+    /// The resource must exist — "you must provide the ARN of the resource from
+    /// which you want to delete the tag or tags" — and the keys it does not
+    /// carry are simply not there to remove, so the call is idempotent: deleting
+    /// the same key twice leaves the same resource.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteTags` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteTagsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteTags"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(DeleteTagsErrorModeled::DependentServiceUnavailableFault(
+                DependentServiceUnavailableFault {
+                    message: Some(st::STORE_UNAVAILABLE.to_string()),
+                },
+            )
+            .into());
+        };
+        // The Region the request was signed for: an ARN names a resource of one
+        // Region, so the resource this `ResourceName` can name is one of THIS
+        // Region.
+        let region = st::request_region(ctx);
+
+        let not_found = || {
+            DeleteTagsErrorModeled::ResourceNotFoundFault(ResourceNotFoundFault {
+                message: Some(format!(
+                    "The resource could not be found: {}",
+                    input.resource_name
+                )),
+            })
+        };
+
+        let mut store = state.lock();
+        let Some(existing) = store.resource_tags(&input.resource_name, &region) else {
+            return Err(not_found().into());
+        };
+        // The keys to remove are indexed ONCE, before the resource's tags are
+        // walked, so the work is the sum of the request and the resource rather
+        // than their product. Tag keys are case-SENSITIVE (the Amazon Redshift
+        // Cluster Management Guide's tag restrictions), so a key is removed only
+        // on an exact match.
+        let removed: std::collections::BTreeSet<&str> =
+            input.tag_keys.iter().map(String::as_str).collect();
+        let remaining: Vec<Tag> = existing
+            .iter()
+            .filter(|tag| tag.key.as_deref().is_none_or(|key| !removed.contains(key)))
+            .cloned()
+            .collect();
+        // Only a request that actually removes a tag writes at all; the write
+        // resolves the resource the same way the read did and reports whether it
+        // still names one, so a discarded write cannot answer success.
+        if remaining.len() != existing.len()
+            && !store.set_resource_tags(&input.resource_name, &region, remaining)
+        {
+            return Err(not_found().into());
+        }
+
+        Ok(DeleteTagsOutput)
     }
 }

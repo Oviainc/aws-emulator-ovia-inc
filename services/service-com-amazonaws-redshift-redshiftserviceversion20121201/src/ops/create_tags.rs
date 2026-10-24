@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTags
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTags`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTags::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Adds the request's tags to the resource its `ResourceName` ARN names: the
+//! tags are written onto that resource's own `Tags` member — the one a
+//! `Describe*` of it reports — so a key the resource already carries takes the
+//! new value and a key it does not is appended.
 //!
 //! ## Shape of an operation
 //!
@@ -107,9 +103,18 @@ impl ::aws_smithy_schema::serde::SerializableStruct for CreateTagsOutput {
 // here — hence the `CreateTagsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#CreateTags")]
+//
+// `DependentServiceUnavailableFault` — the fault this SERVICE models for "a
+// dependent internal service is temporarily unavailable", which every other
+// handler here answers an unreachable shared store with and which this
+// operation's own error list omits — is widened in through `extra_errors`.
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#CreateTags",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum CreateTagsErrorModeled {
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
     InvalidClusterStateFault(InvalidClusterStateFault),
     InvalidTagFault(InvalidTagFault),
     ResourceNotFoundFault(ResourceNotFoundFault),
@@ -162,23 +167,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = CREATE_TAGS_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Tag one resource, or refuse the request without writing anything.
+    ///
+    /// The tags are checked against the published restrictions first, then the
+    /// resource is resolved, and only then is the merged list written: "if you
+    /// try to create more than 50 tags for a resource, you will receive an error
+    /// and the attempt will fail", so a request over the quota must leave the
+    /// resource exactly as it was.
+    ///
+    /// The cluster status is NOT a precondition: the modelled
+    /// `InvalidClusterStateFault` is for an operation whose work needs an
+    /// available cluster, while tagging only writes metadata onto the record —
+    /// Amazon Redshift takes `Tags` on the very `CreateCluster` call that mints a
+    /// cluster in `creating`, so a cluster in that state can carry a tag.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTags` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTagsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTags"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(CreateTagsErrorModeled::DependentServiceUnavailableFault(
+                DependentServiceUnavailableFault {
+                    message: Some(st::STORE_UNAVAILABLE.to_string()),
+                },
+            )
+            .into());
+        };
+        // The Region the request was signed for: an ARN names a resource of one
+        // Region, so the resource this `ResourceName` can name is one of THIS
+        // Region.
+        let region = st::request_region(ctx);
+
+        // The request's own list is capped BEFORE any per-element work, and
+        // before the shared store is locked: "if you try to create more than 50
+        // tags for a resource, you will receive an error and the attempt will
+        // fail", so a request carrying more entries than one resource may hold
+        // is refused on its length alone — the shape
+        // `ModifyClusterParameterGroup` refuses an over-long `Parameters` with.
+        if input.tags.len() > st::TAGS_PER_RESOURCE_QUOTA {
+            return Err(CreateTagsErrorModeled::TagLimitExceededFault(
+                TagLimitExceededFault {
+                    message: Some(st::tag_quota_message(input.tags.len())),
+                },
+            )
+            .into());
+        }
+
+        if let Err(message) = st::check_tags(&input.tags) {
+            return Err(CreateTagsErrorModeled::InvalidTagFault(InvalidTagFault {
+                message: Some(message),
+            })
+            .into());
+        }
+
+        let not_found = || {
+            CreateTagsErrorModeled::ResourceNotFoundFault(ResourceNotFoundFault {
+                message: Some(format!(
+                    "The resource could not be found: {}",
+                    input.resource_name
+                )),
+            })
+        };
+
+        let mut store = state.lock();
+        let Some(existing) = store.resource_tags(&input.resource_name, &region) else {
+            return Err(not_found().into());
+        };
+        let merged = match st::tags_with(existing, &input.tags) {
+            Ok(merged) => merged,
+            Err(message) => {
+                return Err(CreateTagsErrorModeled::TagLimitExceededFault(
+                    TagLimitExceededFault {
+                        message: Some(message),
+                    },
+                )
+                .into())
+            }
+        };
+        // The write resolves the resource the same way the read above did (ONE
+        // resolver serves both) and reports whether it still names one, so a
+        // discarded write can never answer success.
+        if !store.set_resource_tags(&input.resource_name, &region, merged) {
+            return Err(not_found().into());
+        }
+
+        Ok(CreateTagsOutput)
     }
 }

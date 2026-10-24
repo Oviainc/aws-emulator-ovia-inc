@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutApplicationAccessScope
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutApplicationAccessScope`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: adds or updates one access scope of an application stored in this
+//! service's state (`crate::state`), and answers an empty 200. This is the ONLY file to
+//! touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutApplicationAccessScope::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The scopes live ON the application record
+//! ([`crate::state::ApplicationRecord::access_scopes`]), keyed by `Scope` name: a put of
+//! a scope the application already carries REPLACES that scope's `AuthorizedTargets`,
+//! one of a scope it does not carry adds it, and every other scope is left alone. The
+//! operation is `@idempotent`, so repeating the same request leaves the same scope with
+//! the same targets.
+//!
+//! `AuthorizedTargets` is optional and `ScopeTargets` is `length 1..10`, so "authorized
+//! by no target" is the member's ABSENCE rather than an empty list: a put that omits it
+//! stores the scope with no targets, which is what `GetApplicationAccessScope` then
+//! reports. An `ApplicationArn` this account holds no application for is refused the
+//! modelled `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +183,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutApplicationAccessScope` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutApplicationAccessScopeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutApplicationAccessScopeErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the SSO Admin state store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // What the CLOCK already owes every instance, so this write resolves the same
+        // application a read at this instant would resolve (an application whose
+        // instance the clock has already removed no longer exists).
+        store.on_request(&region, ::std::time::SystemTime::now());
+
+        // The application whose access scope this sets must exist: the scopes live ON
+        // the application record, so an `ApplicationArn` nothing holds is the modelled
+        // `ResourceNotFoundException` rather than a scope stored under an ARN no read
+        // resolves.
+        let application = store
+            .application_mut(&input.application_arn)
+            .ok_or_else(|| {
+                PutApplicationAccessScopeErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::application_not_found_message(
+                            &input.application_arn,
+                        )),
+                        // The model's `ResourceNotFoundExceptionReason` enum carries only
+                        // `KMS_NotFoundException`, which this is not.
+                        reason: None,
+                    },
+                )
+            })?;
+
+        // "Adds or updates the list of authorized targets": the scope is keyed by name,
+        // so a put of a scope the application already carries REPLACES that scope's
+        // authorized targets instead of appending to them, and a put of a scope it does
+        // not carry adds it. The operation is `@idempotent`, so repeating the same
+        // request leaves the same single scope carrying the same targets.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutApplicationAccessScope"))
+        // `AuthorizedTargets` is OPTIONAL and `ScopeTargets` is `length 1..10`, so
+        // "authorized by no target" is the member's ABSENCE and not an empty list: a put
+        // that omits it stores the scope with no authorized targets, which is what the
+        // next `GetApplicationAccessScope` reports back.
+        //
+        // ADDING a scope is bounded by the emulator's own per-application memory ceiling
+        // (every distinct `Scope` the pattern admits would otherwise add a key that
+        // lives until a caller deletes it); UPDATING one the application already carries
+        // adds nothing, so it is never refused by the ceiling. The refusal is the
+        // modelled `ValidationException`, since this operation models no
+        // `ServiceQuotaExceededException`.
+        if !application.access_scopes.contains_key(&input.scope)
+            && application.access_scopes.len() >= crate::state::MAX_SCOPES_PER_APPLICATION
+        {
+            return Err(PutApplicationAccessScopeErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::access_scope_ceiling_message(
+                        &input.application_arn,
+                    )),
+                    reason: None,
+                },
+            )
+            .into());
+        }
+        application
+            .access_scopes
+            .insert(input.scope, input.authorized_targets);
+        Ok(PutApplicationAccessScopeOutput)
     }
 }

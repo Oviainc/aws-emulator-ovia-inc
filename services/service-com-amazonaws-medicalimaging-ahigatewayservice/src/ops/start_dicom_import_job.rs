@@ -12,6 +12,11 @@
 //! [`crate::state::IMPORT_JOB_IN_PROGRESS_DELAY`] and
 //! [`crate::state::IMPORT_JOB_COMPLETION_DELAY`]. Nothing here sleeps.
 //!
+//! The data store must have settled into `ACTIVE` first — the model opens this
+//! operation's documentation with "Start importing bulk data into an ACTIVE data store"
+//! — so a store still `CREATING`, or already `DELETING`, is refused with the modeled
+//! `ConflictException` ([`crate::state::Datastore::is_active`]).
+//!
 //! ---
 //!
 //! # Modeled contract for `StartDICOMImportJob`
@@ -167,14 +172,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.advance_clock(now);
 
-        if !store.datastores.contains_key(&input.datastore_id) {
-            return Err(StartDICOMImportJobErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    // Constant, and stated by resource KIND: the requested id is not
-                    // reflected back (`crate::state::DATASTORE_NOT_FOUND_MESSAGE`).
-                    message: crate::state::DATASTORE_NOT_FOUND_MESSAGE.to_string(),
-                },
-            )
+        let datastore_is_active = match store.datastores.get(&input.datastore_id) {
+            Some(datastore) => datastore.is_active(),
+            None => {
+                return Err(StartDICOMImportJobErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        // Constant, and stated by resource KIND: the requested id is not
+                        // reflected back (`crate::state::DATASTORE_NOT_FOUND_MESSAGE`).
+                        message: crate::state::DATASTORE_NOT_FOUND_MESSAGE.to_string(),
+                    },
+                )
+                .into());
+            }
+        };
+
+        // "Start importing bulk data into an ACTIVE data store": a store the clock has
+        // not yet settled — still `CREATING`, or already `DELETING` — cannot take an
+        // import, which is what the modelled `ConflictException` (HTTP 409) reports
+        // ([`crate::state::Datastore::is_active`]).
+        if !datastore_is_active {
+            return Err(StartDICOMImportJobErrorModeled::ConflictException(ConflictException {
+                message: crate::state::DATASTORE_NOT_ACTIVE_MESSAGE.to_string(),
+            })
             .into());
         }
 

@@ -65,7 +65,7 @@ const SEEDED_LATER_WORKFLOW_STATUS: ImageSetWorkflowStatus = ImageSetWorkflowSta
 ///
 /// Built with the crate's own `ImageSet::new` / `push_version`, so a seeded image set is
 /// shaped exactly like one a handler mints.
-fn seed_image_set(emulator: &Emulator, datastore_id: &str, versions: u32) -> String {
+pub(crate) fn seed_image_set(emulator: &Emulator, datastore_id: &str, versions: u32) -> String {
     assert!(
         versions >= 1,
         "an image set always holds at least one version, asked for {versions}"
@@ -102,7 +102,7 @@ fn seed_image_set(emulator: &Emulator, datastore_id: &str, versions: u32) -> Str
 /// `POST /datastore/{datastoreId}/imageSet/{sourceImageSetId}/copyImageSet` —
 /// `CopyImageSet`. `force` and `promoteToPrimary` are `@httpQuery`; the body IS the
 /// `copyImageSetInformation` payload.
-async fn copy_image_set(
+pub(crate) async fn copy_image_set(
     emulator: &Emulator,
     datastore_id: &str,
     source_image_set_id: &str,
@@ -135,7 +135,7 @@ async fn get_image_set(
 
 /// The `copyImageSetInformation` payload: the source's claimed latest version, an
 /// optional `DICOMCopies` subset, and an optional destination.
-fn information(
+pub(crate) fn information(
     source_latest_version: &str,
     copiable_attributes: Option<&str>,
     destination: Option<(&str, &str)>,

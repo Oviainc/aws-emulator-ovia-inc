@@ -1,15 +1,34 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RestoreTable
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RestoreTable`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: restores a source table to a point in its point-in-time-recovery window
+//! as a NEW table in the target keyspace, and answers with the ARN it minted for that
+//! table. This is the ONLY file to touch for `RestoreTable`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RestoreTable::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What the restored table is built from, following the operation's own documentation
+//! below:
+//!
+//! * the SELECTED TIMESTAMP decides the schema and the TTL settings ("the table's schema
+//!   data and TTL settings ... are restored based on the selected timestamp"), which
+//!   [`crate::state::Table::restorable_settings_at`] answers from the source table's
+//!   revisions;
+//! * the source table's CURRENT settings decide the capacity mode, auto scaling,
+//!   encryption, point-in-time recovery and tags ("these settings are always restored
+//!   based on the table's settings as of the current time"), each overridable by this
+//!   request's matching `*Override` member;
+//! * `restoreTimestamp` has to lie inside the source table's restorable window
+//!   (`earliestRestorableTimestamp` to the current time), so a table point-in-time
+//!   recovery is not enabled on has no window and cannot be restored at all.
+//!
+//! `replicaSpecifications` IS served: the per-Region settings of a multi-Region table
+//! are resolved against the TARGET keyspace's replication group, exactly as
+//! `CreateTable` resolves them against the keyspace a table is created in, and reported
+//! back by `GetTable`'s replica summaries. The warm throughput configuration is not among
+//! the settings this operation's documentation says a restore reproduces, and the request
+//! models no member to set it, so the restored table starts with none.
+//!
+//! The paragraphs below are the scaffold's own notes on how an operation is shaped and
+//! how it reaches state; they still describe this file.
 //!
 //! ## Shape of an operation
 //!
@@ -209,18 +228,344 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RestoreTable` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RestoreTableErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RestoreTable"))
+        // The four names are modelled (`len 1..48`, pattern), so the boundary validator has
+        // already refused a request that breaks one of those constraints. What is left here
+        // is what the model cannot state.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            RestoreTableErrorModeled::InternalServerException(InternalServerException {
+                message: Some(
+                    "Amazon Keyspaces could not reach its state store for this request."
+                        .to_string(),
+                ),
+            })
+        })?;
+        let region = crate::state::request_region(ctx);
+
+        let invalid = |message: String| -> RestoreTableError {
+            RestoreTableErrorModeled::ValidationException(ValidationException {
+                message: Some(message),
+            })
+            .into()
+        };
+
+        // What the model cannot state about the overrides: which capacity mode takes the
+        // capacity units, and which encryption type takes a key identifier. Checked before
+        // the store is touched, so a refused restore creates nothing.
+        let capacity_override = match input.capacity_specification_override {
+            None => None,
+            Some(supplied) => {
+                Some(crate::state::resolve_capacity(Some(supplied)).map_err(invalid)?)
+            }
+        };
+        let encryption_override = match input.encryption_specification_override {
+            None => None,
+            Some(supplied) => {
+                Some(crate::state::resolve_encryption(Some(supplied)).map_err(invalid)?)
+            }
+        };
+
+        // The restore point. `restoreTimestamp` is an optional member, and a request that
+        // names none asks for the most recent restorable point, which is this instant.
+        let now = ::std::time::SystemTime::now();
+        let restore_point = match input.restore_timestamp {
+            None => now,
+            Some(at) => ::std::time::SystemTime::try_from(at).map_err(|_| {
+                invalid(format!(
+                    "restoreTimestamp ({} seconds since the epoch) is not an instant this \
+                     service can restore to",
+                    at.secs()
+                ))
+            })?,
+        };
+
+        let mut store = state.lock();
+        // The service-managed keyspaces and their system tables are part of the account
+        // before any call, so one of them resolves below instead of 404-ing — and is then
+        // refused.
+        store.ensure_service_managed_catalog(&region);
+        store.settle(now);
+
+        // A system keyspace holds the SERVICE's own tables: Cassandra refuses DDL against
+        // one as an invalid query ("system keyspace is not user-modifiable"), which is this
+        // operation's `ValidationException`, and a restore is DDL on both sides — it reads
+        // one table's continuous backups and creates another table.
+        for keyspace_name in [&input.source_keyspace_name, &input.target_keyspace_name] {
+            if crate::state::is_service_managed_keyspace(keyspace_name) {
+                return Err(invalid(crate::state::service_managed_rejection(keyspace_name)));
+            }
+        }
+
+        // The source table. Resolved first: a restore of a table that is not there creates
+        // nothing.
+        let Some(source_keyspace) = store.keyspaces.get(&input.source_keyspace_name) else {
+            return Err(RestoreTableErrorModeled::ResourceNotFoundException(
+                crate::state::keyspace_not_found(&region, &input.source_keyspace_name),
+            )
+            .into());
+        };
+        let Some(source) = source_keyspace.tables.get(&input.source_table_name) else {
+            return Err(RestoreTableErrorModeled::ResourceNotFoundException(
+                crate::state::table_not_found(
+                    &region,
+                    &input.source_keyspace_name,
+                    &input.source_table_name,
+                ),
+            )
+            .into());
+        };
+
+        // A table is restorable only from `ACTIVE`: "The operation tried to access a
+        // keyspace, table, or type that doesn't exist. The resource might not be specified
+        // correctly, or its status might not be ACTIVE." While another change to it is still
+        // settling this is the modelled conflict — "you try to perform an action and the
+        // same or a different action is already in progress" — exactly as `UpdateTable`
+        // answers for a source in the same state.
+        if source.status != crate::state::TABLE_STATUS_ACTIVE {
+            return Err(RestoreTableErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Table '{}.{}' is in status {} and cannot be restored until it is {}.",
+                    input.source_keyspace_name,
+                    input.source_table_name,
+                    source.status,
+                    crate::state::TABLE_STATUS_ACTIVE
+                )),
+            })
+            .into());
+        }
+
+        // "Restores the table to the specified point in time within the
+        // earliest_restorable_timestamp and the current time." The window is the one
+        // `GetTable` reports for the source table, so a table point-in-time recovery is not
+        // enabled on has no window and no restorable point at all.
+        let Some(earliest) = source.earliest_restorable_timestamp(now) else {
+            return Err(invalid(format!(
+                "table '{}.{}' has no restorable point in time: point-in-time recovery is \
+                 not {} on it",
+                input.source_keyspace_name,
+                input.source_table_name,
+                crate::state::POINT_IN_TIME_RECOVERY_ENABLED
+            )));
+        };
+        if restore_point < earliest || restore_point > now {
+            return Err(invalid(format!(
+                "restoreTimestamp is outside the restorable window of table '{}.{}', which \
+                 runs from its earliestRestorableTimestamp ({} seconds since the epoch) to \
+                 the current time ({} seconds since the epoch)",
+                input.source_keyspace_name,
+                input.source_table_name,
+                epoch_seconds(earliest),
+                epoch_seconds(now)
+            )));
+        }
+
+        // What the restore reproduces. The schema and the TTL settings come from the
+        // revision of the source table that was in effect at the selected timestamp; the
+        // capacity mode, auto scaling, encryption, point-in-time recovery and tags come from
+        // the source table "as of the current time", each overridable by this request.
+        let restored = source.restorable_settings_at(restore_point);
+        // The comment is part of the table's own metadata and no member of this request can
+        // override it, so it comes from the source table as it stands.
+        let comment = source.comment.clone();
+        let capacity_specification =
+            capacity_override.or_else(|| source.capacity_specification.clone());
+        let encryption_specification =
+            encryption_override.or_else(|| source.encryption_specification.clone());
+        let point_in_time_recovery = input
+            .point_in_time_recovery_override
+            .or_else(|| source.point_in_time_recovery.clone());
+        // Auto scaling is "the optional auto scaling settings for the restored table in
+        // provisioned capacity mode", so it belongs to the mode the RESTORED table lands in:
+        // a supplied specification is checked against that mode (and refused when it is not
+        // provisioned), and the source table's own is carried over only while it still
+        // applies.
+        let effective_capacity = capacity_specification.clone().unwrap_or(CapacitySpecification {
+            throughput_mode: crate::state::DEFAULT_THROUGHPUT_MODE.to_string(),
+            read_capacity_units: None,
+            write_capacity_units: None,
+        });
+        let auto_scaling_specification = match input.auto_scaling_specification {
+            Some(supplied) => {
+                crate::state::resolve_auto_scaling(Some(supplied), &effective_capacity)
+                    .map_err(invalid)?
+            }
+            None => source.auto_scaling_specification.clone().filter(|_| {
+                effective_capacity.throughput_mode == crate::state::PROVISIONED_THROUGHPUT_MODE
+            }),
+        };
+        // "The optional Region specific settings of a multi-Regional table" the source
+        // table holds now. Which of them the restored table keeps depends on the TARGET
+        // keyspace's replication group, resolved once that keyspace is known.
+        let source_replica_specifications = source.replica_specifications.clone();
+        // "Tags" are among the settings a restore takes from the source table and this
+        // request can overwrite: a supplied `tagsOverride` replaces them, under the same
+        // per-resource tag rules `CreateTable` and `TagResource` apply.
+        let tags = match input.tags_override.as_deref() {
+            None => source.tags.clone(),
+            Some(supplied) => crate::state::new_tag_set(Some(supplied)).map_err(|rejection| {
+                let message = Some(rejection.message());
+                match rejection.is_quota() {
+                    true => RestoreTableErrorModeled::ServiceQuotaExceededException(
+                        ServiceQuotaExceededException { message },
+                    ),
+                    false => RestoreTableErrorModeled::ValidationException(ValidationException {
+                        message,
+                    }),
+                }
+            })?,
+        };
+
+        // "Any number of users can execute up to 4 concurrent restores (any type of
+        // restore) in a given account": past that the account is out of the quota this
+        // operation models, until one of the restores in flight finishes. Counted here,
+        // where the store is still borrowed shared, and checked below once the request
+        // itself has been found restorable — so a request with a fault of its own is told
+        // about that fault rather than about the account's concurrency.
+        let in_progress = store.restores_in_progress();
+
+        // The target keyspace, which is where the restored table is created. It may be the
+        // source's own keyspace, so it is resolved only after everything above was read out
+        // of the source table.
+        let Some(target_keyspace) = store.keyspaces.get_mut(&input.target_keyspace_name) else {
+            return Err(RestoreTableErrorModeled::ResourceNotFoundException(
+                crate::state::keyspace_not_found(&region, &input.target_keyspace_name),
+            )
+            .into());
+        };
+        // The Regions the restored table will be replicated in: its target keyspace's
+        // replication group, which is what a per-Region setting may name.
+        let replica_regions: Option<Vec<String>> = target_keyspace
+            .table_replica_regions()
+            .map(<[String]>::to_vec);
+        // A restore creates a table, and "within a keyspace, table names must be unique" —
+        // so a name already taken is the modelled conflict ("you try to create a resource
+        // that already exists"), never a silent overwrite of the table it names.
+        if target_keyspace.tables.contains_key(&input.target_table_name) {
+            return Err(RestoreTableErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "Table '{}.{}' already exists.",
+                    input.target_keyspace_name, input.target_table_name
+                )),
+            })
+            .into());
+        }
+        // The restored table is one more table of the target keyspace, so it is held to the
+        // same per-keyspace cap a created one is.
+        if target_keyspace.tables.len() >= crate::state::MAX_TABLES_PER_KEYSPACE {
+            return Err(RestoreTableErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "the number of tables in keyspace '{}' would exceed the limit of {}",
+                        input.target_keyspace_name,
+                        crate::state::MAX_TABLES_PER_KEYSPACE
+                    )),
+                },
+            )
+            .into());
+        }
+        // Everything about this request is restorable, so the only thing that can still
+        // refuse it is the account's concurrency (counted above).
+        if in_progress >= crate::state::MAX_CONCURRENT_RESTORES {
+            return Err(RestoreTableErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "{in_progress} restores are already in progress in this account, \
+                         which is the limit of {} concurrent restores",
+                        crate::state::MAX_CONCURRENT_RESTORES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The per-Region settings of the restored table: the request's when it carries
+        // them, checked against the target keyspace's Regions and the mode the restored
+        // table lands in, and otherwise the source table's — kept only for a Region the
+        // target keyspace replicates to, and only while the restored table is provisioned,
+        // which is the only mode a per-Region read capacity or auto scaling setting belongs
+        // to.
+        let replica_specifications = match input.replica_specifications {
+            Some(supplied) => crate::state::resolve_replica_specifications(
+                supplied,
+                &::std::collections::BTreeMap::new(),
+                Some(&effective_capacity),
+                replica_regions.as_deref(),
+            )
+            .map_err(invalid)?,
+            None => match effective_capacity.throughput_mode
+                == crate::state::PROVISIONED_THROUGHPUT_MODE
+            {
+                false => ::std::collections::BTreeMap::new(),
+                true => source_replica_specifications
+                    .into_iter()
+                    .filter(|(replica_region, _)| {
+                        replica_regions
+                            .as_deref()
+                            .is_some_and(|regions| regions.contains(replica_region))
+                    })
+                    .collect(),
+            },
+        };
+
+        let restored_table_arn = crate::state::table_arn(
+            &region,
+            &input.target_keyspace_name,
+            &input.target_table_name,
+        );
+        // A restore creates a table, so the created table is `CREATING` until the clock owes
+        // it `ACTIVE` one span from now, exactly as a `CreateTable` leaves one; `settle`
+        // materialises that, and nothing sleeps for it. Until then this restore is one of
+        // the account's concurrent restores.
+        let settles_at = now + crate::state::TRANSIENT_STATUS_SPAN;
+        target_keyspace.tables.insert(
+            input.target_table_name.clone(),
+            crate::state::Table {
+                keyspace_name: input.target_keyspace_name.clone(),
+                table_name: input.target_table_name.clone(),
+                resource_arn: restored_table_arn.clone(),
+                creation_timestamp: Some(now),
+                status: crate::state::TABLE_STATUS_CREATING.to_string(),
+                status_due_at: Some(settles_at),
+                schema_definition: restored.schema_definition,
+                capacity_specification,
+                auto_scaling_specification,
+                // The restored table is a new table in whatever mode it was restored into;
+                // no update has moved it to `PAY_PER_REQUEST`.
+                last_update_to_pay_per_request: None,
+                encryption_specification,
+                point_in_time_recovery,
+                ttl: restored.ttl,
+                default_time_to_live: restored.default_time_to_live,
+                comment,
+                client_side_timestamps: restored.client_side_timestamps,
+                replica_specifications,
+                // Pre-warming is not among the settings this operation's documentation says
+                // a restore reproduces, and the request models no member to set it, so the
+                // restored table is created with no warm throughput configuration.
+                warm_throughput_specification: None,
+                tags,
+                // Nothing has superseded the restored table's own settings since this call
+                // put them there.
+                superseded: Vec::new(),
+                restored_from: Some(crate::state::RestoreOrigin {
+                    source_keyspace_name: input.source_keyspace_name,
+                    source_table_name: input.source_table_name,
+                    restore_timestamp: restore_point,
+                }),
+                // Nothing has been dropped: this table's own settings date from this call.
+                earliest_known_settings: None,
+            },
+        );
+        // The clock now owes the restored table its ACTIVE transition; tell the store the
+        // earliest instant at which `settle` has to look at the tables again.
+        store.note_transition_due(settles_at);
+
+        Ok(RestoreTableOutput { restored_table_arn })
     }
+}
+
+/// Seconds since the epoch, as a refusal names the window a `restoreTimestamp` missed.
+fn epoch_seconds(at: ::std::time::SystemTime) -> f64 {
+    at.duration_since(::std::time::SystemTime::UNIX_EPOCH)
+        .map(|since| since.as_secs_f64())
+        .unwrap_or_default()
 }
