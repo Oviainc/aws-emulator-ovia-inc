@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    Condition, DataLakePrincipal, LFTag, PrincipalResourcePermissions, Resource,
+    Condition, DataCellsFilter, DataLakePrincipal, LFTag, PrincipalResourcePermissions, Resource,
 };
 
 /// One registered data-lake location: the resource ARN Lake Formation manages, the IAM
@@ -156,6 +156,9 @@ impl PermissionGrant {
 ///
 /// `registered_resources` is bounded the same way, by [`MAX_REGISTERED_RESOURCES`] checked
 /// in `RegisterResource`, the single site that inserts into it.
+///
+/// `data_cells_filters` is bounded by [`MAX_DATA_CELLS_FILTERS`], checked in
+/// `CreateDataCellsFilter`, the single site that inserts into it.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsLakeformationAwslakeformationState {
     /// Catalog id -> (tag key -> tag). Both levels are `BTreeMap`s so enumeration order
@@ -176,6 +179,12 @@ pub struct ComAmazonawsLakeformationAwslakeformationState {
     /// Resource ARN -> its registration. A `BTreeMap` for the same reason: `ListResources`
     /// pages over a stable, sorted order, and `DescribeResource` is an exact-ARN lookup.
     pub registered_resources: BTreeMap<String, RegisteredResource>,
+    /// [`data_cells_filter_key`] -> the stored data cells filter.
+    ///
+    /// The modelled `DataCellsFilter` is kept whole, because that is exactly what
+    /// `GetDataCellsFilter` answers with and what `ListDataCellsFilter` pages over; a
+    /// `BTreeMap` so those readers enumerate in a stable, sorted order.
+    pub data_cells_filters: BTreeMap<String, DataCellsFilter>,
 }
 
 impl ComAmazonawsLakeformationAwslakeformationState {
@@ -184,6 +193,170 @@ impl ComAmazonawsLakeformationAwslakeformationState {
     pub fn total_lf_tags(&self) -> usize {
         self.lf_tags.values().map(BTreeMap::len).sum()
     }
+}
+
+/// The most data cells filters this store will hold.
+///
+/// That the number of data cells filters IS bounded comes from the model:
+/// `CreateDataCellsFilter` declares `ResourceNumberLimitExceededException` — "A resource
+/// numerical limit was exceeded" (HTTP 400). The model does not carry the number, and AWS
+/// publishes it as an adjustable service quota, so this ceiling is the emulator's own
+/// choice; what the model fixes is that passing it answers that error instead of growing
+/// the store without limit. Needed because every part of a filter's identity (catalog,
+/// database, table and filter name) is request-supplied.
+pub const MAX_DATA_CELLS_FILTERS: usize = 10_000;
+
+/// The deepest nested column attribute a data cells filter may name.
+///
+/// From the model: `DataCellsFilter$ColumnNames` documents "When specifying nested
+/// attributes, use a qualified dot (.) delimited format such as \"address\".\"zip\".
+/// Nested attributes within this list may not exceed a depth of 5."
+/// (`smithy_query(query="doc",shape="DataCellsFilter",member="ColumnNames")`).
+pub const MAX_COLUMN_NAME_DEPTH: usize = 5;
+
+/// The identity of one data cells filter: the (table catalog, database, table, filter
+/// name) tuple every one of its operations addresses it by.
+///
+/// All four members are modelled required on `DataCellsFilter` and on
+/// `GetDataCellsFilter`'s input, so a filter always has a complete key. Length-prefixed
+/// like [`grant_key`], so no name a request supplies can be read as the next field.
+pub fn data_cells_filter_key(
+    table_catalog_id: &str,
+    database_name: &str,
+    table_name: &str,
+    name: &str,
+) -> String {
+    let mut key = String::new();
+    push_text(&mut key, table_catalog_id);
+    push_text(&mut key, database_name);
+    push_text(&mut key, table_name);
+    push_text(&mut key, name);
+    key
+}
+
+/// How many levels the qualified, dot-delimited column path `column` names, or `None`
+/// when the path leaves a quoted segment unterminated and so names no levels at all.
+///
+/// A segment may be double-quoted (`"address"."zip"` — the form
+/// `DataCellsFilter$ColumnNames` documents), and a quoted segment may itself contain a
+/// dot, so only a dot OUTSIDE quotes separates levels. An odd number of quotes leaves a
+/// segment open, which is not a path the documented form admits: answering `None` for it
+/// is what stops an unterminated quote hiding the dots after it and scoring a path
+/// shallower than it is. An empty path is depth 0.
+pub fn column_name_depth(column: &str) -> Option<usize> {
+    if column.is_empty() {
+        return Some(0);
+    }
+    let mut depth = 1;
+    let mut quoted = false;
+    for character in column.chars() {
+        match character {
+            '"' => quoted = !quoted,
+            '.' if !quoted => depth += 1,
+            _ => {}
+        }
+    }
+    if quoted {
+        return None;
+    }
+    Some(depth)
+}
+
+/// `Ok(())` when exactly one of the two ways a request has of naming a table's columns is
+/// used, else why it is not.
+///
+/// One rule, stated by the model for each of the two shapes that carry the pair: "At least
+/// one of `ColumnNames` or `ColumnWildcard` is required."
+/// (`smithy_query(query="doc",shape="TableWithColumnsResource",member="ColumnNames")`) and
+/// "You must specify either a `ColumnNames` list or the `ColumnWildCard`."
+/// (`smithy_query(query="doc",shape="DataCellsFilter",member="ColumnWildcard")`) — so one
+/// of the two and never both, and a `ColumnNames` that selects no column at all is not a
+/// naming of columns. `context` names the member under validation, so the refusal says
+/// which one it is about.
+pub fn validate_column_choice(
+    context: &str,
+    column_names: Option<&[String]>,
+    has_column_wildcard: bool,
+) -> Result<(), String> {
+    match (column_names, has_column_wildcard) {
+        (Some(_), true) => Err(format!(
+            "{context} must name either ColumnNames or ColumnWildcard, not both"
+        )),
+        (None, false) => Err(format!(
+            "{context} must name either ColumnNames or ColumnWildcard"
+        )),
+        (Some([]), false) => Err(format!(
+            "{context}.ColumnNames must name at least one column"
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// `Ok(())` when `filter` is a data cells filter the service can store, else why it is
+/// not — the message of the modelled `InvalidInputException` its operations answer with.
+///
+/// Two rules the model states but cannot express as constraints:
+///
+/// * exactly one way of naming columns, which [`validate_column_choice`] is;
+/// * a nested column attribute no deeper than [`MAX_COLUMN_NAME_DEPTH`], applied to both
+///   lists of column paths the shape carries (`ColumnNames` and the wildcard's
+///   `ExcludedColumnNames`, which target the same `ColumnNames` shape). This one is the
+///   data cells filter's own: `TableWithColumnsResource$ColumnNames` documents no nesting
+///   at all, so it is not held to a depth the model states only for `DataCellsFilter`.
+///
+/// A `RowFilter` is held to the same "exactly one" rule over its own two alternatives: a
+/// PartiQL predicate is either an expression or the all-rows wildcard, and a predicate
+/// that is neither selects no rows.
+pub fn validate_data_cells_filter(filter: &DataCellsFilter) -> Result<(), String> {
+    validate_column_choice(
+        "TableData",
+        filter.column_names.as_deref(),
+        filter.column_wildcard.is_some(),
+    )?;
+
+    let excluded = filter
+        .column_wildcard
+        .as_ref()
+        .and_then(|wildcard| wildcard.excluded_column_names.as_deref())
+        .unwrap_or_default();
+    for column in filter
+        .column_names
+        .as_deref()
+        .unwrap_or_default()
+        .iter()
+        .chain(excluded)
+    {
+        let Some(depth) = column_name_depth(column) else {
+            return Err(format!(
+                "Column {column:?} leaves a quoted segment unterminated"
+            ));
+        };
+        if depth > MAX_COLUMN_NAME_DEPTH {
+            return Err(format!(
+                "Column {column:?} nests {depth} attributes, the maximum depth is \
+                 {MAX_COLUMN_NAME_DEPTH}"
+            ));
+        }
+    }
+
+    if let Some(row_filter) = &filter.row_filter {
+        let expression = row_filter.filter_expression.is_some();
+        let all_rows = row_filter.all_rows_wildcard.is_some();
+        if expression && all_rows {
+            return Err(
+                "TableData.RowFilter must name either FilterExpression or AllRowsWildcard, \
+                 not both"
+                    .to_string(),
+            );
+        }
+        if !expression && !all_rows {
+            return Err(
+                "TableData.RowFilter must name either FilterExpression or AllRowsWildcard"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
 }
 
 /// The largest page `ListLFTags` can answer, and the page size it uses when the caller
@@ -486,28 +659,13 @@ pub fn validate_resource(resource: &Resource) -> Result<(), String> {
     }
 
     if let Some(table) = &resource.table_with_columns {
-        match (&table.column_names, &table.column_wildcard) {
-            (Some(_), Some(_)) => {
-                return Err(
-                    "Resource.TableWithColumns must name either ColumnNames or ColumnWildcard, \
-                     not both"
-                        .to_string(),
-                )
-            }
-            (None, None) => {
-                return Err(
-                    "Resource.TableWithColumns must name either ColumnNames or ColumnWildcard"
-                        .to_string(),
-                )
-            }
-            (Some(columns), None) if columns.is_empty() => {
-                return Err(
-                    "Resource.TableWithColumns.ColumnNames must name at least one column"
-                        .to_string(),
-                )
-            }
-            _ => {}
-        }
+        // The same rule a data cells filter's columns are held to, so the two cannot
+        // drift apart.
+        validate_column_choice(
+            "Resource.TableWithColumns",
+            table.column_names.as_deref(),
+            table.column_wildcard.is_some(),
+        )?;
     }
 
     Ok(())
