@@ -194,14 +194,6 @@ pub const ENTITY_TYPES: &[&str] = &[
 /// there instead, which is how one resource ARN form names both.
 pub const CHANGE_SET_RESOURCE_TYPE: &str = "ChangeSet";
 
-/// The resource-based policy a resource that has none carries.
-///
-/// `GetResourcePolicy` reports "a resource-based policy of an entity", and
-/// `ResourcePolicyJson` is `@length 1..10240`, so the absence of a policy is
-/// reported as the EMPTY JSON policy document rather than as an absent member
-/// or an empty string, neither of which that bound admits.
-pub const EMPTY_RESOURCE_POLICY: &str = "{}";
-
 /// How many tags one resource holds.
 ///
 /// `TagList` is `@length(min: 1, max: 200)`, which is the bound on the tags a
@@ -1810,6 +1802,24 @@ pub fn resource_not_found(resource: &CatalogResource) -> ResourceNotFoundExcepti
     match resource {
         CatalogResource::Entity { id, .. } => entity_not_found(id),
         CatalogResource::ChangeSet { id } => change_set_not_found(id),
+    }
+}
+
+/// The modelled `ResourceNotFoundException` payload for a resource of this
+/// catalog that carries no resource-based policy.
+///
+/// The policy IS what `GetResourcePolicy` reports, and the output member it
+/// reports it in targets `ResourcePolicyJson` (`@length(min: 1)`): a resource
+/// none is attached to has no document to report, so the read is refused as not
+/// found rather than answered with a document the resource does not carry. The
+/// sentence is built from the request, naming the resource whose policy was
+/// asked for, in the form this service states a missing thing in.
+pub fn resource_policy_not_found(resource: &CatalogResource) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            "Requested resource policy of '{}' does not exist.",
+            resource.id()
+        )),
     }
 }
 

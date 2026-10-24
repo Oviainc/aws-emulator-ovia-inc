@@ -168,23 +168,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // which is a change the clock owes rather than one a reader makes.
         store.settle(now);
 
-        // Reporting a resource's policy reads the resource-POLICY store, which is
-        // keyed by the resource the ARN names and holds an entry only for a
-        // resource a policy was attached to. It is not a read of the catalog's
-        // own record, and this operation creates no binding to one, so a
-        // resource the catalog holds no record for is simply a resource with no
-        // policy attached — which is what AWS answers for it: 200 carrying the
-        // empty policy document, where `PutResourcePolicy` on the very same ARN
-        // answers `ResourceNotFoundException` because attaching DOES bind to the
-        // entity.
+        // This reports "a resource-based policy of an entity that is identified
+        // by its resource ARN": an ARN the catalog holds no record of identifies
+        // no such entity, so there is nothing to report it for — the same
+        // existence test every ARN-addressed operation of this service applies,
+        // reads included.
+        if !store.holds_resource(&resource) {
+            return Err(GetResourcePolicyErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(&resource),
+            )
+            .into());
+        }
+
+        // The policy itself is what is being read, out of the resource-POLICY
+        // store, which holds an entry only for a resource one was attached to.
+        // A resource carrying none has no document to report — `Policy` targets
+        // `ResourcePolicyJson` (`@length(min: 1)`) — so the read is refused as
+        // not found rather than answered with a synthesised document the
+        // resource does not carry.
+        let Some(policy) = store.resource_policies.get(&resource.policy_key()).cloned() else {
+            return Err(GetResourcePolicyErrorModeled::ResourceNotFoundException(
+                crate::state::resource_policy_not_found(&resource),
+            )
+            .into());
+        };
+
         Ok(GetResourcePolicyOutput {
-            policy: Some(
-                store
-                    .resource_policies
-                    .get(&resource.policy_key())
-                    .cloned()
-                    .unwrap_or_else(|| crate::state::EMPTY_RESOURCE_POLICY.to_string()),
-            ),
+            policy: Some(policy),
         })
     }
 }
