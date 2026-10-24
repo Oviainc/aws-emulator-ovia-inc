@@ -16,7 +16,8 @@
 //!   under the body member [`MESSAGE_MEMBER`];
 //! * a value that WAS converted and then failed a rule the model declares (an absent
 //!   `@required` member, a `@length` / `@range` / `@pattern` / enum violation) is a
-//!   constraint refusal, which the framework answers as `ValidationException`.
+//!   constraint refusal, which this service answers as `BadRequestException` (see
+//!   [`crate::service::validation`]).
 //!
 //! The framework renders BOTH as `400 ValidationException` with a lowercase `message`
 //! (`vendor/smithy-server-runtime/src/pre_dispatch.rs`, where every
@@ -59,7 +60,7 @@
 //! agreement against the vendored reader itself, and
 //! `tests/all/query_value_coercion.rs` pins it end to end: a value this layer accepts is
 //! never answered as a coercion failure, and a value it refuses never reaches the
-//! framework's `ValidationException` path.
+//! constraint-refusal path.
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
 use aws_smithy_schema::{Schema, ShapeType};
@@ -72,9 +73,8 @@ use aws_smithy_types::body::SdkBody;
 /// never became an input, so no operation ran to answer with its own error. It is also
 /// the code the framework itself names for a request it cannot process at all
 /// (`pre_dispatch.rs`'s catch-all arm), which is the same refusal one unconvertible
-/// value earns. What it must NOT be is `ValidationException`, the code the framework
-/// would otherwise answer: that is the code for a value that was read and then broke a
-/// modelled constraint.
+/// value earns. What it must NOT be is the constraint-refusal code: that is the code for
+/// a value that was read and then broke a modelled constraint.
 pub const SERIALIZATION_EXCEPTION: &str = "SerializationException";
 
 /// The body member this surface's protocol-level error carries its sentence in.
@@ -252,7 +252,7 @@ mod tests {
     /// This is the case that makes a change to that reader
     /// (`vendor/smithy-schema-server/src/http_binding.rs`'s `StringValueDeserializer`)
     /// fail loudly here instead of quietly sending a conversion failure back to the
-    /// framework's `ValidationException` envelope — or, worse, refusing a value the
+    /// framework's constraint-refusal envelope — or, worse, refusing a value the
     /// framework would have accepted. The rows span both modelled types `GetApiKeys`
     /// binds to the query string, the boolean vocabulary, the integer width's bound and
     /// one past it, and a member whose type this layer does not answer for.

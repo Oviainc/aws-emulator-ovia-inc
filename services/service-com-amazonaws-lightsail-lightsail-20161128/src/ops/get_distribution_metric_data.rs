@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDistributionMetricData
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDistributionMetricData`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Answers the distribution metric series the store holds for the content
+//! delivery network (CDN) distribution the request names, over the window and at
+//! the granularity the request asks for.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDistributionMetricData::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A reporting read: it refuses a request whose values cannot hold together,
+//! looks the distribution up, and reports the datapoints the store has for that
+//! metric — it writes nothing, so a later caller sees exactly what it would have
+//! seen had this call never happened.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -126,6 +127,44 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// Every metric a content delivery network distribution publishes, each with the
+/// `unit` its data is published in.
+///
+/// The list is the modelled `GetDistributionMetricDataRequest$metricName`
+/// documentation — "Valid distribution metric names are listed below, along with
+/// the most useful `statistics` to include in your request, and the published
+/// `unit` value" — and the `unit` of each row is the "published unit" that entry
+/// states. Source:
+/// `smithy_query(query="doc",shape="GetDistributionMetricDataRequest",member="metricName")`.
+///
+/// It covers every member of the modelled `DistributionMetricName` enum, which is
+/// what this operation's boundary walk admits. The documentation writes the two
+/// error-rate entries as `4xxErrorRate` and `5xxErrorRate`, which are that enum's
+/// `Http4xxErrorRate` and `Http5xxErrorRate` members — a Smithy enum member cannot
+/// begin with a digit — so those are the names a request carries and the names
+/// keyed here.
+///
+/// It lives beside the one operation that reads it, the way
+/// `crate::state::INSTANCE_METRIC_UNITS` lives in the store because the alarm
+/// slice reads that one too.
+pub const DISTRIBUTION_METRIC_UNITS: &[(&str, &str)] = &[
+    ("Requests", "None"),
+    ("BytesDownloaded", "None"),
+    ("BytesUploaded", "None"),
+    ("TotalErrorRate", "Percent"),
+    ("Http4xxErrorRate", "Percent"),
+    ("Http5xxErrorRate", "Percent"),
+];
+
+/// The unit the distribution metric `metric_name` is published in, or `None` when
+/// this catalog does not know the metric.
+pub fn distribution_metric_unit(metric_name: &str) -> Option<&'static str> {
+    DISTRIBUTION_METRIC_UNITS
+        .iter()
+        .find(|(name, _)| *name == metric_name)
+        .map(|(_, unit)| *unit)
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -199,18 +238,159 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDistributionMetricData` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDistributionMetricDataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Reporting only: the answer is read from the stored distribution record
+        // and the observations the store holds for the metric, and the one write
+        // behind this call is the clock materialising transitions it already owed
+        // (see `crate::state::with_state`).
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDistributionMetricData"))
+        // Lightsail serves the distribution APIs from the N. Virginia endpoint
+        // ALONE, so the Region the request was signed for decides whether this
+        // call is served at all — a distribution's metrics are not readable
+        // through any other Region's endpoint. Nothing else this operation
+        // reports comes from the request metadata: a distribution is a GLOBAL
+        // resource, identified across the account by its name alone.
+        if let Some(message) = crate::state::domain_region_refusal(ctx.parts()) {
+            return Err(invalid(message));
+        }
+
+        // `distributionName`, `metricName`, `period`, `startTime`, `endTime`,
+        // `unit` and `statistics` are modelled `@required` members; the name's
+        // pattern, the `MetricPeriod` range (60..=86400) and every enum this
+        // input reaches (`DistributionMetricName`, `MetricUnit` and the
+        // `MetricStatistic` entries of `statistics`) are modelled constraints, so
+        // the centralized walk refused anything outside them before this body
+        // ran. What is left is what the model cannot express: the window has to
+        // be a window, the unit has to be the one the metric is published in, and
+        // the request has to ask for at least one statistic.
+
+        // "The start of the time interval for which to get metric data" / "The
+        // end of the time interval": an interval whose end does not follow its
+        // start is no interval at all, so no window of it could be reported.
+        let start = crate::state::timestamp_key(input.start_time);
+        let end = crate::state::timestamp_key(input.end_time);
+        if start >= end {
+            return Err(invalid(format!(
+                "startTime must be earlier than endTime, got startTime {} and endTime {} \
+                 (seconds since the epoch)",
+                // The INSTANT each member names, sub-second part included and
+                // signed, so a window inverted inside one second — or one that
+                // lies before the epoch — is reported as what it is rather than
+                // as two equal whole seconds.
+                input.start_time.as_secs_f64(),
+                input.end_time.as_secs_f64()
+            )));
+        }
+
+        // `unit` is "The unit for the metric data request. Valid units depend on
+        // the metric data being requested. For the valid units with each
+        // available metric, see the metricName parameter" — and each distribution
+        // metric's own entry states the ONE unit it is published in
+        // ([`DISTRIBUTION_METRIC_UNITS`]). A request asking for a
+        // metric in a unit it is not published in names no series, so it is
+        // refused as the invalid input it is rather than answered as if the
+        // series existed.
+        let Some(published_unit) = distribution_metric_unit(&input.metric_name)
+        else {
+            // Unreachable while the catalog covers the modelled
+            // `DistributionMetricName` enum, which the boundary walk restricts
+            // `metricName` to. A metric the model gains and the catalog does not
+            // know yet has no published unit here, so it is honestly "not written
+            // yet" rather than refused or answered.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                "GetDistributionMetricData for the distribution metric {}",
+                input.metric_name
+            )));
+        };
+        if input.unit != published_unit {
+            return Err(invalid(format!(
+                "unit '{}' is not a valid unit for the distribution metric {}: its published \
+                 unit is {published_unit}",
+                input.unit, input.metric_name
+            )));
+        }
+
+        // `statistics` is "The statistic for the metric": a request that names
+        // none asks for no statistic of the metric, so there is nothing it could
+        // be answered with.
+        if input.statistics.is_empty() {
+            return Err(invalid(
+                "statistics must name at least one statistic of the metric to return".to_string(),
+            ));
+        }
+
+        let metric_name = input.metric_name;
+        let distribution_name = input.distribution_name;
+        crate::state::with_state(&*self.engine, |store| {
+            // Metrics are reported for a distribution this account HOLDS: a name
+            // no distribution record answers to earns the service's
+            // `DoesNotExist` envelope, not an authoritative-looking empty series.
+            if store.distribution(&distribution_name).is_none() {
+                return Err(not_found(&distribution_name));
+            }
+            Ok(GetDistributionMetricDataOutput {
+                // "The name of the metric returned" — the metric whose series
+                // this answer is, which is the one the request named.
+                metric_name: Some(metric_name.clone()),
+                // The datapoints the store holds for that metric over the
+                // requested window: NONE, for every window and every
+                // distribution.
+                //
+                // Every distribution metric is a measurement taken on the viewer
+                // TRAFFIC a caching network served — the requests viewers made,
+                // the bytes downloaded to them and uploaded to the origin, and
+                // the share of those requests answered with a 4xx or a 5xx status
+                // (`GetDistributionMetricDataRequest$metricName`). This emulator
+                // serves no viewer request through a distribution and monitors
+                // none, so no observation was ever made in any of the period
+                // windows the request spans, whatever its `period`.
+                //
+                // An empty `metricData` says exactly that, and is what the
+                // service itself answers for a window it holds no data for — a
+                // window before the distribution existed, say. A
+                // plausible-looking number per window would be invented telemetry
+                // a client could not tell from a measured one, and would
+                // contradict the rest of this store, where every alarm stays
+                // `INSUFFICIENT_DATA` because no metric of it has data
+                // (`crate::state::ALARM_STATE_INSUFFICIENT_DATA`) and
+                // `GetInstanceMetricData` and `GetContainerServiceMetricData`
+                // report the same empty series. The `statistics` the request
+                // asked for select members OF a datapoint, so with no datapoints
+                // they have nothing to fill.
+                metric_data: Some(Vec::new()),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not serve: the modelled `InvalidInputException`, whose message names the
+/// member that is wrong and the rule it broke — or states the Region restriction
+/// the model documents on that same shape.
+fn invalid(message: String) -> GetDistributionMetricDataError {
+    GetDistributionMetricDataErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// No distribution of that name is stored: Lightsail's `DoesNotExist` rejection —
+/// HTTP 400, wire error `NotFoundException`, body `code` `DoesNotExist` and a
+/// message naming the resource type and the requested name.
+fn not_found(name: &str) -> GetDistributionMetricDataError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(
+        crate::state::RESOURCE_TYPE_DISTRIBUTION,
+        name,
+    )
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> GetDistributionMetricDataError {
+    GetDistributionMetricDataErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail distribution store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

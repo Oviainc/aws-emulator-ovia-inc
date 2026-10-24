@@ -28,6 +28,13 @@
 //! [`StoredOperation::view`] / [`StoredConfigurationCheckOperation::view`], so no
 //! handler assembles a response member by hand.
 //!
+//! An application's SAP HANA databases are DERIVED from that same record rather than
+//! held beside it: the emulator discovers nothing on the registered instances, so the
+//! databases an application has are the ones its registration named
+//! ([`StoredApplication::databases`], projected onto the wire `DatabaseSummary` by
+//! [`ApplicationDatabase::summary`]) — which is what `ListDatabases` reports, so a
+//! database cannot outlive the registration it came from.
+//!
 //! Resource permissions work the same way: `PutResourcePermission` grants and
 //! `GetResourcePermission` reads the SAME triples in [`RegionState::resource_permissions`],
 //! and the `Policy` document both report is PROJECTED from them by
@@ -39,8 +46,8 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     Application, ApplicationCredential, ApplicationSummary, ConfigurationCheckOperation,
-    ConflictException, Filter, InternalServerException, Operation, ResourceNotFoundException,
-    ValidationException, CONFIGURATION_CHECK_TYPE_VALUES,
+    ConflictException, DatabaseSummary, Filter, InternalServerException, Operation,
+    ResourceNotFoundException, ValidationException, CONFIGURATION_CHECK_TYPE_VALUES,
 };
 
 /// The region an ARN carries when the request is unsigned, so no SigV4 credential
@@ -106,6 +113,22 @@ pub const OPERATION_TYPE_STOP_APPLICATION: &str = "STOP_APPLICATION";
 /// names the resource kind every operation in this slice targets — the registered
 /// application.
 pub const APPLICATION_RESOURCE_TYPE: &str = "APPLICATION";
+
+/// `ComponentType` of the SAP HANA database component of an application. One of the
+/// model's `ComponentType` values (see [`crate::ops::types::COMPONENT_TYPE_VALUES`]).
+pub const COMPONENT_TYPE_HANA: &str = "HANA";
+
+/// The name SAP HANA gives the system database of a multitenant database system; every
+/// other database of that system is a tenant database. It is what tells a `DatabaseType`
+/// of `SYSTEM` from one of `TENANT` — see [`database_type_for`].
+pub const HANA_SYSTEM_DATABASE_NAME: &str = "SYSTEMDB";
+
+/// `DatabaseType` of the system database of a HANA system. One of the model's
+/// `DatabaseType` values (see [`crate::ops::types::DATABASE_TYPE_VALUES`]).
+pub const DATABASE_TYPE_SYSTEM: &str = "SYSTEM";
+
+/// `DatabaseType` of a tenant database of a HANA system.
+pub const DATABASE_TYPE_TENANT: &str = "TENANT";
 
 /// How long after the call that starts it a status change the clock owes falls due.
 ///
@@ -305,7 +328,101 @@ impl StoredApplication {
             _ => None,
         }
     }
+
+    /// The SAP HANA databases of this application, in `DatabaseId` order.
+    ///
+    /// The emulator discovers nothing on the registered instances, so the databases an
+    /// application has are the ones its registration named: every
+    /// `ApplicationCredential` names, in `DatabaseName`, the SAP HANA database its
+    /// secret reaches, so there is one database per distinct name and an application
+    /// registered with no credentials has none. Two credentials naming the same database
+    /// are one database, since a database is identified by its name
+    /// ([`database_id_from_name`]).
+    ///
+    /// `region` is the Region the application is registered in, which is the Region its
+    /// databases' ARNs carry.
+    pub fn databases(&self, region: &str) -> Vec<ApplicationDatabase> {
+        // The component a HANA database belongs to is the application's HANA component,
+        // identified the way this service identifies every component: by the System ID
+        // and the component type. An application whose registration named no System ID
+        // has nothing to identify that component by.
+        let component_id = self
+            .sid
+            .as_deref()
+            .map(|sid| component_id(sid, COMPONENT_TYPE_HANA));
+        // Keyed by `DatabaseId`, which both deduplicates and puts the databases in id
+        // order, so a page taken over them is stable between calls.
+        let mut databases: BTreeMap<String, ApplicationDatabase> = BTreeMap::new();
+        for credential in &self.credentials {
+            let database_id = database_id_from_name(&credential.database_name);
+            databases
+                .entry(database_id.clone())
+                .or_insert_with(|| ApplicationDatabase {
+                    application_id: self.id.clone(),
+                    component_id: component_id.clone(),
+                    arn: database_arn(region, &self.id, &database_id),
+                    database_id,
+                    database_name: credential.database_name.clone(),
+                    database_type: database_type_for(&credential.database_name).to_string(),
+                });
+        }
+        databases.into_values().collect()
+    }
 }
+
+/// A SAP HANA database of a registered application: the record `DatabaseSummary` is
+/// projected from.
+///
+/// DERIVED from the registration by [`StoredApplication::databases`] rather than stored
+/// beside it, so the registration stays the single source of truth for its databases and
+/// no call can report one the application does not have.
+#[derive(Debug, Clone)]
+pub struct ApplicationDatabase {
+    /// The `ApplicationId` of the application this database belongs to.
+    pub application_id: String,
+    /// The `ComponentId` of the application's HANA component, absent when the
+    /// registration named no System ID to identify that component by.
+    pub component_id: Option<String>,
+    /// The `DatabaseId`, derived from the name by [`database_id_from_name`].
+    pub database_id: String,
+    /// The `DatabaseName` the registration's credential named.
+    pub database_name: String,
+    /// A `DatabaseType` value; see [`database_type_for`].
+    pub database_type: String,
+    pub arn: String,
+}
+
+impl ApplicationDatabase {
+    /// Project the database onto the modelled `DatabaseSummary`, with the tags held for
+    /// its ARN.
+    pub fn summary(&self, tags: Option<HashMap<String, String>>) -> DatabaseSummary {
+        DatabaseSummary {
+            application_id: Some(self.application_id.clone()),
+            component_id: self.component_id.clone(),
+            database_id: Some(self.database_id.clone()),
+            database_type: Some(self.database_type.clone()),
+            arn: Some(self.arn.clone()),
+            tags,
+        }
+    }
+
+    /// The key a database listing is ordered and paged by: this database's application
+    /// id and its own id, in that order.
+    ///
+    /// The two are joined by a byte lower than any the modelled `ApplicationId`
+    /// (`^[\w\d\.-]+$`) and `DatabaseId` (`[\w\d]+$`) patterns admit, so ordering these
+    /// keys as strings is the same as ordering by (application id, database id) — which
+    /// is what makes a `NextToken` resume at the database the previous page stopped at.
+    pub fn page_key(&self) -> String {
+        format!(
+            "{}{DATABASE_PAGE_KEY_SEPARATOR}{}",
+            self.application_id, self.database_id
+        )
+    }
+}
+
+/// Joins the two parts of a database listing key; see [`ApplicationDatabase::page_key`].
+const DATABASE_PAGE_KEY_SEPARATOR: char = '\u{1}';
 
 /// A persisted asynchronous operation: the record `GetOperation` reads.
 #[derive(Debug, Clone)]
@@ -886,6 +1003,61 @@ pub fn application_arn(region: &str, application_id: &str) -> String {
     )
 }
 
+/// The id of the component a registration declared with `sid` and `component_type`.
+///
+/// A component is identified by the System ID and the type it was declared with, so two
+/// entries describing the same component are one component — and the HANA component a
+/// database belongs to is named the same way as one the registration listed.
+pub fn component_id(sid: &str, component_type: &str) -> String {
+    format!("{sid}-{component_type}")
+}
+
+/// The ARN of the database `database_id` of the application `application_id` in
+/// `region`: `arn:aws:ssm-sap:<region>:<account>:database/<ApplicationId>/<DatabaseId>`.
+///
+/// A database is a sub-resource of its application, so its ARN names both ids; the
+/// account segment comes from the core's single source of truth, never a literal.
+pub fn database_arn(region: &str, application_id: &str, database_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("database/{application_id}/{database_id}"),
+    )
+}
+
+/// The `DatabaseId` of the SAP HANA database named `database_name`.
+///
+/// A database is identified by its name, so its id is a function of that name: every
+/// character the model's `DatabaseId` pattern (`[\w\d]+$`) does not admit is replaced by
+/// `_`, which that pattern does admit. So a name of any form yields an id of the
+/// modelled form, the same name always yields the same id, and the id is no longer than
+/// the name (`DatabaseName` is at most 100 characters, `DatabaseId` at most 300).
+pub fn database_id_from_name(database_name: &str) -> String {
+    database_name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '_' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// The `DatabaseType` of the SAP HANA database named `database_name`.
+///
+/// The system database of a HANA system is the one named [`HANA_SYSTEM_DATABASE_NAME`]
+/// (HANA database names are case-insensitive); every other database of the system is a
+/// tenant database.
+pub fn database_type_for(database_name: &str) -> &'static str {
+    if database_name.eq_ignore_ascii_case(HANA_SYSTEM_DATABASE_NAME) {
+        DATABASE_TYPE_SYSTEM
+    } else {
+        DATABASE_TYPE_TENANT
+    }
+}
+
 /// The region a request is scoped to: the one its SigV4 credential scope names, or
 /// [`DEFAULT_REGION`] when the request carries no scope (an unsigned call).
 ///
@@ -1057,17 +1229,16 @@ pub fn not_found(message: impl Into<String>) -> ResourceNotFoundException {
     }
 }
 
-/// The message an application-CONTROL call reports when the application it names is not
-/// registered in this account and Region.
+/// The message a call reports when the application it names is not registered in this
+/// account and Region.
 ///
 /// Built from the request: the `ApplicationId` the caller sent is the only variable part,
-/// so every handler that acts on the application a request names reports the SAME
-/// template around it — which is what a client surfacing or matching on the service's
-/// not-found wording reads. The template is AWS's, as the `ssm-sap`
+/// so every handler that acts on or reads under the application a request names reports
+/// the SAME template around it — which is what a client surfacing or matching on the
+/// service's not-found wording reads. The template is AWS's, as the `ssm-sap`
 /// application-control recordings show it, and it goes with the 404
-/// `ResourceNotFoundException` those operations model. A call that merely LOOKS an
-/// application up models no not-found error and answers the same condition with
-/// [`no_registered_application`] (400) instead.
+/// `ResourceNotFoundException` those operations model. A call that models NO not-found
+/// error answers the same condition with [`no_registered_application`] (400) instead.
 pub fn application_not_found_message(reference: &str) -> String {
     format!("Application {reference} doesn't exist.")
 }

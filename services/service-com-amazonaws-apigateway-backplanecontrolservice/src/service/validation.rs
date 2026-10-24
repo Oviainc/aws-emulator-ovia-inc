@@ -4,10 +4,13 @@
 //!
 //! The framework finds the violations (the protocol's deserializer for an absent
 //! required member, `constraints::validate` for a value outside a declared bound) and
-//! words them in its own conventional envelope. API Gateway words the same facts
-//! differently in three ways, all of them properties of the service or of the shape
-//! that was violated rather than of one request:
+//! words them in its own conventional envelope, under its own error code. API Gateway
+//! states the same facts differently in four ways, all of them properties of the service
+//! or of the shape that was violated rather than of one request:
 //!
+//! 0. **The refusal is named `BadRequestException`**, the client-input error this
+//!    service's model declares, rather than the framework's generic
+//!    `ValidationException`; see [`BAD_REQUEST_EXCEPTION`].
 //! 1. **The member path is rooted at the operation's input shape.** AWS's own model
 //!    names an operation's input `<Operation>Input`, and the clause names the member by
 //!    its path from that root in lowerCamel — `updateDocumentationVersionInput.
@@ -25,18 +28,27 @@
 //! 3. **An enum value set is listed in the order the service declares the enum in**,
 //!    which is not always the order the public model lists (see [`OP_VALUE_SET`]).
 //!
-//! Status (400) and error code ([`VALIDATION_EXCEPTION`]) are the framework's own
-//! choice for a constraint failure and are left alone; only the constructed sentence
-//! changes.
+//! Status (400) is the framework's own choice for a constraint failure and is left
+//! alone; the error code and the constructed sentence are this service's.
 
 use aws_smithy_schema_server::constraints::{path, ViolationKind};
 use smithy_server_runtime::{Refused, Violation};
 
-/// The error code a constraint failure is named by, unchanged from the one the
-/// framework's refusal channel picks for this `restJson1` service: a chosen [`Refused`]
-/// replaces the code and the message TOGETHER, so the code is restated here rather than
-/// left to a default that a reworded message would otherwise silently drop.
-pub(super) const VALIDATION_EXCEPTION: &str = "ValidationException";
+/// The error code a constraint failure is named by.
+///
+/// NOT the framework's default for a `restJson1` service (`ValidationException`): API
+/// Gateway classifies a request that breaks a modelled input constraint as a BAD REQUEST
+/// and answers `BadRequestException` (HTTP 400) — the recorded refusal of an
+/// out-of-enum `CreateAuthorizer$type` carries that code, and `BadRequestException` is
+/// the client-input error this service's model declares on the operation ( "The
+/// submitted request is not valid, for example, the input is incomplete or incorrect").
+/// A client branching on `BadRequestException` must therefore recognise the refusal the
+/// boundary validator answers with, and the code is a REQUIREMENT of the wire contract
+/// in a way the constructed sentence is not.
+///
+/// A chosen [`Refused`] replaces the code and the message TOGETHER, which is what lets
+/// this one seam state both.
+pub(super) const BAD_REQUEST_EXCEPTION: &str = "BadRequestException";
 
 /// The one enum of this service whose value set the recordings show in an order the
 /// public Smithy model does not list it in.
@@ -66,7 +78,7 @@ pub(super) fn refusal(operation: &str, violations: &[Violation]) -> Option<Refus
     // cannot arrive here with wording of its own.
     let message = aws_smithy_schema_server::envelope(&stated)?;
     Some(Refused {
-        code: VALIDATION_EXCEPTION.to_string(),
+        code: BAD_REQUEST_EXCEPTION.to_string(),
         message,
     })
 }
@@ -362,8 +374,8 @@ mod tests {
             let stated = refusal("UpdateRestApi", std::slice::from_ref(&found))
                 .unwrap_or_else(|| panic!("case {case:?}: expected a reworded refusal"));
             assert_eq!(
-                stated.code, VALIDATION_EXCEPTION,
-                "case {case:?}: expected the code {VALIDATION_EXCEPTION}, got {:?}",
+                stated.code, BAD_REQUEST_EXCEPTION,
+                "case {case:?}: expected the code {BAD_REQUEST_EXCEPTION}, got {:?}",
                 stated.code
             );
             assert_eq!(
