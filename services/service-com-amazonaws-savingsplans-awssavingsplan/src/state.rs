@@ -469,29 +469,67 @@ pub const MAX_TAG_KEY_CHARS: usize = 128;
 /// The longest tag value AWS accepts (256 Unicode characters, same source).
 pub const MAX_TAG_VALUE_CHARS: usize = 256;
 
+/// Why a tag set was refused, which is what decides WHICH modelled error the
+/// refusal is reported as.
+///
+/// The two are different failures and the model names both: a tag set that
+/// does not fit the per-resource tag allowance has exhausted a QUOTA, so an
+/// operation that declares `ServiceQuotaExceededException` reports it as that
+/// (HTTP 402); a key or value outside its documented length is a malformed
+/// input parameter, so it stays `ValidationException` (HTTP 400) everywhere.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TagRejection {
+    /// The resulting tag set would be larger than [`MAX_TAGS_PER_PLAN`].
+    QuotaExceeded(String),
+    /// A tag key or value breaks the length the service accepts.
+    Invalid(String),
+}
+
+impl TagRejection {
+    /// Whether this refusal is a quota failure rather than a constraint one.
+    pub fn is_quota_exceeded(&self) -> bool {
+        matches!(self, Self::QuotaExceeded(_))
+    }
+
+    /// The refusal's message, for whichever modelled error carries it.
+    pub fn into_message(self) -> String {
+        match self {
+            Self::QuotaExceeded(message) | Self::Invalid(message) => message,
+        }
+    }
+}
+
 /// Refuse a tag set that is larger than the service accepts, or that carries an
 /// over-long key or value. Checked before anything is stored, so a refused
 /// write changes nothing.
-pub fn check_tags(tags: &BTreeMap<String, String>) -> Result<(), String> {
-    if tags.len() > MAX_TAGS_PER_PLAN {
-        return Err(format!(
-            "a Savings Plan cannot carry more than {MAX_TAGS_PER_PLAN} tags, got {}",
-            tags.len()
-        ));
-    }
+///
+/// The two refusals are distinguished by the [`TagRejection`] handed back, so a
+/// caller branching on the quota error sees it for the tag allowance and the
+/// constraint error for a malformed tag.
+pub fn check_tags(tags: &BTreeMap<String, String>) -> Result<(), TagRejection> {
+    // The SHAPE of each tag is checked first: a malformed input parameter is
+    // refused as one however many tags came with it, so a request that is both
+    // malformed and over the allowance is reported as the constraint failure it
+    // is rather than blamed on the quota.
     for (key, value) in tags {
         if key.chars().count() > MAX_TAG_KEY_CHARS {
-            return Err(format!(
+            return Err(TagRejection::Invalid(format!(
                 "a tag key cannot be longer than {MAX_TAG_KEY_CHARS} characters, got {}",
                 key.chars().count()
-            ));
+            )));
         }
         if value.chars().count() > MAX_TAG_VALUE_CHARS {
-            return Err(format!(
+            return Err(TagRejection::Invalid(format!(
                 "the value of tag '{key}' cannot be longer than {MAX_TAG_VALUE_CHARS} characters, got {}",
                 value.chars().count()
-            ));
+            )));
         }
+    }
+    if tags.len() > MAX_TAGS_PER_PLAN {
+        return Err(TagRejection::QuotaExceeded(format!(
+            "a Savings Plan cannot carry more than {MAX_TAGS_PER_PLAN} tags, got {}",
+            tags.len()
+        )));
     }
     Ok(())
 }
@@ -1532,10 +1570,14 @@ impl SavingsPlanRecord {
     /// result would break [`check_tags`] — so a refused `TagResource` leaves the
     /// stored tag set exactly as it was, and no caller can grow it past the
     /// service's tag limit.
+    ///
+    /// The [`TagRejection`] says which refusal it was, so the handler reports a
+    /// tag set that does not fit the allowance as a quota failure and a
+    /// malformed tag as a constraint one.
     pub fn merge_tags(
         &mut self,
         tags: impl IntoIterator<Item = (String, String)>,
-    ) -> Result<(), String> {
+    ) -> Result<(), TagRejection> {
         let mut merged = self.tags.clone();
         merged.extend(tags);
         check_tags(&merged)?;

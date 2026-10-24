@@ -19,6 +19,8 @@ mod activity_language_code;
 mod date_time_wire_form;
 #[path = "all/free_tier.rs"]
 mod free_tier;
+#[path = "all/resource_not_found_status.rs"]
+mod resource_not_found_status;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/wire_contract.rs"]

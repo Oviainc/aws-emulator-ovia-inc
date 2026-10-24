@@ -31,6 +31,8 @@ mod savings_plans_lifecycle;
 mod state_roundtrip;
 #[path = "all/tag_key_round_trip.rs"]
 mod tag_key_round_trip;
+#[path = "all/tag_quota_errors.rs"]
+mod tag_quota_errors;
 #[path = "all/tagging_error_paths.rs"]
 mod tagging_error_paths;
 #[path = "all/validation_echoes_submitted_values.rs"]

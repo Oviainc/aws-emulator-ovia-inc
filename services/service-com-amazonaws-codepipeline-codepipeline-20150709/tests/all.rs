@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/acknowledge_third_party_job.rs"]
 mod acknowledge_third_party_job;
+#[path = "all/action_artifact_lists.rs"]
+mod action_artifact_lists;
 #[path = "all/action_executions.rs"]
 mod action_executions;
 #[path = "all/action_revisions.rs"]

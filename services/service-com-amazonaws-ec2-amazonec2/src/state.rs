@@ -151,6 +151,20 @@
 //! retains is either a word the service chose or an id read back out of another store —
 //! nothing caller-sized — so no byte charge is made for one.
 //!
+//! ## Carrier gateways
+//!
+//! [`ComAmazonawsEc2Amazonec2State::carrier_gateways`] holds the account's carrier
+//! gateways as the modelled `CarrierGateway` shape itself, keyed by `CarrierGatewayId`
+//! in a [`BTreeMap`] — the same arrangement, and for the same reasons, as the VPC and
+//! subnet stores: every member `CreateCarrierGateway` sets round-trips through
+//! `DescribeCarrierGateways` without a field-by-field copy, and the id order is both the
+//! describe's order and what a pagination token names a position in. A carrier gateway
+//! `CreateCarrierGateway` answers is `pending` (`CarrierGatewayState`), so
+//! [`ComAmazonawsEc2Amazonec2State::carrier_gateway_available_at`] records when the clock
+//! owes it `available`, the subnet store's
+//! [`ComAmazonawsEc2Amazonec2State::subnet_available_at`] arrangement on the same
+//! [`TRANSITION_DELAY`].
+//!
 //! ## AMI store tasks
 //!
 //! [`ComAmazonawsEc2Amazonec2State::store_image_tasks`] holds the AMI store tasks
@@ -1963,6 +1977,22 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// Amazon EVS provisions into this account as part of an environment it is still
     /// building.
     pub subnet_available_at: BTreeMap<String, Instant>,
+    /// Every carrier gateway the account holds, by `CarrierGatewayId`, as the modelled
+    /// `CarrierGateway` shape itself — see the module docs. Ordered by id, which is the
+    /// order `DescribeCarrierGateways` reports and pages over.
+    pub carrier_gateways: BTreeMap<String, crate::ops::types::CarrierGateway>,
+    /// When each carrier gateway's `pending` -> `available` transition falls due, for the
+    /// gateways that have one.
+    ///
+    /// The carrier-gateway counterpart of [`Self::subnet_available_at`], for the same
+    /// reason and on the same clock: `CreateCarrierGateway` answers a gateway in the
+    /// non-terminal `pending` state, so the clock owes it `available`
+    /// [`TRANSITION_DELAY`] later whether or not anybody calls again.
+    pub carrier_gateway_available_at: BTreeMap<String, Instant>,
+    /// A `CreateCarrierGateway` `ClientToken` and the carrier gateway id it minted, so a
+    /// repeat of the same request answers with that gateway instead of creating a second
+    /// one.
+    pub carrier_gateway_client_tokens: HashMap<String, String>,
     /// Every Verified Access trust provider the account holds, by
     /// `VerifiedAccessTrustProviderId`, as the modelled
     /// [`crate::ops::types::VerifiedAccessTrustProvider`] shape itself — so a member a
@@ -2493,6 +2523,9 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             default_vpc_ids: BTreeMap::new(),
             subnets: BTreeMap::new(),
             subnet_available_at: BTreeMap::new(),
+            carrier_gateways: BTreeMap::new(),
+            carrier_gateway_available_at: BTreeMap::new(),
+            carrier_gateway_client_tokens: HashMap::new(),
             verified_access_trust_providers: BTreeMap::new(),
             verified_access_trust_provider_client_tokens: HashMap::new(),
             // A fresh account has created no Verified Access group and no endpoint on one.
@@ -4369,7 +4402,8 @@ impl ComAmazonawsEc2Amazonec2State {
     /// instant whether or not anybody asked, so materialising it changes nothing
     /// a later caller would otherwise have seen. It covers every resource kind that
     /// has one — an instance's next state, a `pending` VPC becoming `available` with
-    /// its IPv6 association moving `associating` -> `associated`, a subnet another service
+    /// its IPv6 association moving `associating` -> `associated`, a `pending` carrier
+    /// gateway becoming `available`, a subnet another service
     /// handed over `pending` becoming `available`, a `pending` transit
     /// gateway with the route tables that come up
     /// with it, a `pending` route server endpoint or route server peer becoming
@@ -4426,6 +4460,20 @@ impl ComAmazonawsEc2Amazonec2State {
             // The transition is applied once; nothing is owed on this VPC any more.
             false
         });
+        let carrier_gateways = &mut self.carrier_gateways;
+        self.carrier_gateway_available_at
+            .retain(|carrier_gateway_id, due_at| {
+                if now < *due_at {
+                    return true;
+                }
+                if let Some(carrier_gateway) = carrier_gateways.get_mut(carrier_gateway_id) {
+                    if carrier_gateway.state.as_deref() == Some(CARRIER_GATEWAY_STATE_PENDING) {
+                        carrier_gateway.state = Some(CARRIER_GATEWAY_STATE_AVAILABLE.to_string());
+                    }
+                }
+                // The transition is applied once; nothing is owed on this gateway any more.
+                false
+            });
         let subnets = &mut self.subnets;
         self.subnet_available_at.retain(|subnet_id, due_at| {
             if now < *due_at {
@@ -13344,6 +13392,143 @@ pub fn subnet_payload_bytes(subnet: &Subnet) -> usize {
     tag_list_bytes(subnet.tags.as_deref().unwrap_or_default())
 }
 
+// ---------------------------------------------------------------------------
+// Carrier gateways
+// ---------------------------------------------------------------------------
+//
+// A carrier gateway is a resource INSIDE a VPC, like a subnet or a security group:
+// "Creates a carrier gateway" with "the ID of the VPC to associate with the carrier
+// gateway" (`CreateCarrierGatewayRequest$VpcId`), reported by
+// `DescribeCarrierGateways`. What `CreateCarrierGateway` and `DescribeCarrierGateways`
+// share — the id mint, the state the clock owes, the capacity ceiling and the error
+// codes a refusal carries — lives here, so the two cannot disagree about one gateway.
+
+/// A carrier gateway AWS is still creating: the `CarrierGatewayState` enum's `pending`
+/// member (`smithy_query(query="shape",shape="CarrierGatewayState")`), which is what
+/// `CreateCarrierGateway` answers with until [`TRANSITION_DELAY`] has passed — the
+/// carrier-gateway counterpart of [`SUBNET_STATE_PENDING`].
+pub const CARRIER_GATEWAY_STATE_PENDING: &str = "pending";
+
+/// A carrier gateway that is ready: the `CarrierGatewayState` enum's `available` member,
+/// the state the clock owes a `pending` gateway [`TRANSITION_DELAY`] after its create.
+pub const CARRIER_GATEWAY_STATE_AVAILABLE: &str = "available";
+
+/// The `ResourceType` a `CreateCarrierGateway` tag specification may name: the gateway it
+/// creates (`ResourceType` enum member `carrier-gateway`).
+pub const RESOURCE_TYPE_CARRIER_GATEWAY: &str = "carrier-gateway";
+
+/// The id prefix every carrier gateway id carries (`cagw-…`, the form the EC2 console and
+/// CLI report a carrier gateway under).
+pub const CARRIER_GATEWAY_ID_PREFIX: &str = "cagw";
+
+/// The largest number of carrier gateways this in-memory store holds.
+///
+/// A capacity bound in the same style as [`MAX_VPCS`], not an AWS quota: each gateway is a
+/// record in this process's memory, so the number a caller can create has to be finite.
+/// [`ComAmazonawsEc2Amazonec2State::has_carrier_gateway_capacity`] is the predicate a
+/// writer asks first; a create past it refuses with [`CARRIER_GATEWAY_LIMIT_EXCEEDED`].
+pub const MAX_CARRIER_GATEWAYS: usize = 1_000;
+
+/// The error code a create refuses with once the store is full, in the form EC2 names
+/// every quota refusal with (`VpcLimitExceeded`, `SubnetLimitExceeded`,
+/// `SecurityGroupLimitExceeded`, `VolumeLimitExceeded`): `<Resource>LimitExceeded`. The
+/// ceiling it reports is this store's ([`MAX_CARRIER_GATEWAYS`]), not a published AWS
+/// quota.
+pub const CARRIER_GATEWAY_LIMIT_EXCEEDED: &str = "CarrierGatewayLimitExceeded";
+
+/// EC2's error code for a request that named a carrier gateway id this account holds no
+/// gateway for (EC2 API error codes, "InvalidCarrierGatewayID.NotFound").
+pub const INVALID_CARRIER_GATEWAY_ID_NOT_FOUND: &str = "InvalidCarrierGatewayID.NotFound";
+
+/// What one carrier gateway is created with, beyond everything the service itself derives
+/// ([`ComAmazonawsEc2Amazonec2State::insert_carrier_gateway`] mints the id and fills in
+/// the owning account).
+#[derive(Debug, Clone)]
+pub struct CarrierGatewaySpec {
+    /// "The ID of the VPC to associate with the carrier gateway"
+    /// (`CreateCarrierGatewayRequest$VpcId`).
+    pub vpc_id: String,
+    /// The `CarrierGatewayState` the gateway starts in.
+    pub state: String,
+    /// "The tags to associate with the carrier gateway"
+    /// (`CreateCarrierGatewayRequest$TagSpecifications`).
+    pub tags: Vec<Tag>,
+    /// The `ClientToken` the request carried, if any: the token map keeps it for as long
+    /// as the gateway lives, so the bytes it holds are charged with the gateway's.
+    pub client_token: Option<String>,
+}
+
+/// The caller-chosen bytes a stored carrier gateway holds: its tags and the `ClientToken`
+/// the token map keeps for it. Everything else on the record — the id, the account, the
+/// VPC id and the state — is derived by this module or bounded by the model, so it is
+/// fixed-size.
+///
+/// The ONE definition of that charge, the way [`volume_payload_bytes`] is for a volume:
+/// `CreateCarrierGateway` asks it before the write and
+/// [`ComAmazonawsEc2Amazonec2State::insert_carrier_gateway`] charges exactly it.
+pub fn carrier_gateway_payload_bytes(tags: &[Tag], client_token: Option<&str>) -> usize {
+    tag_list_bytes(tags).saturating_add(client_token.map_or(0, str::len))
+}
+
+/// Refuse a request that named a carrier gateway id no gateway of the account has, the way
+/// EC2 does: HTTP 400 `InvalidCarrierGatewayID.NotFound`, with the message EC2 builds from
+/// the id the request named — it spells the resource with the modelled shape's own name
+/// (`CarrierGateway`), as the real service does.
+pub fn invalid_carrier_gateway_id_not_found<E>(carrier_gateway_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_CARRIER_GATEWAY_ID_NOT_FOUND,
+        400,
+        format!("The CarrierGateway ID '{carrier_gateway_id}' does not exist"),
+    )
+}
+
+/// Refuse a create that would take the store past [`MAX_CARRIER_GATEWAYS`]: HTTP 400
+/// `CarrierGatewayLimitExceeded`.
+pub fn carrier_gateway_limit_exceeded<E>(message: impl Into<String>) -> Scaffolded<E> {
+    Scaffolded::service_error(CARRIER_GATEWAY_LIMIT_EXCEEDED, 400, message)
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another carrier gateway fits inside the store's ceiling
+    /// ([`MAX_CARRIER_GATEWAYS`]).
+    ///
+    /// The same contract as [`Self::has_vpc_capacity`]: a create asks first and refuses
+    /// with [`carrier_gateway_limit_exceeded`] when it answers `false`.
+    pub fn has_carrier_gateway_capacity(&self) -> bool {
+        self.carrier_gateways.len() < MAX_CARRIER_GATEWAYS
+    }
+
+    /// Insert a carrier gateway, and answer the `CarrierGatewayId` it was given.
+    ///
+    /// Everything the service itself owns is derived here rather than taken from the
+    /// caller — the id and the owning account — so two writers cannot report the same
+    /// gateway differently. Like [`Self::insert_subnet`], the caller-chosen bytes the
+    /// record retains ([`carrier_gateway_payload_bytes`], the tags plus the client token
+    /// the token map keeps) are charged against the store's byte budget here, so a writer
+    /// cannot store them uncharged.
+    pub fn insert_carrier_gateway(&mut self, spec: CarrierGatewaySpec) -> String {
+        let carrier_gateway_id = self.next_id(CARRIER_GATEWAY_ID_PREFIX);
+        let carrier_gateway = crate::ops::types::CarrierGateway {
+            carrier_gateway_id: Some(carrier_gateway_id.clone()),
+            vpc_id: Some(spec.vpc_id),
+            state: Some(spec.state),
+            owner_id: Some(::engine::emulator_account_id().to_string()),
+            tags: Some(spec.tags),
+        };
+        self.add_stored_bytes(carrier_gateway_payload_bytes(
+            carrier_gateway.tags.as_deref().unwrap_or_default(),
+            spec.client_token.as_deref(),
+        ));
+        if let Some(token) = spec.client_token {
+            self.carrier_gateway_client_tokens
+                .insert(token, carrier_gateway_id.clone());
+        }
+        self.carrier_gateways
+            .insert(carrier_gateway_id.clone(), carrier_gateway);
+        carrier_gateway_id
+    }
+}
+
 impl ComAmazonawsEc2Amazonec2State {
     /// The default VPC OF `region`, by id — the VPC a request that names none is about:
     /// "If you don't specify a security group when you launch an instance, the instance is
@@ -13444,12 +13629,19 @@ impl ComAmazonawsEc2Amazonec2State {
     /// one) … When you delete the VPC, it deletes the default security group, network ACL,
     /// and route table for the VPC" (`DeleteVpc`). So the dependencies are this VPC's
     /// subnets, its security groups other than the default one, and the instances still
-    /// running in it; the default group is NOT one, because the delete removes it.
+    /// running in it; the default group is NOT one, because the delete removes it. A
+    /// carrier gateway of the VPC is one too: it is a gateway "associated with the VPC",
+    /// and `DeleteVpc` does not remove it.
     pub fn vpc_dependencies(&self, vpc_id: &str) -> Vec<String> {
         let mut found: Vec<String> = Vec::new();
         for (subnet_id, subnet) in &self.subnets {
             if subnet.vpc_id.as_deref() == Some(vpc_id) {
                 found.push(subnet_id.clone());
+            }
+        }
+        for (carrier_gateway_id, carrier_gateway) in &self.carrier_gateways {
+            if carrier_gateway.vpc_id.as_deref() == Some(vpc_id) {
+                found.push(carrier_gateway_id.clone());
             }
         }
         for (group_id, group) in &self.security_groups {

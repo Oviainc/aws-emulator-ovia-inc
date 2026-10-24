@@ -1,19 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAccountAssignmentCreationStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAccountAssignmentCreationStatus`'s real behaviour —
-//! EXCEPT on an account instance of IAM Identity Center, where account assignments do
-//! not exist at all and the handler answers the modelled `ValidationException` (400)
-//! that AWS refuses the whole permission-set / account-assignment surface with.
-//! Implement the rest here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAccountAssignmentCreationStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the STORED status record of the assignment-creation operation a `RequestId`
+//! names, within the instance the request names — a pure read: it writes nothing beyond
+//! what the clock already owes the instances themselves. A `RequestId` this instance
+//! holds no record for is the modelled `ResourceNotFoundException`, and on an ACCOUNT
+//! instance of IAM Identity Center — where account assignments do not exist at all — the
+//! whole permission-set / account-assignment surface answers the modelled
+//! `ValidationException` before anything is looked up.
 //!
 //! ## Shape of an operation
 //!
@@ -159,13 +154,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // ONE answer of this operation is real: the ACCOUNT-INSTANCE restriction. Account
-        // assignments are a feature of an organization instance, so on an account
-        // instance no assignment operation can ever have run and AWS refuses this call
-        // with the modelled `ValidationException` (400) — a 501 would claim "nobody has
-        // written this yet" about a request that is permanently refused. Everything else
-        // about `DescribeAccountAssignmentCreationStatus` IS still unwritten, so it keeps
-        // the SCAFFOLDED marker and its 501 below.
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DescribeAccountAssignmentCreationStatusErrorModeled::InternalServerException(
                 InternalServerException {
@@ -173,18 +161,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
         })?;
-        let withdrawn = {
-            let mut store = state.lock();
-            // The account's ambient instance if nothing has enabled one yet, and what the
-            // clock already owes, so this call resolves the same instance a read at this
-            // instant would resolve.
-            store.on_request(
-                &crate::state::request_region(ctx.parts()),
-                ::std::time::SystemTime::now(),
-            );
-            store.permission_set_surface_withdrawn(&input.instance_arn)
-        };
-        if withdrawn {
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // A READ, except for what the CLOCK already owes the instances themselves, and
+        // the account's ambient instance if nothing has enabled one yet (`on_request`):
+        // reporting a tracked operation's status neither advances it nor creates one.
+        store.on_request(&region, ::std::time::SystemTime::now());
+
+        // The ACCOUNT-INSTANCE restriction, asked BEFORE any resource lookup: account
+        // assignments are a feature of an organization instance, so on an account
+        // instance no assignment operation can ever have run and the refusal does not
+        // depend on whether this request id names one. An ARN this account holds no
+        // instance for is NOT this refusal — it falls through to the 404 below.
+        if store.permission_set_surface_withdrawn(&input.instance_arn) {
             return Err(
                 DescribeAccountAssignmentCreationStatusErrorModeled::ValidationException(
                     ValidationException {
@@ -199,15 +188,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
-        // Implement `DescribeAccountAssignmentCreationStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAccountAssignmentCreationStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAccountAssignmentCreationStatus"))
+
+        if store.instance(&input.instance_arn).is_none() {
+            return Err(
+                DescribeAccountAssignmentCreationStatusErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "No instance found with the ARN {}",
+                            input.instance_arn
+                        )),
+                        reason: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Never minted, belonging to another instance, or gone with the permission set it
+        // named — all the same answer: this instance tracks no operation under that id.
+        let record = store
+            .assignment_operation(
+                &input.instance_arn,
+                &input.account_assignment_creation_request_id,
+            )
+            .ok_or_else(|| {
+                DescribeAccountAssignmentCreationStatusErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::assignment_operation_not_found_message(
+                            &input.account_assignment_creation_request_id,
+                        )),
+                        reason: None,
+                    },
+                )
+            })?;
+
+        // Answered from the STORED record, so this read cannot disagree with what the
+        // create that minted the request id reported.
+        Ok(DescribeAccountAssignmentCreationStatusOutput {
+            account_assignment_creation_status: Some(record.to_shape()),
+        })
     }
 }

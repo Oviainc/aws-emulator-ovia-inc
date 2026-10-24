@@ -149,12 +149,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Any KIND of resource this service holds is addressable by its ARN here (see
         // `state::holds_resource`); an ARN naming none of them is absent.
         if !store.holds_resource(&input.resource_arn) {
-            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!("Could not find resource {}", input.resource_arn)),
-                },
-            )
-            .into());
+            return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                UntagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(crate::state::absent_resource_message(&input.resource_arn)),
+                }),
+                crate::state::RESOURCE_NOT_FOUND_STATUS,
+            ));
         }
         // Removing a key the resource does not carry is not an error: the request's
         // effect is that the key is absent afterwards.
