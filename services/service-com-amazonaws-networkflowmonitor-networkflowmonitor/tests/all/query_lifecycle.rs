@@ -192,9 +192,10 @@ impl Plane {
     }
 }
 
-/// Whether an answer carries `code`, whichever slot this protocol puts it in.
+/// Whether an answer carries `code`, whichever slot this protocol puts it in:
+/// the harness's own accessor, so every suite reads the code one way.
 fn is_error(answer: &Answer, code: &str) -> bool {
-    answer.error_type.contains(code) || answer.text("__type").contains(code)
+    answer.is_error(code)
 }
 
 /// One row of the `date-time` wire-form table: a rendering of the RFC 3339

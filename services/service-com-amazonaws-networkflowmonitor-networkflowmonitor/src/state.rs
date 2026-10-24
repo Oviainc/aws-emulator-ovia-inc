@@ -153,6 +153,21 @@ pub const NO_CONTENT_SUCCESS_STATUS: u16 = 204;
 /// well above what a client script needs.
 pub const MAX_MONITOR_RESOURCES: usize = 100;
 
+/// The most targets one scope's `targets` list holds, and the most targets one
+/// request may name in either of `UpdateScope`'s two lists.
+///
+/// The scope counterpart of [`MAX_MONITOR_RESOURCES`], for the same reason: a
+/// target's identity includes its caller-chosen `accountId`, so without a ceiling
+/// a caller repeating `UpdateScope` with fresh account ids would grow one stored
+/// record — and the work every later call does over it — without limit.
+/// `TargetResourceList` carries `@length(1, 99)` on `UpdateScope`'s own members,
+/// so the boundary validator already caps ONE request's lists; this is what caps
+/// what the STORE ends up holding across calls. A request that would leave a
+/// scope past it is refused with the modelled `ValidationException` (HTTP 400,
+/// naming the member), the refusal `UpdateScope` models for a member it will not
+/// accept.
+pub const MAX_SCOPE_TARGETS: usize = 100;
+
 /// How many `clientToken`s of already-applied updates a monitor remembers, so a
 /// replayed `@idempotent` update is recognized as a replay instead of applying
 /// twice ([`Monitor::update_replayed`]).
@@ -358,9 +373,10 @@ impl Monitor {
     /// is what decides whether `modifiedAt` moves).
     ///
     /// Each list is edited as a SET keyed by an entry's identity (`type` +
-    /// `identifier`): the removals land first and then the additions, so one
-    /// request naming a resource in both ends with that resource present, and
-    /// repeating either is a no-op rather than a duplicate or an error.
+    /// `identifier`): the removals land first and then the additions, so
+    /// repeating either is a no-op rather than a duplicate or an error. A request
+    /// naming one resource in BOTH an add and a remove list never reaches here —
+    /// it is refused as a contradiction before the monitor is read.
     ///
     /// A request that would leave a stored list past [`MAX_MONITOR_RESOURCES`] is
     /// refused: the answer is the member to name in a `ValidationException` and
@@ -609,26 +625,21 @@ pub fn tags_as_map(tags: &BTreeMap<String, String>) -> HashMap<String, String> {
 /// The account id a `TargetId` union carries. `accountId` is its only member
 /// today ("currently, a target is always an Amazon Web Services account"), so an
 /// id that is not one compares equal to nothing.
-fn target_account_id(id: &TargetId) -> &str {
+pub fn target_account_id(id: &TargetId) -> &str {
     match id {
         TargetId::accountId(account_id) => account_id.as_str(),
     }
 }
 
-/// Whether two `targets` lists name the same Region/account pairs in the same
-/// order. `TargetResource` is a generated wire shape and derives no `PartialEq`,
-/// so the comparison is spelled out over its members.
-fn same_targets(stored: &[TargetResource], requested: &[TargetResource]) -> bool {
-    stored.len() == requested.len()
-        && stored.iter().zip(requested).all(|(left, right)| {
-            left.region == right.region
-                && left.target_identifier.target_type == right.target_identifier.target_type
-                && target_account_id(&left.target_identifier.target_id)
-                    == target_account_id(&right.target_identifier.target_id)
-        })
+/// The account that owns every resource this emulator holds — the account segment
+/// of every ARN it mints. A scope is "all the resources for a specific root
+/// account", and that root account here is the emulator's own.
+pub fn owner_account_id() -> &'static str {
+    ::engine::emulator_account_id()
 }
 
-/// The two members a monitor resource list entry carries on the wire.
+/// An entry of a list that an update edits as a SET: the scope's `targets` and a
+/// monitor's `localResources` / `remoteResources`.
 ///
 /// `MonitorLocalResource` and `MonitorRemoteResource` are generated wire shapes
 /// that derive no `PartialEq` and share no trait, so this is how ONE comparison
@@ -660,6 +671,23 @@ impl MonitorResource for MonitorRemoteResource {
     fn identifier(&self) -> &str {
         self.identifier.as_str()
     }
+}
+
+/// The first entry an update names in BOTH its add list and its remove list, or
+/// `None` when the two lists are disjoint.
+///
+/// An update that names one resource in both says two contradictory things about
+/// that resource, which is what makes the REQUEST bad rather than an edit with a
+/// winner, so every add/remove pair is checked through here before anything is
+/// applied.
+pub fn overlapping_resources<'a, T: MonitorResource>(
+    to_add: &'a [T],
+    to_remove: &[T],
+) -> Option<&'a T> {
+    let removed: BTreeSet<(String, String)> = to_remove.iter().map(identity).collect();
+    to_add
+        .iter()
+        .find(|entry| removed.contains(&identity(*entry)))
 }
 
 /// The list `stored` becomes when a request's removals and additions are applied:
@@ -699,6 +727,16 @@ pub fn too_many_resources(named: usize) -> String {
     format!(
         "{named} resources, more than the {MAX_MONITOR_RESOURCES} one monitor list \
          holds in this emulator"
+    )
+}
+
+/// The scope counterpart of [`too_many_resources`]: the reason text of the
+/// modelled 400 for a `targets` list this service will not hold, built from the
+/// request so a caller can fix the request from it alone.
+pub fn too_many_targets(named: usize) -> String {
+    format!(
+        "{named} targets, more than the {MAX_SCOPE_TARGETS} one scope holds in \
+         this emulator"
     )
 }
 
@@ -830,6 +868,79 @@ fn same_resources<T: MonitorResource>(stored: &[T], requested: &[T]) -> bool {
             .iter()
             .zip(requested)
             .all(|(left, right)| identity_ref(left) == identity_ref(right))
+}
+
+/// Whether two `targets` lists name the same Region/account pairs in the same
+/// order. `TargetResource` is a generated wire shape and derives no `PartialEq`,
+/// so the comparison goes through each target's identity.
+fn same_targets(stored: &[TargetResource], requested: &[TargetResource]) -> bool {
+    stored.len() == requested.len()
+        && stored
+            .iter()
+            .zip(requested)
+            .all(|(left, right)| target_identity(left) == target_identity(right))
+}
+
+/// A target's identity: the Region, the target type and the account it names —
+/// the three members that say WHICH Region-account pair a target is, so a scope's
+/// `targets` is edited as a set keyed by them, the way a monitor's resource lists
+/// are keyed by [`identity`].
+fn target_identity(target: &TargetResource) -> (String, String, String) {
+    (
+        target.region.clone(),
+        target.target_identifier.target_type.clone(),
+        target_account_id(&target.target_identifier.target_id).to_string(),
+    )
+}
+
+/// The first target a request names in BOTH `resourcesToAdd` and
+/// `resourcesToDelete`, or `None` when the two lists are disjoint: the target
+/// counterpart of [`overlapping_resources`], for the same reason.
+pub fn overlapping_targets<'a>(
+    to_add: &'a [TargetResource],
+    to_delete: &[TargetResource],
+) -> Option<&'a TargetResource> {
+    let deleted: BTreeSet<(String, String, String)> =
+        to_delete.iter().map(target_identity).collect();
+    to_add
+        .iter()
+        .find(|target| deleted.contains(&target_identity(target)))
+}
+
+/// The `targets` list a scope ends with once an update's deletions and then its
+/// additions are applied: the target counterpart of [`merged_resources`], as a set
+/// keyed by [`target_identity`], so a replay of one update lands on the same
+/// targets and a target named twice is held once.
+pub fn merged_targets(
+    stored: &[TargetResource],
+    to_delete: &[TargetResource],
+    to_add: &[TargetResource],
+) -> Vec<TargetResource> {
+    let deleted: BTreeSet<(String, String, String)> =
+        to_delete.iter().map(target_identity).collect();
+    let mut merged: Vec<TargetResource> = stored
+        .iter()
+        .filter(|target| !deleted.contains(&target_identity(target)))
+        .cloned()
+        .collect();
+    let mut present: BTreeSet<(String, String, String)> =
+        merged.iter().map(target_identity).collect();
+    for addition in to_add {
+        if present.insert(target_identity(addition)) {
+            merged.push(addition.clone());
+        }
+    }
+    merged
+}
+
+/// How a target names itself in a refusal, so a caller can tell WHICH entry of a
+/// list was refused: the account it names, and the Region it names it in.
+pub fn describe_target(target: &TargetResource) -> String {
+    format!(
+        "the target for account {} in {}",
+        target_account_id(&target.target_identifier.target_id),
+        target.region
+    )
 }
 
 /// Per-service state for com-amazonaws-networkflowmonitor-networkflowmonitor. A handler reaches it through [`service_state`].
@@ -1081,7 +1192,17 @@ pub fn state_unavailable() -> InternalServerException {
 /// id this message carries is that ARN.
 pub fn not_found(resource_type: &str, id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
-        message: Some(format!("{resource_type} {id} was not found")),
+        message: Some(format!("{} [{id}] doesn't exist", capitalized(resource_type))),
+    }
+}
+
+/// `word` with its first character upper-cased, so the ARN resource type doubles
+/// as the label a message opens with (`monitor` -> `Monitor`).
+fn capitalized(word: &str) -> String {
+    let mut characters = word.chars();
+    match characters.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + characters.as_str(),
+        None => String::new(),
     }
 }
 
@@ -1119,9 +1240,15 @@ pub fn scope_not_found(region: &str, scope_id: &str) -> ResourceNotFoundExceptio
 }
 
 /// The modelled 409 for a create of a name the store already holds.
-pub fn already_exists(resource_type: &str, id: &str) -> ConflictException {
+///
+/// The text is a constant for the condition, carrying no value from the request:
+/// the caller already named the resource, and the condition is the same whichever
+/// one it was.
+pub fn already_exists(resource_type: &str) -> ConflictException {
     ConflictException {
-        message: Some(format!("{resource_type} {id} already exists")),
+        message: Some(format!(
+            "Cannot create a {resource_type} which already exists"
+        )),
     }
 }
 
@@ -1152,6 +1279,18 @@ pub fn quota_exceeded(resource_type: &str, limit: usize) -> ServiceQuotaExceeded
 pub fn field_validation(member: &str, message: impl Into<String>) -> ValidationException {
     ValidationException {
         message: Some(format!("{member}: {}", message.into())),
+    }
+}
+
+/// The modelled 400 for a `nextToken` this service did not issue.
+///
+/// A constant for the condition rather than a rendering of the rejected token:
+/// every paginated list in this service refuses an unissued cursor with the same
+/// text, so a paginating client can recognise "restart the scan" without parsing
+/// anything out of the message.
+pub fn invalid_next_token() -> ValidationException {
+    ValidationException {
+        message: Some("NextToken provided isn't valid.".to_string()),
     }
 }
 

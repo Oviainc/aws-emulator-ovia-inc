@@ -57,6 +57,13 @@ impl Answer {
     pub fn number(&self, name: &str) -> f64 {
         self.member(name).as_f64().unwrap_or(f64::NAN)
     }
+
+    /// Whether this answer carries the error code `code`, in whichever of the two
+    /// places the protocol renders it (the `x-amzn-errortype` header, or the
+    /// body's `__type`).
+    pub fn is_error(&self, code: &str) -> bool {
+        self.error_type.contains(code) || self.text("__type").contains(code)
+    }
 }
 
 impl Emulator {
@@ -119,6 +126,13 @@ impl Emulator {
 
     pub async fn get_scope(&self, scope_id: &str) -> Answer {
         self.call("GET", &format!("/scopes/{scope_id}"), None).await
+    }
+
+    /// `UpdateScope`: `PATCH /scopes/{scopeId}`, from the operation's `@http`
+    /// trait in the model.
+    pub async fn update_scope(&self, scope_id: &str, body: Value) -> Answer {
+        self.call("PATCH", &format!("/scopes/{scope_id}"), Some(body))
+            .await
     }
 
     pub async fn delete_scope(&self, scope_id: &str) -> Answer {

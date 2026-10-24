@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateScope
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateScope`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateScope::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Edits a stored scope's `targets` ([`crate::state`]) and answers with the stored
+//! record. `@idempotent`: the add and delete lists are applied as a SET, so a
+//! replay of one update lands on the same targets.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +160,165 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateScope` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateScopeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateScope"))
+        // The FORM of the `scopeId` first, exactly as `GetScope` and `DeleteScope`
+        // check it: a value that cannot be an identifier this service generates is
+        // a fault in the request (the modelled 400), not a scope that is absent.
+        if !crate::state::is_scope_id(&input.scope_id) {
+            return Err(
+                UpdateScopeErrorModeled::ValidationException(crate::state::invalid_scope_id())
+                    .into(),
+            );
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateScopeErrorModeled::InternalServerException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+
+        let to_add = input.resources_to_add.unwrap_or_default();
+        let to_delete = input.resources_to_delete.unwrap_or_default();
+
+        // Before the store is reached at all: neither list this request carries
+        // may name more targets than one scope holds. `TargetResourceList`'s own
+        // `@length(1, 99)` already caps them, so this is the belt the monitor
+        // lists wear too (`state::request_overflow`) — one request can never
+        // allocate past the ceiling the stored list is held to below.
+        for (member, named) in [
+            ("resourcesToAdd", to_add.len()),
+            ("resourcesToDelete", to_delete.len()),
+        ] {
+            if named > crate::state::MAX_SCOPE_TARGETS {
+                return Err(UpdateScopeErrorModeled::ValidationException(
+                    crate::state::field_validation(member, crate::state::too_many_targets(named)),
+                )
+                .into());
+            }
+        }
+
+        // The Region this request is made in: the "service region" every target it
+        // adds has to name, and the Region the missing-scope ARN is rendered in.
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.settle(now);
+
+        // "The request specifies a resource that doesn't exist": an update never
+        // creates a scope, so an id the store holds nothing under is the modelled
+        // 404, in the same wording `GetScope` answers with. Taken mutably once:
+        // every refusal below is decided from the request and this record alone,
+        // so nothing else of the store is read after it.
+        let Some(scope) = state.scopes.get_mut(&input.scope_id) else {
+            return Err(UpdateScopeErrorModeled::ResourceNotFoundException(
+                crate::state::scope_not_found(&region, &input.scope_id),
+            )
+            .into());
+        };
+
+        // Network Flow Monitor generates metrics for the Region it runs in, so a
+        // target this request would ADD has to name the Region the request is made
+        // in. Every refusal below happens BEFORE anything is written, so the scope
+        // a refused update names is left exactly as it was.
+        if to_add.iter().any(|target| target.region != region) {
+            return Err(UpdateScopeErrorModeled::ValidationException(cross_region_target()).into());
+        }
+
+        // One target named in both lists says two contradictory things about it,
+        // the same contradiction `UpdateMonitor` refuses in its own four lists.
+        if let Some(both) = crate::state::overlapping_targets(&to_add, &to_delete) {
+            return Err(UpdateScopeErrorModeled::ValidationException(
+                crate::state::field_validation(
+                    "resourcesToAdd",
+                    format!(
+                        "{} is also in resourcesToDelete",
+                        crate::state::describe_target(both)
+                    ),
+                ),
+            )
+            .into());
+        }
+
+        // Whatever the lists say, the scope the update leaves behind has to keep
+        // the account that owns it — a scope is "all the resources for a specific
+        // root account", so dropping that account's own target would leave a scope
+        // that is not its owner's — and at least one target, with none there being
+        // no topology to generate metrics for, and no more than the ceiling one
+        // scope is held to, so repeated updates naming fresh accounts cannot grow
+        // one record without limit. Each is decided on the MERGED result, so a
+        // removal the scope never held is the no-op it is rather than a refusal.
+        let owner = crate::state::owner_account_id();
+        let held_owner = holds_owner(&scope.targets, owner);
+        let targets = crate::state::merged_targets(&scope.targets, &to_delete, &to_add);
+        if held_owner && !holds_owner(&targets, owner) {
+            return Err(
+                UpdateScopeErrorModeled::ValidationException(owner_not_removable(owner)).into(),
+            );
+        }
+        if targets.is_empty() {
+            return Err(UpdateScopeErrorModeled::ValidationException(
+                crate::state::field_validation(
+                    "resourcesToDelete",
+                    "a scope must keep at least one target",
+                ),
+            )
+            .into());
+        }
+        if targets.len() > crate::state::MAX_SCOPE_TARGETS {
+            return Err(UpdateScopeErrorModeled::ValidationException(
+                crate::state::field_validation(
+                    "resourcesToAdd",
+                    crate::state::too_many_targets(targets.len()),
+                ),
+            )
+            .into());
+        }
+
+        scope.targets = targets;
+        // The status is the one the record already holds: this edit changes which
+        // resources the topology covers, and a scope that was ready stays ready.
+        Ok(output(scope))
+    }
+}
+
+/// Whether `targets` includes a target for the account `owner`.
+fn holds_owner(targets: &[TargetResource], owner: &str) -> bool {
+    targets.iter().any(|target| {
+        crate::state::target_account_id(&target.target_identifier.target_id) == owner
+    })
+}
+
+/// The modelled 400 for a target this request would add from another Region.
+///
+/// A constant for the condition: which entry of the list was wrong is the
+/// caller's own input, and the rule is the same for every one of them.
+fn cross_region_target() -> ValidationException {
+    ValidationException {
+        message: Some(
+            "invalid input -> (invalid targets -> (The target region must match the \
+             service region -> (for the specified target resource)))"
+                .to_string(),
+        ),
+    }
+}
+
+/// The modelled 400 for a request that would remove the scope's owner account,
+/// naming the account the request asked to remove.
+fn owner_not_removable(account_id: &str) -> ValidationException {
+    ValidationException {
+        message: Some(format!(
+            "invalid input -> (owner [{account_id}] cannot be removed from scope.)"
+        )),
+    }
+}
+
+/// This operation's output for a stored scope — every member read off the record,
+/// so an update answers exactly what the following `GetScope` answers.
+fn output(scope: &crate::state::Scope) -> UpdateScopeOutput {
+    UpdateScopeOutput {
+        scope_id: scope.scope_id.clone(),
+        scope_arn: scope.scope_arn.clone(),
+        status: scope.status.as_wire().to_string(),
+        tags: crate::state::tags_for_output(&scope.tags),
     }
 }

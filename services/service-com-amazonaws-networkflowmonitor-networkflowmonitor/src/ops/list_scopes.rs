@@ -163,10 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     Some(cursor) => Some(cursor),
                     None => {
                         return Err(ListScopesErrorModeled::ValidationException(
-                            crate::state::field_validation(
-                                "nextToken",
-                                "is not a token this service issued",
-                            ),
+                            crate::state::invalid_next_token(),
                         )
                         .into())
                     }

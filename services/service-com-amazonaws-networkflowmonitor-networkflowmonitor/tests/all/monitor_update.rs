@@ -206,19 +206,6 @@ fn rows() -> Vec<Row> {
             changes_record: false,
         },
         Row {
-            case: "one resource named by both the add and the remove list ends present",
-            name: "add-and-remove-one",
-            local: vec![("AWS::EC2::VPC", "vpc-1")],
-            remote: vec![("AWS::AWSService", "S3")],
-            update: json!({
-                "remoteResourcesToAdd": resources(&[("AWS::AWSService", "S3")]),
-                "remoteResourcesToRemove": resources(&[("AWS::AWSService", "S3")]),
-            }),
-            expect_local: vec![("AWS::EC2::VPC", "vpc-1")],
-            expect_remote: vec![("AWS::AWSService", "S3")],
-            changes_record: false,
-        },
-        Row {
             case: "an update naming no resource at all leaves the monitor alone",
             name: "empty-update",
             local: vec![("AWS::EC2::VPC", "vpc-1")],

@@ -68,9 +68,10 @@ const RESOURCE_NOT_FOUND: &str = "ResourceNotFoundException";
 /// handler resolves before any query lookup, so the id only has to be well formed.
 const UNMINTED_QUERY_ID: &str = "00000000-0000-4000-9000-ffffffffffff";
 
-/// Whether `answer` carries `code`, whichever slot this protocol puts it in.
+/// Whether `answer` carries `code`, whichever slot this protocol puts it in:
+/// the harness's own accessor, so every suite reads the code one way.
 fn is_error(answer: &Answer, code: &str) -> bool {
-    answer.error_type.contains(code) || answer.text("__type").contains(code)
+    answer.is_error(code)
 }
 
 /// Assert a refusal's STATUS and CODE — the two facts a client branches on.

@@ -6,10 +6,12 @@
 //! already holds — "Update a monitor to add or remove local or remote resources" —
 //! and answers with the stored record, so the next `GetMonitor` reports exactly
 //! what this call answered. Each list is edited as a SET keyed by an entry's
-//! `type` + `identifier`: the request's removals land first and then its
-//! additions, and `modifiedAt` moves only when the record actually changed.
-//! `@idempotent` with an `@idempotencyToken`: a `clientToken` this monitor has
-//! already applied answers with the record unchanged.
+//! `type` + `identifier`: a request that names one resource in both an *ToAdd list
+//! and its *ToRemove list is refused as a contradiction, and otherwise the
+//! request's removals land first and then its additions, with `modifiedAt` moving
+//! only when the record actually changed. `@idempotent` with an
+//! `@idempotencyToken`: a `clientToken` this monitor has already applied answers
+//! with the record unchanged.
 //!
 //! ## Shape of an operation
 //!
@@ -209,6 +211,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Then the request's own consistency: a resource named in an *ToAdd list
+        // AND in its *ToRemove list says two contradictory things about that
+        // resource, so the request is refused whole rather than resolved in favour
+        // of one of the two lists. Refused before the monitor is read, so a
+        // contradictory update leaves the record — and `modifiedAt` — as it was.
+        if let Some((member, reason)) = contradiction(&input) {
+            return Err(UpdateMonitorErrorModeled::ValidationException(
+                crate::state::field_validation(member, reason),
+            )
+            .into());
+        }
+
         let mut state = state.lock();
         state.settle(now);
 
@@ -271,6 +285,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the request that came in.
         Ok(output(monitor))
     }
+}
+
+/// Which member of this request contradicts another, and why — or `None` when no
+/// resource is named in both an *ToAdd list and its *ToRemove list.
+///
+/// The two pairs are checked in the order the model declares them, so a request
+/// contradicting both is refused naming the local pair; the reason names the
+/// resource the caller put in both lists, so the request can be fixed from the
+/// message alone.
+fn contradiction(input: &UpdateMonitorInput) -> Option<(&'static str, String)> {
+    let local = crate::state::overlapping_resources(
+        input.local_resources_to_add.as_deref().unwrap_or_default(),
+        input
+            .local_resources_to_remove
+            .as_deref()
+            .unwrap_or_default(),
+    )
+    .map(|entry| {
+        (
+            "localResourcesToAdd",
+            contradiction_reason(
+                "localResourcesToRemove",
+                entry.r#type.as_str(),
+                entry.identifier.as_str(),
+            ),
+        )
+    });
+    local.or_else(|| {
+        crate::state::overlapping_resources(
+            input.remote_resources_to_add.as_deref().unwrap_or_default(),
+            input
+                .remote_resources_to_remove
+                .as_deref()
+                .unwrap_or_default(),
+        )
+        .map(|entry| {
+            (
+                "remoteResourcesToAdd",
+                contradiction_reason(
+                    "remoteResourcesToRemove",
+                    entry.r#type.as_str(),
+                    entry.identifier.as_str(),
+                ),
+            )
+        })
+    })
+}
+
+/// The reason text of the contradiction refusal, built from the request: the
+/// resource it named twice, and the other member it named it in.
+fn contradiction_reason(other_member: &str, resource_type: &str, identifier: &str) -> String {
+    format!("{resource_type} {identifier} is also in {other_member}")
 }
 
 /// This operation's output for a stored monitor — every member read off the

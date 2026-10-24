@@ -240,10 +240,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // silent overwrite of the first monitor.
         if state.monitors.contains_key(&input.monitor_name) {
             return Err(CreateMonitorErrorModeled::ConflictException(
-                crate::state::already_exists(
-                    crate::state::MONITOR_RESOURCE,
-                    &input.monitor_name,
-                ),
+                crate::state::already_exists(crate::state::MONITOR_RESOURCE),
             )
             .into());
         }
