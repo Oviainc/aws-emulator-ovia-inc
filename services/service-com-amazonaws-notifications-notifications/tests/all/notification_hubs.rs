@@ -25,7 +25,7 @@ use service_com_amazonaws_notifications_notifications::state::{
 
 // The HTTP harness this suite drives the service through, shared with every
 // other suite in this crate.
-use crate::harness::{encode_path_label, error_code, Emulator};
+use crate::harness::{encode_path_label, error_code, is_an_instant, Emulator};
 
 /// Long enough that a transition the register or deregister call made due has
 /// certainly fallen due, without depending on how slow the machine is.
@@ -109,23 +109,6 @@ fn status_of(case: &str, hub: &Value) -> String {
         "case {case:?}: status must be one of the modelled NotificationHubStatus values {NOTIFICATION_HUB_STATUS_VALUES:?}, got {status:?}"
     );
     status
-}
-
-/// Whether a rendered timestamp is a real instant: epoch seconds past 2020, or
-/// an RFC 3339 string in this century. This framework renders a timestamp member
-/// in either encoding depending on the schema, so both are accepted — but a zero
-/// or a placeholder is not.
-fn is_an_instant(value: &Value) -> bool {
-    match value {
-        Value::Number(_) => value.as_f64().is_some_and(|secs| secs > 1_600_000_000.0),
-        Value::String(rendered) => {
-            rendered.len() >= 20
-                && rendered.starts_with("20")
-                && rendered[..4].bytes().all(|b| b.is_ascii_digit())
-                && rendered.contains('T')
-        }
-        _ => false,
-    }
 }
 
 /// Whether `later` is at or after `earlier`, for whichever of the two encodings
