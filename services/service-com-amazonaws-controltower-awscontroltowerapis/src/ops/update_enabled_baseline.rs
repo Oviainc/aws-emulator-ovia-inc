@@ -213,10 +213,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The baseline catalog is not in this slice (`ListBaselines`/`GetBaseline` own
-        // it), so the requested version is persisted as given rather than checked against
-        // a catalog this service cannot yet consult.
-        //
+        // The version and the parameters are checked against the CATALOG entry of the
+        // baseline this enablement applies — the one the enable was accepted for — so an
+        // update cannot move an enablement to a version its baseline does not offer or
+        // configure it with a parameter that baseline does not declare.
+        let stored_baseline_identifier = store
+            .enabled_baselines
+            .get(&arn)
+            .map(|enabled| enabled.baseline_identifier.clone())
+            .unwrap_or_default();
+        let Some(baseline) = crate::state::resolve_baseline(&stored_baseline_identifier) else {
+            // Every stored enablement was written by `EnableBaseline`, which refuses a
+            // baseline the catalog does not publish, so this is unreachable from the wire;
+            // the modelled 404 is the answer if a store ever held such an enablement.
+            return Err(UpdateEnabledBaselineErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "no baseline matches baselineIdentifier {stored_baseline_identifier}"
+                    ),
+                },
+            )
+            .into());
+        };
+
+        if let Some(message) = crate::state::unsupported_baseline_version_message(
+            baseline,
+            &input.baseline_version,
+        ) {
+            return Err(UpdateEnabledBaselineErrorModeled::ValidationException(
+                ValidationException { message },
+            )
+            .into());
+        }
+
         // An absent `parameters` member leaves the applied parameters as they are, while a
         // present list — empty included — is the new applied set: the operation updates an
         // enablement's "applied parameters OR version" (model docs), so a version-only
@@ -228,6 +257,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .map(|parameter| (parameter.key, parameter.value))
                     .collect()
             });
+
+        if let Some(message) = parameters
+            .as_deref()
+            .and_then(|parameters| crate::state::unacceptable_parameters_message(baseline, parameters))
+        {
+            return Err(UpdateEnabledBaselineErrorModeled::ValidationException(
+                ValidationException { message },
+            )
+            .into());
+        }
 
         let Some(operation_identifier) =
             store.record_enabled_baseline_update(&arn, &input.baseline_version, parameters, now)

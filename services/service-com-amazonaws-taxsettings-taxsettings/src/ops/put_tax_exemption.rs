@@ -14,15 +14,21 @@
 //! past is refused before any record is written, and no case is opened for a
 //! submission that was not applied.
 //!
-//! Three refusals of the request. Two are `ValidationException`s about the
-//! collection `GetTaxExemptionTypes` publishes: an `exemptionType` that catalog
-//! does not name, and an `authority` outside the jurisdictions that type applies
-//! in ([`crate::state::check_exemption_type`] and
+//! Two refusals of the request, both `ValidationException`s about the collection
+//! `GetTaxExemptionTypes` publishes: an `exemptionType` that catalog does not
+//! name, and an `authority` outside the jurisdictions that type applies in
+//! ([`crate::state::check_exemption_type`] and
 //! [`crate::state::check_exemption_authority`] decide both against the catalog).
-//! The third is the `ResourceNotFoundException` an account outside the caller's
-//! consolidated billing family gets, judged by the same
-//! [`crate::state::ComAmazonawsTaxsettingsTaxsettingsState::reports_exemptions_for`]
-//! predicate `BatchGetTaxExemptions` reads an account through.
+//!
+//! The accounts a submission names are NOT screened. The request addresses "a
+//! single account or all accounts listed in a consolidated billing family", and
+//! membership in that family is not something this service is ever told: it
+//! models no organization and no operation enrolls an account, so a well-formed
+//! account id this service happens to hold no other resource for is
+//! indistinguishable from a family member — a brand-new member account holds no
+//! tax registration at all, and whether it holds one has nothing to do with
+//! submitting an exemption for it. The record the submission writes is what makes
+//! the account one the exemption reads then report on.
 //!
 //! The exemption a submission stores is `Pending`, the status the model gives
 //! one whose certificate has not been reviewed: the certificate is attached to a
@@ -205,21 +211,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(PutTaxExemptionErrorModeled::ValidationException)?;
 
         let mut store = state.lock();
-        // The submission addresses "accounts listed in a consolidated billing
-        // family", so an account this service holds no tax-settings resource for
-        // and that is not the caller's own is outside that family: the CALL is
-        // refused rather than an exemption recorded for an account AWS would not
-        // have accepted — the same judgement, through the same predicate, that
-        // `BatchGetTaxExemptions` makes before reporting on an account.
-        for account_id in &input.account_ids {
-            if !store.reports_exemptions_for(account_id) {
-                return Err(PutTaxExemptionErrorModeled::ResourceNotFoundException(
-                    crate::state::no_exemptions_for_account(account_id),
-                )
-                .into());
-            }
-        }
-
+        // Every account id the request names is written for: the boundary already
+        // refused anything that is not 1..=550 twelve-digit ids, and nothing here
+        // can tell a family member from any other well-formed id (this service
+        // models no organization and no operation enrolls an account in one), so
+        // there is no observable condition to refuse a named account on.
         // The records are written first and the case id minted only once they
         // are: a submission refused for want of room opens no support case, so
         // the ids this service hands out count the submissions it applied. One

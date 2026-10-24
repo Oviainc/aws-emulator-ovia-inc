@@ -14,28 +14,38 @@
 //! (`ClusterConfig`, `EBSOptions`, …) rather than as a second hand-written mirror
 //! of the same members: the model already declares them, and two copies of one
 //! shape is how two operations end up reading two different records.
+//!
+//! Another resource this store holds is the cross-cluster [`Connection`]:
+//! `CreateOutboundConnection` mints one and `DescribeOutboundConnections` reports
+//! it. One record carries both views of a connection — the source domain owner's
+//! outbound one and the destination owner's inbound one — because they are one
+//! resource sharing a `ConnectionId`.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AIMLOptionsInput, AIMLOptionsOutput, AIMLOptionsStatus, AccessPoliciesStatus,
+    AIMLOptionsInput, AIMLOptionsOutput, AIMLOptionsStatus, AWSDomainInformation,
+    AccessPoliciesStatus,
     AdvancedOptionsStatus, AdvancedSecurityOptions, AdvancedSecurityOptionsInput,
     AdvancedSecurityOptionsStatus, AutoTuneOptions, AutoTuneOptionsInput, AutoTuneOptionsOutput,
     AutoTuneOptionsStatus, AutoTuneStatus, AutomatedSnapshotPauseOptions,
     AutomatedSnapshotPauseOptionsStatus, AutomatedSnapshotPauseRequestOptions,
     ChangeProgressDetails, ChangeProgressStatusDetails, ClusterConfig, ClusterConfigStatus,
-    CognitoOptions, CognitoOptionsStatus, DataSourceDetails, DataSourceType,
+    CognitoOptions, CognitoOptionsStatus, ConnectionProperties, DataSourceDetails, DataSourceType,
     DeploymentStrategyOptions,
     DeploymentStrategyOptionsStatus, DomainConfig, DomainEndpointOptions,
-    DomainEndpointOptionsStatus, DomainInfo, DomainStatus, EBSOptions, EBSOptionsStatus,
+    DomainEndpointOptionsStatus, DomainInfo, DomainInformationContainer, DomainStatus, EBSOptions,
+    EBSOptionsStatus,
     EncryptionAtRestOptions, EncryptionAtRestOptionsStatus, EngineModeStatus,
     IAMFederationOptionsOutput, IPAddressTypeStatus, IdentityCenterOptions,
-    IdentityCenterOptionsInput, IdentityCenterOptionsStatus, JWTOptionsOutput, LogPublishingOption,
+    IdentityCenterOptionsInput, IdentityCenterOptionsStatus, InvalidPaginationTokenException,
+    JWTOptionsOutput, LogPublishingOption,
     LogPublishingOptionsStatus, NaturalLanguageQueryGenerationOptionsOutput,
     NodeToNodeEncryptionOptions, NodeToNodeEncryptionOptionsStatus, OffPeakWindowOptions,
-    OffPeakWindowOptionsStatus, OptionStatus, RecurringCharge, ReservedInstance,
-    ReservedInstanceOffering, ResourceNotFoundException,
+    OffPeakWindowOptionsStatus, OptionStatus, OutboundConnection, OutboundConnectionStatus,
+    RecurringCharge, ReservedInstance,
+    ReservedInstanceOffering, ResourceAlreadyExistsException, ResourceNotFoundException,
     RollbackServiceSoftwareOptions, SAMLOptionsOutput, ServiceSoftwareOptions, SnapshotOptions,
     SnapshotOptionsStatus, SoftwareUpdateOptions, SoftwareUpdateOptionsStatus, Tag, UseCaseStatus,
     VPCDerivedInfo, VPCDerivedInfoStatus, VPCOptions, ValidationException, VersionStatus,
@@ -91,15 +101,16 @@ pub const DOMAIN_QUOTA: usize = 100;
 /// [`DOMAIN_QUOTA`] it bounds the whole data-source store.
 pub const DATA_SOURCE_QUOTA: usize = 20;
 
-/// How long a domain stays `Processing` after the call that started the work
-/// (`CreateDomain`, or an `UpdateDomainConfig` that changed something) before the
-/// clock owes it a settled, `Active` configuration.
+/// How long work this control plane starts takes before the clock owes its outcome:
+/// a domain stays `Processing` after the call that started it (`CreateDomain`, or an
+/// `UpdateDomainConfig` that changed something) for this long before it owes a
+/// settled, `Active` configuration, and an outbound cross-cluster connection stays
+/// `VALIDATING` for this long before it owes the next status of its lifecycle.
 ///
 /// OpenSearch Service takes many minutes; the emulator chooses a span, and it is
 /// deliberately NOT zero so a caller acting straight after the call still observes
-/// the transient `Processing` state and the `Processing` option states that go with
-/// it. The due instant is stored on the record and materialised by whichever later
-/// call reads it — nothing sleeps.
+/// the transient state and the states that go with it. The due instant is stored on
+/// the record and materialised by whichever later call reads it — nothing sleeps.
 pub const PROVISIONING: Duration = Duration::from_millis(500);
 
 /// The service software release a domain runs when it is created.
@@ -304,6 +315,166 @@ impl DataSource {
             description: self.description.clone(),
             status: Some(self.status.clone()),
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cross-cluster connections
+// ---------------------------------------------------------------------------
+
+/// `ConnectionMode`'s `DIRECT` value, documented as the mode "used for cross-cluster
+/// search or cross-cluster replication" — which is what `CreateOutboundConnection`
+/// creates, so it is the mode a connection is created with when the request names
+/// none.
+pub const CONNECTION_MODE_DIRECT: &str = "DIRECT";
+
+/// `ConnectionMode`'s `VPC_ENDPOINT` value — the other member of that same two-value
+/// enum, "used for remote reindex between Amazon OpenSearch Service VPC domains".
+/// The model's own enum is what refuses a mode outside the pair, at the request
+/// boundary, before a handler sees it.
+pub const CONNECTION_MODE_VPC_ENDPOINT: &str = "VPC_ENDPOINT";
+
+/// `OutboundConnectionStatusCode`'s `VALIDATING`: "The outbound connection request is
+/// being validated." The status a connection holds from the instant
+/// `CreateOutboundConnection` returns until [`PROVISIONING`] has passed.
+pub const CONNECTION_STATUS_VALIDATING: &str = "VALIDATING";
+
+/// `OutboundConnectionStatusCode`'s (and `InboundConnectionStatusCode`'s)
+/// `PENDING_ACCEPTANCE`: the request "is validated and is not yet accepted by the
+/// remote domain owner" — where a validated connection waits for the destination
+/// domain's owner to accept or reject it.
+pub const CONNECTION_STATUS_PENDING_ACCEPTANCE: &str = "PENDING_ACCEPTANCE";
+
+/// `OutboundConnectionStatusCode`'s `VALIDATION_FAILED`: "Validation failed for the
+/// connection request." Where a request whose referenced domains do not both resolve
+/// ends up, instead of waiting for a decision no owner can make.
+pub const CONNECTION_STATUS_VALIDATION_FAILED: &str = "VALIDATION_FAILED";
+
+/// How many cross-cluster connections ONE source domain holds before
+/// `CreateOutboundConnection` refuses with the modelled `LimitExceededException`.
+///
+/// Like [`DATA_SOURCE_QUOTA`] this is the emulator's OWN bound on the store — it
+/// models neither Service Quotas nor an account's adjustments — and it is what stops
+/// a caller looping with fresh aliases on one source domain from growing the state
+/// without end: every record it counts is released by deleting the connection.
+///
+/// It does NOT on its own bound the whole store, because its partition is the source
+/// domain the REQUEST names and a request may name a domain the registry does not
+/// hold (such a request is accepted and its validation then fails, which is the
+/// behaviour of the service). [`CONNECTION_STORE_QUOTA`] is the bound that does.
+pub const CONNECTION_QUOTA: usize = 20;
+
+/// How many cross-cluster connections the WHOLE store holds before
+/// `CreateOutboundConnection` refuses with the modelled `LimitExceededException`.
+///
+/// This is the aggregate bound on the connection store, and the one that holds
+/// whatever a caller varies: no request field partitions it. It is set at what the
+/// two per-resource quotas allow together — every domain the account can hold, each
+/// with a full set of connections — so it never refuses a create that the
+/// per-source-domain quota would have allowed on a domain that exists. Because the
+/// stored set IS what `DescribeOutboundConnections` answers with, it also bounds the
+/// size of that answer.
+pub const CONNECTION_STORE_QUOTA: usize = CONNECTION_QUOTA * DOMAIN_QUOTA;
+
+/// A status move the clock owes a connection: where the connection goes, what there
+/// is to say about it, and when it falls due.
+///
+/// Stored on the record rather than waited for, so nothing sleeps: whichever later
+/// call reads the connection materialises the move if it is due by then.
+#[derive(Debug, Clone)]
+pub struct OwedStatus {
+    /// The `OutboundConnectionStatusCode` the connection moves to.
+    pub status: String,
+    /// The `OutboundConnectionStatus$Message` that goes with it, where there is more
+    /// to say than the code itself.
+    pub message: Option<String>,
+    /// The instant the move falls due.
+    pub due: SystemTime,
+}
+
+/// One cross-cluster connection between a source (local) domain and a destination
+/// (remote) domain, as this emulator persists it.
+///
+/// A cross-cluster connection is ONE resource with two views: the source domain
+/// owner's OUTBOUND connection and the destination owner's INBOUND connection, which
+/// share a `ConnectionId` and move through the lifecycle together. This is the single
+/// record behind both views — `CreateOutboundConnection` mints it and
+/// `DescribeOutboundConnections` reports it — so no two operations can report the
+/// same connection differently.
+#[derive(Debug, Clone)]
+pub struct Connection {
+    /// `OutboundConnection$ConnectionId`, which is also the inbound view's. Unique
+    /// per connection, so it IS the key the store holds the record under.
+    pub connection_id: String,
+    /// `OutboundConnection$ConnectionAlias`: the name the create gave the connection.
+    pub connection_alias: String,
+    /// The source domain this connection is from, as the create's `LocalDomainInfo`
+    /// resolved to.
+    pub local_domain: AWSDomainInformation,
+    /// The destination domain this connection is to, as the create's
+    /// `RemoteDomainInfo` resolved to.
+    pub remote_domain: AWSDomainInformation,
+    /// `OutboundConnection$ConnectionMode`: [`CONNECTION_MODE_DIRECT`] or
+    /// [`CONNECTION_MODE_VPC_ENDPOINT`].
+    pub connection_mode: String,
+    /// `OutboundConnection$ConnectionProperties`, absent when the create carried
+    /// none. Stored as the modelled shape rather than a second hand-written mirror
+    /// of its members.
+    pub connection_properties: Option<ConnectionProperties>,
+    /// Where the connection is in its lifecycle: one of
+    /// `OutboundConnectionStatusCode`'s values.
+    pub status: String,
+    /// `OutboundConnectionStatus$Message`: what there is to say about that status
+    /// beyond the code — why a validation failed, say. `None` where the code says it
+    /// all.
+    pub status_message: Option<String>,
+    /// The status move the clock owes this connection, if any is outstanding.
+    pub owed: Option<OwedStatus>,
+}
+
+impl Connection {
+    /// Materialise the status move the clock owes this connection, if `now` is past
+    /// its due instant: a request that was being validated becomes one waiting for
+    /// the remote domain owner's decision, or one whose validation failed.
+    ///
+    /// This is the only write a reporting operation makes, and it writes only what
+    /// was already owed at the same instant had nobody called.
+    pub fn settle(&mut self, now: SystemTime) {
+        if self.owed.as_ref().is_none_or(|owed| now < owed.due) {
+            return;
+        }
+        let Some(owed) = self.owed.take() else {
+            return;
+        };
+        self.status = owed.status;
+        self.status_message = owed.message;
+    }
+
+    /// This record as `OutboundConnection` — the element shape
+    /// `DescribeOutboundConnections` reports, and member-for-member the projection
+    /// `CreateOutboundConnection` answers with.
+    pub fn to_outbound(&self) -> OutboundConnection {
+        OutboundConnection {
+            local_domain_info: Some(domain_information(&self.local_domain)),
+            remote_domain_info: Some(domain_information(&self.remote_domain)),
+            connection_id: Some(self.connection_id.clone()),
+            connection_alias: Some(self.connection_alias.clone()),
+            connection_status: Some(OutboundConnectionStatus {
+                status_code: Some(self.status.clone()),
+                // "Verbose information for the outbound connection": carried only
+                // where the status has something to say the code does not.
+                message: self.status_message.clone(),
+            }),
+            connection_mode: Some(self.connection_mode.clone()),
+            connection_properties: self.connection_properties.clone(),
+        }
+    }
+}
+
+/// A stored domain reference in the container the wire reports it in.
+pub fn domain_information(info: &AWSDomainInformation) -> DomainInformationContainer {
+    DomainInformationContainer {
+        aws_domain_information: Some(info.clone()),
     }
 }
 
@@ -1388,6 +1559,13 @@ pub struct ComAmazonawsOpensearchAmazonopensearchserviceState {
     /// the name IS the key. Iterating a `BTreeMap` is order-stable, which is what
     /// lets `ListDomainNames` report the same order twice.
     pub domains: BTreeMap<String, Domain>,
+    /// Every cross-cluster connection, keyed by its `ConnectionId` — unique per
+    /// connection, so the id IS the key. Iterating a `BTreeMap` is order-stable,
+    /// which is what lets `DescribeOutboundConnections` report the same order twice
+    /// and page through the set without repeating or skipping a record.
+    pub connections: BTreeMap<String, Connection>,
+    /// Drives [`ComAmazonawsOpensearchAmazonopensearchserviceState::mint_connection_id`].
+    pub connection_seq: u64,
     /// Drives [`ComAmazonawsOpensearchAmazonopensearchserviceState::mint_endpoint_suffix`].
     pub endpoint_suffix_seq: u64,
     /// The Reserved Instance offering catalog this emulator publishes, keyed by
@@ -1423,6 +1601,8 @@ impl Default for ComAmazonawsOpensearchAmazonopensearchserviceState {
     fn default() -> Self {
         Self {
             domains: BTreeMap::new(),
+            connections: BTreeMap::new(),
+            connection_seq: 0,
             endpoint_suffix_seq: 0,
             reserved_instance_offerings: seed_reserved_instance_offerings(),
             default_application_arn: None,
@@ -1448,9 +1628,28 @@ const SUFFIX_SPACE: u128 = 36u128.pow(SUFFIX_LEN);
 /// SUFFIX_SPACE)` a BIJECTION: distinct seeds can never mint the same suffix.
 const SUFFIX_MULTIPLIER: u128 = 1_000_000_007;
 
-/// The bijection's constant term, so the first suffix minted is not a run of leading
-/// `a`s.
+/// The bijection's constant term for a domain endpoint's suffix, so the first suffix
+/// minted is not a run of leading `a`s.
 const SUFFIX_OFFSET: u128 = 734_291;
+
+/// The bijection's constant term for a connection id. Different from
+/// [`SUFFIX_OFFSET`], so the nth connection id and the nth endpoint suffix — minted
+/// off two counters that both start at zero — do not carry the same token.
+const CONNECTION_ID_OFFSET: u128 = 51_539_607_551;
+
+/// The opaque lowercase-alphanumeric token seed `seq` scrambles to, through the
+/// bijection described on [`SUFFIX_MULTIPLIER`]: distinct seeds under one `offset`
+/// can never render the same token.
+fn opaque_token(seq: u64, offset: u128) -> String {
+    let mut scrambled = (u128::from(seq) * SUFFIX_MULTIPLIER + offset) % SUFFIX_SPACE;
+    let mut token = Vec::with_capacity(SUFFIX_LEN as usize);
+    for _ in 0..SUFFIX_LEN {
+        let digit = usize::try_from(scrambled % 36).unwrap_or(0);
+        token.push(SUFFIX_ALPHABET[digit]);
+        scrambled /= 36;
+    }
+    String::from_utf8(token).unwrap_or_default()
+}
 
 impl ComAmazonawsOpensearchAmazonopensearchserviceState {
     /// Mint the opaque suffix a domain's endpoint host carries, so two domains of
@@ -1460,16 +1659,24 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
     /// [`SUFFIX_MULTIPLIER`], so it is unpredictable-looking yet never repeats.
     pub fn mint_endpoint_suffix(&mut self) -> String {
         self.endpoint_suffix_seq = self.endpoint_suffix_seq.wrapping_add(1);
-        let mut scrambled =
-            (u128::from(self.endpoint_suffix_seq) * SUFFIX_MULTIPLIER + SUFFIX_OFFSET)
-                % SUFFIX_SPACE;
-        let mut suffix = Vec::with_capacity(SUFFIX_LEN as usize);
-        for _ in 0..SUFFIX_LEN {
-            let digit = usize::try_from(scrambled % 36).unwrap_or(0);
-            suffix.push(SUFFIX_ALPHABET[digit]);
-            scrambled /= 36;
-        }
-        String::from_utf8(suffix).unwrap_or_default()
+        opaque_token(self.endpoint_suffix_seq, SUFFIX_OFFSET)
+    }
+
+    /// Mint the identifier a cross-cluster connection is addressed by, so two
+    /// connections never share one.
+    ///
+    /// `ConnectionId` is `@length(min: 10, max: 256)` with pattern
+    /// `^[a-z][a-z0-9\-]+$` — an opaque lowercase token. It is minted off its own
+    /// counter through the same bijection as [`Self::mint_endpoint_suffix`], behind a
+    /// `cc-` prefix for the cross-cluster resource it names, which is also what
+    /// satisfies the pattern's leading letter and carries the token past the
+    /// 10-character minimum.
+    pub fn mint_connection_id(&mut self) -> String {
+        self.connection_seq = self.connection_seq.wrapping_add(1);
+        format!(
+            "cc-{}",
+            opaque_token(self.connection_seq, CONNECTION_ID_OFFSET)
+        )
     }
 
     /// The domain `name` names, with any configuration change the clock owes it
@@ -1485,6 +1692,14 @@ impl ComAmazonawsOpensearchAmazonopensearchserviceState {
     pub fn settle_all(&mut self, now: SystemTime) {
         for domain in self.domains.values_mut() {
             domain.settle(now);
+        }
+    }
+
+    /// Materialise the status move the clock owes every stored cross-cluster
+    /// connection, for a caller about to report on all of them.
+    pub fn settle_connections(&mut self, now: SystemTime) {
+        for connection in self.connections.values_mut() {
+            connection.settle(now);
         }
     }
 
@@ -1868,6 +2083,31 @@ pub fn malformed_arn(member: &str, value: &str) -> ValidationException {
 pub fn default_application_not_set() -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some("No default application is set for this account.".to_string()),
+    }
+}
+
+/// The `ResourceAlreadyExistsException` payload for a create naming a connection
+/// alias the source domain already has a connection under — the mirror of
+/// [`data_source_exists`], so one refusal reads like the other.
+pub fn connection_alias_exists(alias: &str, local_domain: &str) -> ResourceAlreadyExistsException {
+    ResourceAlreadyExistsException {
+        message: Some(format!(
+            "Domain {local_domain} already has a cross-cluster connection with the alias {alias}."
+        )),
+    }
+}
+
+/// The `InvalidPaginationTokenException` payload for a `NextToken` that names no
+/// place in the set being paged: one this service did not mint, or one whose record
+/// has since been released.
+///
+/// The same refusal as [`invalid_next_token`] in a different modelled shape: an
+/// operation that LISTS `InvalidPaginationTokenException` refuses an unresolvable
+/// token with that error, and one that does not falls back to its
+/// `ValidationException`.
+pub fn invalid_pagination_token(token: &str) -> InvalidPaginationTokenException {
+    InvalidPaginationTokenException {
+        message: Some(format!("Invalid pagination token: {token}")),
     }
 }
 

@@ -535,6 +535,8 @@ pub const OPERATION_TYPE_DELETE_LOAD_BALANCER_TLS_CERTIFICATE: &str =
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_DISK_SNAPSHOT: &str = "CreateDiskSnapshot";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_DELETE_DISK_SNAPSHOT: &str = "DeleteDiskSnapshot";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_INSTANCE_SNAPSHOT: &str = "CreateInstanceSnapshot";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_DISK_FROM_SNAPSHOT: &str = "CreateDiskFromSnapshot";
@@ -8588,6 +8590,20 @@ impl ComAmazonawsLightsailLightsail20161128State {
     /// Store a newly created disk snapshot.
     pub fn insert_disk_snapshot(&mut self, snapshot: StoredDiskSnapshot) {
         self.disk_snapshots.insert(snapshot.name.clone(), snapshot);
+    }
+
+    /// Remove the disk snapshot `name` names, answering it. `None` when nothing
+    /// matched.
+    ///
+    /// Nothing else in the store points AT a snapshot: a disk created from one
+    /// copies what it needs out of the snapshot record as it is created, and an
+    /// export record captures its source the same way — which is what lets the
+    /// service say that "regardless of which prior snapshots have been deleted,
+    /// all active snapshots will have access to all the information needed to
+    /// restore the disk". So removing the record is the whole deletion, and the
+    /// clock-owed transition it was carrying goes with it.
+    pub fn remove_disk_snapshot(&mut self, name: &str) -> Option<StoredDiskSnapshot> {
+        self.disk_snapshots.remove(name)
     }
 
     /// The instance snapshot `name` names, for a reporting operation.

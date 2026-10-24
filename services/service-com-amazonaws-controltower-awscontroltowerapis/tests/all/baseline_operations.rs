@@ -47,59 +47,67 @@ pub(crate) struct Enablement {
 }
 
 /// The enablement table: rows differ along what the rule generalises over — the baseline
-/// identifier, the `BaselineVersion` (`@pattern ^\d+(?:\.\d+){0,2}$`, `@length` 1..10, so
-/// one, two and three components and both published bounds), the target, the parameter
-/// list (absent, empty, one, several, and every `Document` kind) and the tag map (absent,
-/// empty, several). Every row names a DIFFERENT baseline/target pair, because one pair is
-/// enabled at most once at a time.
+/// (several entries of the catalog `ListBaselines`/`GetBaseline` publish, in several
+/// regions and partitions-worth of ARN forms), the `baselineVersion` (each baseline's
+/// OLDEST and NEWEST offered version, and one in between), the target, the parameter list
+/// (absent, empty, and the declared key with two `Document` kinds — the value is "a
+/// document of any type") and the tag map (absent, empty, several). The baselines, their
+/// versions and the parameter keys they declare come from
+/// `service_..._awscontroltowerapis::state::BASELINE_CATALOG`, which is what
+/// `ListBaselines` reports. Every row names a DIFFERENT baseline/target pair, because one
+/// pair is enabled at most once at a time.
 pub(crate) fn enablements() -> Vec<Enablement> {
     vec![
         Enablement {
-            case: "a single-component version, no parameters and no tags",
+            case: "the oldest offered version, no parameters and no tags",
             baseline_identifier: "arn:aws:controltower:us-west-2::baseline/17BSJV3IGJ2QSGA2",
-            baseline_version: "4",
+            baseline_version: "1.0",
             target_identifier: "arn:aws:organizations::123456789012:ou/o-exampleorg/ou-aa11-1a",
             parameters: None,
             tags: None,
         },
         Enablement {
-            case: "a two-component version and an empty parameter list",
-            baseline_identifier: "arn:aws:controltower:us-east-1::baseline/J8HX46AHS5MIKQPD",
-            baseline_version: "3.1",
+            case: "a baseline that declares no parameters, with an empty parameter list",
+            baseline_identifier: "arn:aws:controltower:us-east-1::baseline/4T4HA1KMO10S6311",
+            baseline_version: "1.0",
             target_identifier: "arn:aws:organizations::123456789012:ou/o-exampleorg/ou-bb22-2b",
             parameters: Some(serde_json::json!([])),
             tags: Some(serde_json::json!({})),
         },
         Enablement {
-            case: "a three-component version and one string parameter",
+            case: "a baseline whose newest offered version is not its predecessor's",
             baseline_identifier: "arn:aws:controltower:eu-west-1::baseline/LN25R72TTG6IGPTQ",
-            baseline_version: "4.0.2",
+            baseline_version: "4.0",
             target_identifier: "arn:aws:organizations::123456789012:ou/o-exampleorg/ou-cc33-3c",
-            parameters: Some(serde_json::json!([
-                { "key": "IdentityCenterEnabledForBaseline", "value": "true" }
-            ])),
+            parameters: None,
             tags: Some(serde_json::json!({ "Team": "platform" })),
         },
         Enablement {
-            case: "parameters covering every Document kind",
-            baseline_identifier: "arn:aws:controltower:ap-south-1::baseline/QQ1234567890ABCD",
-            baseline_version: "10.10.1000",
+            case: "the newest offered version, with the declared parameter as a boolean",
+            baseline_identifier: "arn:aws:controltower:us-west-2::baseline/17BSJV3IGJ2QSGA2",
+            baseline_version: "4.0",
             target_identifier: "arn:aws:organizations::123456789012:ou/o-exampleorg/ou-dd44-4d",
             parameters: Some(serde_json::json!([
-                { "key": "RetentionDays", "value": 35 },
-                { "key": "Enabled", "value": true },
-                { "key": "Regions", "value": ["us-west-2", "eu-west-1"] },
-                { "key": "Nested", "value": { "level": { "deeper": [1, 2, 3] } } }
+                { "key": "IdentityCenterEnabledForBaseline", "value": true }
             ])),
             tags: Some(serde_json::json!({ "Team": "platform", "Cost-Centre": "4711" })),
         },
         Enablement {
-            case: "the shortest version, on the same baseline as another row's target",
-            baseline_identifier: "arn:aws:controltower:us-west-2::baseline/17BSJV3IGJ2QSGA2",
-            baseline_version: "1",
+            case: "a baseline of one of the shared accounts, in another region",
+            baseline_identifier: "arn:aws:controltower:ap-south-1::baseline/WM8FJ6YHL3QS5XKB",
+            baseline_version: "1.0",
             target_identifier: "arn:aws:organizations::123456789012:ou/o-exampleorg/ou-ee55-5e",
+            parameters: Some(serde_json::json!([])),
+            tags: None,
+        },
+        Enablement {
+            case: "a version between the oldest and the newest, and the declared parameter \
+                   as a string",
+            baseline_identifier: "arn:aws:controltower:us-west-2::baseline/17BSJV3IGJ2QSGA2",
+            baseline_version: "3.0",
+            target_identifier: "arn:aws:organizations::123456789012:ou/o-exampleorg/ou-ff77-7g",
             parameters: Some(serde_json::json!([
-                { "key": "Value", "value": null }
+                { "key": "IdentityCenterEnabledForBaseline", "value": "true" }
             ])),
             tags: None,
         },
@@ -587,12 +595,14 @@ async fn the_enablement_store_is_bounded() {
     use service_com_amazonaws_controltower_awscontroltowerapis::state::MAX_ENABLED_BASELINES;
 
     let baseline = "arn:aws:controltower:us-west-2::baseline/17BSJV3IGJ2QSGA2";
-    let overflow_target = "arn:aws:organizations::123456789012:ou/o-exampleorg/ou-overflow";
+    let overflow_target =
+        "arn:aws:organizations::123456789012:ou/o-exampleorg/ou-cap1-overflow";
 
     let router = emulator();
     let mut first_arn = String::new();
     for index in 0..MAX_ENABLED_BASELINES {
-        let target = format!("arn:aws:organizations::123456789012:ou/o-exampleorg/ou-{index:06}");
+        let target =
+            format!("arn:aws:organizations::123456789012:ou/o-exampleorg/ou-cap1-{index:06}");
         let enabled = enable_pair(&router, baseline, &target).await;
         assert_eq!(
             enabled.status, 200,

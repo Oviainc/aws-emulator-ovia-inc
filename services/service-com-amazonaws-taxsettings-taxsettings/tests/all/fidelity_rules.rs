@@ -555,8 +555,7 @@ fn valid_entry() -> Value {
 /// A `PutTaxExemption` request whose certificate is named `document_name`.
 ///
 /// The account is the caller's own, so a request the boundary admits reaches the
-/// handler and is applied rather than refused for naming an account outside the
-/// caller's consolidated billing family.
+/// handler and is applied.
 fn exemption_request(document_name: &str) -> Value {
     json!({
         "accountIds": [engine::emulator_account_id()],

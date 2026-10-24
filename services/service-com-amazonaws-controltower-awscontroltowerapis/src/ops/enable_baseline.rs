@@ -4,6 +4,9 @@
 //!
 //! Applies a baseline to a target: persists an `EnabledBaseline` in [`crate::state`] and
 //! starts the asynchronous `ENABLE_BASELINE` operation `GetBaselineOperation` reports.
+//! The request is checked against the service's baseline catalog first — the baseline, the
+//! version it offers, the organizational-unit target and the parameters that baseline
+//! declares — so only an enablement that could exist is persisted.
 //! Implemented here because `GetBaselineOperation` has nothing to resolve until some call
 //! mints a baseline operation; the remaining baseline operations keep their own stub
 //! issues.
@@ -181,6 +184,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // WHAT the request asks for is settled before any state is touched, so a request
+        // naming something that could not exist writes nothing: the baseline must be one
+        // the service's catalog publishes, at a version that baseline offers, applied to
+        // an organizational unit, configured only by parameters that baseline declares.
+        // `baselineIdentifier` and `targetIdentifier` are both typed as the generic `Arn`,
+        // whose pattern cannot express either kind of resource, so these are the handler's
+        // to check.
+        let baseline = match crate::state::resolve_baseline(&input.baseline_identifier) {
+            Some(baseline) => baseline,
+            // An ARN of the right shape that names no catalog baseline is a reference to a
+            // resource that does not exist; anything else is not a baseline reference at
+            // all, which is a malformed input rather than a missing resource.
+            None if crate::state::is_baseline_arn(&input.baseline_identifier) => {
+                return Err(EnableBaselineErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "no baseline matches baselineIdentifier {}",
+                            input.baseline_identifier
+                        ),
+                    },
+                )
+                .into());
+            }
+            None => {
+                return Err(EnableBaselineErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "baselineIdentifier {:?} is not the ARN of an AWS Control Tower \
+                             baseline; a baseline is named by the ARN ListBaselines and \
+                             GetBaseline report for it",
+                            input.baseline_identifier
+                        ),
+                    },
+                )
+                .into());
+            }
+        };
+
+        if let Some(message) =
+            crate::state::non_organizational_unit_target_message(&input.target_identifier)
+        {
+            return Err(
+                EnableBaselineErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
+        }
+
+        if let Some(message) = crate::state::unsupported_baseline_version_message(
+            baseline,
+            &input.baseline_version,
+        ) {
+            return Err(
+                EnableBaselineErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
+        }
+
+        let parameters: Vec<(String, ::aws_smithy_types::Document)> = input
+            .parameters
+            .unwrap_or_default()
+            .into_iter()
+            .map(|parameter| (parameter.key, parameter.value))
+            .collect();
+        if let Some(message) = crate::state::unacceptable_parameters_message(baseline, &parameters)
+        {
+            return Err(
+                EnableBaselineErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
+        }
+
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         store.settle(now);
@@ -215,19 +289,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the model declares for this operation.
         let Some(operation_identifier) = store.record_enablement(
             &arn,
-            // The baseline catalog is not in this slice (`ListBaselines`/`GetBaseline`
-            // own it), so the identifier and version are persisted as given and reported
-            // back unchanged rather than checked against a catalog this service cannot
-            // yet consult.
+            // Checked against the catalog above, so what is persisted and reported back is
+            // a baseline this service publishes, at a version that baseline offers.
             &input.baseline_identifier,
             &input.baseline_version,
             &input.target_identifier,
-            input
-                .parameters
-                .unwrap_or_default()
-                .into_iter()
-                .map(|parameter| (parameter.key, parameter.value))
-                .collect(),
+            parameters,
             now,
         ) else {
             return Err(EnableBaselineErrorModeled::ServiceQuotaExceededException(

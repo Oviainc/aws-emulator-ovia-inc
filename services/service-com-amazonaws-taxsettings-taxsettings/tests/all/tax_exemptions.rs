@@ -8,10 +8,12 @@
 //! * the reads report, for each account, the exemptions this service holds for
 //!   it — every stored record, member for member — and an account it holds none
 //!   for simply has no entry in the reported map;
-//! * an account this service holds no tax settings for and that is not the
-//!   caller's own is outside the caller's consolidated billing family, so the
-//!   CALL is refused with `ResourceNotFoundException` (404) rather than reported
-//!   on or written for;
+//! * an exemption READ naming an account this service holds no tax settings for
+//!   and that is not the caller's own refuses the CALL with
+//!   `ResourceNotFoundException` (404) rather than reporting on it;
+//! * a submission, by contrast, screens no account: it records the exemption for
+//!   every account id it names, whatever this service already holds for that
+//!   account, and answers one support case id;
 //! * an exemption whose expiration date has passed is reported `Expired`,
 //!   because lapsing is a transition the clock owes; every other recorded status
 //!   is reported as recorded;
@@ -29,8 +31,11 @@
 //!
 //! The tables below span the classes those rules generalise over — the kinds of
 //! evidence an account is in the family (the caller's own, a stored TRN, stored
-//! exemptions), the number of accounts named (one, the model's `@length` bound of
-//! five, one past it, and duplicates), the catalog entry an exemption was granted
+//! exemptions), what a submission's accounts already hold (nothing at all, a tax
+//! registration, another exemption) against how many it names (one, several, the
+//! model's `@length` bound of 550, and duplicates), the number of accounts a read
+//! names (one, its own `@length` bound of five, one past it, and duplicates), the
+//! catalog entry an exemption was granted
 //! under and whether it is named by its description or its display name, the
 //! authority's shape (a country, a country and a state, either re-cased or
 //! padded), which dates a record carries, every value of
@@ -53,7 +58,7 @@ use service_com_amazonaws_taxsettings_taxsettings::ops::types::{Authority, TaxEx
 use service_com_amazonaws_taxsettings_taxsettings::state::{
     tax_exemption_type_catalog, ComAmazonawsTaxsettingsTaxsettingsState, StoredTaxExemption,
     DEFAULT_PAGE_SIZE, EXEMPTION_STATUS_EXPIRED, EXEMPTION_STATUS_NONE, EXEMPTION_STATUS_PENDING,
-    EXEMPTION_STATUS_VALID, MAX_STORED_EXEMPTIONS,
+    EXEMPTION_STATUS_VALID, MAX_PAGE_SIZE, MAX_STORED_EXEMPTIONS,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -772,23 +777,6 @@ fn certificate(document_name: &str) -> Value {
     })
 }
 
-/// Make each of `accounts` an account this service holds tax settings for, so a
-/// submission naming it is inside the caller's consolidated billing family.
-async fn hold_tax_settings_for(router: &MultiServiceRouter, accounts: &[&str]) {
-    for account in accounts {
-        let stored = call(
-            router,
-            "PutTaxRegistration",
-            &json!({ "accountId": account, "taxRegistrationEntry": a_registration() }),
-        )
-        .await;
-        assert_eq!(
-            stored.status, 200,
-            "case \"setup for {account}\": the registration must store, got {stored:?}"
-        );
-    }
-}
-
 /// One `PutTaxExemption` submission and what the listing must then report for it.
 struct Submission {
     case: &'static str,
@@ -918,7 +906,6 @@ async fn every_submitted_exemption_is_reported_for_every_account_it_names() {
     for submission in SUBMISSIONS {
         let case = submission.case;
         let router = emulator();
-        hold_tax_settings_for(&router, submission.accounts).await;
 
         let before = epoch_secs(SystemTime::now());
         let stored = call(&router, "PutTaxExemption", &submission.body()).await;
@@ -1080,7 +1067,6 @@ async fn an_exemption_is_identified_by_its_type_and_its_jurisdiction() {
     ];
 
     let router = emulator();
-    hold_tax_settings_for(&router, &[account]).await;
     let mut case_ids: Vec<String> = Vec::new();
     for (case, submission, expected_held) in submissions {
         let body = json!({
@@ -1116,26 +1102,162 @@ async fn an_exemption_is_identified_by_its_type_and_its_jurisdiction() {
     }
 }
 
-/// RULE: a submission addresses accounts in the caller's consolidated billing
-/// family, so one naming an account this service holds no tax settings for is
-/// refused whole with `ResourceNotFoundException` (404) and stores nothing.
+/// What this service already holds for an account a submission names. None of it
+/// is a precondition for the submission, so the table spans it.
+#[derive(Clone, Copy, Debug)]
+enum Held {
+    /// Nothing at all: a billing-family member account that has never called
+    /// this service.
+    Nothing,
+    /// A tax registration, stored through `PutTaxRegistration` — a resource that
+    /// has nothing to do with exemptions.
+    ARegistration,
+    /// Another exemption, recorded by an earlier submission.
+    AnotherExemption,
+}
+
+/// Make this service hold `held` for each of `accounts`, through the wire.
+async fn make_service_hold(router: &MultiServiceRouter, held: Held, accounts: &[String]) {
+    for account in accounts {
+        let answer = match held {
+            Held::Nothing => continue,
+            Held::ARegistration => {
+                call(
+                    router,
+                    "PutTaxRegistration",
+                    &json!({ "accountId": account, "taxRegistrationEntry": a_registration() }),
+                )
+                .await
+            }
+            Held::AnotherExemption => {
+                call(
+                    router,
+                    "PutTaxExemption",
+                    &json!({
+                        "accountIds": [account],
+                        "authority": { "country": "US" },
+                        "exemptionType": "Direct Pay Permit",
+                        "exemptionCertificate": certificate("permit.pdf"),
+                    }),
+                )
+                .await
+            }
+        };
+        assert_eq!(
+            answer.status, 200,
+            "case \"setup {held:?} for {account}\": expected 200, got {answer:?}"
+        );
+    }
+}
+
+/// Every account the listing reports, across its pages, sorted — the whole of
+/// what a submission recorded, however many accounts it named.
+async fn all_listed_accounts(router: &MultiServiceRouter) -> Vec<String> {
+    let mut seen: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    loop {
+        // The largest page `maxResults` admits, so the biggest table row still
+        // takes few pages (`smithy_query(query="operation",
+        // operation="ListTaxExemptions")`: 1..=1000).
+        let mut body = json!({ "maxResults": MAX_PAGE_SIZE });
+        if let Some(cursor) = &token {
+            body["nextToken"] = json!(cursor);
+        }
+        let page = call(router, "ListTaxExemptions", &body).await;
+        assert_eq!(
+            (page.status, page.error_code.as_str()),
+            (200, ""),
+            "case \"listing what a submission recorded\": expected 200, got {page:?}"
+        );
+        seen.extend(reported_accounts(&page));
+        token = page
+            .get("nextToken")
+            .as_str()
+            .map(std::string::ToString::to_string);
+        if token.is_none() {
+            break;
+        }
+    }
+    seen.sort();
+    seen
+}
+
+/// RULE: a submission names the accounts it applies to rather than looking them
+/// up — it records the exemption for EVERY well-formed account id it names,
+/// whatever this service already holds for that account, and answers one support
+/// case id. Holding a tax registration is no precondition: the model has no
+/// operation that enrols an account in a consolidated billing family, so a
+/// well-formed id this service holds nothing for is a member account like any
+/// other.
 #[tokio::test]
-async fn a_submission_for_an_account_outside_the_billing_family_is_refused() {
-    let in_family = "000000000012";
-    // The rows differ along which account is outside the family and where it sits
-    // in the list — alone, first, or beside accounts that would have been
-    // written.
-    let cases: &[(&str, Vec<&str>, u16)] = &[
-        ("the caller's own account", vec![own_account()], 200),
-        ("an account with a stored TRN", vec![in_family], 200),
-        ("an account this service knows nothing about", vec!["999999999999"], 404),
-        ("a foreign account named first", vec!["999999999999", in_family], 404),
-        ("a foreign account named last", vec![in_family, "999999999998"], 404),
+async fn a_submission_records_the_exemption_for_every_account_it_names() {
+    // `accountIds` is @length 1..=550 of 12-digit ids
+    // (`smithy_query(query="operation", operation="PutTaxExemption")`), so one row
+    // names as many accounts as a submission may — none of them known here — while
+    // the others differ along how many accounts are named, where in the list an
+    // unknown one sits, whether an id repeats, and what the service already holds.
+    let the_maximum: Vec<String> = (1..=550).map(|index| format!("7{index:011}")).collect();
+    let cases: Vec<(&str, Vec<String>, Held)> = vec![
+        (
+            "one account this service holds nothing for",
+            vec!["111111111111".to_string()],
+            Held::Nothing,
+        ),
+        (
+            "two accounts this service holds nothing for",
+            vec!["111111111111".to_string(), "222222222222".to_string()],
+            Held::Nothing,
+        ),
+        (
+            "the caller's own account",
+            vec![own_account().to_string()],
+            Held::Nothing,
+        ),
+        (
+            "an account holding a tax registration",
+            vec!["000000000031".to_string()],
+            Held::ARegistration,
+        ),
+        (
+            "an account already holding another exemption",
+            vec!["000000000032".to_string()],
+            Held::AnotherExemption,
+        ),
+        (
+            "an unknown account named after the caller's own",
+            vec![own_account().to_string(), "222222222222".to_string()],
+            Held::Nothing,
+        ),
+        (
+            "an unknown account named before the caller's own",
+            vec!["333333333333".to_string(), own_account().to_string()],
+            Held::Nothing,
+        ),
+        (
+            "ids from across the 12-digit space",
+            vec![
+                "000000000001".to_string(),
+                "123456789012".to_string(),
+                "999999999999".to_string(),
+            ],
+            Held::Nothing,
+        ),
+        (
+            "the same unknown account named twice",
+            vec!["444444444444".to_string(), "444444444444".to_string()],
+            Held::Nothing,
+        ),
+        (
+            "the 550 accounts the model's bound admits, none of them known",
+            the_maximum,
+            Held::Nothing,
+        ),
     ];
 
-    for (case, accounts, expected_status) in cases {
+    for (case, accounts, held) in cases {
         let router = emulator();
-        hold_tax_settings_for(&router, &[in_family]).await;
+        make_service_hold(&router, held, &accounts).await;
+
         let answer = call(
             &router,
             "PutTaxExemption",
@@ -1148,27 +1270,84 @@ async fn a_submission_for_an_account_outside_the_billing_family_is_refused() {
         )
         .await;
         assert_eq!(
-            answer.status, *expected_status,
-            "case {case:?}: expected HTTP {expected_status}, got {answer:?}"
+            (answer.status, answer.error_code.as_str()),
+            (200, ""),
+            "case {case:?}: expected the submission to be applied, got {answer:?}"
+        );
+        let case_id = answer
+            .get("caseId")
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case:?}: expected a caseId, got {answer:?}"))
+            .to_string();
+        assert!(
+            (1..=200).contains(&case_id.chars().count()),
+            "case {case:?}: caseId is a 1..200 string, got {case_id:?}"
         );
 
-        let listed = call(&router, "ListTaxExemptions", &json!({})).await;
-        if *expected_status == 200 {
-            let expected: Vec<String> =
-                accounts.iter().map(|account| (*account).to_string()).collect();
+        let mut expected: Vec<String> = accounts.clone();
+        expected.sort();
+        expected.dedup();
+        let recorded = all_listed_accounts(&router).await;
+        assert_eq!(
+            recorded, expected,
+            "case {case:?}: expected the exemption recorded for every account named, got \
+             {recorded:?}"
+        );
+
+        // Read the records back through `BatchGetTaxExemptions` — the first, a
+        // middle and the last of the accounts named, within that read's @length
+        // bound of five.
+        let mut sampled: Vec<String> = Vec::new();
+        for index in [0, expected.len() / 2, expected.len() - 1] {
+            let account = expected[index].clone();
+            if !sampled.contains(&account) {
+                sampled.push(account);
+            }
+        }
+        let read = call(
+            &router,
+            "BatchGetTaxExemptions",
+            &json!({ "accountIds": sampled }),
+        )
+        .await;
+        assert_eq!(
+            (read.status, read.error_code.as_str()),
+            (200, ""),
+            "case {case:?}: expected the recorded accounts to be readable, got {read:?}"
+        );
+        for account in &sampled {
+            let records = reported_exemptions(&read, account);
+            let expected_count = match held {
+                Held::AnotherExemption => 2,
+                Held::Nothing | Held::ARegistration => 1,
+            };
             assert_eq!(
-                reported_accounts(&listed),
-                expected,
-                "case {case:?}: expected the exemption to be recorded, got {listed:?}"
+                records.len(),
+                expected_count,
+                "case {case:?} ({account}): expected {expected_count} exemption(s), got {records:?}"
             );
-        } else {
-            assert!(
-                answer.error_code.contains("ResourceNotFoundException"),
-                "case {case:?}: expected a ResourceNotFoundException, got {answer:?}"
+            let submitted = records
+                .iter()
+                .find(|record| {
+                    record
+                        .get("taxExemptionType")
+                        .and_then(|exemption_type| exemption_type.get("displayName"))
+                        .and_then(Value::as_str)
+                        == Some("Reseller")
+                })
+                .unwrap_or_else(|| {
+                    panic!("case {case:?} ({account}): expected the submitted type, got {records:?}")
+                });
+            assert_eq!(
+                submitted.get("authority"),
+                Some(&json!({ "country": "US" })),
+                "case {case:?} ({account}): expected the submitted jurisdiction, got {submitted}"
             );
-            assert!(
-                reported_accounts(&listed).is_empty(),
-                "case {case:?}: a refused submission stores nothing, got {listed:?}"
+            assert_eq!(
+                submitted.get("status").and_then(Value::as_str),
+                Some(EXEMPTION_STATUS_PENDING),
+                "case {case:?} ({account}): a submitted certificate is under review, got \
+                 {submitted}"
             );
         }
     }
@@ -1392,7 +1571,6 @@ async fn a_cursor_this_service_did_not_issue_is_refused() {
 #[tokio::test]
 async fn listing_the_exemptions_changes_nothing() {
     let (router, engine) = emulator_with_engine();
-    hold_tax_settings_for(&router, &["000000000021"]).await;
     let submitted = call(
         &router,
         "PutTaxExemption",

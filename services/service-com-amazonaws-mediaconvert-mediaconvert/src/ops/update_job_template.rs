@@ -220,6 +220,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .hop_destinations
             .as_deref()
             .and_then(crate::state::hop_wait_problem);
+        // A `Settings` the caller sent REPLACES the stored graph, so the graph this
+        // request would leave behind is the one it carries, and it takes the same test a
+        // graph takes on the way in: a template is "all the transcode settings ... that
+        // will be applied to jobs created from it", so it can only be left in a state a
+        // job can be built from.
+        let settings_problem = input
+            .settings
+            .as_ref()
+            .and_then(crate::state::job_template_settings_problem);
 
         // The ADDRESSED resource is checked first: the template must exist, and a
         // built-in one cannot be changed at all — "System or built-in job templates can't
@@ -253,6 +262,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(UpdateJobTemplateErrorModeled::BadRequestException(
                 BadRequestException {
                     message: Some(problem),
+                },
+            )
+            .into());
+        }
+        // Refused BEFORE any member is applied, so a request carrying a graph the service
+        // cannot save leaves the stored template exactly as it was — including the members
+        // it named beside `Settings` and its `LastUpdated`.
+        if let Some(problem) = settings_problem {
+            return Err(UpdateJobTemplateErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(problem.message()),
                 },
             )
             .into());

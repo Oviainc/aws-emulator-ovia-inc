@@ -261,17 +261,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Note that if you include VocabularyFilterName in your request, you must
         // also include VocabularyFilterMethod" (model doc for
-        // `CallAnalyticsJobSettings$VocabularyFilterName`).
-        if let Some(settings) = input.settings.as_ref() {
-            if settings.vocabulary_filter_name.is_some()
-                && settings.vocabulary_filter_method.is_none()
-            {
-                return Err(bad_request(
-                    "Settings.VocabularyFilterMethod is required when \
-                     Settings.VocabularyFilterName is set. Correct your request and try \
-                     again.",
-                ));
-            }
+        // `CallAnalyticsJobSettings$VocabularyFilterName`) — one of this service's
+        // one-way co-requirements, worded by
+        // [`crate::state::missing_companion_error`].
+        let settings = input.settings.as_ref();
+        if let Some(message) = crate::state::missing_companion_error(
+            "Settings.VocabularyFilterName",
+            settings.is_some_and(|settings| settings.vocabulary_filter_name.is_some()),
+            "Settings.VocabularyFilterMethod",
+            settings.is_some_and(|settings| settings.vocabulary_filter_method.is_some()),
+        ) {
+            return Err(bad_request(&message));
         }
 
         // One definition per channel, each naming a different participant: "if your
@@ -310,6 +310,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
+
+        // A Call Analytics job may only apply a custom vocabulary, custom vocabulary
+        // filter or custom language model this account HOLDS — the rule every job
+        // family's settings follow, see [`crate::state::unheld_reference_error`]. The
+        // per-language `LanguageIdSettings` name resources of the same families, so
+        // every entry of it is checked too.
+        let mut references = crate::state::custom_resource_references(
+            settings.and_then(|settings| settings.vocabulary_name.as_deref()),
+            settings.and_then(|settings| settings.vocabulary_filter_name.as_deref()),
+            settings.and_then(|settings| settings.language_model_name.as_deref()),
+        );
+        crate::state::extend_language_id_references(
+            &mut references,
+            settings.and_then(|settings| settings.language_id_settings.as_ref()),
+        );
+        if let Some(message) = store.unheld_reference_error(&references) {
+            return Err(bad_request(&message));
+        }
 
         // "This name is case sensitive, cannot contain spaces, and must be unique
         // within an Amazon Web Services account. If you try to create a new job with

@@ -37,6 +37,8 @@ mod job_lifecycle;
 mod job_search;
 #[path = "all/job_template_crud.rs"]
 mod job_template_crud;
+#[path = "all/job_template_settings_validation.rs"]
+mod job_template_settings_validation;
 #[path = "all/job_templates.rs"]
 mod job_templates;
 #[path = "all/jobs_query.rs"]

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDiskSnapshot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDiskSnapshot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Removes the stored disk snapshot the request names so no later read reports
+//! it, and answers the operation-log entry that records the removal.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDiskSnapshot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +163,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDiskSnapshot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDiskSnapshotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDiskSnapshot"))
+        // `ctx` carries request metadata only, and nothing this operation reports
+        // comes from it: the snapshot is deleted where it lives, and the stored
+        // record already names that location.
+        let _ = ctx;
+
+        // `diskSnapshotName` is a modelled `@required` member carrying a modelled
+        // pattern, so the centralized walk refused anything outside it before this
+        // body ran. What is left is whether this account holds a snapshot of that
+        // name.
+        let name = input.disk_snapshot_name;
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            let Some(deleted) = store.remove_disk_snapshot(&name) else {
+                return Err(not_found(&name));
+            };
+            // The record is gone as this call returns, so the work this operation
+            // describes is already done and the operation is answered terminal.
+            // `operations` is a list because a Lightsail call can act on several
+            // resources at once; deleting a snapshot touches exactly one record —
+            // "only the data not needed for any other snapshot is removed", so no
+            // other stored snapshot changes — and so answers exactly one entry.
+            let operation = store.start_operation(
+                now,
+                crate::state::OPERATION_TYPE_DELETE_DISK_SNAPSHOT,
+                crate::state::RESOURCE_TYPE_DISK_SNAPSHOT,
+                &name,
+                &deleted.location,
+                None,
+            );
+            Ok(DeleteDiskSnapshotOutput {
+                operations: Some(vec![operation.view()]),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// No disk snapshot of that name is stored: Lightsail's `DoesNotExist` rejection
+/// — HTTP 400, wire error `NotFoundException`, body `code` `DoesNotExist` and a
+/// message naming the resource type and the requested name. Deleting a snapshot
+/// twice therefore fails the second time rather than reporting a deletion that
+/// did not happen.
+fn not_found(name: &str) -> DeleteDiskSnapshotError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(
+        crate::state::RESOURCE_TYPE_DISK_SNAPSHOT,
+        name,
+    )
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> DeleteDiskSnapshotError {
+    DeleteDiskSnapshotErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail disk snapshot store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

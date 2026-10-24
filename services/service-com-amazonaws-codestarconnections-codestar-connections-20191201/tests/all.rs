@@ -21,6 +21,8 @@ mod host_deletion;
 mod host_lifecycle;
 #[path = "all/host_listing.rs"]
 mod host_listing;
+#[path = "all/host_reads.rs"]
+mod host_reads;
 #[path = "all/repository_link_lifecycle.rs"]
 mod repository_link_lifecycle;
 #[path = "all/repository_link_reads.rs"]
@@ -33,3 +35,5 @@ mod state_roundtrip;
 mod sync_blocker_resolution;
 #[path = "all/sync_blocker_summary.rs"]
 mod sync_blocker_summary;
+#[path = "all/wire_target_routing.rs"]
+mod wire_target_routing;

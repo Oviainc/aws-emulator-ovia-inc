@@ -313,17 +313,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "VocabularyFilterMethod must be specified if VocabularyFilterName is set."
-        if input.settings.vocabulary_filter_name.is_some()
-            && input.settings.vocabulary_filter_method.is_none()
-        {
-            return Err(bad_request(
-                "Settings.VocabularyFilterMethod is required when \
-                 Settings.VocabularyFilterName is set. Correct your request and try again.",
-            ));
+        if let Some(message) = crate::state::missing_companion_error(
+            "Settings.VocabularyFilterName",
+            input.settings.vocabulary_filter_name.is_some(),
+            "Settings.VocabularyFilterMethod",
+            input.settings.vocabulary_filter_method.is_some(),
+        ) {
+            return Err(bad_request(&message));
         }
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+
+        // A Medical Scribe job may only apply a custom vocabulary or custom vocabulary
+        // filter this account HOLDS — the rule every job family's settings follow, see
+        // [`crate::state::unheld_reference_error`].
+        if let Some(message) = store.unheld_reference_error(&[
+            (
+                crate::state::ResourceFamily::Vocabulary,
+                input.settings.vocabulary_name.as_deref(),
+            ),
+            (
+                crate::state::ResourceFamily::VocabularyFilter,
+                input.settings.vocabulary_filter_name.as_deref(),
+            ),
+        ]) {
+            return Err(bad_request(&message));
+        }
 
         // "This name is case sensitive, cannot contain spaces, and must be unique
         // within an Amazon Web Services account. If you try to create a new job with

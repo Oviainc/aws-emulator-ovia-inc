@@ -16,7 +16,7 @@ use ::sha2::Digest;
 use crate::ops::types::{
     AccountRecoverySettingType, AcrLevelConfigType, AdminCreateUserConfigType,
     AnalyticsConfigurationType, AttributeType, AuthenticationResultType, CustomDomainConfigType,
-    DeviceConfigurationType, DomainDescriptionType, EmailConfigurationType, GroupType,
+    DeviceConfigurationType, DeviceType, DomainDescriptionType, EmailConfigurationType, GroupType,
     IssuerConfigurationType, KeyConfigurationType, LambdaConfigType, MFAOptionType,
     NumberAttributeConstraintsType, PasswordPolicyType, RefreshTokenRotationType,
     ResourceServerScopeType, ResourceServerType, RoutingType,
@@ -353,6 +353,43 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
     /// The token record for `token`, or `None` when this emulator never issued it.
     pub fn token(&self, token: &str) -> Option<&TokenRecord> {
         self.issued_tokens.get(token)
+    }
+
+    /// The stored pool and user that an ACCESS token identifies as the currently
+    /// signed-in user, as of `now`.
+    ///
+    /// The self-service half of this API identifies its user by the `AccessToken`
+    /// the sign-in returned and models no `UserPoolId` or `Username` member at
+    /// all, so the stored token record is what names the pool and the user:
+    /// `ListDevices.AccessToken` is "a valid access token that Amazon Cognito
+    /// issued to the currently signed-in user" (this service's model). Only an
+    /// access token answers — an id or refresh token names its user too, but it
+    /// is not the token the member asks for.
+    ///
+    /// A PURE read: a token the clock has already expired is refused where it
+    /// stands rather than swept, so asking changes nothing a later caller sees.
+    pub fn signed_in_user(
+        &self,
+        access_token: &str,
+        now: SystemTime,
+    ) -> Result<(&UserPool, &User), TokenRejection> {
+        let record = self
+            .issued_tokens
+            .get(access_token)
+            .ok_or(TokenRejection::NotAnAccessToken)?;
+        if record.kind != TokenKind::Access || record.revoked {
+            return Err(TokenRejection::NotAnAccessToken);
+        }
+        if record.expires_at <= now {
+            return Err(TokenRejection::Expired);
+        }
+        let pool = self
+            .pool(&record.user_pool_id)
+            .ok_or(TokenRejection::PoolGone)?;
+        let user = pool
+            .user(&record.username)
+            .ok_or(TokenRejection::UserGone)?;
+        Ok((pool, user))
     }
 
     /// Issue the access / id / refresh token triple for `username` on
@@ -1193,6 +1230,10 @@ pub struct User {
     pub user_create_date: SystemTime,
     pub user_last_modified_date: SystemTime,
     pub groups: BTreeSet<String>,
+    /// The devices remembered for this user, keyed by `DeviceKey` and ordered so
+    /// a listing of several is stable. `DeviceKeyType` carries no
+    /// case-insensitivity trait, so a key is matched exactly as it was stored.
+    pub devices: BTreeMap<String, Device>,
 }
 
 impl User {
@@ -1220,6 +1261,12 @@ impl User {
         }
     }
 
+    /// This user's device keys in ascending order — the stable order a
+    /// paginated device listing indexes into.
+    pub fn device_keys(&self) -> Vec<String> {
+        self.devices.keys().cloned().collect()
+    }
+
     /// Whether the stored password is a temporary one that has outlived
     /// `validity` as of `now`.
     pub fn temporary_password_expired(&self, validity: Duration, now: SystemTime) -> bool {
@@ -1231,6 +1278,64 @@ impl User {
             None => false,
         }
     }
+}
+
+/// One device remembered for a user: the device a sign-in minted a `DeviceKey`
+/// for, as the device operations stored it, and what every later device read of
+/// this user renders.
+#[derive(Debug, Clone)]
+pub struct Device {
+    /// The key this device is known by (`DeviceKeyType`, len 1..55, pattern
+    /// `^[\w-]+_[0-9a-f-]+$`), which every device operation names it with.
+    pub device_key: String,
+    /// The device's attributes keyed by name, ordered so a read is stable.
+    pub attributes: BTreeMap<String, String>,
+    pub create_date: SystemTime,
+    pub last_modified_date: SystemTime,
+    /// When this device last authenticated a sign-in, absent until one has:
+    /// `DeviceType.DeviceLastAuthenticatedDate` is "the date when the device was
+    /// last authenticated" (this service's model), which is nothing yet for a
+    /// device that has not authenticated.
+    pub last_authenticated_date: Option<SystemTime>,
+}
+
+impl Device {
+    /// The stored attributes as the modelled list, in name order.
+    pub fn attribute_list(&self) -> Vec<AttributeType> {
+        self.attributes
+            .iter()
+            .map(|(name, value)| AttributeType {
+                name: name.clone(),
+                value: Some(value.clone()),
+            })
+            .collect()
+    }
+
+    /// The modelled view of this device, rendered from what is stored.
+    pub fn to_device_type(&self) -> DeviceType {
+        DeviceType {
+            device_key: Some(self.device_key.clone()),
+            device_attributes: non_empty(&self.attribute_list()),
+            device_create_date: Some(to_date_time(self.create_date)),
+            device_last_modified_date: Some(to_date_time(self.last_modified_date)),
+            device_last_authenticated_date: self.last_authenticated_date.map(to_date_time),
+        }
+    }
+}
+
+/// Why an access token does not identify a signed-in user
+/// ([`ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState::signed_in_user`]).
+/// The operation that asked maps each one to a modelled error IT declares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenRejection {
+    /// Not a token this emulator issued, not an ACCESS token, or revoked.
+    NotAnAccessToken,
+    /// An access token whose lifetime the clock is past.
+    Expired,
+    /// The token names a user pool this emulator no longer holds.
+    PoolGone,
+    /// The token names a user its pool no longer holds.
+    UserGone,
 }
 
 /// One stored group of a user pool: what `CreateGroup` stored and every later

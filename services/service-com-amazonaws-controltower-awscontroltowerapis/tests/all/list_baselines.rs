@@ -380,8 +380,8 @@ async fn a_max_results_outside_the_modeled_range_is_a_front_door_bad_request() {
 }
 
 /// RULE (the service-managed side of it): the catalog does not depend on what the account
-/// holds, so a repeated listing is identical and no call — not even one that enables an
-/// uncatalogued baseline — adds, changes or removes an entry.
+/// holds, so a repeated listing is identical and no call — not even one that enables a
+/// baseline on a target — adds, changes or removes an entry.
 #[tokio::test]
 async fn no_call_changes_the_listing() {
     let router = emulator();
@@ -389,7 +389,7 @@ async fn no_call_changes_the_listing() {
     let expected = page_entries("before any mutating call", &before);
 
     // Mutating calls of each kind this service serves: a landing zone, and an enablement
-    // of a baseline identifier the catalog does not hold.
+    // of a baseline the catalog publishes.
     let created = call(
         &router,
         "/create-landingzone",
@@ -409,7 +409,7 @@ async fn no_call_changes_the_listing() {
         &router,
         "/enable-baseline",
         serde_json::json!({
-            "baselineIdentifier": "arn:aws:controltower:us-west-2::baseline/QQ1234567890ABCD",
+            "baselineIdentifier": "arn:aws:controltower:us-west-2::baseline/17BSJV3IGJ2QSGA2",
             "baselineVersion": "4.0",
             "targetIdentifier": "arn:aws:organizations::123456789012:ou/o-exampleorg/ou-ct11-1c",
         }),
@@ -417,7 +417,7 @@ async fn no_call_changes_the_listing() {
     .await;
     assert_eq!(
         enabled.status, 200,
-        "enabling an uncatalogued baseline: expected 200, got {} body {:?}",
+        "enabling a catalogued baseline: expected 200, got {} body {:?}",
         enabled.status, enabled.body
     );
 
