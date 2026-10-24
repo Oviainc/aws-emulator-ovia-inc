@@ -27,6 +27,9 @@ service-common = { path = "../common" }
 # Opaque pagination tokens: `ListServiceLevelObjectives`'s `NextToken` is the hex
 # encoding of the cursor, so a caller cannot read or forge a store key out of it.
 hex = { workspace = true }
+# The stable `LocationHash` of a dynamic instrumentation configuration: the maintained
+# SHA-256 implementation, rather than a hand-written digest.
+sha2 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

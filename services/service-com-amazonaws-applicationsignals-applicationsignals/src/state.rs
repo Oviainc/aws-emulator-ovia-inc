@@ -13,6 +13,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
+use std::time::Duration;
 
 use ::aws_smithy_types::DateTime;
 
@@ -28,6 +29,10 @@ use crate::ops::types::{
 // SLO lifecycle's above are edited on separate lines.
 use crate::ops::types::{
     MetricReference, Service, ServiceDependency, ServiceDependent, ServiceOperation, ServiceSummary,
+};
+// The dynamic instrumentation shapes, on their own `use` for the same reason.
+use crate::ops::types::{
+    InstrumentationConfiguration, InstrumentationConfigurationWithoutServiceEnv, Location,
 };
 
 /// This service's SigV4 signing name, which is also its ARN namespace
@@ -141,6 +146,21 @@ pub struct ComAmazonawsApplicationsignalsApplicationsignalsState {
     /// entry per tagged resource, so [`MAX_SLOS`] bounds this map too; the entry is dropped
     /// once the resource holds no tags (see [`Self::remove_tags`]).
     pub tags: BTreeMap<String, BTreeMap<String, String>>,
+    /// Every dynamic instrumentation configuration this emulator holds, grouped by the
+    /// [`InstrumentationScope`] a `ListInstrumentationConfigurations` call names.
+    ///
+    /// The grouping is the one the API itself imposes: every instrumentation operation takes
+    /// `Service`, `Environment` and `InstrumentationType` together (the type "determines
+    /// which backing store to query"), and a list reports exactly one scope's set. Within a
+    /// scope the records are keyed by [`instrumentation_key`] — signal type and location
+    /// hash — which is the rest of the identity a create conflicts on, and the ordered map
+    /// gives the list a deterministic order to page over.
+    pub instrumentation_configurations: BTreeMap<InstrumentationScope, InstrumentationConfigurationSet>,
+    /// The next instant [`ComAmazonawsApplicationsignalsApplicationsignalsState::expire_instrumentation_configurations`]
+    /// has anything to do, or `None` while it owes nothing — so the pass every create and
+    /// list makes walks the store only when the clock has actually made a lapse or a scope
+    /// drop due.
+    instrumentation_due_at: Option<DateTime>,
     /// This account's grouping configuration, or `None` while none is configured.
     ///
     /// At most ONE configuration exists: `PutGroupingConfiguration` "creates or updates the
@@ -1253,5 +1273,534 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
                 });
         }
         by_edge.into_values().collect()
+    }
+}
+
+// =============================================================================
+// Dynamic instrumentation configurations
+// =============================================================================
+
+/// The resource-type segment of an instrumentation configuration ARN. The modelled
+/// `InstrumentationConfigurationArn` doc spells the whole format:
+/// `arn:${Partition}:application-signals:${Region}:${Account}:instrumentationConfig/${service}/${environment}/${signalType}/${locationHash}`.
+pub const INSTRUMENTATION_CONFIG_ARN_RESOURCE: &str = "instrumentationConfig";
+
+/// The `InstrumentationType` whose configurations are temporary
+/// (`smithy_query(shape="InstrumentationType")`: "Temporary instrumentation that expires
+/// automatically (default 24 hours)").
+pub const INSTRUMENTATION_TYPE_BREAKPOINT: &str = "BREAKPOINT";
+
+/// How many digest bytes a `LocationHash` renders: the member is modelled `length 16..16`
+/// and the ARN pattern spells that suffix `[0-9a-f]{16}`, so 16 hex characters \u2014 8 bytes.
+const LOCATION_HASH_BYTES: usize = 8;
+
+/// How long a BREAKPOINT configuration lives when the request names no `ExpiresAt`.
+/// `CreateInstrumentationConfiguration`'s doc: "For BREAKPOINT type configurations, they
+/// expire after 24 hours unless a shorter expiration is provided", and the `ExpiresAt`
+/// member's: "For BREAKPOINT: optional, defaults to 24 hours".
+pub const BREAKPOINT_DEFAULT_EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// The shortest BREAKPOINT expiry a request may name. `ExpiresAt`'s doc: "must be between
+/// 5 min and 24 hours".
+pub const BREAKPOINT_MIN_EXPIRY: Duration = Duration::from_secs(5 * 60);
+
+/// The longest BREAKPOINT expiry a request may name, from the same sentence.
+pub const BREAKPOINT_MAX_EXPIRY: Duration = BREAKPOINT_DEFAULT_EXPIRY;
+
+/// The `SyncInterval` a list reports. `InstrumentationConfigurationsPage.SyncInterval`'s
+/// doc: "The suggested number of seconds to wait before the next sync request. This is at
+/// least 60 seconds to prevent excessive polling", which is also the member's modelled
+/// `range min 60`. This emulator holds one process's state and has no load to spread, so it
+/// suggests exactly that floor.
+pub const SYNC_INTERVAL_SECONDS: i32 = 60;
+
+/// The page `ListInstrumentationConfigurations` returns when the caller names no
+/// `MaxResults`: the member's modelled `@default` of 50 ("The default is 50 and the maximum
+/// is 100").
+pub const DEFAULT_INSTRUMENTATION_CONFIGURATION_PAGE: i32 = 50;
+
+/// The [`NEXT_TOKEN_TAG`] of `ListInstrumentationConfigurations`, which every token it
+/// issues carries together with a fingerprint of the scope that issued it (see
+/// [`instrumentation_token_tag`]).
+pub const INSTRUMENTATION_CONFIGURATIONS_TOKEN_TAG: &str = "instrumentation-configurations/1/";
+
+/// The most instrumentation configurations this service holds, after which a create is
+/// refused with the modelled `ServiceQuotaExceededException`.
+///
+/// AWS publishes no figure for this quota, so the bound is this emulator's own; what is not
+/// chosen is that there IS one. `CreateInstrumentationConfiguration` is the only writer, and
+/// only an explicit delete or a BREAKPOINT expiry removes a record, so without a cap the
+/// store's size would be a property of the caller rather than of the service \u2014 and the
+/// operation models `ServiceQuotaExceededException` for precisely that refusal.
+pub const MAX_INSTRUMENTATION_CONFIGURATIONS: usize = 1_000;
+
+/// How long a scope whose set has EMPTIED keeps its last-change instant before the record
+/// itself is dropped.
+///
+/// A list tells every caller to come back after [`SYNC_INTERVAL_SECONDS`], but that member
+/// is a FLOOR ("at least 60 seconds"), not a cadence: a conforming caller may poll a good
+/// deal later. The horizon is therefore a generous multiple of the advertised interval, so a
+/// caller polling slower than the floor still learns that its configuration lapsed, while
+/// the record does not hold quota indefinitely after it stopped being news. Once the horizon
+/// passes, a later sync is answered with `Changed: false` over an empty set, which is what a
+/// scope this service holds nothing for means. Keeping the record for ever instead would let
+/// a caller grow the store with scope keys of its own choosing \u2014 the count is also capped
+/// (see
+/// [`ComAmazonawsApplicationsignalsApplicationsignalsState::instrumentation_entry_count`]),
+/// and this horizon is what keeps a retained record from holding that quota for ever.
+pub const EMPTY_SCOPE_RETENTION: Duration =
+    Duration::from_secs(EMPTY_SCOPE_RETENTION_INTERVALS * SYNC_INTERVAL_SECONDS as u64);
+
+/// How many advertised sync intervals [`EMPTY_SCOPE_RETENTION`] spans.
+const EMPTY_SCOPE_RETENTION_INTERVALS: u64 = 10;
+
+/// The set of instrumentation configurations one list call reports over: the service, the
+/// environment it runs in and the instrumentation type, which is every selector the
+/// instrumentation operations take beside the location.
+///
+/// `InstrumentationType` is part of the scope rather than a filter over one store because
+/// the model says so (`ListInstrumentationConfigurations.InstrumentationType`: "Required to
+/// determine which backing store to query").
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct InstrumentationScope {
+    pub instrumentation_type: String,
+    pub service: String,
+    pub environment: String,
+}
+
+impl InstrumentationScope {
+    /// The scope a request's `InstrumentationType`, `Service` and `Environment` name.
+    pub fn new(instrumentation_type: &str, service: &str, environment: &str) -> Self {
+        Self {
+            instrumentation_type: instrumentation_type.to_string(),
+            service: service.to_string(),
+            environment: environment.to_string(),
+        }
+    }
+}
+
+/// One [`InstrumentationScope`]'s configurations, plus when the set last changed.
+#[derive(Debug, Default)]
+pub struct InstrumentationConfigurationSet {
+    /// The scope's configurations, keyed by [`instrumentation_key`].
+    pub configurations: BTreeMap<String, InstrumentationConfiguration>,
+    /// The instant this set last gained, lost or expired a configuration, or `None` while
+    /// it has never held one.
+    ///
+    /// This is what `ListInstrumentationConfigurations` answers `Changed` from: the member
+    /// is documented as "whether there are configuration changes since the provided
+    /// SyncedAt timestamp", so the service has to remember when the set last changed rather
+    /// than deduce it from the records it still holds \u2014 a deletion leaves no record to read
+    /// a timestamp off.
+    pub last_changed_at: Option<DateTime>,
+}
+
+impl InstrumentationConfigurationSet {
+    /// Record that this set changed at `at`, keeping the LATEST change instant: a change is
+    /// news to every caller that synced before it, and an older change must not hide a
+    /// newer one.
+    fn record_change(&mut self, at: DateTime) {
+        let keep = self
+            .last_changed_at
+            .is_none_or(|previous| previous.as_secs_f64() < at.as_secs_f64());
+        if keep {
+            self.last_changed_at = Some(at);
+        }
+    }
+}
+
+impl ComAmazonawsApplicationsignalsApplicationsignalsState {
+    /// How many entries the instrumentation store holds against its quota: one per stored
+    /// configuration, and at least one for a retained scope whose set has emptied.
+    ///
+    /// A retained scope costs quota exactly like a configuration, so
+    /// [`MAX_INSTRUMENTATION_CONFIGURATIONS`] bounds the number of SCOPE KEYS the store
+    /// holds as well as the number of records inside them: a caller cannot grow the store
+    /// past the cap by creating configurations in fresh scopes and letting them lapse. Both
+    /// halves of a scope key are modelled `length 1..255`, so a bounded count of keys is a
+    /// bounded size too.
+    pub fn instrumentation_entry_count(&self) -> usize {
+        self.instrumentation_configurations
+            .values()
+            .map(|set| set.configurations.len().max(1))
+            .sum()
+    }
+
+    /// Whether another instrumentation configuration would put this service over its
+    /// [`MAX_INSTRUMENTATION_CONFIGURATIONS`] quota.
+    pub fn at_instrumentation_configuration_quota(&self) -> bool {
+        self.instrumentation_entry_count() >= MAX_INSTRUMENTATION_CONFIGURATIONS
+    }
+
+    /// The configuration stored in `scope` under `key` ([`instrumentation_key`]), or `None`
+    /// when the scope holds no configuration at that location.
+    pub fn instrumentation_configuration(
+        &self,
+        scope: &InstrumentationScope,
+        key: &str,
+    ) -> Option<&InstrumentationConfiguration> {
+        self.instrumentation_configurations
+            .get(scope)
+            .and_then(|set| set.configurations.get(key))
+    }
+
+    /// Store `configuration` in `scope`, recording `at` as the instant the scope's set
+    /// changed.
+    pub fn put_instrumentation_configuration(
+        &mut self,
+        scope: InstrumentationScope,
+        configuration: InstrumentationConfiguration,
+        at: DateTime,
+    ) {
+        let key = instrumentation_key(&configuration.signal_type, &configuration.location_hash);
+        let expires_at = configuration.expires_at;
+        let set = self.instrumentation_configurations.entry(scope).or_default();
+        set.configurations.insert(key, configuration);
+        set.record_change(at);
+        if let Some(expires_at) = expires_at {
+            self.schedule_instrumentation_pass(expires_at);
+        }
+    }
+
+    /// Note that [`Self::expire_instrumentation_configurations`] has something to do at `due`,
+    /// keeping the EARLIEST such instant: the pass walks the store only once the first thing
+    /// it owes has fallen due.
+    fn schedule_instrumentation_pass(&mut self, due: DateTime) {
+        let sooner = self
+            .instrumentation_due_at
+            .is_none_or(|known| due.as_secs_f64() < known.as_secs_f64());
+        if sooner {
+            self.instrumentation_due_at = Some(due);
+        }
+    }
+
+    /// The next instant [`Self::expire_instrumentation_configurations`] has anything to do:
+    /// the soonest `ExpiresAt` a stored configuration carries, or the soonest instant an
+    /// emptied scope's record may be dropped, whichever comes first.
+    fn next_instrumentation_pass(&self) -> Option<DateTime> {
+        self.instrumentation_configurations
+            .values()
+            .flat_map(|set| {
+                let expiries = set
+                    .configurations
+                    .values()
+                    .filter_map(|stored| stored.expires_at);
+                let droppable = if set.configurations.is_empty() {
+                    set.last_changed_at.map(|changed| {
+                        DateTime::from_secs_f64(
+                            changed.as_secs_f64() + EMPTY_SCOPE_RETENTION.as_secs_f64(),
+                        )
+                    })
+                } else {
+                    None
+                };
+                expiries.chain(droppable)
+            })
+            .min_by(|left, right| left.as_secs_f64().total_cmp(&right.as_secs_f64()))
+    }
+
+    /// Drop every configuration whose `ExpiresAt` has fallen due by `now`, record the instant
+    /// each lapse became due as a change to its scope's set, and drop a scope whose set has
+    /// been empty for longer than [`EMPTY_SCOPE_RETENTION`].
+    ///
+    /// This is the one write a reporting operation may make: a BREAKPOINT configuration
+    /// "expires after 24 hours unless a shorter expiration is provided", so its removal was
+    /// owed by the CLOCK at `ExpiresAt` whether or not anybody called. The change is dated
+    /// at the expiry instant rather than at `now` for the same reason: that is when the set
+    /// changed, so a caller that synced after it is not told the set changed again. Dropping
+    /// an emptied scope once its retention horizon has passed is owed by the clock in the
+    /// same way.
+    ///
+    /// The store is walked only when the clock owes something ([`Self::next_instrumentation_pass`]),
+    /// so the common call pays no scan at all — and the walk itself is over a store bounded
+    /// by [`MAX_INSTRUMENTATION_CONFIGURATIONS`] entries, scopes included, so its cost cannot
+    /// grow with the scopes a caller mints.
+    pub fn expire_instrumentation_configurations(&mut self, now: &DateTime) {
+        let threshold = now.as_secs_f64();
+        if self
+            .instrumentation_due_at
+            .is_none_or(|due| due.as_secs_f64() > threshold)
+        {
+            return;
+        }
+
+        let lapsed: Vec<(InstrumentationScope, String, DateTime, String)> = self
+            .instrumentation_configurations
+            .iter()
+            .flat_map(|(scope, set)| {
+                set.configurations.iter().filter_map(move |(key, stored)| {
+                    let expires_at = stored.expires_at?;
+                    (expires_at.as_secs_f64() <= threshold).then(|| {
+                        (
+                            scope.clone(),
+                            key.clone(),
+                            expires_at,
+                            stored.arn.clone(),
+                        )
+                    })
+                })
+            })
+            .collect();
+
+        for (scope, key, expires_at, arn) in lapsed {
+            if let Some(set) = self.instrumentation_configurations.get_mut(&scope) {
+                set.configurations.remove(&key);
+                set.record_change(expires_at);
+            }
+            // Tags are addressed by resource ARN, so a record that is gone takes its tags
+            // with it rather than leaving them for the next resource minted at that ARN.
+            self.tags.remove(&arn);
+        }
+
+        // An emptied scope keeps its last-change instant only while a caller could still be
+        // syncing from before that change; past the horizon the record has nothing left to
+        // tell anyone, and keeping it would let a caller grow the store with scope keys it
+        // chooses.
+        self.instrumentation_configurations.retain(|_, set| {
+            !set.configurations.is_empty()
+                || set.last_changed_at.is_none_or(|changed| {
+                    changed.as_secs_f64() + EMPTY_SCOPE_RETENTION.as_secs_f64() > threshold
+                })
+        });
+
+        self.instrumentation_due_at = self.next_instrumentation_pass();
+    }
+
+    /// Whether `scope`'s set has changed since `since`.
+    ///
+    /// Strictly after: a caller that synced at the instant of the last change already saw
+    /// it, which is what makes an unchanged-since poll answer `Changed: false`. A scope that
+    /// has never held a configuration has nothing new either.
+    pub fn instrumentation_changed_since(
+        &self,
+        scope: &InstrumentationScope,
+        since: &DateTime,
+    ) -> bool {
+        self.instrumentation_configurations
+            .get(scope)
+            .and_then(|set| set.last_changed_at)
+            .is_some_and(|changed| changed.as_secs_f64() > since.as_secs_f64())
+    }
+
+    /// One page of `scope`'s configurations, in key order, starting strictly after `cursor`,
+    /// together with the token for the page after it (`None` once the page is the last one).
+    ///
+    /// At most `page_size + 1` records are collected, so the response is bounded by the page
+    /// rather than by the number of stored configurations. The cursor is a stored KEY rather
+    /// than an offset, so a configuration created or expired between two pages cannot make
+    /// the next page skip or repeat an entry.
+    pub fn page_instrumentation_configurations(
+        &self,
+        scope: &InstrumentationScope,
+        cursor: Option<&str>,
+        page_size: usize,
+    ) -> (
+        Vec<InstrumentationConfigurationWithoutServiceEnv>,
+        Option<String>,
+    ) {
+        let Some(set) = self.instrumentation_configurations.get(scope) else {
+            return (Vec::new(), None);
+        };
+        // A page of nothing could not advance its own cursor, so a caller following
+        // `NextToken` would loop for ever. `MaxResults` is modelled `range 1..100`, so this
+        // only ever clamps a bound no request can state.
+        let page_size = page_size.max(1);
+        let lower = match cursor {
+            Some(cursor) => Bound::Excluded(cursor),
+            None => Bound::Unbounded,
+        };
+        let mut window: Vec<&InstrumentationConfiguration> = set
+            .configurations
+            .range::<str, _>((lower, Bound::Unbounded))
+            .map(|(_, stored)| stored)
+            .take(page_size.saturating_add(1))
+            .collect();
+
+        let next_token = if window.len() > page_size {
+            window.truncate(page_size);
+            window.last().map(|stored| {
+                encode_cursor(
+                    &instrumentation_token_tag(scope),
+                    &instrumentation_key(&stored.signal_type, &stored.location_hash),
+                )
+            })
+        } else {
+            None
+        };
+        (
+            window.into_iter().map(without_service_env).collect(),
+            next_token,
+        )
+    }
+}
+
+/// A configuration's key within its [`InstrumentationScope`]: the rest of the identity a
+/// create conflicts on ("If a configuration already exists for the same service,
+/// environment, signal type, and location, this operation returns a conflict").
+///
+/// `/` separates the two parts unambiguously: `signal_type` is an enum value
+/// (`DynamicInstrumentationSignalType`) and a location hash is 16 hex characters, so neither
+/// can contain one.
+pub fn instrumentation_key(signal_type: &str, location_hash: &str) -> String {
+    format!("{signal_type}/{location_hash}")
+}
+
+/// The ARN of the configuration at `location_hash` in `scope`, in the format the modelled
+/// `InstrumentationConfigurationArn` doc states:
+/// `arn:${Partition}:application-signals:${Region}:${Account}:instrumentationConfig/${service}/${environment}/${signalType}/${locationHash}`.
+pub fn instrumentation_configuration_arn(
+    region: &str,
+    scope: &InstrumentationScope,
+    signal_type: &str,
+    location_hash: &str,
+) -> String {
+    ::engine::emulator_arn(
+        SIGNING_NAME,
+        region,
+        &format!(
+            "{INSTRUMENTATION_CONFIG_ARN_RESOURCE}/{}/{}/{signal_type}/{location_hash}",
+            scope.service, scope.environment
+        ),
+    )
+}
+
+/// The `NextToken` tag `scope` issues its page tokens under: the operation's
+/// [`INSTRUMENTATION_CONFIGURATIONS_TOKEN_TAG`] plus a fingerprint of the scope.
+///
+/// A cursor is a key within ONE scope's ordered set, so a token issued for another scope
+/// would silently skip entries if it were honoured. Binding the scope into the tag makes
+/// such a token fail to decode, and it is refused like any other token this service did not
+/// issue.
+pub fn instrumentation_token_tag(scope: &InstrumentationScope) -> String {
+    let fingerprint = stable_hash(&[
+        Some(scope.instrumentation_type.as_str()),
+        Some(scope.service.as_str()),
+        Some(scope.environment.as_str()),
+    ]);
+    format!("{INSTRUMENTATION_CONFIGURATIONS_TOKEN_TAG}{fingerprint}/")
+}
+
+/// The `LocationHash` of a location: "A stable hash computed from the location that uniquely
+/// identifies this instrumentation point within the service, environment, and signal type."
+///
+/// Stable (the same location always hashes the same, in this process and the next, because
+/// nothing but the location's own members feeds it) and 16 lowercase hex characters, as the
+/// member's `length 16..16` and the ARN pattern's `[0-9a-f]{16}` suffix require.
+pub fn location_hash(location: &Location) -> String {
+    match location {
+        Location::CodeLocation(code) => {
+            let line_number = code.line_number.map(|line| line.to_string());
+            stable_hash(&[
+                // The union member name, so two variants could never collide on one
+                // rendering of their contents.
+                Some("CodeLocation"),
+                Some(code.language.as_str()),
+                code.code_unit.as_deref(),
+                code.class_name.as_deref(),
+                code.method_name.as_deref(),
+                Some(code.file_path.as_str()),
+                line_number.as_deref(),
+            ])
+        }
+    }
+}
+
+/// 16 lowercase hex characters of SHA-256 over `fields`.
+///
+/// The digest is the maintained `sha2` crate's, and the rendering is INJECTIVE: each field
+/// contributes a present/absent marker, its byte length and its bytes, so no two different
+/// field lists produce the same input \u2014 which is what makes two locations that differ only
+/// in where a value sits (an absent `ClassName` against an empty one, say) hash differently.
+fn stable_hash(fields: &[Option<&str>]) -> String {
+    use ::sha2::Digest;
+
+    let mut digest = ::sha2::Sha256::new();
+    for field in fields {
+        match field {
+            Some(value) => {
+                digest.update([1u8]);
+                digest.update((value.len() as u64).to_le_bytes());
+                digest.update(value.as_bytes());
+            }
+            None => digest.update([0u8]),
+        }
+    }
+    ::hex::encode(&digest.finalize()[..LOCATION_HASH_BYTES])
+}
+
+/// A stored configuration as a list reports it: every member of the record except the
+/// service and environment, "because they are provided in the request" and the page states
+/// them once.
+pub fn without_service_env(
+    stored: &InstrumentationConfiguration,
+) -> InstrumentationConfigurationWithoutServiceEnv {
+    InstrumentationConfigurationWithoutServiceEnv {
+        instrumentation_type: stored.instrumentation_type.clone(),
+        signal_type: stored.signal_type.clone(),
+        location: stored.location.clone(),
+        location_hash: stored.location_hash.clone(),
+        description: stored.description.clone(),
+        expires_at: stored.expires_at,
+        attribute_filters: stored.attribute_filters.clone(),
+        capture_configuration: stored.capture_configuration.clone(),
+        created_at: stored.created_at,
+        arn: stored.arn.clone(),
+    }
+}
+
+/// The `ExpiresAt` a create stores for an `InstrumentationType`, or `Err` with the refusal
+/// the request earns.
+///
+/// The rule is the operation's own doc: "For BREAKPOINT type configurations, they expire
+/// after 24 hours unless a shorter expiration is provided. For PROBE type configurations,
+/// they persist until explicitly deleted; an expiration cannot be set for PROBE
+/// configurations", and the member's: "For BREAKPOINT: optional, defaults to 24 hours, must
+/// be between 5 min and 24 hours. For PROBE: not supported."
+///
+/// The window is measured from the instant the create is served, which is what makes the
+/// stored expiry a lifetime rather than a wall-clock instant the caller may pick freely.
+pub fn requested_expiry(
+    instrumentation_type: &str,
+    requested: Option<&DateTime>,
+    now: &DateTime,
+) -> Result<Option<DateTime>, String> {
+    if instrumentation_type != INSTRUMENTATION_TYPE_BREAKPOINT {
+        return match requested {
+            Some(_) => Err(format!(
+                "ExpiresAt is not supported for {instrumentation_type} instrumentation \
+                 configurations, which persist until they are explicitly deleted"
+            )),
+            None => Ok(None),
+        };
+    }
+
+    let Some(requested) = requested else {
+        return Ok(Some(DateTime::from_secs_f64(
+            now.as_secs_f64() + BREAKPOINT_DEFAULT_EXPIRY.as_secs_f64(),
+        )));
+    };
+
+    let lifetime = requested.as_secs_f64() - now.as_secs_f64();
+    if lifetime < BREAKPOINT_MIN_EXPIRY.as_secs_f64()
+        || lifetime > BREAKPOINT_MAX_EXPIRY.as_secs_f64()
+    {
+        return Err(format!(
+            "ExpiresAt must be between {} and {} seconds after the time of the request for \
+             {INSTRUMENTATION_TYPE_BREAKPOINT} instrumentation configurations",
+            BREAKPOINT_MIN_EXPIRY.as_secs(),
+            BREAKPOINT_MAX_EXPIRY.as_secs(),
+        ));
+    }
+    Ok(Some(*requested))
+}
+
+/// The modelled `ConflictException` for a create that names a configuration already stored.
+///
+/// `ConflictException` carries only `Message`, so the message is the only place the
+/// conflicting resource can be identified \u2014 and it identifies it by the ARN read off the
+/// STORED record, which is what a client resolves or adopts the existing configuration by.
+pub fn instrumentation_configuration_already_exists(arn: &str) -> ConflictException {
+    ConflictException {
+        message: format!("Instrumentation configuration with arn '{arn}' already exists."),
     }
 }

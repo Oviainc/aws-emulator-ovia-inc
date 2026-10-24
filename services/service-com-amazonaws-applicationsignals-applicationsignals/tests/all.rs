@@ -17,6 +17,8 @@ mod error_identity;
 mod get_service;
 #[path = "all/grouping_configuration.rs"]
 mod grouping_configuration;
+#[path = "all/instrumentation_configurations.rs"]
+mod instrumentation_configurations;
 #[path = "all/list_services.rs"]
 mod list_services;
 #[path = "all/resource_tags.rs"]

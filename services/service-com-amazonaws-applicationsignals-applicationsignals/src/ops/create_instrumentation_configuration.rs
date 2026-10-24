@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateInstrumentationConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateInstrumentationConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateInstrumentationConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints and persists one dynamic instrumentation configuration, and answers the stored
+//! record.
 //!
 //! ## Shape of an operation
 //!
@@ -191,23 +184,131 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::CREATE_INSTRUMENTATION_CONFIGURATION_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Store one configuration under the identity it names, and answer the record that was
+    /// written.
+    ///
+    /// The response is the stored record, never a re-echo of the request: `LocationHash` is
+    /// the stable hash of the location, `ARN` is built from this service's namespace, the
+    /// request's region and the identity, `CreatedAt` comes from the clock, and `ExpiresAt`
+    /// is the lifetime the type documents (24 hours by default for BREAKPOINT, absent for
+    /// PROBE). A second create at the same identity — service, environment, instrumentation
+    /// type, signal type and location — is a `ConflictException`, because "configurations
+    /// are immutable after creation".
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateInstrumentationConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateInstrumentationConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateInstrumentationConfiguration"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateInstrumentationConfigurationErrorModeled::ThrottlingException(
+                    ThrottlingException {
+                        message: crate::state::STATE_UNAVAILABLE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+
+        // The model cannot express "this member is only supported for one value of that
+        // one", nor a window measured from the time of the request, so both parts of the
+        // documented `ExpiresAt` rule are enforced here and refused with 400 rather than
+        // silently coerced.
+        let expires_at = crate::state::requested_expiry(
+            &input.instrumentation_type,
+            input.expires_at.as_ref(),
+            &now,
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        let scope = crate::state::InstrumentationScope::new(
+            &input.instrumentation_type,
+            &input.service,
+            &input.environment,
+        );
+        let location_hash = crate::state::location_hash(&input.location);
+        let key = crate::state::instrumentation_key(&input.signal_type, &location_hash);
+        let region = crate::state::region_of(ctx.parts());
+
+        let mut store = state.lock();
+
+        // A BREAKPOINT configuration whose expiry has fallen due is gone, so it neither
+        // conflicts with this create nor counts against the quota.
+        store.expire_instrumentation_configurations(&now);
+
+        // The conflicting resource is identified by ITS OWN ARN, read off the stored record
+        // rather than minted from this request.
+        if let Some(existing) = store.instrumentation_configuration(&scope, &key) {
+            return Err(
+                CreateInstrumentationConfigurationErrorModeled::ConflictException(
+                    crate::state::instrumentation_configuration_already_exists(&existing.arn),
+                )
+                .into(),
+            );
+        }
+
+        if store.at_instrumentation_configuration_quota() {
+            return Err(
+                CreateInstrumentationConfigurationErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "The number of instrumentation configurations has reached the quota of {}",
+                            crate::state::MAX_INSTRUMENTATION_CONFIGURATIONS
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let configuration = InstrumentationConfiguration {
+            instrumentation_type: input.instrumentation_type.clone(),
+            service: input.service.clone(),
+            environment: input.environment.clone(),
+            signal_type: input.signal_type.clone(),
+            location: input.location.clone(),
+            location_hash: location_hash.clone(),
+            description: input.description.clone(),
+            expires_at,
+            attribute_filters: input.attribute_filters.clone(),
+            capture_configuration: input.capture_configuration.clone(),
+            created_at: now,
+            arn: crate::state::instrumentation_configuration_arn(
+                &region,
+                &scope,
+                &input.signal_type,
+                &location_hash,
+            ),
+        };
+
+        // Tags are addressed by resource ARN, the key this service's tagging operations
+        // take, so they are stored there rather than on the record.
+        if let Some(tags) = input.tags.as_ref().filter(|tags| !tags.is_empty()) {
+            store.tags.insert(
+                configuration.arn.clone(),
+                tags.iter()
+                    .map(|tag| (tag.key.clone(), tag.value.clone()))
+                    .collect(),
+            );
+        }
+
+        store.put_instrumentation_configuration(scope, configuration.clone(), now);
+
+        Ok(CreateInstrumentationConfigurationOutput {
+            instrumentation_type: configuration.instrumentation_type,
+            service: configuration.service,
+            environment: configuration.environment,
+            signal_type: configuration.signal_type,
+            location: configuration.location,
+            location_hash: configuration.location_hash,
+            description: configuration.description,
+            expires_at: configuration.expires_at,
+            attribute_filters: configuration.attribute_filters,
+            capture_configuration: configuration.capture_configuration,
+            created_at: configuration.created_at,
+            arn: configuration.arn,
+        })
     }
 }

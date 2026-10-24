@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListInstrumentationConfigurations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListInstrumentationConfigurations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListInstrumentationConfigurations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one scope's active dynamic instrumentation configurations, a page at a time.
 //!
 //! ## Shape of an operation
 //!
@@ -162,23 +154,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::LIST_INSTRUMENTATION_CONFIGURATIONS_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Report the configurations stored for the service, environment and instrumentation
+    /// type the request names, a page at a time.
+    ///
+    /// A read: it projects stored records and writes nothing of its own. The one write it
+    /// does make is the lapse of a BREAKPOINT configuration whose `ExpiresAt` has fallen
+    /// due, which the CLOCK owed at that instant whether or not anybody called — see
+    /// [`crate::state::ComAmazonawsApplicationsignalsApplicationsignalsState::expire_instrumentation_configurations`].
+    ///
+    /// `SyncedAt` makes the call an incremental sync: when the scope's set has not changed
+    /// since the instant the caller supplies, `Changed` is false and the configuration
+    /// details are omitted, as the operation's doc requires ("When no changes are detected,
+    /// the response sets Changed to false and omits configuration details"). The response
+    /// always carries the server instant to supply on the next sync and the interval to
+    /// wait before it.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListInstrumentationConfigurations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListInstrumentationConfigurationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListInstrumentationConfigurations"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListInstrumentationConfigurationsErrorModeled::ThrottlingException(
+                    ThrottlingException {
+                        message: crate::state::STATE_UNAVAILABLE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+        let scope = crate::state::InstrumentationScope::new(
+            &input.instrumentation_type,
+            &input.service,
+            &input.environment,
+        );
+
+        // `MaxResults` is modelled with a `@default` of 50 and `range 1..100`, so the
+        // boundary validator has already refused anything outside the range and filled the
+        // default for an absent member. A non-positive value can therefore only mean the
+        // member was absent, and is read as the documented default rather than as a page of
+        // nothing.
+        let page_size = if input.max_results < 1 {
+            crate::state::DEFAULT_INSTRUMENTATION_CONFIGURATION_PAGE as usize
+        } else {
+            input.max_results as usize
+        };
+
+        // The token is resolved under the tag of the scope that issued it, so a token from
+        // another service, environment or instrumentation type is refused rather than
+        // honoured as a cursor into this scope.
+        let token_tag = crate::state::instrumentation_token_tag(&scope);
+        let cursor = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_cursor(&token_tag, token) {
+                Some(cursor) => Some(cursor),
+                None => {
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        "NextToken is not a token this service issued for this service, \
+                         environment and instrumentation type",
+                    ))
+                }
+            },
+        };
+
+        let mut store = state.lock();
+        store.expire_instrumentation_configurations(&now);
+
+        let changed = match input.synced_at.as_ref() {
+            None => true,
+            Some(since) => store.instrumentation_changed_since(&scope, since),
+        };
+
+        let (latest_configurations, next_token) = if changed {
+            let (page, next_token) =
+                store.page_instrumentation_configurations(&scope, cursor.as_deref(), page_size);
+            (Some(page), next_token)
+        } else {
+            (None, None)
+        };
+
+        Ok(ListInstrumentationConfigurationsOutput {
+            service: input.service,
+            environment: input.environment,
+            changed,
+            latest_configurations,
+            synced_at: now,
+            sync_interval: crate::state::SYNC_INTERVAL_SECONDS,
+            next_token,
+        })
     }
 }
