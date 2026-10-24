@@ -193,6 +193,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the resource does not already hold grows its tag set and re-tagging a held
         // key can never reach the ceiling. The resulting count is checked BEFORE any
         // tag is stored, so a refused call leaves the tag set exactly as it was.
+        //
+        // Past the ceiling this is a QUOTA refusal about the target resource's
+        // accumulated tag count, not a statement about the shape of this request: the
+        // request may carry a single, well-formed tag and still meet it. So it answers
+        // the modelled `LimitExceededException` (HTTP 410), "You've reached the quota
+        // for a resource", the error this service declares for every accumulated-count
+        // ceiling — the one a client catches to prune a tag and retry. A request that
+        // ITSELF carries more tags than `TagMap`'s `@length` max admits is the other
+        // failure, and the boundary validator refuses it before this handler runs.
         let resulting = tags.len()
             + input
                 .tags
@@ -200,7 +209,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .filter(|key| !tags.contains_key(*key))
                 .count();
         if resulting > crate::state::MAX_TAGS_PER_RESOURCE {
-            return Err(too_many_tags(&input.resource_arn, resulting));
+            return Err(limit_exceeded(resulting));
         }
 
         for (key, value) in input.tags {
@@ -225,17 +234,15 @@ fn not_found(resource_arn: &str) -> TagResourceError {
     .into()
 }
 
-/// HTTP 400 `TooManyTagsException`: the call would carry the resource past the
-/// per-resource ceiling, so none of its tags is stored.
-fn too_many_tags(resource_arn: &str, resulting: usize) -> TagResourceError {
-    TagResourceErrorModeled::TooManyTagsException(TooManyTagsException {
-        message: Some(format!(
+/// HTTP 410 `LimitExceededException`: the call would carry the target resource past
+/// the per-resource tag ceiling, so none of its tags is stored.
+fn limit_exceeded(resulting: usize) -> TagResourceError {
+    TagResourceErrorModeled::LimitExceededException(LimitExceededException {
+        message: format!(
             "The request would leave {resulting} tags on the resource; a resource holds at \
              most {} tags.",
             crate::state::MAX_TAGS_PER_RESOURCE
-        )),
-        // The member's own documentation: "The name of the resource with too many tags."
-        resource_name: Some(resource_arn.to_string()),
+        ),
     })
     .into()
 }

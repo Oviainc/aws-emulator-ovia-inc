@@ -44,7 +44,7 @@ const REGION: &str = "us-west-2";
 pub(crate) const PAST_ACTIVATION: Duration = Duration::from_millis(900);
 
 /// A router with just this service mounted on a fresh shared engine.
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     router_with_engine().0
 }
 
@@ -103,7 +103,7 @@ pub(crate) async fn call_with_headers(
 }
 
 /// One request without extra headers, answered as `(status, parsed body)`.
-async fn call(
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -114,7 +114,7 @@ async fn call(
 }
 
 /// The wire error code of an error body (`__type`), or `""`.
-fn error_code(body: &Value) -> &str {
+pub(crate) fn error_code(body: &Value) -> &str {
     body.get("__type").and_then(Value::as_str).unwrap_or("")
 }
 
@@ -124,7 +124,7 @@ fn error_message(body: &Value) -> &str {
 }
 
 /// `POST /asset-models` with `body`, answering the created id.
-async fn create_model(router: &MultiServiceRouter, body: Value) -> String {
+pub(crate) async fn create_model(router: &MultiServiceRouter, body: Value) -> String {
     let (status, created) = call(router, "POST", "/asset-models", Some(body.clone())).await;
     assert_eq!(status, 202, "CreateAssetModel {body}: got {status} {created}");
     created["assetModelId"]
@@ -134,7 +134,7 @@ async fn create_model(router: &MultiServiceRouter, body: Value) -> String {
 }
 
 /// `POST /assets` with `body`, answering the created id.
-async fn create_asset(router: &MultiServiceRouter, body: Value) -> String {
+pub(crate) async fn create_asset(router: &MultiServiceRouter, body: Value) -> String {
     let (status, created) = call(router, "POST", "/assets", Some(body.clone())).await;
     assert_eq!(status, 202, "CreateAsset {body}: got {status} {created}");
     created["assetId"]
@@ -442,10 +442,13 @@ async fn associating_then_disassociating_a_triple_round_trips_through_stored_sta
         "before associating, the child asset is top level"
     );
 
-    // Associate by raw id. `AssociateAssets` (implemented alongside this fix, on
-    // mainline) refuses a repeat of the SAME triple as an existing resource, so the
-    // second call is a 409 and the stored association set stays single-valued —
-    // which is what `DisassociateAssets` below has to remove exactly once.
+    // Associate by raw id. A repeat of the SAME triple is refused, and WHICH refusal
+    // depends on how far the first association has got: this one lands while it is
+    // still settling, so it is the transient 409 `ConflictingOperationException`
+    // ("another operation on this resource is in flight") rather than the terminal
+    // 400 an established association answers. Either way the stored association set
+    // stays single-valued — which is what `DisassociateAssets` below has to remove
+    // exactly once.
     let associate = json!({
         "assetId": fixture.parent_asset,
         "hierarchyId": fixture.hierarchy_id,
@@ -471,11 +474,11 @@ async fn associating_then_disassociating_a_triple_round_trips_through_stored_sta
     .await;
     assert_eq!(
         status, 409,
-        "a repeat of the same triple is an existing association, got {status} {answered}"
+        "a repeat while the association is still settling collides with it, got {status} {answered}"
     );
     assert_eq!(
         error_code(&answered),
-        "ResourceAlreadyExistsException",
+        "ConflictingOperationException",
         "repeat-association refusal code, got {answered}"
     );
     let children = {
@@ -890,6 +893,216 @@ async fn a_delete_blocked_by_a_dependent_resource_is_a_terminal_request_error() 
         "with its only asset deleted the model deletes: got {status} {answered}"
     );
     let _ = referrer;
+}
+
+#[tokio::test]
+async fn delete_asset_is_refused_while_a_child_is_associated_under_any_hierarchy() {
+    let (router, _engine) = router_with_engine();
+
+    // A parent model with TWO hierarchies to the same child model, so the rule can
+    // be exercised on each of them: the dependency is "a child under ANY hierarchy
+    // of this asset", not a property of one particular hierarchy.
+    let child_model = create_model(
+        &router,
+        json!({
+            "assetModelName": "Sensor",
+            "assetModelProperties": [{
+                "name": "Temperature",
+                "dataType": "DOUBLE",
+                "type": { "measurement": {} }
+            }]
+        }),
+    )
+    .await;
+    let parent_model = create_model(
+        &router,
+        json!({
+            "assetModelName": "Boiler",
+            "assetModelProperties": [],
+            "assetModelHierarchies": [
+                { "name": "Sensors", "childAssetModelId": child_model },
+                { "name": "Spares", "childAssetModelId": child_model },
+            ]
+        }),
+    )
+    .await;
+    let (status, described) =
+        call(&router, "GET", &format!("/asset-models/{parent_model}"), None).await;
+    assert_eq!(status, 200, "DescribeAssetModel: got {status} {described}");
+    let hierarchies: Vec<(String, String)> = described["assetModelHierarchies"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no hierarchies in {described}"))
+        .iter()
+        .map(|hierarchy| {
+            (
+                hierarchy["name"].as_str().unwrap_or("").to_string(),
+                hierarchy["id"].as_str().unwrap_or("").to_string(),
+            )
+        })
+        .collect();
+    assert_eq!(hierarchies.len(), 2, "two hierarchies, got {described}");
+
+    // One row per hierarchy: with a child associated under it, the parent's delete is
+    // refused and the parent survives; once the child is disassociated, the IDENTICAL
+    // delete is the call that succeeds.
+    for (name, hierarchy_id) in &hierarchies {
+        let parent = create_asset(
+            &router,
+            json!({ "assetName": format!("Boiler-{name}"), "assetModelId": parent_model }),
+        )
+        .await;
+        let child = create_asset(
+            &router,
+            json!({ "assetName": format!("Sensor-{name}"), "assetModelId": child_model }),
+        )
+        .await;
+        let triple = json!({
+            "assetId": parent,
+            "hierarchyId": hierarchy_id,
+            "childAssetId": child,
+        });
+        let (status, answered) = call(
+            &router,
+            "POST",
+            &format!("/assets/{parent}/associate"),
+            Some(triple.clone()),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {name:?}: AssociateAssets got {status} {answered}"
+        );
+
+        let (status, refused) = call(&router, "DELETE", &format!("/assets/{parent}"), None).await;
+        assert_eq!(
+            status, 400,
+            "case {name:?}: deleting a parent with a child must be refused, got {status} {refused}"
+        );
+        assert_eq!(
+            error_code(&refused),
+            "InvalidRequestException",
+            "case {name:?}: a dependent resource is a terminal request error, got {refused}"
+        );
+        // The parent survives, with the association intact.
+        let (status, survived) = call(&router, "GET", &format!("/assets/{parent}"), None).await;
+        assert_eq!(
+            status, 200,
+            "case {name:?}: a refused delete leaves the parent, got {status} {survived}"
+        );
+        assert_eq!(
+            top_level_count(&router, &child_model).await,
+            0,
+            "case {name:?}: the child is still associated"
+        );
+
+        // Deleting the CHILD is refused for the same reason seen from the other end:
+        // it is "associated to another asset", which the operation's documentation
+        // forbids deleting.
+        let (status, refused) = call(&router, "DELETE", &format!("/assets/{child}"), None).await;
+        assert_eq!(
+            status, 400,
+            "case {name:?}: deleting an associated child must be refused, got {status} {refused}"
+        );
+        assert_eq!(
+            error_code(&refused),
+            "InvalidRequestException",
+            "case {name:?}: a still-associated asset is a terminal request error, got {refused}"
+        );
+        let (status, survived) = call(&router, "GET", &format!("/assets/{child}"), None).await;
+        assert_eq!(
+            status, 200,
+            "case {name:?}: a refused delete leaves the child, got {status} {survived}"
+        );
+
+        // Disassociated, BOTH ends delete — which is what makes the two refusals
+        // preconditions on the caller rather than broken operations.
+        let (status, answered) = call(
+            &router,
+            "POST",
+            &format!("/assets/{parent}/disassociate"),
+            Some(triple),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {name:?}: DisassociateAssets got {status} {answered}"
+        );
+        let (status, answered) = call(&router, "DELETE", &format!("/assets/{child}"), None).await;
+        assert_eq!(
+            status, 202,
+            "case {name:?}: the disassociated child deletes, got {status} {answered}"
+        );
+        let (status, answered) = call(&router, "DELETE", &format!("/assets/{parent}"), None).await;
+        assert_eq!(
+            status, 202,
+            "case {name:?}: with no children the delete succeeds, got {status} {answered}"
+        );
+        assert_eq!(
+            answered["assetStatus"]["state"], "DELETING",
+            "case {name:?}: the accepted delete reports DELETING, got {answered}"
+        );
+    }
+
+    // An asset that is in no hierarchy at all deletes straight away: the refusals
+    // above are about the association and nothing else.
+    let lone = create_asset(
+        &router,
+        json!({ "assetName": "Boiler-lone", "assetModelId": parent_model }),
+    )
+    .await;
+    let (status, answered) = call(&router, "DELETE", &format!("/assets/{lone}"), None).await;
+    assert_eq!(
+        status, 202,
+        "an unassociated asset deletes, got {status} {answered}"
+    );
+
+    // The same refusal when the child goes away first by DELETING the parent's
+    // dependency through DisassociateAssets rather than per hierarchy row.
+    let parent = create_asset(
+        &router,
+        json!({ "assetName": "Boiler-disassociated", "assetModelId": parent_model }),
+    )
+    .await;
+    let child = create_asset(
+        &router,
+        json!({ "assetName": "Sensor-disassociated", "assetModelId": child_model }),
+    )
+    .await;
+    let triple = json!({
+        "assetId": parent,
+        "hierarchyId": hierarchies[0].1,
+        "childAssetId": child,
+    });
+    let (status, answered) = call(
+        &router,
+        "POST",
+        &format!("/assets/{parent}/associate"),
+        Some(triple.clone()),
+    )
+    .await;
+    assert_eq!(status, 200, "AssociateAssets got {status} {answered}");
+    for (case, asset) in [("the parent", &parent), ("the child", &child)] {
+        let (status, refused) = call(&router, "DELETE", &format!("/assets/{asset}"), None).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: the delete is refused while the association stands, got {status} {refused}"
+        );
+    }
+    let (status, answered) = call(
+        &router,
+        "POST",
+        &format!("/assets/{parent}/disassociate"),
+        Some(triple),
+    )
+    .await;
+    assert_eq!(status, 200, "DisassociateAssets got {status} {answered}");
+    for (case, asset) in [("the parent", &parent), ("the child", &child)] {
+        let (status, answered) = call(&router, "DELETE", &format!("/assets/{asset}"), None).await;
+        assert_eq!(
+            status, 202,
+            "case {case:?}: once disassociated the delete succeeds, got {status} {answered}"
+        );
+    }
 }
 
 #[tokio::test]

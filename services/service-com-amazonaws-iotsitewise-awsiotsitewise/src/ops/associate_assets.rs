@@ -202,6 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // token -> outcome mapping, so a retry with the same token is judged on the
         // state it finds, exactly like a first call. Deliberately left to the
         // idempotency issue rather than half-done here, as `CreateAsset` leaves it.
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
 
         // Each of the three ids is a `CustomID` label: the raw UUID or the
@@ -268,29 +269,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // The association already recorded under this exact hierarchy is the resource
-        // this call would create, so a repeat of it is a conflict rather than a
-        // silently-ignored no-op.
-        if children_of(&store, &parent_id, &hierarchy_id)
-            .iter()
-            .any(|child| child == &child_id)
-        {
-            let child_arn = store
-                .assets
-                .get(&child_id)
-                .map(|asset| asset.arn.clone())
-                .unwrap_or_default();
-            return Err(AssociateAssetsErrorModeled::ResourceAlreadyExistsException(
-                ResourceAlreadyExistsException {
-                    message: format!(
-                        "The asset {child_id} is already associated with the asset \
-                         {parent_id} through the hierarchy {hierarchy_id}."
+        // The association already recorded under this exact hierarchy is the one this
+        // call would record, so a repeat of it is refused — and WHICH refusal depends
+        // on how far that association has got, because the two say different things to
+        // the caller. An association whose own transition is still settling is a
+        // transient collision between two operations on one resource, which is what
+        // `ConflictingOperationException` (409) states ("you're trying to perform more
+        // than one operation on the same resource at the same time") and what a client's
+        // retry handler reacts to. An association already established is a terminal
+        // statement about the request — no retry of it can succeed — so it is
+        // `InvalidRequestException` (400). Neither is `ResourceAlreadyExistsException`,
+        // which this service uses for a resource-IDENTITY collision (two resources
+        // claiming one id or one external id), not for an association that is already
+        // in place.
+        match store.association_state(&parent_id, &hierarchy_id, &child_id, now) {
+            Some(crate::state::AssociationState::InProgress) => {
+                let parent_arn = store
+                    .assets
+                    .get(&parent_id)
+                    .map(|asset| asset.arn.clone())
+                    .unwrap_or_default();
+                return Err(conflicting_operation(
+                    format!(
+                        "An operation associating the asset {child_id} with the asset \
+                         {parent_id} through the hierarchy {hierarchy_id} is already in \
+                         progress."
                     ),
-                    resource_id: child_id.clone(),
-                    resource_arn: child_arn,
-                },
-            )
-            .into());
+                    &parent_id,
+                    &parent_arn,
+                ));
+            }
+            Some(crate::state::AssociationState::Established) => {
+                return Err(invalid_request(format!(
+                    "The asset {child_id} is already associated with the asset \
+                     {parent_id} through the hierarchy {hierarchy_id}."
+                )))
+            }
+            None => {}
         }
 
         // Asset hierarchies form a tree: an asset has at most one parent, so a child
@@ -324,45 +339,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(|(parent, _)| parent.to_string());
         }
 
-        record_association(&mut store, &parent_id, &hierarchy_id, &child_id);
+        // One hierarchy holds a bounded number of children, and this is the operation
+        // that grows it: past the cap the association is a quota refusal, which is
+        // what this operation declares `LimitExceededException` (HTTP 410) for ("this
+        // can occur if you're trying to associate more than the allowed number of
+        // child assets").
+        let children = store.hierarchy_children(&parent_id, &hierarchy_id).len();
+        if children >= crate::state::MAX_CHILDREN_PER_HIERARCHY {
+            return Err(AssociateAssetsErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: format!(
+                        "The hierarchy {hierarchy_id} of the asset {parent_id} already holds \
+                         {children} child assets, which is the most it may hold."
+                    ),
+                },
+            )
+            .into());
+        }
+
+        store.associate_child(&parent_id, &hierarchy_id, &child_id, now);
 
         Ok(AssociateAssetsOutput)
-    }
-}
-
-/// The children already associated under `(parent_asset_id, hierarchy_id)`, in the
-/// order they were associated. Empty for a hierarchy nothing is associated under,
-/// so the caller never has to tell "no entry" from "no children".
-fn children_of<'a>(
-    store: &'a crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState,
-    parent_asset_id: &str,
-    hierarchy_id: &str,
-) -> &'a [String] {
-    match store
-        .asset_hierarchy_children
-        .get(&(parent_asset_id.to_string(), hierarchy_id.to_string()))
-    {
-        Some(children) => children.as_slice(),
-        None => &[],
-    }
-}
-
-/// Record `child_asset_id` as a child of `parent_asset_id` under `hierarchy_id`,
-/// after the children already associated there. The list stays a set: a child
-/// already in that hierarchy is not added twice (the duplicate is refused above,
-/// so this is belt-and-braces for the stored invariant).
-fn record_association(
-    store: &mut crate::state::ComAmazonawsIotsitewiseAwsiotsitewiseState,
-    parent_asset_id: &str,
-    hierarchy_id: &str,
-    child_asset_id: &str,
-) {
-    let children = store
-        .asset_hierarchy_children
-        .entry((parent_asset_id.to_string(), hierarchy_id.to_string()))
-        .or_default();
-    if !children.iter().any(|child| child == child_asset_id) {
-        children.push(child_asset_id.to_string());
     }
 }
 
@@ -393,4 +390,20 @@ fn not_found(message: String) -> AssociateAssetsError {
 /// association the hierarchy rules do not allow.
 fn invalid_request(message: String) -> AssociateAssetsError {
     AssociateAssetsErrorModeled::InvalidRequestException(InvalidRequestException { message }).into()
+}
+
+/// HTTP 409 `ConflictingOperationException`: another operation on the same
+/// resource is still in flight, so this one collides with it and a retry can
+/// succeed. `resource_id`/`resource_arn` name THAT resource.
+fn conflicting_operation(
+    message: String,
+    resource_id: &str,
+    resource_arn: &str,
+) -> AssociateAssetsError {
+    AssociateAssetsErrorModeled::ConflictingOperationException(ConflictingOperationException {
+        message,
+        resource_id: resource_id.to_string(),
+        resource_arn: resource_arn.to_string(),
+    })
+    .into()
 }

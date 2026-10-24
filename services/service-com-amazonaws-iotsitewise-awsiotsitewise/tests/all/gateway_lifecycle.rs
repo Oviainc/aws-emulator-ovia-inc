@@ -339,25 +339,80 @@ async fn a_platform_device_hosts_at_most_one_gateway() {
             })),
         )
         .await;
+        // The collision is on a request ATTRIBUTE already in use by another resource
+        // — the platform device — and not on the identity of the gateway this create
+        // would make, so it is the terminal request error and not
+        // `ResourceAlreadyExistsException`, which this service keeps for a resource
+        // that is itself already there (see the gateway-name suite below).
         assert_eq!(
-            status, 409,
-            "case {case:?}: a duplicate device expected 409, got {status} {conflict}"
+            status, 400,
+            "case {case:?}: a duplicate device expected 400, got {status} {conflict}"
         );
         assert_eq!(
             error_code(&conflict),
-            "ResourceAlreadyExistsException",
+            "InvalidRequestException",
             "case {case:?}: unexpected error code in {conflict}"
         );
-        assert_eq!(
-            conflict["resourceId"].as_str().unwrap_or(""),
-            id,
-            "case {case:?}: the conflict must name the gateway already on the device, got {conflict}"
+        // The refusal names the DIMENSION the caller supplied, not an id it never
+        // sent: diagnosis has to point at the thing name or group ARN that collided.
+        let message = conflict["message"].as_str().unwrap_or("");
+        let device = device_name(&first_platform_of(case));
+        assert!(
+            message.contains(&device),
+            "case {case:?}: the refusal must name the colliding device {device:?}, got {conflict}"
         );
+        assert!(
+            !message.contains(&id),
+            "case {case:?}: the refusal must not name a gateway id the caller never sent, got {conflict}"
+        );
+
+        // The gateway already on the device is untouched, and a create naming a FREE
+        // device still succeeds.
+        let (status, described) = call(&router, "GET", &format!("{GATEWAYS}/{id}"), None).await;
         assert_eq!(
-            conflict["resourceArn"], created["gatewayArn"],
-            "case {case:?}: the conflict must carry that gateway's ARN, got {conflict}"
+            status, 200,
+            "case {case:?}: the pre-existing gateway must survive, got {status} {described}"
+        );
+        let (status, other) = call(
+            &router,
+            "POST",
+            GATEWAYS,
+            Some(json!({
+                "gatewayName": format!("third-{case}"),
+                "gatewayPlatform": greengrass_v2(&format!("free-{case}"), None),
+            })),
+        )
+        .await;
+        assert_eq!(
+            status, 201,
+            "case {case:?}: a free device must still be accepted, got {status} {other}"
         );
     }
+}
+
+/// The platform of the `case` row of [`a_platform_device_hosts_at_most_one_gateway`],
+/// by the row's name — so the assertion above reads the device out of the same place
+/// the row built it from.
+fn first_platform_of(case: &str) -> Value {
+    match case {
+        "greengrass-group" => greengrass("shared-group"),
+        "greengrassV2-core-device" => greengrass_v2("shared-core-device", None),
+        _ => siemens_ie("shared-siemens-thing"),
+    }
+}
+
+/// The device a `gatewayPlatform` names, whichever platform type it is.
+fn device_name(platform: &Value) -> String {
+    for (key, member) in [
+        ("greengrass", "groupArn"),
+        ("greengrassV2", "coreDeviceThingName"),
+        ("siemensIE", "iotCoreThingName"),
+    ] {
+        if let Some(value) = platform[key][member].as_str() {
+            return value.to_string();
+        }
+    }
+    panic!("the platform {platform} names no device")
 }
 
 #[tokio::test]
