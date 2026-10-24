@@ -32,5 +32,7 @@ mod error_wire_contract;
 mod readiness_check_lifecycle;
 #[path = "all/recovery_group_lifecycle.rs"]
 mod recovery_group_lifecycle;
+#[path = "all/recovery_group_readiness_summary.rs"]
+mod recovery_group_readiness_summary;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
