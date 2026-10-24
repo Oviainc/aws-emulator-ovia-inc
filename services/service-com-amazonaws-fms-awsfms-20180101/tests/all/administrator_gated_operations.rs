@@ -261,6 +261,10 @@ fn gated_calls() -> Vec<Gated> {
             operation: "DeleteResourceSet",
             body: json!({ "Identifier": UNKNOWN_RESOURCE_SET_ID }),
         },
+        Gated {
+            operation: "ListResourceSets",
+            body: json!({ "MaxResults": 5 }),
+        },
     ]
 }
 

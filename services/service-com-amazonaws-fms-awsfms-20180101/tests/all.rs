@@ -31,6 +31,8 @@ mod protocols_list_lifecycle;
 mod protocols_lists_enumeration;
 #[path = "all/resource_set_deletion.rs"]
 mod resource_set_deletion;
+#[path = "all/resource_set_listing.rs"]
+mod resource_set_listing;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tagging_across_resource_kinds.rs"]

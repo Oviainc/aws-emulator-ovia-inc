@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListResourceSets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListResourceSets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListResourceSets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports a page of `ResourceSetSummary` projections of the stored resource
+//! sets, in the stable `Base62Id` order the store keeps them in. A REPORTING
+//! operation: it writes nothing.
+//!
+//! Administrator-gated, like every organisation-scoped Firewall Manager
+//! operation and like the `PutResourceSet` / `GetResourceSet` that write and
+//! read the same records: with no Firewall Manager default administrator
+//! association in this account/Region the call is refused by
+//! [`crate::state::require_administrator`] before the store is read at all.
+//!
+//! Paging follows the model's `@paginated(inputToken: NextToken, outputToken:
+//! NextToken, items: ResourceSets, pageSize: MaxResults)`: at most `MaxResults`
+//! summaries per page, and a `NextToken` ONLY when resource sets remain after
+//! the page. The token is opaque and carries the id the next page starts at, so
+//! it round-trips into the next page without a server-side cursor.
 //!
 //! ## Shape of an operation
 //!
@@ -121,6 +128,12 @@ impl From<ListResourceSetsErrorModeled> for ListResourceSetsError {
     }
 }
 
+/// The largest page `ListResourceSets` serves, which is the maximum the model's
+/// `com.amazonaws.fms#PaginationMaxResults` declares for `MaxResults` (range
+/// 1..100). It bounds the response for EVERY caller, including one that sends no
+/// `MaxResults` at all.
+const MAX_PAGE_SIZE: usize = 100;
+
 /// The `ListResourceSets` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -157,18 +170,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListResourceSets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListResourceSetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListResourceSetsErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the Firewall Manager store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let store = state.lock();
+        // The authorization gate, BEFORE any member of the request is examined
+        // and before any of the store's contents is reported, so a bad
+        // `NextToken` and a well-formed request get the same refusal from an
+        // unauthorized caller.
+        crate::state::require_administrator(&store, &crate::state::request_region(ctx.parts()))?;
+
+        // A token this service did not mint for a resource-set page names no page
+        // boundary. The refusal is a bad request, not an invented page: the
+        // modelled `InvalidInputException` is exactly "the parameters of the
+        // request were invalid".
+        let start = match input.next_token.as_deref() {
+            Some(token) => match crate::state::decode_base62_page_token(token) {
+                Some(start) => Some(start),
+                None => {
+                    return Err(ListResourceSetsErrorModeled::InvalidInputException(
+                        InvalidInputException {
+                            message: Some(
+                                "NextToken is not a pagination token issued by ListResourceSets"
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                }
+            },
+            None => None,
+        };
+
+        // `resource_sets` is ordered by the resource set's `Id`, so the boundary
+        // is a key: resume at the first id at or after the token's. With no token
+        // the lower bound is the empty id, which sorts before every `Base62Id`.
+        let lower = start.unwrap_or_default();
+        let mut remaining = store.resource_sets.range(lower..);
+
+        // The page is bounded whether or not the caller asked for a bound: the
+        // model's `PaginationMaxResults` range is 1..100, so 100 is the largest
+        // page this operation serves, and a caller who sends no `MaxResults` gets
+        // that same bounded page plus a `NextToken` rather than the whole store
+        // projected into one response.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListResourceSets"))
+        // Clamped into 1..=MAX_PAGE_SIZE rather than only capped: the modelled
+        // range already refuses a page size below 1, and this keeps a page from
+        // ever being empty-with-a-token (which a client would follow forever) if
+        // that validation ever changes.
+        let page_size = input
+            .max_results
+            .map_or(MAX_PAGE_SIZE, |max| usize::try_from(max).unwrap_or(0))
+            .clamp(1, MAX_PAGE_SIZE);
+        let resource_sets: Vec<ResourceSetSummary> = remaining
+            .by_ref()
+            .take(page_size)
+            .map(|(_, record)| record.summary())
+            .collect();
+        // A token only when a resource set is left AFTER this page, so the last
+        // page carries none.
+        let next_token = remaining
+            .next()
+            .map(|(id, _)| crate::state::encode_key_token(id));
+
+        Ok(ListResourceSetsOutput {
+            resource_sets: Some(resource_sets),
+            next_token,
+        })
     }
 }

@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AppsListData, DiscoveredResource, Policy, PolicySummary, ProtocolsListData,
-    ProtocolsListDataSummary, ResourceNotFoundException, ResourceSet, Tag,
+    ProtocolsListDataSummary, ResourceNotFoundException, ResourceSet, ResourceSetSummary, Tag,
 };
 
 /// The Region an emulated service reports when the request carries no SigV4
@@ -251,6 +251,22 @@ impl ResourceSetRecord {
         resource_set.last_update_time = Some(::aws_smithy_types::DateTime::from(self.updated_at));
         resource_set.resource_set_status = Some(RESOURCE_SET_STATUS_ACTIVE.to_string());
         resource_set
+    }
+
+    /// The `ResourceSetSummary` projection `ListResourceSets` reports: every
+    /// member read off this record, so a summary cannot disagree with the
+    /// `ResourceSet` [`Self::resource_set`] reports for the same id. The summary
+    /// shape carries no `UpdateToken` and no `ResourceTypeList`, which is why it
+    /// is a projection rather than the whole document.
+    pub fn summary(&self) -> ResourceSetSummary {
+        let resource_set = self.resource_set();
+        ResourceSetSummary {
+            id: resource_set.id,
+            name: Some(resource_set.name),
+            description: resource_set.description,
+            last_update_time: resource_set.last_update_time,
+            resource_set_status: resource_set.resource_set_status,
+        }
     }
 }
 
@@ -1153,6 +1169,23 @@ pub fn decode_page_token(token: &str) -> Option<String> {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-');
     is_minted_id.then_some(decoded)
+}
+
+/// Decode a `Base62Id`-keyed `PaginationToken` produced by
+/// [`encode_key_token`], for the paginated operations whose store key is a
+/// resource set's `Id`. `None` when the token was not produced by this service
+/// for such a page.
+///
+/// The decoded value must still be a `Base62Id` (the model's
+/// `com.amazonaws.fms#Base62Id`: exactly 22 characters matching
+/// `^[a-z0-9A-Z]{22}$`), so a token minted for a policy or account page — or any
+/// foreign token that happens to be valid hex — is refused rather than resumed
+/// from as an arbitrary key.
+pub fn decode_base62_page_token(token: &str) -> Option<String> {
+    let decoded = decode_key_token(token)?;
+    let is_base62_id = decoded.chars().count() == 22
+        && decoded.chars().all(|c| c.is_ascii_alphanumeric());
+    is_base62_id.then_some(decoded)
 }
 
 /// Decode an account-keyed `PaginationToken` produced by
