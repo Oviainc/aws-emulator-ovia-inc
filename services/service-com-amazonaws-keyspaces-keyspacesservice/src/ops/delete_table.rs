@@ -2,6 +2,9 @@
 
 //! @op DeleteTable
 //! IMPLEMENTED: moves a table into `DELETING` and lets the clock complete the deletion.
+//! A table that is still `CREATING` or `UPDATING` is refused with the code this
+//! operation's own documentation names for that case, `ResourceInUseException` — a shape
+//! this model does not declare, so it travels through `crate::scaffolded`.
 //! This is the ONLY file to touch for `DeleteTable`.
 //!
 //! The paragraphs below are the scaffold's own notes on how an operation is shaped and
@@ -67,6 +70,10 @@
 //! * `ConflictException` (HTTP 409) — Amazon Keyspaces couldn't complete the requested
 //!   action. This error may occur if you try to perform an action and the same or a different
 //!   action is already in progress, or if you try to create a resource that already exists.
+//!   NOTE: this handler returns no `ConflictException` on any path. The one in-flight case
+//!   this operation has is the `CREATING`/`UPDATING` one, and its documentation names
+//!   `ResourceInUseException` for it (see the paragraph above), which the model does not
+//!   declare — so it travels through `crate::scaffolded` instead.
 //! * `InternalServerException` (HTTP 500) — Amazon Keyspaces was unable to fully process this
 //!   request because of an internal server error.
 //! * `ResourceNotFoundException` (HTTP 404) — The operation tried to access a keyspace,
@@ -212,20 +219,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(settles_at)
             }
             // "If a table is either in the CREATING or UPDATING states, then Amazon
-            // Keyspaces returns a ResourceInUseException" — a shape this model does not
-            // declare. Its ConflictException is the same claim in the shapes this
-            // operation DOES declare: "you try to perform an action and the same or a
-            // different action is already in progress".
+            // Keyspaces returns a ResourceInUseException" — the code the service's own
+            // documentation names for this case, so it is the code a client branching on
+            // "wait until the table settles, then retry the delete" matches on. This
+            // model declares no `ResourceInUseException` shape, so it travels through the
+            // one channel that can carry an error this model does not declare
+            // (`crate::scaffolded`), as HTTP 400 `ResourceInUseException` — NOT as the
+            // modeled `ConflictException`, which is a different code on the wire.
             in_progress => {
-                return Err(DeleteTableErrorModeled::ConflictException(ConflictException {
-                    message: Some(format!(
-                        "Table '{}.{}' is in status {in_progress} and cannot be deleted until it is {}.",
-                        input.keyspace_name,
-                        input.table_name,
-                        crate::state::TABLE_STATUS_ACTIVE
-                    )),
-                })
-                .into())
+                return Err(crate::scaffolded::Scaffolded::resource_in_use(format!(
+                    "Table '{}.{}' is in status {in_progress} and cannot be deleted until it is {}.",
+                    input.keyspace_name,
+                    input.table_name,
+                    crate::state::TABLE_STATUS_ACTIVE
+                )))
             }
         };
         if let Some(settles_at) = settles_at {
