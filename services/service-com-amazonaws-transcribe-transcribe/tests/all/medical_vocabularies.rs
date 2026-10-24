@@ -100,7 +100,11 @@ fn name_of(request: &Value) -> String {
 
 /// Whether a member is absent from an answer (or present as JSON `null`), which is
 /// how an unset modelled member reaches the wire.
-fn is_absent(reply: &Reply, member: &str) -> bool {
+///
+/// `pub(crate)` because the NON-medical file-backed vocabulary suite
+/// (`crate::vocabulary_file_uri`) asserts the same absences, and one helper is better
+/// than two spellings of "the member did not reach the wire".
+pub(crate) fn is_absent(reply: &Reply, member: &str) -> bool {
     reply.body.get(member).is_none_or(Value::is_null)
 }
 
