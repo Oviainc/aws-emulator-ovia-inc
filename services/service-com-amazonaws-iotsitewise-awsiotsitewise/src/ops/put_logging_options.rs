@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutLoggingOptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutLoggingOptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutLoggingOptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Logging options are a SETTING, not a resource: this operation replaces the
+//! options of exactly one scope — the workspace the request names, or the
+//! account-and-region-wide scope when it names none — and `DescribeLoggingOptions`
+//! reads that same scope back. Both reach the one stored setting through
+//! `crate::state`'s `logging_options_for` / `set_logging_options`, so neither
+//! keeps a copy of its own.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +146,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutLoggingOptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutLoggingOptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutLoggingOptions"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutLoggingOptionsError::Modeled(
+                PutLoggingOptionsErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: "the IoT SiteWise store is unavailable".to_string(),
+                    },
+                ),
+            )
+        })?;
+        let _ = ctx;
+
+        // `level` is modelled as a `LoggingLevel`, and the generated
+        // `LOGGING_LEVEL_VALUES` is that enum's whole value set — so a level outside
+        // it names no verbosity this service logs at, and storing it would let a
+        // later read report a level the model does not define.
+        let level = input.logging_options.level.as_str();
+        if !LOGGING_LEVEL_VALUES.contains(&level) {
+            return Err(invalid_request(format!(
+                "The logging level must be one of {}, not {level}.",
+                LOGGING_LEVEL_VALUES.join(" | ")
+            )));
+        }
+
+        // The whole setting is replaced, for the named scope only: a put is the last
+        // word on the scope it names and says nothing about any other, so repeating
+        // the same put is idempotent. The instant is what bounds the store: see
+        // `crate::state::set_logging_options`.
+        state.lock().set_logging_options(
+            input.workspace_name.as_deref(),
+            input.logging_options,
+            ::std::time::SystemTime::now(),
+        );
+
+        Ok(PutLoggingOptionsOutput {})
     }
+}
+
+/// HTTP 400 `InvalidRequestException` carrying `message`.
+fn invalid_request(message: String) -> PutLoggingOptionsError {
+    PutLoggingOptionsError::Modeled(PutLoggingOptionsErrorModeled::InvalidRequestException(
+        InvalidRequestException { message },
+    ))
 }
