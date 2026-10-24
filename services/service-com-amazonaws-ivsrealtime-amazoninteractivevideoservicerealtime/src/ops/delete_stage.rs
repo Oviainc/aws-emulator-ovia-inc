@@ -157,6 +157,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // The tokens were issued against this stage, so they go with it.
         store.participant_tokens.remove(&input.arn);
+        // So do its sessions: the operation "shuts down and deletes the specified
+        // stage (disconnecting all participants)", after which the stage holds no
+        // session for a listing to report.
+        store.stage_sessions.remove(&input.arn);
         // So does every replication the stage is an end of: a replica is a participant
         // of its source stage replicated into its destination stage, so neither end can
         // outlive the stage it names. The replicas sourced from this stage go with its

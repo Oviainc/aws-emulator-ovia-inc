@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListParticipants
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListParticipants`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListParticipants::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation reports
+//!
+//! The participants of ONE stage session, which are exactly the ones the store holds
+//! for the `(stageArn, sessionId)` pair the request names
+//! ([`crate::state::StageSessionRecord`]): every participant that joined that
+//! session, in join order, the ones that have since left included. A participant
+//! reaches a stage through the stage's DATA plane — it joins over WebRTC with its
+//! participant token, or publishes to the WHIP/RTMP endpoints `CreateStage`
+//! advertises — so `crate::state::join_stage_session` is what records one, and this
+//! operation answers from those records alone.
+//!
+//! Three things it does beyond reading them, each stated once in
+//! [`ListParticipants::handle`]: it refuses a request carrying more than one of the
+//! four filters (the model documents only one per request), it refuses a `nextToken`
+//! it did not issue, and it pages the matching records with the documented default of
+//! fifty per page. A `(stageArn, sessionId)` pair this store holds no session for is
+//! not an error — the model declares no `ResourceNotFoundException` here — it simply
+//! selects no participant.
 //!
 //! ## Shape of an operation
 //!
@@ -107,10 +117,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-ivsrealtime-amazoninter
 // here — hence the `ListParticipantsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.ivsrealtime#ListParticipants")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.ivsrealtime#ListParticipants",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum ListParticipantsErrorModeled {
     AccessDeniedException(AccessDeniedException),
+    // Widened in through `extra_errors`: the SERVICE models `InternalServerException`
+    // (HTTP 500) though `ListParticipants` does not list it, and it is the only honest
+    // answer if the shared engine cannot hand back this service's store.
+    InternalServerException(InternalServerException),
     ValidationException(ValidationException),
 }
 
@@ -160,23 +177,158 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::LIST_PARTICIPANTS_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Report the participants of the named stage session.
+    ///
+    /// A pure read over the stored session; nothing is written, so polling it while
+    /// participants come and go cannot itself change what a later caller sees.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListParticipants` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListParticipantsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // Nothing here reads request metadata: the session this reports is named
+        // entirely by the `stageArn` and `sessionId` members, whose modelled lengths
+        // and patterns the framework's constraint walk refuses with a 400
+        // `ValidationException` before `handle` runs.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::state::store_unavailable(ListParticipantsErrorModeled::InternalServerException)
+        })?;
+
+        // "Only one of filterByUserId, filterByPublished, filterByState, or
+        // filterByRecordingState can be provided per request", as each of the four
+        // members' own doc states it. A request carrying two is refused rather than
+        // served by applying both, so it reports no page at all.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListParticipants"))
+        // `filterByPublished` carries the model's `@default false`, so an absent
+        // member and `false` are one value on the wire and in this input: the filter
+        // is the one the member describes ("only show participants who published"),
+        // which `false` does not ask for.
+        let supplied: Vec<&str> = [
+            ("filterByUserId", input.filter_by_user_id.is_some()),
+            ("filterByPublished", input.filter_by_published),
+            ("filterByState", input.filter_by_state.is_some()),
+            (
+                "filterByRecordingState",
+                input.filter_by_recording_state.is_some(),
+            ),
+        ]
+        .into_iter()
+        .filter(|(_, provided)| *provided)
+        .map(|(member, _)| member)
+        .collect();
+        if supplied.len() > 1 {
+            return Err(crate::state::validation_failed(
+                ListParticipantsErrorModeled::ValidationException,
+                crate::state::mutually_exclusive_members_message(
+                    Self::NAME,
+                    &supplied,
+                    &EXCLUSIVE_FILTERS,
+                ),
+            ));
+        }
+
+        // A `nextToken` this operation did not issue names no position, so it is
+        // refused rather than read as "start from the beginning" — including a token
+        // from this service's other listing, which names a position among records
+        // these pages do not hold.
+        let resume_after = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) => Some(
+                crate::state::decode_participant_page_token(token).ok_or_else(|| {
+                    crate::state::validation_failed(
+                        ListParticipantsErrorModeled::ValidationException,
+                        // The one rule this service words a foreign page token with,
+                        // shared with its other listings.
+                        crate::state::foreign_page_token_message(Self::NAME),
+                    )
+                })?,
+            ),
+        };
+        let page_size = input
+            .max_results
+            .and_then(|max| usize::try_from(max).ok())
+            // Documented on `ListParticipantsRequest$maxResults`: "Maximum number of
+            // results to return. Default: 50" — the same default the model documents
+            // for every listing of this service.
+            .unwrap_or(crate::state::DEFAULT_LIST_PAGE_SIZE)
+            // Unreachable defence, not an accepted-and-adjusted input: the modelled
+            // `MaxParticipantResults` range (1..100) refuses a non-positive
+            // `maxResults` with a 400 before this handler runs. It is here only so a
+            // page size of zero can never make pagination loop forever.
+            .max(1);
+
+        let store = state.lock();
+        // Join order, so a participant joining or leaving mid-pagination cannot shift
+        // a later page onto an already-returned one. A pair this store holds no
+        // session for selects nothing: see the module note.
+        let matching: Vec<&crate::state::ParticipantRecord> = store
+            .stage_session(&input.stage_arn, &input.session_id)
+            .map(crate::state::StageSessionRecord::participants_in_join_order)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|record| selected_by_filters(&input, record))
+            .filter(|record| resume_after.is_none_or(|after| record.sequence > after))
+            .collect();
+        let participants: Vec<ParticipantSummary> = matching
+            .iter()
+            .take(page_size)
+            .map(|record| record.to_summary())
+            .collect();
+        // A token only when a participant is left over, and it names the position this
+        // page ended at: the last page carries none.
+        let next_token = (matching.len() > page_size).then(|| {
+            crate::state::encode_participant_page_token(matching[page_size - 1].sequence)
+        });
+
+        Ok(ListParticipantsOutput {
+            participants,
+            next_token,
+        })
     }
+}
+
+/// The four filter members, in the order the model's own doc lists them, only one of
+/// which one request may carry.
+const EXCLUSIVE_FILTERS: [&str; 4] = [
+    "filterByUserId",
+    "filterByPublished",
+    "filterByState",
+    "filterByRecordingState",
+];
+
+/// Whether `record` is selected by the filter the request carries.
+///
+/// Each arm is the member's own doc read literally: `filterByUserId` matches the
+/// participant's own user id, `filterByPublished` keeps the participants that
+/// published, and `filterByState` / `filterByRecordingState` match the state the
+/// record holds. A request carrying no filter selects every participant of the
+/// session, and one carrying two never reaches here.
+///
+/// A participant whose token named no user id reads as the empty user id, which is a
+/// value the modelled `UserId` (`@length 0..128`) admits and the one reading under
+/// which `filterByUserId` is answered from the record alone.
+fn selected_by_filters(
+    input: &ListParticipantsInput,
+    record: &crate::state::ParticipantRecord,
+) -> bool {
+    if let Some(user_id) = input.filter_by_user_id.as_deref() {
+        if record.user_id.as_deref().unwrap_or_default() != user_id {
+            return false;
+        }
+    }
+    if input.filter_by_published && !record.published {
+        return false;
+    }
+    if let Some(participant_state) = input.filter_by_state.as_deref() {
+        if record.state != participant_state {
+            return false;
+        }
+    }
+    if let Some(recording_state) = input.filter_by_recording_state.as_deref() {
+        if record.recording_state != recording_state {
+            return false;
+        }
+    }
+    true
 }
