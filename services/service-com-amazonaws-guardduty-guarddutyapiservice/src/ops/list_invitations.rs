@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListInvitations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListInvitations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListInvitations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the membership invitations the current account's inbox holds, out of
+//! stored state, one page at a time: the inbox is what an invitation is delivered
+//! to and what an acceptance resolves against, and this is a pure report — it never
+//! writes.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +141,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListInvitations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListInvitationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListInvitations"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListInvitationsErrorModeled::InternalServerErrorException(
+                crate::state::state_unavailable(),
+            )
+            .into());
+        };
+
+        // The operation names no detector (`GET /invitation` —
+        // `smithy_query(operation="ListInvitations")`), so the inbox it reports is
+        // the one the Region the request was signed for serves.
+        let region = crate::state::request_region(ctx);
+        // A pure report: nothing below writes to the store.
+        let state = state.lock();
+        let invitations = state.received_invitations_in(&region);
+
+        // One page out of that total order, so the token this call hands back names
+        // the same entry on the call that returns it.
+        let (window, next_token) = crate::state::paginate_window(
+            invitations.len(),
+            input.max_results,
+            input.next_token.as_deref(),
+            INVITATIONS_MAX,
+        )
+        .map_err(|_| {
+            // Under the error CLASS, naming the parameter at fault and not quoting
+            // the token back.
+            crate::scaffolded::Scaffolded::invalid_input(crate::state::invalid_parameter_message(
+                crate::state::NEXT_TOKEN_MEMBER,
+            ))
+        })?;
+
+        let page: Vec<Invitation> = invitations[window]
+            .iter()
+            .copied()
+            .map(crate::state::invitation_view)
+            .collect();
+
+        Ok(ListInvitationsOutput {
+            // Present and empty when the inbox holds no invitation: an empty list is
+            // the answer, and a client reads it the same way as a full one.
+            invitations: Some(page),
+            next_token,
+        })
     }
 }
+
+/// `Invitations` is `len 0..50` (`smithy_query(operation="ListInvitations")`), so one
+/// page can never carry more than 50 invitations whatever `maxResults` asks for —
+/// which is also the modelled ceiling on `MaxResults` itself (range 1..50).
+const INVITATIONS_MAX: usize = 50;
