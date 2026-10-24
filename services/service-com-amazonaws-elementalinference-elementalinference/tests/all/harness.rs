@@ -167,6 +167,18 @@ pub fn output_config(kind: &str) -> Value {
     }
 }
 
+/// One output named `name`, carrying the `kind` config and `status` — the three members
+/// `CreateOutput` requires (`smithy_query(query="shape",shape="CreateOutput")`).
+pub fn output(name: &str, kind: &str, status: &str) -> Value {
+    json!({"name": name, "outputConfig": output_config(kind), "status": status})
+}
+
+/// One ENABLED output named `name`, carrying the `kind` config — the output a suite
+/// builds when the output's own `status` is not what it is testing.
+pub fn enabled_output(name: &str, kind: &str) -> Value {
+    output(name, kind, "ENABLED")
+}
+
 /// One output whose subtitling config names `dictionary` (`SubtitlingConfig$dictionary`:
 /// "the ID of a custom dictionary"), or names none when it is `None`.
 ///

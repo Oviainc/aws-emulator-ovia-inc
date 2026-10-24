@@ -33,7 +33,9 @@
 //!   reports the feed unchanged;
 //! * an id no live feed has is `ResourceNotFoundException` (HTTP 404) on both.
 
-use crate::harness::{call, output_config, past_the_transition_span, router, REGION, SIGNING_NAME};
+use crate::harness::{
+    call, output, output_config, past_the_transition_span, router, REGION, SIGNING_NAME,
+};
 use serde_json::{json, Value};
 use service_com_amazonaws_elementalinference_elementalinference::state::{
     feed_not_associated_message, FeedStatus, FEED_ALREADY_ASSOCIATED_MESSAGE,
@@ -41,11 +43,6 @@ use service_com_amazonaws_elementalinference_elementalinference::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 use std::sync::Arc;
-
-/// One output, named `name`, carrying the `kind` config and `status`.
-fn output(name: &str, kind: &str, status: &str) -> Value {
-    json!({"name": name, "outputConfig": output_config(kind), "status": status})
-}
 
 /// Create a feed carrying `outputs` and return its id. A created feed is settled and
 /// `AVAILABLE` at once, so the caller can associate it in the very next request.
