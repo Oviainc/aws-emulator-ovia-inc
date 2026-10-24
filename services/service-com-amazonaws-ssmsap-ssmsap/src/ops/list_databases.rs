@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDatabases
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDatabases`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDatabases::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one `DatabaseSummary` per SAP HANA database of the registered applications
+//! this request reaches, computed from state: the databases an application has are the
+//! ones its registration named ([`crate::state::StoredApplication::databases`]),
+//! `ApplicationId` narrows the listing to one application, `ComponentId` to the
+//! databases of one component, `MaxResults` bounds the page and `NextToken` resumes
+//! after the last database of the previous one.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +147,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDatabases` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDatabasesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDatabases"))
+        // The Region this request was signed for: a listing reports what is registered
+        // at THIS regional endpoint and nothing of any other Region.
+        let region = crate::state::request_region(ctx.parts());
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListDatabasesErrorModeled::InternalServerException(crate::state::store_unavailable())
+        })?;
+        let mut state = state.lock();
+        // Materialise what the clock already owed, so this listing agrees with any other
+        // read made at the same instant.
+        state.settle(::std::time::SystemTime::now());
+        let region_state = state.region(&region);
+
+        // `ApplicationId` is optional in the model, so a request that names one is
+        // narrowed to that application — which must be registered here, an absent one
+        // being the `ResourceNotFoundException` this operation models — and one that
+        // names none reaches every application of this Region, in id order.
+        let applications: Vec<&crate::state::StoredApplication> =
+            match input.application_id.as_deref() {
+                Some(application_id) => {
+                    let application =
+                        region_state.applications.get(application_id).ok_or_else(|| {
+                            ListDatabasesErrorModeled::ResourceNotFoundException(
+                                crate::state::not_found(
+                                    crate::state::application_not_found_message(application_id),
+                                ),
+                            )
+                        })?;
+                    ::std::vec![application]
+                }
+                None => region_state.applications.values().collect(),
+            };
+
+        // Every database the request reaches, paired with the key the listing is ordered
+        // by: applications come in id order and each application's databases in database
+        // id order, so the keys are already ascending and a `NextToken` resumes exactly
+        // where the previous page stopped.
+        let matching: Vec<(String, crate::state::ApplicationDatabase)> = applications
+            .into_iter()
+            .flat_map(|application| application.databases(&region))
+            .filter(|database| match input.component_id.as_deref() {
+                // A component the request names narrows the listing to the databases of
+                // that component; a component no database of these applications belongs
+                // to matches none of them.
+                Some(component_id) => database.component_id.as_deref() == Some(component_id),
+                None => true,
+            })
+            .map(|database| (database.page_key(), database))
+            .collect();
+
+        let page = crate::state::page(matching, input.max_results, input.next_token.as_deref())
+            .map_err(|error| {
+                ListDatabasesErrorModeled::ValidationException(
+                    crate::state::page_validation_exception(&error),
+                )
+            })?;
+
+        let databases: Vec<DatabaseSummary> = page
+            .items
+            .iter()
+            .map(|database| database.summary(region_state.tags_for(&database.arn)))
+            .collect();
+
+        Ok(ListDatabasesOutput {
+            databases: Some(databases),
+            next_token: page.next_token,
+        })
     }
 }

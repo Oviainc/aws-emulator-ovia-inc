@@ -25,7 +25,19 @@ const PREDEFINED: &[&str] = &[
     "CodeDeployDefault.HalfAtATime",
     "CodeDeployDefault.AllAtOnce",
     "CodeDeployDefault.LambdaAllAtOnce",
+    "CodeDeployDefault.LambdaCanary10Percent5Minutes",
+    "CodeDeployDefault.LambdaCanary10Percent10Minutes",
+    "CodeDeployDefault.LambdaCanary10Percent15Minutes",
+    "CodeDeployDefault.LambdaCanary10Percent30Minutes",
+    "CodeDeployDefault.LambdaLinear10PercentEvery1Minute",
+    "CodeDeployDefault.LambdaLinear10PercentEvery2Minutes",
+    "CodeDeployDefault.LambdaLinear10PercentEvery3Minutes",
+    "CodeDeployDefault.LambdaLinear10PercentEvery10Minutes",
     "CodeDeployDefault.ECSAllAtOnce",
+    "CodeDeployDefault.ECSCanary10Percent5Minutes",
+    "CodeDeployDefault.ECSCanary10Percent15Minutes",
+    "CodeDeployDefault.ECSLinear10PercentEvery1Minutes",
+    "CodeDeployDefault.ECSLinear10PercentEvery3Minutes",
 ];
 
 /// The names in a listing's `deploymentConfigsList` member.

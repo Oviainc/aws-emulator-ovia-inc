@@ -45,6 +45,8 @@ mod documentation_part_import_bulk;
 mod documentation_parts;
 #[path = "all/documentation_versions.rs"]
 mod documentation_versions;
+#[path = "all/domain_name_access_association_reject.rs"]
+mod domain_name_access_association_reject;
 #[path = "all/domain_name_collection.rs"]
 mod domain_name_collection;
 #[path = "all/epoch_second_timestamps.rs"]
@@ -107,6 +109,8 @@ mod update_stage;
 mod usage_plan_lifecycle;
 #[path = "all/validation_message_rules.rs"]
 mod validation_message_rules;
+#[path = "all/vpc_links.rs"]
+mod vpc_links;
 
 // Declared after the sorted list on purpose: every apigateway fix that lands adds its
 // suite inside that list, so a line inserted there collides with every other suite
@@ -132,3 +136,5 @@ mod update_stage_readers;
 mod execution_logging_prerequisites;
 #[path = "all/usage_plan_creation_bounds.rs"]
 mod usage_plan_creation_bounds;
+#[path = "all/control_plane_deletes.rs"]
+mod control_plane_deletes;

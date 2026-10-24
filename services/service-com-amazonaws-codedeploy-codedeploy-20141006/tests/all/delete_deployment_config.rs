@@ -23,15 +23,29 @@ use service_com_amazonaws_codedeploy_codedeploy_20141006 as codedeploy;
 
 use crate::codedeploy_lifecycle::{error_code, s3_revision, seeded_group, Emulator};
 
-/// The `CodeDeployDefault.*` configurations this service ships, one per compute
-/// platform, as the AWS CodeDeploy User Guide's "deployment configurations"
-/// pages list them (the same catalog `src/state.rs` seeds).
+/// The `CodeDeployDefault.*` configurations this service ships, in the order it
+/// seeds them: the EC2/on-premises ones, then the Lambda ones (all-at-once and
+/// every time-based canary and linear variant), then the Amazon ECS ones — as
+/// the AWS CodeDeploy User Guide's "deployment configurations" pages list them
+/// (the same catalog `src/state.rs` seeds).
 const PREDEFINED: &[&str] = &[
     "CodeDeployDefault.OneAtATime",
     "CodeDeployDefault.HalfAtATime",
     "CodeDeployDefault.AllAtOnce",
     "CodeDeployDefault.LambdaAllAtOnce",
+    "CodeDeployDefault.LambdaCanary10Percent5Minutes",
+    "CodeDeployDefault.LambdaCanary10Percent10Minutes",
+    "CodeDeployDefault.LambdaCanary10Percent15Minutes",
+    "CodeDeployDefault.LambdaCanary10Percent30Minutes",
+    "CodeDeployDefault.LambdaLinear10PercentEvery1Minute",
+    "CodeDeployDefault.LambdaLinear10PercentEvery2Minutes",
+    "CodeDeployDefault.LambdaLinear10PercentEvery3Minutes",
+    "CodeDeployDefault.LambdaLinear10PercentEvery10Minutes",
     "CodeDeployDefault.ECSAllAtOnce",
+    "CodeDeployDefault.ECSCanary10Percent5Minutes",
+    "CodeDeployDefault.ECSCanary10Percent15Minutes",
+    "CodeDeployDefault.ECSLinear10PercentEvery1Minutes",
+    "CodeDeployDefault.ECSLinear10PercentEvery3Minutes",
 ];
 
 /// Create the deployment configuration `name` from `members`, failing the case

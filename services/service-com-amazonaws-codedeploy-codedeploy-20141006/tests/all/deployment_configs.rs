@@ -16,15 +16,28 @@ use serde_json::{json, Value};
 
 use crate::codedeploy_lifecycle::{error_code, Emulator};
 
-/// The `CodeDeployDefault.*` built-ins this service seeds, one per compute
-/// platform, as the AWS CodeDeploy User Guide's "deployment configurations"
-/// pages list them.
+/// The `CodeDeployDefault.*` built-ins this service seeds, as the AWS CodeDeploy
+/// User Guide's "deployment configurations" pages list them: the EC2/on-premises
+/// ones, the Lambda ones (all-at-once and every time-based canary and linear
+/// variant) and the Amazon ECS ones.
 const PREDEFINED: &[&str] = &[
     "CodeDeployDefault.OneAtATime",
     "CodeDeployDefault.HalfAtATime",
     "CodeDeployDefault.AllAtOnce",
     "CodeDeployDefault.LambdaAllAtOnce",
+    "CodeDeployDefault.LambdaCanary10Percent5Minutes",
+    "CodeDeployDefault.LambdaCanary10Percent10Minutes",
+    "CodeDeployDefault.LambdaCanary10Percent15Minutes",
+    "CodeDeployDefault.LambdaCanary10Percent30Minutes",
+    "CodeDeployDefault.LambdaLinear10PercentEvery1Minute",
+    "CodeDeployDefault.LambdaLinear10PercentEvery2Minutes",
+    "CodeDeployDefault.LambdaLinear10PercentEvery3Minutes",
+    "CodeDeployDefault.LambdaLinear10PercentEvery10Minutes",
     "CodeDeployDefault.ECSAllAtOnce",
+    "CodeDeployDefault.ECSCanary10Percent5Minutes",
+    "CodeDeployDefault.ECSCanary10Percent15Minutes",
+    "CodeDeployDefault.ECSLinear10PercentEvery1Minutes",
+    "CodeDeployDefault.ECSLinear10PercentEvery3Minutes",
 ];
 
 // ---------------------------------------------------------------------------

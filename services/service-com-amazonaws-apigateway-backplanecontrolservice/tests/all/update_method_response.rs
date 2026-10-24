@@ -553,7 +553,7 @@ async fn a_patch_this_operation_cannot_apply_is_refused_and_changes_nothing() {
         vec![op("upsert", "/responseModels/text~1plain", Some("Empty"))],
     )
     .await;
-    assert_failure(&answer, 400, "ValidationException", "an op nothing names");
+    assert_failure(&answer, 400, "BadRequestException", "an op nothing names");
     assert_read_back(
         &gateway,
         &api,
@@ -643,7 +643,7 @@ async fn an_unknown_identifier_is_a_not_found_and_patches_nothing() {
             )
             .await,
             400,
-            "ValidationException",
+            "BadRequestException",
             &format!("UpdateMethodResponse({status})"),
         );
     }

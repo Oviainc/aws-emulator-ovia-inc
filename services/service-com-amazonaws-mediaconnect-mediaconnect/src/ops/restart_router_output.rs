@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RestartRouterOutput
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RestartRouterOutput`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RestartRouterOutput::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Restarts the router output one ARN addresses, in this service's store: the stored
+//! record enters the transient `RECOVERING` state and the clock owes it the state the
+//! restart resumes it in ([`resume_state`]). The response is read back off that record;
+//! the read sides are GetRouterOutput and BatchGetRouterOutput.
 //!
 //! ## Shape of an operation
 //!
@@ -90,6 +86,52 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The server-side failure for a store this service cannot reach.
+fn store_unavailable(detail: &str) -> RestartRouterOutputError {
+    RestartRouterOutputErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: detail.to_string(),
+    })
+    .into()
+}
+
+/// The state a restarted router output RESUMES into — what the clock owes it one
+/// [`crate::state::TRANSITION_SPAN`] after this operation accepted the call — or `None`
+/// when an output in `state` cannot be restarted at all.
+///
+/// Every value it names is one `crate::state` owns for this family
+/// (`ROUTER_OUTPUT_STATE_*`), out of the enum this crate GENERATES from the model as
+/// `super::types::ROUTER_OUTPUT_STATE_VALUES`
+/// (`smithy_query(query="shape",shape="RouterOutputState")`: CREATING | STANDBY | STARTING
+/// | ACTIVE | STOPPING | DELETING | UPDATING | ERROR | RECOVERING | MIGRATING), which the
+/// integration suite drives this operation over so the rule cannot drift from the model.
+///
+/// RestartRouterOutput "restarts a router output … to recover from errors or refresh the
+/// output state": it acts on an output that is at REST, and puts it back in the state in
+/// which it is meant to be carrying content.
+///
+/// * an output that is carrying content (`ACTIVE`), or that has FAILED while meant to
+///   (`ERROR`, the state the operation documents recovering from), resumes `ACTIVE`;
+/// * an output that was created and not started yet (`STANDBY`) has no content to resume,
+///   so the restart refreshes it and leaves it in `STANDBY`;
+/// * in every other value the enum declares a change is ALREADY in flight (`CREATING`,
+///   `STARTING`, `STOPPING`, `UPDATING`, `RECOVERING`, `MIGRATING`) or the output is going
+///   away (`DELETING`, which is a HARD delete), so a restart would conflict with it —
+///   which is what the modelled `ConflictException` is for ("the requested operation would
+///   cause a conflict with the current state of a service resource associated with the
+///   request"). An unmodelled string, which nothing in this service can store, is refused
+///   the same way rather than acted on.
+fn resume_state(state: &str) -> Option<&'static str> {
+    match state {
+        crate::state::ROUTER_OUTPUT_STATE_ACTIVE | crate::state::ROUTER_OUTPUT_STATE_ERROR => {
+            Some(crate::state::ROUTER_OUTPUT_STATE_ACTIVE)
+        }
+        crate::state::ROUTER_OUTPUT_STATE_STANDBY => {
+            Some(crate::state::ROUTER_OUTPUT_STATE_STANDBY)
+        }
+        _ => None,
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -164,18 +206,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RestartRouterOutput` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RestartRouterOutputErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RestartRouterOutput"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(store_unavailable(
+                "the mediaconnect router output store is unavailable",
+            ));
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The ONE lookup a router output operation resolves an `@httpLabel` ARN through
+        // ([`crate::state::ComAmazonawsMediaconnectMediaconnectState::router_output_mut`]),
+        // which materialises the changes the clock already owes first: an output whose
+        // `CREATING` became `STANDBY` while nobody was looking is a settled output, a
+        // restart that has run its course has already resumed, and an output whose deletion
+        // has come due is gone — so this call sees the state every other caller sees.
+        let Some(router_output) = store.router_output_mut(&input.arn, now) else {
+            return Err(RestartRouterOutputErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: crate::state::not_found_message(&input.arn),
+                },
+            )
+            .into());
+        };
+
+        // A restart acts on an output that is at REST; one with a change already in flight
+        // (or on its way out) conflicts with that change, which is exactly what the
+        // modelled `ConflictException` reports — 409, which with the error code is the
+        // contract; the sentence only states which call was refused and why. A record the
+        // clock still owes a state is in flight too, whatever that state is called, so it
+        // is refused the same way the sibling RestartRouterInput refuses one
+        // (`StoredRouterInput::is_transitioning`).
+        let resumes_in = resume_state(&router_output.state)
+            .filter(|_| router_output.pending.is_none() && !router_output.is_deleting());
+        let Some(resumes_in) = resumes_in else {
+            return Err(RestartRouterOutputErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "Router output {} is in state {} and a state change is already in \
+                         progress, so it cannot be restarted yet.",
+                        router_output.arn, router_output.state
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // The restart is accepted: the output is RECOVERING now, and the clock owes it the
+        // resumed state one `crate::state::TRANSITION_SPAN` later — so a caller polling
+        // straight after this call still observes the transient state. The transition is
+        // started through the record's own [`crate::state::StoredRouterOutput::begin_transition`],
+        // the way every other router output transition is. The record changed, so
+        // `RouterOutput$UpdatedAt` ("the timestamp when the router output was last
+        // updated") moves with it; the clock settling the owed state later does not move it
+        // again, because that materialises the change this call already made due. Nothing
+        // else about the record changes: a restart neither re-routes the output
+        // (`RoutedInputArn`) nor drops the messages the service has recorded about it.
+        router_output.begin_transition(crate::state::ROUTER_OUTPUT_STATE_RECOVERING, resumes_in, now);
+        router_output.updated_at = now;
+
+        // The response is read back off the STORED record, never built from the request.
+        Ok(RestartRouterOutputOutput {
+            arn: router_output.arn.clone(),
+            name: router_output.name.clone(),
+            state: router_output.state.clone(),
+        })
     }
 }
