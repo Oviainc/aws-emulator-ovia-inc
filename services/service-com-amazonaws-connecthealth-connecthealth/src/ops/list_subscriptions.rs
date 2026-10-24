@@ -219,7 +219,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(domain) = store.live_domain(&input.domain_id) else {
             return Err(ListSubscriptionsErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!("Domain {} was not found", input.domain_id)),
+                    message: Some(crate::service::error_detail::domain_not_found_message(
+                        &input.domain_id,
+                    )),
                 },
             )
             .into());

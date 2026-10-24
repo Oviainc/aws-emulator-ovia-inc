@@ -444,9 +444,13 @@ pub struct StandardDefinition {
 ///
 /// The text is per entry, not generated from a family template: entries of one family
 /// differ in whether the catalog expands an acronym (the NIST entries do not, the PCI
-/// and CIS entries do), in "checks your" versus "checks for your", and in the
-/// typography of a possessive. So each description is copied from the catalog for that
-/// standard, never derived from a neighbour's.
+/// and CIS entries do), in "checks your" versus "checks for your", in how the
+/// requirement subset is named (the four CIS AWS benchmark revisions all say "a subset
+/// of CIS requirements" while the two PCI DSS revisions disagree with each other — the
+/// older says "a subset of PCI DSS requirements", the newer "a subset of PCI DSS
+/// V4.0.1 requirements"), and in the typography of a possessive. So each description is
+/// copied from the catalog for that standard, never derived from a neighbour's by
+/// substituting a version token.
 ///
 /// Ordered by `Name`, which is the order `DescribeStandards` reports the catalog in,
 /// so a page boundary falls in the same place on every call.
@@ -575,6 +579,9 @@ pub const STANDARDS_CATALOG: [StandardDefinition; 13] = [
         slug: "pci-dss",
         version: "3.2.1",
         name: "PCI DSS v3.2.1",
+        // This revision's catalog text names the requirement subset without a version
+        // ("a subset of PCI DSS requirements"), unlike the v4.0.1 entry below: the
+        // recorded catalog confirms both, so neither is derived from the other.
         description: "The Payment Card Industry Data Security Standard (PCI DSS) v3.2.1 is an information security standard for entities that store, process, and/or transmit cardholder data. This Security Hub standard automatically checks for your compliance readiness against a subset of PCI DSS requirements.",
         provider: "AWS",
         enabled_by_default: false,
@@ -584,13 +591,14 @@ pub const STANDARDS_CATALOG: [StandardDefinition; 13] = [
         slug: "pci-dss",
         version: "4.0.1",
         name: "PCI DSS v4.0.1",
-        // The PCI DSS family's published catalog wording (identical to the v3.2.1
-        // entry above, which the recording confirms, with this revision's version
-        // substituted). AWS's own text for THIS revision is the one catalog string
-        // this emulator has no source for: it is not in the model, not in the issue
-        // report and the replay withholds it, so the entry keeps the family's
-        // published wording rather than an invented sentence.
-        description: "The Payment Card Industry Data Security Standard (PCI DSS) v4.0.1 is an information security standard for entities that store, process, and/or transmit cardholder data. This Security Hub standard automatically checks for your compliance readiness against a subset of PCI DSS requirements.",
+        // This revision's OWN published catalog text, which is not the v3.2.1 entry's
+        // sentence with the version swapped: where the v3.2.1 entry names the
+        // requirement subset "a subset of PCI DSS requirements", this entry qualifies
+        // it with the revision — "a subset of PCI DSS V4.0.1 requirements", with the
+        // catalog's own capital "V" there beside the lowercase "v4.0.1" of the opening
+        // clause. One more reason a description is copied per entry and never derived
+        // from a sibling revision's.
+        description: "The Payment Card Industry Data Security Standard (PCI DSS) v4.0.1 is an information security standard for entities that store, process, and/or transmit cardholder data. This Security Hub standard automatically checks for your compliance readiness against a subset of PCI DSS V4.0.1 requirements.",
         provider: "AWS",
         enabled_by_default: false,
         partition_wide_ruleset: false,

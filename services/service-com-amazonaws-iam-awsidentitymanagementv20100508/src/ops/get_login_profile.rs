@@ -1,16 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetLoginProfile
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetLoginProfile`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetLoginProfile::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
-//!
+//! ## Shape of an operation
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -154,18 +146,59 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetLoginProfile` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetLoginProfileErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetLoginProfile"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetLoginProfileErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        // A read: it "retrieves the user name for the specified IAM user", so it
+        // reports the stored record and writes nothing.
+        let store = state.lock();
+
+        // With no `UserName` the profile reported is the one of the IAM user the
+        // request was signed by, resolved from the request's access key id exactly as
+        // `GetUser` resolves it. Credentials that belong to no IAM user resolve to no
+        // user, so such a request is refused rather than having an identity invented
+        // for it — IAM serves the nameless form from an AssumeRoot session, which
+        // this emulator has no principal for.
+        let user_key = match &input.user_name {
+            Some(user_name) => crate::state::name_key(user_name),
+            None => {
+                let akid = ::engine::extract_akid(&ctx.parts().headers);
+                match store.access_keys.get(&akid) {
+                    Some(record) => record.user_key.clone(),
+                    None => {
+                        // `GetLoginProfile` models only `NoSuchEntityException` and
+                        // `ServiceFailureException`, and neither fits: the request
+                        // named no entity to be missing and the service did not
+                        // fail, so the refusal goes through the crate's generic
+                        // client-input channel (HTTP 400, `ValidationException`), as
+                        // `GetUser` refuses the same request.
+                        return Err(crate::scaffolded::Scaffolded::validation(
+                            "Must specify userName when calling with non-User credentials",
+                        ));
+                    }
+                }
+            }
+        };
+
+        // "If the user does not exist or does not have a password, the operation
+        // returns a 404 (NoSuchEntity) error" — one refusal for both, since a login
+        // profile exists only as a password of a user the account holds.
+        match store.login_profile_report(&user_key) {
+            Some(login_profile) => Ok(GetLoginProfileOutput { login_profile }),
+            None => Err(GetLoginProfileErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "Login Profile for user {} cannot be found.",
+                        input.user_name.as_deref().unwrap_or(&user_key)
+                    )),
+                },
+            )
+            .into()),
+        }
     }
 }
