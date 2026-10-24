@@ -33,14 +33,30 @@
 //!   [`crate::state::property_definition_needs_data_type`] holds for every
 //!   writer of a definition. Checked over the WHOLE patched record, because an
 //!   update that clears `extendsFrom` takes away the inheritance an older
-//!   definition was relying on.
+//!   definition was relying on;
+//! * a reference the update DECLARES does not resolve — an `extendsFrom` or
+//!   `compositeComponentTypes[*].componentTypeId` id naming a component type
+//!   the service does not hold, inheritance that reaches back to the component
+//!   type being updated, or a `propertyGroups[*].propertyNames` entry naming a
+//!   property the patched component type neither defines nor inherits — a
+//!   `ValidationException` (HTTP 400), the rules
+//!   [`crate::state::extends_from_violation`],
+//!   [`crate::state::composite_component_types_violation`] and
+//!   [`crate::state::property_groups_violation`] hold for every writer of
+//!   those members. A declared id resolves to a component type stored in the
+//!   workspace or to one of the service's built-in types (see
+//!   [`crate::state::BUILT_IN_COMPONENT_TYPE_ID_PREFIX`]). The two ID members
+//!   are resolved only where this request NAMES them, since a reference an
+//!   earlier write left dangling is not this call's to refuse; the property
+//!   GROUPS are checked over the whole patched record whenever the request
+//!   touches what their names resolve against — the groups, the own
+//!   definitions, or the inheritance the inherited ones come through — because
+//!   a patch that drops a property a stored group names is the call that
+//!   strands that group.
 //!
-//! The same deliberate gaps as the create: `extendsFrom` is stored without
-//! checking that the parent component types exist (this emulator holds no
-//! registry of the service's built-in types), and authorization is not
-//! emulated, so the modelled `AccessDeniedException` is never returned. No
-//! quota applies to a call that creates nothing, so the modelled
-//! `ServiceQuotaExceededException` is not returned either.
+//! Authorization is not emulated, so the modelled `AccessDeniedException` is
+//! never returned. No quota applies to a call that creates nothing, so the
+//! modelled `ServiceQuotaExceededException` is not returned either.
 //!
 //! ## Shape of an operation
 //!
@@ -222,7 +238,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Both labels address an EXISTING resource, so neither naming something
         // the store does not hold is anything but a 404 — the same reading
         // `GetComponentType` gives the same two labels.
-        let Some(workspace) = state.workspaces.get_mut(&input.workspace_id) else {
+        let Some(workspace) = state.workspaces.get(&input.workspace_id) else {
             return Err(UpdateComponentTypeErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::workspace_not_found_message(
@@ -232,7 +248,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        let Some(stored) = workspace.component_types.get_mut(&input.component_type_id) else {
+        let Some(stored) = workspace.component_types.get(&input.component_type_id) else {
             return Err(UpdateComponentTypeErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: Some(crate::state::component_type_not_found_message(
@@ -245,16 +261,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
-        // The clock's transition first: the update applies to the record as it
-        // stands at this instant, not as the previous call left it. The service
-        // models no conflict for an update that arrives while a create or an
-        // earlier update is still in flight, so one is applied rather than
-        // refused; it simply reopens the window.
-        stored.settle(now);
 
         // The patch is built on a COPY, so a request refused below leaves the
-        // stored record exactly as it was.
+        // stored record exactly as it was. The clock's transition is applied to
+        // that copy first: the update applies to the record as it stands at
+        // this instant, not as the previous call left it. The service models no
+        // conflict for an update that arrives while a create or an earlier
+        // update is still in flight, so one is applied rather than refused; it
+        // simply reopens the window.
         let mut updated = stored.clone();
+        updated.settle(now);
+        // Which reference-carrying members this request DECLARES, captured
+        // before the patch moves them onto the copy: the ids and names a call
+        // declares are the ones it has to be able to resolve.
+        let declares_extends_from = input.extends_from.is_some();
+        let declares_property_definitions = input.property_definitions.is_some();
+        let declares_composite_component_types = input.composite_component_types.is_some();
+        let declares_property_groups = input.property_groups.is_some();
         if let Some(component_type_name) = input.component_type_name {
             updated.component_type_name = Some(component_type_name);
         }
@@ -296,6 +319,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             updated.composite_component_types = composite_component_types.into_iter().collect();
         }
 
+        // A reference the update DECLARES has to resolve: the ids it puts in
+        // `extendsFrom` and `compositeComponentTypes` must name component types
+        // the service holds, the inheritance they declare must not reach back
+        // to this component type, and a property group must name properties the
+        // patched component type defines. Checked BEFORE the `dataType` rule
+        // below, because a dangling parent is what would otherwise license a
+        // definition with no `dataType` to be stored.
+        //
+        // Only the members this request NAMES are resolved for the two id
+        // members: those are the references this call declares, and one some
+        // earlier write left dangling is not this call's to refuse — refusing
+        // it would make an unrelated patch (a description, say) of such a
+        // record impossible.
+        if declares_extends_from {
+            if let Some(message) = crate::state::extends_from_violation(
+                workspace,
+                &input.component_type_id,
+                &updated.extends_from,
+            ) {
+                return Err(validation_exception(message));
+            }
+        }
+        if declares_composite_component_types {
+            if let Some(message) = crate::state::composite_component_types_violation(
+                workspace,
+                &updated.composite_component_types,
+            ) {
+                return Err(validation_exception(message));
+            }
+        }
+        // The property groups, by contrast, are checked over the WHOLE patched
+        // record whenever this request touches the set of properties they can
+        // resolve against — the groups themselves, the own definitions, or the
+        // inheritance the inherited ones come from — because a patch that drops
+        // a definition a stored group still names is the call that strands that
+        // group, exactly as a patch that clears `extendsFrom` is the call that
+        // strands an inherited definition (the `dataType` rule below).
+        if declares_property_groups || declares_property_definitions || declares_extends_from {
+            if let Some(message) = crate::state::property_groups_violation(workspace, &updated) {
+                return Err(validation_exception(message));
+            }
+        }
+
         // Every definition the patched record would hold has to be reportable,
         // not just the ones this request carried: an update that clears
         // `extendsFrom` takes the inheritance an older definition was relying
@@ -303,15 +369,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for (property_name, definition) in &updated.property_definitions {
             if crate::state::property_definition_needs_data_type(&updated.extends_from, definition)
             {
-                return Err(UpdateComponentTypeErrorModeled::ValidationException(
-                    ValidationException {
-                        message: Some(format!(
-                            "propertyDefinitions.{property_name}.dataType is required for a \
-                             component type that extends nothing"
-                        )),
-                    },
-                )
-                .into());
+                return Err(validation_exception(format!(
+                    "propertyDefinitions.{property_name}.dataType is required for a component \
+                     type that extends nothing"
+                )));
             }
         }
 
@@ -319,13 +380,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // component type reports the non-terminal state an update in flight is
         // in; the clock, not a caller, settles it back in `ACTIVE`.
         updated.begin_update(now);
+        let output = UpdateComponentTypeOutput {
+            workspace_id: updated.workspace_id.clone(),
+            component_type_id: updated.component_type_id.clone(),
+            arn: updated.arn.clone(),
+            state: updated.state.clone(),
+        };
+
+        // Commit LAST: the record is re-borrowed mutably here — the lookups
+        // that validated the request held the workspace immutably, so the
+        // references above could be resolved against its other component types
+        // — and nothing past this point can fail.
+        let Some(stored) = state
+            .workspaces
+            .get_mut(&input.workspace_id)
+            .and_then(|workspace| workspace.component_types.get_mut(&input.component_type_id))
+        else {
+            return Err(UpdateComponentTypeErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(format!(
+                        "component type {} of workspace {} vanished",
+                        input.component_type_id, input.workspace_id
+                    )),
+                },
+            )
+            .into());
+        };
         *stored = updated;
 
-        Ok(UpdateComponentTypeOutput {
-            workspace_id: stored.workspace_id.clone(),
-            component_type_id: stored.component_type_id.clone(),
-            arn: stored.arn.clone(),
-            state: stored.state.clone(),
-        })
+        Ok(output)
     }
+}
+
+/// One refusal of this operation's `ValidationException`, with the message the
+/// rule that refused the request produced.
+///
+/// The message is built from the REQUEST — the member and the id or name the
+/// service could not resolve — so a caller is told what to change.
+fn validation_exception(message: String) -> UpdateComponentTypeError {
+    UpdateComponentTypeErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
 }

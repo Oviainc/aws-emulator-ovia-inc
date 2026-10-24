@@ -60,3 +60,5 @@ mod update_roundtrip;
 mod resource_tags;
 #[path = "all/published_data_plane_urls.rs"]
 mod published_data_plane_urls;
+#[path = "all/reserved_tag_keys.rs"]
+mod reserved_tag_keys;

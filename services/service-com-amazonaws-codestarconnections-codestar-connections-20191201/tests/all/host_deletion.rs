@@ -21,8 +21,8 @@
 //! so each row starts from exactly the status it is about — including the two
 //! transitional VPC states no create produces. That is the same store the handler reads
 //! — the engine is shared, as `state_roundtrip.rs` pins — so a seeded host is observed
-//! through the wire exactly as a created one is; `host_lifecycle.rs` covers the hosts
-//! `CreateHost` itself mints.
+//! through the wire exactly as a created one is; `host_lifecycle.rs` and
+//! `host_listing.rs` cover the hosts `CreateHost` itself mints.
 
 use std::sync::Arc;
 
@@ -127,6 +127,11 @@ impl Emulator {
     /// return its ARN.
     fn seed_host(&self, id: &str, status: &str, vpc: Option<VpcSeed>) -> String {
         let host_arn = host_arn(id);
+        let state = self.engine.state::<ServiceState>();
+        let mut store = state.lock();
+        // Creation order comes from the store's own counter, exactly as `CreateHost`
+        // takes it, so two seeded hosts never share a sequence.
+        let sequence = store.take_sequence();
         let record = StoredHost {
             name: format!("host-{id}"),
             host_arn: host_arn.clone(),
@@ -144,12 +149,9 @@ impl Emulator {
             }),
             status: status.to_string(),
             status_message: None,
+            sequence,
         };
-        self.engine
-            .state::<ServiceState>()
-            .lock()
-            .hosts
-            .insert(host_arn.clone(), record);
+        store.hosts.insert(host_arn.clone(), record);
         host_arn
     }
 

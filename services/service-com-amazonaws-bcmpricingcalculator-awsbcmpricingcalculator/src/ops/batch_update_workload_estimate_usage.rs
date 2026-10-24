@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchUpdateWorkloadEstimateUsage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchUpdateWorkloadEstimateUsage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Applies each entry's mutations to the usage line its `id` names under the workload
+//! estimate `workloadEstimateId` names, re-prices that line from the usage it now
+//! models, and lands the estimate's recomputed cost
+//! (`crate::state::WorkloadEstimate::recompute_cost`) — so a later read of the estimate
+//! reports the new total rather than the pre-update one.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchUpdateWorkloadEstimateUsage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A `workloadEstimateId` no live estimate carries is `ResourceNotFoundException` (HTTP
+//! 404) for the whole request — there is no parent whose lines could be updated. An
+//! `id` that estimate does not hold belongs to ONE entry, so it is reported in `errors`
+//! against that id while the other entries are still applied, which is what the
+//! per-entry `errors` list is modelled for.
+//!
+//! Each mutable member of an entry (`amount`, `group`) is optional and an omitted one
+//! leaves the line as it was.
 //!
 //! ## Shape of an operation
 //!
@@ -149,20 +154,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchUpdateWorkloadEstimateUsage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchUpdateWorkloadEstimateUsageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchUpdateWorkloadEstimateUsage"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                BatchUpdateWorkloadEstimateUsageErrorModeled::DataUnavailableException(
+                    DataUnavailableException {
+                        message: "the workload estimate store is unavailable".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut state = store.lock();
+        // Materialise what the clock has already made due, so this call does not mutate
+        // a line under an estimate that is already past its `expiresAt`.
+        state.settle(crate::state::now_millis());
+
+        let Some(estimate) = state.workload_estimate_mut(&input.workload_estimate_id) else {
+            return Err(
+                BatchUpdateWorkloadEstimateUsageErrorModeled::ResourceNotFoundException(
+                    crate::state::workload_estimate_not_found(&input.workload_estimate_id),
+                )
+                .into(),
+            );
+        };
+
+        let mut items = Vec::with_capacity(input.usage.len());
+        let mut errors = Vec::new();
+        for entry in &input.usage {
+            let Some(line) = estimate
+                .usage
+                .iter_mut()
+                .find(|line| line.id == entry.id)
+            else {
+                // A line this estimate does not hold is this ENTRY's failure, not the
+                // request's: it is reported against the id the entry named, with the
+                // `WorkloadEstimateUpdateUsageErrorCode` value for a subject that is not
+                // there (smithy_query `shape="WorkloadEstimateUpdateUsageErrorCode"`:
+                // `BAD_REQUEST | NOT_FOUND | CONFLICT | INTERNAL_SERVER_ERROR`).
+                errors.push(BatchUpdateWorkloadEstimateUsageError2 {
+                    id: Some(entry.id.clone()),
+                    error_code: Some("NOT_FOUND".to_string()),
+                    error_message: Some(format!(
+                        "this workload estimate holds no usage line {}",
+                        entry.id
+                    )),
+                });
+                continue;
+            };
+
+            // Each mutable member is individually optional, so an omitted one leaves
+            // what the line already carries rather than clearing it.
+            if let Some(amount) = entry.amount {
+                line.amount = amount;
+            }
+            if let Some(group) = &entry.group {
+                line.group = Some(group.clone());
+            }
+            // The amount is what the line's cost is computed over, so the line is priced
+            // again from the usage it now models.
+            line.reprice();
+            items.push(line.usage_item());
+        }
+
+        // The estimate's cost is the sum over its lines, which this call just changed.
+        estimate.recompute_cost();
+
+        Ok(BatchUpdateWorkloadEstimateUsageOutput {
+            items: Some(items),
+            errors: Some(errors),
+        })
     }
 }

@@ -23,6 +23,9 @@ mod component_type_listing;
 #[path = "all/component_type_update.rs"]
 mod component_type_update;
 
+#[path = "all/component_type_update_references.rs"]
+mod component_type_update_references;
+
 #[path = "all/entity_composite_components.rs"]
 mod entity_composite_components;
 

@@ -11,7 +11,10 @@
 //!
 //! The MERGED tag map is judged against the tag bounds
 //! ([`crate::state::MAX_TAGS_PER_RESOURCE`] and the key/value character caps) before
-//! anything is written, so a resource's tag map cannot grow without a ceiling.
+//! anything is written, so a resource's tag map cannot grow without a ceiling, and the
+//! keys the REQUEST names are judged against the reserved
+//! [`crate::state::RESERVED_TAG_KEY_PREFIX`] namespace, which belongs to AWS and which a
+//! caller may therefore not write into (`ValidationException`, 400).
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken".
@@ -205,6 +208,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::TAGGED_RESOURCE_NOT_FOUND_MESSAGE,
             ));
         };
+        // AWS owns the `aws:` tag-key namespace: a caller may neither create nor replace
+        // a tag in it, so the keys the REQUEST names are judged against it before
+        // anything is written. `tags` is the wire name of the member they arrived in
+        // (`@jsonName("tags")` on `TagResourceRequest$Tags`).
+        if let Some(rejection) =
+            crate::state::reserved_tag_key_rejection("tags", input.tags.keys().map(String::as_str))
+        {
+            return Err(TagResourceErrorModeled::ValidationException(rejection).into());
+        }
+
         let merged = crate::state::merged_tags(&current, &input.tags);
         if let Some(rejection) = crate::state::tag_bounds_rejection(&merged) {
             return Err(TagResourceErrorModeled::ValidationException(rejection).into());

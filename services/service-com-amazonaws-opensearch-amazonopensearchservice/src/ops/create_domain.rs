@@ -275,6 +275,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             domain_id: domain_id(&name),
             domain_name: name.clone(),
             arn: domain_arn(&name, &region),
+            region: region.clone(),
             engine_version,
             engine_mode: input
                 .engine_mode

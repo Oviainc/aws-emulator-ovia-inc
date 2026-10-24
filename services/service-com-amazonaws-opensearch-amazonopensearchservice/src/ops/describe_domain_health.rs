@@ -1,15 +1,35 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDomainHealth
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDomainHealth`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the health of the stored [`crate::state::Domain`] record —
+//! every count is derived from that record's `ClusterConfig`, and every value that
+//! describes the RUNNING cluster is reported only once the provisioning the clock
+//! owes the domain has fallen due.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDomainHealth::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The two regimes, and nothing else, decide what this operation answers:
+//!
+//! * CONFIGURED values (`AvailabilityZoneCount`, `StandByAvailabilityZoneCount`,
+//!   `DataNodeCount`, `DedicatedMaster`, `MasterEligibleNodeCount`, `WarmNodeCount`,
+//!   `AvailabilityZoneInfo$ConfiguredDataNodeCount`) come from the `ClusterConfig`
+//!   member that defines each of them, whatever state the domain is in. A member the
+//!   record holds no value for is reported as the modelled `NotAvailable`, which is
+//!   what `NumberOfAZs`/`NumberOfNodes` document for information the service cannot
+//!   fetch — never as an invented default.
+//! * OBSERVED values (`ActiveAvailabilityZoneCount`, `MasterNode`, `ClusterHealth`,
+//!   `TotalShards`, `TotalUnAssignedShards`, `AvailabilityZoneInfo$ZoneStatus`,
+//!   `AvailabilityZoneInfo$AvailableDataNodeCount`) describe a cluster that is up, so
+//!   they are `NotAvailable` (`UnAvailable` for `MasterNode`, which models no
+//!   `NotAvailable`) while the domain is still `Creating`, and read off the record
+//!   once it is not.
+//!
+//! Reporting a domain materialises only the configuration change the clock already
+//! owed it, exactly as [`crate::ops::describe_domain`] does; nothing else is written.
+//!
+//! Nothing a caller sends sizes this answer: the only count that could, the stored
+//! `ZoneAwarenessConfig$AvailabilityZoneCount`, is reported — and turned into zone
+//! information — only within the values that member publishes ([`ZONE_COUNT_RANGE`]),
+//! so the response holds at most three zones however large a `ClusterConfig` the
+//! domain was created with.
 //!
 //! ## Shape of an operation
 //!
@@ -113,6 +133,270 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{Domain, PROCESSING_STATUS_CREATING};
+
+/// The value every count member of this response (`NumberOfAZs`, `NumberOfNodes`,
+/// `NumberOfShards`) documents for information the service cannot fetch, and the
+/// `NotAvailable` variant of `DomainState`, `DomainHealth` and `ZoneStatus`.
+const NOT_AVAILABLE: &str = "NotAvailable";
+
+/// `DomainState`'s `Active`: "Requested changes have been processed and deployed to
+/// the domain."
+const DOMAIN_STATE_ACTIVE: &str = "Active";
+
+/// `DomainState`'s `Processing`: "The domain has updates in progress."
+const DOMAIN_STATE_PROCESSING: &str = "Processing";
+
+/// `MasterNodeStatus`'s `Available`: "The domain has an elected master node."
+const MASTER_NODE_AVAILABLE: &str = "Available";
+
+/// `MasterNodeStatus`'s `UnAvailable`: "The master node hasn't yet been elected, and
+/// a quorum to elect a new master node hasn't been reached."
+const MASTER_NODE_UNAVAILABLE: &str = "UnAvailable";
+
+/// `DomainHealth`'s `Green`: "All primary shards and their replicas are allocated to
+/// nodes."
+const CLUSTER_HEALTH_GREEN: &str = "Green";
+
+/// `ZoneStatus`'s `Active`: the zone is serving the cluster.
+const ZONE_STATUS_ACTIVE: &str = "Active";
+
+/// `ZoneStatus`'s `StandBy`: the zone is the reserve one a multi-AZ-with-standby
+/// domain keeps out of the rotation.
+const ZONE_STATUS_STANDBY: &str = "StandBy";
+
+/// The number of Availability Zones a domain sits in when `ZoneAwarenessEnabled` is
+/// off: one. `ClusterConfig$ZoneAwarenessEnabled` "Indicates whether multiple
+/// Availability Zones are enabled", so a domain without it occupies a single zone.
+const SINGLE_ZONE: i32 = 1;
+
+/// The numbers of Availability Zones a zone-aware domain can be configured in, from
+/// `ZoneAwarenessConfig$AvailabilityZoneCount`: "Valid values are `2` and `3`."
+///
+/// A stored count outside this range names no number of zones the service supports,
+/// so it is reported as [`NOT_AVAILABLE`] and no zone information is built for it.
+/// That is also what keeps this response BOUNDED: the count is a request field
+/// (`CreateDomain` and `UpdateDomainConfig` persist the caller's `ClusterConfig`
+/// verbatim, and `IntegerClass` carries no `@range`), and nothing a caller sends may
+/// size an allocation or a response here.
+const ZONE_COUNT_RANGE: ::std::ops::RangeInclusive<i32> = 2..=3;
+
+/// How many of a multi-AZ domain's zones are held in standby when
+/// `MultiAZWithStandbyEnabled` is on: one. From
+/// `ClusterConfig$MultiAZWithStandbyEnabled` — "whether a multi-AZ domain is turned
+/// on with a standby AZ" — the standby is a single zone.
+const STANDBY_ZONES: i32 = 1;
+
+/// The letters an Availability Zone name ends in, appended to the Region (`us-east-1`
+/// + `a` = `us-east-1a`).
+///
+/// WHICH of a Region's zones an account's domain lands in is an account-specific
+/// mapping AWS does not publish, so the emulator names a domain's zones in order from
+/// the Region's first zone letter. `AvailabilityZone` is capped at 15 characters,
+/// which `<region><letter>` stays inside for every published Region name.
+const ZONE_LETTERS: &[u8] = b"abcdefgh";
+
+/// A configured count as the modelled `NumberOfAZs`/`NumberOfNodes`/`NumberOfShards`
+/// string.
+///
+/// `Some(n)` renders as decimal digits; `None` — the record holds no value for the
+/// member that defines the count — renders as [`NOT_AVAILABLE`], which is what those
+/// shapes document for information the service is unable to fetch. A negative value
+/// satisfies neither branch of their `^((\d+)|(NotAvailable))$` pattern, so it is
+/// reported the same way as no value at all rather than off-pattern.
+fn count(value: Option<i32>) -> String {
+    value
+        .filter(|value| *value >= 0)
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| NOT_AVAILABLE.to_string())
+}
+
+/// Whether the domain's cluster is up: its nodes are provisioned, so it has an
+/// elected master and a readable cluster.
+///
+/// A domain is `Creating` from the call that mints it until the provisioning the
+/// clock owes it falls due, and no node exists before then. A later configuration
+/// change leaves the running cluster in place, so a `Modifying` domain is up.
+fn cluster_is_up(domain: &Domain) -> bool {
+    domain.created && domain.processing_status != PROCESSING_STATUS_CREATING
+}
+
+/// The number of Availability Zones the domain's configuration places it in: the
+/// zone-awareness count when multiple zones are turned on
+/// (`ZoneAwarenessConfig$AvailabilityZoneCount` is "the number of zones that you want
+/// the domain to use"), and [`SINGLE_ZONE`] when they are not.
+///
+/// `None` when zone awareness is on and the record carries no count for it, or one
+/// outside [`ZONE_COUNT_RANGE`] — the configuration then names no supported number of
+/// zones, so there is none to report and nothing sized by it to build.
+fn configured_zone_count(cluster: &ClusterConfig) -> Option<i32> {
+    if cluster.zone_awareness_enabled == Some(true) {
+        cluster
+            .zone_awareness_config
+            .as_ref()
+            .and_then(|config| config.availability_zone_count)
+            .filter(|zones| ZONE_COUNT_RANGE.contains(zones))
+    } else {
+        Some(SINGLE_ZONE)
+    }
+}
+
+/// How the domain's data nodes sit across its `zones` Availability Zones: zone
+/// awareness spreads them evenly, so each zone holds `nodes / zones` of them and the
+/// first `nodes % zones` zones hold one more.
+///
+/// `zones` is the already-bounded count [`configured_zone_count`] answers — at most
+/// the top of [`ZONE_COUNT_RANGE`] — so the vector this builds is bounded too, and is
+/// capped again here rather than trusting its caller.
+///
+/// `None` for a node count the record does not carry: the nodes per zone are then
+/// unknown too.
+fn nodes_per_zone(nodes: Option<i32>, zones: i32) -> Vec<Option<i32>> {
+    let zones = zones.clamp(0, *ZONE_COUNT_RANGE.end());
+    let zone_count = usize::try_from(zones).unwrap_or(0);
+    let Some(nodes) = nodes
+        .filter(|nodes| *nodes >= 0)
+        .filter(|_| zone_count > 0)
+    else {
+        return vec![None; zone_count];
+    };
+    (0..zones)
+        .map(|zone| Some(nodes / zones + i32::from(zone < nodes % zones)))
+        .collect()
+}
+
+/// The name of the `index`-th Availability Zone of `region`; `None` once the zone
+/// index runs past [`ZONE_LETTERS`], since the zone then has no name to report.
+fn zone_name(region: &str, index: usize) -> Option<String> {
+    let letter = char::from(*ZONE_LETTERS.get(index)?);
+    Some(format!("{region}{letter}"))
+}
+
+/// The shard census of a domain: the total number of primary and replica shards, and
+/// how many of them are unassigned.
+///
+/// Shards belong to indexes, and this emulator persists no index (`CreateIndex`,
+/// `GetIndex` and `DeleteIndex` are still scaffolds), so a domain holds no shard and
+/// none of them is unassigned. This is the ONE place that changes when index state
+/// arrives — `ClusterHealth` is derived from the census, not stated.
+fn shard_census(_domain: &Domain) -> (i32, i32) {
+    (0, 0)
+}
+
+/// The health of the stored domain, as `DescribeDomainHealth` reports it.
+fn domain_health(domain: &Domain) -> DescribeDomainHealthOutput {
+    let cluster = &domain.cluster_config;
+    let up = cluster_is_up(domain);
+
+    // Configured: read straight off the record, in whatever state the domain is.
+    let configured_zones = configured_zone_count(cluster);
+    let standby_zones = if cluster.multi_az_with_standby_enabled == Some(true) {
+        STANDBY_ZONES
+    } else {
+        0
+    };
+    let data_nodes = cluster.instance_count;
+    let dedicated_master = cluster.dedicated_master_enabled.unwrap_or(false);
+    // With dedicated master nodes on, exactly those nodes can be elected master;
+    // without them every data node is master-eligible.
+    let master_eligible_nodes = if dedicated_master {
+        cluster.dedicated_master_count
+    } else {
+        data_nodes
+    };
+    // Warm storage off means the cluster has no warm node, which is a count, not an
+    // unknown.
+    let warm_nodes = if cluster.warm_enabled == Some(true) {
+        cluster.warm_count
+    } else {
+        Some(0)
+    };
+
+    // Observed: only a cluster that is up has zones serving traffic, an elected
+    // master and a readable shard allocation.
+    let (total_shards, unassigned_shards) = shard_census(domain);
+    let active_zones = configured_zones.map(|zones| (zones - standby_zones).max(0));
+    let zone_nodes = nodes_per_zone(data_nodes, configured_zones.unwrap_or(0));
+    // The standby zones are the LAST of the domain's zones, so every zone before
+    // this index is one serving traffic.
+    let serving_zones = zone_nodes
+        .len()
+        .saturating_sub(usize::try_from(standby_zones).unwrap_or(0));
+    let zones: Vec<AvailabilityZoneInfo> = zone_nodes
+        .iter()
+        .enumerate()
+        .map(|(index, nodes)| AvailabilityZoneInfo {
+            availability_zone_name: zone_name(&domain.region, index),
+            zone_status: Some(
+                if !up {
+                    NOT_AVAILABLE
+                } else if index < serving_zones {
+                    ZONE_STATUS_ACTIVE
+                } else {
+                    ZONE_STATUS_STANDBY
+                }
+                .to_string(),
+            ),
+            configured_data_node_count: Some(count(*nodes)),
+            available_data_node_count: Some(count(up.then_some(*nodes).flatten())),
+            total_shards: Some(count(up.then_some(total_shards))),
+            total_un_assigned_shards: Some(count(up.then_some(unassigned_shards))),
+        })
+        .collect();
+
+    DescribeDomainHealthOutput {
+        domain_state: Some(
+            if domain.processing {
+                DOMAIN_STATE_PROCESSING
+            } else {
+                DOMAIN_STATE_ACTIVE
+            }
+            .to_string(),
+        ),
+        availability_zone_count: Some(count(configured_zones)),
+        active_availability_zone_count: Some(count(if up { active_zones } else { None })),
+        stand_by_availability_zone_count: Some(count(Some(standby_zones))),
+        data_node_count: Some(count(data_nodes)),
+        dedicated_master: Some(dedicated_master),
+        master_eligible_node_count: Some(count(master_eligible_nodes)),
+        warm_node_count: Some(count(warm_nodes)),
+        master_node: Some(
+            if up {
+                MASTER_NODE_AVAILABLE
+            } else {
+                MASTER_NODE_UNAVAILABLE
+            }
+            .to_string(),
+        ),
+        cluster_health: Some(
+            if !up {
+                // No node is up yet, so there is no cluster health to retrieve.
+                NOT_AVAILABLE
+            } else if unassigned_shards == 0 {
+                CLUSTER_HEALTH_GREEN
+            } else {
+                // `Yellow` and `Red` tell an unallocated REPLICA from an unallocated
+                // PRIMARY, which needs the per-index shard state this emulator does
+                // not persist; until it does, an unassigned shard is health the
+                // service cannot report.
+                NOT_AVAILABLE
+            }
+            .to_string(),
+        ),
+        total_shards: Some(count(up.then_some(total_shards))),
+        total_un_assigned_shards: Some(count(up.then_some(unassigned_shards))),
+        environment_information: if zones.is_empty() {
+            // The configuration names no number of zones, so the domain has no zone
+            // information to report.
+            None
+        } else {
+            Some(vec![EnvironmentInfo {
+                availability_zone_information: Some(zones),
+            }])
+        },
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -185,18 +469,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDomainHealth` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDomainHealthErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDomainHealth"))
+        let _ = ctx;
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // Reporting health materialises only the configuration change the clock
+        // already owed this domain at `now` — it would have fallen due whether or not
+        // anybody called. Nothing else about the record changes on a read.
+        let domain = store.settled_mut(&input.domain_name, now).ok_or_else(|| {
+            DescribeDomainHealthErrorModeled::ResourceNotFoundException(
+                crate::state::domain_not_found(&input.domain_name),
+            )
+        })?;
+
+        Ok(domain_health(domain))
     }
 }

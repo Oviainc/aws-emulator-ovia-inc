@@ -133,8 +133,8 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // is read-only here, so this seam is where the emulator can hold it. (This is
         // the service-wide change the open issue
         // `…-implemented-connection-operations-answer-501-notimplemented-instead-of.md`
-        // names: every operation of this crate was unreachable without it, including the
-        // `DeleteRepositoryLink` this change implements.)
+        // names: every operation of this crate was unreachable without it, `ListHosts`
+        // included.)
         let operation = service_common::rpc_target::requested_operation(req, self.shape_id())?;
         self.entry.routing_table().get(operation)
     }

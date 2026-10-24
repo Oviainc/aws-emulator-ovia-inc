@@ -63,3 +63,42 @@ Model facts cited: smithy_query(query="operation", operation="UpdateAccountCusto
 2. Cause 1: replay fixture uxc-configure-visible-regions-roundtrip up to step task#4 -- PATCH /v1/account-customizations carrying the fixture's visibleRegions -- and compare the 200 body's $.visibleRegions positionally with the recording. The emulator answers us-east-1, us-west-2, eu-west-1; the recording is eu-west-1, us-east-1, us-west-2.
 3. Cause 2: replay fixture uxc-partial-update-preserves-other-fields up to step task#2 -- PATCH /v1/account-customizations -- and compare the 200 body's $.visibleServices positionally. The emulator answers ec2, s3; the recording is s3, ec2. Then continue to that fixture's task#4 GetAccountCustomizations, which currently passes, to see that any ordering rule adopted must satisfy both echoes.
 4. Both steps return HTTP 200 with the correct member sets, so the divergence is visible only in array element positions -- diff the arrays index by index rather than as sets.
+
+## Resolution
+
+One rule, applied on the write for BOTH list settings: `UpdateAccountCustomizations` persists
+`visibleRegions` / `visibleServices` CANONICALIZED — the members the request named, in ascending
+order of the identifier — so the update's own echo and every later `GetAccountCustomizations`
+report the one same sequence whatever sequence the request used. The members stay the caller's:
+nothing is added, dropped or de-duplicated (neither list declares `@uniqueItems`).
+
+The model fixes no order (`ServiceList`/`RegionsList` are plain lists with no `@uniqueItems` and
+no sort trait — `smithy_query(query="shape", shape="ServiceList,RegionsList")`), so this is
+recorded behaviour: every recorded response for either setting is ascending except the single
+step in Cause 2 below.
+
+Implemented in `services/service-com-amazonaws-uxc-awsaccountuxsetting/src/state.rs`
+(`canonical_members`, called by `AccountUxCustomization::set_visible_services` /
+`set_visible_regions`); `src/ops/update_account_customizations.rs` and
+`src/ops/get_account_customizations.rs` already answer from the stored record, so neither needed
+a code change. Pinned by `tests/all/list_setting_order.rs` (a table over size, supplied sequence,
+element form and duplication; hand-written canonical rows including the recorded Region case; all
+24 permutations of a four-member list answered with the same canonical document; plus an
+`assert_canonical` that checks the answer is ascending and holds exactly the supplied multiset)
+and by the updated `tests/all/visible_services_round_trip.rs` and
+`tests/all/account_customizations.rs`.
+
+- **Cause 1 (`uxc-configure-visible-regions-roundtrip#task#4`, `visibleRegions` order) — FIXED.**
+  Replay key `uxc|UpdateAccountCustomizations|2xx->2xx|$.visibleRegions[*]` is `fixed` and the
+  whole fixture passes.
+- **Cause 2 (`uxc-partial-update-preserves-other-fields#task#2`, `visibleServices` order) —
+  DECLINED as per-response variation.** That fixture records the SAME stored pair in two
+  different orders with no write between them: `task#2`'s update echo descending and `task#4`'s
+  `GetAccountCustomizations` ascending. Measured three ways: canonicalizing ascending makes
+  `task#4` agree and `task#2` differ, storing the supplied sequence does the same, and storing it
+  reversed makes `task#2` agree and `task#4` differ — so the recorded order of this array is not
+  a function of the request or of the stored state, and only keying the write on one recorded
+  response could reproduce it. The canonical rule is the one that agrees with every other
+  recorded response, including this fixture's own later read, so key
+  `uxc|UpdateAccountCustomizations|2xx->2xx|$.visibleServices[*]` still mismatches on that one
+  step's sequence while the setting's members, status and read-back all agree.

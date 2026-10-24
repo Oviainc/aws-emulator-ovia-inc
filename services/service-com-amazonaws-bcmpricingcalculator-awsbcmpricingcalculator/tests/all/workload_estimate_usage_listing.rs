@@ -13,6 +13,7 @@
 //! drift from the front door that one exercises.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_bcmpricingcalculator_awsbcmpricingcalculator::state;
 
 use crate::bill_scenario_lifecycle::{error_code, is_resource_id, Emulator};
 use crate::workload_estimate_lifecycle::create_estimate;
@@ -35,9 +36,9 @@ const HISTORICAL_SERVICE_CODE: &str = "AWSDataTransfer";
 const HISTORICAL_USAGE_TYPE: &str = "DataTransfer-Out-Bytes";
 const HISTORICAL_OPERATION: &str = "TransferOut";
 const HISTORICAL_ACCOUNT_ID: &str = "999999999999";
-/// The one location any seeded line reports anywhere: on a `historicalUsage`, which is
-/// the caller's own input, unlike a line's `location` (a price-list value this emulator
-/// does not carry).
+/// The location a seeded line's `historicalUsage` reports, which is the caller's own
+/// input — unlike a line's own `location`, which the service resolves from its usage
+/// type.
 const HISTORICAL_LOCATION: &str = "us-east-1";
 
 /// What a seeded line's `historicalUsage` is.
@@ -51,8 +52,14 @@ enum Historical {
     At(&'static str),
 }
 
-/// One seeded usage line: every attribute a `ListUsageFilter` can select on, plus the
-/// amount the line's `quantity` reports.
+/// The location every seeded line's usage type names: none of them carries a region
+/// prefix, so each belongs to the region AWS leaves unprefixed.
+const LINE_LOCATION: &str = "us-east-1";
+
+/// One seeded usage line: every attribute a `ListUsageFilter` can select on, the amount
+/// the line's `quantity` reports, and what this service's rate card publishes for that
+/// usage — stated HERE, from the published price lists, rather than read from the
+/// implementation.
 #[derive(Debug, Clone, Copy)]
 struct Line {
     key: &'static str,
@@ -63,6 +70,12 @@ struct Line {
     group: Option<&'static str>,
     historical: Historical,
     amount: f64,
+    /// The unit of measure of this usage type, absent when this service publishes no
+    /// rate for it under this operation.
+    unit: Option<&'static str>,
+    /// The published USD price of one unit at [`LINE_LOCATION`], absent when there is
+    /// none — then the line carries no cost.
+    rate: Option<f64>,
 }
 
 /// The lines every suite seeds, in creation order.
@@ -70,7 +83,15 @@ struct Line {
 /// They span the selectable attributes: several service codes sharing a prefix, usage
 /// types sharing a prefix and differing in a substring, repeated and distinct
 /// operations, three account ids, a group shared by two lines, a group no other line
-/// carries, lines with no group at all, and the three `historicalUsage` shapes.
+/// carries, lines with no group at all, and the three `historicalUsage` shapes — and,
+/// for the price, usage this service publishes a rate for and usage it does not
+/// (including a usage type it carries under a DIFFERENT operation, which is part of a
+/// rate's key).
+///
+/// The rates are the published on-demand prices in `us-east-1`: an m5.xlarge Linux
+/// instance-hour USD 0.192 and an m5.large USD 0.096
+/// (<https://aws.amazon.com/ec2/pricing/on-demand/>), a Single-AZ MySQL db.t3.micro hour
+/// USD 0.017 (<https://aws.amazon.com/rds/mysql/pricing/>).
 const LINES: [Line; 6] = [
     Line {
         key: "a",
@@ -81,6 +102,8 @@ const LINES: [Line; 6] = [
         group: Some("group-a"),
         historical: Historical::At(HISTORICAL_LOCATION),
         amount: 1.0,
+        unit: Some("Hrs"),
+        rate: Some(0.192),
     },
     Line {
         key: "b",
@@ -91,7 +114,12 @@ const LINES: [Line; 6] = [
         group: Some("group-b"),
         historical: Historical::Absent,
         amount: 2.5,
+        unit: Some("Hrs"),
+        rate: Some(0.096),
     },
+    // `TimedStorage-ByteHrs` IS on the rate card — under the `StandardStorage`
+    // operation. This line models it under another, which is a different rate, and one
+    // this service does not publish.
     Line {
         key: "c",
         service_code: "AmazonS3",
@@ -101,6 +129,8 @@ const LINES: [Line; 6] = [
         group: None,
         historical: Historical::WithoutLocation,
         amount: 0.0,
+        unit: None,
+        rate: None,
     },
     Line {
         key: "d",
@@ -111,6 +141,8 @@ const LINES: [Line; 6] = [
         group: Some("group-a"),
         historical: Historical::Absent,
         amount: 1_000_000.5,
+        unit: None,
+        rate: None,
     },
     Line {
         key: "e",
@@ -121,6 +153,8 @@ const LINES: [Line; 6] = [
         group: None,
         historical: Historical::Absent,
         amount: 0.25,
+        unit: Some("Hrs"),
+        rate: Some(0.017),
     },
     Line {
         key: "f",
@@ -131,6 +165,8 @@ const LINES: [Line; 6] = [
         group: Some("grp9"),
         historical: Historical::Absent,
         amount: 7.5,
+        unit: Some("Hrs"),
+        rate: Some(0.192),
     },
 ];
 
@@ -228,10 +264,13 @@ async fn list(emulator: &Emulator, estimate: &str, extra: Value) -> (u16, Value)
 /// RULE: the list reports one item per usage line stored under the estimate it names, in
 /// the order those lines were created, and every member of an item is the one the
 /// operation that stored the line reported for it — so a caller cannot tell the two
-/// readers apart. The members that come from the price list this emulator does not carry
-/// (`location`, `cost`, `currency`, `status`, and the quantity's `unit`) are absent
-/// rather than invented, and the list reports only stored state: calling it twice answers
-/// the same way.
+/// readers apart. Each item carries the price of its usage: the location its usage type
+/// names, the unit it is measured in and its cost where this service publishes a rate,
+/// and no cost (with the `INVALID` cost status) where it does not. The list reports only
+/// stored state: calling it twice answers the same way.
+///
+/// The table spans the number of stored lines, from none upwards, and (through
+/// [`LINES`]) the optional members a line carries and whether its usage is priced.
 ///
 /// The table spans the number of stored lines, from none upwards, and (through
 /// [`LINES`]) the optional members a line carries.
@@ -291,24 +330,63 @@ async fn the_list_reports_every_stored_usage_line_as_its_creator_did() {
                 "{where_}: expected quantity.amount {}, got {item}",
                 line.amount
             );
-            for absent in ["location", "cost", "currency", "status"] {
-                assert!(
-                    item[absent].is_null(),
-                    "{where_}: {absent} comes from the price list and must stay absent, \
-                     got {item}"
-                );
-            }
-            assert!(
-                item["quantity"]["unit"].is_null(),
-                "{where_}: the quantity's unit comes from the price list and must stay \
-                 absent, got {item}"
-            );
             // `WorkloadEstimateUsageItem` declares no `key` member, so the batch entry's
             // key must not reach this reader.
             assert!(
                 item["key"].is_null(),
                 "{where_}: the batch entry's key is not a member of this item, got {item}"
             );
+            assert_eq!(
+                item["location"].as_str(),
+                Some(LINE_LOCATION),
+                "{where_}: expected the location this usage type names, got {item}"
+            );
+            assert_eq!(
+                item["quantity"]["unit"].as_str(),
+                line.unit,
+                "{where_}: expected the unit {:?} this usage type is measured in, got {item}",
+                line.unit
+            );
+            match line.rate {
+                Some(rate) => {
+                    let want = rate * line.amount;
+                    let got = item["cost"].as_f64().unwrap_or_else(|| {
+                        panic!("{where_}: expected a cost of {want}, got {item}")
+                    });
+                    let tolerance = 1e-9 * want.abs().max(1.0);
+                    assert!(
+                        (got - want).abs() <= tolerance,
+                        "{where_}: expected cost {want} (±{tolerance}), got {got}"
+                    );
+                    assert_eq!(
+                        item["currency"].as_str(),
+                        Some(state::COST_CURRENCY),
+                        "{where_}: expected the modelled currency beside the cost, got {item}"
+                    );
+                    assert_eq!(
+                        item["status"].as_str(),
+                        Some(state::COST_STATUS_VALID),
+                        "{where_}: expected a priced line's cost status, got {item}"
+                    );
+                }
+                None => {
+                    assert!(
+                        item["cost"].is_null(),
+                        "{where_}: no rate is published for this usage, so it must carry \
+                         no cost, got {item}"
+                    );
+                    assert!(
+                        item["currency"].is_null(),
+                        "{where_}: a line with no cost has no currency to report it in, \
+                         got {item}"
+                    );
+                    assert_eq!(
+                        item["status"].as_str(),
+                        Some(state::COST_STATUS_INVALID),
+                        "{where_}: expected an unpriced line's cost status, got {item}"
+                    );
+                }
+            }
         }
 
         let (status, again) = list(&emulator, &estimate, json!({})).await;
@@ -575,12 +653,19 @@ async fn a_filter_selects_on_the_usage_attribute_it_names() {
             expected: vec!["f"],
         },
         FilterCase {
-            // A line's `location` comes from the price list this emulator does not
-            // carry, so no line carries one and this filter selects nothing.
-            case: "LOCATION, a value the price list would supply",
+            // Every seeded line's usage type carries no region prefix, so every line's
+            // location is the region AWS leaves unprefixed.
+            case: "LOCATION, the region every line's usage type names",
             name: "LOCATION",
             match_option: Some("EQUALS"),
-            values: vec![HISTORICAL_LOCATION],
+            values: vec![LINE_LOCATION],
+            expected: vec!["a", "b", "c", "d", "e", "f"],
+        },
+        FilterCase {
+            case: "LOCATION, a region no line's usage type names",
+            name: "LOCATION",
+            match_option: Some("EQUALS"),
+            values: vec!["eu-west-1"],
             expected: vec![],
         },
         FilterCase {

@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the catalogue of what Amazon EVS PROVIDES: every VCF version it installs,
+//! with that version's status, the default ESX version its Bill Of Materials names and
+//! the EC2 instance types it is offered on, plus the ESX versions offered for each of
+//! those instance types. REPORTING ONLY: the catalogue is a property of the service, not
+//! of the account, so this operation writes nothing and names no resource — two reads
+//! answer alike and nothing a caller does changes what the next one reads.
+//!
+//! The catalogue itself lives in [`crate::state`]
+//! ([`crate::state::provided_vcf_versions`], [`crate::state::instance_type_esx_versions`])
+//! so the versions this operation reports are the SAME ones the rest of the service acts
+//! on — `CreateEnvironmentHost` resolves a host's default ESX version out of it — rather
+//! than a list only this response knows. `instanceTypeEsxVersions` is computed as the
+//! transpose of the VCF version list, so the two halves of one response cannot disagree.
 //!
 //! ## Shape of an operation
 //!
@@ -137,21 +142,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
     async fn handle(
         &self,
-        input: Self::Input,
+        _input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `GetVersionsRequest` carries no member: the request names only the caller.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetVersions"))
+        // Authorization first: AWS decides it at the IAM layer. This call addresses no
+        // nameable resource — the catalogue is the service's, not an environment's — so
+        // only a statement covering every resource decides it.
+        if let Some(denied) =
+            crate::state::authorization::denied(&*self.engine, ctx, Self::NAME, None)
+        {
+            return Err(denied);
+        }
+
+        // Both members are `@required`, and both are read from the one catalogue the rest
+        // of the service acts on. Nothing is stored: a response that states what Amazon
+        // EVS provides carries no fact about the account that read it.
+        Ok(GetVersionsOutput {
+            vcf_versions: crate::state::provided_vcf_versions(),
+            instance_type_esx_versions: crate::state::instance_type_esx_versions(),
+        })
     }
 }

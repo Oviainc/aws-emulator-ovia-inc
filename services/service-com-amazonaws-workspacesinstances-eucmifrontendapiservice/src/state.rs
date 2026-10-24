@@ -1607,8 +1607,50 @@ pub fn field_validation_failed(name: &str, why: impl Into<String>) -> Validation
     }
 }
 
+/// The tag-key prefix AWS keeps for the tags it generates itself.
+///
+/// AWS's tagging guidance reserves this prefix — in any mix of upper and lower case —
+/// for AWS's own use: a caller may neither create nor edit a tag key that begins with
+/// it. The modelled `TagKey` pattern (`^([\p{L}\p{Z}\p{N}_.:/=+\-@]+)$`,
+/// `smithy_query(query="shape",shape="TagKey")`) admits `:`, so no boundary validator
+/// can refuse such a key and the operations that store tags enforce it themselves
+/// through [`reject_reserved_tag_keys`].
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Whether `key` is a tag key in the reserved [`RESERVED_TAG_KEY_PREFIX`] namespace.
+///
+/// Case-insensitive, because the prefix is reserved whatever case it is written in.
+/// Only the PREFIX is reserved: a key that merely contains it later on, or that stops
+/// short of the colon, is an ordinary caller key.
+pub fn is_reserved_tag_key(key: &str) -> bool {
+    key.get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
+}
+
+/// Refuse a request carrying a caller-supplied tag key in the reserved namespace.
+///
+/// `member` is the input member the keys arrived in, named in the refusal exactly as
+/// [`field_validation_failed`] names any other bad member. Shared by every operation
+/// that stores caller tags, so one reserved key is refused the same way whichever
+/// member carried it, and nothing is written for a request that is going to be
+/// refused. The wording states the rule and none of what the caller sent.
+pub fn reject_reserved_tag_keys<'a>(
+    member: &str,
+    keys: impl IntoIterator<Item = &'a str>,
+) -> Result<(), ValidationException> {
+    if keys.into_iter().any(is_reserved_tag_key) {
+        return Err(field_validation_failed(
+            member,
+            format!(
+                "a tag key must not begin with the reserved {RESERVED_TAG_KEY_PREFIX} prefix, \
+                 which carries the tags AWS generates"
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// [`resource_not_found`] lifted into an operation's error channel, answered with
-/// [`RESOURCE_NOT_FOUND_STATUS`].
 /// [`RESOURCE_NOT_FOUND_STATUS`].
 ///
 /// `wrap` is the operation's own `ResourceNotFoundException` variant, so every

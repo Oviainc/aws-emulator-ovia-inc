@@ -72,7 +72,11 @@ fn baseline() -> Value {
     })
 }
 
-/// An emulator holding the one workspace the cases are created in.
+/// An emulator holding the one workspace the cases are created in, plus the
+/// component types the patches below declare references to: an update's
+/// declared `extendsFrom` and `compositeComponentTypes` ids have to name
+/// component types the service holds, so the ones the rows name are created
+/// here.
 async fn baseline_emulator() -> Emulator {
     let emulator = Emulator::new();
     assert_eq!(
@@ -80,6 +84,20 @@ async fn baseline_emulator() -> Emulator {
         200,
         "the workspace the cases are created in must exist"
     );
+    for referenced in [
+        "com.example.parent",
+        "com.example.other",
+        "com.example.outlet",
+    ] {
+        assert_eq!(
+            emulator
+                .create_component_type(WORKSPACE, referenced, json!({}))
+                .await
+                .status,
+            200,
+            "the component type {referenced:?} the patches reference must exist"
+        );
+    }
     emulator
 }
 
@@ -203,11 +221,15 @@ async fn an_update_replaces_the_members_it_names_and_keeps_the_rest() {
             "propertyDefinitions.replaced",
             // The map the request carries is the map the component type ends up
             // with: `serial` and `temperature` were not restated, so they are
-            // gone.
+            // gone. The patch empties `propertyGroups` in the same breath
+            // because the stored `readings` group names `serial`: a patch that
+            // left the group behind would strand it on a property the component
+            // type no longer defines, which the service refuses.
             json!({
                 "propertyDefinitions": {
                     "pressure": {"dataType": {"type": "DOUBLE", "unitOfMeasure": "kPa"}},
                 },
+                "propertyGroups": {},
             }),
             vec![
                 (
@@ -216,6 +238,7 @@ async fn an_update_replaces_the_members_it_names_and_keeps_the_rest() {
                 ),
                 ("/propertyDefinitions/serial", None),
                 ("/propertyDefinitions/temperature", None),
+                ("/propertyGroups/readings", None),
                 // A map the patch did NOT name is untouched.
                 ("/functions/dataReader/scope", Some(json!("ENTITY"))),
             ],

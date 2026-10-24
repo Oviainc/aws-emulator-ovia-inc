@@ -136,6 +136,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // A key in the reserved `aws:` namespace names a tag AWS generates, not one a
+        // caller may set, so the request is refused BEFORE the store is reached: the
+        // resource's tag set is left exactly as it was.
+        crate::state::reject_reserved_tag_keys(
+            "Tags",
+            input.tags.iter().filter_map(|tag| tag.key.as_deref()),
+        )
+        .map_err(TagResourceErrorModeled::ValidationException)?;
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(TagResourceErrorModeled::InternalServerException(
                 InternalServerException {

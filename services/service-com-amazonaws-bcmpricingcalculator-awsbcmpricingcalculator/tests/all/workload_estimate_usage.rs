@@ -24,12 +24,41 @@ use crate::workload_estimate_lifecycle::create_estimate;
 /// A 12-digit `AccountId`, the form `^\d{12}$` requires.
 const USAGE_ACCOUNT_ID: &str = "000000000000";
 
+/// What the usage every row of these tables models costs, stated HERE rather than read
+/// from the implementation so a changed rate card fails these suites instead of moving
+/// with them.
+///
+/// `BoxUsage:m5.xlarge` carries no region prefix, so its location is the region AWS
+/// leaves unprefixed (`us-east-1`), it is measured in instance-hours, and the published
+/// on-demand price of one m5.xlarge Linux instance-hour there is USD 0.192
+/// (<https://aws.amazon.com/ec2/pricing/on-demand/>).
+const LOCATION: &str = "us-east-1";
+const UNIT: &str = "Hrs";
+const RATE: f64 = 0.192;
+
+/// How far a reported cost may sit from `rate × amount`: the reported value is rounded
+/// to a fixed number of decimal places, and the product itself carries binary
+/// floating-point error, so the comparison is made to a relative tolerance rather than
+/// bit-for-bit.
+fn assert_cost(label: &str, got: Option<f64>, want: f64) {
+    let actual = got.unwrap_or_else(|| panic!("{label}: expected a cost of {want}, got none"));
+    let tolerance = 1e-9 * want.abs().max(1.0);
+    assert!(
+        (actual - want).abs() <= tolerance,
+        "{label}: expected cost {want} (±{tolerance}), got {actual}"
+    );
+}
+
 /// One `BatchCreateWorkloadEstimateUsageEntry`.
 ///
 /// Every required member is sent; `group` and `historicalUsage` are the optional ones
 /// the table varies. `HistoricalUsageEntity` requires `billInterval` and
 /// `filterExpression` (smithy_query: `shape="HistoricalUsageEntity"`), and every member
 /// of `Expression` is optional, so the narrowest expression is the empty one.
+///
+/// The usage it models is one this service publishes a rate for, so every line it
+/// creates is a priced one; the unpriced half of the rule is exercised in
+/// `workload_estimate_pricing`.
 fn entry(key: &str, amount: f64, group: Option<&str>, historical: bool) -> Value {
     let mut entry = json!({
         "key": key,
@@ -83,10 +112,10 @@ struct CreateCase {
 /// RULE: a batch create mints one usage line per entry under the workload estimate the
 /// request names, stores it there, and answers from what it persisted — a fresh
 /// `ResourceId` per line, the entry's own `key`, `serviceCode`, `usageType`,
-/// `operation`, `usageAccountId`, `group` and `historicalUsage` reported back, and the
-/// entry's `amount` as the line's `quantity.amount`. The members that come from the
-/// price list this emulator does not carry (`location`, `cost`, `currency`, `status`
-/// and the quantity's `unit`) are absent rather than invented.
+/// `operation`, `usageAccountId`, `group` and `historicalUsage` reported back, the
+/// entry's `amount` as the line's `quantity.amount`, and the price of that usage: the
+/// location its usage type names, the unit it is measured in, the published rate times
+/// the amount as `cost`, and the `currency` and cost `status` that qualify it.
 ///
 /// The table spans the entry count (1 up to `BatchCreateWorkloadEstimateUsageEntries`'
 /// modelled maximum of 25), the amount's magnitude (zero, fractional, large) and
@@ -212,19 +241,37 @@ async fn batch_created_usage_is_what_the_store_and_a_replay_report() {
                 item["quantity"]["amount"]
             );
             assert_eq!(
-                item["quantity"]["unit"],
-                Value::Null,
-                "case {label} entry {index}: expected the quantity's unit absent (it comes from the price list), got {:?}",
+                item["quantity"]["unit"].as_str(),
+                Some(UNIT),
+                "case {label} entry {index}: expected the unit this usage type is \
+                 measured in, got {:?}",
                 item["quantity"]["unit"]
             );
-            for absent in ["location", "cost", "currency", "status"] {
-                assert_eq!(
-                    item[absent],
-                    Value::Null,
-                    "case {label} entry {index}: expected {absent} absent (it comes from the price list), got {:?}",
-                    item[absent]
-                );
-            }
+            assert_eq!(
+                item["location"].as_str(),
+                Some(LOCATION),
+                "case {label} entry {index}: expected the location this usage type \
+                 names, got {:?}",
+                item["location"]
+            );
+            let expected_cost = RATE * case.amount;
+            assert_cost(
+                &format!("case {label} entry {index}"),
+                item["cost"].as_f64(),
+                expected_cost,
+            );
+            assert_eq!(
+                item["currency"].as_str(),
+                Some(state::COST_CURRENCY),
+                "case {label} entry {index}: expected the modelled currency, got {:?}",
+                item["currency"]
+            );
+            assert_eq!(
+                item["status"].as_str(),
+                Some(state::COST_STATUS_VALID),
+                "case {label} entry {index}: expected a priced line's cost status, got {:?}",
+                item["status"]
+            );
         }
 
         // What the response reported is what the store holds, in creation order.
@@ -257,48 +304,35 @@ async fn batch_created_usage_is_what_the_store_and_a_replay_report() {
     }
 }
 
-/// RULE: adding usage changes what an estimate's cost is computed over, so the estimate
-/// re-enters the non-terminal status it was created in and the CLOCK alone settles it
-/// back to the terminal one, over a span that is never zero — landing the cost
-/// recomputed over the lines it now holds (nothing, since pricing a line needs the
-/// price list this emulator does not carry).
+/// RULE: adding usage changes what an estimate's cost is computed over, so the call that
+/// adds it lands the recomputed cost on the estimate — the sum over the costs of the
+/// lines it now holds, in the one modelled currency — and leaves the estimate in the
+/// terminal status, with the lines it holds untouched afterwards.
 ///
-/// The table spans how long the caller waits before reading, on each side of the window.
+/// The table spans how long the caller waits before reading: there is nothing to wait
+/// for, so every row must read the same cost, including the row that does not wait.
 #[tokio::test]
-async fn adding_usage_reopens_the_cost_recomputation_the_clock_settles() {
-    let window = u64::try_from(state::WORKLOAD_ESTIMATE_UPDATING_MILLIS)
-        .expect("the window is a positive number of milliseconds");
-    assert!(
-        window > 0,
-        "expected a non-zero window so a caller can observe the transient status, got {window}"
-    );
+async fn adding_usage_lands_the_recomputed_cost_on_the_estimate() {
+    let waits: [u64; 3] = [0, 150, 650];
+    let amounts = [7.5, 2.25];
 
-    let cases: [(u64, &str); 3] = [
-        (0, state::WORKLOAD_ESTIMATE_STATUS_UPDATING),
-        (window + 150, state::WORKLOAD_ESTIMATE_STATUS_VALID),
-        (window * 2 + 150, state::WORKLOAD_ESTIMATE_STATUS_VALID),
-    ];
-
-    for (waited_millis, expected_status) in cases {
+    for waited_millis in waits {
         let case = format!("waited={waited_millis}ms");
         let emulator = Emulator::new();
         let estimate = create_estimate(&emulator, "recompute").await;
 
-        // Let the estimate's own create settle first, so the status the add is observed
-        // to re-open is a settled one.
-        std::thread::sleep(std::time::Duration::from_millis(window + 150));
-        let (status, settled) = emulator
+        let (status, created) = emulator
             .call("GetWorkloadEstimate", json!({ "identifier": estimate }))
             .await;
         assert_eq!(
             status, 200,
-            "case {case}: expected 200 from the reader, got {status} with {settled}"
+            "case {case}: expected 200 from the reader, got {status} with {created}"
         );
         assert_eq!(
-            settled["status"].as_str(),
-            Some(state::WORKLOAD_ESTIMATE_STATUS_VALID),
-            "case {case}: expected the create to have settled, got {:?}",
-            settled["status"]
+            created["totalCost"].as_f64(),
+            Some(0.0),
+            "case {case}: expected an estimate holding no usage to cost 0, got {:?}",
+            created["totalCost"]
         );
 
         let (status, batch) = emulator
@@ -306,7 +340,10 @@ async fn adding_usage_reopens_the_cost_recomputation_the_clock_settles() {
                 "BatchCreateWorkloadEstimateUsage",
                 json!({
                     "workloadEstimateId": estimate,
-                    "usage": [entry("a", 7.5, None, false), entry("b", 2.25, None, false)],
+                    "usage": [
+                        entry("a", amounts[0], None, false),
+                        entry("b", amounts[1], None, false),
+                    ],
                 }),
             )
             .await;
@@ -319,7 +356,7 @@ async fn adding_usage_reopens_the_cost_recomputation_the_clock_settles() {
             std::thread::sleep(std::time::Duration::from_millis(waited_millis));
         }
 
-        // Read twice: a settled status is stable, and a read is not what settles it.
+        // Read twice: the cost is stored state, so reading is not what computes it.
         for attempt in 0..2 {
             let (status, fetched) = emulator
                 .call("GetWorkloadEstimate", json!({ "identifier": estimate }))
@@ -330,18 +367,16 @@ async fn adding_usage_reopens_the_cost_recomputation_the_clock_settles() {
             );
             assert_eq!(
                 fetched["status"].as_str(),
-                Some(expected_status),
-                "case {case} attempt={attempt}: expected status {expected_status}, got {:?}",
+                Some(state::WORKLOAD_ESTIMATE_STATUS_VALID),
+                "case {case} attempt={attempt}: expected the terminal status over a \
+                 resolved cost, got {:?}",
                 fetched["status"]
             );
-            // The cost is the sum over the costs of the lines the estimate holds, and
-            // no line carries one, so it stays at the cost of an estimate holding no
-            // priced usage.
-            assert_eq!(
+            // The cost of the estimate is the sum over the costs of the lines it holds.
+            assert_cost(
+                &format!("case {case} attempt={attempt}"),
                 fetched["totalCost"].as_f64(),
-                Some(0.0),
-                "case {case} attempt={attempt}: expected the cost summed over unpriced lines, got {:?}",
-                fetched["totalCost"]
+                RATE * (amounts[0] + amounts[1]),
             );
             assert_eq!(
                 fetched["costCurrency"].as_str(),
@@ -351,12 +386,12 @@ async fn adding_usage_reopens_the_cost_recomputation_the_clock_settles() {
             );
         }
 
-        // The usage itself is untouched by the settling.
+        // The usage itself is untouched by the roll-up.
         let stored = stored_usage(&emulator, &estimate);
         assert_eq!(
             stored.iter().map(|(_, amount)| *amount).collect::<Vec<_>>(),
-            vec![7.5, 2.25],
-            "case {case}: expected the added lines to survive the settling, got {stored:?}"
+            amounts.to_vec(),
+            "case {case}: expected the added lines to survive the roll-up, got {stored:?}"
         );
     }
 }

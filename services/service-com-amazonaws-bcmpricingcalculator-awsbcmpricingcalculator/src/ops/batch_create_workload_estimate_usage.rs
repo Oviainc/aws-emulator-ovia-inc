@@ -5,9 +5,9 @@
 //! `workloadEstimateId` names, stores it there, and reports each one with the `id` it
 //! was assigned and the `quantity` read off the entry's `amount`.
 //!
-//! Adding usage changes what the estimate's cost is computed over, so the estimate
-//! re-enters the non-terminal `UPDATING` status and the CLOCK owes it the terminal one
-//! with the recomputed cost (`crate::state::WorkloadEstimate::begin_cost_recompute`).
+//! Adding usage changes what the estimate's cost is computed over, so the call that
+//! added it lands the recomputed cost and the status over it
+//! (`crate::state::WorkloadEstimate::recompute_cost`).
 //!
 //! A `workloadEstimateId` no live estimate carries is `ResourceNotFoundException` (HTTP
 //! 404) for the whole request — there is no parent to store anything under. A failure
@@ -21,9 +21,11 @@
 //! (another estimate, other entries) is `ConflictException` (HTTP 409) rather than a
 //! replay of someone else's answer.
 //!
-//! A line's `location`, `cost`, `currency`, `status` and its quantity's `unit` all come
-//! from the AWS price list, which this emulator does not carry, so they stay unset
-//! rather than carrying a value nothing computed.
+//! A line's `location` is the region its usage type's prefix names, its quantity's
+//! `unit` and its `cost` come from the rate `crate::state::RATE_CARD` publishes for that
+//! usage type at that location, and `currency` and `status` qualify that cost. A usage
+//! type the price list this emulator carries does not publish a rate for is stored and
+//! reported with no cost and the `INVALID` cost status, never with an invented number.
 //!
 //! ## Shape of an operation
 //!
@@ -133,10 +135,10 @@ impl From<BatchCreateWorkloadEstimateUsageErrorModeled> for BatchCreateWorkloadE
     }
 }
 
-// The `WorkloadEstimateCostStatus` a current cost carries, and the currency it is in,
-// live in `crate::state` (`COST_STATUS_VALID` / `COST_CURRENCY`, reported through
-// `WorkloadEstimateUsage::cost_status` and `cost_currency`), so every reader of a usage
-// line qualifies its cost the same way.
+// The `WorkloadEstimateCostStatus` a cost carries, and the currency it is in, live in
+// `crate::state` (`COST_STATUS_VALID` / `COST_STATUS_INVALID` / `COST_CURRENCY`,
+// reported through `WorkloadEstimateUsage::cost_status` and `cost_currency`), so every
+// reader of a usage line qualifies its cost the same way.
 
 /// Push the digest parts of one batch entry.
 ///
@@ -174,9 +176,9 @@ fn item_for(line: &crate::state::WorkloadEstimateUsage) -> BatchCreateWorkloadEs
         quantity: Some(line.quantity()),
         cost: line.cost,
         // `currency` says which currency a reported `cost` is in, and `status` (a
-        // `WorkloadEstimateCostStatus`) qualifies that same cost, so both are reported
-        // exactly when a cost is — the rule `crate::state` holds for every reader of a
-        // usage line, so the batch answer and a later read cannot disagree.
+        // `WorkloadEstimateCostStatus`) qualifies that same cost — the rule
+        // `crate::state` holds for every reader of a usage line, so the batch answer and
+        // a later read cannot disagree.
         currency: line.cost_currency(),
         status: line.cost_status(),
         historical_usage: line.historical_usage.clone(),
@@ -232,8 +234,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = store.lock();
         let now_millis = crate::state::now_millis();
         // Materialise what the clock has already made due, so this call does not store
-        // anything under an estimate that is already past its `expiresAt`, and does not
-        // start a recomputation from a status the clock has moved on from.
+        // anything under an estimate that is already past its `expiresAt`.
         state.settle(now_millis);
 
         // The per-entry failures this request earns, computed from the request alone:
@@ -377,31 +378,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         for (entry, id) in accepted.iter().zip(&created_ids) {
-            let line = crate::state::WorkloadEstimateUsage {
-                id: id.clone(),
-                key: Some(entry.key.clone()),
-                service_code: entry.service_code.clone(),
-                usage_type: entry.usage_type.clone(),
-                operation: entry.operation.clone(),
-                usage_account_id: entry.usage_account_id.clone(),
-                // Resolving a usage type's pricing location needs the price list,
-                // which this emulator does not carry.
-                location: None,
-                group: entry.group.clone(),
-                amount: entry.amount,
-                // And so does pricing it.
-                cost: None,
-                historical_usage: entry.historical_usage.clone(),
-            };
+            // Priced through `crate::state`, so this batch's answer and every later read
+            // of the line report the same location, unit and cost for the same usage.
+            let line = crate::state::WorkloadEstimateUsage::priced(
+                id.clone(),
+                Some(entry.key.clone()),
+                entry.service_code.clone(),
+                entry.usage_type.clone(),
+                entry.operation.clone(),
+                entry.usage_account_id.clone(),
+                entry.group.clone(),
+                entry.amount,
+                entry.historical_usage.clone(),
+            );
 
             items.push(item_for(&line));
             estimate.usage.push(line);
         }
 
         // The estimate's cost is computed over the usage it holds, which this call just
-        // changed, so the service owes it a recomputation: the estimate re-enters the
-        // non-terminal status and the clock lands the new cost with the terminal one.
-        estimate.begin_cost_recompute(now_millis);
+        // changed, so the new cost — and the status over it — are landed here.
+        estimate.recompute_cost();
 
         state.record_idempotent(
             Self::NAME,
