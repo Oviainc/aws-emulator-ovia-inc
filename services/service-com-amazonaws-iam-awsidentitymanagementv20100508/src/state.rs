@@ -312,6 +312,12 @@ pub const MARKER_SCOPE_ACCOUNT_ALIASES: &str = "account-aliases";
 /// changing it.
 pub const MARKER_SCOPE_SERVICE_SPECIFIC_CREDENTIALS: &str = "service-specific-credentials";
 
+/// The marker scope of the account's access keys, which `ListAccessKeys` pages
+/// over. One scope covers the whole collection because that operation pages over
+/// the same key order (the access key id) whichever user it reports on — the
+/// user selects within the order rather than changing it.
+pub const MARKER_SCOPE_ACCESS_KEYS: &str = "access-keys";
+
 /// The alphabet the suffix is drawn from: RFC 4648 base32, every character of
 /// which is an uppercase alphanumeric and so inside `idType`'s `^[\w]+$`.
 const BASE32_ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Attaches a resource-based permission policy document to a secret, replacing whatever
+//! policy it carried. The document is stored verbatim, so `GetResourcePolicy` reports it
+//! byte for byte.
 //!
 //! ## Shape of an operation
 //!
@@ -172,20 +166,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutResourcePolicy"))
+        // The document has to be a policy document before anything is stored:
+        // "The resource policy has syntax errors."
+        // (`MalformedPolicyDocumentException`). Parsed BEFORE the store lock is
+        // taken, since it is a property of the request alone.
+        let policy = crate::state::parse_resource_policy(&input.resource_policy).map_err(
+            |message| {
+                PutResourcePolicyErrorModeled::MalformedPolicyDocumentException(
+                    MalformedPolicyDocumentException {
+                        message: Some(message),
+                    },
+                )
+            },
+        )?;
+
+        // "Specifies whether to block resource-based policies that allow broad
+        // access to the secret, for example those that use a wildcard for the
+        // principal. By default, public policies aren't blocked"
+        // (`PutResourcePolicyRequest$BlockPublicPolicy`), so the check runs only
+        // where the caller asked for it.
+        if input.block_public_policy.unwrap_or(false)
+            && crate::state::policy_grants_public_access(&policy)
+        {
+            return Err(PutResourcePolicyErrorModeled::PublicPolicyException(
+                PublicPolicyException {
+                    message: Some(crate::state::PUBLIC_POLICY_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
+        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+        store.expire_due(now);
+
+        let Some(secret) = store.get_mut(&input.secret_id) else {
+            return Err(PutResourcePolicyErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::SECRET_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // "A parameter value is not valid for the current state of the
+        // resource. Possible causes: The secret is scheduled for deletion."
+        if secret.scheduled_for_deletion() {
+            return Err(PutResourcePolicyErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(crate::state::MARKED_FOR_DELETION_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // Stored as it arrived, not re-serialized from the parse above, so the
+        // document `GetResourcePolicy` reports is the one the caller attached.
+        secret.attach_resource_policy(input.resource_policy.clone(), now);
+        Ok(PutResourcePolicyOutput {
+            arn: Some(secret.arn.clone()),
+            name: Some(secret.name.clone()),
+        })
     }
+}
+
+/// The modelled server error for a request that cannot reach this service's
+/// store. `service_state` answers `None` only when the engine is not the shared
+/// in-memory one, which is a server-side fault, never a bad request.
+fn state_unavailable() -> PutResourcePolicyError {
+    PutResourcePolicyErrorModeled::InternalServiceError(InternalServiceError {
+        message: Some("the Secrets Manager emulator's state store is unavailable".to_string()),
+    })
+    .into()
 }

@@ -134,12 +134,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `ctx` carries request metadata only; this operation reads none of it — a group is
-        // named by id, or by name within the default VPC. The store is reached through the
-        // engine held on `self`.
-        let _ = ctx;
+        // `ctx` carries the Region this request was signed for, which is what says which
+        // default VPC a group NAME is resolved in (see below); the store is reached through
+        // the engine held on `self`.
         use crate::state;
 
+        let region = state::request_region(ctx.parts());
         let state_handle = state::require_service_state(&*self.engine)?;
         let mut store = state_handle.lock();
 
@@ -160,8 +160,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             (Some(group_id), None) => group_id.to_string(),
             (None, Some(group_name)) => {
+                // The Region's ambient default network is the account's whatever it has
+                // created, so it is materialised before a name is resolved in that VPC.
+                store.ensure_default_network(&region);
                 let default_vpc = store
-                    .default_vpc_id()
+                    .default_vpc_id(&region)
                     .ok_or_else(|| state::invalid_group_not_found(group_name))?;
                 store
                     .security_group_id_for_name(&default_vpc, group_name)

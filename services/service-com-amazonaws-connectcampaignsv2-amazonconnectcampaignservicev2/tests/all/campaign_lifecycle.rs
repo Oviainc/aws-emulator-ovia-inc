@@ -1014,23 +1014,30 @@ async fn each_create_mints_a_distinct_id_and_keeps_its_own_record() {
     let region = "us-east-1";
     let router = router();
 
-    // The same request body twice: only the server-minted id distinguishes them.
+    // Two campaigns that differ only in their name — the member a Connect
+    // instance's campaigns are identified by, so this is the closest two distinct
+    // campaigns of one instance can be.
     let request = json!({
-        "name": "same-name",
+        "name": "twin-a",
         "connectInstanceId": "instance-1",
         "channelSubtypeConfig": telephony_config(),
         "tags": {"env": "test"},
     });
 
     let first = create(&router, region, &request).await;
-    let second = create(&router, region, &request).await;
+    let second = create(
+        &router,
+        region,
+        &merged(&request, &json!({"name": "twin-b"})),
+    )
+    .await;
     assert_ne!(
         first["id"], second["id"],
-        "case \"two identical creates\": expected distinct ids, got {first} and {second}"
+        "case \"two creates differing only in name\": expected distinct ids, got {first} and {second}"
     );
     assert_ne!(
         first["arn"], second["arn"],
-        "case \"two identical creates\": expected distinct arns, got {first} and {second}"
+        "case \"two creates differing only in name\": expected distinct arns, got {first} and {second}"
     );
 
     // Moving one campaign's state leaves the other where it was.
@@ -1083,18 +1090,21 @@ async fn creates_past_the_store_ceiling_are_refused_as_a_quota_breach() {
 
     let region = "us-east-1";
     let router = router();
-    let request = json!({"name": "filler", "connectInstanceId": "instance-1"});
+    // A campaign name is unique within its Connect instance, so the filler
+    // campaigns carry one name each; only the ceiling, not a name, refuses a
+    // create below.
+    let filler = |index: usize| json!({"name": format!("filler-{index}"), "connectInstanceId": "instance-1"});
+    let past_the_ceiling = filler(MAX_CAMPAIGNS);
 
     let mut first_id = String::new();
     for index in 0..MAX_CAMPAIGNS {
-        let created = create(&router, region, &request).await;
+        let created = create(&router, region, &filler(index)).await;
         if index == 0 {
             first_id = created["id"].as_str().expect("a minted id").to_string();
         }
     }
 
-    // (case, how many campaigns the store holds, expected status)
-    let (status, body) = call(&router, region, "PUT", "/v2/campaigns", &request).await;
+    let (status, body) = call(&router, region, "PUT", "/v2/campaigns", &past_the_ceiling).await;
     assert_eq!(
         status, 402,
         "case \"create at the ceiling\": expected HTTP 402, got {status} {body}"
@@ -1119,8 +1129,15 @@ async fn creates_past_the_store_ceiling_are_refused_as_a_quota_breach() {
         status, 200,
         "case \"delete to free a slot\": expected 200, got {status} {body}"
     );
-    create(&router, region, &request).await;
-    let (status, body) = call(&router, region, "PUT", "/v2/campaigns", &request).await;
+    create(&router, region, &past_the_ceiling).await;
+    let (status, body) = call(
+        &router,
+        region,
+        "PUT",
+        "/v2/campaigns",
+        &filler(MAX_CAMPAIGNS + 1),
+    )
+    .await;
     assert_eq!(
         status, 402,
         "case \"create at the ceiling again\": expected HTTP 402, got {status} {body}"

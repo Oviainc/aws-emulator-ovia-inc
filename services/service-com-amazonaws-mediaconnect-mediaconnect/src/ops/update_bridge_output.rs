@@ -1,15 +1,34 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateBridgeOutput
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateBridgeOutput`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateBridgeOutput::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies the settings the request carries to ONE output of the STORED bridge — the
+//! output that bridge addresses by the requested name — and answers with the stored output
+//! read back, so DescribeBridge afterwards reports exactly what this operation wrote.
+//!
+//! The operation is a PARTIAL update (`@idempotent`, every input member but the two
+//! `@httpLabel`s optional), exactly like UpdateBridgeSource: a member the request carries
+//! replaces that setting on the stored output and a member it omits leaves the stored
+//! setting untouched. The request-only wrapper shape is merged member by member into the
+//! shape the bridge holds: `UpdateBridgeNetworkOutputRequest` into the
+//! `BridgeNetworkOutput`. A member of the stored shape the request shape has no
+//! counterpart for is the service's own and is carried over untouched —
+//! `BridgeNetworkOutput$Name`, the name the bridge addresses the output by, which is the
+//! `@httpLabel` this request resolves it with.
+//!
+//! A `BridgeOutput` is EITHER a flow output ("the output of the associated flow", the one
+//! a cloud flow creates when it takes the bridge as its source) or a network output ("the
+//! network output for the bridge"), and this request shape carries a wrapper for the
+//! network kind only. So a request that names `NetworkOutput` for an output that is a flow
+//! output is refused — that output has no network settings to update — with
+//! `BadRequestException` (HTTP 400), the error the model describes as the one for "a
+//! semantic error" in the request. A request that names NO wrapper is a partial update of
+//! nothing: it is accepted and the stored output is answered unchanged, the same way
+//! UpdateBridgeSource and UpdateBridge answer a request that carries no setting.
+//!
+//! The model gives this operation no state member and documents no state change for it, so
+//! it leaves the bridge's state alone: it only settles a transition the clock had already
+//! made due, exactly as DescribeBridge, AddBridgeOutputs and UpdateBridgeSource do.
 //!
 //! ## Shape of an operation
 //!
@@ -83,6 +102,35 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// Refuse a WELL-FORMED request the addressed OUTPUT itself does not admit, with
+/// `BadRequestException` (HTTP 400) under this service's bad-request envelope
+/// ([`crate::state::bad_request_message`]): the request is not malformed, the output just
+/// has no such settings to update. The same split UpdateBridgeSource makes for a wrapper
+/// the addressed source has no counterpart for.
+///
+/// A bridge's flow output is one the service materialises for it, never one a request
+/// configures ([`crate::state::materialise_bridge_output`] projects a `NetworkOutput`
+/// only), so no bridge this emulator stores holds an output this refuses yet. It guards
+/// the merge rather than assuming the kind, so the day a flow output can be stored the
+/// request that cannot apply to it is refused instead of silently rewriting its kind.
+fn refused_by_output(detail: impl Into<String>) -> UpdateBridgeOutputError {
+    UpdateBridgeOutputErrorModeled::BadRequestException(BadRequestException {
+        message: crate::state::bad_request_message(&detail.into()),
+    })
+    .into()
+}
+
+/// Refuse the request with `NotFoundException` (HTTP 404): "one or more of the resources in
+/// the request does not exist in the system" — the bridge or the output `identifier`
+/// addressed, in this service's not-found envelope
+/// ([`crate::state::not_found_message`]).
+fn not_found(identifier: &str) -> UpdateBridgeOutputError {
+    UpdateBridgeOutputErrorModeled::NotFoundException(NotFoundException {
+        message: crate::state::not_found_message(identifier),
+    })
+    .into()
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -158,18 +206,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateBridgeOutput` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateBridgeOutputErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateBridgeOutput"))
+        // Nothing in this operation's answer depends on request metadata: both the bridge
+        // ARN and the output name are `@httpLabel`s the deserializer already put on
+        // `input`, and the response is read back out of the stored bridge.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateBridgeOutputErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: "the mediaconnect bridge store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The only write this operation owes beyond the request: a bridge state change the
+        // clock already made due is materialised before the bridge is read or written.
+        store.settle_due_transitions(now);
+
+        // This operation updates an output of "an existing bridge", addressed by the
+        // bridge's own ARN.
+        let Some(bridge) = store.bridges.get_mut(&input.bridge_arn) else {
+            return Err(not_found(&input.bridge_arn));
+        };
+        // The output updated is the one of THIS bridge's outputs the bridge addresses by
+        // the requested name ("this name is used to reference the output and must be unique
+        // among outputs in this bridge"), so at most one position matches; a name of some
+        // other bridge's output, or of an output already removed, resolves nothing here.
+        let Some(position) = bridge.output_position(&input.output_name) else {
+            return Err(not_found(&input.output_name));
+        };
+
+        // What the output becomes once this request is applied: the request's value for
+        // every member it carries, the stored value for every member it does not. The
+        // merged output is computed in full before anything is written, and a wrapper the
+        // addressed output has no counterpart for is refused rather than silently ignored,
+        // so a refused update leaves the bridge exactly as it was. A request that carries
+        // no wrapper updates no setting, so it writes NOTHING and the stored output is
+        // answered as it stands.
+        if let Some(update) = input.network_output.as_ref() {
+            let stored = &bridge.outputs[position];
+            let Some(stored_network) = stored.network_output.as_ref() else {
+                return Err(refused_by_output(
+                    "NetworkOutput cannot be updated on a flow output of a bridge.",
+                ));
+            };
+            let merged = BridgeOutput {
+                // The request shape has no member for a flow output, so whatever the
+                // stored output holds there is carried over untouched — the same
+                // member-for-member carry-over every setting the request omits gets.
+                flow_output: stored.flow_output.clone(),
+                network_output: Some(BridgeNetworkOutput {
+                    ip_address: update
+                        .ip_address
+                        .clone()
+                        .unwrap_or_else(|| stored_network.ip_address.clone()),
+                    // `BridgeNetworkOutput$Name` is the name the bridge addresses this
+                    // output by — the `@httpLabel` that resolved it — and the request shape
+                    // has no member for it, so it is carried over untouched.
+                    name: stored_network.name.clone(),
+                    network_name: update
+                        .network_name
+                        .clone()
+                        .unwrap_or_else(|| stored_network.network_name.clone()),
+                    port: update.port.unwrap_or(stored_network.port),
+                    protocol: update
+                        .protocol
+                        .clone()
+                        .unwrap_or_else(|| stored_network.protocol.clone()),
+                    ttl: update.ttl.unwrap_or(stored_network.ttl),
+                }),
+            };
+            bridge.outputs[position] = merged;
+        }
+
+        // "The ARN of the bridge that was updated" and "the bridge output that was updated"
+        // — both read back out of the STORED bridge rather than echoed from the request, so
+        // the answer can only report what this call actually wrote. Updating an output
+        // moves nothing else about the bridge: its state is left as it was, because no
+        // clock owes a change for an updated output.
+        Ok(UpdateBridgeOutputOutput {
+            bridge_arn: Some(bridge.bridge_arn.clone()),
+            output: Some(bridge.outputs[position].clone()),
+        })
     }
 }

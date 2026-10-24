@@ -1531,6 +1531,63 @@ pub const SERVICE_CODE: &str = "billingconductor";
 /// caller cannot grow one resource's tag map without limit.
 pub const MAX_TAGS_PER_RESOURCE: usize = 200;
 
+/// The tag-key prefix Amazon Web Services keeps for the tags it generates itself.
+///
+/// Amazon Web Services' tagging rules reserve this prefix service-wide: a caller can
+/// neither create nor edit nor delete a tag key carrying it, and a request that tries is
+/// refused. The model cannot express the rule — `TagKey` carries only
+/// `@length(1..128)` and no pattern (`smithy_query(query="shape",shape="TagKey")`), so
+/// the boundary walk admits such a key — which is why every path taking a
+/// caller-supplied tag key enforces it through [`check_tag_keys_not_reserved`].
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Whether `key` names a tag in the reserved [`RESERVED_TAG_KEY_PREFIX`] namespace.
+///
+/// The comparison is case-insensitive, because the namespace is reserved however it is
+/// cased. It is a byte-slice compare rather than a lowercasing one so no allocation
+/// happens per key; `get` answers `None` for a key shorter than the prefix, or one whose
+/// fourth byte falls inside a multi-byte character, and both of those are exactly "not
+/// reserved" — a `TagKey`'s only modelled constraint is its length in characters, so any
+/// character at all reaches here.
+pub fn is_reserved_tag_key(key: &str) -> bool {
+    key.get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
+}
+
+/// `Ok(())` when no key in `keys` is reserved, or the modelled `ValidationException`
+/// that refuses the request.
+///
+/// One helper, so every operation that takes caller-supplied tag keys — `TagResource`
+/// and `UntagResource`, and the `Tags` of `CreateBillingGroup`, `CreatePricingPlan`,
+/// `CreatePricingRule` and `CreateCustomLineItem` — refuses that namespace the same way
+/// and cannot drift apart. `member` names the input member that carried the keys, which
+/// is what travels in `Fields`, and the message is built from the request: the offenders
+/// are sorted and deduplicated, so a map's iteration order never shows through the text.
+pub fn check_tag_keys_not_reserved<'a>(
+    member: &str,
+    keys: impl IntoIterator<Item = &'a str>,
+) -> Result<(), crate::ops::types::ValidationException> {
+    let mut reserved: Vec<&str> = keys
+        .into_iter()
+        .filter(|key| is_reserved_tag_key(key))
+        .collect();
+    if reserved.is_empty() {
+        return Ok(());
+    }
+    reserved.sort_unstable();
+    reserved.dedup();
+    Err(validation_exception(
+        "FIELD_VALIDATION_FAILED",
+        member,
+        format!(
+            "Value at '{member}' failed to satisfy constraint: a tag key must not begin \
+             with '{RESERVED_TAG_KEY_PREFIX}', the prefix reserved for the tags Amazon Web \
+             Services generates; this request names {}",
+            reserved.join(", ")
+        ),
+    ))
+}
+
 /// The wire error code a tagging operation answers when its `ResourceArn` names no
 /// resource of this service.
 ///

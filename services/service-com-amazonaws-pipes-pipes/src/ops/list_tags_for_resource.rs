@@ -152,9 +152,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.settle_due_transitions();
 
         let pipe = state.pipe_by_arn(&input.resource_arn).ok_or_else(|| {
-            ListTagsForResourceErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!("Pipe not found: {}", input.resource_arn)),
-            })
+            ListTagsForResourceErrorModeled::NotFoundException(crate::state::pipe_not_found(
+                crate::state::pipe_name_in_arn(&input.resource_arn),
+            ))
         })?;
 
         // `tag_map()` reports `None` for an untagged pipe: an empty map is not a legal

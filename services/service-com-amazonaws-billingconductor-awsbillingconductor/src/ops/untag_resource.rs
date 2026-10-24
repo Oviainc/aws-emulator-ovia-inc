@@ -11,6 +11,11 @@
 //! member's `@pattern` is off the boundary (`skip_validation` on `UntagResourceInput`)
 //! for the same recorded reason.
 //!
+//! A `TagKeys` entry in the reserved `aws:` namespace is REFUSED with the modelled 400
+//! `ValidationException` and removes nothing: the tags under that prefix are Amazon Web
+//! Services' own, which a caller may no more delete than create (see
+//! [`crate::state::check_tag_keys_not_reserved`]).
+//!
 //! This operation is NOT payer-account-gated
 //! (`crate::service::PAYER_UNGATED_OPERATIONS`).
 //!
@@ -153,6 +158,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The `TagKeys` list's own length bound is refused by the boundary before this
         // runs; the `ResourceArn` pattern is not (see this module's header).
         let _ = ctx;
+
+        // A reserved key is refused from the REQUEST alone, before the store is reached:
+        // a caller may not DELETE a tag Amazon Web Services generated either, so the
+        // request is answered the same way `TagResource` answers one that tries to set
+        // it, and no key the request names is removed.
+        if let Err(refusal) = crate::state::check_tag_keys_not_reserved(
+            "TagKeys",
+            input.tag_keys.iter().map(String::as_str),
+        ) {
+            return Err(UntagResourceErrorModeled::ValidationException(refusal).into());
+        }
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UntagResourceErrorModeled::InternalServerException(
                 InternalServerException {

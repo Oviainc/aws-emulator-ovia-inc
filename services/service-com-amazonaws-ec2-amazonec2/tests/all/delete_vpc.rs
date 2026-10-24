@@ -99,7 +99,7 @@ fn default_vpc_id(engine: &engine::InMemoryEngine) -> String {
     engine
         .state::<Ec2State>()
         .lock()
-        .default_vpc_id()
+        .default_vpc_id(REGION)
         .expect("a fresh account has a default VPC")
 }
 

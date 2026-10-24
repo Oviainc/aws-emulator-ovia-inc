@@ -90,6 +90,9 @@ mod official_lens_catalog;
 #[path = "all/profile_lifecycle.rs"]
 mod profile_lifecycle;
 
+#[path = "all/profile_reads.rs"]
+mod profile_reads;
+
 #[path = "all/question_choice_catalog.rs"]
 mod question_choice_catalog;
 

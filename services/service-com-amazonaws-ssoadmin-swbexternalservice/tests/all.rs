@@ -61,6 +61,8 @@ mod managed_policies;
 mod managed_policies_in_permission_set;
 #[path = "all/permissions_boundary.rs"]
 mod permissions_boundary;
+#[path = "all/permissions_boundary_delete.rs"]
+mod permissions_boundary_delete;
 #[path = "all/ssoadmin_permission_sets.rs"]
 mod ssoadmin_permission_sets;
 #[path = "all/state_roundtrip.rs"]

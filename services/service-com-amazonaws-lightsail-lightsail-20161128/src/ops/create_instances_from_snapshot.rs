@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateInstancesFromSnapshot
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateInstancesFromSnapshot`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Inserts one instance record per requested name into this service's store, as a
+//! copy of the instance an instance snapshot captured, together with one block
+//! storage disk per entry of the requested attached-disk mapping, and answers the
+//! operation-log entry each new instance appended.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateInstancesFromSnapshot::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -209,18 +206,576 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateInstancesFromSnapshot` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateInstancesFromSnapshotErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries request metadata only, and nothing this operation stores
+        // comes from it: a restored instance's region is the region of the
+        // availability zone the request names, not the one the request signed
+        // for.
+        let _ = ctx;
+
+        // `instanceNames`, `availabilityZone` and `bundleId` are modelled
+        // `@required` members and every pattern on this input is a modelled
+        // constraint, so the centralized walk refused anything outside them
+        // before this body ran. What is left is what the model cannot express:
+        // the bundle and the zone must name things this service serves, exactly
+        // one source must be named, the automatic-snapshot members must be used
+        // only with that source, the attached-disk mapping must map names this
+        // request creates onto device paths the snapshot captured, the source
+        // must be a resource this account holds, no name may already be taken,
+        // and the caller-sized lists must be within the store's bounds. Every
+        // one of those is checked BEFORE the first write, so a refused request
+        // creates nothing.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateInstancesFromSnapshot"))
+        // The blueprint is NOT a member of this input: a restored instance runs
+        // the image the snapshot captured, so it is read off the snapshot record
+        // rather than resolved against the creatable catalog — an instance
+        // snapshot of a since-retired image still restores.
+        let bundle = crate::state::bundle_spec(&input.bundle_id).ok_or_else(|| {
+            invalid(format!(
+                "bundleId '{}' names no Lightsail bundle: its leading size token must be \
+                 one of [{}]",
+                input.bundle_id,
+                crate::state::bundle_sizes()
+            ))
+        })?;
+        let region = crate::state::region_of_availability_zone(&input.availability_zone)
+            .ok_or_else(|| {
+                invalid(format!(
+                    "availabilityZone '{}' is not a zone of a Lightsail region: it must be \
+                     a region name followed by a zone letter, for one of [{}]",
+                    input.availability_zone,
+                    crate::state::region_names()
+                ))
+            })?;
+        let ip_address_type = input
+            .ip_address_type
+            .clone()
+            .unwrap_or_else(|| crate::state::DEFAULT_IP_ADDRESS_TYPE.to_string());
+        if !IP_ADDRESS_TYPE_VALUES.contains(&ip_address_type.as_str()) {
+            return Err(invalid(format!(
+                "ipAddressType must be one of [{}], got '{ip_address_type}'",
+                IP_ADDRESS_TYPE_VALUES.join(", ")
+            )));
+        }
+        if input.instance_names.is_empty() {
+            return Err(invalid(
+                "instanceNames must name at least one instance to create".to_string(),
+            ));
+        }
+        if input.instance_names.len() > crate::state::MAX_INSTANCE_NAMES_PER_REQUEST {
+            return Err(invalid(format!(
+                "instanceNames carries {} names, more than the {} this service accepts in \
+                 one request",
+                input.instance_names.len(),
+                crate::state::MAX_INSTANCE_NAMES_PER_REQUEST
+            )));
+        }
+        let tags = input.tags.clone().unwrap_or_default();
+        if tags.len() > crate::state::MAX_TAGS {
+            return Err(invalid(format!(
+                "tags carries {} entries, more than the {} this service accepts",
+                tags.len(),
+                crate::state::MAX_TAGS
+            )));
+        }
+
+        let source = requested_source(&input)?;
+        // Everything each new instance will carry, resolved before any write
+        // because an unacceptable request must create no instance at all. The
+        // plan follows `instanceNames` in the order the request wrote them, so
+        // the store's allocators hand out ids and addresses in that order
+        // however the attached-disk mapping was keyed.
+        let mut planned = planned_instances(&input)?;
+
+        let location = crate::state::StoredLocation::zonal(&input.availability_zone, region);
+        let now = crate::state::now_ms();
+
+        crate::state::with_state(&*self.engine, |store| {
+            // Every name is checked before anything is written, so a request
+            // that names one instance that already exists creates none of the
+            // others either — and never silently overwrites the existing record.
+            for (position, name) in input.instance_names.iter().enumerate() {
+                if store.instances.contains_key(name) {
+                    return Err(invalid(format!("an instance named '{name}' already exists")));
+                }
+                if input.instance_names[..position].contains(name) {
+                    return Err(invalid(format!(
+                        "instanceNames names '{name}' more than once"
+                    )));
+                }
+            }
+            if store.instances.len() + planned.len() > crate::state::MAX_INSTANCES {
+                return Err(invalid(format!(
+                    "creating {} instances would take this account past the {} this \
+                     emulator holds",
+                    planned.len(),
+                    crate::state::MAX_INSTANCES
+                )));
+            }
+
+            // The snapshotted instance the new instances are copies of. The
+            // snapshot's own record is the source of truth for the blueprint,
+            // the system volume's size and the block storage disks it captured;
+            // nothing here reads the instance the snapshot was taken of, which
+            // may have been changed or deleted since.
+            let (snapshot_name, snapshot_blueprint_id, snapshot_size_in_gb, captured_disks) =
+                match &source {
+                    RequestedSource::Snapshot(requested) => {
+                        let snapshot = store.instance_snapshot(requested).ok_or_else(|| {
+                            not_found(crate::state::RESOURCE_TYPE_INSTANCE_SNAPSHOT, requested)
+                        })?;
+                        // A snapshot belongs to the region it was taken in, and
+                        // only that region's Lightsail endpoint can restore it:
+                        // moving one between regions is what `CopySnapshot` is
+                        // for.
+                        if snapshot.location.region_name != region {
+                            return Err(invalid(format!(
+                                "instanceSnapshotName '{}' is a snapshot of region {}, which \
+                                 cannot be restored into availabilityZone '{}' of region \
+                                 {region}",
+                                snapshot.name,
+                                snapshot.location.region_name,
+                                input.availability_zone
+                            )));
+                        }
+                        // A snapshot is restorable only once every block it
+                        // captures is captured: while Lightsail is still taking
+                        // it the snapshot reports `pending`
+                        // (`InstanceSnapshot$state`), and there is nothing
+                        // complete to restore from yet. That is a well-formed
+                        // request the resources' state does not allow, which is
+                        // what the modelled `OperationFailureException` is for.
+                        if snapshot.state != crate::state::INSTANCE_SNAPSHOT_STATE_AVAILABLE {
+                            return Err(operation_failure(format!(
+                                "The instance snapshot {} is {}: an instance can be restored \
+                                 only from a snapshot that is {}.",
+                                snapshot.name,
+                                snapshot.state,
+                                crate::state::INSTANCE_SNAPSHOT_STATE_AVAILABLE
+                            )));
+                        }
+                        (
+                            snapshot.name.clone(),
+                            snapshot.from_blueprint_id.clone(),
+                            snapshot.size_in_gb,
+                            snapshot.from_attached_disks.clone(),
+                        )
+                    }
+                    // An AUTOMATIC snapshot is one the `AutoSnapshot` add-on
+                    // takes on the daily schedule an instance carries. This
+                    // store holds none — the add-on records the hour it would run
+                    // at and nothing takes a copy — so, once the source instance
+                    // is known to exist, there is no automatic snapshot of it to
+                    // restore from and the request is refused with the service's
+                    // `DoesNotExist` envelope rather than answered with an
+                    // instance restored from nothing.
+                    RequestedSource::AutoSnapshot {
+                        instance_name,
+                        date,
+                    } => {
+                        store.instance(instance_name).ok_or_else(|| {
+                            not_found(crate::state::RESOURCE_TYPE_INSTANCE, instance_name)
+                        })?;
+                        return Err(crate::scaffolded::Scaffolded::does_not_exist(format!(
+                            "no automatic snapshot of the Instance {instance_name} is \
+                             available to restore ({date}): this account has taken none"
+                        )));
+                    }
+                };
+
+            // A restored system volume holds every block the snapshot captured,
+            // so the plan it is restored onto cannot carry a smaller SSD than
+            // the volume that was snapshotted; a larger plan is accepted and the
+            // extra space is the new instance's.
+            if bundle.disk_size_in_gb < snapshot_size_in_gb {
+                return Err(invalid(format!(
+                    "bundleId '{}' provides a {} GB SSD, smaller than the {snapshot_size_in_gb} \
+                     GB system volume instance snapshot '{snapshot_name}' captured: an \
+                     instance restored from a snapshot must be created on a bundle at least \
+                     as large as the snapshotted volume",
+                    input.bundle_id, bundle.disk_size_in_gb
+                )));
+            }
+
+            // Each mapped device path must be one the snapshot actually
+            // captured, and each new disk name must be free: the size of the
+            // disk to restore is the captured disk's own, resolved here so the
+            // write below reads nothing it has not already checked.
+            let mut new_disks = 0usize;
+            for instance in planned.iter_mut() {
+                for disk in instance.disks.iter_mut() {
+                    let captured = captured_disks
+                        .iter()
+                        .find(|captured| {
+                            captured.path.as_deref() == Some(disk.original_disk_path.as_str())
+                        })
+                        .ok_or_else(|| {
+                            invalid(format!(
+                                "attachedDiskMapping names originalDiskPath '{}', which \
+                                 instance snapshot '{snapshot_name}' did not capture: it \
+                                 captured [{}]",
+                                disk.original_disk_path,
+                                captured_disks
+                                    .iter()
+                                    .filter_map(|captured| captured.path.clone())
+                                    .collect::<Vec<String>>()
+                                    .join(", ")
+                            ))
+                        })?;
+                    if store.disk(&disk.new_disk_name).is_some() {
+                        return Err(invalid(format!(
+                            "a disk named '{}' already exists",
+                            disk.new_disk_name
+                        )));
+                    }
+                    disk.size_in_gb = captured.size_in_gb;
+                    new_disks += 1;
+                }
+            }
+            if store.disks.len() + new_disks > crate::state::MAX_DISKS {
+                return Err(invalid(format!(
+                    "restoring {new_disks} disks would take this account past the {} this \
+                     emulator holds",
+                    crate::state::MAX_DISKS
+                )));
+            }
+
+            let mut operations = Vec::with_capacity(planned.len());
+            for instance in planned {
+                let id = store.mint_uuid();
+                let (private_ip_address, public_ip_address, ipv6_addresses) =
+                    store.fresh_addresses(&ip_address_type);
+                // A restored instance is not serving yet: the clock owes it
+                // `running`, which is why a read straight after this call still
+                // reports `pending`, exactly as it does against AWS.
+                let due = crate::state::DueTransition::after(now, crate::state::RUNNING);
+                store.insert_instance(crate::state::StoredInstance {
+                    name: instance.name.clone(),
+                    arn: crate::state::instance_arn(region, &id),
+                    support_code: crate::state::support_code(&id),
+                    created_at_ms: now,
+                    location: location.clone(),
+                    tags: tags.clone(),
+                    // The image is the snapshot's, not the request's: this input
+                    // models no blueprint.
+                    blueprint_id: snapshot_blueprint_id.clone(),
+                    // The plan is the request's: a restore is where a caller
+                    // moves a snapshotted instance onto another bundle.
+                    bundle_id: input.bundle_id.clone(),
+                    add_ons: instance.add_ons,
+                    is_static_ip: false,
+                    private_ip_address,
+                    public_ip_address,
+                    ipv6_addresses,
+                    ip_address_type: ip_address_type.clone(),
+                    bundle,
+                    ssh_key_name: input
+                        .key_pair_name
+                        .clone()
+                        .unwrap_or_else(|| crate::state::DEFAULT_SSH_KEY_NAME.to_string()),
+                    user_data: input.user_data.clone(),
+                    // An instance snapshot captures the system volume, the
+                    // blueprint and bundle, and the attached block storage disks
+                    // (`InstanceSnapshot`), and no member of it reports a
+                    // firewall — so a restored instance opens the platform's
+                    // defaults for its blueprint, exactly as a directly created
+                    // one does, and the public-ports operations make of them
+                    // whatever a caller asks next.
+                    ports: crate::state::default_port_rules(
+                        &snapshot_blueprint_id,
+                        &ip_address_type,
+                    ),
+                    state: crate::state::PENDING,
+                    due: Some(due),
+                });
+                // Each mapped disk is restored as a block storage disk of its
+                // own and attached to the new instance at the device path it was
+                // exposed at on the snapshotted one. It is stored `in-use` with
+                // nothing owed: that is what an attached disk's state is, and a
+                // disk owed `available` while attached is one a detach is
+                // releasing (see `advance_clock`).
+                for disk in instance.disks {
+                    let disk_id = store.mint_uuid();
+                    store.insert_disk(crate::state::StoredDisk {
+                        name: disk.new_disk_name,
+                        arn: crate::state::disk_arn(region, &disk_id),
+                        support_code: crate::state::support_code(&disk_id),
+                        created_at_ms: now,
+                        location: location.clone(),
+                        // The tags this call adds to what it creates; the
+                        // snapshot carries no tags for a captured disk that a
+                        // restore could inherit.
+                        tags: tags.clone(),
+                        // `addOns` are the add-ons asked for the INSTANCE, which
+                        // is the resource this input names them for; a restored
+                        // disk carries none until `EnableAddOn` is called on it.
+                        add_ons: Vec::new(),
+                        size_in_gb: disk.size_in_gb,
+                        state: crate::state::DISK_STATE_IN_USE,
+                        due: None,
+                        attached_to: Some(instance.name.clone()),
+                        path: Some(disk.original_disk_path),
+                    });
+                }
+                operations.push(
+                    store
+                        .start_operation(
+                            now,
+                            crate::state::OPERATION_TYPE_CREATE_INSTANCES_FROM_SNAPSHOT,
+                            crate::state::RESOURCE_TYPE_INSTANCE,
+                            &instance.name,
+                            &location,
+                            Some(due.at_ms),
+                        )
+                        .view(),
+                );
+            }
+            Ok(CreateInstancesFromSnapshotOutput {
+                operations: Some(operations),
+            })
+        })
+        .ok_or_else(unavailable)?
     }
+}
+
+/// One instance this request creates, with everything resolved that can be
+/// resolved before the store is read.
+struct PlannedInstance {
+    /// The name the request asked for, kept verbatim — the new record's store
+    /// key.
+    name: String,
+    /// The add-ons `addOns` enables on it.
+    add_ons: Vec<AddOn>,
+    /// The block storage disks `attachedDiskMapping` asks this call to restore
+    /// onto it, in the order the mapping listed them.
+    disks: Vec<PlannedDisk>,
+}
+
+/// One block storage disk the attached-disk mapping asks this call to restore.
+struct PlannedDisk {
+    /// `DiskMap$originalDiskPath` — "The original disk path exposed to the
+    /// instance" — which is both how the captured disk is addressed in the
+    /// snapshot and the path the restored disk is attached at.
+    original_disk_path: String,
+    /// `DiskMap$newDiskName` — "The new disk name".
+    new_disk_name: String,
+    /// The captured disk's size in GB, filled in once the snapshot has been
+    /// read: a restored disk is a copy of the volume the snapshot captured, so
+    /// its size is that volume's and never a figure from the request.
+    size_in_gb: i32,
+}
+
+/// What `input` asks this call to create, one entry per name in `instanceNames`
+/// and in that order, or the refusal its members earn.
+///
+/// `attachedDiskMapping` is a map keyed by the name of an instance this request
+/// creates, so a key naming anything else maps a disk onto nothing and is
+/// refused. Its entries are read in `instanceNames` order rather than the map's,
+/// so one request writes the same records whatever order a client serialized the
+/// mapping in.
+fn planned_instances(
+    input: &CreateInstancesFromSnapshotInput,
+) -> Result<Vec<PlannedInstance>, CreateInstancesFromSnapshotError> {
+    let mapping = input.attached_disk_mapping.clone().unwrap_or_default();
+    // The mapping is caller-sized, and nothing modelled bounds it, so it is
+    // CLAMPED before any entry is looked at — the same way `instanceNames`,
+    // `tags` and `addOns` are. A request cannot restore more disks than this
+    // emulator holds, so that is the bound, applied to the whole mapping rather
+    // than to one key's list: a request past it creates nothing however it
+    // spread its entries across keys.
+    let mapped_entries: usize = mapping.values().map(Vec::len).sum();
+    if mapped_entries > crate::state::MAX_DISKS {
+        return Err(invalid(format!(
+            "attachedDiskMapping carries {mapped_entries} entries, more than the {} disks \
+             this emulator holds",
+            crate::state::MAX_DISKS
+        )));
+    }
+    for key in mapping.keys() {
+        if !input.instance_names.contains(key) {
+            return Err(invalid(format!(
+                "attachedDiskMapping maps disks onto '{key}', which this request does not \
+                 create: every key must be one of the instanceNames"
+            )));
+        }
+    }
+    let add_on_requests = input.add_ons.clone().unwrap_or_default();
+    let mut taken_disk_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut planned = Vec::with_capacity(input.instance_names.len());
+    for name in &input.instance_names {
+        let add_ons =
+            crate::state::add_ons_from_requests(name, &add_on_requests).map_err(invalid)?;
+        let mut disks: Vec<PlannedDisk> = Vec::new();
+        // Keyed, not scanned, so planning one instance's mapping costs time
+        // linear in its (already bounded) entries.
+        let mut taken_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for entry in mapping.get(name).map(Vec::as_slice).unwrap_or_default() {
+            // Both members are modelled optional, and a mapping entry that
+            // names only one of them says either which disk to restore or what
+            // to call it, never both — there is nothing to create from it.
+            let (Some(original_disk_path), Some(new_disk_name)) =
+                (entry.original_disk_path.clone(), entry.new_disk_name.clone())
+            else {
+                return Err(invalid(format!(
+                    "attachedDiskMapping['{name}'] carries an entry without both \
+                     originalDiskPath and newDiskName: a disk mapping names the path a disk \
+                     was exposed at and the name to restore it under"
+                )));
+            };
+            // A device path addresses one device on the instance, so two
+            // restored disks cannot be exposed at the same one.
+            if !taken_paths.insert(original_disk_path.clone()) {
+                return Err(invalid(format!(
+                    "attachedDiskMapping['{name}'] names originalDiskPath \
+                     '{original_disk_path}' more than once: one device path exposes one disk"
+                )));
+            }
+            // A disk name addresses one disk, so one request cannot restore two
+            // disks under the same name.
+            if !taken_disk_names.insert(new_disk_name.clone()) {
+                return Err(invalid(format!(
+                    "attachedDiskMapping names newDiskName '{new_disk_name}' more than once: \
+                     a disk name addresses one disk"
+                )));
+            }
+            disks.push(PlannedDisk {
+                original_disk_path,
+                new_disk_name,
+                // Filled in from the snapshot once it has been read.
+                size_in_gb: 0,
+            });
+        }
+        planned.push(PlannedInstance {
+            name: name.clone(),
+            add_ons,
+            disks,
+        });
+    }
+    Ok(planned)
+}
+
+/// The snapshot the request asked to restore: exactly one of the two mutually
+/// exclusive sources the modelled input admits, resolved against the store once
+/// the request is known to name one.
+enum RequestedSource {
+    /// A manual snapshot, named by `instanceSnapshotName`.
+    Snapshot(String),
+    /// An AUTOMATIC snapshot of `instance_name`, addressed either by the
+    /// `restoreDate` the request carried or by the latest restorable one — which
+    /// `date` reports as the modelled `useLatestRestorableAutoSnapshot`
+    /// documentation words it.
+    AutoSnapshot { instance_name: String, date: String },
+}
+
+/// The source `input` names, or the refusal its combination of members earns.
+///
+/// The modelled documentation states each rule enforced here:
+/// `instanceSnapshotName` and `sourceInstanceName` "are mutually exclusive";
+/// `restoreDate` and `useLatestRestorableAutoSnapshot` "are mutually exclusive";
+/// and both of the latter are to be defined "only when creating a new instance
+/// from an automatic snapshot", which is what `sourceInstanceName` names the
+/// source of. A restore of nothing is not a restore, so naming neither source is
+/// refused too.
+fn requested_source(
+    input: &CreateInstancesFromSnapshotInput,
+) -> Result<RequestedSource, CreateInstancesFromSnapshotError> {
+    let wants_latest = input.use_latest_restorable_auto_snapshot == Some(true);
+    // WHICH source the request names is judged first, so a request carrying the
+    // automatic-snapshot members with a MANUAL snapshot is told that, rather
+    // than being refused for the form of a date it should not have sent at all.
+    match (&input.instance_snapshot_name, &input.source_instance_name) {
+        (Some(snapshot_name), None) => {
+            if input.restore_date.is_some() || wants_latest {
+                return Err(invalid(
+                    "restoreDate and useLatestRestorableAutoSnapshot are to be defined only \
+                     when creating a new instance from an automatic snapshot, which \
+                     sourceInstanceName names the source of, not together with \
+                     instanceSnapshotName"
+                        .to_string(),
+                ));
+            }
+            Ok(RequestedSource::Snapshot(snapshot_name.clone()))
+        }
+        (None, Some(instance_name)) => match (&input.restore_date, wants_latest) {
+            (Some(restore_date), false) => {
+                if !crate::state::is_auto_snapshot_date(restore_date) {
+                    return Err(invalid(format!(
+                        "restoreDate '{restore_date}' must be specified in YYYY-MM-DD format"
+                    )));
+                }
+                Ok(RequestedSource::AutoSnapshot {
+                    instance_name: instance_name.clone(),
+                    date: restore_date.clone(),
+                })
+            }
+            (None, true) => Ok(RequestedSource::AutoSnapshot {
+                instance_name: instance_name.clone(),
+                date: "the latest restorable automatic snapshot".to_string(),
+            }),
+            (Some(_), true) => Err(invalid(
+                "restoreDate and useLatestRestorableAutoSnapshot are mutually exclusive: \
+                 name the date of the automatic snapshot to restore, or ask for the latest \
+                 restorable one, but not both"
+                    .to_string(),
+            )),
+            (None, false) => Err(invalid(
+                "sourceInstanceName names the source instance of an automatic snapshot, so \
+                 one of restoreDate or useLatestRestorableAutoSnapshot must be defined with \
+                 it"
+                .to_string(),
+            )),
+        },
+        (Some(_), Some(_)) => Err(invalid(
+            "instanceSnapshotName and sourceInstanceName are mutually exclusive: name the \
+             instance snapshot to restore, or the source instance of the automatic snapshot \
+             to restore, but not both"
+                .to_string(),
+        )),
+        (None, None) => Err(invalid(
+            "one of instanceSnapshotName or sourceInstanceName must be defined: an instance \
+             is created from a manual snapshot of an instance, or from an automatic snapshot \
+             of one"
+                .to_string(),
+        )),
+    }
+}
+
+/// Lightsail's refusal of a well-formed request its resources' state does not
+/// allow: the modelled `OperationFailureException` — HTTP 400, "Lightsail throws
+/// this exception when an operation fails to execute" — whose message names the
+/// resource that is in the way and the state it is in.
+fn operation_failure(message: String) -> CreateInstancesFromSnapshotError {
+    CreateInstancesFromSnapshotErrorModeled::OperationFailureException(OperationFailureException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// This operation's 400 refusal for a request the model admits but the service
+/// does not: the modelled `InvalidInputException`, whose message names the member
+/// that is wrong and the constraint it broke.
+fn invalid(message: String) -> CreateInstancesFromSnapshotError {
+    CreateInstancesFromSnapshotErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// The source the request named is not a resource this account holds:
+/// Lightsail's `DoesNotExist` rejection — HTTP 400, wire error
+/// `NotFoundException`, body `code` `DoesNotExist` and a message naming the
+/// resource type and the requested name.
+fn not_found(resource_type: &str, name: &str) -> CreateInstancesFromSnapshotError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(resource_type, name)
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> CreateInstancesFromSnapshotError {
+    CreateInstancesFromSnapshotErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail instance store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

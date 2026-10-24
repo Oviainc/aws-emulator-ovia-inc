@@ -155,8 +155,8 @@
 use super::types::*;
 
 use crate::state::{
-    normalize_dns_name, RecordKey, StoredZone, HOSTED_ZONE_ALREADY_EXISTS_MESSAGE,
-    MAX_HOSTED_ZONES,
+    normalize_dns_name, resource_location, RecordKey, StoredZone,
+    HOSTED_ZONE_ALREADY_EXISTS_MESSAGE, MAX_HOSTED_ZONES,
 };
 use std::collections::BTreeMap;
 
@@ -177,10 +177,6 @@ const SOA_RECORD_TTL: i64 = 900;
 /// and the serial, refresh, retry, expire and minimum fields Route 53 writes into
 /// a new zone's SOA record (same Developer Guide page).
 const SOA_RDATA_TAIL: &str = "awsdns-hostmaster.amazon.com. 1 7200 900 1209600 86400";
-
-/// The host a `Location` URL falls back to when the request carried no `Host`
-/// header to build it from.
-const DEFAULT_ENDPOINT_HOST: &str = "route53.amazonaws.com";
 
 /// The default SOA record and NS record (carrying all four name servers) that
 /// Route 53 creates at a new hosted zone's apex.
@@ -217,19 +213,6 @@ fn default_apex_records(zone_name: &str, name_servers: &[String]) -> Vec<Resourc
         ..ResourceRecordSet::default()
     };
     vec![soa, ns]
-}
-
-/// The `Location` URL of a newly created hosted zone, built from the endpoint
-/// the caller actually addressed so the URL it gets back is one it can follow.
-fn location_of(ctx: &smithy_server_runtime::OperationContext<'_>, zone_id: &str) -> String {
-    let host = ctx
-        .parts()
-        .headers
-        .get(::http::header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| !value.is_empty())
-        .unwrap_or(DEFAULT_ENDPOINT_HOST);
-    format!("https://{host}/2013-04-01/hostedzone/{zone_id}")
 }
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -462,7 +445,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             change_info: change.to_change_info(),
             delegation_set: stored.to_delegation_set(),
             vpc: stored.vpcs.first().cloned(),
-            location: location_of(ctx, &id),
+            location: resource_location(ctx, &format!("hostedzone/{id}")),
         })
     }
 }
