@@ -436,31 +436,9 @@ async fn re_registering_the_same_provider_and_product_conflicts() {
     );
 }
 
-/// RULE: a member the service cannot invent and the response cannot omit is refused, not
-/// fabricated — `IdentityProviderSummary.Settings` is `@required`, so a registration
-/// without `Settings` cannot be answered.
-#[tokio::test]
-async fn a_registration_without_settings_is_refused() {
-    let h = harness();
-    for row in REGISTRATIONS {
-        let body = json!({
-            "IdentityProvider": provider_union(row.directory_id),
-            "Product": row.product,
-        });
-        let reply = register(&h, &body).await;
-        assert_eq!(
-            reply.status, 400,
-            "case {:?}: ValidationException is modelled at HTTP 400, got {reply:?}",
-            row.case
-        );
-        assert_eq!(
-            reply.error_type.as_deref(),
-            Some("ValidationException"),
-            "case {:?}: expected ValidationException, got {reply:?}",
-            row.case
-        );
-    }
-}
+// `Settings` is OPTIONAL on `RegisterIdentityProviderRequest`, so a registration that
+// omits it is accepted and persisted with no subnet and no security group; that rule is
+// asserted in `optional_settings_registration`.
 
 /// RULE: a provider that names no directory at all identifies nothing to register, so it
 /// is refused rather than stored under an empty key.

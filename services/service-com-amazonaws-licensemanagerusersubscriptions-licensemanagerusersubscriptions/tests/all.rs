@@ -23,6 +23,8 @@ mod license_server_endpoint_deletion;
 mod license_server_endpoints;
 #[path = "all/list_instances.rs"]
 mod list_instances;
+#[path = "all/optional_settings_registration.rs"]
+mod optional_settings_registration;
 #[path = "all/refusals.rs"]
 mod refusals;
 #[path = "all/resource_resolution_refusals.rs"]

@@ -15,11 +15,11 @@
 //! the same directory provide: `InstanceSummary.Products` is read from the directory's
 //! registrations, so adding one changes those views just as deregistering one does.
 //!
-//! `Settings` is optional in the model, but `IdentityProviderSummary.Settings` is
-//! `@required` and `Settings` itself requires at least one subnet and a security group —
-//! so a registration without them could only be answered by inventing values. A request
-//! that omits `Settings` is therefore refused with the modelled `ValidationException`
-//! rather than answered with a fabricated summary.
+//! `Settings` is NOT `@required` in the request, so a registration that omits it is
+//! accepted: what the caller supplied is persisted as supplied, and a registration that
+//! supplied none carries no subnet and no security group — the configuration a product
+//! whose licensing goes through a license server endpoint needs no VPC endpoints for.
+//! The summary reports exactly that empty configuration; nothing is invented for it.
 //!
 //! Two request values are refused here that no modelled constraint can express:
 //!
@@ -168,14 +168,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        // `Settings` is optional on the wire but required on every summary this service
-        // returns, and it cannot be invented: refuse instead of fabricating subnets.
-        let Some(settings) = input.settings.clone() else {
-            return Err(validation(
-                "Settings is required to register an identity provider: it carries the \
-                 subnets and security group the product's VPC endpoints are provisioned in",
-            ));
-        };
+        // `Settings` is optional on the wire, so an omitted one is a registration that
+        // provisions no activation-server VPC endpoints: it is stored as the empty
+        // configuration (no subnet, no security group) rather than refused, and nothing
+        // is invented to fill it in. Whatever the caller DID supply is stored verbatim.
+        let settings = input.settings.clone().unwrap_or_default();
         let key = crate::state::provider_key(&input.identity_provider).map_err(into_error)?;
 
         // `Product` is a plain `String` on the wire, so nothing before this point has

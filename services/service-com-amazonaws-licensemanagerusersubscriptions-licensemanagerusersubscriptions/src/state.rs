@@ -390,7 +390,13 @@ pub struct IdentityProviderRecord {
     pub identity_provider: IdentityProvider,
     /// The user-based subscription product this registration is for.
     pub product: String,
-    /// The product-related configuration settings (subnets + security group).
+    /// The product-related configuration settings (subnets + security group) exactly as
+    /// the registration supplied them.
+    ///
+    /// The input member is OPTIONAL, so a registration that provisions no activation-server
+    /// VPC endpoints supplies none; the record then carries no subnet and no security group
+    /// (an empty [`Settings`]) and every summary reports that empty configuration rather
+    /// than values nobody asked for.
     pub settings: Settings,
     /// `REGISTERING` until [`REGISTRATION_SPAN`] has elapsed, then `REGISTERED`;
     /// `DEREGISTERING` from the moment a deregistration was accepted until
