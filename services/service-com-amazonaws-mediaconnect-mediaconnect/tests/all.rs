@@ -33,6 +33,8 @@ mod flow_outputs;
 mod flow_projection;
 #[path = "all/flow_source_failover_bound.rs"]
 mod flow_source_failover_bound;
+#[path = "all/flow_source_metadata.rs"]
+mod flow_source_metadata;
 #[path = "all/flow_sources.rs"]
 mod flow_sources;
 #[path = "all/gateway_lifecycle.rs"]
