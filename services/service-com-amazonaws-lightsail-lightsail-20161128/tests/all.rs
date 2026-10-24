@@ -29,6 +29,8 @@ mod bundle_catalog;
 mod container_image_registry;
 #[path = "all/container_service_lifecycle.rs"]
 mod container_service_lifecycle;
+#[path = "all/container_service_metric_data.rs"]
+mod container_service_metric_data;
 #[path = "all/container_service_public_endpoint.rs"]
 mod container_service_public_endpoint;
 #[path = "all/disk_attachment.rs"]

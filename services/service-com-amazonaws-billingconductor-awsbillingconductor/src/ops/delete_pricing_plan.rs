@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeletePricingPlan
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeletePricingPlan`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeletePricingPlan::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes the pricing plan the request's `Arn` names, which is an identity: the
+//! modelled `PricingPlanArn` pattern spells a plan either as the full ARN or as the
+//! bare id, and both name the ONE record this service's store keys by the full ARN.
+//! A plan a billing group still computes with cannot go — "the pricing plan must not
+//! be associated with any billing groups to delete successfully" — which is the
+//! modelled 409 `ConflictException`
+//! (`PRICING_PLAN_ATTACHED_TO_BILLING_GROUP_DELETE_CONFLICT`); this operation models
+//! no `ResourceNotFoundException`, so an `Arn` no plan of this account answers to is
+//! the modelled 400 `ValidationException` (`MISSING_PRICINGPLAN`), and one of the
+//! plans Amazon Web Services owns — the `BasicPricingPlan` / `Passthrough` ids the
+//! pattern admits, whose ARN carries the literal `aws` account segment — is
+//! `MISMATCHED_PRICINGPLAN_ARN`, the same answer `UpdatePricingPlan` gives them,
+//! because they belong to no account. Every refusal writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +156,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeletePricingPlan` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeletePricingPlanErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeletePricingPlanErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the billingconductor store is unavailable".to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        // The `PricingPlanArn` pattern accepts the full ARN or the bare id, and both
+        // name the same stored plan.
+        let plan_arn = crate::state::normalize_pricing_plan_arn(&input.arn);
+
+        // The plans Amazon Web Services owns exist for every caller but belong to no
+        // account, so they are not a plan this account may delete — the same reason
+        // `UpdatePricingPlan` refuses a modification of one with. Answering "does not
+        // exist" would contradict the rest of the service, which reports them as
+        // existing.
+        if crate::state::is_aws_managed_pricing_plan(&plan_arn) {
+            return Err(validation(
+                "MISMATCHED_PRICINGPLAN_ARN",
+                "Arn",
+                format!(
+                    "the pricing plan {plan_arn} is managed by Amazon Web Services and cannot \
+                     be deleted"
+                ),
+            ));
+        }
+
+        // This operation models no `ResourceNotFoundException`, so an `Arn` that names
+        // no stored plan is refused with the modelled `ValidationException` and the
+        // reason the model enumerates for exactly that (`MISSING_PRICINGPLAN`) — the
+        // same reason `CreateBillingGroup` refuses a computation preference naming a
+        // plan that does not exist with.
+        if !state.pricing_plans.contains_key(&plan_arn) {
+            return Err(validation(
+                "MISSING_PRICINGPLAN",
+                "Arn",
+                format!("the pricing plan {plan_arn} does not exist"),
+            ));
+        }
+
+        // "The pricing plan must not be associated with any billing groups to delete
+        // successfully." A group computes its bill WITH the plan its
+        // `ComputationPreference` names, so deleting the plan under it is the
+        // "inconsistent state by ... deleting a resource" the modelled
+        // `ConflictException` describes, and `ConflictExceptionReason` enumerates the
+        // case by name. The caller points the group at another plan, or deletes the
+        // group, first.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeletePricingPlan"))
+        // A billing TRANSFER PREFERENCE also names a pricing plan
+        // (`AutoTransferBillingGroupCreationPreference.PricingPlanArn`, the
+        // `PRICING_PLAN_REFERENCED_BY_PREFERENCE_DELETE_CONFLICT` reason), but the only
+        // operation that records one (`UpdateBillingTransferPreference`) is still a
+        // scaffold, so no such reference can exist in this store yet: that conflict
+        // belongs with the operation that can create one.
+        let holders = state.billing_groups_referencing_pricing_plan(&plan_arn);
+        if let Some(group_arn) = holders.first() {
+            return Err(DeletePricingPlanErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "the pricing plan is associated with {} billing group(s), including \
+                     {group_arn}",
+                    holders.len()
+                ),
+                resource_id: plan_arn,
+                resource_type: "pricingplan".to_string(),
+                reason: Some("PRICING_PLAN_ATTACHED_TO_BILLING_GROUP_DELETE_CONFLICT".to_string()),
+            })
+            .into());
+        }
+
+        // One state method removes the plan and the index entries that only existed
+        // because of it: its name-index entry (so the name can be reused) and the
+        // idempotency entries that named it.
+        state.remove_pricing_plan(&plan_arn);
+
+        // The audit record for a state-changing call: who asked, what changed and that
+        // it succeeded. Never a `@sensitive` member (the plan's name and description) —
+        // only the access key id the caller presented and the ARN it addressed.
+        ::tracing::info!(
+            operation = Self::NAME,
+            akid = %::engine::extract_akid(&ctx.parts().headers),
+            pricing_plan_arn = %plan_arn,
+            outcome = "deleted",
+            "pricing plan deleted"
+        );
+
+        Ok(DeletePricingPlanOutput {
+            arn: Some(plan_arn),
+        })
     }
+}
+
+/// Refuse the request with this operation's modelled 400 `ValidationException`.
+fn validation(reason: &str, field: &str, message: String) -> DeletePricingPlanError {
+    DeletePricingPlanErrorModeled::ValidationException(crate::state::validation_exception(
+        reason, field, message,
+    ))
+    .into()
 }

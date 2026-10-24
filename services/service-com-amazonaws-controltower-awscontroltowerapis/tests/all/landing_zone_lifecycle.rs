@@ -24,7 +24,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 /// How long these tests wait for the clock to make an operation due: the service's own
 /// settle span plus slack, so retuning `OPERATION_SETTLE_AFTER` retunes the waits too.
-fn past_the_settle_span() -> std::time::Duration {
+pub(crate) fn past_the_settle_span() -> std::time::Duration {
     service_com_amazonaws_controltower_awscontroltowerapis::state::OPERATION_SETTLE_AFTER
         + std::time::Duration::from_millis(400)
 }
@@ -60,12 +60,12 @@ pub(crate) struct Answer {
 
 impl Answer {
     /// The body as a borrowed JSON object member, or `Value::Null` when absent.
-    fn get(&self, member: &str) -> &serde_json::Value {
+    pub(crate) fn get(&self, member: &str) -> &serde_json::Value {
         self.body.get(member).unwrap_or(&serde_json::Value::Null)
     }
 
     /// A member that must be a string, for assertion messages that show what came back.
-    fn string(&self, member: &str) -> String {
+    pub(crate) fn string(&self, member: &str) -> String {
         self.get(member)
             .as_str()
             .unwrap_or_default()
@@ -155,7 +155,7 @@ async fn create(
 
 /// The modeled `OperationIdentifier` pattern:
 /// `^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$`, length 36.
-fn is_operation_identifier(value: &str) -> bool {
+pub(crate) fn is_operation_identifier(value: &str) -> bool {
     let groups: Vec<&str> = value.split('-').collect();
     groups.len() == 5
         && [8usize, 4, 4, 4, 12]

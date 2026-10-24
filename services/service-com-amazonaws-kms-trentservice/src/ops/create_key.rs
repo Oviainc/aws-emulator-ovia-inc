@@ -28,9 +28,10 @@
 //!
 //! `BypassPolicyLockoutSafetyCheck` is accepted and has no effect: the lockout check
 //! asks whether the key policy lets the CALLING PRINCIPAL make a subsequent
-//! `PutKeyPolicy` request, which needs principal evaluation this emulator does not
-//! model (and `PutKeyPolicy` itself is not implemented). The policy is checked for
-//! syntactic validity instead, which is the part that can be decided here.
+//! `PutKeyPolicy` request, which needs the caller's IAM identity this emulator does
+//! not model. The document itself is judged by `crate::state::validate_key_policy`
+//! instead — the criteria the `Policy` member states, shared with `PutKeyPolicy` —
+//! which is the part that can be decided here.
 //!
 //! The store this writes into is bounded: past `crate::state::MAX_KEYS` the request
 //! is refused with the modelled `LimitExceededException` and nothing is persisted.
@@ -455,12 +456,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A supplied key policy must be "syntactically or semantically correct"
-        // (`MalformedPolicyDocumentException`): an IAM policy document is a JSON
-        // object carrying a non-empty `Statement` list.
+        // (`MalformedPolicyDocumentException`): `crate::state::validate_key_policy`
+        // holds the criteria the `Policy` member states, shared with every other
+        // operation that takes a key policy.
         let policy = match input.policy.as_deref() {
             None => crate::state::default_key_policy(),
             Some(policy) => {
-                if let Err(reason) = validate_policy(policy) {
+                // The stored document is bounded by KMS's key policy quota, which
+                // holds wherever a key policy is accepted.
+                if policy.len() > crate::state::MAX_KEY_POLICY_BYTES {
+                    return Err(quota_exceeded(format!(
+                        "A key policy document can be at most {} bytes, but the request \
+                         carried {}.",
+                        crate::state::MAX_KEY_POLICY_BYTES,
+                        policy.len()
+                    )));
+                }
+                if let Err(reason) = crate::state::validate_key_policy(policy) {
                     return Err(CreateKeyErrorModeled::MalformedPolicyDocumentException(
                         MalformedPolicyDocumentException {
                             message: Some(reason),
@@ -581,19 +593,4 @@ fn store_unavailable() -> CreateKeyError {
         message: Some("the KMS state store is unavailable".to_string()),
     })
     .into()
-}
-
-/// Whether `policy` is a syntactically valid key policy document, and why not when
-/// it is not.
-fn validate_policy(policy: &str) -> Result<(), String> {
-    let document: ::serde_json::Value = ::serde_json::from_str(policy)
-        .map_err(|error| format!("The key policy is not valid JSON: {error}."))?;
-    let Some(object) = document.as_object() else {
-        return Err("The key policy must be a JSON object.".to_string());
-    };
-    match object.get("Statement") {
-        Some(::serde_json::Value::Array(statements)) if !statements.is_empty() => Ok(()),
-        Some(_) => Err("The key policy's Statement must be a non-empty list.".to_string()),
-        None => Err("The key policy must contain a Statement list.".to_string()),
-    }
 }

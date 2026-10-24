@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op EnableBaseline
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `EnableBaseline`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`EnableBaseline::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies a baseline to a target: persists an `EnabledBaseline` in [`crate::state`] and
+//! starts the asynchronous `ENABLE_BASELINE` operation `GetBaselineOperation` reports.
+//! Implemented here because `GetBaselineOperation` has nothing to resolve until some call
+//! mints a baseline operation; the remaining baseline operations keep their own stub
+//! issues.
+//!
+//! AUTHORIZATION and THROTTLING are NOT emulated here, so the modelled
+//! `AccessDeniedException` (403) and `ThrottlingException` (429) are deliberately
+//! unreachable from this handler: the emulator verifies the request signature at its
+//! front door and models no per-principal policy or request budget.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +170,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `EnableBaseline` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(EnableBaselineErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("EnableBaseline"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(EnableBaselineErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the AWS Control Tower emulator is mounted on an engine that \
+                              holds no state"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        // One baseline per target: the pair is what identifies an enablement, so a second
+        // enable of the same pair would leave two `EnabledBaseline` resources describing
+        // one target. The rule is read off the store, so it holds whichever call enabled
+        // the existing one. (A baseline whose DISABLE has become due is already out of
+        // the map above, so that pair enables again.)
+        if let Some(existing) = store
+            .enabled_baseline_on_target(&input.baseline_identifier, &input.target_identifier)
+        {
+            return Err(EnableBaselineErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "baseline {} is already enabled on target {} as {existing}",
+                        input.baseline_identifier, input.target_identifier
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let arn = crate::state::enabled_baseline_arn(
+            &region,
+            &crate::state::new_enabled_baseline_id(),
+        );
+
+        // The single insertion site for an enablement, which is what bounds that store:
+        // past its cap nothing is written and the request is refused with the quota error
+        // the model declares for this operation.
+        let Some(operation_identifier) = store.record_enablement(
+            &arn,
+            // The baseline catalog is not in this slice (`ListBaselines`/`GetBaseline`
+            // own it), so the identifier and version are persisted as given and reported
+            // back unchanged rather than checked against a catalog this service cannot
+            // yet consult.
+            &input.baseline_identifier,
+            &input.baseline_version,
+            &input.target_identifier,
+            input
+                .parameters
+                .unwrap_or_default()
+                .into_iter()
+                .map(|parameter| (parameter.key, parameter.value))
+                .collect(),
+            now,
+        ) else {
+            return Err(EnableBaselineErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this account already holds the maximum of {} enabled baselines; \
+                         disable one before enabling another",
+                        crate::state::MAX_ENABLED_BASELINES
+                    ),
+                },
+            )
+            .into());
+        };
+
+        if let Some(tags) = input.tags {
+            store.tags.insert(arn.clone(), tags.into_iter().collect());
+        }
+
+        Ok(EnableBaselineOutput {
+            arn,
+            operation_identifier,
+        })
     }
 }
