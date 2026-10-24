@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/arn_inputs.rs"]
 mod arn_inputs;
+#[path = "all/enforced_guardrail_configuration.rs"]
+mod enforced_guardrail_configuration;
 #[path = "all/evaluation_jobs.rs"]
 mod evaluation_jobs;
 #[path = "all/foundation_models.rs"]

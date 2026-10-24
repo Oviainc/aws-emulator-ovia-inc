@@ -219,11 +219,12 @@ async fn every_error_envelope_names_the_request_it_answers() {
             code: "MissingRequiredParameter",
         },
         EnvelopeCase {
-            // `DescribeConfigurationOptions` still carries the scaffold header, so it
-            // answers the 501 — which is an error response and carries the element too.
-            // Its input models no required member, so the request reaches the handler.
+            // `DescribeEnvironmentManagedActions` still carries the scaffold header, so
+            // it answers the 501 — which is an error response and carries the element
+            // too. Its input models no required member, so the request reaches the
+            // handler.
             case: "the scaffold's 501",
-            action: "DescribeConfigurationOptions",
+            action: "DescribeEnvironmentManagedActions",
             params: Vec::new(),
             status: 501,
             code: "NotImplemented",

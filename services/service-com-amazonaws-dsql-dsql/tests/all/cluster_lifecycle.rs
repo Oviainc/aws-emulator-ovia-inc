@@ -23,7 +23,7 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_dsql_dsql::state::{
-    Cluster, ComAmazonawsDsqlDsqlState, PendingTransition, TokenScope, MAX_CLUSTERS,
+    Cluster, ComAmazonawsDsqlDsqlState, PendingTransition, RecordedCall, TokenScope, MAX_CLUSTERS,
     MAX_CREATE_TOKENS, MAX_RETIRED_CLUSTERS, STATUS_DELETED,
 };
 
@@ -947,7 +947,7 @@ fn the_bookkeeping_stores_stay_bounded() {
         state.tokens(TokenScope::CreateCluster).record(
             format!("token-{n}"),
             format!("fingerprint-{n}"),
-            &cluster_id_for(n),
+            RecordedCall::new(&cluster_id_for(n)),
         );
         assert!(
             state.tokens_of(TokenScope::CreateCluster).len() <= MAX_CREATE_TOKENS,

@@ -13,6 +13,11 @@
 //! share, so the configuration one request stores is the configuration the next
 //! request reads back.
 //!
+//! It also holds the account's enforced guardrail configuration — the single record
+//! `ops/put_enforced_guardrail_configuration.rs` installs and
+//! `ops/list_enforced_guardrails_configuration.rs` reports, so the configuration one
+//! request stores is the configuration the next request lists.
+//!
 //! And it holds the prompt routers `ops/create_prompt_router.rs` mints and
 //! `ops/get_prompt_router.rs` reads back, so a router created by one request is the
 //! router every later request sees.
@@ -61,7 +66,8 @@ use crate::ops::types::{
     GuardrailTopicPolicy, GuardrailTopicPolicyConfig, GuardrailTopicsTier,
     GuardrailTopicsTierConfig, GuardrailWord, GuardrailWordConfig, GuardrailWordPolicy,
     GuardrailWordPolicyConfig, LoggingConfig, MarketplaceModelEndpoint, ModelDataSource,
-    PromptRouterTargetModel, RoutingCriteria, Tag, VpcConfig,
+    ModelEnforcement, PromptRouterTargetModel, RoutingCriteria, SelectiveContentGuarding, Tag,
+    VpcConfig,
 };
 
 /// The working version every guardrail always has, as `GuardrailDraftVersion`
@@ -88,6 +94,14 @@ pub const STATUS_READY: &str = "READY";
 /// `CLASSIC` "provides established guardrails functionality" — so `CLASSIC` is the tier a
 /// guardrail is on until a request names the other one.
 pub const TIER_CLASSIC: &str = "CLASSIC";
+
+/// `ConfigurationOwner` — who owns an enforced guardrail configuration.
+///
+/// The enum carries exactly one value, `ACCOUNT`
+/// (`smithy_query(query="shape",shape="ConfigurationOwner")`), and the configuration the
+/// put installs is the ACCOUNT-level one, so this is the owner every stored configuration
+/// reports.
+pub const CONFIGURATION_OWNER_ACCOUNT: &str = "ACCOUNT";
 
 /// The most guardrails this account may hold at once, past which a create is
 /// refused with `ServiceQuotaExceededException`.
@@ -645,6 +659,47 @@ pub struct EvaluationJobRecord {
     pub last_modified_at: SystemTime,
 }
 
+/// The account's enforced guardrail configuration: the guardrail revision every
+/// invocation in this account is guarded by, as `PutEnforcedGuardrailConfiguration` last
+/// installed it.
+///
+/// ONE record per account rather than a map, because the listing that reports it is
+/// modelled `@length(min: 0, max: 1)`
+/// (`smithy_query(query="operation",operation="ListEnforcedGuardrailsConfiguration")`):
+/// an account holds at most one such configuration, so a further put REPLACES this record
+/// instead of adding another.
+///
+/// The guardrail is stored as the id and the ARN of the guardrail the request's
+/// `guardrailIdentifier` resolved to, rather than as the identifier's own spelling, so the
+/// listing reports the same resource whichever spelling installed it.
+#[derive(Debug, Clone)]
+pub struct EnforcedGuardrailConfiguration {
+    /// `configId` — the id this configuration is addressed by, minted by
+    /// [`ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState::mint_enforced_guardrail_config_id`]
+    /// when the first put installed it.
+    pub config_id: String,
+    /// `guardrailId` of the guardrail this configuration enforces.
+    pub guardrail_id: String,
+    /// `guardrailArn` of that same guardrail, as the stored guardrail carries it.
+    pub guardrail_arn: String,
+    /// `guardrailVersion` — the numbered version being enforced
+    /// (`GuardrailNumericalVersion`, so never the DRAFT).
+    pub guardrail_version: String,
+    /// `selectiveContentGuarding`, as the put carried it (absent when it carried none).
+    pub selective_content_guarding: Option<SelectiveContentGuarding>,
+    /// `modelEnforcement`, as the put carried it (absent when it carried none).
+    pub model_enforcement: Option<ModelEnforcement>,
+    /// When the configuration was first installed; kept across a later put, which
+    /// replaces the configuration rather than creating a new one.
+    pub created_at: SystemTime,
+    /// The principal that first installed it ([`caller_principal`]).
+    pub created_by: String,
+    /// When the last admitted put stored it.
+    pub updated_at: SystemTime,
+    /// The principal that made that put ([`caller_principal`]).
+    pub updated_by: String,
+}
+
 /// Per-service state for com-amazonaws-bedrock-amazonbedrockcontrolplaneservice. A handler reaches it through [`service_state`].
 ///
 /// Every map here is bounded, and each bound holds by construction rather than by
@@ -719,6 +774,17 @@ pub struct ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     /// again. It is keyed by nothing for the same reason the guardrail store is not
     /// keyed by region: this store models the one account the emulator serves.
     pub model_invocation_logging: Option<LoggingConfig>,
+    /// The account's enforced guardrail configuration, as
+    /// `PutEnforcedGuardrailConfiguration` last installed it, or `None` while the account
+    /// has none.
+    ///
+    /// ONE record for the reason [`EnforcedGuardrailConfiguration`] gives: the listing that
+    /// reports it admits at most one entry, so a put replaces this field whole and the
+    /// store cannot grow by putting again.
+    pub enforced_guardrail_configuration: Option<EnforcedGuardrailConfiguration>,
+    /// How many enforced guardrail configuration ids this store has minted; the uniqueness
+    /// half of a minted id.
+    pub minted_enforced_guardrail_configs: u64,
     /// Every stored prompt router, keyed by its `PromptRouterArn` — the one identifier
     /// `GetPromptRouter` and `DeletePromptRouter` address a router by.
     pub prompt_routers: HashMap<String, PromptRouter>,
@@ -813,6 +879,15 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     pub fn mint_guardrail_id(&mut self, now: SystemTime) -> String {
         self.minted_guardrails += 1;
         minted_id(self.minted_guardrails, now)
+    }
+
+    /// Mint a fresh `configId` for an enforced guardrail configuration:
+    /// `AccountEnforcedGuardrailConfigurationId` is `^[a-z0-9]+$`, which is what
+    /// [`minted_id`] spells, and the id is unique within this store for the two reasons a
+    /// guardrail id is.
+    pub fn mint_enforced_guardrail_config_id(&mut self, now: SystemTime) -> String {
+        self.minted_enforced_guardrail_configs += 1;
+        minted_id(self.minted_enforced_guardrail_configs, now)
     }
 
     /// The prompt router a `PromptRouterArn` names.
@@ -1304,6 +1379,29 @@ pub fn invalid_arn_format_message(value: &str) -> Option<String> {
     // `model-invocation-job`); the recorded sentence spells it as words.
     let words = resource_type.replace('-', " ");
     Some(format!("Invalid {words} ARN format"))
+}
+
+/// The principal that made this request, for the `createdBy` / `updatedBy` an enforced
+/// guardrail configuration reports.
+///
+/// Derived from the request's OWN SigV4 access key id, so the two members report who
+/// called rather than a fabricated identity; the emulator sees an access key id and no
+/// role session, so the id is rendered as the IAM principal that holds it. That id is
+/// caller-controlled text, so it is first reduced to the characters an access key id can
+/// hold, and an unsigned request falls back to the account root — the member is a plain
+/// `String` in the model, and this keeps it an ARN whatever the header said.
+#[must_use]
+pub fn caller_principal(parts: &http::request::Parts) -> String {
+    let user_name: String = ::engine::extract_akid(&parts.headers)
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .take(128)
+        .collect();
+    if user_name.is_empty() {
+        ::engine::emulator_arn("iam", "", "root")
+    } else {
+        ::engine::emulator_arn("iam", "", &format!("user/{user_name}"))
+    }
 }
 
 /// A `SystemTime` as the wire timestamp type the response shapes carry.

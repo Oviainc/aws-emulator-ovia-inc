@@ -127,6 +127,18 @@ pub(crate) fn published_stack(index: usize) -> &'static eb::state::SolutionStack
         .expect("the service publishes this many solution stacks")
 }
 
+/// The service's own published solution stack whose `platform_category` is
+/// `category` — the same catalogue [`published_stack`] indexes into, looked up
+/// by the key a suite that cares about the RUNTIME needs (the
+/// `configuration_options` suite, whose rows are platform categories), so
+/// neither suite keeps a catalogue lookup of its own.
+pub(crate) fn published_stack_of_category(category: &str) -> &'static eb::state::SolutionStack {
+    eb::state::SOLUTION_STACKS
+        .iter()
+        .find(|stack| stack.platform_category == category)
+        .unwrap_or_else(|| panic!("the service publishes a {category} platform version"))
+}
+
 /// One row of the create table: the request's configuration source and option
 /// settings, and the configuration the template must then hold.
 struct TemplateCase {
@@ -1037,7 +1049,15 @@ async fn the_option_setting_bound_is_enforced_on_the_request_and_on_the_merged_r
 
 /// Call `action` and require a 200, returning the answer: a precondition that
 /// did not hold fails the test where it was set up rather than later.
-async fn created(emulator: &Emulator, action: &str, params: &[(&str, &str)]) -> Answer {
+///
+/// `pub(crate)` beside [`published_stack`] and the option-setting helpers above:
+/// the `configuration_options` suite drives its own preconditions through this
+/// one rather than keeping a second copy of it.
+pub(crate) async fn created(
+    emulator: &Emulator,
+    action: &str,
+    params: &[(&str, &str)],
+) -> Answer {
     let answer = emulator.call(action, params).await;
     assert_eq!(
         answer.status, 200,
