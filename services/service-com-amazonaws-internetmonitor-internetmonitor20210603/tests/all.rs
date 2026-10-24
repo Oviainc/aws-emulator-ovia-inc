@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/health_events.rs"]
 mod health_events;
+#[path = "all/internet_events.rs"]
+mod internet_events;
 #[path = "all/monitor_lifecycle.rs"]
 mod monitor_lifecycle;
 #[path = "all/state_roundtrip.rs"]
