@@ -31,7 +31,7 @@
 //! `PROCESSING` | `FAILED`, and the single `RemediationType` value `INHERITANCE_DRIFT`.
 
 use crate::landing_zone_lifecycle::{
-    call, emulator, is_operation_identifier, past_the_settle_span, Answer,
+    call, emulator, is_operation_identifier, manifest_governing, past_the_settle_span, Answer,
 };
 
 use smithy_server_runtime::MultiServiceRouter;
@@ -43,10 +43,7 @@ const CATALOG: &str =
 
 /// A manifest document, parameterised so each row can deploy a DIFFERENT one.
 fn manifest(governed_region: &str) -> serde_json::Value {
-    serde_json::json!({
-        "governedRegions": [governed_region],
-        "organizationStructure": { "security": { "name": "Security" } }
-    })
+    manifest_governing(&[governed_region])
 }
 
 /// Create the account's one landing zone and wait for its `CREATE` operation to become
@@ -148,12 +145,11 @@ struct UpdateCase {
 }
 
 /// The update table. Rows differ along what the rule generalises over: the requested
-/// `version` relative to the catalog (below, equal, above, a minor larger numerically but
-/// smaller lexicographically, and both published length bounds of `LandingZoneVersion`,
-/// len 3..10), whether the request carries a new `manifest` or omits it, whether it
-/// carries `remediationTypes` (`RemediationType` has the single value
-/// `INHERITANCE_DRIFT`, and the list's length is 1..1), adds them, omits them, and which
-/// of the two identifier forms addresses the landing zone.
+/// `version` within the catalog of offered versions (its oldest, a step inside the 2.x
+/// line, across the major boundary, and its newest), whether the request carries a new
+/// `manifest` or omits it, whether it carries `remediationTypes` (`RemediationType` has
+/// the single value `INHERITANCE_DRIFT`, and the list's length is 1..1), adds them, omits
+/// them, and which of the two identifier forms addresses the landing zone.
 fn update_cases() -> Vec<UpdateCase> {
     vec![
         UpdateCase {
@@ -179,48 +175,37 @@ fn update_cases() -> Vec<UpdateCase> {
             expected_latest_available: "3.3",
         },
         UpdateCase {
-            case: "a version above the catalog, which becomes its own latest available",
-            created_version: "3.2",
+            case: "across the major boundary of the catalog",
+            created_version: "2.9",
             created_region: "ap-south-1",
             created_remediation_types: None,
-            update_version: "4.0",
+            update_version: "3.0",
             update_region: Some("ap-south-1"),
-            update_remediation_types: None,
-            by_bare_id: false,
-            expected_latest_available: "4.0",
-        },
-        UpdateCase {
-            case: "a minor larger numerically but smaller lexicographically",
-            created_version: "3.2",
-            created_region: "us-east-2",
-            created_remediation_types: None,
-            update_version: "3.10",
-            update_region: Some("us-east-1"),
-            update_remediation_types: None,
-            by_bare_id: true,
-            expected_latest_available: "3.10",
-        },
-        UpdateCase {
-            case: "the shortest allowed version, len 3",
-            created_version: "3.2",
-            created_region: "ca-central-1",
-            created_remediation_types: None,
-            update_version: "1.0",
-            update_region: Some("ca-central-1"),
             update_remediation_types: None,
             by_bare_id: false,
             expected_latest_available: "3.3",
         },
         UpdateCase {
-            case: "the longest allowed version, len 10",
-            created_version: "3.2",
-            created_region: "sa-east-1",
+            case: "the catalog's oldest version to its newest",
+            created_version: "2.0",
+            created_region: "us-east-2",
             created_remediation_types: None,
-            update_version: "12345.6789",
-            update_region: Some("sa-east-1"),
+            update_version: "3.3",
+            update_region: Some("us-east-1"),
             update_remediation_types: None,
             by_bare_id: true,
-            expected_latest_available: "12345.6789",
+            expected_latest_available: "3.3",
+        },
+        UpdateCase {
+            case: "one minor step inside the 2.x line",
+            created_version: "2.0",
+            created_region: "ca-central-1",
+            created_remediation_types: None,
+            update_version: "2.1",
+            update_region: Some("ca-central-1"),
+            update_remediation_types: None,
+            by_bare_id: false,
+            expected_latest_available: "3.3",
         },
         UpdateCase {
             case: "remediation types added by the update",

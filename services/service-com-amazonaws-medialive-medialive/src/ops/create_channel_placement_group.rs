@@ -266,10 +266,9 @@ fn refused(refusal: crate::state::ChannelPlacementGroupRefusal) -> CreateChannel
             )
         }
         crate::state::ChannelPlacementGroupRefusal::TooManyNodes { count } => {
-            let message = format!(
-                "Nodes accepts at most {} node id, but {count} were supplied",
-                crate::state::MAX_CHANNEL_PLACEMENT_GROUP_NODES
-            );
+            // The one wording for this refusal lives in the slice, so the
+            // update cannot word the same documented bound differently.
+            let message = crate::state::too_many_nodes_message(count);
             CreateChannelPlacementGroupErrorModeled::UnprocessableEntityException(
                 UnprocessableEntityException {
                     message: Some(message.clone()),

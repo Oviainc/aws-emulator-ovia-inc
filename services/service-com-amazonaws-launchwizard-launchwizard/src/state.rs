@@ -97,15 +97,28 @@ pub const COMPARATOR_EQUAL: &str = "Equal";
 /// See [`COMPARATOR_EQUAL`].
 pub const COMPARATOR_NOT_EQUAL: &str = "NotEqual";
 
-/// The version name every seeded catalogue entry reports for both
-/// `workloadVersionName` and `deploymentPatternVersionName`.
+/// The `workloadVersionName` every seeded catalogue entry reports.
 ///
 /// `WorkloadVersionName` / `DeploymentPatternVersionName` are len 5..30 with pattern
 /// `^(([A-Za-z0-9][a-zA-Z0-9-]*)|(\d+\.\d+\.\d+))$`; this is the dotted alternative at
 /// its shortest. The catalogue is service-owned (no API creates a workload or a
-/// pattern), so the emulator seeds ONE version per pattern; the
-/// deployment-pattern-version operations extend this when they are implemented.
+/// pattern), so the emulator seeds ONE version per workload; a pattern's own versions
+/// are [`CATALOGUE_PATTERN_VERSIONS`].
 pub const CATALOGUE_VERSION: &str = "1.0.0";
+
+/// The `DeploymentPatternVersionName`s the seeded catalogue publishes for EVERY
+/// deployment pattern, OLDEST FIRST — the last entry is the version the pattern
+/// currently deploys, which is the one `ListWorkloadDeploymentPatterns` and
+/// `GetWorkloadDeploymentPattern` report as its `deploymentPatternVersionName`.
+///
+/// The catalogue is service-owned (there is no API that creates a pattern or a version
+/// of one), so this list is the EMULATOR's own rather than a claim about which versions
+/// AWS publishes; each entry stays inside `DeploymentPatternVersionName` (see
+/// [`CATALOGUE_VERSION`]) using the dotted alternative. More than one version is seeded
+/// because a pattern's version operations (`GetDeploymentPatternVersion`,
+/// `ListDeploymentPatternVersions`) exist to tell the versions of ONE pattern apart,
+/// which a catalogue holding a single version per pattern cannot show.
+pub const CATALOGUE_PATTERN_VERSIONS: &[&str] = &["1.0.0", "1.1.0", "2.0.0"];
 
 /// The message an update of a deployment that is going away is refused with.
 ///
@@ -142,6 +155,16 @@ pub const WORKLOAD_NOT_FOUND_MESSAGE: &str =
 /// pattern name (caller input, and a probe of the catalogue) must not breach either.
 pub const DEPLOYMENT_PATTERN_NOT_FOUND_MESSAGE: &str =
     "The specified deployment pattern does not exist or insufficient permissions.";
+
+/// The message a deployment-pattern-VERSION lookup that finds nothing carries.
+///
+/// A version of a deployment pattern is its own resource (its own name, description and
+/// read operations), so a pattern that exists at a version the catalogue does not
+/// publish is refused with its own message rather than with the pattern's. Fixed and
+/// identifier-free for the reason [`DEPLOYMENT_PATTERN_NOT_FOUND_MESSAGE`] gives, and
+/// CHOSEN for the same reason: neither AWS's docs nor the recordings state the wording.
+pub const DEPLOYMENT_PATTERN_VERSION_NOT_FOUND_MESSAGE: &str =
+    "The specified deployment pattern version does not exist or insufficient permissions.";
 
 /// How many deployment records this emulator keeps at once.
 ///
@@ -261,6 +284,24 @@ impl SpecificationField {
     }
 }
 
+/// One VERSION of a deployment pattern, in the seeded, read-only catalogue.
+///
+/// This is the single record every deployment-pattern-version view reports from
+/// (`GetDeploymentPatternVersion` today), so a version's name and description cannot
+/// differ between two readers. The workload and pattern a version belongs to are NOT
+/// stored here: they are read off the [`DeploymentPattern`] that holds it (see
+/// [`DeploymentPattern::version_summary`]), so a version can never name a pattern it is
+/// not part of.
+#[derive(Debug, Clone)]
+pub struct PatternVersion {
+    /// `DeploymentPatternVersionName`: len 5..30,
+    /// `^(([A-Za-z0-9][a-zA-Z0-9-]*)|(\d+\.\d+\.\d+))$`. One of
+    /// [`CATALOGUE_PATTERN_VERSIONS`].
+    pub version_name: String,
+    /// `DeploymentPatternVersionDataSummary$description`.
+    pub description: String,
+}
+
 /// A deployment pattern of a workload, in the seeded, read-only catalogue.
 ///
 /// This is the single record `ListWorkloadDeploymentPatterns` (summaries) and
@@ -283,13 +324,59 @@ pub struct DeploymentPattern {
     pub status_message: Option<String>,
     /// `workloadVersionName`, see [`CATALOGUE_VERSION`].
     pub workload_version_name: String,
-    /// `deploymentPatternVersionName`, see [`CATALOGUE_VERSION`].
-    pub pattern_version_name: String,
+    /// Every version of this pattern the catalogue publishes, OLDEST FIRST — see
+    /// [`CATALOGUE_PATTERN_VERSIONS`]. The pattern's current version is derived from
+    /// this list ([`DeploymentPattern::current_version`]) rather than stored beside it,
+    /// so the version a pattern reports is always one the catalogue holds.
+    pub versions: Vec<PatternVersion>,
     /// The specification schema a `CreateDeployment` for this pattern fills in.
     pub specifications: Vec<SpecificationField>,
 }
 
 impl DeploymentPattern {
+    /// The version this pattern currently deploys: the NEWEST version the catalogue
+    /// publishes for it, which is the one both pattern views report as
+    /// `deploymentPatternVersionName`. `None` only for a pattern with no versions at
+    /// all, which the seeded catalogue never builds.
+    pub fn current_version(&self) -> Option<&PatternVersion> {
+        self.versions.last()
+    }
+
+    /// The version of this pattern named `version_name`, or `None` when the catalogue
+    /// publishes no such version of it.
+    ///
+    /// The lookup is over the published list, so "a version this pattern has" means the
+    /// same thing to every caller — the reads that report a version and the update that
+    /// moves a deployment onto one.
+    pub fn version(&self, version_name: &str) -> Option<&PatternVersion> {
+        self.versions
+            .iter()
+            .find(|version| version.version_name == version_name)
+    }
+
+    /// One of this pattern's versions as the `DeploymentPatternVersionDataSummary`
+    /// `GetDeploymentPatternVersion` returns, or `None` when the catalogue publishes no
+    /// version of this pattern under that name.
+    ///
+    /// `workloadName` and `deploymentPatternName` are read off THIS record rather than
+    /// off the request, so the reported version is always stated as a version of the
+    /// pattern it was found in. `documentationUrl` is absent for the reason
+    /// [`Workload::to_data`] gives: this emulator hosts no document for a catalogue
+    /// entry, so there is no URL to report.
+    pub fn version_summary(
+        &self,
+        version_name: &str,
+    ) -> Option<DeploymentPatternVersionDataSummary> {
+        let version = self.version(version_name)?;
+        Some(DeploymentPatternVersionDataSummary {
+            deployment_pattern_version_name: Some(version.version_name.clone()),
+            description: Some(version.description.clone()),
+            documentation_url: None,
+            workload_name: Some(self.workload_name.clone()),
+            deployment_pattern_name: Some(self.pattern_name.clone()),
+        })
+    }
+
     /// This pattern as the `WorkloadDeploymentPatternDataSummary`
     /// `ListWorkloadDeploymentPatterns` returns.
     ///
@@ -300,7 +387,9 @@ impl DeploymentPattern {
             workload_name: Some(self.workload_name.clone()),
             deployment_pattern_name: Some(self.pattern_name.clone()),
             workload_version_name: Some(self.workload_version_name.clone()),
-            deployment_pattern_version_name: Some(self.pattern_version_name.clone()),
+            deployment_pattern_version_name: self
+                .current_version()
+                .map(|version| version.version_name.clone()),
             display_name: Some(self.display_name.clone()),
             description: Some(self.description.clone()),
             status: Some(self.status.clone()),
@@ -317,7 +406,9 @@ impl DeploymentPattern {
             workload_name: Some(self.workload_name.clone()),
             deployment_pattern_name: Some(self.pattern_name.clone()),
             workload_version_name: Some(self.workload_version_name.clone()),
-            deployment_pattern_version_name: Some(self.pattern_version_name.clone()),
+            deployment_pattern_version_name: self
+                .current_version()
+                .map(|version| version.version_name.clone()),
             display_name: Some(self.display_name.clone()),
             description: Some(self.description.clone()),
             status: Some(self.status.clone()),
@@ -910,7 +1001,7 @@ fn seeded_workloads() -> BTreeMap<String, Workload> {
                             status: PATTERN_ACTIVE.to_string(),
                             status_message: None,
                             workload_version_name: CATALOGUE_VERSION.to_string(),
-                            pattern_version_name: CATALOGUE_VERSION.to_string(),
+                            versions: seeded_pattern_versions(pattern_description),
                             specifications: specifications.clone(),
                         },
                     )
@@ -926,6 +1017,24 @@ fn seeded_workloads() -> BTreeMap<String, Workload> {
                     patterns,
                 },
             )
+        })
+        .collect()
+}
+
+/// The versions the catalogue publishes for one seeded deployment pattern, oldest
+/// first: one per entry of [`CATALOGUE_PATTERN_VERSIONS`].
+///
+/// A version's description is DERIVED from the pattern's own description and the
+/// version's name, so it says what that version of that pattern deploys without
+/// inventing per-version release notes this emulator does not have.
+fn seeded_pattern_versions(pattern_description: &str) -> Vec<PatternVersion> {
+    CATALOGUE_PATTERN_VERSIONS
+        .iter()
+        .map(|version_name| PatternVersion {
+            version_name: (*version_name).to_string(),
+            description: format!(
+                "Version {version_name} of this deployment pattern. {pattern_description}"
+            ),
         })
         .collect()
 }

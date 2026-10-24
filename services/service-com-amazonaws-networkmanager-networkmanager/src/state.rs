@@ -31,8 +31,8 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     AWSLocation, AccountStatus, Attachment, Bandwidth, ConnectAttachment, ConnectAttachmentOptions,
     Connection, ConnectionHealth, CoreNetwork, CoreNetworkEdge, CoreNetworkNetworkFunctionGroup,
-    CoreNetworkPolicyError, CoreNetworkPolicyException, CoreNetworkSegment, Device, GlobalNetwork,
-    Link, LinkAssociation, Location, NetworkTelemetry, OrganizationStatus,
+    CoreNetworkPolicy, CoreNetworkPolicyError, CoreNetworkPolicyException, CoreNetworkSegment,
+    Device, GlobalNetwork, Link, LinkAssociation, Location, NetworkTelemetry, OrganizationStatus,
     ResourceNotFoundException, Site, SiteToSiteVpnAttachment, Tag, ValidationException,
     ValidationExceptionField, VpcAttachment, VpcOptions,
 };
@@ -98,6 +98,14 @@ pub const LINK_ASSOCIATION_KIND: &str = "link-association";
 /// (`smithy_query shape=CoreNetworkId`), which the 17 hex digits of
 /// [`ComAmazonawsNetworkmanagerNetworkmanagerState::next_id`] satisfy.
 pub const CORE_NETWORK_KIND: &str = "core-network";
+/// The resource kind a refusal names when the resource addressed is ONE policy of a core
+/// network rather than the core network itself. A policy version is not a resource this
+/// service mints an id or an ARN for — the model identifies it by its owning
+/// `CoreNetworkId` plus an `Integer` `PolicyVersionId` (`smithy_query
+/// operation=GetCoreNetworkPolicy,DeleteCoreNetworkPolicyVersion`) — so the pair travels
+/// in the refusal's `ResourceId` ([`policy_version_resource_id`]) and this kind in its
+/// `ResourceType`.
+pub const CORE_NETWORK_POLICY_KIND: &str = "core-network-policy";
 /// See [`GLOBAL_NETWORK_KIND`]. The model constrains an attachment's id too:
 /// `AttachmentId` carries `pattern ^attachment-([0-9a-f]{8,17})$` (`smithy_query
 /// shape=AttachmentId`), which the 17 hex digits of
@@ -481,6 +489,72 @@ pub const MAX_ATTACHMENTS_PER_CORE_NETWORK: usize = 100;
 /// Nothing sleeps for it: the due instant is stored and compared against the clock.
 pub const SETTLE_DELAY: Duration = Duration::from_millis(500);
 
+/// The `PolicyVersionId` the first version of a core network's policy takes — the one a
+/// create's document becomes ([`CoreNetworkRecord::add_policy_version`] mints from
+/// [`CoreNetworkRecord::policy_version_counter`], which starts at zero).
+pub const FIRST_POLICY_VERSION: i32 = 1;
+
+/// How many policy versions one core network may hold.
+///
+/// A CHOSEN bound: a policy version is immutable ("Creates a new, immutable version of a
+/// core network policy", `smithy_query query="doc" shape="PutCoreNetworkPolicy"`), so a
+/// put never replaces one and the history would otherwise grow without end, and neither
+/// the model nor the published quotas state a number. `PutCoreNetworkPolicy` models no
+/// quota error at all (`smithy_query operation=PutCoreNetworkPolicy`), so a put past this
+/// cap is refused with its modelled `ValidationException` (HTTP 400,
+/// [`VALIDATION_REASON_OTHER`]) and stores nothing; deleting a version frees room for
+/// another put, though never its version id ([`CoreNetworkRecord::policy_version_counter`]).
+pub const MAX_POLICY_VERSIONS_PER_CORE_NETWORK: usize = 100;
+
+/// The members of `CoreNetworkPolicyAlias` (`smithy_query shape=CoreNetworkPolicyAlias`:
+/// LIVE, LATEST — mirrored in `ops::types::CORE_NETWORK_POLICY_ALIAS_VALUES`): "Whether a
+/// core network policy is the current LIVE policy or the most recently submitted policy".
+pub const POLICY_ALIAS_LIVE: &str = "LIVE";
+/// See [`POLICY_ALIAS_LIVE`].
+pub const POLICY_ALIAS_LATEST: &str = "LATEST";
+
+/// The members of `ChangeSetState` a stored policy version reports (`smithy_query
+/// shape=ChangeSetState`: PENDING_GENERATION, FAILED_GENERATION, READY_TO_EXECUTE,
+/// EXECUTING, EXECUTION_SUCCEEDED, OUT_OF_DATE — mirrored in
+/// `ops::types::CHANGE_SET_STATE_VALUES`).
+///
+/// A version whose change set has not been executed waits in
+/// [`CHANGE_SET_PENDING_GENERATION`] until the span the clock owes elapses and then reads
+/// [`CHANGE_SET_READY_TO_EXECUTE`]; one whose document is being put in force reads
+/// [`CHANGE_SET_EXECUTING`] and then [`CHANGE_SET_EXECUTION_SUCCEEDED`]
+/// ([`CoreNetworkPolicyRecord::change_set_state_at`]). `FAILED_GENERATION` is unreachable
+/// here because a document that does not pass [`validate_policy_document`] is refused
+/// synchronously with `CoreNetworkPolicyException` and never stored, and `OUT_OF_DATE`
+/// belongs to `ExecuteCoreNetworkChangeSet` — the operation that moves the LIVE policy,
+/// and still a scaffold stub.
+pub const CHANGE_SET_PENDING_GENERATION: &str = "PENDING_GENERATION";
+/// See [`CHANGE_SET_PENDING_GENERATION`].
+pub const CHANGE_SET_READY_TO_EXECUTE: &str = "READY_TO_EXECUTE";
+/// See [`CHANGE_SET_PENDING_GENERATION`].
+pub const CHANGE_SET_EXECUTING: &str = "EXECUTING";
+/// See [`CHANGE_SET_PENDING_GENERATION`].
+pub const CHANGE_SET_EXECUTION_SUCCEEDED: &str = "EXECUTION_SUCCEEDED";
+
+/// How this service names ONE policy version of a core network in the required
+/// `ResourceId` of a modelled refusal: `<CoreNetworkId>/<PolicyVersionId>`.
+///
+/// A version id is an `Integer` that is unique only inside its core network, so neither
+/// half identifies the addressed policy on its own.
+pub fn policy_version_resource_id(core_network_id: &str, version_id: i32) -> String {
+    format!("{core_network_id}/{version_id}")
+}
+
+/// How this service names the policy a request addressed by ALIAS rather than by version
+/// id: `<CoreNetworkId>/<Alias>`.
+///
+/// A request that selects a policy by alias names no version id, and a core network may
+/// hold no version for that alias to resolve to, so this keeps a refusal's `ResourceId`
+/// reading `<CoreNetworkId>/<selector>` whichever selector the request used, beside the
+/// same `ResourceType` ([`CORE_NETWORK_POLICY_KIND`]).
+pub fn policy_alias_resource_id(core_network_id: &str, alias: &str) -> String {
+    format!("{core_network_id}/{alias}")
+}
+
 /// A stored global network. `state` is not a field: it is a function of the clock
 /// (see [`GlobalNetworkRecord::state_at`]), so reading one never writes.
 #[derive(Debug, Clone)]
@@ -691,6 +765,70 @@ impl DeviceRecord {
     }
 }
 
+/// A stored core network policy VERSION: one immutable document a core network holds.
+///
+/// "Creates a new, immutable version of a core network policy" (`smithy_query
+/// query="doc" shape="PutCoreNetworkPolicy"`), so a stored version is never edited: a
+/// later put mints the next version beside it. The document lives HERE and nowhere else
+/// — a core network's LIVE document is the one of the version
+/// [`CoreNetworkRecord::live_policy_version`] names — so no two records of this service
+/// hold a copy of the same policy.
+#[derive(Debug, Clone)]
+pub struct CoreNetworkPolicyRecord {
+    /// The core network this version belongs to, carried so a read of the version reports
+    /// it without the reader having to pass it back in.
+    pub core_network_id: String,
+    pub version_id: i32,
+    pub description: Option<String>,
+    pub created_at: SystemTime,
+    /// The instant the change-set transition the clock owes this version becomes due:
+    /// `PENDING_GENERATION` -> `READY_TO_EXECUTE` while it waits to be executed, or
+    /// `EXECUTING` -> `EXECUTION_SUCCEEDED` while its document is being put in force.
+    pub settled_at: SystemTime,
+    /// The policy document, verbatim as the request supplied it.
+    pub document: String,
+    /// The `ClientToken` of the `PutCoreNetworkPolicy` that minted this version, kept so a
+    /// retry of that request answers this version instead of minting a second one.
+    pub client_token: Option<String>,
+    /// Whether this version's change set has been executed, which is what puts its
+    /// document in force. The version a create carries is executed by the create itself
+    /// ("A subsequent change set is created showing the differences between the LIVE
+    /// policy and the submitted policy", `smithy_query query="doc"
+    /// shape="PutCoreNetworkPolicy"` — a put only PREPARES one).
+    pub executed: bool,
+}
+
+impl CoreNetworkPolicyRecord {
+    /// This version's `ChangeSetState` as of `now` — a function of the clock, so reading a
+    /// version never writes. See [`CHANGE_SET_PENDING_GENERATION`].
+    pub fn change_set_state_at(&self, now: SystemTime) -> &'static str {
+        match (self.executed, now >= self.settled_at) {
+            (false, false) => CHANGE_SET_PENDING_GENERATION,
+            (false, true) => CHANGE_SET_READY_TO_EXECUTE,
+            (true, false) => CHANGE_SET_EXECUTING,
+            (true, true) => CHANGE_SET_EXECUTION_SUCCEEDED,
+        }
+    }
+
+    /// The modelled `CoreNetworkPolicy` for this version, as of `now`, carrying the
+    /// `alias` its core network gives it ([`CoreNetworkRecord::policy_alias_of`]).
+    pub fn to_shape(&self, alias: Option<&str>, now: SystemTime) -> CoreNetworkPolicy {
+        CoreNetworkPolicy {
+            core_network_id: Some(self.core_network_id.clone()),
+            policy_version_id: Some(self.version_id),
+            alias: alias.map(str::to_string),
+            description: self.description.clone(),
+            created_at: Some(epoch_seconds(self.created_at)),
+            change_set_state: Some(self.change_set_state_at(now).to_string()),
+            // `PolicyErrors` "describes any errors in a core network policy": a stored
+            // version passed [`validate_policy_document`], so it carries none and the
+            // member is absent rather than an empty list.
+            policy_errors: None,
+            policy_document: Some(self.document.clone()),
+        }
+    }
+}
+
 /// A stored link association: the tie between one device and one link of the same global
 /// network and the same site.
 ///
@@ -821,7 +959,7 @@ impl ConnectionRecord {
 /// A stored core network: the Cloud WAN managed network a global network owns.
 ///
 /// Its `state` is a function of the clock, like the records above, and its topology
-/// (`Segments`, `NetworkFunctionGroups`, `Edges`) is derived from the policy document
+/// (`Segments`, `NetworkFunctionGroups`, `Edges`) is derived from the LIVE policy document
 /// once, where that document is accepted — nothing about a core network is kept twice and
 /// no read re-parses the document.
 #[derive(Debug, Clone)]
@@ -833,11 +971,21 @@ pub struct CoreNetworkRecord {
     pub created_at: SystemTime,
     /// The instant the `CREATING` -> `AVAILABLE` transition the clock owes becomes due.
     pub available_at: SystemTime,
-    /// The LIVE core network policy document, verbatim as the request supplied it, or
-    /// `None` when the core network was created without one.
-    pub policy_document: Option<String>,
-    /// The topology [`policy_topology`] derived from [`Self::policy_document`] when it was
-    /// accepted: what the core network reports once its policy is in force.
+    /// Every policy version this core network holds, by `PolicyVersionId`. The documents
+    /// live in these records alone, so a read of a version reports what was put, and the
+    /// LIVE document is the document of the version [`Self::live_policy_version`] names.
+    pub policy_versions: BTreeMap<i32, CoreNetworkPolicyRecord>,
+    /// The version whose document is in force (the one aliased `LIVE`), or `None` for a
+    /// core network created without a policy document.
+    pub live_policy_version: Option<i32>,
+    /// The highest `PolicyVersionId` ever minted here. A version is immutable, so its id
+    /// is never reused: the next put takes this plus one even when the version that held
+    /// it has since been deleted.
+    pub policy_version_counter: i32,
+    /// The topology [`policy_topology`] derived from the LIVE policy document when
+    /// that document was put in force: what the core network reports once its policy is in
+    /// force. A version that has not been executed is not in force, so putting one leaves
+    /// this untouched.
     pub topology: PolicyTopology,
     /// The `ClientToken` of the request that minted this record, kept so a retry of that
     /// request answers this record instead of minting a second one.
@@ -846,6 +994,94 @@ pub struct CoreNetworkRecord {
 }
 
 impl CoreNetworkRecord {
+    /// The document the CREATE of this core network carried: its first policy version,
+    /// `None` for a core network created without a document.
+    ///
+    /// The version is identified by being both the FIRST and an EXECUTED one — a create
+    /// executes the change set of the document it carries, a put never does — so a put
+    /// that mints version 1 on a core network created without a document does not make
+    /// this answer the put's document. This, and not the LIVE document, is what a retried
+    /// create compares itself against: the LIVE document moves to whichever version is
+    /// executed next, while the document a create carried is the one it is idempotent in.
+    pub fn created_policy_document(&self) -> Option<&str> {
+        self.policy_versions
+            .get(&FIRST_POLICY_VERSION)
+            .filter(|version| version.executed)
+            .map(|version| version.document.as_str())
+    }
+
+    /// The highest `PolicyVersionId` this core network still holds, or `None` while it
+    /// holds no version at all.
+    pub fn latest_policy_version(&self) -> Option<i32> {
+        self.policy_versions.keys().next_back().copied()
+    }
+
+    /// The alias of the version `version_id`: `LIVE` for the version in force, `LATEST`
+    /// for the newest version held when that is not the one in force, and none for every
+    /// other version — the model allows a policy a single alias
+    /// ([`POLICY_ALIAS_LIVE`]), and the policy in force is the one a caller means by it.
+    pub fn policy_alias_of(&self, version_id: i32) -> Option<&'static str> {
+        if self.live_policy_version == Some(version_id) {
+            Some(POLICY_ALIAS_LIVE)
+        } else if self.latest_policy_version() == Some(version_id) {
+            Some(POLICY_ALIAS_LATEST)
+        } else {
+            None
+        }
+    }
+
+    /// The modelled `CoreNetworkPolicy` for the version `version_id` as of `now`, or
+    /// `None` when this core network holds no such version.
+    pub fn policy_shape(&self, version_id: i32, now: SystemTime) -> Option<CoreNetworkPolicy> {
+        let alias = self.policy_alias_of(version_id);
+        self.policy_versions
+            .get(&version_id)
+            .map(|version| version.to_shape(alias, now))
+    }
+
+    /// Store `document` as this core network's next policy version and answer that
+    /// version's modelled `CoreNetworkPolicy`.
+    ///
+    /// `executed` says whether this version's change set is being executed, which is what
+    /// puts its document in force: an executed version becomes the LIVE one. A freshly
+    /// minted version always carries the highest id in the history, so its alias follows
+    /// from `executed` alone — `LIVE` for the version just put in force, `LATEST`
+    /// otherwise — and the answer is built from the record itself rather than looked up
+    /// again. The DERIVED topology stays the caller's to set, because deriving it means
+    /// parsing the document and handlers do that before they lock the store.
+    pub fn add_policy_version(
+        &mut self,
+        document: String,
+        description: Option<String>,
+        client_token: Option<String>,
+        now: SystemTime,
+        executed: bool,
+    ) -> CoreNetworkPolicy {
+        let version_id = self.policy_version_counter.saturating_add(1);
+        self.policy_version_counter = version_id;
+        let record = CoreNetworkPolicyRecord {
+            core_network_id: self.id.clone(),
+            version_id,
+            description,
+            created_at: now,
+            settled_at: now + SETTLE_DELAY,
+            document,
+            client_token,
+            executed,
+        };
+        let alias = if executed {
+            POLICY_ALIAS_LIVE
+        } else {
+            POLICY_ALIAS_LATEST
+        };
+        let shape = record.to_shape(Some(alias), now);
+        self.policy_versions.insert(version_id, record);
+        if executed {
+            self.live_policy_version = Some(version_id);
+        }
+        shape
+    }
+
     /// This core network's lifecycle state as of `now`.
     pub fn state_at(&self, now: SystemTime) -> &'static str {
         if now >= self.available_at {

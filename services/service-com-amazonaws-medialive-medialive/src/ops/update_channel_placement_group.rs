@@ -1,15 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateChannelPlacementGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateChannelPlacementGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateChannelPlacementGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Change the settings of one MediaLive Anywhere `ChannelPlacementGroup` in
+//! this service's store and report the group back out of that store.
+//!
+//! The channel-placement-group slice owns the documented rules (`Name` "unique
+//! in the Cluster", the single node `Nodes` accepts, and the
+//! `ASSIGNING` -> `ASSIGNED` / `UNASSIGNING` -> `UNASSIGNED` transition the
+//! clock owes a group whose node set changed): see
+//! [`crate::state::ComAmazonawsMedialiveMedialiveState::apply_channel_placement_group_changes`].
+//! This handler turns a
+//! [`crate::state::ChannelPlacementGroupUpdateRefusal`] into this operation's
+//! own modelled error and reports the group by reading the stored record back,
+//! through the slice's own projection, so it cannot drift from the create and
+//! the describe.
+//!
+//! A member the request omits is NOT changed — "Include this parameter only if
+//! you want to change the current ..." on both of them — so this is a PARTIAL
+//! update, not a replace.
+//!
+//! `Name`'s documentation on THIS operation carries both "Include this parameter
+//! only if you want to change the current name of the ChannelPlacementGroup" and
+//! the create member's "You can't change the name" sentence. The first is the
+//! one this operation can act on — the second would leave a modelled, settable
+//! member with no effect at all — so a `Name` the request carries replaces the
+//! stored one, under the same in-cluster uniqueness the create enforces.
 //!
 //! ## Shape of an operation
 //!
@@ -106,7 +122,15 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-medialive-medialive.jso
 // here — hence the `UpdateChannelPlacementGroupError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.medialive#UpdateChannelPlacementGroup")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.medialive#UpdateChannelPlacementGroup",
+    // `NotFoundException` is a shape the SERVICE models, and one
+    // `DescribeChannelPlacementGroup` and `DeleteChannelPlacementGroup` declare
+    // for this very resource, which this operation's error list omits: the real
+    // service answers a pair that names no group with it, so this operation
+    // needs it to say the same.
+    extra_errors = ["NotFoundException"]
+)]
 #[derive(Debug)]
 pub enum UpdateChannelPlacementGroupErrorModeled {
     BadGatewayException(BadGatewayException),
@@ -115,6 +139,7 @@ pub enum UpdateChannelPlacementGroupErrorModeled {
     ForbiddenException(ForbiddenException),
     GatewayTimeoutException(GatewayTimeoutException),
     InternalServerErrorException(InternalServerErrorException),
+    NotFoundException(NotFoundException),
     TooManyRequestsException(TooManyRequestsException),
     UnprocessableEntityException(UnprocessableEntityException),
 }
@@ -170,18 +195,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateChannelPlacementGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateChannelPlacementGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateChannelPlacementGroup"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = state.lock();
+        // Clock-owed work first, as every operation of this service does: it
+        // materialises only what the clock had already made due, so it never
+        // changes what a later caller would otherwise have seen.
+        state.settle(now);
+
+        let changes = crate::state::ChannelPlacementGroupChanges {
+            name: input.name,
+            // Stored verbatim by the slice, exactly as `CreateChannelPlacementGroup`
+            // stores the node ids ITS request carries: the two operations write
+            // the same member of the same record, so neither resolves it while
+            // the other does not. Resolving a node id against the node slice
+            // that has since landed — for the documented "The Node and the
+            // ChannelPlacementGroup must be in the same Cluster" — is one change
+            // to the create and the update together, not to this handler alone.
+            nodes: input.nodes,
+        };
+        // The slice checks every refusal BEFORE the first write, so a refused
+        // update leaves the stored group exactly as it was.
+        state
+            .apply_channel_placement_group_changes(
+                &input.cluster_id,
+                &input.channel_placement_group_id,
+                changes,
+                now,
+            )
+            .map_err(|refusal| refused(refusal, &input.channel_placement_group_id))?;
+
+        // Read back out of the store, so the response reports what was written
+        // rather than what the request asked for: `State` and `Channels` are the
+        // store's, and so is every member the request did not carry.
+        let group = state
+            .channel_placement_group_description(
+                &input.cluster_id,
+                &input.channel_placement_group_id,
+            )
+            .ok_or_else(unavailable)?;
+        Ok(crate::state::channel_placement_group_output!(
+            UpdateChannelPlacementGroupOutput,
+            group
+        ))
     }
+}
+
+/// The modelled error a
+/// [`crate::state::ChannelPlacementGroupUpdateRefusal`] is answered with.
+///
+/// A pair that names no group of that cluster — or one whose delete has already
+/// been accepted, which names no resource a caller may still change — leaves
+/// nothing to update: `NotFoundException` (404), which
+/// `DescribeChannelPlacementGroup` and `DeleteChannelPlacementGroup` declare for
+/// this same resource. A `Name` another group of the cluster holds is a clash
+/// with the stored state, which is what this operation's `ConflictException`
+/// (409) is for — the create, which models none, answers the same clash with its
+/// own 422. A `Nodes` list past the documented single node is a request that
+/// cannot be processed: `UnprocessableEntityException` (422) naming the member it
+/// was found at, exactly as the create reports it.
+fn refused(
+    refusal: crate::state::ChannelPlacementGroupUpdateRefusal,
+    group_id: &str,
+) -> UpdateChannelPlacementGroupError {
+    use crate::state::ChannelPlacementGroupUpdateRefusal as Refusal;
+    match refusal {
+        Refusal::NoSuchGroup => {
+            UpdateChannelPlacementGroupErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::not_found_message(
+                    "ChannelPlacementGroup",
+                    group_id,
+                )),
+            })
+        }
+        Refusal::AlreadyDeleted => {
+            UpdateChannelPlacementGroupErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::already_deleted_message(&format!(
+                    "ChannelPlacementGroup {group_id}"
+                ))),
+            })
+        }
+        Refusal::NameTaken => {
+            UpdateChannelPlacementGroupErrorModeled::ConflictException(ConflictException {
+                message: Some(crate::state::NAME_ALREADY_IN_USE_MESSAGE.to_string()),
+            })
+        }
+        Refusal::TooManyNodes { count } => {
+            // The one wording for this refusal lives in the slice, so the create
+            // and the update cannot word the same documented bound differently.
+            let message = crate::state::too_many_nodes_message(count);
+            UpdateChannelPlacementGroupErrorModeled::UnprocessableEntityException(
+                UnprocessableEntityException {
+                    message: Some(message.clone()),
+                    validation_errors: Some(vec![ValidationError {
+                        element_path: Some("nodes".to_string()),
+                        error_message: Some(message),
+                    }]),
+                },
+            )
+        }
+    }
+    .into()
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no store to update the group in. A modelled server error, never a
+/// fresh engine (which would drop the write when this request returns).
+fn unavailable() -> UpdateChannelPlacementGroupError {
+    UpdateChannelPlacementGroupErrorModeled::InternalServerErrorException(
+        InternalServerErrorException {
+            message: Some(crate::state::NO_STORE.to_string()),
+        },
+    )
+    .into()
 }

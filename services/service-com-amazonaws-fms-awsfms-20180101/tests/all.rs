@@ -63,3 +63,5 @@ mod tagging_across_resource_kinds;
 mod tagging_administrator_gate;
 #[path = "all/tagging_and_managing_admins.rs"]
 mod tagging_and_managing_admins;
+#[path = "all/tagging_refusals_across_resource_kinds.rs"]
+mod tagging_refusals_across_resource_kinds;

@@ -31,7 +31,9 @@
 
 use crate::baseline_operations::{disable, enable, enablements, get_operation, member};
 use crate::front_door_validation::arn_of_length;
-use crate::landing_zone_lifecycle::{call, emulator, is_operation_identifier, past_the_settle_span};
+use crate::landing_zone_lifecycle::{
+    call, emulator, is_operation_identifier, past_the_settle_span, simple_manifest,
+};
 
 /// RULE: every enablement tears down through its own `DISABLE_BASELINE` operation —
 /// refused while the enablement is still being applied, idempotent while the teardown is
@@ -257,7 +259,7 @@ async fn only_the_enablements_own_arn_names_it() {
         "/create-landingzone",
         serde_json::json!({
             "version": "3.3",
-            "manifest": { "governedRegions": ["us-west-2"] }
+            "manifest": simple_manifest()
         }),
     )
     .await;

@@ -5,11 +5,17 @@
 //! Every test drives the service the way a client does — through
 //! `MultiServiceRouter::dispatch` with real HTTP requests — so what is asserted
 //! is the emulator's wire behaviour, not an internal function's return value.
+//!
 //! The clusters the rows place groups in are created through `CreateCluster`, so
 //! every `ClusterId` in this suite is an id the store really minted.
 //!
 //! The suites are tables: one cluster, one name and one node id is ONE row of
 //! each.
+//!
+//! The group helpers here are `pub(crate)` because the UPDATE suite
+//! ([`crate::channel_placement_group_update`]) drives the same resource through
+//! the same two URIs: one harness for the resource, so the create, the read and
+//! the update suites cannot disagree about how a group is reached.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_medialive_medialive::state::MAX_CHANNEL_PLACEMENT_GROUPS;
@@ -33,13 +39,17 @@ fn groups_uri(cluster: &str) -> String {
 
 /// The instance URI `DescribeChannelPlacementGroup` is bound to
 /// (`GET /prod/clusters/{ClusterId}/channelplacementgroups/{ChannelPlacementGroupId}`).
-fn group_uri(cluster: &str, id: &str) -> String {
+pub(crate) fn group_uri(cluster: &str, id: &str) -> String {
     format!("{}/{id}", groups_uri(cluster))
 }
 
 /// One cluster to place groups in, created through `CreateCluster`; answers the
 /// id it minted.
-async fn create_cluster(router: &MultiServiceRouter, case: &str, name: &str) -> String {
+pub(crate) async fn create_cluster(
+    router: &MultiServiceRouter,
+    case: &str,
+    name: &str,
+) -> String {
     let (status, created) = call(
         router,
         "POST",
@@ -64,7 +74,7 @@ async fn create_group(
 
 /// A created channel placement group, with the create itself asserted to have
 /// succeeded. `201 Created` is the status the model declares for this create.
-async fn created(
+pub(crate) async fn created(
     router: &MultiServiceRouter,
     case: &str,
     cluster: &str,
@@ -88,7 +98,7 @@ async fn describe_group(
 
 /// The group a describe reports, with the read itself asserted to have
 /// succeeded.
-async fn described(
+pub(crate) async fn described(
     router: &MultiServiceRouter,
     case: &str,
     cluster: &str,
@@ -104,7 +114,7 @@ async fn described(
 
 /// One group description with its `State` dropped, so two reads can be compared
 /// on every member the clock does not move.
-fn without_state(group: &Value) -> Value {
+pub(crate) fn without_state(group: &Value) -> Value {
     let mut copy = group.clone();
     if let Some(object) = copy.as_object_mut() {
         object.remove("state");
@@ -113,7 +123,7 @@ fn without_state(group: &Value) -> Value {
 }
 
 /// The `id` of a reported group.
-fn id_of(group: &Value) -> String {
+pub(crate) fn id_of(group: &Value) -> String {
     group["id"].as_str().unwrap_or_default().to_string()
 }
 

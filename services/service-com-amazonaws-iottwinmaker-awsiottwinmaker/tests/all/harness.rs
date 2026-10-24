@@ -339,6 +339,18 @@ impl Emulator {
             .await
     }
 
+    /// `ListSyncJobs`: POST /workspaces/{workspaceId}/sync-jobs-list, with the
+    /// workspace as the only `@httpLabel` and the page members (`maxResults`,
+    /// `nextToken`) carried in the body.
+    pub(crate) async fn list_sync_jobs(&self, workspace_id: &str, body: Value) -> Resp {
+        self.call(
+            "POST",
+            &format!("/workspaces/{workspace_id}/sync-jobs-list"),
+            Some(body),
+        )
+        .await
+    }
+
     /// `TagResource`: POST /tags with the ARN and the tag map in the body.
     pub(crate) async fn tag_resource(&self, resource_arn: &str, tags: Value) -> Resp {
         self.call(

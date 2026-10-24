@@ -73,6 +73,28 @@ async fn put_policy(
         .to_string()
 }
 
+/// The largest tag set one Firewall Manager resource can hold: the modelled
+/// length maximum of `com.amazonaws.fms#TagList` (len 0..200), so a resource
+/// holding more could not be reported by `ListTagsForResource`.
+///
+/// `pub(crate)` so the sibling suite that asserts this bound over EVERY taggable
+/// resource kind names the same number, and a change to the modelled bound is
+/// made in one place. Deliberately an INDEPENDENT expectation, derived from the
+/// model rather than imported from the handler's own
+/// `ops::tag_resource::MAX_TAGS_PER_RESOURCE`: if the two ever disagree, the
+/// tests say so instead of agreeing with a wrong constant.
+pub(crate) const MAX_TAGS_PER_RESOURCE: usize = 200;
+
+/// A `TagList` naming `count` distinct keys — how both bound assertions build a
+/// list at, or past, [`MAX_TAGS_PER_RESOURCE`].
+pub(crate) fn tag_list_of_size(count: usize) -> Value {
+    Value::Array(
+        (0..count)
+            .map(|index| json!({ "Key": format!("key{index}"), "Value": "v" }))
+            .collect(),
+    )
+}
+
 /// A `TagList` wire value built from key/value pairs.
 pub(crate) fn tag_list(pairs: &[(&str, &str)]) -> Value {
     Value::Array(
@@ -502,74 +524,11 @@ async fn a_tag_list_repeating_a_key_is_refused() {
     }
 }
 
-/// The tag set a resource can hold is bounded by the modelled `TagList` length
-/// (0..200): the bound itself is accepted, and a write that would cross it is
-/// refused with a 400 client error rather than stored.
-#[tokio::test]
-async fn the_tag_set_is_bounded_by_the_modelled_tag_list_length() {
-    // `com.amazonaws.fms#TagList` is len 0..200.
-    const MAX_TAGS: usize = 200;
-
-    let router = emulator();
-    associate_admin(&router).await;
-    let arn = put_policy(&router, "bounded.policy", &tag_list(&[])).await;
-
-    let keys: Vec<String> = (0..MAX_TAGS).map(|index| format!("key{index}")).collect();
-    let at_bound: Vec<(&str, &str)> = keys.iter().map(|key| (key.as_str(), "v")).collect();
-    let (status, body) = call(
-        &router,
-        "TagResource",
-        &json!({ "ResourceArn": arn, "TagList": tag_list(&at_bound) }),
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "case at-bound: expected a {MAX_TAGS}-tag write to answer 200, got {status} with {body:?}"
-    );
-    let (_, _, tags) = list_tags(&router, &arn).await;
-    assert_eq!(
-        tags.len(),
-        MAX_TAGS,
-        "case at-bound: expected the resource to hold {MAX_TAGS} tags, got {}",
-        tags.len()
-    );
-
-    // One key past the bound, both ways round: added to a full resource, and
-    // sent as one over-long list.
-    let one_more = tag_list(&[("key-past-the-bound", "v")]);
-    let mut over_bound: Vec<(&str, &str)> = at_bound.clone();
-    over_bound.push(("key-past-the-bound", "v"));
-    let rows: [(&str, Value); 2] = [
-        ("one tag past a full resource", one_more),
-        ("a list one longer than the bound", tag_list(&over_bound)),
-    ];
-    for (case, over) in rows {
-        let (status, body) = call(
-            &router,
-            "TagResource",
-            &json!({ "ResourceArn": arn, "TagList": over }),
-        )
-        .await;
-        let code = error_code(&body);
-        assert_eq!(
-            status, 400,
-            "case {case:?}: expected a write past the {MAX_TAGS}-tag bound to be refused with \
-             400, got {status} / {code:?} with {body:?}"
-        );
-        assert!(
-            code == "LimitExceededException" || code == "ValidationException",
-            "case {case:?}: expected the refusal to carry a modelled client error code, got \
-             {code:?} with {body:?}"
-        );
-        let (_, _, tags) = list_tags(&router, &arn).await;
-        assert_eq!(
-            tags.len(),
-            MAX_TAGS,
-            "case {case:?}: a refused write must not grow the tag set past {MAX_TAGS}, got {}",
-            tags.len()
-        );
-    }
-}
+// The `TagList` length bound (0..200) is asserted over EVERY taggable resource
+// kind — of which a policy is one — by
+// `crate::tagging_refusals_across_resource_kinds`, from the
+// [`MAX_TAGS_PER_RESOURCE`] and [`tag_list_of_size`] declared above, rather than
+// a second policy-only copy here.
 
 /// `ListAdminsManagingAccount` is `ResourceNotFoundException` while no
 /// administrator manages the caller, and reports the associated administrator
