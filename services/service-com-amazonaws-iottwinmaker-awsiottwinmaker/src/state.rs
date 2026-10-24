@@ -1159,8 +1159,9 @@ pub fn property_definition_response(
 /// A component's properties and property groups are stored as the modelled
 /// request shapes the caller supplied, so `GetEntity` reports back exactly the
 /// definition and value that were persisted rather than a lossy projection of
-/// them. Inheritance from a component *type* is not represented: component types
-/// are a later slice, so every definition stored here is the entity-local one.
+/// them. Inheritance from a component *type* is not resolved: every definition
+/// stored here is the entity-local one, which is why every `isInherited` this
+/// service reports is `false`.
 #[derive(Debug, Clone, Default)]
 pub struct ComponentRecord {
     pub component_name: String,
@@ -1170,6 +1171,146 @@ pub struct ComponentRecord {
     pub properties: BTreeMap<String, PropertyRecord>,
     /// The component's property groups, keyed by group name.
     pub property_groups: BTreeMap<String, PropertyGroupRecord>,
+    /// The composite components created INSIDE this component, keyed by the
+    /// part of their `ComponentPath` below this component (`inner`, or
+    /// `inner/deeper` for one nested a level further down) — the path with its
+    /// first segment, which is this component's own name, removed. Keyed that
+    /// way because the path below the component is what identifies a composite
+    /// component within it, whatever depth it sits at. See
+    /// [`resolve_composite_component_path`].
+    pub composite_components: BTreeMap<String, CompositeComponentRecord>,
+}
+
+/// One composite component of an entity's component: an instance of the
+/// component type that the holding component's own component type declares
+/// under this name in its `compositeComponentTypes`.
+///
+/// Its properties and property groups are stored as the modelled request shapes
+/// the caller supplied, the same choice [`ComponentRecord`] makes.
+#[derive(Debug, Clone, Default)]
+pub struct CompositeComponentRecord {
+    /// The whole `ComponentPath` the create addressed this composite component
+    /// by, starting at the entity's top-level component. Reported as
+    /// `ComponentSummary::componentPath`.
+    pub component_path: String,
+    /// This composite component's own name: the LAST segment of its path, which
+    /// is what `GetEntity` keys `ComponentResponse::compositeComponents` by
+    /// (`CompositeComponentResponse`'s key is a `Name`, whose pattern admits no
+    /// `/`).
+    pub component_name: String,
+    /// The component type this composite component is an instance of — the one
+    /// the declaration its path resolved to names.
+    pub component_type_id: String,
+    pub description: Option<String>,
+    /// The composite component's properties, keyed by property name.
+    pub properties: BTreeMap<String, PropertyRecord>,
+    /// The composite component's property groups, keyed by group name.
+    pub property_groups: BTreeMap<String, PropertyGroupRecord>,
+}
+
+/// The separator between the segments of a `ComponentPath`.
+///
+/// A composite component is addressed by the path of names that leads to it:
+/// the entity's top-level component, then one name per
+/// `compositeComponentTypes` declaration walked through. `ComponentPath`'s
+/// pattern (`^[a-zA-Z_\-0-9/]+$`) is a `Name`'s (`^[a-zA-Z_\-0-9]+$`) plus
+/// `/`, so `/` is what joins those names.
+pub const COMPONENT_PATH_SEPARATOR: &str = "/";
+
+/// A `ComponentPath` resolved against an entity's components and its
+/// workspace's component types. See [`resolve_composite_component_path`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedComponentPath {
+    /// The entity's top-level component the path starts at: its first segment.
+    pub component_name: String,
+    /// The path BELOW that component — the remaining segments, still joined by
+    /// [`COMPONENT_PATH_SEPARATOR`]. This is the key the composite component is
+    /// held under in [`ComponentRecord::composite_components`].
+    pub composite_path: String,
+    /// The composite component's own name: the path's last segment.
+    pub composite_name: String,
+    /// The component type the declaration the path ends at names: the type the
+    /// composite component is an instance of.
+    pub component_type_id: String,
+}
+
+/// Resolve a `ComponentPath` that addresses a COMPOSITE component of an entity.
+///
+/// A composite component path is valid when its first segment names one of the
+/// entity's components and each following segment names an entry in the
+/// `compositeComponentTypes` of the component type reached by the segment
+/// before it — which is why resolution needs both the entity's components and
+/// the workspace's component types. A path that resolves yields the component it
+/// hangs under and the component type it instantiates; one that does not yields
+/// the reason, built from the request so the refusal names the member and the
+/// segment that failed to resolve.
+///
+/// Shared by every writer of an entity's composite components, so a create and
+/// an update hold one path to one rule.
+///
+/// Two limits are deliberate, both inherited from how this service stores
+/// component types. A path of a single segment names a top-level component and
+/// no composite component, so it does not resolve; and resolution walks only
+/// the component type's OWN `compositeComponentTypes`, because this service
+/// resolves no inheritance (every `isInherited` it reports is `false`) and holds
+/// no registry of the built-in component types a real workspace carries — so a
+/// path through a component type this workspace does not hold cannot be
+/// resolved, and is refused rather than guessed at.
+pub fn resolve_composite_component_path(
+    components: &BTreeMap<String, ComponentRecord>,
+    component_types: &BTreeMap<String, ComponentType>,
+    component_path: &str,
+) -> Result<ResolvedComponentPath, String> {
+    let segments: Vec<&str> = component_path.split(COMPONENT_PATH_SEPARATOR).collect();
+    if segments.len() < 2 || segments.iter().any(|segment| segment.is_empty()) {
+        return Err(format!(
+            "compositeComponents.{component_path} is not the path of a composite component: a \
+             component path names one of the entity's components and at least one \
+             compositeComponentType declared inside it, separated by \
+             '{COMPONENT_PATH_SEPARATOR}'"
+        ));
+    }
+    let component_name = segments[0];
+    let Some(component) = components.get(component_name) else {
+        return Err(format!(
+            "compositeComponents.{component_path} names component {component_name}, which the \
+             entity does not have"
+        ));
+    };
+    let Some(mut component_type_id) = component.component_type_id.clone() else {
+        return Err(format!(
+            "compositeComponents.{component_path} names component {component_name}, which \
+             instantiates no componentType and so declares no composite component"
+        ));
+    };
+    for segment in &segments[1..] {
+        let Some(parent) = component_types.get(&component_type_id) else {
+            return Err(format!(
+                "compositeComponents.{component_path}: componentType {component_type_id} does \
+                 not exist in this workspace, so {segment} cannot be resolved against it"
+            ));
+        };
+        let Some(declaration) = parent.composite_component_types.get(*segment) else {
+            return Err(format!(
+                "compositeComponents.{component_path}: componentType {component_type_id} \
+                 declares no compositeComponentTypes.{segment}"
+            ));
+        };
+        let Some(declared) = declaration.component_type_id.clone() else {
+            return Err(format!(
+                "compositeComponents.{component_path}: componentType {component_type_id} \
+                 declares compositeComponentTypes.{segment} with no componentTypeId, so it names \
+                 no component type to instantiate"
+            ));
+        };
+        component_type_id = declared;
+    }
+    Ok(ResolvedComponentPath {
+        component_name: component_name.to_string(),
+        composite_path: segments[1..].join(COMPONENT_PATH_SEPARATOR),
+        composite_name: segments[segments.len() - 1].to_string(),
+        component_type_id,
+    })
 }
 
 impl ComponentRecord {

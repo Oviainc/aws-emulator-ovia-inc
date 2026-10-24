@@ -23,6 +23,9 @@ mod component_type_listing;
 #[path = "all/component_type_update.rs"]
 mod component_type_update;
 
+#[path = "all/entity_composite_components.rs"]
+mod entity_composite_components;
+
 #[path = "all/execute_query.rs"]
 mod execute_query;
 
