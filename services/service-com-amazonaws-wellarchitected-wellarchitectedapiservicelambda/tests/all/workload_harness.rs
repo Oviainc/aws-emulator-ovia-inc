@@ -272,6 +272,21 @@ impl Client {
         .await
     }
 
+    /// `UpdateWorkloadShare`: `PATCH /workloads/{WorkloadId}/shares/{ShareId}`.
+    pub(crate) async fn update_share(
+        &self,
+        workload_id: &str,
+        share_id: &str,
+        body: Value,
+    ) -> Answer {
+        self.send(
+            "PATCH",
+            &format!("/workloads/{workload_id}/shares/{share_id}"),
+            Some(body),
+        )
+        .await
+    }
+
     /// `ListWorkloadShares`: `GET /workloads/{WorkloadId}/shares`, with every filter and
     /// paging member bound to the query string. `query` is passed as sent, empty for a
     /// request that names none.
