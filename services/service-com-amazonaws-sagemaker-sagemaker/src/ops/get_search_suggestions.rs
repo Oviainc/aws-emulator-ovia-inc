@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSearchSuggestions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSearchSuggestions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: answers the property names of the requested resource that the caller's
+//! `PropertyNameHint` begins — the members the model binds that resource type to in
+//! `SearchRecord`, plus the dotted path of every key the resources stored in
+//! `crate::state` carry in a keyed member of that entity (`Tags.<key>`,
+//! `Parameters.<key>`, `InputArtifacts.<key>`, `OutputArtifacts.<key>`,
+//! `CustomerMetadataProperties.<key>`). This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSearchSuggestions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! KNOWN GAP, same class as `HyperParameters.<name>` below: a trial component's
+//! `Metrics.<name>` are NOT suggested. The metric series a trial component carries are
+//! written by the SageMaker METRICS service's `BatchPutMetrics` and live in THAT service's
+//! state; this service stores none, and a suggestion is only ever made for a name some
+//! stored resource actually carries — never for work nothing reported. Whichever change
+//! brings those series within reach of this service's state (a store here, or a shared
+//! crate under `services/` both services depend on) adds the `Metrics` arm to
+//! [`stored_property_names`] beside the others.
+//!
+//! Reporting only: this operation WRITES NOTHING — it reads the model's schemas and the
+//! service's stores, so nothing it answers changes what a later caller sees.
+//!
+//! One request's work is BOUNDED: every candidate name goes through [`Suggestions::offer`],
+//! which drops the names the hint does not begin and keeps at most
+//! [`MAX_PROPERTY_NAME_SUGGESTIONS`] of them, so no store is ever materialised into the
+//! answer and what the handler holds never exceeds what it returns.
 //!
 //! ## Shape of an operation
 //!
@@ -68,6 +82,8 @@
 //! * `PropertyNameSuggestions` (PropertyNameSuggestionList) — A list of property names for a
 //!   Resource that match a SuggestionQuery.
 
+use ::std::collections::BTreeSet;
+
 #[allow(unused_imports)]
 use super::types::*;
 
@@ -99,6 +115,308 @@ pub type GetSearchSuggestionsError = crate::scaffolded::Scaffolded<GetSearchSugg
 impl From<GetSearchSuggestionsErrorModeled> for GetSearchSuggestionsError {
     fn from(modeled: GetSearchSuggestionsErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
+    }
+}
+
+/// The `ResourceType` value whose searchable entity is `TrialComponent`: the resource
+/// whose stored record carries the most caller-named members (`Parameters`,
+/// `InputArtifacts`, `OutputArtifacts` beside its `Tags`).
+const TRIAL_COMPONENT_RESOURCE: &str = "ExperimentTrialComponent";
+
+/// The most property names ONE answer carries, and with it the most this handler ever
+/// holds: every name is offered through [`Suggestions::offer`], which keeps nothing past
+/// this count, so one request's work is bounded whatever the account has stored.
+///
+/// Neither AWS nor the model publishes a number — `PropertyNameSuggestionList` declares no
+/// length — so the bound is CHOSEN BY THIS EMULATOR rather than modelled. It sits far above
+/// what a real answer holds: the largest `SearchRecord` entity declares a few dozen
+/// members, and one resource carries at most the modelled `TagList` length of 50 keys. Past
+/// the cap the answer is the FIRST names in the one stable order this operation guarantees,
+/// so two identical reads still agree.
+pub const MAX_PROPERTY_NAME_SUGGESTIONS: usize = 1_000;
+
+/// The suggestions collected so far: deduplicated, in one stable order, filtered to the
+/// names the caller's hint begins, and capped at [`MAX_PROPERTY_NAME_SUGGESTIONS`].
+///
+/// Every name this operation can answer goes through [`Suggestions::offer`], so the
+/// filter and the cap are applied where a name is PRODUCED rather than after a whole
+/// store has been copied: what the handler holds never exceeds what it answers.
+struct Suggestions<'hint> {
+    /// `PropertyNameHint`, or the empty string when the request carried no
+    /// `SuggestionQuery` (which "limits the property names" and so limits nothing).
+    hint: &'hint str,
+    names: BTreeSet<String>,
+}
+
+impl<'hint> Suggestions<'hint> {
+    fn new(hint: &'hint str) -> Self {
+        Self {
+            hint,
+            names: BTreeSet::new(),
+        }
+    }
+
+    /// Offer `name` as a suggestion: kept only when the hint begins it, and only while the
+    /// answer is below its cap — past that the largest name drops, so the set holds the
+    /// first [`MAX_PROPERTY_NAME_SUGGESTIONS`] names of the order it answers in.
+    fn offer(&mut self, name: String) {
+        if !hint_begins(&name, self.hint) {
+            return;
+        }
+        self.names.insert(name);
+        if self.names.len() > MAX_PROPERTY_NAME_SUGGESTIONS {
+            self.names.pop_last();
+        }
+    }
+
+    /// The collected names, in the stable order they are answered in.
+    fn into_names(self) -> impl Iterator<Item = String> {
+        self.names.into_iter()
+    }
+}
+
+/// The searchable entity the model binds the `ResourceType` value `resource` to, or
+/// `None` when it binds none.
+///
+/// `Filter`'s `Name` documents a resource's valid property names as the members of its
+/// `SearchRecord` entry ("For valid property names, see SearchRecord"), so the entity
+/// `SearchRecord` binds a resource type to is what names that resource's properties — and
+/// a suggestion is a "possible match for the property name to use in Search queries"
+/// (this operation's own doc), i.e. one of exactly those names.
+///
+/// A `ResourceType` value names its `SearchRecord` member directly, except the two
+/// `Experiment`-prefixed ones (`ExperimentTrial` / `ExperimentTrialComponent`), whose
+/// members are `Trial` / `TrialComponent`. `Image` and `ImageVersion` are `ResourceType`
+/// values `SearchRecord` declares NO member for, so the model names no searchable
+/// property for them.
+///
+/// The names themselves come from the generated schemas rather than a hand-written
+/// catalogue, so this surface follows the model the service is built from.
+fn search_entity(resource: &str) -> Option<&'static ::aws_smithy_schema::Schema> {
+    Some(match resource {
+        "TrainingJob" => &TrainingJob::SCHEMA,
+        "Experiment" => &Experiment::SCHEMA,
+        "ExperimentTrial" => &Trial::SCHEMA,
+        TRIAL_COMPONENT_RESOURCE => &TrialComponent::SCHEMA,
+        "Endpoint" => &Endpoint::SCHEMA,
+        "Model" => &ModelDashboardModel::SCHEMA,
+        "ModelPackage" => &ModelPackage::SCHEMA,
+        "ModelPackageGroup" => &ModelPackageGroup::SCHEMA,
+        "Pipeline" => &Pipeline::SCHEMA,
+        "PipelineExecution" => &PipelineExecution::SCHEMA,
+        "PipelineVersion" => &PipelineVersion::SCHEMA,
+        "FeatureGroup" => &FeatureGroup::SCHEMA,
+        "FeatureMetadata" => &FeatureMetadata::SCHEMA,
+        "Project" => &Project::SCHEMA,
+        "HyperParameterTuningJob" => &HyperParameterTuningJobSearchEntity::SCHEMA,
+        "ModelCard" => &ModelCard::SCHEMA,
+        "Job" => &Job::SCHEMA,
+        "HubContent" => &HubContent::SCHEMA,
+        _ => return None,
+    })
+}
+
+/// Whether `schema` declares a member called `member`.
+fn declares(schema: &::aws_smithy_schema::Schema, member: &str) -> bool {
+    schema
+        .members()
+        .iter()
+        .any(|declared| declared.member_name() == Some(member))
+}
+
+/// Whether the hint `hint` begins the property name `name`.
+///
+/// `PropertyNameHint` is documented as "Text that begins a property's name", so the match
+/// is a PREFIX match — text occurring anywhere else in a name begins nothing — and the
+/// console autocompletes whatever the user typed as it is typed, so case is not
+/// significant. The hint may begin the whole name or any one of its dot-separated
+/// segments: a segment is a property's name in its own right (the key of a `Tags` or
+/// `Parameters` entry is the property the caller named, and the path only says where it
+/// sits), so a caller part-way through typing a key is offered the PATH that key sits at
+/// — the one form a `Search` filter accepts for it. The empty hint that
+/// `PropertyNameHint`'s `len 0..100` admits begins every name, and so does an absent
+/// `SuggestionQuery`, which only "limits the property names that are included".
+///
+/// Folding is ASCII-only, so a key carrying non-ASCII characters is matched byte-exactly
+/// rather than by some locale's idea of its case.
+fn hint_begins(name: &str, hint: &str) -> bool {
+    ::std::iter::once(name)
+        .chain(name.split('.'))
+        .any(|candidate| {
+            candidate.len() >= hint.len()
+                && candidate.as_bytes()[..hint.len()].eq_ignore_ascii_case(hint.as_bytes())
+        })
+}
+
+/// The property names the account's stored resources of type `resource` contribute: the
+/// dotted path of every caller-named entry a stored resource carries in a member of
+/// `entity`, its searchable entity.
+///
+/// ONE rule decides which members those are, and it is the operation's own doc: it
+/// "provides suggestions for `HyperParameters`, `Tags`, and `Metrics`". Those three, plus
+/// the entity's other MAP members (`Parameters`, `InputArtifacts`, `OutputArtifacts`,
+/// `CustomerMetadataProperties`), are the members whose entries the CALLER names and
+/// which `Search` addresses BY that name, so `<Member>.<name>` is a property name and the
+/// stored resources are the only place those names can come from. A member that is a list
+/// of MODELLED structures is not one of them — `PipelineParameters` and `FeatureMetadata`'s
+/// `Parameters` are addressed through their structure's own members (`.Name`, `.Value`),
+/// which the entity already declares, not through the value a caller put in them — so no
+/// caller-chosen name is emitted under those.
+///
+/// `Metrics` is the one member of the operation's three this emulator cannot contribute a
+/// name for: a trial component's metric series are written by another service
+/// (`BatchPutMetrics`) and stored in ITS state, and nothing is suggested for a name no
+/// stored resource here carries. See the module header's KNOWN GAP.
+///
+/// Only the PATH is suggested, never the bare key: what this operation returns is "the
+/// property name to use in Search queries", and the path is the form `Filter`'s `Name`
+/// accepts for an entry inside a member. A caller part-way through typing the key still
+/// reaches it — [`hint_begins`] matches the hint against each segment of the path, so
+/// typing a tag's key offers `Tags.<key>`.
+///
+/// A name is emitted only when `entity` declares the member the path's first segment
+/// names, so no entry is ever offered under a member the resource does not have.
+///
+/// A resource type this emulator stores nothing for contributes nothing, and so does a
+/// stored record whose entity declares no such member: the modelled names from `entity`
+/// are then the whole answer.
+///
+/// Names are offered into `names`, which filters them by the hint and caps how many are
+/// kept, so walking a store never accumulates more than the answer carries.
+fn stored_property_names(
+    resource: &str,
+    store: &crate::state::ComAmazonawsSagemakerSagemakerState,
+    entity: Option<&'static ::aws_smithy_schema::Schema>,
+    names: &mut Suggestions<'_>,
+) {
+    let mut push = |container: &str, key: &str| {
+        let first = container.split('.').next().unwrap_or(container);
+        if !key.is_empty() && entity.is_some_and(|schema| declares(schema, first)) {
+            names.offer(format!("{container}.{key}"));
+        }
+    };
+
+    match resource {
+        "Endpoint" => {
+            for endpoint in store.endpoints.values() {
+                for tag in &endpoint.tags {
+                    push("Tags", &tag.key);
+                }
+            }
+        }
+        "Experiment" => {
+            for experiment in store.experiments.values() {
+                for tag in &experiment.tags {
+                    push("Tags", &tag.key);
+                }
+            }
+        }
+        "ExperimentTrial" => {
+            for trial in store.trials.values() {
+                for tag in &trial.tags {
+                    push("Tags", &tag.key);
+                }
+            }
+        }
+        "HyperParameterTuningJob" => {
+            for job in store.tuning_jobs.values() {
+                for tag in &job.tags {
+                    push("Tags", &tag.key);
+                }
+            }
+        }
+        "FeatureGroup" => {
+            for group in store.feature_groups.values() {
+                for tag in &group.tags {
+                    push("Tags", &tag.key);
+                }
+            }
+        }
+        "Model" => {
+            for model in store.models.values() {
+                // `SearchRecord`'s `Model` member targets `ModelDashboardModel`, which
+                // carries the model itself under its own `Model` member — so a model's
+                // tags sit at `Model.Tags`, not at `Tags`.
+                for tag in &model.tags {
+                    push("Model.Tags", &tag.key);
+                }
+            }
+        }
+        "ModelPackage" => {
+            for package in store.model_packages.values() {
+                for tag in &package.tags {
+                    push("Tags", &tag.key);
+                }
+                let metadata = package.customer_metadata_properties.iter().flatten();
+                for (key, _) in metadata {
+                    push("CustomerMetadataProperties", key);
+                }
+            }
+        }
+        "ModelPackageGroup" => {
+            for group in store.model_package_groups.values() {
+                for tag in &group.tags {
+                    push("Tags", &tag.key);
+                }
+            }
+        }
+        "Pipeline" => {
+            for pipeline in store.pipelines.values() {
+                for tag in &pipeline.tags {
+                    push("Tags", &tag.key);
+                }
+            }
+        }
+        "ModelCard" => {
+            for card in store.model_cards.values() {
+                for tag in &card.tags {
+                    push("Tags", &tag.key);
+                }
+            }
+        }
+        TRIAL_COMPONENT_RESOURCE => {
+            for component in store.trial_components.values() {
+                for tag in &component.tags {
+                    push("Tags", &tag.key);
+                }
+                for (parameter, _) in component.parameters.iter().flatten() {
+                    push("Parameters", parameter);
+                }
+                for (artifact, _) in component.input_artifacts.iter().flatten() {
+                    push("InputArtifacts", artifact);
+                }
+                for (artifact, _) in component.output_artifacts.iter().flatten() {
+                    push("OutputArtifacts", artifact);
+                }
+                // No `Metrics.<name>` beside them: this service stores no metric series
+                // (see the module header's KNOWN GAP), and a name nothing here carries is
+                // not suggested.
+            }
+        }
+        // Every remaining `ResourceType` value is one no stored record can contribute a
+        // caller-named entry for, for one of three reasons. (1) This service keeps no
+        // store for the resource: there is no project, feature-metadata, pipeline-version
+        // or unified-`Job` map on `ComAmazonawsSagemakerSagemakerState`. (2) The store
+        // exists but its records carry no caller-named entry: the training-job record is
+        // the `TrainingJobSummary` projection `ListTrainingJobs` needs, so it keeps
+        // neither tags nor hyperparameters (`CreateTrainingJob` and
+        // `DescribeTrainingJob` are still scaffold stubs, each with its own issue, and
+        // whichever lands extends that record) — which is also why no
+        // `HyperParameters.<name>` is suggested yet, since `TrainingJob` is the only
+        // entity declaring that member whose store could ever hold one; this emulator's
+        // hub-content record likewise keeps no tags. (3) The store exists and the records
+        // carry caller-named values, but not in a member `Search` addresses by that name:
+        // a pipeline execution's parameters are the entity's `PipelineParameters`, a list
+        // of modelled `Parameter` structures addressed through `.Name`/`.Value`, which the
+        // entity already declares. `Image` and `ImageVersion` have stores but no
+        // `SearchRecord` member at all, so the model names no property for them. The
+        // stores for resource kinds `ResourceType` does not name (`transform_jobs`,
+        // `processing_jobs`, `algorithms`, `ai_benchmark_jobs`, `contexts`, `artifacts`,
+        // `actions`, `clusters`, `apps`, …) are not reachable here either: a transform or
+        // processing job appears in the model only INSIDE a trial component's
+        // `SourceDetail`, never as a `SearchRecord` member. A record that gains a
+        // caller-named member of the first kind needs an arm here.
+        _ => {}
     }
 }
 
@@ -138,18 +456,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSearchSuggestions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSearchSuggestionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSearchSuggestions"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // "Limits the property names that are included in the response"
+        // (`SuggestionQuery`), so no query at all limits nothing.
+        let hint = input
+            .suggestion_query
+            .as_ref()
+            .and_then(|query| query.property_name_query.as_ref())
+            .map(|query| query.property_name_hint.as_str())
+            .unwrap_or_default();
+
+        let entity = search_entity(&input.resource);
+        // The collector applies the hint filter and the answer's cap to every name offered
+        // to it, and keeps them deduplicated in one stable order however the stores are
+        // iterated — the model leaves the list's order unspecified, and a caller reading
+        // twice must get the same list.
+        let mut names = Suggestions::new(hint);
+        // The names the MODEL gives this resource: the members of its `SearchRecord`
+        // entity.
+        for member in entity
+            .into_iter()
+            .flat_map(|schema| schema.members().iter().filter_map(|m| m.member_name()))
+        {
+            names.offer(member.to_owned());
+        }
+
+        // A pure read: the store is locked for reading only, so asking for suggestions
+        // changes nothing a later caller sees.
+        let store = state.lock();
+        stored_property_names(&input.resource, &store, entity, &mut names);
+        drop(store);
+
+        Ok(GetSearchSuggestionsOutput {
+            property_name_suggestions: Some(
+                names
+                    .into_names()
+                    .map(|property_name| PropertyNameSuggestion {
+                        property_name: Some(property_name),
+                    })
+                    .collect(),
+            ),
+        })
     }
 }
