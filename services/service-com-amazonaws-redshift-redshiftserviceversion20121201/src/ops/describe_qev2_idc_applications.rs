@@ -193,19 +193,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An ARN that names no application is refused rather than reported as an
         // empty page; an UNFILTERED read of a store holding none is an empty
         // page, which is what "no application exists" looks like.
-        if let Some(wanted) = input.qev2_idc_application_arn.as_deref() {
-            if matched.is_empty() {
-                return Err(
-                    DescribeQev2IdcApplicationsErrorModeled::Qev2IdcApplicationNotExistsFault(
-                        Qev2IdcApplicationNotExistsFault {
-                            message: Some(format!(
-                                "Amazon Redshift Query Editor (QEV2) IAM Identity Center application not found: {wanted}"
-                            )),
-                        },
-                    )
-                    .into(),
-                );
-            }
+        if input.qev2_idc_application_arn.is_some() && matched.is_empty() {
+            return Err(
+                DescribeQev2IdcApplicationsErrorModeled::Qev2IdcApplicationNotExistsFault(
+                    Qev2IdcApplicationNotExistsFault {
+                        message: Some(st::QEV2_IDC_APPLICATION_NOT_EXISTS.to_string()),
+                    },
+                )
+                .into(),
+            );
         }
 
         let (start, end, next_marker) =

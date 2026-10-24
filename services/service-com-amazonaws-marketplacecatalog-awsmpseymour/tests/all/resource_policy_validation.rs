@@ -46,6 +46,11 @@ const ACCOUNT: &str = "000000000000";
 /// The restJson1 document media type: `application/json`, for answers and refusals alike.
 const JSON: &str = "application/json";
 
+/// The document a resource carrying no resource-based policy reports: the empty JSON
+/// policy document, which states no `Statement` and so grants what no attached policy
+/// grants — and which this suite shows `PutResourcePolicy` refuses to store.
+const EMPTY_POLICY_DOCUMENT: &str = "{}";
+
 /// The policy-language versions an IAM JSON policy document may declare, written out here
 /// from the IAM JSON policy reference rather than read from the crate, so an
 /// implementation that publishes its own set cannot make this suite pass. The reference
@@ -482,12 +487,12 @@ async fn a_document_that_is_not_a_resource_policy_is_refused_and_attaches_nothin
             refused.message()
         );
 
-        // Nothing was stored: the resource still carries no policy, so the read is
-        // refused as not found rather than answering the document that was turned away.
+        // Nothing was stored: the resource still carries no policy, so the read answers
+        // the EMPTY policy document rather than the document that was turned away.
         let read = get_resource_policy(&router, &arn).await;
         assert_eq!(
-            (read.status, read.error_code()),
-            (404, "ResourceNotFoundException"),
+            (read.status, read.text("/Policy")),
+            (200, EMPTY_POLICY_DOCUMENT.to_string()),
             "case {case:?}: a refused document must not become the resource's policy, got \
              {} with {:?}",
             read.status,
