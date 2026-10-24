@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateSecurityRequirementPack
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateSecurityRequirementPack`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateSecurityRequirementPack::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies the mutable members of one stored security requirement pack — `name`,
+//! `description` and `status` — to the record the pack store holds, advances its
+//! `updatedAt`, and answers the record as it now stands, so a following
+//! `GetSecurityRequirementPack` or `ListSecurityRequirementPacks` reports the same
+//! values.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +159,123 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateSecurityRequirementPack` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateSecurityRequirementPackErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateSecurityRequirementPack"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateSecurityRequirementPackErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the security requirement pack store is unavailable".to_string(),
+                },
+            )
+        })?;
+
+        // `packId` is `@required` but carries no `@length`, so an empty one reaches the
+        // handler. It names no pack and never could, so it is a bad request rather than
+        // a missing resource: refused with the modelled `ValidationException` (HTTP 400).
+        if input.pack_id.is_empty() {
+            return Err(invalid("packId", "must not be empty"));
+        }
+
+        // A name that carries no characters at all would leave the pack with no usable
+        // name, so it is refused on the same rule `CreateSecurityRequirementPack`
+        // applies to the name it stores.
+        if input.name.as_deref().is_some_and(|name| name.trim().is_empty()) {
+            return Err(invalid("name", "must not be blank"));
+        }
+
+        // A `status` outside the `SecurityRequirementPackStatus` enum is refused rather
+        // than written, so a later read can only ever answer a modelled enum value.
+        if let Some(requested) = input.status.as_deref() {
+            if !crate::state::PACK_STATUS_VALUES.contains(&requested) {
+                return Err(invalid(
+                    "status",
+                    &format!(
+                        "must be one of {}",
+                        crate::state::PACK_STATUS_VALUES.join(", ")
+                    ),
+                ));
+            }
+        }
+
+        let mut state = state.lock();
+        let pack = state
+            .security_requirement_packs
+            .get_mut(&input.pack_id)
+            .ok_or_else(|| {
+                UpdateSecurityRequirementPackErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "No security requirement pack found for ID: {}",
+                            input.pack_id
+                        ),
+                    },
+                )
+            })?;
+
+        // "For customer managed packs, both metadata and status can be updated. For AWS
+        // managed packs, only status can be updated" (this operation's own
+        // documentation): the metadata of a pack AWS ships is AWS's, so a request that
+        // asks to change it is refused instead of being partly applied.
+        if pack.management_type == crate::state::MANAGEMENT_TYPE_AWS_MANAGED {
+            for (path, supplied) in [
+                ("name", input.name.is_some()),
+                ("description", input.description.is_some()),
+            ] {
+                if supplied {
+                    return Err(invalid(
+                        path,
+                        &format!(
+                            "must not be supplied for an {} pack, whose status alone can \
+                             be updated",
+                            crate::state::MANAGEMENT_TYPE_AWS_MANAGED
+                        ),
+                    ));
+                }
+            }
+        }
+
+        // Each member the request carries is written to the stored record; a member it
+        // does not carry leaves that field as it was, so an update of one member is not
+        // a clear of the others.
+        let mut mutated = false;
+        if let Some(name) = input.name {
+            pack.name = name;
+            mutated = true;
+        }
+        if let Some(description) = input.description {
+            pack.description = Some(description);
+            mutated = true;
+        }
+        if let Some(status) = input.status {
+            pack.status = status;
+            mutated = true;
+        }
+        // `updatedAt` is when the record last CHANGED, so it moves for an update that
+        // wrote something and stays put for one that carried no mutable member at all.
+        if mutated {
+            pack.updated_at = ::std::time::SystemTime::now();
+        }
+
+        // The answer is the stored record as it now stands, never the request echoed:
+        // `name`, `description` and `status` come off the pack, including the values an
+        // absent member left untouched.
+        Ok(UpdateSecurityRequirementPackOutput {
+            pack_id: pack.pack_id.clone(),
+            name: Some(pack.name.clone()),
+            description: pack.description.clone(),
+            status: Some(pack.status.clone()),
+        })
     }
+}
+
+/// The modelled `ValidationException` for a request member this service refuses, with
+/// the member path in the `fieldList` a client reads.
+fn invalid(path: &str, requirement: &str) -> UpdateSecurityRequirementPackError {
+    UpdateSecurityRequirementPackErrorModeled::ValidationException(ValidationException {
+        message: format!("{path} {requirement}"),
+        field_list: Some(vec![ValidationExceptionField {
+            path: path.to_string(),
+            message: requirement.to_string(),
+        }]),
+    })
+    .into()
 }

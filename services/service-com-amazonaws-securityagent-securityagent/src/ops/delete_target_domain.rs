@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteTargetDomain
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteTargetDomain`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteTargetDomain::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes one registered target domain: drops the record `CreateTargetDomain`
+//! persisted, so `BatchGetTargetDomains` afterwards reports that id in `notFound` and
+//! no longer carries its record.
 //!
 //! ## Shape of an operation
 //!
@@ -72,12 +67,33 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-securityagent-securitya
 
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
-// here — hence the `DeleteTargetDomainError` alias below. An operation that models no errors
-// generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.securityagent#DeleteTargetDomain")]
+// here — hence the `DeleteTargetDomainError` alias below.
+//
+// This operation lists NO errors of its own, so every variant below is widened in with
+// `extra_errors`: the SERVICE models all three shapes (every other target domain
+// operation lists them), and a delete needs them — `ResourceNotFoundException`
+// (HTTP 404) for an id the account does not hold, `ValidationException` (HTTP 400) for
+// one that could never name a record, and `InternalServerException` (HTTP 500) for a
+// store this process cannot reach, which is a server fault and not a bad request.
+//
+// The 404 is also what the recorded behaviour of the neighbouring target domain
+// operations shows for an id the account does not hold; the alternative here would be a
+// 200 reporting the deletion of a record that never existed. Note the trade: a generated
+// SDK for THIS model cannot deserialize an error shape this operation does not declare,
+// so it sees the status and the `x-amzn-errortype` code rather than a typed exception.
+#[smithy_macros::operation_error(
+    "com.amazonaws.securityagent#DeleteTargetDomain",
+    extra_errors = [
+        "InternalServerException",
+        "ResourceNotFoundException",
+        "ValidationException"
+    ]
+)]
 #[derive(Debug)]
 pub enum DeleteTargetDomainErrorModeled {
+    InternalServerException(InternalServerException),
+    ResourceNotFoundException(ResourceNotFoundException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -131,18 +147,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteTargetDomain` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteTargetDomainErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteTargetDomainErrorModeled::InternalServerException(InternalServerException {
+                message: "the target domain store is unavailable".to_string(),
+            })
+        })?;
+
+        // `targetDomainId` is `@required` but carries no `@length`, so an empty one
+        // reaches the handler. It names no record and never could, so it is a bad
+        // request rather than a missing resource.
+        if input.target_domain_id.is_empty() {
+            return Err(DeleteTargetDomainErrorModeled::ValidationException(
+                ValidationException {
+                    message: "targetDomainId must not be empty".to_string(),
+                    field_list: Some(vec![ValidationExceptionField {
+                        path: "targetDomainId".to_string(),
+                        message: "must not be empty".to_string(),
+                    }]),
+                },
+            )
+            .into());
+        }
+
+        let mut state = state.lock();
+
+        // The record is dropped from the store, so the reads that walk it — a batch get,
+        // a listing — no longer see it. An id the account does not hold is refused
+        // rather than answered as a delete that happened, so a client cannot read the
+        // deletion of a typo as the deletion of the domain it meant.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteTargetDomain"))
+        // The agent spaces that referenced this domain keep their `targetDomainIds` as
+        // stored: the association is the agent space's own record, which only an agent
+        // space operation writes.
+        if state.target_domains.remove(&input.target_domain_id).is_none() {
+            return Err(DeleteTargetDomainErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!(
+                        "No target domain found with id {}",
+                        input.target_domain_id
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // "The unique identifier of the deleted target domain": the record that was
+        // removed, which this call is what removed.
+        Ok(DeleteTargetDomainOutput {
+            target_domain_id: Some(input.target_domain_id),
+        })
     }
 }
