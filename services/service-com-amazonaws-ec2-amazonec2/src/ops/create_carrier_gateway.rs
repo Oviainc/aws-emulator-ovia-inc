@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCarrierGateway
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCarrierGateway`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCarrierGateway::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates one carrier gateway in the VPC the request names and stores it in
+//! [`crate::state`], where `DescribeCarrierGateways` reports it from. The gateway is
+//! answered in the non-terminal `pending` state the model publishes, with its
+//! `available` move owed to the clock a [`crate::state::TRANSITION_DELAY`] later.
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +135,130 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCarrierGateway` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCarrierGatewayErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCarrierGateway"))
+        use crate::state;
+        use std::time::Instant;
+
+        // `ctx` carries request metadata only, and nothing about a carrier gateway is a
+        // fact of the Region (the modelled `CarrierGateway` carries no Region or ARN
+        // member), so this operation reads none of it. The store is reached through the
+        // engine held on `self`.
+        let _ = ctx;
+
+        // "The tags to associate with the carrier gateway"
+        // (`CreateCarrierGatewayRequest$TagSpecifications`) — the shared reader refuses a
+        // specification naming any other resource type and holds the payload to the
+        // documented bounds.
+        let tags: Vec<Tag> = state::tags_from_specifications(
+            input.tag_specifications.as_deref(),
+            state::RESOURCE_TYPE_CARRIER_GATEWAY,
+            Self::NAME,
+        )?;
+
+        // "Unique, case-sensitive identifier that you provide to ensure the idempotency of
+        // the request" (`CreateCarrierGatewayRequest$ClientToken`). The model puts no
+        // `@length` on it and the store keeps it for the process's lifetime, so the bound
+        // this crate holds every client token to is enforced here.
+        if input
+            .client_token
+            .as_ref()
+            .is_some_and(|token| token.chars().count() > state::MAX_CLIENT_TOKEN_CHARS)
+        {
+            return Err(state::invalid_parameter_value(format!(
+                "clientToken accepts at most {max} characters",
+                max = state::MAX_CLIENT_TOKEN_CHARS,
+            )));
+        }
+
+        // The caller-chosen bytes this create would retain, counted by the ONE definition
+        // of that charge: the tags, plus the client token the token map keeps.
+        let payload_bytes =
+            state::carrier_gateway_payload_bytes(&tags, input.client_token.as_deref());
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+
+        // Idempotency: one token names the one gateway it minted, so a replay reports that
+        // gateway and creates nothing. Read here and answered below the DryRun check,
+        // because a replay stores nothing and so passes the ceilings a fresh create has to
+        // clear.
+        let replayed = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.carrier_gateway_client_tokens.get(token).cloned());
+
+        // "The ID of the VPC to associate with the carrier gateway"
+        // (`CreateCarrierGatewayRequest$VpcId`): a VPC id this account holds no VPC for is
+        // a refusal, not a gateway in no VPC.
+        if !store.vpcs.contains_key(&input.vpc_id) {
+            return Err(state::invalid_vpc_id_not_found(&input.vpc_id));
+        }
+
+        // A count ceiling first, then the byte budget: a record count on its own admits
+        // gigabytes, because each record holds strings the caller chose the length of. A
+        // replay stores nothing, so it is charged nothing and clears both gates.
+        if replayed.is_none() && !store.has_carrier_gateway_capacity() {
+            return Err(state::carrier_gateway_limit_exceeded(format!(
+                "This emulator holds {max} carrier gateways, which is as many as it stores",
+                max = state::MAX_CARRIER_GATEWAYS,
+            )));
+        }
+        if replayed.is_none() && store.would_exceed_stored_bytes(payload_bytes) {
+            return Err(state::carrier_gateway_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied \
+                 data, so it cannot store {payload_bytes} more",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation"
+        // (`CreateCarrierGatewayRequest$DryRun`). Nothing has been written yet, and
+        // nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        if let Some(carrier_gateway_id) = replayed {
+            return store
+                .carrier_gateways
+                .get(&carrier_gateway_id)
+                .cloned()
+                .map(|carrier_gateway| CreateCarrierGatewayOutput {
+                    carrier_gateway: Some(carrier_gateway),
+                })
+                .ok_or_else(|| {
+                    state::internal_error(format!(
+                        "a client token names carrier gateway '{carrier_gateway_id}', \
+                         which is not stored"
+                    ))
+                });
+        }
+
+        let carrier_gateway_id = store.insert_carrier_gateway(state::CarrierGatewaySpec {
+            vpc_id: input.vpc_id.clone(),
+            state: state::CARRIER_GATEWAY_STATE_PENDING.to_string(),
+            tags,
+            // The token is recorded with the gateway it minted, so a replay of this
+            // request reports that gateway instead of creating a second one.
+            client_token: input.client_token.clone(),
+        });
+        // What the clock now owes this gateway: `available`, one TRANSITION_DELAY from now
+        // — the same span, off the same monotonic clock, as a `pending` subnet's own move.
+        store.carrier_gateway_available_at.insert(
+            carrier_gateway_id.clone(),
+            Instant::now() + state::TRANSITION_DELAY,
+        );
+
+        // The answer is the record as it was stored, so `CreateCarrierGateway` and
+        // `DescribeCarrierGateways` cannot drift apart.
+        let Some(carrier_gateway) = store.carrier_gateways.get(&carrier_gateway_id).cloned() else {
+            return Err(state::internal_error(
+                "the carrier gateway just created could not be read back",
+            ));
+        };
+        Ok(CreateCarrierGatewayOutput {
+            carrier_gateway: Some(carrier_gateway),
+        })
     }
 }

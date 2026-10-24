@@ -153,12 +153,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // resource this service holds resolves here (see `state::holds_resource`).
         let store = state.lock();
         if !store.holds_resource(&input.resource_arn) {
-            return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!("Could not find resource {}", input.resource_arn)),
-                },
-            )
-            .into());
+            return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                ListTagsForResourceErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::absent_resource_message(
+                            &input.resource_arn,
+                        )),
+                    },
+                ),
+                crate::state::RESOURCE_NOT_FOUND_STATUS,
+            ));
         }
 
         Ok(ListTagsForResourceOutput {
