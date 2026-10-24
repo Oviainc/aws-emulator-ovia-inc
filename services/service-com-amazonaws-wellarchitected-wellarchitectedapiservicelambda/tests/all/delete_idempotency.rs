@@ -21,6 +21,10 @@
 //!    same token later deletes a target that does exist.
 //! 4. A token already spent on a delete of a DIFFERENT target cannot be a retry of this
 //!    one, so it is a 409 `ConflictException` and the target it named is untouched.
+//! 5. A replay answers the ORIGINAL request's result and changes NOTHING: it does not
+//!    resurrect what that request removed, it does not touch a resource created after it —
+//!    including a replacement carrying the deleted resource's own name — and it keeps
+//!    replaying however many later deletes have spent tokens of their own in between.
 //!
 //! Every rule is asserted over a TABLE: one row per implemented delete that binds the
 //! member, crossed with the token forms the model allows. Requests go through the real
@@ -335,6 +339,98 @@ async fn a_token_spent_on_another_target_is_a_conflict() {
             &format!("{case}/second"),
             kind.operation(),
         );
+    }
+}
+
+/// One row of rule 5: how much happens between the original delete and its retry, because
+/// a replay is served from the record of the original request and not from whatever the
+/// store holds when the retry arrives.
+const INTERLEAVED_DELETES: [(&str, usize); 3] = [
+    ("retried-straight-away", 0),
+    ("one-delete-in-between", 1),
+    ("several-deletes-in-between", 5),
+];
+
+/// Rule 5. The rows differ along the operation and along how many OTHER deletes completed
+/// between the original request and its retry, and every row puts a replacement resource —
+/// one carrying the deleted resource's own name, which the delete freed — in the store
+/// before the retry runs.
+#[tokio::test]
+async fn a_replay_leaves_the_store_exactly_as_the_original_delete_left_it() {
+    let client = Client::new();
+
+    for kind in DELETABLES {
+        for (form, in_between) in INTERLEAVED_DELETES {
+            let case = format!("{}/{form}", kind.operation());
+            let name = format!("{}-replay-{form}", kind.tag());
+            let token = format!("tok-replay-{}-{form}", kind.tag());
+
+            let original = create(&client, kind, &name).await;
+            assert_deleted(
+                &delete(&client, kind, &original, &token).await,
+                &case,
+                kind.operation(),
+            );
+
+            // Deletes of other targets, each under a token of its own, spend ledger
+            // entries between the original request and its retry.
+            let mut interleaved: Vec<String> = Vec::new();
+            for step in 0..in_between {
+                let other = create(&client, kind, &format!("{name}-between-{step}")).await;
+                assert_deleted(
+                    &delete(&client, kind, &other, &format!("{token}-between-{step}")).await,
+                    &format!("{case}/between-{step}"),
+                    kind.operation(),
+                );
+                interleaved.push(other);
+            }
+
+            // The replacement is a DIFFERENT resource that happens to carry the deleted
+            // one's name, so a replay keyed to anything but the original request would
+            // reach it.
+            let replacement = create(&client, kind, &name).await;
+            assert_ne!(
+                replacement, original,
+                "case {case:?}: the replacement must be its own resource, got the deleted \
+                 identifier back"
+            );
+
+            assert_deleted(
+                &delete(&client, kind, &original, &token).await,
+                &format!("{case}/retry"),
+                kind.operation(),
+            );
+
+            // What the original request removed is still gone, and so is every target the
+            // interleaved deletes removed.
+            let gone = read(&client, kind, &original).await;
+            assert_eq!(
+                gone.status, 404,
+                "case {case:?}: a replay must not resurrect the original target, got {gone:?}"
+            );
+            for (step, other) in interleaved.iter().enumerate() {
+                let still_gone = read(&client, kind, other).await;
+                assert_eq!(
+                    still_gone.status, 404,
+                    "case {case:?}/between-{step}: a replay must not resurrect another \
+                     deleted target, got {still_gone:?}"
+                );
+            }
+
+            // And the replacement is untouched: still stored, and still deletable under a
+            // token of its own.
+            let survivor = read(&client, kind, &replacement).await;
+            assert_eq!(
+                survivor.status, 200,
+                "case {case:?}: a replay must leave a resource created after the original \
+                 delete stored, got {survivor:?}"
+            );
+            assert_deleted(
+                &delete(&client, kind, &replacement, &format!("{token}-replacement")).await,
+                &format!("{case}/replacement"),
+                kind.operation(),
+            );
+        }
     }
 }
 
