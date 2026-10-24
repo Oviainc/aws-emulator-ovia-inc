@@ -62,6 +62,9 @@ mod milestone_listing;
 #[path = "all/milestone_name_uniqueness.rs"]
 mod milestone_name_uniqueness;
 
+#[path = "all/official_lens_catalog.rs"]
+mod official_lens_catalog;
+
 #[path = "all/profile_lifecycle.rs"]
 mod profile_lifecycle;
 

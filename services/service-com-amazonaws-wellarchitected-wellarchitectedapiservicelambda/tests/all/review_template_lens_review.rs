@@ -54,11 +54,13 @@ const FRAMEWORK_PILLARS: [(&str, &str, i64); 6] = [
 /// How many questions that lens asks in all.
 const FRAMEWORK_QUESTIONS: i64 = 11 + 11 + 13 + 5 + 11 + 6;
 
-/// The alias of the one lens this emulator ships a question set for.
+/// The alias of the AWS Well-Architected Framework lens.
 const FRAMEWORK_LENS: &str = "wellarchitected";
 
-/// A lens alias AWS publishes but this emulator ships no question set for.
-const UNSHIPPED_LENS: &str = "serverless";
+/// A lens alias AWS publishes that this emulator's AWS-official lens catalog carries no
+/// content for, so it asks no questions here (the catalog itself is pinned by
+/// `super::official_lens_catalog`).
+const UNSHIPPED_LENS: &str = "mergersandacquisitions";
 
 /// The Region the harness signs every request for, which is the Region an AWS-official
 /// lens's `LensArn` is reported in.

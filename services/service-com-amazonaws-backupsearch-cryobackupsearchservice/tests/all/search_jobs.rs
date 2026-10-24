@@ -27,11 +27,16 @@ use service_com_amazonaws_backupsearch_cryobackupsearchservice::state;
 use service_com_amazonaws_backupsearch_cryobackupsearchservice::EmulatedService;
 
 /// Longer than `crate::state::TRANSITION_DELAY`, so the clock has made a search job's
-/// owed status transition due by the time the next call is made.
+/// owed status transitions due by the time the next call is made.
 pub(crate) const PAST_THE_DUE_INSTANT: Duration = Duration::from_millis(900);
 
-/// Shorter than the transition span, to pin that the span is NOT zero: a caller acting
-/// straight after `StartSearchJob` still observes the transient `RUNNING`.
+/// Longer than `crate::state::CREATING_DELAY` but shorter than
+/// `crate::state::TRANSITION_DELAY`, so a search job has left `CREATING` for the
+/// `RUNNING` phase of its scan and not yet reached its terminal status.
+pub(crate) const PAST_THE_CREATING_INSTANT: Duration = Duration::from_millis(350);
+
+/// Shorter than either span, to pin that neither is zero: a caller acting straight after
+/// `StartSearchJob` still observes the transient `CREATING` the job is created in.
 pub(crate) const WITHIN_THE_DUE_INSTANT: Duration = Duration::from_millis(50);
 
 /// One emulator holding one service over one shared engine, as the router builds it,
@@ -274,8 +279,8 @@ async fn a_started_job_is_persisted_and_every_member_is_read_back_out_of_the_sto
         );
         assert_eq!(
             fetched.string("Status"),
-            "RUNNING",
-            "case {case:?}: a job started a moment ago is still RUNNING, got {:?}",
+            state::CREATING,
+            "case {case:?}: a job started a moment ago is still being created, got {:?}",
             fetched.get("Status")
         );
         assert_eq!(
@@ -407,8 +412,8 @@ async fn a_started_job_appears_in_the_list_with_the_members_it_was_stored_with()
         );
         assert_eq!(
             summary["Status"].as_str(),
-            Some("RUNNING"),
-            "position {position}: a job started a moment ago is RUNNING, got {summary:?}"
+            Some(state::CREATING),
+            "position {position}: a job started a moment ago is still being created, got {summary:?}"
         );
         assert!(
             summary["CreationTime"].as_f64().is_some(),
@@ -416,7 +421,7 @@ async fn a_started_job_appears_in_the_list_with_the_members_it_was_stored_with()
         );
         assert!(
             summary["CompletionTime"].is_null(),
-            "position {position}: a running job has not completed, got {summary:?}"
+            "position {position}: a job that has not reached a terminal status has not completed, got {summary:?}"
         );
     }
 }
@@ -916,7 +921,7 @@ async fn stopping_a_running_job_moves_it_to_stopping_and_then_to_stopped() {
     .await;
     assert_eq!(
         stopped.status, 200,
-        "StopSearchJob on a RUNNING job must succeed, got {} ({:?})",
+        "StopSearchJob on a job whose scan has not ended must succeed, got {} ({:?})",
         stopped.status, stopped.body
     );
 
@@ -1021,12 +1026,28 @@ async fn a_running_job_settles_when_the_clock_makes_it_due() {
     let identifier = started.string("SearchJobIdentifier");
     let job_uri = format!("/search-jobs/{identifier}");
 
+    // A job is created before it runs, so the first status a caller can observe is
+    // CREATING and the scan's RUNNING phase follows it; neither span is zero.
     tokio::time::sleep(WITHIN_THE_DUE_INSTANT).await;
+    let creating = call(&emulator, "us-west-2", "GET", &job_uri, None).await;
+    assert_eq!(
+        creating.string("Status"),
+        state::CREATING,
+        "the span before the scan starts is never zero, so the job is still CREATING, got {:?}",
+        creating.get("Status")
+    );
+    assert!(
+        creating.get("CompletionTime").is_null(),
+        "a job being created has no CompletionTime, got {:?}",
+        creating.get("CompletionTime")
+    );
+
+    tokio::time::sleep(PAST_THE_CREATING_INSTANT).await;
     let running = call(&emulator, "us-west-2", "GET", &job_uri, None).await;
     assert_eq!(
         running.string("Status"),
-        "RUNNING",
-        "the span before completion is never zero, so the job is still RUNNING, got {:?}",
+        state::RUNNING,
+        "once the job has been created its scan is RUNNING, got {:?}",
         running.get("Status")
     );
     assert!(
@@ -1309,7 +1330,7 @@ async fn starting_a_job_past_the_store_cap_is_refused_with_the_quota_error() {
                 tags: std::collections::HashMap::new(),
                 client_token: None,
                 request_fingerprint: identifier,
-                next_status_due: None,
+                owed_statuses: std::collections::VecDeque::new(),
             });
         }
     }

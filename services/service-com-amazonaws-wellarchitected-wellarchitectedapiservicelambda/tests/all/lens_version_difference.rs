@@ -656,12 +656,19 @@ async fn a_lens_or_version_with_no_content_to_compare_is_not_found() {
 
     // (case, alias, base, target)
     let cases: Vec<(&str, String, Option<&str>, Option<&str>)> = vec![
-        // An Amazon Web Services official lens this emulator ships no content for: the
-        // alias names a lens, and there is no version of it to compare.
-        ("official-lens-without-content", "serverless".to_string(), None, None),
+        // An Amazon Web Services official lens whose content this emulator's catalog does
+        // not carry: the alias names a lens AWS publishes, and there is no version of it
+        // to compare. (An official lens the catalog DOES carry has exactly one version and
+        // is compared above.)
+        (
+            "official-lens-without-content",
+            "mergersandacquisitions".to_string(),
+            None,
+            None,
+        ),
         (
             "official-arn-without-content",
-            "arn:aws:wellarchitected:us-west-2::lens/serverless".to_string(),
+            "arn:aws:wellarchitected:us-west-2::lens/mergersandacquisitions".to_string(),
             None,
             None,
         ),

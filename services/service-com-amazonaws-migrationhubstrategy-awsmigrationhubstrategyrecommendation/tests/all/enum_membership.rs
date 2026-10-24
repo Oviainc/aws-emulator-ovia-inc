@@ -21,6 +21,7 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::enum_support::undeclared_values;
 use crate::import_and_assess::{
     at, call, emulator, get_assessment, start_assessment, start_import, Answer,
 };
@@ -174,50 +175,6 @@ fn enum_members() -> Vec<EnumMember> {
     ]
 }
 
-/// Values the enumeration `declared` does not declare, differing along what the rule
-/// generalises over: an unrelated word, the empty string, how near the value comes to a
-/// declared one (case, whitespace, one character short, one character long) and whether
-/// it is a value a sibling enumeration of this service declares.
-///
-/// Derived from the catalog itself, so each row is a value for THAT member rather than a
-/// string that happens to work for one of them, and anything that is in fact declared is
-/// dropped.
-fn undeclared_values(declared: &[&str]) -> Vec<(String, String)> {
-    let near = declared[0];
-    let mut rows = vec![
-        // The two values the issue recorded.
-        ("an unrelated word".to_string(), "Bogus".to_string()),
-        ("an SQL-looking condition".to_string(), "LIKE".to_string()),
-        ("the empty string".to_string(), String::new()),
-        (
-            "a declared value in the wrong case".to_string(),
-            near.to_lowercase(),
-        ),
-        (
-            "a declared value with trailing whitespace".to_string(),
-            format!("{near} "),
-        ),
-        (
-            "a declared value one character short".to_string(),
-            near[..near.len() - 1].to_string(),
-        ),
-        (
-            "a declared value with a suffix".to_string(),
-            format!("{near}X"),
-        ),
-    ];
-    for catalog in CATALOGS {
-        if let Some(foreign) = catalog.iter().find(|value| !declared.contains(value)) {
-            rows.push((
-                "a value a sibling enumeration of this service declares".to_string(),
-                (*foreign).to_string(),
-            ));
-        }
-    }
-    rows.retain(|(_, value)| !declared.contains(&value.as_str()));
-    rows
-}
-
 /// Send `request` to the named operation.
 async fn start(router: &MultiServiceRouter, operation: &str, request: Value) -> Answer {
     match operation {
@@ -278,7 +235,7 @@ async fn created_something(router: &MultiServiceRouter, operation: &str) -> bool
 #[tokio::test]
 async fn an_undeclared_enum_value_is_refused_and_creates_nothing() {
     for member in enum_members() {
-        for (shape, value) in undeclared_values(member.declared) {
+        for (shape, value) in undeclared_values(member.declared, CATALOGS) {
             let case = format!(
                 "{}${} = {value:?} ({shape})",
                 member.operation, member.member

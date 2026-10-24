@@ -12,6 +12,13 @@ use serde_json::{json, Value};
 
 use super::workload_harness::{created_id, minimal_create, Client};
 
+use service_com_amazonaws_wellarchitected_wellarchitectedapiservicelambda::state;
+
+/// How many questions the AWS Well-Architected Framework lens asks — its published
+/// numbering, OPS 11, SEC 11, REL 13, PERF 5, COST 11, SUS 6. Spelled out so the roll-up
+/// below is anchored to a number rather than only to the catalog it reads.
+const FRAMEWORK_LENS_QUESTIONS: usize = 11 + 11 + 13 + 5 + 11 + 6;
+
 /// CreateWorkload stores the whole record and GetWorkload rebuilds it: a table spanning
 /// the member classes the request can carry — list sizes, optional strings, tags,
 /// both `Environment` values (including `PREPRODUCTION`, which the issue did not cite),
@@ -130,30 +137,41 @@ async fn created_workload_round_trips_through_get_workload() {
             "case {case:?}: UpdatedAt must be set, got {workload:?}"
         );
         // The risk roll-up carries every `Risk` bucket. Nothing can answer a question
-        // yet, so `UNANSWERED` is the question count of the attached lenses whose
-        // definition this emulator ships (the Well-Architected Framework lens asks 57
-        // questions: OPS 11, SEC 11, REL 13, PERF 5, COST 11, SUS 6) and every other
+        // yet, so `UNANSWERED` is the number of questions the ATTACHED lenses ask — each
+        // attached lens contributes its own AWS-official catalog entry's question set, the
+        // Well-Architected Framework lens's being its published 57 — and every other
         // bucket is 0.
-        let framework_lenses = request
+        assert_eq!(
+            state::lens_question_count("wellarchitected"),
+            FRAMEWORK_LENS_QUESTIONS,
+            "the framework lens asks {FRAMEWORK_LENS_QUESTIONS} questions"
+        );
+        let attached: BTreeSet<String> = request
             .get("Lenses")
             .and_then(Value::as_array)
             .map(|lenses| {
                 lenses
                     .iter()
-                    .filter(|lens| lens.as_str() == Some("wellarchitected"))
-                    .count()
+                    .filter_map(Value::as_str)
+                    .map(|lens| state::lens_alias(lens).to_string())
+                    .collect()
             })
             .unwrap_or_default();
+        let unanswered: usize = attached
+            .iter()
+            .map(|lens| state::lens_question_count(lens))
+            .sum();
         assert_eq!(
             workload.get("RiskCounts"),
             Some(&json!({
-                "UNANSWERED": framework_lenses * 57,
+                "UNANSWERED": unanswered,
                 "HIGH": 0,
                 "MEDIUM": 0,
                 "NONE": 0,
                 "NOT_APPLICABLE": 0,
             })),
-            "case {case:?}: expected the roll-up over {framework_lenses} framework lenses, got {workload:?}"
+            "case {case:?}: expected the roll-up over the lenses {attached:?} ask, got \
+             {workload:?}"
         );
         assert_eq!(
             workload.get("IsReviewOwnerUpdateAcknowledged"),
