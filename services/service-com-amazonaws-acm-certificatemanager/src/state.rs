@@ -27,8 +27,9 @@
 //! ([`acme_domain_validation_arn`]), so one endpoint's validations are a contiguous
 //! range ([`ComAmazonawsAcmCertificatemanagerState::acme_domain_validations_of`]) and
 //! deleting the endpoint drops them with it. `DescribeAcmeDomainValidation` projects
-//! that record through [`acme_domain_validation_detail`], including the DNS record the
-//! service minted for it ([`acme_prevalidation_resource_record`]), and a freshly
+//! that record through [`acme_domain_validation_detail`] and
+//! `ListAcmeDomainValidations` through [`acme_domain_validation_summary`], including the
+//! DNS record the service minted for it ([`acme_prevalidation_resource_record`]), and a freshly
 //! created validation is `VALIDATING` until the transition the clock owes it falls due,
 //! exactly as a freshly created endpoint is `CREATING`.
 //!
@@ -54,7 +55,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AcmCertificateMetadata, AcmeAccountSummary, AcmeDomainValidation, AcmeEndpoint,
+    AcmCertificateMetadata, AcmeAccountSummary, AcmeDomainValidation, AcmeDomainValidationSummary,
+    AcmeEndpoint,
     AcmeEndpointSummary,
     CertificateAuthority,
     CertificateDetail, CertificateMetadata, CertificateOptions, CertificateSearchResult,
@@ -2255,6 +2257,31 @@ pub fn acme_domain_validation_detail(
         failure_details: validation.failure_details.clone(),
         created_at: Some(to_date_time(validation.created_at)),
         updated_at: Some(to_date_time(validation.updated_at)),
+    }
+}
+
+/// A stored ACME domain validation as `ListAcmeDomainValidations`'
+/// `AcmeDomainValidationSummary`.
+///
+/// `AcmeDomainValidationSummary` declares exactly the members `AcmeDomainValidation`
+/// does, so one validation is reported identically whether it is read one at a time or
+/// listed: the summary is projected from the same record, member for member, through
+/// [`acme_domain_validation_detail`] — including `FailureDetails`, which is present only
+/// for a validation that failed.
+pub fn acme_domain_validation_summary(
+    validation: &AcmeDomainValidationRecord,
+) -> AcmeDomainValidationSummary {
+    let detail = acme_domain_validation_detail(validation);
+    AcmeDomainValidationSummary {
+        acme_domain_validation_arn: detail.acme_domain_validation_arn,
+        acme_endpoint_arn: detail.acme_endpoint_arn,
+        domain_name: detail.domain_name,
+        prevalidation_type: detail.prevalidation_type,
+        prevalidation_details: detail.prevalidation_details,
+        status: detail.status,
+        failure_details: detail.failure_details,
+        created_at: detail.created_at,
+        updated_at: detail.updated_at,
     }
 }
 

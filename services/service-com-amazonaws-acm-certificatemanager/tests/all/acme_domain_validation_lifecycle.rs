@@ -38,17 +38,17 @@ use crate::certificate_lifecycle::{call, error_code, error_message, router_with_
 
 /// Every `DomainScopeOption` the model declares
 /// (`smithy_query(query="shape", shape="com.amazonaws.acm#DomainScopeOption")`).
-const DOMAIN_SCOPE_OPTIONS: &[&str] = &["ENABLED", "DISABLED"];
+pub(crate) const DOMAIN_SCOPE_OPTIONS: &[&str] = &["ENABLED", "DISABLED"];
 
 /// A `HostedZoneId` satisfying the member's modelled pattern (`^Z[A-Z0-9]+$`).
-const HOSTED_ZONE_ID: &str = "Z2FDTNDATAQYW2";
+pub(crate) const HOSTED_ZONE_ID: &str = "Z2FDTNDATAQYW2";
 
 /// One `CreateAcmeDomainValidation` case: what it exercises, the domain name to
 /// validate, and the `PrevalidationOptions` to configure.
-type ValidationCase<'a> = (&'a str, String, Value);
+pub(crate) type ValidationCase<'a> = (&'a str, String, Value);
 
 /// A request body creating one ACME endpoint to hang domain validations off.
-fn endpoint_body() -> Value {
+pub(crate) fn endpoint_body() -> Value {
     json!({
         "AuthorizationBehavior": AUTHORIZATION_BEHAVIORS[0],
         "Contact": "REQUIRED",
@@ -57,7 +57,11 @@ fn endpoint_body() -> Value {
 }
 
 /// `CreateAcmeDomainValidation`, asserted to succeed, returning the ARN it minted.
-async fn create_validation(router: &MultiServiceRouter, case: &str, body: &Value) -> String {
+pub(crate) async fn create_validation(
+    router: &MultiServiceRouter,
+    case: &str,
+    body: &Value,
+) -> String {
     let (status, response) = call(router, "CreateAcmeDomainValidation", body).await;
     assert_eq!(
         status, 200,
@@ -72,7 +76,11 @@ async fn create_validation(router: &MultiServiceRouter, case: &str, body: &Value
 }
 
 /// `DescribeAcmeDomainValidation`'s `AcmeDomainValidation` member, asserted to succeed.
-async fn describe_validation(router: &MultiServiceRouter, case: &str, arn: &str) -> Value {
+pub(crate) async fn describe_validation(
+    router: &MultiServiceRouter,
+    case: &str,
+    arn: &str,
+) -> Value {
     let (status, response) = call(
         router,
         "DescribeAcmeDomainValidation",
@@ -107,7 +115,7 @@ fn is_well_formed_validation_arn(arn: &str, acme_endpoint_arn: &str) -> bool {
 /// materialised by `materialize_due` on the next request, exactly as in production. A
 /// test about the transient state therefore cannot be made flaky by the
 /// [`state::ACME_DOMAIN_VALIDATION_SETTLE_DELAY`] span elapsing mid-test.
-fn hold_prevalidations(engine: &Arc<engine::InMemoryEngine>) {
+pub(crate) fn hold_prevalidations(engine: &Arc<engine::InMemoryEngine>) {
     let store = engine.state::<state::ComAmazonawsAcmCertificatemanagerState>();
     let mut store = store.lock();
     let held = SystemTime::now() + Duration::from_secs(3600);
@@ -125,7 +133,7 @@ fn hold_prevalidations(engine: &Arc<engine::InMemoryEngine>) {
 /// transition is still applied by `materialize_due`, so a test that needs the settled
 /// state does not have to wait [`state::ACME_DOMAIN_VALIDATION_SETTLE_DELAY`] out on the
 /// wall clock.
-fn settle_prevalidations_now(engine: &Arc<engine::InMemoryEngine>) -> SystemTime {
+pub(crate) fn settle_prevalidations_now(engine: &Arc<engine::InMemoryEngine>) -> SystemTime {
     let store = engine.state::<state::ComAmazonawsAcmCertificatemanagerState>();
     let mut store = store.lock();
     let past = SystemTime::now() - Duration::from_millis(1);
@@ -168,7 +176,7 @@ fn longest_domain_name() -> String {
 }
 
 /// One request body for each row of the table.
-fn validation_cases() -> Vec<ValidationCase<'static>> {
+pub(crate) fn validation_cases() -> Vec<ValidationCase<'static>> {
     vec![
         (
             "apex domain, no prevalidation configuration at all",
@@ -220,7 +228,7 @@ fn validation_cases() -> Vec<ValidationCase<'static>> {
 
 /// The `(key, value)` tag set each row of the table creates its validation with: no
 /// tags, one, a non-ASCII pair, and `TagList`'s maximum length.
-fn tag_case(index: usize) -> Option<Value> {
+pub(crate) fn tag_case(index: usize) -> Option<Value> {
     match index % 4 {
         0 => None,
         1 => Some(json!([{ "Key": "owner", "Value": "platform" }])),
