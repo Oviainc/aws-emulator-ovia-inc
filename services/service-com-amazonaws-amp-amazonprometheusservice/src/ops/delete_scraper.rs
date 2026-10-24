@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteScraper
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteScraper`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: starts the deletion of one stored scraper. The scraper moves to
+//! `DELETING` (which this operation reports) and the clock owes its removal
+//! ([`crate::state::TRANSITION_DELAY`]), after which `ListScrapers` no longer carries it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteScraper::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +151,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteScraper` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteScraperErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteScraper"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteScraperErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the workspace store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        store.materialize_due(now);
+
+        let Some(scraper) = store.scrapers.get_mut(&input.scraper_id) else {
+            return Err(DeleteScraperErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::SCRAPER_NOT_FOUND_MESSAGE.to_string(),
+                    resource_id: input.scraper_id.clone(),
+                    resource_type: crate::state::SCRAPER_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        };
+
+        // `clientToken` carries `@idempotencyToken`: re-sending the very call that
+        // started the pending deletion is that same call, so it is accepted again and
+        // answers from the record it already wrote, instead of pushing the removal out.
+        let replays_pending_delete = input.client_token.is_some()
+            && scraper.delete_token == input.client_token
+            && scraper.status_code == crate::state::STATUS_DELETING;
+
+        // `ScraperStatusCode$DELETING` documents the rule: "Deletions are allowed only
+        // when status is ACTIVE" (and `CREATING`/`UPDATING` repeat it: "Deletion is
+        // disallowed until status is ACTIVE"). Deleting a scraper in any other status
+        // would leave an inconsistent state — ConflictException (409).
+        if !replays_pending_delete && scraper.status_code != crate::state::STATUS_ACTIVE {
+            return Err(DeleteScraperErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "The scraper is {}; deletions are allowed only when status is {}",
+                        scraper.status_code,
+                        crate::state::STATUS_ACTIVE,
+                    ),
+                    resource_id: scraper.scraper_id.clone(),
+                    resource_type: crate::state::SCRAPER_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // The deletion is asynchronous (modelled 202): the record moves to `DELETING`
+        // here and the clock owes its removal, which
+        // `ComAmazonawsAmpAmazonprometheusserviceState::materialize_due` applies.
+        if !replays_pending_delete {
+            scraper.status_code = crate::state::STATUS_DELETING.to_string();
+            scraper.transition_due = Some(now + crate::state::TRANSITION_DELAY);
+            scraper.delete_token = input.client_token;
+            // This call CHANGED the stored scraper, which is what
+            // `ScraperSummary$lastModifiedAt` reports.
+            scraper.last_modified_at = now;
+        }
+
+        // Reported from the record this call wrote, never from a literal.
+        Ok(DeleteScraperOutput {
+            scraper_id: scraper.scraper_id.clone(),
+            status: ScraperStatus {
+                status_code: scraper.status_code.clone(),
+            },
+        })
     }
 }
