@@ -18,6 +18,11 @@
 //! is reported in the response's `errors` list, which is what `GetRecommendationError`
 //! describes ("Describes an error experienced when getting recommendations").
 //!
+//! The rows it reports are those of the ONE account it answers for: `accountIds` names a
+//! member account of an organization, which this emulator has none of, so a well-formed id
+//! naming another account is refused rather than used to select rows with (see
+//! [`requested_account_id`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -203,30 +208,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A malformed request is refused BEFORE the store is read, so
         // InvalidParameterValueException takes precedence over the opt-in gate below, as it
-        // does in this service's other readers.
-        let account_ids = input.account_ids.clone().unwrap_or_default();
-        // `accountIds`: "You can only specify one account ID per request."
-        if account_ids.len() > 1 {
-            return Err(invalid_parameter(
-                "The value supplied for parameter accountIds is not valid: you can only specify \
-                 one account ID per request."
-                    .to_string(),
-            ));
-        }
-        if let Some(value) = account_ids
-            .iter()
-            .find(|value| !crate::state::is_account_id(value))
-        {
-            return Err(invalid_parameter(format!(
-                "The value supplied for parameter accountIds is not valid: {value} is not a \
-                 12-digit Amazon Web Services account ID."
-            )));
-        }
+        // does in this service's other readers; so is a request that asks about an account
+        // this service cannot answer for (see [`requested_account_id`]).
+        let account_id = requested_account_id(input.account_ids.as_deref())?;
 
         // `resourceArns`: "The ARN that identifies the Amazon Aurora or RDS database" — so
         // each value is an ARN. WHICH resource an ARN names is not checked here: a
-        // well-formed ARN this service holds no database recommendation for is reported in
-        // `errors` below, not refused.
+        // well-formed ARN this service holds no database recommendation for — including one
+        // naming a resource of an account it does not answer for — is reported in `errors`
+        // below, not refused.
         let resource_arns = input.resource_arns.clone().unwrap_or_default();
         if let Some(value) = resource_arns
             .iter()
@@ -253,7 +243,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let selection_fingerprint = crate::state::fingerprint(&(
             Self::NAME,
             &resource_arns,
-            &account_ids,
+            &account_id,
             &filters,
             &input.recommendation_preferences,
         ));
@@ -309,18 +299,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // names carry that region.
         let region = crate::state::request_region(ctx);
 
-        // The databases the request selects: those of the named resources, of the named
-        // account, whose recommendation satisfies every filter. A member the request omits
-        // selects nothing away. The filters read the REPORTED recommendation, so they select
-        // on exactly the values the response carries.
+        // The databases the request selects: those the account it asks about owns, of the
+        // named resources, whose recommendation satisfies every filter. A member the request
+        // omits selects nothing away. The account is never a filter key a request chooses:
+        // it is the ONE account this service answers for ([`requested_account_id`]), so a row
+        // another account owns is reported to nobody. The filters read the REPORTED
+        // recommendation, so they select on exactly the values the response carries.
         let selected: Vec<RDSDBRecommendation> = store
             .analysed_resources
             .iter()
             .filter(|resource| resource.resource_type == crate::state::SOURCE_TYPE_RDS_DB_INSTANCE)
+            .filter(|resource| resource.account_id == account_id)
             .filter(|resource| {
                 resource_arns.is_empty() || resource_arns.contains(&resource.arn_in(&region))
             })
-            .filter(|resource| account_ids.is_empty() || account_ids.contains(&resource.account_id))
             .map(|resource| {
                 recommendation_for(
                     resource,
@@ -339,12 +331,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Every ARN the request named that this service holds no database recommendation
         // for, whatever the filters select. Reported with each page, because it describes
-        // the request rather than the page.
+        // the request rather than the page. A row this account does not own is no
+        // recommendation of this request's, so an ARN naming one is reported here exactly as
+        // an ARN nothing analysed is — never answered with another account's row.
         let errors: Vec<GetRecommendationError> = resource_arns
             .iter()
             .filter(|arn| {
                 !store.analysed_resources.iter().any(|resource| {
                     resource.resource_type == crate::state::SOURCE_TYPE_RDS_DB_INSTANCE
+                        && resource.account_id == account_id
                         && resource.arn_in(&region) == **arn
                 })
             })
@@ -545,6 +540,23 @@ fn savings_opportunity(resource: &crate::state::AnalysedResource) -> SavingsOppo
             value: crate::state::round_hundredths(savings),
         }),
     }
+}
+
+/// The account whose analysed databases this request asks about: the one id `accountIds`
+/// carries, or the caller's own account when it carries none.
+///
+/// The rule is the crate's ([`crate::state::requested_account_id`]): "You can only specify
+/// one account ID per request" (`GetRDSDatabaseRecommendations$accountIds`), an account id
+/// is "a 12-digit Amazon Web Services account ID" (`Scope$value`), and `accountIds` is the
+/// MANAGEMENT account's mechanism for naming a MEMBER account of its organization — of
+/// which this emulator, presenting one standalone account, has none. So an id that is
+/// well-formed but names another account asks for recommendations this service cannot
+/// report and is refused, never used as a key to select rows of the findings catalog with.
+/// This wrapper only lifts the reason into this operation's error channel.
+fn requested_account_id(
+    account_ids: Option<&[String]>,
+) -> Result<String, GetRDSDatabaseRecommendationsError> {
+    crate::state::requested_account_id(account_ids).map_err(invalid_parameter)
 }
 
 /// The 400 `InvalidParameterValueException` this operation refuses a bad request with: "The
