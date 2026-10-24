@@ -211,6 +211,33 @@ impl ComAmazonawsGuarddutyGuarddutyapiserviceState {
             .filter(|detector| detector.region == region)
     }
 
+    /// Drop the administrator relationship the account that owns the detector
+    /// `region`'s endpoint serves for `id` is monitored by.
+    ///
+    /// `None` when that endpoint holds no such detector at all; `Some(false)` when it
+    /// does and the account has accepted no invitation, so there is no relationship
+    /// to leave; `Some(true)` when this call dropped one. The caller needs all three,
+    /// because only the last is a success.
+    ///
+    /// The mutation clock ([`Self::tick_millis`]) is read ONLY on the path that
+    /// writes, so neither refusal advances it — which is what lets this be one lookup
+    /// in the handler instead of a resolve-then-tick-then-resolve-again walk. The
+    /// write itself is [`Detector::disassociate_from_administrator`].
+    pub fn disassociate_detector_from_administrator(
+        &mut self,
+        region: &str,
+        id: &str,
+    ) -> Option<bool> {
+        if self.detector_in(region, id)?.administrator.is_none() {
+            return Some(false);
+        }
+        let now = self.tick_millis();
+        Some(
+            self.detector_in_mut(region, id)
+                .is_some_and(|detector| detector.disassociate_from_administrator(now)),
+        )
+    }
+
     /// The detector `region`'s endpoint minted under `token`, if a create recorded
     /// one and that detector is still held.
     ///
@@ -1364,6 +1391,23 @@ pub fn invitation_not_pending_message() -> String {
     invitation_not_pending_message_for(MASTER_ID_MEMBER)
 }
 
+/// The message the MEMBER-side disassociation is refused with when the account
+/// that owns the named detector is monitored by no administrator.
+///
+/// `DisassociateFromAdministratorAccount` "disassociates the current GuardDuty
+/// member account from its administrator account"
+/// (`smithy_query(query="doc",shape="DisassociateFromAdministratorAccount")`): it
+/// acts on the one relationship [`Detector::administrator`] holds, so an account
+/// that has accepted no invitation has nothing for it to act on. The only
+/// client-error channel the operation models is `BadRequestException`/400 and its
+/// output carries no per-account result the way `DisassociateMembers`'
+/// `UnprocessedAccounts` does, so the absence is reported as the refusal rather
+/// than as a hollow success. HTTP 400 under the `InvalidInputException` class is
+/// the requirement here; this wording follows the refusal style every other
+/// rejection on this service uses — it states the rule and quotes nothing back.
+pub const NO_ADMINISTRATOR_MESSAGE: &str =
+    "The request is rejected because the current account is not associated with an administrator account.";
+
 /// The message a request is DENIED with when the account is not authorized on the
 /// resource `member` names.
 ///
@@ -2120,6 +2164,39 @@ impl Detector {
             relationship_status: RELATIONSHIP_ENABLED.to_string(),
             invited_at_millis: invitation.invited_at_millis,
         });
+        self.updated_at_millis = now;
+        true
+    }
+
+    /// Drop the administrator relationship this detector's account is monitored
+    /// by, reporting whether there was one to drop.
+    ///
+    /// The MEMBER side of the association, and the exact inverse of
+    /// [`Self::accept_invitation`]: it clears [`Self::administrator`], so the
+    /// administrator reads (`GetAdministratorAccount` / `GetMasterAccount`) report
+    /// none afterwards. The accepted invitation is NOT put back in the inbox — "the
+    /// member account details obtained from the CreateMembers API ... are retained.
+    /// This is done so that the delegated administrator can invoke the
+    /// InviteMembers API without the need to invoke the CreateMembers API again"
+    /// (`smithy_query(query="doc",shape="DisassociateFromAdministratorAccount")`):
+    /// re-association goes through a fresh invitation, which is the
+    /// administrator's call to make and not this one's.
+    ///
+    /// Nothing else moves: the member records this detector's account administers
+    /// are the OTHER side of the relationship (they belong to the accounts this one
+    /// administers, not to the administrator it is leaving), so they are untouched.
+    /// `false` writes NOTHING at all, which is what lets the caller refuse without
+    /// having changed anything.
+    ///
+    /// Shared with the deprecated `DisassociateFromMasterAccount` ("this operation
+    /// is deprecated, use DisassociateFromAdministratorAccount instead",
+    /// `smithy_query(operation="DisassociateFromMasterAccount")`), which is still a
+    /// scaffold with an issue of its own: the two names are one behaviour, so
+    /// neither can drop a relationship the other would keep.
+    pub fn disassociate_from_administrator(&mut self, now: i64) -> bool {
+        if self.administrator.take().is_none() {
+            return false;
+        }
         self.updated_at_millis = now;
         true
     }
