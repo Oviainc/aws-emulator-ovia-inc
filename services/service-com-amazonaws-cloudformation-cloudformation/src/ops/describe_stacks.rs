@@ -224,7 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // clock had already made due, which was owed whether or not anyone called.
         store.settle(::std::time::SystemTime::now());
 
-        let matching = match &input.stack_name {
+        let matching: Vec<&StoredStack> = match &input.stack_name {
             // "The name or the unique stack ID that's associated with the stack …
             // Running stacks: either. Deleted stacks: you must specify the unique stack
             // ID." A name that resolves to nothing is a `ValidationError`, not an empty
@@ -235,20 +235,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         crate::state::stack_does_not_exist(name_or_id),
                     )
                 })?;
-                vec![stack_view(stack)]
+                vec![stack]
             }
             // "Deleted stacks don't show up in the DescribeStacks operation if the
             // deletion has been completed successfully."
-            None => store.live_stacks().map(stack_view).collect(),
+            None => store.live_stacks().collect(),
         };
         // `@paginated(inputToken: NextToken, outputToken: NextToken, items: Stacks)`: one
-        // response carries one bounded page, and the token resumes just past it.
-        let (stacks, next_token) = crate::state::paginate(
+        // response carries one bounded page, and the token resumes just past it. The page
+        // is taken over the STORED stacks and only its members are projected onto the wire
+        // shape, so the work one request costs is bounded by the page and not by how many
+        // stacks the store holds.
+        let (page, next_token) = crate::state::paginate(
             crate::state::PageOf::Stacks,
             matching,
             input.next_token.as_deref(),
         )
         .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        let stacks: Vec<Stack> = page.into_iter().map(stack_view).collect();
 
         Ok(DescribeStacksOutput {
             stacks: Some(stacks),

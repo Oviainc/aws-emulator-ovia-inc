@@ -22,11 +22,12 @@
 //! [`crate::state`], shared with `UpdateItem` and `DeleteItem`.
 //!
 //! `ReturnConsumedCapacity=INDEXES` reports the capacity the write consumed on the table
-//! AND on each secondary index the written item reaches, and
+//! AND on each secondary index whose stored entry this write CHANGES, and
 //! `ReturnItemCollectionMetrics=SIZE` reports the item collection the write landed in —
 //! both computed from the stored table by [`crate::state::Table::write_capacity`] and
-//! [`crate::state::Table::item_collection_metrics`], so an index the item does not reach
-//! and a table with no local secondary index report nothing.
+//! [`crate::state::Table::item_collection_metrics`], so an index the item does not reach,
+//! an index whose entry the put leaves exactly as it stood, and a table with no local
+//! secondary index report nothing.
 //!
 //! Sizes a request can choose are bounded before the write lands: the item's own size
 //! (the documented 400 KB limit), its nesting (the documented 32 levels) and the

@@ -63,6 +63,11 @@ impl Answer {
 /// The emulator under test: one shared engine behind the production router.
 pub(crate) struct Emulator {
     router: MultiServiceRouter,
+    /// The SAME engine the router handed every operation. Held so a suite can seed a
+    /// resource this service's implemented operations cannot yet mint themselves (an
+    /// image set, which only a DICOM import creates) and then drive the real HTTP
+    /// surface over it. No case asserts THROUGH this handle — assertions read the wire.
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Emulator {
@@ -71,9 +76,16 @@ impl Emulator {
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
         router.register_service(
-            service_com_amazonaws_medicalimaging_ahigatewayservice::EmulatedService::new(engine),
+            service_com_amazonaws_medicalimaging_ahigatewayservice::EmulatedService::new(
+                Arc::clone(&engine),
+            ),
         );
-        Self { router }
+        Self { router, engine }
+    }
+
+    /// The shared engine, for seeding only — see the field's note.
+    pub(crate) fn engine(&self) -> &engine::InMemoryEngine {
+        &self.engine
     }
 
     pub(crate) async fn call(&self, method: &str, uri: &str, body: Option<Value>) -> Answer {

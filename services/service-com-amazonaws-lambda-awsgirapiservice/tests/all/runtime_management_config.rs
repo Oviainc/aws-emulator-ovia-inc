@@ -20,8 +20,18 @@
 //! mode (the whole [`UPDATE_RUNTIME_ON_VALUES`] set), the form of the runtime version
 //! ARN (both branches of the member's own pattern, see [`RUNTIME_VERSION_ARNS`]), the
 //! version the configuration is addressed on (`$LATEST` implicitly, `$LATEST`
-//! explicitly, a published version number, a qualified `FunctionName`), the documented
-//! `FunctionName` form, and how many calls have been made (none, one, several).
+//! explicitly, a published version number, a qualified `FunctionName`, an alias), the
+//! documented `FunctionName` form, and how many calls have been made (none, one,
+//! several).
+//!
+//! The reporting side has rules of its own, pinned by the last three suites below:
+//! `GetRuntimeManagementConfig` resolves the `FunctionName`/`Qualifier` pair to ONE
+//! version of one stored function, so every documented way of naming that version reads
+//! the same stored value and reports the same canonical `FunctionArn`; a pair whose two
+//! halves name two DIFFERENT versions names no single resource and is refused
+//! `InvalidParameterValueException` (HTTP 400) without storing anything; and because the
+//! configuration belongs to the version, a qualifier naming an alias reads (and writes)
+//! the configuration of the version that alias invokes.
 
 use std::sync::Arc;
 
@@ -250,6 +260,28 @@ async fn publish_version(router: &MultiServiceRouter, name: &str) -> String {
     answer
         .string("Version")
         .unwrap_or_else(|| panic!("PublishVersion {name:?} must report a Version: {}", answer.text()))
+}
+
+/// `CreateAlias`: one alias of `function`, named `alias`, invoking `version`.
+///
+/// Built on this suite's own `call`, like every other request helper here, so the whole
+/// suite drives one harness; `function_aliases.rs` reaches the same binding through its
+/// harness and pins `CreateAlias`'s own rules, which this helper only sets up for.
+async fn create_alias(router: &MultiServiceRouter, function: &str, alias: &str, version: &str) {
+    let answer = call(
+        router,
+        "POST",
+        &format!("{FUNCTIONS_URI}/{function}/aliases"),
+        &json!({ "Name": alias, "FunctionVersion": version }),
+    )
+    .await;
+    assert_eq!(
+        answer.status,
+        201,
+        "CreateAlias {alias:?} -> {version:?} must succeed, got {} {}",
+        answer.status,
+        answer.text()
+    );
 }
 
 /// The unqualified ARN of the function `name`.
@@ -858,4 +890,439 @@ async fn a_version_that_does_not_exist_has_no_runtime_management_config() {
         None,
         &function_arn("runtime-present"),
     );
+}
+
+/// One way of naming a version: the case name, how the `FunctionName` is built from the
+/// function's name, and the `Qualifier` parameter the request carries (if any).
+type Reference = (&'static str, fn(&str) -> String, Option<&'static str>);
+
+/// Every way of naming ONE version, with the configuration and the `FunctionArn` that
+/// version must report: `(version, references, mode, runtime version ARN, FunctionArn)`.
+type Group = (
+    &'static str,
+    Vec<Reference>,
+    &'static str,
+    Option<&'static str>,
+    String,
+);
+
+/// A `FunctionName`/`Qualifier` pair whose halves name two different versions: the case
+/// name, how the name is built, and the `Qualifier` it disagrees with.
+type Conflict = (&'static str, fn(&str) -> String, &'static str);
+
+/// One read of a configuration: `(FunctionName, Qualifier, mode, runtime version ARN,
+/// FunctionArn)`.
+type Read = (
+    String,
+    Option<&'static str>,
+    &'static str,
+    Option<&'static str>,
+    String,
+);
+
+/// Every documented way of naming the `$LATEST` version, from the `FunctionName`
+/// member's own pattern (`smithy_query(query="shape", shape="NamespacedFunctionName")`:
+/// an optional ARN prefix, region and account id, an optional `function:` literal, the
+/// name, and an optional `:$LATEST(.PUBLISHED)|:<qualifier>`) combined with the
+/// `Qualifier` parameter, which "If no value is specified, the configuration for the
+/// $LATEST version is returned".
+fn latest_references() -> Vec<Reference> {
+    vec![
+        ("a bare name, no Qualifier", |name| name.to_string(), None),
+        (
+            "a bare name and an explicit Qualifier",
+            |name| name.to_string(),
+            Some("$LATEST"),
+        ),
+        (
+            "a name qualified with $LATEST",
+            |name| format!("{name}:$LATEST"),
+            None,
+        ),
+        (
+            "a name and a Qualifier naming the same version",
+            |name| format!("{name}:$LATEST"),
+            Some("$LATEST"),
+        ),
+        (
+            "the bare function: prefix",
+            |name| format!("function:{name}"),
+            None,
+        ),
+        (
+            "a partial ARN and a Qualifier",
+            |name| format!("{ACCOUNT}:function:{name}"),
+            Some("$LATEST"),
+        ),
+        (
+            "a qualified partial ARN",
+            |name| format!("{ACCOUNT}:function:{name}:$LATEST"),
+            None,
+        ),
+        (
+            "a function ARN",
+            |name| format!("arn:aws:lambda:{REGION}:{ACCOUNT}:function:{name}"),
+            None,
+        ),
+        (
+            "a qualified function ARN",
+            |name| format!("arn:aws:lambda:{REGION}:{ACCOUNT}:function:{name}:$LATEST"),
+            None,
+        ),
+    ]
+}
+
+/// The same forms, naming published version `1` instead: by the `Qualifier` parameter,
+/// by the name's own qualifier, or by both at once.
+fn version_one_references() -> Vec<Reference> {
+    vec![
+        ("a bare name and a Qualifier", |name| name.to_string(), Some("1")),
+        (
+            "a name qualified with the version",
+            |name| format!("{name}:1"),
+            None,
+        ),
+        (
+            "a name and a Qualifier naming the same version",
+            |name| format!("{name}:1"),
+            Some("1"),
+        ),
+        (
+            "the bare function: prefix and a Qualifier",
+            |name| format!("function:{name}"),
+            Some("1"),
+        ),
+        (
+            "a partial ARN and a Qualifier",
+            |name| format!("{ACCOUNT}:function:{name}"),
+            Some("1"),
+        ),
+        (
+            "a qualified partial ARN",
+            |name| format!("{ACCOUNT}:function:{name}:1"),
+            None,
+        ),
+        (
+            "a function ARN and a Qualifier",
+            |name| format!("arn:aws:lambda:{REGION}:{ACCOUNT}:function:{name}"),
+            Some("1"),
+        ),
+        (
+            "a qualified function ARN",
+            |name| format!("arn:aws:lambda:{REGION}:{ACCOUNT}:function:{name}:1"),
+            None,
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn every_way_of_naming_one_version_reads_the_same_configuration() {
+    let engine = Arc::new(engine::InMemoryEngine::new());
+    let router = router_on(&engine);
+
+    let function = "runtime-reference-forms";
+    create_function(&router, function).await;
+    let published = publish_version(&router, function).await;
+    assert_eq!(
+        published, "1",
+        "the first published version must be 1, got {published:?}"
+    );
+
+    // The two versions hold DIFFERENT configurations, so a row that resolved to the
+    // wrong version reports the other one's values rather than passing by accident.
+    for (qualifier, mode, arn) in [
+        (None, MANUAL, Some(RUNTIME_VERSION_ARNS[0])),
+        (Some("1"), "FunctionUpdate", None),
+    ] {
+        let seeded =
+            put_runtime_management_config(&router, function, qualifier, mode, arn).await;
+        assert_eq!(
+            seeded.status,
+            200,
+            "seeding {:?} must succeed, got {} {}",
+            qualifier.unwrap_or("$LATEST"),
+            seeded.status,
+            seeded.text()
+        );
+    }
+
+    // Each group names ONE version, so every row in it reads the same stored value and
+    // reports the same canonical FunctionArn — whatever form the request used to get
+    // there.
+    let groups: Vec<Group> = vec![
+        (
+            "$LATEST",
+            latest_references(),
+            MANUAL,
+            Some(RUNTIME_VERSION_ARNS[0]),
+            function_arn(function),
+        ),
+        (
+            "version 1",
+            version_one_references(),
+            "FunctionUpdate",
+            None,
+            format!("{}:1", function_arn(function)),
+        ),
+    ];
+
+    for (version, references, mode, arn, expected_function_arn) in groups {
+        for (case, build, qualifier) in references {
+            let reference = build(function);
+            let label = format!("{version} as {case} ({reference}?Qualifier={qualifier:?})");
+            // Read twice: a report does not change what the next caller sees, so the
+            // second read of every form answers exactly what the first one did.
+            for round in 0..2 {
+                let fetched =
+                    get_runtime_management_config(&router, &reference, qualifier).await;
+                assert_reports(
+                    &format!("{label} (read {round})"),
+                    "GetRuntimeManagementConfig",
+                    &fetched,
+                    mode,
+                    arn,
+                    &expected_function_arn,
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_name_and_qualifier_that_name_two_versions_are_refused() {
+    let engine = Arc::new(engine::InMemoryEngine::new());
+    let router = router_on(&engine);
+
+    let function = "runtime-conflicting-qualifier";
+    create_function(&router, function).await;
+    let published = publish_version(&router, function).await;
+    assert_eq!(
+        published, "1",
+        "the first published version must be 1, got {published:?}"
+    );
+    // Both versions start configured, so a refusal that stored anything shows up as a
+    // change to one of these two configurations.
+    for (qualifier, mode, arn) in [
+        (None, MANUAL, Some(RUNTIME_VERSION_ARNS[1])),
+        (Some("1"), "FunctionUpdate", None),
+    ] {
+        let seeded =
+            put_runtime_management_config(&router, function, qualifier, mode, arn).await;
+        assert_eq!(
+            seeded.status,
+            200,
+            "seeding {:?} must succeed, got {} {}",
+            qualifier.unwrap_or("$LATEST"),
+            seeded.status,
+            seeded.text()
+        );
+    }
+
+    // One row per way the two halves can disagree: the name's qualifier against the
+    // parameter, in each direction, in each documented name form, and naming a version
+    // that exists or one that does not — the pair names no single resource either way,
+    // so the disagreement is what is reported rather than a 404.
+    let conflicts: Vec<Conflict> = vec![
+        (
+            "a published version in the name against $LATEST",
+            |name| format!("{name}:1"),
+            "$LATEST",
+        ),
+        (
+            "$LATEST in the name against a published version",
+            |name| format!("{name}:$LATEST"),
+            "1",
+        ),
+        (
+            "a partial ARN qualified with a version nobody published",
+            |name| format!("{ACCOUNT}:function:{name}:9"),
+            "1",
+        ),
+        (
+            "a function ARN against an alias name",
+            |name| format!("arn:aws:lambda:{REGION}:{ACCOUNT}:function:{name}:1"),
+            "live",
+        ),
+    ];
+
+    for (case, build, qualifier) in conflicts {
+        let reference = build(function);
+        let label = format!("{case} ({reference}?Qualifier={qualifier})");
+        for (operation, answer) in [
+            (
+                "GetRuntimeManagementConfig",
+                get_runtime_management_config(&router, &reference, Some(qualifier)).await,
+            ),
+            (
+                "PutRuntimeManagementConfig",
+                put_runtime_management_config(&router, &reference, Some(qualifier), "Auto", None)
+                    .await,
+            ),
+        ] {
+            assert_eq!(
+                answer.status,
+                400,
+                "case {label:?}: expected 400 from {operation}, got {} {}",
+                answer.status,
+                answer.text()
+            );
+            assert!(
+                answer.error_code().contains("InvalidParameterValueException"),
+                "case {label:?}: expected InvalidParameterValueException from {operation}, got \
+                 {:?}",
+                answer.error_code()
+            );
+        }
+    }
+
+    // Neither refusal stored anything: both versions still hold what was seeded.
+    for (qualifier, mode, arn, expected_function_arn) in [
+        (
+            None,
+            MANUAL,
+            Some(RUNTIME_VERSION_ARNS[1]),
+            function_arn(function),
+        ),
+        (
+            Some("1"),
+            "FunctionUpdate",
+            None,
+            format!("{}:1", function_arn(function)),
+        ),
+    ] {
+        let fetched = get_runtime_management_config(&router, function, qualifier).await;
+        assert_reports(
+            qualifier.unwrap_or("$LATEST"),
+            "GetRuntimeManagementConfig",
+            &fetched,
+            mode,
+            arn,
+            &expected_function_arn,
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_alias_reads_the_configuration_of_the_version_it_invokes() {
+    let engine = Arc::new(engine::InMemoryEngine::new());
+    let router = router_on(&engine);
+
+    let function = "runtime-aliased";
+    create_function(&router, function).await;
+    let published = publish_version(&router, function).await;
+    assert_eq!(
+        published, "1",
+        "the first published version must be 1, got {published:?}"
+    );
+    for (qualifier, mode, arn) in [
+        (None, MANUAL, Some(RUNTIME_VERSION_ARNS[0])),
+        (Some("1"), "FunctionUpdate", None),
+    ] {
+        let seeded =
+            put_runtime_management_config(&router, function, qualifier, mode, arn).await;
+        assert_eq!(
+            seeded.status,
+            200,
+            "seeding {:?} must succeed, got {} {}",
+            qualifier.unwrap_or("$LATEST"),
+            seeded.status,
+            seeded.text()
+        );
+    }
+    // Two aliases over the same function, invoking the two different versions.
+    create_alias(&router, function, "live", "1").await;
+    create_alias(&router, function, "edge", "$LATEST").await;
+
+    // The configuration belongs to the VERSION, so each alias reports the configuration
+    // of the version it invokes, whether the alias arrives as the `Qualifier` parameter
+    // or as the name's own qualifier, while the reported `FunctionArn` names what the
+    // request addressed.
+    let reads: Vec<Read> = vec![
+        (
+            function.to_string(),
+            Some("live"),
+            "FunctionUpdate",
+            None,
+            format!("{}:live", function_arn(function)),
+        ),
+        (
+            format!("{function}:live"),
+            None,
+            "FunctionUpdate",
+            None,
+            format!("{}:live", function_arn(function)),
+        ),
+        (
+            function.to_string(),
+            Some("edge"),
+            MANUAL,
+            Some(RUNTIME_VERSION_ARNS[0]),
+            format!("{}:edge", function_arn(function)),
+        ),
+        (
+            format!("arn:aws:lambda:{REGION}:{ACCOUNT}:function:{function}:edge"),
+            None,
+            MANUAL,
+            Some(RUNTIME_VERSION_ARNS[0]),
+            format!("{}:edge", function_arn(function)),
+        ),
+    ];
+
+    for (reference, qualifier, mode, arn, expected_function_arn) in &reads {
+        let label = format!("{reference}?Qualifier={qualifier:?}");
+        let fetched = get_runtime_management_config(&router, reference, *qualifier).await;
+        assert_reports(
+            &label,
+            "GetRuntimeManagementConfig",
+            &fetched,
+            mode,
+            *arn,
+            expected_function_arn,
+        );
+    }
+
+    // A call addressed by an alias and one addressed by the version that alias invokes
+    // reach the SAME configuration: setting it through `live` is what version 1 reports,
+    // and `$LATEST` (and therefore `edge`) is untouched.
+    let through_alias =
+        put_runtime_management_config(&router, function, Some("live"), "Auto", None).await;
+    assert_reports(
+        "through the alias",
+        "PutRuntimeManagementConfig",
+        &through_alias,
+        "Auto",
+        None,
+        &format!("{}:live", function_arn(function)),
+    );
+    for (qualifier, mode, arn, expected_function_arn) in [
+        ("1", "Auto", None, format!("{}:1", function_arn(function))),
+        (
+            "live",
+            "Auto",
+            None,
+            format!("{}:live", function_arn(function)),
+        ),
+        (
+            "$LATEST",
+            MANUAL,
+            Some(RUNTIME_VERSION_ARNS[0]),
+            function_arn(function),
+        ),
+        (
+            "edge",
+            MANUAL,
+            Some(RUNTIME_VERSION_ARNS[0]),
+            format!("{}:edge", function_arn(function)),
+        ),
+    ] {
+        let fetched = get_runtime_management_config(&router, function, Some(qualifier)).await;
+        assert_reports(
+            qualifier,
+            "GetRuntimeManagementConfig",
+            &fetched,
+            mode,
+            arn,
+            &expected_function_arn,
+        );
+    }
 }

@@ -485,7 +485,7 @@ async fn a_request_that_does_not_name_exactly_one_selector_is_refused() {
         ),
         (
             "both selectors naming different recorders",
-            json!({ "Arn": arn, "ServicePrincipal": BYSTANDER }),
+            json!({ "Arn": arn, "ServicePrincipal": bystander_of(linked) }),
         ),
         ("neither selector", json!({})),
     ];

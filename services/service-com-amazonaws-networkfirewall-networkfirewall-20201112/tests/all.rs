@@ -31,6 +31,8 @@ mod response_projections;
 mod rule_group_capacity_and_resource_policy;
 #[path = "all/rule_group_lifecycle.rs"]
 mod rule_group_lifecycle;
+#[path = "all/rule_group_listing.rs"]
+mod rule_group_listing;
 #[path = "all/rule_group_mutations.rs"]
 mod rule_group_mutations;
 #[path = "all/rule_group_response_members.rs"]

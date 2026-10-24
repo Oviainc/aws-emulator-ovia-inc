@@ -176,21 +176,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CreateIPSetErrorModeled::WAFInternalErrorException(WAFInternalErrorException {
-                message: Some("the AWS WAF IPSet store is unavailable".to_string()),
+                message: Some(crate::state::MESSAGE_INTERNAL_ERROR.to_string()),
             })
         })?;
         let mut state = state.lock();
 
         // Every IPSet is a stored record, so the number a caller can create is
         // bounded, as it is on the real service.
-        if state.ip_sets.len() >= crate::state::MAX_IP_SETS {
+        if state.ip_set_quota_exhausted() {
             return Err(CreateIPSetErrorModeled::WAFLimitsExceededException(
                 WAFLimitsExceededException {
-                    message: Some(format!(
-                        "The request would exceed the maximum number of IPSet objects ({}) \
-                         allowed for this account",
-                        crate::state::MAX_IP_SETS
-                    )),
+                    message: Some(crate::state::MESSAGE_LIMITS_EXCEEDED.to_string()),
                 },
             )
             .into());
@@ -203,29 +199,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !state.consume_change_token(&input.change_token) {
             return Err(CreateIPSetErrorModeled::WAFStaleDataException(
                 WAFStaleDataException {
-                    message: Some(format!(
-                        "The change token {} is not a change token this request can use; \
-                         call GetChangeToken for a new one",
-                        input.change_token
-                    )),
+                    // This exception type's own fixed sentence: the token the caller
+                    // submitted is never reflected back into the error body.
+                    message: Some(crate::state::MESSAGE_STALE_DATA.to_string()),
                 },
             )
             .into());
         }
 
-        // A fresh id per call: `ResourceName` carries no uniqueness constraint, so two
-        // IPSets created with the same `Name` are two distinct resources, each stored
-        // under its own `IPSetId`.
-        let ip_set_id = state.mint_id();
-        // A new IPSet holds no addresses: they arrive through `UpdateIPSet`.
-        let entry = crate::state::IPSetEntry::new(ip_set_id.clone(), input.name);
-        // The response is the projection of the record that was STORED, not of the
-        // request.
-        let ip_set = entry.to_modelled();
-        state.ip_sets.insert(ip_set_id, entry);
+        // A fresh id per call, and the response is the projection of the record that was
+        // STORED, not of the request.
+        let entry = state.insert_new_ip_set(input.name);
 
         Ok(CreateIPSetOutput {
-            ip_set: Some(ip_set),
+            ip_set: Some(entry.to_modelled()),
             change_token: Some(input.change_token),
         })
     }

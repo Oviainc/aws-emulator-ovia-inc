@@ -12,7 +12,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ecs_wire::{
-    count, create_cluster, list, ok, refused, service, string, ACCOUNT, SIGNED_REGION,
+    cluster_with_capacity, count, create_cluster, list, ok, refused, register_capacity, service,
+    string, ACCOUNT, SIGNED_REGION,
 };
 
 /// Long enough for one clock-owed task transition (`state::TRANSITION_SPAN` is 500 ms)
@@ -670,7 +671,7 @@ async fn task_definition_requests_outside_the_documented_rules_are_refused() {
 #[tokio::test]
 async fn run_describe_stop_and_delete_is_one_consistent_story() {
     let router = service();
-    let cluster_arn = create_cluster(&router, "demo", "lifecycle").await;
+    let cluster_arn = cluster_with_capacity(&router, "demo", "lifecycle").await;
     let (definition_arn, revision) = register(&router, "web", "app", "lifecycle").await;
     assert_eq!(revision, 1, "the first revision of a family is 1");
 
@@ -994,13 +995,16 @@ async fn run_describe_stop_and_delete_is_one_consistent_story() {
         )
         .await;
         create_cluster(&router, "demo", &case).await;
+        // The delete released the container instance with the cluster, so the cluster
+        // this row runs its tasks in gets its own capacity back.
+        register_capacity(&router, "demo", &case).await;
     }
 }
 
 #[tokio::test]
 async fn run_task_resolves_every_documented_task_definition_reference() {
     let router = service();
-    create_cluster(&router, "demo", "references").await;
+    cluster_with_capacity(&router, "demo", "references").await;
     let (first_arn, _) = register(&router, "web", "app", "references").await;
     let (second_arn, second_revision) = register(&router, "web", "sidecar", "references").await;
     assert_eq!(second_revision, 2, "the second revision of a family is 2");
@@ -1156,6 +1160,7 @@ async fn run_and_stop_requests_outside_the_documented_rules_are_refused() {
 async fn describe_tasks_reports_missing_for_ids_that_name_nothing() {
     let router = service();
     create_cluster(&router, "demo", "missing").await;
+    register_capacity(&router, "demo", "missing").await;
     create_cluster(&router, "other", "missing").await;
     register(&router, "web", "app", "missing").await;
     let run = ok(
@@ -1241,6 +1246,7 @@ async fn describe_tasks_reports_missing_for_ids_that_name_nothing() {
 async fn describe_batches_are_bounded_and_deduplicated() {
     let router = service();
     create_cluster(&router, "demo", "batches").await;
+    register_capacity(&router, "demo", "batches").await;
     register(&router, "web", "app", "batches").await;
     let run = ok(
         &router,
@@ -1339,9 +1345,24 @@ async fn describe_batches_are_bounded_and_deduplicated() {
 #[tokio::test]
 async fn list_tasks_filters_and_pages_over_stored_tasks() {
     let router = service();
-    create_cluster(&router, "demo", "filters").await;
-    create_cluster(&router, "other", "filters").await;
-    register(&router, "web", "app", "filters").await;
+    cluster_with_capacity(&router, "demo", "filters").await;
+    cluster_with_capacity(&router, "other", "filters").await;
+    // `web` is registered Fargate-compatible (`awsvpc` plus task-level cpu and memory),
+    // so the row that runs it under the FARGATE launch type asks for a placement the
+    // revision was validated against; `worker` stays EC2-only.
+    ok(
+        &router,
+        "RegisterTaskDefinition",
+        json!({
+            "family": "web",
+            "networkMode": "awsvpc",
+            "cpu": "256",
+            "memory": "512",
+            "containerDefinitions": [container("app", "public.ecr.aws/nginx/nginx:latest")],
+        }),
+        "filters",
+    )
+    .await;
     register(&router, "worker", "app", "filters").await;
 
     // Three tasks that differ along every filter the slice supports, plus one in a
@@ -1465,7 +1486,7 @@ async fn list_tasks_filters_and_pages_over_stored_tasks() {
 #[tokio::test]
 async fn cluster_and_task_references_accept_a_name_or_an_arn() {
     let router = service();
-    let cluster_arn = create_cluster(&router, "demo", "references").await;
+    let cluster_arn = cluster_with_capacity(&router, "demo", "references").await;
     register(&router, "web", "app", "references").await;
 
     // Every `cluster` member's doc: "The short name or full Amazon Resource Name (ARN)

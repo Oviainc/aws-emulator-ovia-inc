@@ -405,6 +405,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // "The platform version that your tasks in the service are running on ... If one
+        // isn't specified, the LATEST platform version is used": a version this service
+        // does not know names no platform, which is what `PlatformUnknownException` is
+        // modelled for.
+        if crate::state::is_unknown_platform_version(input.platform_version.as_deref()) {
+            return Err(CreateServiceErrorModeled::PlatformUnknownException(
+                PlatformUnknownException {
+                    message: Some(crate::state::PLATFORM_UNKNOWN_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
         // "This is required if schedulingStrategy is REPLICA or isn't specified. If
         // schedulingStrategy is DAEMON then this isn't required."
         let daemon = scheduling_strategy == crate::state::SCHEDULING_DAEMON;
@@ -497,6 +510,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(found)
             }
         };
+
+        // A revision is placed with a launch type only where it was validated against
+        // it (`TaskDefinition$compatibilities`), so a service that asks for one the
+        // stored revision does not support is refused before anything is stored.
+        if let (Some(found), Some(launch_type)) = (&definition, input.launch_type.as_deref()) {
+            if let Err(message) = crate::state::validate_launch_type(found, launch_type) {
+                return Err(CreateServiceErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
+        }
 
         let key = (cluster_name.clone(), name.clone());
         if let Some(existing) = guard.services.get(&key) {

@@ -8,8 +8,10 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
-# The shared constraint-violation value recovery: the bytes a caller submitted, which the
-# framework's validating walk stores elided on each violation.
+# The ONE caller-supplied-ARN parse, which `state::is_sns_topic_arn` reads a
+# notification channel's uri against, and the shared constraint-violation value
+# recovery: the bytes a caller submitted, which the framework's validating walk stores
+# elided on each violation.
 service-common = { path = "../common" }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }

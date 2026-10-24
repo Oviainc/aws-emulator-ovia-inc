@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListLineageGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListLineageGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListLineageGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: filters, sorts and pages the lineage groups the request's Region holds in
+//! `crate::state`.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -129,6 +123,27 @@ impl<Eng> ListLineageGroups<Eng> {
     }
 }
 
+/// `SortOrder`'s documented default for THIS operation ("The sort order for the results.
+/// The default is `Ascending`."), the opposite of the `Descending` the crate's other
+/// listings document, so it is stated here rather than taken from
+/// `crate::state::DEFAULT_SORT_ORDER` — but it names the member through the crate's one
+/// `crate::state::ORDER_ASCENDING` rather than a bare literal. `SortBy`'s default is the
+/// shared `crate::state::DEFAULT_SORT_BY` (`CreationTime`), the value this operation
+/// documents too, and the accepted value sets are the generated `*_VALUES` slices in
+/// `super::types`, so a refusal stays in step with the model rather than with a
+/// transcription of it.
+const DEFAULT_SORT_ORDER: &str = crate::state::ORDER_ASCENDING;
+
+/// `MaxResults`'s documented default ("This value defaults to 10."), applied when the
+/// caller sends none. The service's own ceiling, [`crate::state::MAX_PAGE_SIZE`], still
+/// caps a larger request.
+const DEFAULT_MAX_RESULTS: i32 = 10;
+
+/// The `SortLineageGroupsBy` member that sorts by `LineageGroupName` rather than by
+/// `CreationTime`; named here so the branch below and the accepted set
+/// (`SORT_LINEAGE_GROUPS_BY_VALUES`) stay in step with the model.
+const SORT_BY_NAME: &str = "Name";
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ListLineageGroups<Eng>
 {
@@ -146,18 +161,126 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListLineageGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListLineageGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListLineageGroups"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let sort_by = input
+            .sort_by
+            .as_deref()
+            .unwrap_or(crate::state::DEFAULT_SORT_BY);
+        if !SORT_LINEAGE_GROUPS_BY_VALUES.contains(&sort_by) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "SortBy must be one of {}; got \"{sort_by}\".",
+                SORT_LINEAGE_GROUPS_BY_VALUES.join(", ")
+            )));
+        }
+        let sort_order = input.sort_order.as_deref().unwrap_or(DEFAULT_SORT_ORDER);
+        if !SORT_ORDER_VALUES.contains(&sort_order) {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "SortOrder must be one of {}; got \"{sort_order}\".",
+                SORT_ORDER_VALUES.join(", ")
+            )));
+        }
+        let descending = sort_order == crate::state::ORDER_DESCENDING;
+
+        let after = input.created_after.map(crate::state::timestamp_key);
+        let before = input.created_before.map(crate::state::timestamp_key);
+        let region = crate::state::request_region(ctx);
+
+        // A read: the guard is taken, the matching records are copied out and NOTHING is
+        // written back, so a listing never materialises a group. A lineage group enters
+        // the store only through `ensure_lineage_group`, which the lineage-entity creates
+        // call (see `crate::state`), so an account whose entities put nothing in a Region
+        // has nothing to list there.
+        let store = state.lock();
+        // Each record's creation key is computed ONCE, here, and carried beside the record:
+        // the bounds below and the sort further down both read it, rather than converting
+        // the stored instant again on every comparison.
+        let mut matching: Vec<((i64, u32), &crate::state::LineageGroup)> = store
+            .lineage_groups_in(&region)
+            .filter_map(|group| {
+                // Both bounds are inclusive, so a timestamp copied straight out of a
+                // prior response's `CreationTime` still selects that group.
+                let created =
+                    crate::state::timestamp_key(crate::state::timestamp(group.creation_time));
+                let selected = after.is_none_or(|bound| created >= bound)
+                    && before.is_none_or(|bound| created <= bound);
+                selected.then_some((created, group))
+            })
+            .collect();
+        // `SortOrder` reverses the SORT KEY only. The tie-break stays `LineageGroupName`
+        // ascending in both directions, so two groups provisioned in the same instant keep
+        // one order whichever way the page is sorted — and a `NextToken` resolved against a
+        // freshly computed result set lands on the same boundary.
+        matching.sort_by(|(left_created, left), (right_created, right)| {
+            let by_key = if sort_by == SORT_BY_NAME {
+                left.name.cmp(&right.name)
+            } else {
+                // The only other member is `CreationTime`, this operation's default.
+                left_created.cmp(right_created)
+            };
+            let by_key = if descending { by_key.reverse() } else { by_key };
+            by_key.then_with(|| left.name.cmp(&right.name))
+        });
+
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let resumed_after = crate::state::decode_page_token(token)
+                    .and_then(|name| matching.iter().position(|(_, group)| group.name == name))
+                    .ok_or_else(|| {
+                        // The crate's one wording for a token it cannot resolve, so every
+                        // paginated listing of this service refuses alike.
+                        crate::scaffolded::Scaffolded::validation(
+                            crate::state::STALE_PAGE_TOKEN,
+                        )
+                    })?;
+                resumed_after + 1
+            }
+        };
+
+        // `MaxResults` caps the page — at its documented default of 10 when the caller
+        // sends none — and so does the service's own ceiling: a larger `MaxResults` still
+        // cannot make one call serialise the whole store. The token below is emitted
+        // whenever anything is left, so a paginating client walks the full result set
+        // exactly once either way.
+        let start = start.min(matching.len());
+        // The clamp leaves the value in `1..=MAX_PAGE_SIZE`, so the conversion cannot
+        // lose anything; the fallback keeps that invariant stated rather than asserted.
+        let page_size = usize::try_from(
+            input
+                .max_results
+                .unwrap_or(DEFAULT_MAX_RESULTS)
+                .clamp(1, crate::state::MAX_PAGE_SIZE),
+        )
+        .unwrap_or(DEFAULT_MAX_RESULTS as usize);
+        let end = start.saturating_add(page_size).min(matching.len());
+        let page = &matching[start..end];
+
+        // A token only where a further page exists, so a paginating client stops.
+        let next_token = page
+            .last()
+            .filter(|_| end < matching.len())
+            .map(|(_, last)| crate::state::encode_page_token(&last.name));
+
+        Ok(ListLineageGroupsOutput {
+            lineage_group_summaries: Some(
+                page.iter()
+                    .map(|(_, group)| LineageGroupSummary {
+                        // The ARN the group was materialised under, replayed rather than
+                        // re-rendered, so a summary and `DescribeLineageGroup` report one
+                        // ARN for one group.
+                        lineage_group_arn: Some(group.arn.clone()),
+                        lineage_group_name: Some(group.name.clone()),
+                        display_name: group.display_name.clone(),
+                        creation_time: Some(crate::state::timestamp(group.creation_time)),
+                        last_modified_time: Some(crate::state::timestamp(
+                            group.last_modified_time,
+                        )),
+                    })
+                    .collect(),
+            ),
+            next_token,
+        })
     }
 }

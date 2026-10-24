@@ -29,24 +29,11 @@ use serde_json::{json, Value};
 use service_com_amazonaws_sagemaker_sagemaker::state::{
     DEFAULT_LINEAGE_GROUP, LINEAGE_GROUP_QUOTA,
 };
-use service_com_amazonaws_sagemaker_sagemaker::ComAmazonawsSagemakerSagemakerState as SageMakerState;
 
 use super::inference_deployment_lifecycle::{
-    epoch_seconds, error_code, f64_field, message, str_field, Emulator, ACCOUNT,
+    epoch_seconds, error_code, f64_field, materialise_lineage_group as materialise, message,
+    str_field, Emulator, ACCOUNT,
 };
-
-/// Materialise the lineage group `name` in `region` at `at` on `emulator`'s shared
-/// engine, exactly as a lineage-entity create does, and answer the ARN when this call is
-/// what materialised it.
-///
-/// This reaches the store directly because it is the only way to put a group there with
-/// a chosen name, region and instant: SageMaker models no `CreateLineageGroup`, so the
-/// state API is the service's own write path.
-fn materialise(emulator: &Emulator, region: &str, name: &str, at: SystemTime) -> Option<String> {
-    let state = emulator.engine.state::<SageMakerState>();
-    let mut store = state.lock();
-    store.ensure_lineage_group(region, name, at)
-}
 
 /// `DescribeLineageGroup` for `name`, signed for `region`, requiring a 200.
 async fn describe_ok(emulator: &Emulator, region: &str, name: &str) -> Value {

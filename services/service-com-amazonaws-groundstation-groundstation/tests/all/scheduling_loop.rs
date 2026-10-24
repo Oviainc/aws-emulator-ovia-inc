@@ -191,6 +191,87 @@ pub(crate) async fn send(
     }
 }
 
+/// Every item a listing returns, across as many pages as it takes, in the order the
+/// listing gave them.
+///
+/// `path` is the listing's route, `items_member` the response member that carries the
+/// page, and `page_size` the caller's `maxResults` (`None` names none). Written once here
+/// because every listing of this service pages the same way — one `nextToken`, one items
+/// member — so a suite asserts its own listing rather than its own page walk.
+pub(crate) async fn list_pages(
+    router: &MultiServiceRouter,
+    path: &str,
+    items_member: &str,
+    page_size: Option<i64>,
+) -> Vec<Value> {
+    let mut items: Vec<Value> = Vec::new();
+    let mut token: Option<String> = None;
+    // One more page than a bounded store could need at a page size of one, so a token
+    // that failed to advance is caught as a bounded failure instead of looping forever.
+    for page in 0..64 {
+        let mut query: Vec<String> = Vec::new();
+        if let Some(size) = page_size {
+            query.push(format!("maxResults={size}"));
+        }
+        if let Some(token) = &token {
+            query.push(format!("nextToken={token}"));
+        }
+        let route = if query.is_empty() {
+            path.to_string()
+        } else {
+            format!("{path}?{}", query.join("&"))
+        };
+
+        let reply = send(router, "GET", &route, None).await;
+        assert_eq!(
+            reply.status, 200,
+            "case maxResults={page_size:?} page-{page}: expected {path} 200, got {} {}",
+            reply.status, reply.body
+        );
+        let items_on_page = reply
+            .field(items_member)
+            .as_array()
+            .unwrap_or_else(|| {
+                panic!(
+                    "case maxResults={page_size:?} page-{page}: {items_member} must be a list, \
+                     got {}",
+                    reply.body
+                )
+            })
+            .clone();
+        if let Some(size) = page_size {
+            assert!(
+                items_on_page.len() as i64 <= size,
+                "case maxResults={page_size:?} page-{page}: a page must hold at most {size} \
+                 items, got {}",
+                items_on_page.len()
+            );
+        }
+        items.extend(items_on_page);
+
+        token = reply.field("nextToken").as_str().map(str::to_string);
+        if token.is_none() {
+            return items;
+        }
+    }
+    panic!("case maxResults={page_size:?}: the listing of {path} never closed");
+}
+
+/// Whether `id` is spelled the way the modelled `Uuid` requires
+/// (`^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$`) — the shape of every
+/// id this service mints, so the check is written once for every suite that asserts one.
+pub(crate) fn is_uuid(id: &str) -> bool {
+    let groups: Vec<&str> = id.split('-').collect();
+    groups.len() == 5
+        && [8, 4, 4, 4, 12]
+            .iter()
+            .zip(&groups)
+            .all(|(len, group)| group.len() == *len)
+        && groups
+            .iter()
+            .all(|group| group.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()))
+}
+
 /// A spectral config with every optional member set, so a response that echoes it back
 /// is comparable to the request verbatim (`polarization` carries a modelled default,
 /// which an omitted member would materialise).

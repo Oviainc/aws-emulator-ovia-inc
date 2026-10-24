@@ -170,19 +170,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "Template names must be between 1 and 100 valid characters in length." A
         // name of nothing but whitespace names no template, and neither does one
-        // carrying a control character.
-        if input.approval_rule_template_name.trim().is_empty()
-            || input
-                .approval_rule_template_name
-                .chars()
-                .any(char::is_control)
-        {
+        // carrying a control character — decided for every operation that takes a
+        // template name in `crate::state::is_approval_rule_template_name`.
+        if !crate::state::is_approval_rule_template_name(&input.approval_rule_template_name) {
             return Err(
                 UpdateApprovalRuleTemplateContentErrorModeled::InvalidApprovalRuleTemplateNameException(
                     InvalidApprovalRuleTemplateNameException {
-                        message: Some(format!(
-                            "the approval rule template name {} is not valid",
-                            input.approval_rule_template_name
+                        message: Some(crate::state::invalid_approval_rule_template_name_message(
+                            &input.approval_rule_template_name,
                         )),
                     },
                 )
