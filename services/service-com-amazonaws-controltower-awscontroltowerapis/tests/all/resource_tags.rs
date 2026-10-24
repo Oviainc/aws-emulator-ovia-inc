@@ -64,14 +64,14 @@ async fn apply_tags(
 }
 
 /// `ListTagsForResource`: GET the tags of `arn`. The operation carries no body.
-async fn read_tags(router: &MultiServiceRouter, arn: &str) -> Answer {
+pub(crate) async fn read_tags(router: &MultiServiceRouter, arn: &str) -> Answer {
     dispatch(router, "GET", &tags_path(arn), None).await
 }
 
 /// The `tags` member of a `ListTagsForResource` answer, as a key-ordered map so a case
 /// compares SETS rather than JSON object order. An absent member is the empty map:
 /// restJson1 may omit an empty map rather than emit `{}`, and both say "no tags".
-fn reported_tags(answer: &Answer) -> BTreeMap<String, String> {
+pub(crate) fn reported_tags(answer: &Answer) -> BTreeMap<String, String> {
     answer
         .get("tags")
         .as_object()
@@ -87,7 +87,7 @@ fn reported_tags(answer: &Answer) -> BTreeMap<String, String> {
 }
 
 /// A tag map from `(key, value)` pairs, for the tables below.
-fn tags(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+pub(crate) fn tags(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
     pairs
         .iter()
         .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
