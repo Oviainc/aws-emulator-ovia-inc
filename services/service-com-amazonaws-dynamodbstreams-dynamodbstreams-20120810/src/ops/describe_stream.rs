@@ -153,7 +153,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // Reporting only: the description is read out of the store, and the one
         // clock-driven value in it (`StreamStatus`) is DERIVED from the registration
-        // instant rather than written back.
+        // instant rather than written back. The one write is
+        // `materialize_due_expiries`, which finishes what the clock already made due
+        // at this instant whether or not anybody called — a stream past the
+        // documented 24 hours of its disable is gone, so it is not described as if
+        // it were still there.
         let _ = ctx;
         let now = std::time::SystemTime::now();
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
@@ -161,7 +165,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the DynamoDB Streams store is unavailable".to_string()),
             })
         })?;
-        let guard = state.lock();
+        let mut guard = state.lock();
+        guard.materialize_due_expiries(now);
 
         let stream = guard.stream(&input.stream_arn).ok_or_else(|| {
             DescribeStreamErrorModeled::ResourceNotFoundException(ResourceNotFoundException {

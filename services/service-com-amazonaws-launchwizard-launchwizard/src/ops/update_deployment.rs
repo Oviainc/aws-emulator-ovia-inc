@@ -160,6 +160,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
         let now = ::std::time::SystemTime::now();
+
+        // The KEYS of the submitted settings are judged FIRST, by the rules the model
+        // gives them (`DeploymentSpecifications` keys are `KeyString`: len 3..256,
+        // `^[a-zA-Z0-9-:]+$`). The pre-handler walk judged everything else about this
+        // input, but a map's KEY constraints are the one part the generated schema does
+        // not carry (see `state::map_key_schema`), so they are judged here — before the
+        // store is reached, which is the boundary's order. `force` does not reach this:
+        // it overrides validation WARNINGS, not the shape the model gives a key.
+        if let Some(message) =
+            crate::state::specification_key_refusal(input.specifications.keys().map(String::as_str))
+        {
+            return Err(UpdateDeploymentErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UpdateDeploymentErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the Launch Wizard state store is unavailable".to_string()),

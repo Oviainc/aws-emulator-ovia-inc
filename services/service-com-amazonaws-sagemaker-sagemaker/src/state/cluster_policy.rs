@@ -115,6 +115,22 @@ impl Store {
         self.configs.len() < QUOTA
     }
 
+    /// Every stored policy, in `ClusterSchedulerConfigId` order.
+    ///
+    /// Named `values` so this slice's store answers the same two calls a plain
+    /// `BTreeMap` field does, which is what lets the service's ONE `ResourceArn` ->
+    /// tag-set resolution (`crate::state`'s `tag_accessors!`) reach these records
+    /// through the same expansion as every other taggable store rather than needing an
+    /// arm of its own.
+    pub fn values(&self) -> impl Iterator<Item = &Config> {
+        self.configs.values()
+    }
+
+    /// Every stored policy, to edit. See [`Self::values`].
+    pub fn values_mut(&mut self) -> impl Iterator<Item = &mut Config> {
+        self.configs.values_mut()
+    }
+
     /// The cluster policy called `name` in the cluster `cluster_arn`.
     ///
     /// A policy's name is unique WITHIN its cluster, not across the store: "The name

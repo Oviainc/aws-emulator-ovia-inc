@@ -35,6 +35,15 @@ const CODE: &str = "ValidationException";
 /// See [`CODE`].
 const STATUS: u16 = 400;
 
+/// A `specifications` map every seeded deployment pattern accepts: the two fields the
+/// published schema marks `required` and nothing it does not publish. The rows below
+/// are about a member OTHER than `specifications`, so they carry a map the handler's
+/// own schema check has nothing to say about — what they assert is the boundary
+/// refusal that precedes it.
+fn conforming_specifications() -> Value {
+    json!({"KeyPairName": "a-key-pair", "VpcId": "vpc-0123456789abcdef0"})
+}
+
 /// The `Message` of a refusal, after requiring the modelled status and code.
 async fn refusal_message(harness: &Harness, case: &str, path: &str, body: Value) -> String {
     let reply = harness.refused(case, path, body, STATUS, CODE).await;
@@ -138,7 +147,7 @@ async fn a_member_constraint_names_the_member_and_the_requirement_without_the_va
                 "workloadName": "SAP",
                 "deploymentPatternName": "SapHanaSingle",
                 "name": "bad name",
-                "specifications": {"applicationName": "demo"},
+                "specifications": conforming_specifications(),
                 "dryRun": true,
             }),
             expected: scalar_clause(
@@ -154,7 +163,7 @@ async fn a_member_constraint_names_the_member_and_the_requirement_without_the_va
                 "workloadName": "SAP",
                 "deploymentPatternName": "-SapHanaSingle",
                 "name": "valid-name",
-                "specifications": {"applicationName": "demo"},
+                "specifications": conforming_specifications(),
                 "dryRun": true,
             }),
             expected: scalar_clause(
@@ -382,7 +391,7 @@ async fn an_unusable_next_token_is_refused_with_the_fixed_pagination_message() {
                 "workloadName": "SAP",
                 "deploymentPatternName": "SapHanaSingle",
                 "name": "token-suite",
-                "specifications": {"applicationName": "demo"},
+                "specifications": conforming_specifications(),
                 "dryRun": false,
             }),
         )

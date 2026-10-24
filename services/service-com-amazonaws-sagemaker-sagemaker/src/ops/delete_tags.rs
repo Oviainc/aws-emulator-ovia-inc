@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteTags
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteTags`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteTags::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the tags `TagKeys` names from the resource `ResourceArn` names, leaving every
+//! other tag of that resource in place and in its stored order.
+//!
+//! Keyed removal is IDEMPOTENT: a key the resource does not carry is nothing to remove,
+//! not a failure, so repeating the same call answers the same way. The removal is made
+//! on the resource's own record (through
+//! [`crate::state::ComAmazonawsSagemakerSagemakerState::tags_mut`]), the one tag set
+//! `AddTags` writes and `ListTags` reports.
 //!
 //! ## Shape of an operation
 //!
@@ -134,18 +134,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteTags` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteTagsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteTags"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        let mut store = state.lock();
+        // Same resolution as `AddTags` and `ListTags`: an ARN this account holds no
+        // resource under has no tag set to delete from, which is refused rather than
+        // reported as a successful removal that happened nowhere.
+        let tags = store.tags_mut(&input.resource_arn).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::does_not_exist(
+                crate::state::TAGGED_RESOURCE_ENTITY,
+                &input.resource_arn,
+            ))
+        })?;
+
+        let before = tags.len();
+        // Removal is by KEY, and a key the resource does not carry is a no-op rather than
+        // a failure: the request states the keys that must be gone afterwards, so the same
+        // call made twice answers the same way.
+        tags.retain(|tag| !input.tag_keys.iter().any(|key| key == &tag.key));
+        let removed = before - tags.len();
+        drop(store);
+
+        if removed > 0 {
+            crate::state::record_state_change(Self::NAME, &input.resource_arn, ctx);
+        }
+        Ok(DeleteTagsOutput {})
     }
 }
