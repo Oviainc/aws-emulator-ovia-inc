@@ -16,7 +16,12 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-freetier-awsfreetierser
 pub struct GetAccountPlanStateInput {
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.freetier#GetAccountPlanStateResponse")]
+/// `GetAccountPlanStateResponse`. Its schema and codec come from
+/// [`freetier_schema_and_codec!`] rather than `#[smithy_macros::smithy(shape = ...)]`,
+/// because `accountPlanExpirationDate` carries `@timestampFormat("date-time")` and the
+/// derive drops that trait; see `types::date_time_wire` for the whole story. Member set,
+/// order and requiredness from
+/// `smithy_query(query="operation",operation="GetAccountPlanState")`.
 #[derive(Debug, Clone, Default)]
 pub struct GetAccountPlanStateOutput {
     pub account_id: String,
@@ -25,4 +30,48 @@ pub struct GetAccountPlanStateOutput {
     pub account_plan_remaining_credits: Option<MonetaryAmount>,
     pub account_plan_expiration_date: Option<::aws_smithy_types::DateTime>,
 }
+
+freetier_schema_and_codec!(
+    GetAccountPlanStateOutput,
+    GET_ACCOUNT_PLAN_STATE_OUTPUT_SCHEMA,
+    "com.amazonaws.freetier#GetAccountPlanStateResponse",
+    "com.amazonaws.freetier",
+    "GetAccountPlanStateResponse",
+    (M_ACCOUNT_ID, account_id, "accountId", 0, req, string),
+    // `AccountPlanType`/`AccountPlanStatus` are enum shapes: string-encoded, which is
+    // the kind the derive classifies them as too.
+    (
+        M_ACCOUNT_PLAN_TYPE,
+        account_plan_type,
+        "accountPlanType",
+        1,
+        req,
+        string
+    ),
+    (
+        M_ACCOUNT_PLAN_STATUS,
+        account_plan_status,
+        "accountPlanStatus",
+        2,
+        req,
+        string
+    ),
+    (
+        M_ACCOUNT_PLAN_REMAINING_CREDITS,
+        account_plan_remaining_credits,
+        "accountPlanRemainingCredits",
+        3,
+        opt,
+        struct_of(MonetaryAmount)
+    ),
+    // `@timestampFormat("date-time")` — THE reason this schema is not derived.
+    (
+        M_ACCOUNT_PLAN_EXPIRATION_DATE,
+        account_plan_expiration_date,
+        "accountPlanExpirationDate",
+        4,
+        opt,
+        date_time
+    ),
+);
 
