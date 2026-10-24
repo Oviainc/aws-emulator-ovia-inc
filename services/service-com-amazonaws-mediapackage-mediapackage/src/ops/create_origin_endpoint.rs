@@ -202,7 +202,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
         })?;
-        let mut state = state.lock();
 
         // Bound what the caller may make this record cost, before anything is stored:
         // the store copies these collections and strings verbatim, so one request must
@@ -231,6 +230,50 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.cmaf_package.as_ref(),
             input.mss_package.as_ref(),
         )?;
+        // The access-control and packaging members are judged by CONTENT too, not only by
+        // size: a whitelist entry that is not an address range, an ARN that names no
+        // resource of the documented service, and a CMAF package that publishes no child
+        // manifest are each refused before anything is stored — by the one function the
+        // update calls as well.
+        crate::state::check_origin_endpoint_members(
+            input.whitelist.as_deref(),
+            input.authorization.as_ref(),
+            input.hls_package.as_ref(),
+            input.dash_package.as_ref(),
+            input.cmaf_package.as_ref(),
+            input.mss_package.as_ref(),
+        )?;
+
+        // MediaPackage acts AS every role this request names — it reads the CDN secret as
+        // the authorization role and reaches the key provider as the SPEKE role — so a role
+        // it could never assume is refused here instead of being stored as credentials that
+        // would reject every playback request. The IAM store is a different store in the
+        // same engine, and its guard is taken and released BEFORE this service's, so no two
+        // orders of the same two locks exist.
+        let assumed_roles = crate::state::origin_endpoint_assumed_roles(
+            input.authorization.as_ref(),
+            input.hls_package.as_ref(),
+            input.dash_package.as_ref(),
+            input.cmaf_package.as_ref(),
+            input.mss_package.as_ref(),
+        );
+        if !assumed_roles.is_empty() {
+            let iam = crate::state::iam_state(&*self.engine).ok_or_else(|| {
+                CreateOriginEndpointErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        message: Some("the IAM store is unavailable".into()),
+                    },
+                )
+            })?;
+            let iam = iam.lock();
+            for (member, role_arn) in &assumed_roles {
+                if let Some(refusal) = crate::state::assume_role_refusal(member, role_arn, &iam) {
+                    return Err(refusal.into());
+                }
+            }
+        }
+
+        let mut state = state.lock();
 
         // An OriginEndpoint packages ONE Channel: a ChannelId naming no stored channel
         // has nothing to package, so the endpoint is not created. This is a value in the

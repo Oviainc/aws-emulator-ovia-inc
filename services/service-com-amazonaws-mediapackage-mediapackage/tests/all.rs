@@ -29,6 +29,8 @@ mod ingest_credentials;
 mod mutation_persistence;
 #[path = "all/mutually_exclusive_list_filters.rs"]
 mod mutually_exclusive_list_filters;
+#[path = "all/origin_endpoint_contents.rs"]
+mod origin_endpoint_contents;
 #[path = "all/origin_endpoint_defaults.rs"]
 mod origin_endpoint_defaults;
 #[path = "all/origin_endpoint_durations.rs"]

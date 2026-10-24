@@ -61,6 +61,18 @@ const ACCEPTED: &[i32] = &[DISABLED, MINIMUM, MINIMUM + 1, 600, 86_400, 1_209_60
 /// rule is asserted across them rather than on one.
 const PACKAGES: &[&str] = &["hlsPackage", "dashPackage", "mssPackage", "cmafPackage"];
 
+/// The smallest body for `package` this service stores: empty for the three formats whose
+/// every member is optional, and one child manifest for `cmafPackage`, whose `HlsManifests`
+/// is what its playback URL serves (`state::MIN_CMAF_HLS_MANIFESTS`) — a package publishing
+/// none is refused, which `tests/all/origin_endpoint_contents.rs` is the suite for.
+fn package_body(package: &str) -> Value {
+    if package == "cmafPackage" {
+        json!({ "hlsManifests": [{ "id": "primary" }] })
+    } else {
+        json!({})
+    }
+}
+
 /// The requirement a refused value states: the member's own minimum, as the service words
 /// every violated numeric bound.
 fn requirement() -> String {
@@ -71,7 +83,7 @@ fn requirement() -> String {
 /// `Some` and leaving the member out when it is `None`.
 fn create_body(id: &str, package: &str, seconds: Option<i32>) -> Value {
     let mut body = json!({ "channelId": CHANNEL_ID, "id": id });
-    body[package] = json!({});
+    body[package] = package_body(package);
     if let Some(seconds) = seconds {
         body["startoverWindowSeconds"] = json!(seconds);
     }
@@ -83,7 +95,7 @@ fn create_body(id: &str, package: &str, seconds: Option<i32>) -> Value {
 /// `ChannelId`, so neither travels in its body.
 fn update_body(package: &str, seconds: Option<i32>) -> Value {
     let mut body = json!({});
-    body[package] = json!({});
+    body[package] = package_body(package);
     if let Some(seconds) = seconds {
         body["startoverWindowSeconds"] = json!(seconds);
     }
