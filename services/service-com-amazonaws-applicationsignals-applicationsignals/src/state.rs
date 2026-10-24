@@ -144,8 +144,10 @@ pub struct ComAmazonawsApplicationsignalsApplicationsignalsState {
     pub slos: BTreeMap<String, ServiceLevelObjective>,
     /// Tags per resource ARN, the key the service's tagging operations address a resource
     /// by (`TagResource`/`UntagResource`/`ListTagsForResource` take a `ResourceArn`). One
-    /// entry per tagged resource, so [`MAX_SLOS`] bounds this map too; the entry is dropped
-    /// once the resource holds no tags (see [`Self::remove_tags`]).
+    /// entry per tagged resource of either kind this service holds, so
+    /// [`MAX_SLOS`] + [`MAX_INSTRUMENTATION_CONFIGURATIONS`] bounds this map too; the entry
+    /// is dropped once the resource holds no tags (see [`Self::remove_tags`]) or the resource
+    /// itself is gone.
     pub tags: BTreeMap<String, BTreeMap<String, String>>,
     /// Every dynamic instrumentation configuration this emulator holds, grouped by the
     /// [`InstrumentationScope`] a `ListInstrumentationConfigurations` call names.
@@ -202,11 +204,26 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
     /// `ResourceNotFoundException` for.
     ///
     /// `ResourceArn` is an ARN (`AmazonResourceName`), so only the ARN form resolves: a
-    /// bare SLO name is not a resource ARN and names no resource here. Which ARNs name a
-    /// resource of this service and account is [`tagged_slo_name_in_arn`]'s rule.
+    /// bare SLO name is not a resource ARN and names no resource here. Which ARNs name an
+    /// SLO of this service and account is [`tagged_slo_name_in_arn`]'s rule.
+    ///
+    /// An instrumentation configuration is tagged too (`CreateInstrumentationConfiguration`
+    /// takes a `TagList`), and its ARN carries the service and environment names, which may
+    /// themselves contain `/` — so it is resolved by comparing against the ARN each stored
+    /// record was minted with rather than by taking the identity apart again. The scan is
+    /// bounded by [`MAX_INSTRUMENTATION_CONFIGURATIONS`].
     pub fn tagged_resource_arn(&self, resource_arn: &str) -> Option<&str> {
-        let name = tagged_slo_name_in_arn(resource_arn)?;
-        self.slos.get(name).map(|slo| slo.arn.as_str())
+        if let Some(arn) = tagged_slo_name_in_arn(resource_arn)
+            .and_then(|name| self.slos.get(name))
+            .map(|slo| slo.arn.as_str())
+        {
+            return Some(arn);
+        }
+        self.instrumentation_configurations
+            .values()
+            .flat_map(|set| set.configurations.values())
+            .find(|configuration| configuration.arn == resource_arn)
+            .map(|configuration| configuration.arn.as_str())
     }
 
     /// The tags attached to the resource stored under `arn`, as the modelled `TagList`.
@@ -435,12 +452,33 @@ pub fn slo_not_found(region: &str, id: &str) -> ResourceNotFoundException {
 /// full resource identifier, so there is nothing to mint from it and nothing of the
 /// caller's identity to re-derive — unlike [`slo_not_found`], which renders an ARN for a
 /// request that may have named a bare SLO name. `ResourceType` is the capitalised type name
-/// of the only resource this service's tagging operations address.
+/// of the resource KIND the ARN addresses ([`tagged_resource_type`]), so a client comparing
+/// it sees the type it asked about rather than the type of this service's other resource.
 pub fn tagged_resource_not_found(resource_arn: &str) -> ResourceNotFoundException {
+    let resource_type = tagged_resource_type(resource_arn);
     ResourceNotFoundException {
-        message: format!("{SLO_RESOURCE_TYPE} with arn '{resource_arn}' does not exist."),
-        resource_type: SLO_RESOURCE_TYPE.to_string(),
+        message: format!("{resource_type} with arn '{resource_arn}' does not exist."),
+        resource_type: resource_type.to_string(),
         resource_id: resource_arn.to_string(),
+    }
+}
+
+/// The capitalised type name of the resource kind a tagging operation's `ResourceArn`
+/// addresses: this service tags two kinds, and which one an ARN names is the resource TYPE
+/// segment of an ARN of THIS service — read through `service_common::arn::parse_of`, the
+/// workspace's ONE resource-ARN parse narrowed to this service's namespace, so the segment
+/// comes out of the ARN's resource field rather than out of a substring match, and an ARN of
+/// another vendor cannot be reported as a resource type of this one.
+///
+/// Anything else is reported as the SLO type, which is also what an ARN of another service or
+/// another account earns: the tagging operations' primary resource.
+pub fn tagged_resource_type(resource_arn: &str) -> &'static str {
+    let names_configuration = ::service_common::arn::parse_of(resource_arn, SIGNING_NAME)
+        .is_some_and(|arn| arn.resource_type() == INSTRUMENTATION_CONFIG_ARN_RESOURCE);
+    if names_configuration {
+        INSTRUMENTATION_CONFIG_RESOURCE_TYPE
+    } else {
+        SLO_RESOURCE_TYPE
     }
 }
 
@@ -1822,6 +1860,13 @@ pub fn instrumentation_configuration_already_exists(arn: &str) -> ConflictExcept
     }
 }
 
+/// The only `DynamicInstrumentationDeletionStatus` the model declares
+/// (`smithy_query(query="shape",shape="DynamicInstrumentationDeletionStatus")` ->
+/// `["DELETED"]`), which `DeleteInstrumentationConfiguration` answers once the configuration
+/// it named is no longer stored. Its member doc: "The value is DELETED when the
+/// configuration has been removed."
+pub const DELETION_STATUS_DELETED: &str = "DELETED";
+
 /// The `ResourceType` an instrumentation configuration failure reports: the resource's TYPE
 /// NAME (the modelled `InstrumentationConfiguration` shape), not the camel-case segment an
 /// ARN spells ([`INSTRUMENTATION_CONFIG_ARN_RESOURCE`]) — the same distinction
@@ -1849,5 +1894,40 @@ pub fn instrumentation_configuration_not_found(
         ),
         resource_type: INSTRUMENTATION_CONFIG_RESOURCE_TYPE.to_string(),
         resource_id: arn,
+    }
+}
+
+impl ComAmazonawsApplicationsignalsApplicationsignalsState {
+    /// Remove the configuration stored in `scope` under `key` ([`instrumentation_key`]),
+    /// along with its tags, and hand back the removed record. `None` — and nothing removed —
+    /// when the scope holds no configuration at that location.
+    ///
+    /// `at` is recorded as the instant the scope's set changed, the mirror of
+    /// [`Self::put_instrumentation_configuration`]: a deletion is news to every caller that
+    /// synced before it, and it leaves no record for a list to read a timestamp off. A scope
+    /// whose set this empties keeps that instant for [`EMPTY_SCOPE_RETENTION`] so a slower
+    /// caller still learns of the change, and the expiry pass is scheduled for the end of
+    /// that horizon so the emptied record is dropped once it has nothing left to tell.
+    pub fn remove_instrumentation_configuration(
+        &mut self,
+        scope: &InstrumentationScope,
+        key: &str,
+        at: DateTime,
+    ) -> Option<InstrumentationConfiguration> {
+        let (removed, emptied) = {
+            let set = self.instrumentation_configurations.get_mut(scope)?;
+            let removed = set.configurations.remove(key)?;
+            set.record_change(at);
+            (removed, set.configurations.is_empty())
+        };
+        // Tags are addressed by resource ARN, so a record that is gone takes its tags with
+        // it rather than leaving them for the next resource minted at that ARN.
+        self.tags.remove(&removed.arn);
+        if emptied {
+            self.schedule_instrumentation_pass(DateTime::from_secs_f64(
+                at.as_secs_f64() + EMPTY_SCOPE_RETENTION.as_secs_f64(),
+            ));
+        }
+        Some(removed)
     }
 }

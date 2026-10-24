@@ -1,15 +1,7 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteInstrumentationConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteInstrumentationConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteInstrumentationConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the stored dynamic instrumentation configuration an identity names.
 //!
 //! ## Shape of an operation
 //!
@@ -145,23 +137,69 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::DELETE_INSTRUMENTATION_CONFIGURATION_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Remove the stored configuration, and its tags, so later reads no longer see it.
+    ///
+    /// `DeletionStatus` is the only value the modelled
+    /// `DynamicInstrumentationDeletionStatus` carries, and it is answered only once the
+    /// configuration the request named is no longer stored — "the value is DELETED when the
+    /// configuration has been removed".
+    ///
+    /// Deleting an identity that names no stored configuration is a 404: the model declares
+    /// `ResourceNotFoundException` and the operation is not `@idempotent`, so a repeat of a
+    /// successful delete is refused rather than answered DELETED a second time. A
+    /// configuration whose lifetime has already run out is gone for the same reason it is
+    /// gone for a reader — the clock, not this call — so deleting it is that same 404.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteInstrumentationConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteInstrumentationConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteInstrumentationConfiguration"))
+        let now = ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now());
+        let region = crate::state::region_of(ctx.parts());
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DeleteInstrumentationConfigurationErrorModeled::ThrottlingException(
+                    ThrottlingException {
+                        message: crate::state::STATE_UNAVAILABLE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Either form of `LocationIdentifier` resolves to the same record, since the create
+        // stored the configuration under the hash of its location. `InstrumentationType` is
+        // part of the scope a configuration lives in ("required to determine which backing
+        // store to query"), so a request naming the other type names no configuration.
+        let scope = crate::state::InstrumentationScope::new(
+            &input.instrumentation_type,
+            &input.service,
+            &input.environment,
+        );
+        let location_hash = crate::state::identified_location_hash(&input.location_identifier);
+        let key = crate::state::instrumentation_key(&input.signal_type, &location_hash);
+
+        let mut store = state.lock();
+        store.expire_instrumentation_configurations(&now);
+        if store
+            .remove_instrumentation_configuration(&scope, &key, now)
+            .is_none()
+        {
+            return Err(
+                DeleteInstrumentationConfigurationErrorModeled::ResourceNotFoundException(
+                    crate::state::instrumentation_configuration_not_found(
+                        &region,
+                        &scope,
+                        &input.signal_type,
+                        &location_hash,
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        Ok(DeleteInstrumentationConfigurationOutput {
+            deletion_status: crate::state::DELETION_STATUS_DELETED.to_string(),
+        })
     }
 }

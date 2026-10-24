@@ -19,6 +19,8 @@ mod get_instrumentation_configuration;
 mod get_service;
 #[path = "all/grouping_configuration.rs"]
 mod grouping_configuration;
+#[path = "all/instrumentation_configuration_deletion.rs"]
+mod instrumentation_configuration_deletion;
 #[path = "all/instrumentation_configurations.rs"]
 mod instrumentation_configurations;
 #[path = "all/list_services.rs"]
