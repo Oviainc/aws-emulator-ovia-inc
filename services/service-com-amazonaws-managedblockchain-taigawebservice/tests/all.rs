@@ -39,6 +39,8 @@ mod not_found_and_malformed_ids;
 mod proposal_lifecycle;
 #[path = "all/public_networks_and_membership.rs"]
 mod public_networks_and_membership;
+#[path = "all/region_isolation.rs"]
+mod region_isolation;
 #[path = "all/reserved_tag_keys.rs"]
 mod reserved_tag_keys;
 #[path = "all/resource_tags.rs"]

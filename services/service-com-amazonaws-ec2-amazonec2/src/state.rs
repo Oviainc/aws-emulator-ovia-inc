@@ -90,6 +90,22 @@
 //! resolved — which answers [`INVALID_LOCAL_GATEWAY_ROUTE_TABLE_ID_NOT_FOUND`] for every
 //! well-formed id while the route table store is empty.
 //!
+//! ## A security group's rules are objects of their own
+//!
+//! A security group's rules have two shapes in the EC2 API: the aggregated
+//! `IpPermissions`/`IpPermissionsEgress` lists `DescribeSecurityGroups` reports, and the
+//! individual [`SecurityGroupRule`] objects — one per destination, each with its own
+//! `SecurityGroupRuleId` — that `AuthorizeSecurityGroup{Ingress,Egress}` answers with and
+//! `DescribeSecurityGroupRules`, `ModifySecurityGroupRules` and the revokes address by id.
+//! [`ComAmazonawsEc2Amazonec2State::security_group_rules`] holds those objects, keyed by
+//! rule id, and [`ComAmazonawsEc2Amazonec2State::insert_security_group_rules`] is the ONLY
+//! writer of a rule: it expands one `IpPermission` into one rule per grant it names and
+//! ends by recomputing the aggregated lists of the group it belongs to
+//! ([`ComAmazonawsEc2Amazonec2State::resync_security_group_permissions`]), so the two views
+//! of one rule cannot drift apart. The rules a group is created with (the allow-all
+//! outbound rule every group carries, the default group's self-referencing inbound rule)
+//! are stored through that same writer, so every rule the store holds has an id.
+//!
 //! A fact of a VPC that the modelled [`Vpc`] shape carries no member for is stored beside
 //! it under the same id rather than on it:
 //! [`ComAmazonawsEc2Amazonec2State::vpc_attributes`] holds the `VpcAttributeName`
@@ -883,8 +899,8 @@ use crate::ops::types::{
     LaunchTemplate, MacHost, Monitoring, NatGateway, NetworkInsightsAccessScope,
     NetworkInsightsAccessScopeAnalysis, NetworkInterface, NetworkInterfacePrivateIpAddress,
     OperatorResponse, PeeringAttachmentStatus, Placement,
-    PlacementGroup,
-    PrivateDnsNameOptionsOnLaunch,
+    PlacementGroup, PrefixListId,
+    PrivateDnsNameOptionsOnLaunch, ReferencedSecurityGroup, SecurityGroupRule,
     DnsEntry, PayerResponsibilityEntry, ProductCode,
     Region, ReplaceRootVolumeTask, RequestLaunchTemplateData, RouteServer, RouteServerBfdStatus,
     RouteServerBgpOptions, RouteServerBgpStatus, RouteServerEndpoint, RouteServerPeer,
@@ -909,9 +925,9 @@ use crate::ops::types::{
 };
 use crate::scaffolded::Scaffolded;
 
-// The shapes a security group RULE is made of, imported on their own line so this file's
-// one big `use crate::ops::types::{..}` list stays as it is.
-use crate::ops::types::{Ipv6Range, PrefixListId, ReferencedSecurityGroup, SecurityGroupRule};
+// One shape a security group rule's aggregated view is made of, imported on its own line so
+// this file's one big `use crate::ops::types::{..}` list stays as it is.
+use crate::ops::types::Ipv6Range;
 
 /// The Traffic Mirror filter store's own primitives — the id prefix, the bounds, the byte
 /// charge and the error channel `CreateTrafficMirrorFilter` and
@@ -1405,6 +1421,13 @@ pub const INVALID_DHCP_OPTION_ID_NOT_FOUND: &str = "InvalidDhcpOptionID.NotFound
 
 /// EC2's error code for a request that named a security group no group of the account has.
 pub const INVALID_GROUP_NOT_FOUND: &str = "InvalidGroup.NotFound";
+
+/// EC2's error code for a value that is not a security group id at all, answered BEFORE
+/// the id is looked up — the security group surface's own `.Malformed`, the same ordering
+/// [`require_well_formed_id`] keeps for every other resource named by one id. A value no
+/// `sg-` id could be names no group in ANY account, so it is refused as malformed rather
+/// than reported absent from this one.
+pub const INVALID_GROUP_ID_MALFORMED: &str = "InvalidGroupId.Malformed";
 
 /// EC2's error code for a request that named a security group rule id no rule of the
 /// account has (EC2 API error codes, "InvalidSecurityGroupRuleId.NotFound").
@@ -2934,8 +2957,16 @@ impl ComAmazonawsEc2Amazonec2State {
             // `CreateSecurityGroup` takes no rules from the request — so their bytes are not
             // charged to the caller-chosen budget, the same terms the group's own name and
             // description are stored on.
-            let minted =
-                self.insert_security_group_rules(&group_id, false, permission, false, &region);
+            let minted = self.insert_security_group_rules(
+                &group_id,
+                false,
+                permission,
+                // `CreateSecurityGroup` takes no tags for a rule: a tag specification on it
+                // applies to the GROUP.
+                &[],
+                false,
+                &region,
+            );
             // Those defaults always fit the published per-direction quota, so a permission
             // dropped here would be a group stored with fewer rules than its spec named —
             // the one thing the empty answer of `insert_security_group_rules` could hide.
@@ -2949,8 +2980,14 @@ impl ComAmazonawsEc2Amazonec2State {
             );
         }
         for permission in &spec.ip_permissions_egress {
-            let minted =
-                self.insert_security_group_rules(&group_id, true, permission, false, &region);
+            let minted = self.insert_security_group_rules(
+                &group_id,
+                true,
+                permission,
+                &[],
+                false,
+                &region,
+            );
             debug_assert_eq!(
                 minted.len(),
                 ip_permission_grant_count(permission),
@@ -2989,6 +3026,7 @@ impl ComAmazonawsEc2Amazonec2State {
         group_id: &str,
         is_egress: bool,
         permission: &IpPermission,
+        tags: &[Tag],
         caller_supplied: bool,
         region: &str,
     ) -> Vec<String> {
@@ -2999,63 +3037,13 @@ impl ComAmazonawsEc2Amazonec2State {
         if !self.has_security_group_rule_capacity(group_id, is_egress, grants) {
             return Vec::new();
         }
-        // What every rule of this permission shares; the grant each one names is set on
-        // the clone below.
-        let template = SecurityGroupRule {
-            group_id: Some(group_id.to_string()),
-            group_owner_id: Some(::engine::emulator_account_id().to_string()),
-            is_egress: Some(is_egress),
-            ip_protocol: permission.ip_protocol.clone(),
-            from_port: permission.from_port,
-            to_port: permission.to_port,
-            ..SecurityGroupRule::default()
-        };
         let mut minted: Vec<String> = Vec::new();
-        for range in permission.ip_ranges.iter().flatten() {
-            let rule = SecurityGroupRule {
-                cidr_ipv4: range.cidr_ip.clone(),
-                description: range.description.clone(),
-                ..template.clone()
-            };
-            minted.extend(self.insert_security_group_rule(rule, None, caller_supplied, region));
-        }
-        for range in permission.ipv6_ranges.iter().flatten() {
-            let rule = SecurityGroupRule {
-                cidr_ipv6: range.cidr_ipv6.clone(),
-                description: range.description.clone(),
-                ..template.clone()
-            };
-            minted.extend(self.insert_security_group_rule(rule, None, caller_supplied, region));
-        }
-        for entry in permission.prefix_list_ids.iter().flatten() {
-            let rule = SecurityGroupRule {
-                prefix_list_id: entry.prefix_list_id.clone(),
-                description: entry.description.clone(),
-                ..template.clone()
-            };
-            minted.extend(self.insert_security_group_rule(rule, None, caller_supplied, region));
-        }
-        for pair in permission.user_id_group_pairs.iter().flatten() {
-            let rule = SecurityGroupRule {
-                // "Describes the security group that is referenced in the rule"
-                // (`SecurityGroupRule$ReferencedGroupInfo`): the same facts the
-                // permission's `UserIdGroupPair` carries, minus the ones that belong to
-                // the grant rather than to the referenced group (its name, which is not a
-                // member of `ReferencedSecurityGroup`, and the description, which is the
-                // rule's own).
-                referenced_group_info: Some(ReferencedSecurityGroup {
-                    group_id: pair.group_id.clone(),
-                    user_id: pair.user_id.clone(),
-                    vpc_id: pair.vpc_id.clone(),
-                    vpc_peering_connection_id: pair.vpc_peering_connection_id.clone(),
-                    peering_status: pair.peering_status.clone(),
-                }),
-                description: pair.description.clone(),
-                ..template.clone()
-            };
+        for (rule, referenced_group_name) in
+            security_group_rule_grants(group_id, is_egress, permission, tags)
+        {
             minted.extend(self.insert_security_group_rule(
                 rule,
-                pair.group_name.clone(),
+                referenced_group_name,
                 caller_supplied,
                 region,
             ));
@@ -3291,6 +3279,7 @@ impl ComAmazonawsEc2Amazonec2State {
                 ipv6_ranges: Some(Vec::new()),
                 prefix_list_ids: Some(Vec::new()),
             },
+            &[],
             // The rule AWS gives a default group, not one a request named.
             false,
             region,
@@ -3486,6 +3475,175 @@ pub fn ip_permission_grant_count(permission: &IpPermission) -> usize {
         + permission.user_id_group_pairs.iter().flatten().count()
 }
 
+/// The rules one [`IpPermission`] grants on `group_id`, each beside the NAME its grant named
+/// a referenced group by — the rules as they will be stored, minus what the service itself
+/// mints for them (the rule id and its ARN).
+///
+/// The ONE definition of WHICH rules a permission describes: the protocol, the port range
+/// and the tags are facts of the permission, so every rule it grants carries them, while the
+/// one destination and the description belong to the grant.
+///
+/// Reached only from [`ComAmazonawsEc2Amazonec2State::insert_security_group_rules`], and only
+/// AFTER it has weighed the whole permission against the per-direction quota, so the rules
+/// built here are at most that quota's worth — the same records the store is about to hold.
+/// A writer that wants the SIZE of those rules before any of them exists asks
+/// [`security_group_rules_charge`], which counts lengths instead of building anything.
+fn security_group_rule_grants(
+    group_id: &str,
+    is_egress: bool,
+    permission: &IpPermission,
+    tags: &[Tag],
+) -> Vec<(SecurityGroupRule, Option<String>)> {
+    // What every rule of this permission shares; the grant each one names is set on the
+    // clones below.
+    let template = SecurityGroupRule {
+        group_id: Some(group_id.to_string()),
+        group_owner_id: Some(::engine::emulator_account_id().to_string()),
+        is_egress: Some(is_egress),
+        ip_protocol: permission.ip_protocol.clone(),
+        from_port: permission.from_port,
+        to_port: permission.to_port,
+        // "The tags applied to the security group rule"
+        // (`AuthorizeSecurityGroupEgressRequest$TagSpecifications`): a tag specification
+        // applies to the resources the call creates, which is every rule of the permission.
+        tags: Some(tags.to_vec()),
+        ..SecurityGroupRule::default()
+    };
+    let mut grants: Vec<(SecurityGroupRule, Option<String>)> = Vec::new();
+    for range in permission.ip_ranges.iter().flatten() {
+        grants.push((
+            SecurityGroupRule {
+                cidr_ipv4: range.cidr_ip.clone(),
+                description: range.description.clone(),
+                ..template.clone()
+            },
+            None,
+        ));
+    }
+    for range in permission.ipv6_ranges.iter().flatten() {
+        grants.push((
+            SecurityGroupRule {
+                cidr_ipv6: range.cidr_ipv6.clone(),
+                description: range.description.clone(),
+                ..template.clone()
+            },
+            None,
+        ));
+    }
+    for entry in permission.prefix_list_ids.iter().flatten() {
+        grants.push((
+            SecurityGroupRule {
+                prefix_list_id: entry.prefix_list_id.clone(),
+                description: entry.description.clone(),
+                ..template.clone()
+            },
+            None,
+        ));
+    }
+    for pair in permission.user_id_group_pairs.iter().flatten() {
+        grants.push((
+            SecurityGroupRule {
+                // "Describes the security group that is referenced in the rule"
+                // (`SecurityGroupRule$ReferencedGroupInfo`): the same facts the permission's
+                // `UserIdGroupPair` carries, minus the ones that belong to the grant rather
+                // than to the referenced group (its name, which is not a member of
+                // `ReferencedSecurityGroup`, and the description, which is the rule's own).
+                referenced_group_info: Some(ReferencedSecurityGroup {
+                    group_id: pair.group_id.clone(),
+                    user_id: pair.user_id.clone(),
+                    vpc_id: pair.vpc_id.clone(),
+                    vpc_peering_connection_id: pair.vpc_peering_connection_id.clone(),
+                    peering_status: pair.peering_status.clone(),
+                }),
+                description: pair.description.clone(),
+                ..template.clone()
+            },
+            pair.group_name.clone(),
+        ));
+    }
+    grants
+}
+
+/// The bytes the rules `permissions` describe will be charged against [`MAX_STORED_BYTES`]
+/// once stored, with `tags` on every one of them.
+///
+/// What a writer of SEVERAL permissions asks BEFORE it stores any of them, so a request that
+/// would pass the store's byte budget is refused with nothing stored rather than part-way
+/// through. Counted over the rules [`security_group_rule_grants`] says the permissions
+/// describe, with the same [`security_group_rule_payload_bytes`] the stored record is charged
+/// with, so the question asked here and the charge made later cannot come to differ. The
+/// group and the direction the rules will belong to are not charged for, which is why this
+/// needs neither.
+pub fn security_group_rules_charge(permissions: &[IpPermission], tags: &[Tag]) -> usize {
+    let text = |value: &Option<String>| value.as_deref().map_or(0, str::len);
+    // The tags one specification applies to every rule are weighed ONCE and counted per
+    // rule, never cloned onto each of them, and no rule is built to weigh it: answering this
+    // allocates nothing and is linear in the request, where building the rules would be the
+    // product of its grant count and its tag count — and this is the guard that runs BEFORE
+    // the store's budget has admitted anything.
+    let tag_bytes = tag_list_bytes(tags);
+    let mut charge = 0usize;
+    for permission in permissions {
+        for range in permission.ip_ranges.iter().flatten() {
+            charge = charge.saturating_add(security_group_rule_charge(
+                text(&range.cidr_ip),
+                text(&range.description),
+                0,
+                tag_bytes,
+            ));
+        }
+        for range in permission.ipv6_ranges.iter().flatten() {
+            charge = charge.saturating_add(security_group_rule_charge(
+                text(&range.cidr_ipv6),
+                text(&range.description),
+                0,
+                tag_bytes,
+            ));
+        }
+        for entry in permission.prefix_list_ids.iter().flatten() {
+            charge = charge.saturating_add(security_group_rule_charge(
+                text(&entry.prefix_list_id),
+                text(&entry.description),
+                0,
+                tag_bytes,
+            ));
+        }
+        for pair in permission.user_id_group_pairs.iter().flatten() {
+            charge = charge.saturating_add(security_group_rule_charge(
+                0,
+                text(&pair.description),
+                text(&pair.group_id)
+                    .saturating_add(text(&pair.user_id))
+                    .saturating_add(text(&pair.group_name)),
+                tag_bytes,
+            ));
+        }
+    }
+    charge
+}
+
+/// What ONE stored security group rule costs the store: the fixed per-record overhead plus
+/// the caller-chosen bytes it retains, grouped as the destination it names, its description,
+/// the group it references (that group's id, the account owning it and the name the grant
+/// named it by) and its tags.
+///
+/// The ONE definition of a rule's charge, shared by [`security_group_rule_payload_bytes`],
+/// which weighs a record that exists, and by [`security_group_rules_charge`], which weighs
+/// the rules a request describes before any of them is built — so a request cannot be
+/// admitted under one arithmetic and charged under another.
+fn security_group_rule_charge(
+    destination: usize,
+    description: usize,
+    referenced_group: usize,
+    tags: usize,
+) -> usize {
+    STORED_RECORD_OVERHEAD_BYTES
+        .saturating_add(destination)
+        .saturating_add(description)
+        .saturating_add(referenced_group)
+        .saturating_add(tags)
+}
+
 /// The bytes one stored security group rule holds: the fixed
 /// [`STORED_RECORD_OVERHEAD_BYTES`] every stored record costs, plus every string the record
 /// retains — the grant it names, its description, the group it references and its tags.
@@ -3501,18 +3659,19 @@ pub fn ip_permission_grant_count(permission: &IpPermission) -> usize {
 /// named, recorded on [`SecurityGroupRuleRecord::payload_bytes`] and given back by
 /// [`ComAmazonawsEc2Amazonec2State::remove_security_group`], so a group's rules are as
 /// bounded in bytes as the group itself.
+/// Counted as [`security_group_rule_charge`]'s terms, the same arithmetic
+/// [`security_group_rules_charge`] admits a request under.
 pub fn security_group_rule_payload_bytes(record: &SecurityGroupRuleRecord) -> usize {
     let rule = &record.rule;
     let text = |value: &Option<String>| value.as_deref().map_or(0, str::len);
     let referenced = rule.referenced_group_info.as_ref();
-    STORED_RECORD_OVERHEAD_BYTES
-        + text(&rule.cidr_ipv4)
-        + text(&rule.cidr_ipv6)
-        + text(&rule.prefix_list_id)
-        + text(&rule.description)
-        + text(&record.referenced_group_name)
-        + referenced.map_or(0, |group| text(&group.group_id) + text(&group.user_id))
-        + tag_list_bytes(rule.tags.as_deref().unwrap_or_default())
+    security_group_rule_charge(
+        text(&rule.cidr_ipv4) + text(&rule.cidr_ipv6) + text(&rule.prefix_list_id),
+        text(&rule.description),
+        text(&record.referenced_group_name)
+            + referenced.map_or(0, |group| text(&group.group_id) + text(&group.user_id)),
+        tag_list_bytes(rule.tags.as_deref().unwrap_or_default()),
+    )
 }
 
 /// One stored launch template: the modelled [`LaunchTemplate`] every operation that reports
@@ -7352,6 +7511,20 @@ pub fn invalid_group_not_found<E>(group: &str) -> crate::scaffolded::Scaffolded<
         INVALID_GROUP_NOT_FOUND,
         400,
         format!("The security group '{group}' does not exist"),
+    )
+}
+
+/// Refuse a value that is not a security group id at all, the way EC2 does: HTTP 400
+/// `InvalidGroupId.Malformed`.
+///
+/// What a handler answers for a value [`security_group_id_is_well_formed`] rejects, whether
+/// it arrived as the operation's own group id or inside a rule's `UserIdGroupPair`, so one
+/// malformed id has one refusal wherever it is named.
+pub fn invalid_group_id_malformed<E>(group_id: &str) -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_error(
+        INVALID_GROUP_ID_MALFORMED,
+        400,
+        format!("Invalid id: '{group_id}'"),
     )
 }
 
@@ -12858,6 +13031,136 @@ pub fn security_group_limit_exceeded<E>() -> Scaffolded<E> {
     )
 }
 
+// ---------------------------------------------------------------------------
+// Security group rules
+// ---------------------------------------------------------------------------
+
+/// The `ResourceType` an `AuthorizeSecurityGroup{Ingress,Egress}` tag specification may
+/// name: the rule it creates (`ResourceType` enum member `security-group-rule`), which is
+/// what "the tags applied to the security group rule" (`$TagSpecifications`) are applied to.
+pub const RESOURCE_TYPE_SECURITY_GROUP_RULE: &str = "security-group-rule";
+
+/// EC2's error code for a rule the group already holds (EC2 API error codes,
+/// "InvalidPermission.Duplicate": "the specified inbound or outbound rule already exists
+/// for that security group").
+pub const INVALID_PERMISSION_DUPLICATE: &str = "InvalidPermission.Duplicate";
+
+/// EC2's error code for a rule whose own members do not hold together (EC2 API error codes,
+/// "InvalidPermission.Malformed": "the specified rule is not valid").
+pub const INVALID_PERMISSION_MALFORMED: &str = "InvalidPermission.Malformed";
+
+/// The `IpProtocol` of TCP, one of the protocols that "must specify a port range"
+/// (`IpPermission$IpProtocol`).
+pub const IP_PROTOCOL_TCP: &str = "tcp";
+
+/// The `IpProtocol` of UDP (see [`IP_PROTOCOL_TCP`]).
+pub const IP_PROTOCOL_UDP: &str = "udp";
+
+/// The `IpProtocol` of ICMP (see [`IP_PROTOCOL_TCP`]).
+pub const IP_PROTOCOL_ICMP: &str = "icmp";
+
+/// The `IpProtocol` of ICMPv6, for which "the port range is optional; if you omit the port
+/// range, traffic for all types and codes is allowed" (`IpPermission$IpProtocol`).
+pub const IP_PROTOCOL_ICMPV6: &str = "icmpv6";
+
+/// The protocols a rule MUST carry a port range for: "For `tcp`, `udp`, and `icmp`, you
+/// must specify a port range" (`IpPermission$IpProtocol`). For ICMP that range is the type
+/// and the code rather than ports, which is why the bounds below differ by protocol.
+pub const PORT_RANGE_PROTOCOLS: [&str; 3] = [IP_PROTOCOL_TCP, IP_PROTOCOL_UDP, IP_PROTOCOL_ICMP];
+
+/// The largest TCP or UDP port number.
+pub const MAX_PORT: i32 = 65_535;
+
+/// The largest ICMP type or code number: ICMP carries both in one byte (RFC 792), and the
+/// model admits `-1` beside them for "all ICMP types"/"all ICMP codes"
+/// (`IpPermission$FromPort` and `$ToPort`).
+pub const MAX_ICMP_TYPE: i32 = 255;
+
+/// The value that stands for "all ICMP types" in `FromPort` and "all ICMP codes" in
+/// `ToPort` (`IpPermission$FromPort` and `$ToPort`), and for a whole port range on a
+/// protocol that has none.
+pub const ALL_PORTS: i32 = -1;
+
+/// Whether `protocol` is one the model requires a port range for ([`PORT_RANGE_PROTOCOLS`]).
+pub fn protocol_requires_port_range(protocol: &str) -> bool {
+    PORT_RANGE_PROTOCOLS
+        .iter()
+        .any(|named| protocol.eq_ignore_ascii_case(named))
+}
+
+/// Whether `protocol` names ICMP or ICMPv6, whose `FromPort`/`ToPort` are an ICMP type and
+/// code rather than ports (`IpPermission$FromPort`).
+pub fn protocol_is_icmp(protocol: &str) -> bool {
+    protocol.eq_ignore_ascii_case(IP_PROTOCOL_ICMP) || protocol.eq_ignore_ascii_case(IP_PROTOCOL_ICMPV6)
+}
+
+/// `protocol` in the one form a stored rule carries it in.
+///
+/// The model spells every protocol name in lower case (`tcp`, `udp`, `icmp`, `icmpv6` —
+/// `IpPermission$IpProtocol`), so a name is stored folded to it the way a CIDR is stored
+/// canonicalised: one rule then has one stored form however the request spelled it, and a
+/// duplicate is recognised as one. A protocol NUMBER has only one spelling and is kept as
+/// it was written.
+pub fn canonical_ip_protocol(protocol: &str) -> String {
+    for named in [
+        IP_PROTOCOL_TCP,
+        IP_PROTOCOL_UDP,
+        IP_PROTOCOL_ICMP,
+        IP_PROTOCOL_ICMPV6,
+    ] {
+        if protocol.eq_ignore_ascii_case(named) {
+            return named.to_string();
+        }
+    }
+    protocol.to_string()
+}
+
+/// A requested IPv4 CIDR range of a security group rule in the canonical form AWS stores
+/// it in, with NO rule on the prefix length.
+///
+/// "Amazon Web Services canonicalizes IPv4 and IPv6 CIDRs. For example, if you specify
+/// 100.68.0.18/18 for the CIDR block, Amazon Web Services canonicalizes the CIDR block to
+/// 100.68.0.0/18. Any subsequent DescribeSecurityGroups and DescribeSecurityGroupRules
+/// calls will return the canonicalized form of the CIDR block"
+/// (`AuthorizeSecurityGroupIngressRequest$CidrIp`) — so the host bits are cleared rather
+/// than the value being refused. Deliberately no block-size bound, unlike a VPC's or a
+/// subnet's block: a rule may name a single address (`/32`) or every address (`/0`), and
+/// the model states no size for one.
+pub fn canonical_security_group_cidr(value: &str) -> Result<String, CidrProblem> {
+    canonical_ipv4_cidr(value)
+}
+
+/// Refuse a rule the group already holds: HTTP 400 `InvalidPermission.Duplicate`.
+pub fn invalid_permission_duplicate<E>(rule_id: &str) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_PERMISSION_DUPLICATE,
+        400,
+        format!("the specified rule \"{rule_id}\" already exists"),
+    )
+}
+
+/// Refuse a request that describes one rule more than once: HTTP 400
+/// `InvalidPermission.Duplicate`. The same code as a rule the group already holds, because
+/// it is the same refusal — the rule would be added twice — but worded for a request that
+/// has not been stored, so there is no rule id to name.
+pub fn invalid_permission_duplicate_in_request<E>(position: usize) -> Scaffolded<E> {
+    Scaffolded::service_error(
+        INVALID_PERMISSION_DUPLICATE,
+        400,
+        format!(
+            "the rule described at ipPermissions.{position} is already described earlier \
+             in this request"
+        ),
+    )
+}
+
+/// Refuse a rule whose members do not hold together: HTTP 400
+/// `InvalidPermission.Malformed`. `message` says which member is at odds with which, so the
+/// caller can fix the request from the text alone.
+pub fn invalid_permission_malformed<E>(message: impl Into<String>) -> Scaffolded<E> {
+    Scaffolded::service_error(INVALID_PERMISSION_MALFORMED, 400, message)
+}
+
 /// The caller-chosen bytes a stored VPC retains: its tags, plus the strings an IPv6
 /// association holds. The same quantity `CreateVpc` charged against the store's budget, so
 /// [`ComAmazonawsEc2Amazonec2State::remove_vpc`] gives back exactly what was taken.
@@ -13029,6 +13332,10 @@ impl ComAmazonawsEc2Amazonec2State {
     /// [`MAX_STORED_BYTES`]. A caller cannot create a second group named
     /// [`DEFAULT_SECURITY_GROUP_NAME`] in a VPC (the name is already taken), so that name
     /// identifies the uncharged group exactly.
+    ///
+    /// The group's RULES go with it — a rule of a group that no longer exists is a rule of
+    /// nothing — and the bytes each of them retained go back to the budget they were taken
+    /// from when the rule was stored.
     pub fn remove_security_group(&mut self, group_id: &str) -> Option<SecurityGroup> {
         let was_default = self.is_default_security_group(group_id);
         let group = self.security_groups.remove(group_id)?;

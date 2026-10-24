@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateConnector
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateConnector`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateConnector::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records the asynchronous update of a stored connector: the connector moves to
+//! `UPDATING` and the clock leaves it `RUNNING` with the capacity or the configuration
+//! the request named, at the next version, and an `UPDATE_WORKER_SETTING` or
+//! `UPDATE_CONNECTOR_CONFIGURATION` connector operation is stored, starting `PENDING`
+//! and walking the model's update states and steps on the clock. The answer carries the
+//! connector's ARN, its new state and the new operation's ARN, which
+//! `DescribeConnectorOperation` and `ListConnectorOperations` report from.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +162,173 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateConnector` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateConnectorErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateConnector"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateConnectorErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the kafkaconnect store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let mut state = store.lock();
+        state.settle_due();
+
+        // "For request body, specify only one parameter: either capacity or
+        // connectorConfiguration" — this operation's own documentation. The
+        // model makes both members optional, so the framework cannot refuse a
+        // body that names both or neither.
+        let target = match (input.capacity, input.connector_configuration) {
+            (Some(capacity), None) => {
+                // Capacity is "whether it is auto scaled or provisioned":
+                // exactly one of the two forms, the same rule a create's
+                // capacity answers to.
+                let auto_scaled = capacity.auto_scaling.is_some();
+                let provisioned = capacity.provisioned_capacity.is_some();
+                if auto_scaled == provisioned {
+                    return Err(UpdateConnectorErrorModeled::BadRequestException(
+                        BadRequestException {
+                            message: Some(crate::state::invalid_parameter_because(
+                                "capacity",
+                                crate::state::ONE_CAPACITY_FORM,
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                crate::state::ConnectorSettings::Capacity(crate::state::capacity_from_update(
+                    capacity,
+                ))
+            }
+            (None, Some(configuration)) => {
+                crate::state::ConnectorSettings::Configuration(configuration)
+            }
+            (Some(_), Some(_)) | (None, None) => {
+                return Err(UpdateConnectorErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(crate::state::invalid_parameter_because(
+                            "capacity",
+                            "Specify exactly one of capacity or connectorConfiguration.",
+                        )),
+                    },
+                )
+                .into());
+            }
+        };
+
+        let Some(connector) = state.connectors.get(&input.connector_arn) else {
+            return Err(UpdateConnectorErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::invalid_parameter_because(
+                    "connectorArn",
+                    crate::state::RESOURCE_DOES_NOT_EXIST,
+                )),
+            })
+            .into());
+        };
+
+        // "The current version of the connector that you want to update": the
+        // version a client holds is the one the service handed it, so a value
+        // that is not the connector's own names settings it has moved on from
+        // and the update is refused rather than applied to the wrong ones.
+        if input.current_version != connector.current_version {
+            return Err(UpdateConnectorErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::invalid_parameter_because(
+                    "currentVersion",
+                    crate::state::VERSION_IS_NOT_CURRENT,
+                )),
+            })
+            .into());
+        }
+
+        // Only a running connector has workers to move onto new settings; one
+        // still being created, already updating or restarting, or being
+        // deleted, has none — the same refusal a restart answers with.
+        if connector.state != crate::state::CONNECTOR_RUNNING {
+            return Err(UpdateConnectorErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::invalid_parameter_because(
+                    "connectorArn",
+                    &crate::state::connector_is_not_running(),
+                )),
+            })
+            .into());
+        }
+
+        // The settings the connector holds now: the same kind as the ones the
+        // request named, so the operation reports a before and an after of one
+        // kind.
+        let origin = match &target {
+            crate::state::ConnectorSettings::Capacity(_) => {
+                crate::state::ConnectorSettings::Capacity(connector.capacity.clone())
+            }
+            crate::state::ConnectorSettings::Configuration(_) => {
+                crate::state::ConnectorSettings::Configuration(connector.configuration.clone())
+            }
+        };
+        let connector_arn = connector.arn.clone();
+        let connector_name = connector.name.clone();
+
+        // The operations stored against one connector are metered, so a
+        // connector updated without end does not grow this store without end.
+        if state.connector_operation_quota_reached(&connector_arn) {
+            return Err(UpdateConnectorErrorModeled::TooManyRequestsException(
+                TooManyRequestsException {
+                    message: Some(format!(
+                        "Limit exceeded. Resource limit reached: this connector already holds {} operations.",
+                        crate::state::RESOURCE_QUOTA
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let id = state.mint_resource_id("connector-operation", &connector_name);
+        // The operation's ARN is derived from the connector's, so it names the
+        // same partition, region and account the connector itself lives in. The
+        // fallback covers only a connector ARN of a shape this service did not
+        // mint, which keeps the handler total without a panic.
+        let arn = crate::state::connector_operation_arn(&connector_arn, &id).unwrap_or_else(|| {
+            ::engine::emulator_arn(
+                crate::state::ARN_SERVICE,
+                &region,
+                &format!("connector-operation/{connector_name}/{id}"),
+            )
+        });
+        let operation = crate::state::ConnectorOperationRecord::update(
+            arn.clone(),
+            connector_arn.clone(),
+            origin,
+            target.clone(),
+        );
+
+        // The connector is updating until the clock has run every step of that
+        // operation: `settle_due` is what then leaves it running on the new
+        // settings, so a caller that reads it straight away still sees the
+        // transient state and the settings it is still running with.
+        let steps = u32::try_from(operation.remaining_states.len()).unwrap_or(1);
+        let connector_state = {
+            let Some(connector) = state.connectors.get_mut(&connector_arn) else {
+                return Err(UpdateConnectorErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        message: Some("the connector could not be updated".to_string()),
+                    },
+                )
+                .into());
+            };
+            connector.state = crate::state::CONNECTOR_UPDATING.to_string();
+            connector.pending = Some(crate::state::PendingChange::in_steps(
+                crate::state::PendingKind::Settle,
+                steps,
+            ));
+            connector.pending_update = Some(target);
+            connector.state.clone()
+        };
+
+        let output = UpdateConnectorOutput {
+            connector_arn: Some(connector_arn),
+            connector_state: Some(connector_state),
+            connector_operation_arn: Some(operation.arn.clone()),
+        };
+        state.connector_operations.insert(arn, operation);
+        Ok(output)
     }
 }

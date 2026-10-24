@@ -13,6 +13,10 @@
 //! * "This action can only be used after the Amazon EVS environment is deployed";
 //! * "You cannot use the `dedicatedHostId` and `placementGroupId` parameters together
 //!   in the same `CreateEnvironmentHost` action";
+//! * a `placementGroupId` or `dedicatedHostId` names an EC2 resource of the caller's own
+//!   account, so one the account does not hold is refused with the member named (the
+//!   accepted side of that rule lives in `host_placement_references`, which mints the
+//!   resources through Amazon EC2 itself);
 //! * "DNS hostnames for hosts must be unique across Amazon EVS environments";
 //! * an ESX host's management interface lives on the `vmkManagement` VLAN, so its
 //!   address comes out of that VLAN subnet and that subnet's usable range is what
@@ -284,22 +288,25 @@ async fn every_host_precondition_is_refused_with_a_validation_exception() {
             vec!["host"],
         ),
         (
-            "a dedicated host alone",
+            // The EC2 resources a host is placed on belong to the caller's account, and
+            // this account holds neither of these two: the held case is covered by
+            // `host_placement_references`, which mints them through Amazon EC2 itself.
+            "a Dedicated Host the account does not hold",
             host_request(
                 &deployed,
                 "esx-dedicated",
                 json!({ "dedicatedHostId": "h-0123456789abcdef0" }),
             ),
-            vec![],
+            vec!["host.dedicatedHostId"],
         ),
         (
-            "a placement group alone",
+            "a placement group the account does not hold",
             host_request(
                 &deployed,
                 "esx-placement-group",
                 json!({ "placementGroupId": "pg-0123456789abcdef0" }),
             ),
-            vec![],
+            vec!["host.placementGroupId"],
         ),
         (
             "a host name another host already carries",

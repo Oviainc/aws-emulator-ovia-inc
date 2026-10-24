@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RevokeGrant
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RevokeGrant`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: deletes the grant `GrantId` names on the KMS key `KeyId` names, so the
+//! permissions it carried are gone from the next request on. This is the ONLY file to
+//! touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RevokeGrant::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A mutating operation — except under `DryRun`, which validates the request exactly as
+//! a real one and then refuses it with `DryRunOperationException`, deleting nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -198,18 +195,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RevokeGrant` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RevokeGrantErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RevokeGrant"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(RevokeGrantErrorModeled::KMSInternalException(KMSInternalException {
+                message: Some("the KMS state store is unavailable".to_string()),
+            })
+            .into());
+        };
+
+        // "Identifies the grant to revoke. To get the grant ID, use CreateGrant,
+        // ListGrants, or ListRetirableGrants"
+        // (`smithy_query(query="doc",shape="RevokeGrantRequest",member="GrantId")`): a
+        // value that is not a grant id at all cannot identify one, which is the
+        // modelled `InvalidGrantIdException`.
+        if !crate::state::names_a_grant_id(&input.grant_id) {
+            return Err(RevokeGrantErrorModeled::InvalidGrantIdException(
+                InvalidGrantIdException {
+                    message: Some(crate::state::invalid_grant_id_message(&input.grant_id)),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx);
+        let mut state = state.lock();
+
+        // "Specify the key ID or key ARN of the KMS key"
+        // (`smithy_query(query="doc",shape="RevokeGrantRequest",member="KeyId")`) —
+        // resolved the way every other operation resolves a `KeyId`.
+        let key_id = match state.resolve(&region, &input.key_id) {
+            crate::state::KeyRef::Found(key) => {
+                // "The KMS key that you use for this operation must be in a compatible
+                // key state" (`smithy_query(query="doc",shape="RevokeGrant")`). A key
+                // whose deletion is scheduled is not; a disabled key still has grants
+                // to revoke, and this operation models no `DisabledException`.
+                if key.key_state == crate::state::KEY_STATE_PENDING_DELETION {
+                    return Err(RevokeGrantErrorModeled::KMSInvalidStateException(
+                        KMSInvalidStateException {
+                            message: Some(crate::state::invalid_state_message(key)),
+                        },
+                    )
+                    .into());
+                }
+                key.key_id.clone()
+            }
+            crate::state::KeyRef::MalformedArn => {
+                return Err(RevokeGrantErrorModeled::InvalidArnException(InvalidArnException {
+                    message: Some(crate::state::invalid_arn_message(&input.key_id)),
+                })
+                .into());
+            }
+            crate::state::KeyRef::NotFound => {
+                return Err(RevokeGrantErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::key_not_found_message(&region, &input.key_id)),
+                })
+                .into());
+            }
+        };
+
+        // A grant id that names no grant OF THIS KEY is "the specified entity or
+        // resource could not be found" — which is also what a second revoke of the same
+        // grant meets, since the first one removed it.
+        let held = state
+            .grant(&region, &input.grant_id)
+            .is_some_and(|grant| grant.key_id == key_id);
+        if !held {
+            return Err(RevokeGrantErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::grant_not_found_message(&input.grant_id)),
+            })
+            .into());
+        }
+
+        // `DryRun` is answered only once everything that would reject the request for
+        // its own reason has been judged, so a dry run reports the SAME refusal a real
+        // call would — and it reaches no write, so the grant stays as it is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(RevokeGrantErrorModeled::DryRunOperationException(
+                DryRunOperationException {
+                    message: Some(crate::state::DRY_RUN_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        state.remove_grant(&region, &input.grant_id);
+
+        // "This operation does not return a response."
+        Ok(RevokeGrantOutput)
     }
 }

@@ -153,12 +153,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A reporting operation: the page is cut from stored state, and the one write it
         // makes is materialising the status transitions the clock already owed.
         //
-        // Nothing on this path needs the request metadata: every value it reports is read
-        // off the STORED record (whose ARNs were minted in the region of the call that
-        // created it), and the one failure it raises names the resource it could not find
-        // by id rather than by ARN — so this handler mints no ARN and needs no region.
-        // Discarded rather than renamed, the same way `list_members.rs` does.
-        let _ = ctx;
+        // The Region this request is addressed to, read off its own credential scope: a
+        // network and the proposals on it belong to the Region their creates were signed
+        // for, so the lookups below are scoped to it.
+        let region = crate::state::request_region(ctx);
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListProposalsErrorModeled::InternalServiceErrorException(
@@ -186,9 +184,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         guard.settle(::std::time::SystemTime::now());
 
         // Unlike `ListNodes`, this operation DOES model `ResourceNotFoundException`, so a
-        // `NetworkId` nothing holds is the modelled 404 rather than an empty page, which
-        // would claim the network exists and carries no proposals.
-        let Some(network) = guard.networks.get(&input.network_id) else {
+        // `NetworkId` this Region holds no network for is the modelled 404 rather than an
+        // empty page, which would claim the network exists and carries no proposals.
+        let Some(network) = guard.network(&region, &input.network_id) else {
             return Err(ListProposalsErrorModeled::ResourceNotFoundException(
                 // Named by id, so `ResourceName` is omitted — see `crate::state::not_found`.
                 crate::state::not_found(crate::state::RESOURCE_NETWORK, &input.network_id),
@@ -197,8 +195,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let selected: Vec<(String, ProposalSummary)> = network
-            .proposals
-            .values()
+            .proposals_in(&region)
             .map(|proposal| (proposal.id.clone(), proposal.to_summary(network)))
             .collect();
 

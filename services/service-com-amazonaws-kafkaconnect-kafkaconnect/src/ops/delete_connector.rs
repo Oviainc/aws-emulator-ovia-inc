@@ -182,7 +182,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(DeleteConnectorErrorModeled::BadRequestException(BadRequestException {
                     message: Some(crate::state::invalid_parameter_because(
                         "currentVersion",
-                        "The specified version is not the current version of the resource.",
+                        crate::state::VERSION_IS_NOT_CURRENT,
                     )),
                 })
                 .into());

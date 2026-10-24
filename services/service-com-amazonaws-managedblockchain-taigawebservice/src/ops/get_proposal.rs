@@ -151,7 +151,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // settling to `AVAILABLE`, a proposal passing its `ExpirationDate`), each of
         // which was due at this instant whether or not anybody called. Nothing in the
         // answer comes from the request.
-        let _ = ctx;
+        //
+        // The Region this request is addressed to, read off its own credential scope: a
+        // resource belongs to the Region its create was signed for, so the lookups below
+        // are scoped to it.
+        let region = crate::state::request_region(ctx);
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetProposalErrorModeled::InternalServiceErrorException(
@@ -165,9 +169,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `GET /networks/{NetworkId}/proposals/{ProposalId}` nests the proposal INSIDE
         // the network, so the path labels resolve left to right: a `NetworkId` this
-        // service does not hold is itself the missing resource, and the proposal inside
-        // it is never reached.
-        let Some(network) = guard.networks.get(&input.network_id) else {
+        // service does not hold in this Region is itself the missing resource, and the
+        // proposal inside it is never reached.
+        let Some(network) = guard.network(&region, &input.network_id) else {
             return Err(GetProposalErrorModeled::ResourceNotFoundException(
                 crate::state::not_found(crate::state::RESOURCE_NETWORK, &input.network_id),
             )
@@ -175,8 +179,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The network resolved, so the leaf label is next: a proposal that network does
-        // not hold is the resource the request asked for and did not get.
-        let Some(proposal) = network.proposals.get(&input.proposal_id) else {
+        // not hold in this Region is the resource the request asked for and did not get.
+        let Some(proposal) = network.proposal(&region, &input.proposal_id) else {
             return Err(GetProposalErrorModeled::ResourceNotFoundException(
                 crate::state::not_found(crate::state::RESOURCE_PROPOSAL, &input.proposal_id),
             )

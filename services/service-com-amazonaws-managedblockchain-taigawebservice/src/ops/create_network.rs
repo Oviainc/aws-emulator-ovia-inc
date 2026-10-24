@@ -239,7 +239,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "An idempotent operation completes no more than once" (`ClientRequestToken`):
         // a token already used replays the ids its first call minted instead of creating
         // a second network.
-        let token = crate::state::idempotency_key(Self::NAME, &input.client_request_token);
+        let token = crate::state::idempotency_key(&region, Self::NAME, &input.client_request_token);
         if let Some(created) = guard.replay_idempotent(&token) {
             return Ok(CreateNetworkOutput {
                 network_id: created.network_id.clone(),
@@ -247,8 +247,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
-        // The store's ceiling counts the networks this account created; AWS's standing
-        // public networks are not account resources and consume none of it.
+        // The store's ceiling counts the networks this account created, in every Region:
+        // it is this emulator's memory ceiling (see `crate::state::MAX_NETWORKS`), not a
+        // per-Region quota, so a caller cannot grow the store past it by spreading creates
+        // over Regions. AWS's standing public networks are not account resources and
+        // consume none of it.
         let owned = guard
             .networks
             .values()
@@ -364,8 +367,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
 
         // Answer from the STORED records, so these are the ids every later read of this
-        // network and of its first member answers to.
-        let Some(stored) = guard.networks.get(&network_id) else {
+        // network and of its first member answers to \u2014 read back through the same
+        // Region-scoped resolver every other read goes through.
+        let Some(stored) = guard.network(&region, &network_id) else {
             return Err(CreateNetworkErrorModeled::InternalServiceErrorException(
                 InternalServiceErrorException {},
             )
@@ -373,7 +377,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         Ok(CreateNetworkOutput {
             network_id: Some(stored.id.clone()),
-            member_id: stored.members.get(&member_id).map(|member| member.id.clone()),
+            member_id: stored
+                .member(&region, &member_id)
+                .map(|member| member.id.clone()),
         })
     }
 }

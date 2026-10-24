@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateGrant
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateGrant`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: persists a grant on the KMS key `KeyId` names and answers the grant's
+//! id together with a fresh grant token. This is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateGrant::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A mutating operation — except under `DryRun`, which validates the request exactly as
+//! a real one and then refuses it with `DryRunOperationException`, persisting nothing. A
+//! request carrying a `Name` is idempotent: a retry with identical parameters answers the
+//! original grant id rather than creating a second grant.
+//!
+//! One deliberate divergence: a key's grants are bounded at
+//! [`crate::state::MAX_GRANTS_PER_KEY`], which is far below the grants-per-key quota KMS
+//! publishes. It is a bound on how far a loop of valid creates can grow this process, not
+//! a claim about the service's quota, so a caller that creates more grants on one key than
+//! that bound sees `LimitExceededException` where AWS would still succeed.
+//!
+//! A presented `GrantTokens` value is judged more loosely here than in a cryptographic
+//! operation: this is a MANAGEMENT operation, so a token has only to name a grant the
+//! store still holds — its key, its permitted operations and its encryption-context
+//! constraints (which apply to cryptographic operations) do not narrow it, and a token
+//! naming a grant on another key is accepted.
 //!
 //! ## Shape of an operation
 //!
@@ -263,18 +274,307 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateGrant` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateGrantErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(store_unavailable());
+        };
+
+        // "You must specify either GranteePrincipal or GranteeServicePrincipal, but
+        // not both"
+        // (`smithy_query(query="doc",shape="CreateGrantRequest",member="GranteePrincipal")`).
+        // The model cannot express the choice, so the operation refuses a request
+        // that makes neither or both with the synthetic 400 `ValidationException`.
+        if input.grantee_principal.is_some() == input.grantee_service_principal.is_some() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "You must specify either GranteePrincipal or GranteeServicePrincipal, but \
+                 not both.",
+            ));
+        }
+
+        // "You can specify either RetiringPrincipal or RetiringServicePrincipal, but
+        // not both"
+        // (`smithy_query(query="doc",shape="CreateGrantRequest",member="RetiringServicePrincipal")`).
+        // Unlike the grantee, a retiring principal is optional: "The grant determines
+        // the retiring principal" only when one was given.
+        if input.retiring_principal.is_some() && input.retiring_service_principal.is_some() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "You can specify either RetiringPrincipal or RetiringServicePrincipal, but \
+                 not both.",
+            ));
+        }
+
+        // "When you specify a GranteeServicePrincipal, you must also specify a
+        // SourceArn grant constraint. In addition, you must specify either a
+        // RetiringPrincipal or a RetiringServicePrincipal"
+        // (`smithy_query(query="doc",shape="CreateGrantRequest",member="GranteeServicePrincipal")`).
+        if input.grantee_service_principal.is_some() {
+            let has_source_arn = input
+                .constraints
+                .as_ref()
+                .is_some_and(|constraints| constraints.source_arn.is_some());
+            if !has_source_arn {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    "When you specify a GranteeServicePrincipal, you must also specify a \
+                     SourceArn grant constraint.",
+                ));
+            }
+            if input.retiring_principal.is_none() && input.retiring_service_principal.is_none() {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    "When you specify a GranteeServicePrincipal, you must specify either a \
+                     RetiringPrincipal or a RetiringServicePrincipal.",
+                ));
+            }
+        }
+
+        // "To specify the grantee principal, use the Amazon Resource Name (ARN) of an
+        // Amazon Web Services principal" — the same for the retiring principal. A
+        // principal that is not given as an ARN is the modelled `InvalidArnException`,
+        // "a specified ARN … is not valid".
+        for principal in [
+            input.grantee_principal.as_deref(),
+            input.retiring_principal.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !crate::state::names_a_principal_arn(principal) {
+                return Err(CreateGrantErrorModeled::InvalidArnException(InvalidArnException {
+                    message: Some(crate::state::invalid_arn_message(principal)),
+                })
+                .into());
+            }
+        }
+
+        let region = crate::state::request_region(ctx);
+        let mut state = state.lock();
+
+        // The grant tokens a request presents are judged below, once the key is known
+        // and its key state has been judged — the same order the cryptographic
+        // operations use, so a key that cannot carry a grant at all reports why rather
+        // than reporting an authorization failure.
+        let tokens = input.grant_tokens.clone().unwrap_or_default();
+
+        // "Identifies the KMS key for the grant … Specify the key ID or key ARN"
+        // (`smithy_query(query="doc",shape="CreateGrantRequest",member="KeyId")`). The
+        // grant records the key the identifier RESOLVED to, so an alias that is later
+        // repointed does not move the grant.
+        let (key_id, key_arn) = match state.resolve(&region, &input.key_id) {
+            crate::state::KeyRef::Found(key) => {
+                // "The KMS key that you use for this operation must be in a compatible
+                // key state" (`smithy_query(query="doc",shape="CreateGrant")`). A
+                // disabled key is the one the operation models its own error for —
+                // `DisabledException`, "the specified KMS key is not enabled" — and
+                // every other state outside `Enabled` is reported as the key state it
+                // is actually in.
+                if key.key_state == crate::state::KEY_STATE_DISABLED {
+                    return Err(CreateGrantErrorModeled::DisabledException(DisabledException {
+                        message: Some(crate::state::invalid_state_message(key)),
+                    })
+                    .into());
+                }
+                if key.key_state != crate::state::KEY_STATE_ENABLED {
+                    return Err(CreateGrantErrorModeled::KMSInvalidStateException(
+                        KMSInvalidStateException {
+                            message: Some(crate::state::invalid_state_message(key)),
+                        },
+                    )
+                    .into());
+                }
+
+                // "This list must include only operations that are permitted in a
+                // grant. Also, the operation must be supported on the KMS key … If you
+                // try, KMS returns a ValidationError exception"
+                // (`smithy_query(query="doc",shape="CreateGrantRequest",member="Operations")`).
+                // Which operations one key supports follows from its `KeyUsage` and the
+                // kind of key material its `KeySpec` gives it.
+                for operation in &input.operations {
+                    if let Some(reason) = crate::state::grant_operation_refusal(key, operation) {
+                        return Err(crate::scaffolded::Scaffolded::validation(reason));
+                    }
+                }
+
+                (key.key_id.clone(), key.arn.clone())
+            }
+            crate::state::KeyRef::MalformedArn => {
+                return Err(CreateGrantErrorModeled::InvalidArnException(InvalidArnException {
+                    message: Some(crate::state::invalid_arn_message(&input.key_id)),
+                })
+                .into());
+            }
+            crate::state::KeyRef::NotFound => {
+                return Err(CreateGrantErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::key_not_found_message(&region, &input.key_id)),
+                })
+                .into());
+            }
+        };
+
+        // "Use a grant token when your permission to call this operation comes from a
+        // new grant that has not yet achieved eventual consistency"
+        // (`smithy_query(query="doc",shape="CreateGrantRequest",member="GrantTokens")`).
+        // A token that is not one this service minted names no grant at all, so the
+        // TOKEN "is not valid"; one whose grant is gone carries no permission, which is
+        // an authorization failure. `CreateGrant` is a management operation, so the
+        // grant's own encryption-context constraints — which apply to cryptographic
+        // operations — do not narrow it further.
+        if !tokens.is_empty() {
+            if let Err(refusal) = state.grants_for_tokens(&region, &tokens) {
+                return Err(match refusal {
+                    crate::state::GrantRefusal::MalformedToken => {
+                        CreateGrantErrorModeled::InvalidGrantTokenException(
+                            InvalidGrantTokenException {
+                                message: Some(
+                                    "The specified grant token is not valid.".to_string(),
+                                ),
+                            },
+                        )
+                        .into()
+                    }
+                    crate::state::GrantRefusal::NotAuthorized => {
+                        crate::scaffolded::Scaffolded::access_denied(
+                            crate::state::grant_access_denied_message(Self::NAME, &key_arn),
+                        )
+                    }
+                });
+            }
+        }
+
+        // The grant this request asks for. Its id is filled in only if it is actually
+        // minted, so the candidate can be fingerprinted and compared against what the
+        // store already holds without reserving an id for a grant that already exists.
+        let candidate = crate::state::Grant {
+            grant_id: String::new(),
+            key_id: key_id.clone(),
+            key_arn,
+            region: region.clone(),
+            issuing_account: crate::state::issuing_account_arn(),
+            name: input.name.clone(),
+            creation_date: ::std::time::SystemTime::now(),
+            grantee_principal: input.grantee_principal.clone(),
+            grantee_service_principal: input.grantee_service_principal.clone(),
+            retiring_principal: input.retiring_principal.clone(),
+            retiring_service_principal: input.retiring_service_principal.clone(),
+            operations: input.operations.clone(),
+            constraints: input.constraints.clone(),
+        };
+        let fingerprint = candidate.fingerprint();
+
+        // "When this value is absent, all CreateGrant requests result in a new grant
+        // with a unique GrantId even if all the supplied parameters are identical …
+        // When this value is present, you can retry a CreateGrant request with
+        // identical parameters; if the grant already exists, the original GrantId is
+        // returned without creating a new grant"
+        // (`smithy_query(query="doc",shape="CreateGrantRequest",member="Name")`).
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateGrant"))
+        // The key's grants are read ONCE here: the idempotence scan and the per-key
+        // bound below are about the same list. Only a grant carrying the same name can
+        // be the retry, so the fingerprint — a digest — is computed for those alone.
+        let (duplicate, held) = {
+            let grants = state.grants_for_key(&region, &key_id);
+            let duplicate = input.name.as_deref().and_then(|name| {
+                grants
+                    .iter()
+                    .filter(|grant| grant.name.as_deref() == Some(name))
+                    .find(|grant| grant.fingerprint() == fingerprint)
+                    .map(|grant| grant.grant_id.clone())
+            });
+            (duplicate, grants.len())
+        };
+
+        // A key's grants are bounded, so a loop of valid creates cannot grow the store
+        // without end. A retry that resolves to a grant already held adds nothing, so
+        // it is not measured against the bound. The store as a whole is bounded too:
+        // the per-key count is per key AND Region, and the Region is the caller's to
+        // choose.
+        if duplicate.is_none() {
+            if held >= crate::state::MAX_GRANTS_PER_KEY {
+                return Err(CreateGrantErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "The request was rejected because a quota was exceeded: a KMS key \
+                             carries at most {} grants, and this key already has {held}.",
+                            crate::state::MAX_GRANTS_PER_KEY
+                        )),
+                    },
+                )
+                .into());
+            }
+            if !state.has_room_for_another_grant() {
+                return Err(CreateGrantErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "The request was rejected because a quota was exceeded: this \
+                             emulator holds at most {} grants.",
+                            crate::state::MAX_GRANTS
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // "Checks if your request will succeed. DryRun is an optional parameter"
+        // (`smithy_query(query="doc",shape="CreateGrantRequest",member="DryRun")`), and
+        // `DryRunOperationException` is "the request was rejected because the DryRun
+        // parameter was specified". It is answered only once everything that would
+        // reject the request for its own reason has been judged, so a dry run reports
+        // the SAME refusal a real call would — and it reaches no write, so nothing is
+        // persisted and no id or token is handed out.
+        if input.dry_run.unwrap_or(false) {
+            return Err(CreateGrantErrorModeled::DryRunOperationException(
+                DryRunOperationException {
+                    message: Some(crate::state::DRY_RUN_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The id this call answers, and the record to write — `None` when the request
+        // resolved to a grant the store already holds.
+        let (grant_id, to_persist) = match duplicate {
+            Some(grant_id) => (grant_id, None),
+            None => {
+                let Some(grant_id) = crate::state::mint_grant_id() else {
+                    return Err(entropy_unavailable());
+                };
+                let mut grant = candidate;
+                grant.grant_id = grant_id.clone();
+                (grant_id, Some(grant))
+            }
+        };
+
+        // "The returned grant token is unique with every CreateGrant request, even when
+        // a duplicate GrantId is returned", so the token is minted on every call —
+        // including the idempotent one that created nothing. It is minted BEFORE the
+        // write, so a failure to produce entropy cannot leave a grant persisted that
+        // the caller was never told about.
+        let Some(grant_token) = crate::state::mint_grant_token(&grant_id) else {
+            return Err(entropy_unavailable());
+        };
+
+        if let Some(grant) = to_persist {
+            state.insert_grant(grant);
+        }
+
+        Ok(CreateGrantOutput {
+            grant_id: Some(grant_id),
+            grant_token: Some(grant_token),
+        })
     }
+}
+
+/// The state store is missing, which is a server fault rather than a bad request.
+fn store_unavailable() -> CreateGrantError {
+    CreateGrantErrorModeled::KMSInternalException(KMSInternalException {
+        message: Some("the KMS state store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// The platform refused to produce entropy, so no grant id or grant token could be
+/// minted. A server fault the caller may retry, never a fabricated identifier.
+fn entropy_unavailable() -> CreateGrantError {
+    CreateGrantErrorModeled::KMSInternalException(KMSInternalException {
+        message: Some("the KMS random source is unavailable".to_string()),
+    })
+    .into()
 }

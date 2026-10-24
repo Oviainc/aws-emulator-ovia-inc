@@ -76,9 +76,13 @@ pub(crate) fn new_router() -> MultiServiceRouter {
     router_over(Arc::new(engine::InMemoryEngine::new()))
 }
 
-/// Send one request and return what the emulator answered.
-pub(crate) async fn call(
+/// Send one request SIGNED FOR `region` and return what the emulator answered.
+///
+/// The credential scope is the only place a request says which Region it addresses, so a
+/// suite that drives two Regions goes through here; [`call`] is this with [`REGION`].
+pub(crate) async fn call_in_region(
     router: &MultiServiceRouter,
+    region: &str,
     method: &str,
     path: &str,
     body: Option<Value>,
@@ -89,14 +93,14 @@ pub(crate) async fn call(
     let request = http::Request::builder()
         .method(method)
         .uri(format!(
-            "https://managedblockchain.{REGION}.amazonaws.com{path}"
+            "https://managedblockchain.{region}.amazonaws.com{path}"
         ))
         .header("content-type", "application/json")
         // The credential scope is how a handler learns the region its ARNs name.
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/{REGION}/managedblockchain/aws4_request, \
+                "AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/{region}/managedblockchain/aws4_request, \
                  SignedHeaders=host, Signature=abc"
             ),
         )
@@ -129,6 +133,16 @@ pub(crate) async fn call(
         error_type,
         body,
     }
+}
+
+/// Send one request signed for [`REGION`] and return what the emulator answered.
+pub(crate) async fn call(
+    router: &MultiServiceRouter,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> Answer {
+    call_in_region(router, REGION, method, path, body).await
 }
 
 /// A `MemberConfiguration` naming `name`, with the admin user every Fabric member needs.

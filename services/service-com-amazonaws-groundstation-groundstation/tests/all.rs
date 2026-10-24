@@ -33,6 +33,8 @@ mod dataflow_endpoint_group_listing;
 mod dataflow_endpoint_groups;
 #[path = "all/ephemeris_catalog.rs"]
 mod ephemeris_catalog;
+#[path = "all/ephemeris_deletion.rs"]
+mod ephemeris_deletion;
 #[path = "all/ephemeris_description.rs"]
 mod ephemeris_description;
 #[path = "all/ground_station_reservations.rs"]

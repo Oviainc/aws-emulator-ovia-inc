@@ -45,6 +45,8 @@ mod list_services;
 mod resource_tags;
 #[path = "all/service_dependency_metrics.rs"]
 mod service_dependency_metrics;
+#[path = "all/service_groups.rs"]
+mod service_groups;
 #[path = "all/sli_metric_type.rs"]
 mod sli_metric_type;
 #[path = "all/slo_evaluation_kind.rs"]

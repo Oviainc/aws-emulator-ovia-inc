@@ -30,7 +30,7 @@ use crate::ops::types::{
 // SLO lifecycle's above are edited on separate lines.
 use crate::ops::types::{
     AttributeFilter, ChangeEvent, Dimension, MetricReference, Service, ServiceDependency,
-    ServiceDependent, ServiceOperation, ServiceState, ServiceSummary,
+    ServiceDependent, ServiceGroup, ServiceOperation, ServiceState, ServiceSummary,
 };
 // The dynamic instrumentation shapes, on their own `use` for the same reason.
 use crate::ops::types::{
@@ -1539,7 +1539,142 @@ fn standard_metric_references(dimensions: Vec<Dimension>) -> Vec<MetricReference
         .collect()
 }
 
+/// The `GroupSource` of a group whose value was DERIVED from the entity's own attributes
+/// under one of the definition's source keys.
+///
+/// `GroupSource` is "the source of the grouping attribute, such as `TAG`, `OTEL`, or
+/// `DEFAULT`" (`smithy_query(shape="ServiceGroup")`), and the source keys "derive the
+/// grouping attribute value from telemetry data, Amazon Web Services tags, or other
+/// sources" (`smithy_query(shape="GroupingAttributeDefinition")`, member
+/// `GroupingSourceKeys`). The attributes an entity is reported with here are the identity
+/// the instrumented application's telemetry carries, not a tag this emulator holds, so a
+/// value read out of them comes from telemetry.
+const GROUP_SOURCE_TELEMETRY: &str = "OTEL";
+
+/// The `GroupSource` of a group whose value came from the definition's
+/// `DefaultGroupingValue`, which is "the default value to use for this grouping attribute
+/// when no value can be derived from the source keys".
+const GROUP_SOURCE_DEFAULT: &str = "DEFAULT";
+
+/// The longest value a reported group may carry: `GroupValue` is modelled `length 1..255`
+/// (`smithy_query(shape="GroupValue")`), while an attribute value is `length 1..1024`
+/// (`smithy_query(shape="Attributes")`), so a long attribute value is not a value this
+/// member can state.
+const MAX_GROUP_VALUE: usize = 255;
+
+/// What separates the grouping name from the value in a minted `GroupIdentifier`.
+///
+/// The identifier is "a unique identifier for this grouping attribute value"
+/// (`smithy_query(shape="ServiceGroup")`), so it must distinguish one grouping's value from
+/// another's: the pair of name and value IS that identity. `GroupingString` (the grouping
+/// name) is `pattern ^[a-zA-Z0-9\s+\-=\._:/@]*$`, which admits no `#`, so the first `#`
+/// always ends the name and the pair can be read back out of the identifier.
+const GROUP_IDENTIFIER_SEPARATOR: char = '#';
+
+/// The value one grouping attribute definition gives the entity `key_attributes`
+/// identifies, with the `GroupSource` that value came from — or `None` when the definition
+/// gives the entity no value at all.
+///
+/// A source key names an attribute to read the value from, and the keys are tried in the
+/// order the definition lists them, so the first key the entity carries a USABLE value under
+/// wins — a key whose attribute holds a value the modelled `GroupValue` cannot state is
+/// passed over and the next key is tried. The comparison ignores ASCII case: a source key is
+/// written in the casing of the telemetry field it names (`["business_unit", "team"]`) while
+/// an entity's attributes are the capitalised `Attributes` names, and the same field named in
+/// either casing is the same field. Which attribute ONE source key selects does not depend on
+/// iteration order: the attribute whose name matches exactly is preferred, and among
+/// attributes that match only case-insensitively the smallest name by byte order is taken, so
+/// two reads of one entity report the same value ([`attribute_matching`]).
+///
+/// When no source key yields a value the definition's `DefaultGroupingValue` does, since it
+/// "ensures all services have a grouping value even if the source data is missing". A
+/// definition that declares no default and matches no attribute leaves the entity out of
+/// that grouping entirely rather than reporting an empty value, which `GroupValue`
+/// (`length 1..255`) cannot carry.
+fn grouping_value(
+    definition: &GroupingAttributeDefinition,
+    key_attributes: &HashMap<String, String>,
+) -> Option<(String, &'static str)> {
+    let derived = definition
+        .grouping_source_keys
+        .iter()
+        .flatten()
+        .filter_map(|source_key| attribute_matching(key_attributes, source_key))
+        .find(|value| reportable_group_value(value))
+        .map(|value| (value.clone(), GROUP_SOURCE_TELEMETRY));
+    derived.or_else(|| {
+        definition
+            .default_grouping_value
+            .as_deref()
+            .filter(|value| reportable_group_value(value))
+            .map(|value| (value.to_string(), GROUP_SOURCE_DEFAULT))
+    })
+}
+
+/// Whether a derived value is one the modelled `GroupValue` can state: non-empty and no
+/// longer than [`MAX_GROUP_VALUE`].
+fn reportable_group_value(value: &str) -> bool {
+    !value.is_empty() && value.chars().count() <= MAX_GROUP_VALUE
+}
+
+/// The value `key_attributes` holds under the attribute `name` denotes, comparing attribute
+/// names without ASCII case.
+///
+/// The choice is deterministic rather than the first entry a map walk happens to reach: the
+/// exactly-named attribute is preferred, and failing that the smallest matching name by byte
+/// order. `Attributes` is a map and its iteration order is unspecified, so an entity carrying
+/// two names that differ only in case would otherwise be reported differently from one read
+/// to the next.
+fn attribute_matching<'a>(
+    key_attributes: &'a HashMap<String, String>,
+    name: &str,
+) -> Option<&'a String> {
+    if let Some(value) = key_attributes.get(name) {
+        return Some(value);
+    }
+    key_attributes
+        .iter()
+        .filter(|(attribute, _)| attribute.eq_ignore_ascii_case(name))
+        .min_by(|(left, _), (right, _)| left.cmp(right))
+        .map(|(_, value)| value)
+}
+
 impl ComAmazonawsApplicationsignalsApplicationsignalsState {
+    /// The groups the entity `key_attributes` identifies belongs to, as every projection
+    /// that carries `ServiceGroups` reports them: one group per stored grouping attribute
+    /// definition that gives this entity a value ([`grouping_value`]), in the order the
+    /// configuration lists its definitions.
+    ///
+    /// `ServiceGroups` is "an array of service groups that this service belongs to, BASED ON
+    /// THE CONFIGURED GROUPING ATTRIBUTES" (`smithy_query(shape="Service")`), so the stored
+    /// grouping configuration — the one `PutGroupingConfiguration` wrote and
+    /// `DeleteGroupingConfiguration` clears — is what the groups are computed from. With no
+    /// configuration stored, or with none of its definitions giving this entity a value,
+    /// the member stays absent: the entity belongs to no group, and the member is optional.
+    ///
+    /// Single-homed here so `GetService` and `ListServices` cannot disagree about which
+    /// groups one entity belongs to.
+    fn service_groups(&self, key_attributes: &HashMap<String, String>) -> Option<Vec<ServiceGroup>> {
+        let configuration = self.grouping_configuration.as_ref()?;
+        let groups: Vec<ServiceGroup> = configuration
+            .grouping_attribute_definitions
+            .iter()
+            .filter_map(|definition| {
+                let (group_value, group_source) = grouping_value(definition, key_attributes)?;
+                Some(ServiceGroup {
+                    group_identifier: format!(
+                        "{}{GROUP_IDENTIFIER_SEPARATOR}{group_value}",
+                        definition.grouping_name
+                    ),
+                    group_name: definition.grouping_name.clone(),
+                    group_value,
+                    group_source: group_source.to_string(),
+                })
+            })
+            .collect();
+        (!groups.is_empty()).then_some(groups)
+    }
+
     /// Every stored SLO that monitors the entity `key_attributes` identifies, over a window
     /// ending at `window_end`.
     ///
@@ -1575,9 +1710,13 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
     /// for it and the list is empty, exactly as it is for a window in which nothing was
     /// observed.
     ///
-    /// `AttributeMaps`, `ServiceGroups` and `LogGroupReferences` stay absent: they are
-    /// platform, grouping and log-group facts the real service learns from the telemetry an
-    /// instrumented application sends it, which this emulator never receives.
+    /// `ServiceGroups` reports the groups the configured grouping attributes put this entity
+    /// in ([`Self::service_groups`]) — again only for an entity the store is evidence of,
+    /// since an identity nothing monitored is no service to group.
+    ///
+    /// `AttributeMaps` and `LogGroupReferences` stay absent: they are platform and
+    /// log-group facts the real service learns from the telemetry an instrumented
+    /// application sends it, which this emulator never receives.
     pub fn observed_service(
         &self,
         key_attributes: &HashMap<String, String>,
@@ -1594,15 +1733,18 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
                 }
             }
         }
-        let metric_references = if discovered {
-            standard_metric_references(metric_dimensions(&reported, None, None))
+        let (metric_references, service_groups) = if discovered {
+            (
+                standard_metric_references(metric_dimensions(&reported, None, None)),
+                self.service_groups(&reported),
+            )
         } else {
-            Vec::new()
+            (Vec::new(), None)
         };
         Service {
             key_attributes: reported,
             attribute_maps: None,
-            service_groups: None,
+            service_groups,
             metric_references,
             log_group_references: None,
         }
@@ -1627,11 +1769,12 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
     /// the caller a summary whose `KeyAttributes` no `GetService` echoes back.
     ///
     /// `MetricReferences` reports the standard metrics collected for each reported identity
-    /// ([`standard_metric_references`]) — every summary here IS a discovered service, so
-    /// each carries them — and `AttributeMaps`/`ServiceGroups` stay absent, exactly as
-    /// [`Self::observed_service`] leaves them: they are platform, grouping and telemetry
-    /// facts the real service learns from an instrumented application, which this emulator
-    /// never receives.
+    /// ([`standard_metric_references`]) and `ServiceGroups` the groups the configured
+    /// grouping attributes put it in ([`Self::service_groups`]) — every summary here IS a
+    /// discovered service, so each carries both, exactly as [`Self::observed_service`]
+    /// reports them for the same entity. `AttributeMaps` stays absent, as it does there: it
+    /// is a platform and telemetry fact the real service learns from an instrumented
+    /// application, which this emulator never receives.
     pub fn observed_services(
         &self,
         window_start: &DateTime,
@@ -1665,7 +1808,7 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
             .map(|key_attributes| ServiceSummary {
                 key_attributes: key_attributes.clone(),
                 attribute_maps: None,
-                service_groups: None,
+                service_groups: self.service_groups(key_attributes),
                 metric_references: standard_metric_references(metric_dimensions(
                     key_attributes,
                     None,

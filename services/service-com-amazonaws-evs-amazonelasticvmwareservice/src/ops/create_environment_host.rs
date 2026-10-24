@@ -38,10 +38,30 @@
 //! 5. The environment's `vmkManagement` VLAN subnet has an address left for the host:
 //!    an ESX host's management interface lives on that VLAN, so that subnet's usable
 //!    range is what bounds how many hosts one environment can hold.
+//! 6. The EC2 resources the host is PLACED on exist in the account's own Amazon EC2
+//!    store: `placementGroupId` is "the unique ID of the placement group where the host
+//!    is placed" and `dedicatedHostId` "the unique ID of the Amazon EC2 Dedicated Host",
+//!    and Amazon EVS creates neither, so a host that names one names a resource the
+//!    account already holds ([`crate::state::ec2_resources::host_placement_failures`]) —
+//!    the rule `CreateEnvironment` already applies to an environment's `vpcId` and
+//!    `serviceAccessSubnetId`. A host that names BOTH mechanisms is refused by rule 3
+//!    alone, so neither reference is resolved for it.
+//! 7. An `esxVersion` the request names is one of the versions Amazon EVS offers for the
+//!    environment's VCF version: "To find the available ESX versions for a particular VCF
+//!    version, use the GetVersions action", so the catalogue that action reports
+//!    ([`crate::state::available_esx_versions`]) is what an asked-for version has to be
+//!    in. A VCF version that catalogue states no versions for leaves nothing to judge a
+//!    requested version against, so nothing is refused for it.
 //!
-//! Rules 2 to 5 are evaluated together, so a request that breaks several is refused
+//! Rules 2 to 7 are evaluated together, so a request that breaks several is refused
 //! ONCE with one `ValidationException` whose `fieldList` carries an entry per failure —
 //! the shape `CreateEnvironment` answers with. A refused request adds nothing.
+//!
+//! `keyName` is the one member of a host naming an EC2 resource that is NOT resolved:
+//! the account's Amazon EC2 store holds no key pairs at all — every `…KeyPair` operation
+//! of that service is still a scaffold stub, so nothing can put one there — and a store
+//! that holds no records of a kind is no evidence about any one name, the same reading
+//! this service takes of an EC2 store it cannot read at all.
 //!
 //! `esxVersion` is stored as the version the host RUNS: the one the request named, or
 //! — when it named none — the default ESX version the service's own version catalogue
@@ -265,8 +285,45 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             ));
         }
-        if input.host.dedicated_host_id.is_some() && input.host.placement_group_id.is_some() {
+        let placement_conflict =
+            input.host.dedicated_host_id.is_some() && input.host.placement_group_id.is_some();
+        if placement_conflict {
             failures.push(crate::state::placement_conflict_failure("host"));
+        }
+        // The EC2 resources the host is PLACED on belong to the caller's account, and
+        // Amazon EVS creates neither of them, so each reference the request names has to
+        // resolve in the account's own Amazon EC2 store — the rule `CreateEnvironment`
+        // applies to the `vpcId` and `serviceAccessSubnetId` an environment names. A host
+        // naming BOTH mechanisms is already refused for that, so neither reference is
+        // resolved for it: the pair has nothing further to judge.
+        //
+        // LOCK ORDER. This reads EC2's store while this service's guard is held, which is
+        // the one order either lock is ever taken in (the launch below does the same).
+        if !placement_conflict {
+            failures.extend(crate::state::ec2_resources::host_placement_failures(
+                &*self.engine,
+                &[crate::state::ec2_resources::HostPlacementReferences {
+                    member_prefix: "host",
+                    placement_group_id: input.host.placement_group_id.as_deref(),
+                    dedicated_host_id: input.host.dedicated_host_id.as_deref(),
+                }],
+            ));
+        }
+        // "To find the available ESX versions for a particular VCF version, use the
+        // GetVersions action" (this operation's doc): a version the request names is one
+        // of the versions that catalogue offers for THIS environment's VCF version, and
+        // any other string names no ESX version Amazon EVS can install on the host. A VCF
+        // version the catalogue states no versions for leaves nothing to judge against, so
+        // nothing is refused for it.
+        if let Some(requested) = input.esx_version.as_deref() {
+            let available = crate::state::available_esx_versions(&environment.vcf_version);
+            if !available.is_empty() && !available.contains(&requested) {
+                failures.push(crate::state::unavailable_esx_version_failure(
+                    requested,
+                    &environment.vcf_version,
+                    &available,
+                ));
+            }
         }
         // "DNS hostnames for hosts must be unique across Amazon EVS environments and
         // within VCF": the scope is every environment, THIS one included, which is what

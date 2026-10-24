@@ -16,14 +16,17 @@
 //! response and `GetFreeTierUsage`' `FreeTierUsage` carry none), so these four members
 //! are the whole class.
 //!
-//! The suite checks the rule twice over, at both ends of the mechanism that carries it:
+//! The suite checks the rule at each end of the mechanism that carries it:
 //!
 //! * on the WIRE, over a table of stored instants spanning the span a `Timestamp` can
 //!   hold, including the round trip back to the instant the store holds (so a well-formed
 //!   string naming the wrong moment fails too);
 //! * on the SCHEMA, because the member schema's `timestamp_format()` is the single thing
 //!   the JSON codec consults (`vendor/smithy-schema-server/src/json.rs::write_timestamp`)
-//!   — with each shape's non-timestamp members as control rows.
+//!   — with each shape's non-timestamp members as control rows;
+//! * over the CLASS, by taking the census of `@timestampFormat("date-time")` members from
+//!   the model file itself, so the rule is asserted for every member the specification
+//!   puts in the class and not only for the ones listed by hand here.
 //!
 //! The harness (router, request signing, response parsing) is the one `free_tier.rs`
 //! already builds; this suite drives it rather than copying it.
@@ -199,6 +202,119 @@ async fn every_activity_date_time_member_is_an_rfc_3339_string_naming_the_stored
                 }
             }
         }
+    }
+}
+
+/// This service's own Smithy model, so the class the rule bites on is read off the
+/// SPECIFICATION rather than listed by hand.
+const MODEL: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/smithy-model/com-amazonaws-freetier-awsfreetierservice.json"
+));
+
+/// RULE, stated over the whole class at once: EVERY structure member this service's model
+/// marks `@timestampFormat("date-time")` is emitted with a schema that carries that
+/// format, because that schema is the only thing the JSON codec consults when it decides
+/// between the date-time string and the protocol-default epoch number.
+///
+/// The census comes from the model itself, so a member added to the model later — on a
+/// shape nobody has hand-written a schema for yet — fails this test instead of silently
+/// going out as a number. That is the one thing the member-for-member table below cannot
+/// do, because its rows are written by hand.
+#[test]
+fn every_date_time_member_the_model_declares_is_emitted_with_that_format() {
+    // The schema this service emits for each `(shape, member)` the model marks
+    // `@timestampFormat("date-time")`. Keyed by the model's own names, so the comparison
+    // against the census is name-for-name.
+    let emitted: [(&str, &str, &aws_smithy_schema::Schema); 4] = [
+        (
+            "GetAccountPlanStateResponse",
+            "accountPlanExpirationDate",
+            &GetAccountPlanStateOutput::M_ACCOUNT_PLAN_EXPIRATION_DATE,
+        ),
+        (
+            "GetAccountActivityResponse",
+            "expiresAt",
+            &GetAccountActivityOutput::M_EXPIRES_AT,
+        ),
+        (
+            "GetAccountActivityResponse",
+            "startedAt",
+            &GetAccountActivityOutput::M_STARTED_AT,
+        ),
+        (
+            "GetAccountActivityResponse",
+            "completedAt",
+            &GetAccountActivityOutput::M_COMPLETED_AT,
+        ),
+    ];
+
+    let model: Value = serde_json::from_str(MODEL).expect("the service's own model is JSON AST");
+    let shapes = model["shapes"]
+        .as_object()
+        .expect("a JSON AST model has a shape map");
+
+    // `@timestampFormat` applies either to a member or to the timestamp shape a member
+    // targets. A shape-level one would put members this census cannot see into the class,
+    // so it is checked for rather than assumed away.
+    let shape_level: Vec<&str> = shapes
+        .iter()
+        .filter(|(_, shape)| {
+            shape.get("type").and_then(Value::as_str) == Some("timestamp")
+                && shape
+                    .pointer("/traits/smithy.api#timestampFormat")
+                    .is_some()
+        })
+        .map(|(shape_id, _)| shape_id.as_str())
+        .collect();
+    assert!(
+        shape_level.is_empty(),
+        "case \"shape-level @timestampFormat\": every member targeting one of {shape_level:?} \
+         joins the class, so this census must widen to cover them"
+    );
+
+    let mut census: Vec<(&str, &str)> = Vec::new();
+    for (shape_id, shape) in shapes {
+        let Some(members) = shape.get("members").and_then(Value::as_object) else {
+            continue;
+        };
+        for (member_name, member) in members {
+            let format = member
+                .pointer("/traits/smithy.api#timestampFormat")
+                .and_then(Value::as_str);
+            if format == Some("date-time") {
+                let local = shape_id.split('#').next_back().unwrap_or(shape_id.as_str());
+                census.push((local, member_name.as_str()));
+            }
+        }
+    }
+    census.sort_unstable();
+    assert!(
+        !census.is_empty(),
+        "case \"the census\": the model must declare at least one date-time member for the \
+         rule to be about, got none — the model or its path has moved"
+    );
+
+    let mut covered: Vec<(&str, &str)> = emitted
+        .iter()
+        .map(|(shape, member, _)| (*shape, *member))
+        .collect();
+    covered.sort_unstable();
+    assert_eq!(
+        covered, census,
+        "case \"the census\": the members emitted with a date-time schema must be exactly \
+         the ones the model marks @timestampFormat(\"date-time\"), got {covered:?} against \
+         the model's {census:?}"
+    );
+
+    for (shape, member_name, member) in emitted {
+        let case = format!("{shape}${member_name}");
+        let format = member.timestamp_format().map(|trait_| trait_.format());
+        assert!(
+            matches!(format, Some(TimestampFormat::DateTime)),
+            "case {case:?}: the model marks this member @timestampFormat(\"date-time\"), so \
+             the schema the codec reads must carry that format, got {format:?}"
+        );
     }
 }
 

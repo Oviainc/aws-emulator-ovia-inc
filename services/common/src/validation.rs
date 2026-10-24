@@ -63,8 +63,11 @@
 //!   this is the same order of magnitude rather than a new amplification class.
 //! * [`MAX_RECORDED_LEAVES`] (256) and [`MAX_RECORDED_BYTES`] (64 KiB) — the leaf count
 //!   and the owned bytes (paths plus values) this walk may collect from one request. The
-//!   walk stops at the leaf cap and skips any leaf that does not fit the byte budget, so
-//!   the collection is never a second full copy of the request's strings.
+//!   leaf count is over every leaf VISITED, kept or dropped, so the traversal stops at the
+//!   cap even for a request whose every value is too large to keep; the walk skips any
+//!   leaf that does not fit the byte budget, so the collection is never a second full copy
+//!   of the request's strings. A rendered composite is bounded the same way, by child
+//!   count and by the bytes its children hold ([`MAX_RENDERED_CHILDREN`]).
 //!
 //! Beyond any of these the framework's elided text stands: a shortened echo is a
 //! divergence in one message, while an unbounded one is a response sized by the request.
@@ -83,7 +86,7 @@
 //!
 //! # What of a validation message this module now owns, and what is still to come
 //!
-//! Three parts of a validation-exception message are the same for EVERY service, and two
+//! Four parts of a validation-exception message are the same for EVERY service, and three
 //! of them live here:
 //!
 //! * which value a clause echoes — the one the caller submitted ([`with_submitted_values`]),
@@ -100,16 +103,19 @@
 //!   own change, and nothing new should inline the rule again. The copies that are not
 //!   wired to this one still decline to drop the pair around a top-level alternation, which
 //!   the recordings show AWS dropping ([`unanchored`] explains why); that difference goes
-//!   away as each is deleted.
+//!   away as each is deleted;
+//! * the subject half's one fact a violation cannot carry: WHETHER the member was absent
+//!   or was present with no text rendering of its own, so a service that states
+//!   `Value at '<path>' …` for a present-but-unquotable value can still state
+//!   `Value null at '<path>' …` for an absent one ([`SubmittedEcho`],
+//!   [`with_submitted_echoes`]) — which value a clause then quotes, and how long a value it
+//!   is willing to quote, stays with the service.
 //!
-//! Two parts still belong here and are not here yet:
+//! One part still belongs here and is not here yet:
 //!
 //! * the requirement half, read off the framework's own wording from a violation with NO
 //!   value attached and split at the LAST clause marker, so neither the rejected value
-//!   nor a caller-chosen map key in the member path can reach it;
-//! * the subject half: a service that reports a present-but-invalid value as
-//!   `Value at '<path>' …` without quoting it back, while an ABSENT member keeps
-//!   `Value null at '<path>' …`.
+//!   nor a caller-chosen map key in the member path can reach it.
 //!
 //! How the clauses are then counted, ordered and joined into an envelope is a service
 //! DIALECT (`N validation error(s) detected: …,…` for Amazon EVS,
@@ -188,6 +194,56 @@ pub fn refusing_violations_with_lists<O: Operation>(
 pub(crate) struct Refusing {
     pub(crate) violations: Vec<Violation>,
     pub(crate) lists: HashMap<String, String>,
+    /// How a clause can state each violation's value, in the same order as `violations`,
+    /// when the caller asked for it ([`Echoes::Renderings`]; otherwise empty).
+    pub(crate) echoes: Vec<SubmittedEcho>,
+}
+
+/// How a clause can state the value one violation is about.
+///
+/// The distinction [`Violation::value`] cannot carry: `None` there means the member was
+/// ABSENT, so a value that was PRESENT but has no text rendering (a blob's bytes, a map, a
+/// document) reaches a service as the framework's summary of it — `<n> bytes`,
+/// `<n> entries`, `<document>` — which is wire text AWS never emits, and a service that
+/// omits the value for exactly those members cannot tell them apart. Here such a value is
+/// [`SubmittedEcho::Unrendered`], an ABSENT member is [`SubmittedEcho::Absent`], and
+/// everything this walk can render — including a LIST as `[<element>, …]` and a STRUCTURE
+/// as `<ShapeName>(<member>=<value>, …)`, the form the AWS SDKs print a modelled structure
+/// in — is [`SubmittedEcho::Rendered`]. Which of them a clause quotes, and how long a
+/// value it is willing to quote, stays with the service.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubmittedEcho {
+    /// The member was absent from the request: there is no submitted value at all.
+    Absent,
+    /// The value the caller submitted, rendered the way a value renders inside a clause:
+    /// a string as its own text, a number as its digits, a list as `[<element>, …]`, a
+    /// structure as `<ShapeName>(<member>=<value>, …)`.
+    Rendered(String),
+    /// A value that WAS submitted and has no text rendering this walk produces, or one
+    /// past the bounds this module states. What a clause says in place of it — omit the
+    /// value, name its class — is the service's own choice.
+    Unrendered,
+}
+
+/// Every violation that refuses `req` before `O`'s handler runs, each paired with how a
+/// clause can state the value it is about ([`SubmittedEcho`]).
+///
+/// The same collecting walk as [`refusing_violations`] — [`violations_in`], over the
+/// framework's own deserializer and `constraints::validate` — so the two cannot find a
+/// different set of violations. Only the echo differs: this one renders a COMPOSITE value
+/// (a list, a structure) rather than leaving the framework's count summary in place, and
+/// reports a value it cannot render as such instead of as a summary.
+#[must_use]
+pub fn refusing_violations_with_echoes<O: Operation>(
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+) -> Vec<(Violation, SubmittedEcho)> {
+    let refusing = violations_in::<O>(protocol, req, Echoes::Renderings);
+    refusing
+        .violations
+        .into_iter()
+        .zip(refusing.echoes)
+        .collect()
 }
 
 /// Whether a collected violation's value echo is restored to the bytes the caller sent.
@@ -203,6 +259,10 @@ pub(crate) enum Echoes {
     Rendered,
     /// Restore each echo, and collect the request's lists too ([`submitted_lists`]).
     SubmittedWithLists,
+    /// Pair each violation with how a clause can state its value
+    /// ([`with_submitted_echoes`]), which renders a composite value instead of leaving the
+    /// framework's count summary in place.
+    Renderings,
 }
 
 /// The ONE collecting walk this crate performs: every violation that refuses `req` before
@@ -230,11 +290,24 @@ pub(crate) fn violations_in<O: Operation>(
                 Echoes::Submitted => Refusing {
                     violations: with_submitted_values(violations, &input, O::INPUT_SCHEMA),
                     lists: HashMap::new(),
+                    echoes: Vec::new(),
                 },
                 Echoes::Rendered => Refusing {
                     violations,
                     lists: HashMap::new(),
+                    echoes: Vec::new(),
                 },
+                Echoes::Renderings => {
+                    let (violations, echoes) =
+                        with_submitted_echoes(violations, &input, O::INPUT_SCHEMA)
+                            .into_iter()
+                            .unzip();
+                    Refusing {
+                        violations,
+                        lists: HashMap::new(),
+                        echoes,
+                    }
+                }
                 Echoes::SubmittedWithLists => {
                     // The lists are only ever READ for a violation found on a list
                     // ELEMENT, so a request that broke no such constraint — which is every
@@ -249,6 +322,7 @@ pub(crate) fn violations_in<O: Operation>(
                         } else {
                             HashMap::new()
                         },
+                        echoes: Vec::new(),
                     }
                 }
             }
@@ -265,6 +339,9 @@ pub(crate) fn violations_in<O: Operation>(
                 value: None,
             }],
             lists: HashMap::new(),
+            // An absent member has no submitted value, whichever echo the caller asked
+            // for, so this stays in step with `violations` for every mode.
+            echoes: vec![SubmittedEcho::Absent],
         },
         Err(_) => Refusing::default(),
     }
@@ -283,6 +360,23 @@ const MAX_RECORDED_LEAVES: usize = 256;
 /// from one request. Equal to [`MAX_RESTORED_TOTAL`]: a leaf that could never be restored
 /// within that budget is not worth copying.
 const MAX_RECORDED_BYTES: usize = MAX_RESTORED_TOTAL;
+
+/// The most member positions [`submitted_renderings`] records from one request. The same
+/// count bound the leaf collection states, for the same reason: the collection is never
+/// sized by the request.
+const MAX_RECORDED_RENDERINGS: usize = MAX_RECORDED_LEAVES;
+
+/// The owned bytes — paths plus renderings — [`submitted_renderings`] may hold.
+const MAX_RECORDED_RENDERED_BYTES: usize = MAX_RECORDED_BYTES;
+
+/// The most children ONE composite renders from. A composite with more keeps no
+/// rendering at all, rather than one stating fewer elements than were sent.
+///
+/// The other half of a composite's bound is its SIZE: its children may hold at most
+/// [`MAX_RESTORED_ECHO`] rendering bytes together, and a child rendering past that bound
+/// is never handed to a composite at all, so the text a nested value retains cannot be
+/// sized by the request at any depth.
+const MAX_RENDERED_CHILDREN: usize = 256;
 
 /// `violations`, with every elided value echo replaced by the value as submitted, within
 /// the bounds this module states.
@@ -335,6 +429,75 @@ pub fn with_submitted_values(
         violation.value = Some(restored);
     }
     violations
+}
+
+/// `violations`, each paired with how a clause can state the value it is about.
+///
+/// `input` and `schema` must be the ones the violations were collected from, exactly as
+/// for [`with_submitted_values`]. A violation whose path this walk recorded no rendering
+/// for — a value with no text rendering, a path past the stated bounds — is
+/// [`SubmittedEcho::Unrendered`]; nothing is guessed from the framework's summary of it.
+#[must_use]
+pub fn with_submitted_echoes(
+    violations: Vec<Violation>,
+    input: &dyn SerializableStruct,
+    schema: &Schema,
+) -> Vec<(Violation, SubmittedEcho)> {
+    // A refusal that states no value at all (an absent `@required` member is the common
+    // case) is not worth a walk over the whole input.
+    if violations.iter().all(|violation| violation.value.is_none()) {
+        return violations
+            .into_iter()
+            .map(|violation| (violation, SubmittedEcho::Absent))
+            .collect();
+    }
+    let renderings = submitted_renderings(input, schema);
+    // ONE pass over the renderings builds the lookup, so the cost is O(positions) rather
+    // than O(violations x positions).
+    let mut by_path: HashMap<&str, Option<&str>> = HashMap::new();
+    for (position, rendering) in &renderings {
+        by_path
+            .entry(position.as_str())
+            .or_insert(rendering.as_deref());
+    }
+    let mut budget = MAX_RESTORED_TOTAL;
+    violations
+        .into_iter()
+        .map(|violation| {
+            let echo = echo_of(&violation, &by_path, &mut budget);
+            (violation, echo)
+        })
+        .collect()
+}
+
+/// How a clause can state `violation`'s value, within the bounds this module states.
+fn echo_of(
+    violation: &Violation,
+    by_path: &HashMap<&str, Option<&str>>,
+    budget: &mut usize,
+) -> SubmittedEcho {
+    if violation.value.is_none() {
+        return SubmittedEcho::Absent;
+    }
+    let rendered = match violation.kind {
+        // A `@uniqueItems` clause is reported at the LIST's path but states the ELEMENT
+        // that repeated, where the rendering recorded is the whole list. The framework's
+        // own echo IS that element, already bounded, so it stands.
+        ViolationKind::UniqueItems => violation.value.as_deref(),
+        _ => match by_path.get(violation.path.as_str()) {
+            Some(Some(rendering)) => Some(*rendering),
+            // A value with no text rendering, or a position this walk recorded nothing
+            // for (its bounds, or a path the frozen crate spells differently).
+            _ => None,
+        },
+    };
+    match rendered {
+        Some(rendering) if rendering.len() <= MAX_RESTORED_ECHO && rendering.len() <= *budget => {
+            *budget -= rendering.len();
+            SubmittedEcho::Rendered(rendering.to_string())
+        }
+        _ => SubmittedEcho::Unrendered,
+    }
 }
 
 /// The collected leaves of one request, indexed for the lookups a violation needs.
@@ -654,6 +817,138 @@ fn collected_leaves(
     (walk.leaves, !walk.skipped)
 }
 
+/// Every member position of `input` this walk reaches, in walk order, paired with the
+/// rendering a clause states the value held there with — `None` for a value this walk
+/// produces no text rendering for (a blob, a map, a document) or one past its bounds.
+///
+/// The SIBLING of [`submitted_leaves`] and [`submitted_lists`], over the SAME walk and so
+/// the same path spelling: the positions are the ones the validating walk reports a
+/// violation at, including a COMPOSITE member (a list, a structure), which that walk
+/// reports a `@length` clause on and has only a count rendering for.
+///
+/// A composite renders from its children: a list as `[<element>, …]`, a structure as
+/// `<ShapeName>(<member>=<value>, …)` over the members that were present. A composite
+/// with any unrenderable child renders as `None` rather than as one missing a part of the
+/// value, and so does a map (no rule for how AWS states one in a clause is known here)
+/// and a structure reached as a struct MEMBER, whose schema names the member rather than
+/// the shape.
+///
+/// Bounded by [`MAX_RECORDED_RENDERINGS`], [`MAX_RECORDED_RENDERED_BYTES`],
+/// [`MAX_RENDERED_CHILDREN`] and [`MAX_RESTORED_ECHO`], so neither the memory nor the
+/// text this produces is sized by the request.
+#[must_use]
+pub fn submitted_renderings(
+    input: &dyn SerializableStruct,
+    schema: &Schema,
+) -> Vec<(String, Option<String>)> {
+    // The ONLY walk that composes renderings: a caller that reads one named leaf
+    // ([`submitted_leaves`], [`submitted_lists`]) pays nothing for them.
+    let mut walk = SubmittedValues {
+        renders: true,
+        ..SubmittedValues::default()
+    };
+    let _ = walk.write_struct(schema, input);
+    walk.renderings
+}
+
+/// One child of an open composite: the member name it reported under (absent for a
+/// collection element) and how its value renders.
+#[derive(Debug)]
+struct RenderedChild {
+    name: Option<String>,
+    rendering: Option<String>,
+}
+
+/// The children of one composite being walked, and whether more arrived than
+/// [`MAX_RENDERED_CHILDREN`] allows, one of them was larger than a composite may hold,
+/// or one of them was never written.
+#[derive(Debug, Default)]
+struct Composite {
+    children: Vec<RenderedChild>,
+    /// Rendering bytes the children hold together, bounded by [`MAX_RESTORED_ECHO`]: a
+    /// composite that could never be quoted in a clause is not worth holding, and holding
+    /// it is what would let one request's text be retained at every nesting level.
+    bytes: usize,
+    truncated: bool,
+}
+
+impl Composite {
+    /// Take one child, or mark this composite truncated once it is full — by child COUNT
+    /// or by the bytes its children already hold. A truncated composite renders as nothing
+    /// ([`SubmittedValues::close_children`]), so dropping a child never states a value
+    /// missing a part of itself.
+    fn take(&mut self, child: RenderedChild) {
+        let bytes = child.name.as_ref().map_or(0, String::len)
+            + child.rendering.as_ref().map_or(0, String::len);
+        if self.children.len() >= MAX_RENDERED_CHILDREN
+            || self.bytes + bytes > MAX_RESTORED_ECHO
+        {
+            self.truncated = true;
+            return;
+        }
+        self.bytes += bytes;
+        self.children.push(child);
+    }
+}
+
+/// The text `children` would render to, including the separators and brackets a list or a
+/// structure puts between them, or `None` when any child has no text rendering.
+///
+/// Measured BEFORE anything is joined, so a rendering past [`MAX_RESTORED_ECHO`] is never
+/// allocated only to be discarded.
+fn rendered_length(children: &[RenderedChild], named: bool) -> Option<usize> {
+    let mut length = 2; // the brackets, or the parentheses after a shape's name
+    for (index, child) in children.iter().enumerate() {
+        if index > 0 {
+            length += 2; // ", "
+        }
+        if named {
+            // `<member>=`
+            length += child.name.as_ref()?.len() + 1;
+        }
+        length += child.rendering.as_ref()?.len();
+    }
+    Some(length)
+}
+
+/// `children` as a list renders: the elements in order, comma-separated, in brackets,
+/// through the one renderer of that form ([`rendered_list`]). `None` when any element has
+/// no text rendering, so a list of blobs states no value rather than one missing an
+/// element, and `None` when the rendering would be longer than [`MAX_RESTORED_ECHO`] —
+/// measured before it is built, so an oversized rendering is never allocated.
+fn rendered_sequence(children: &[RenderedChild]) -> Option<String> {
+    if rendered_length(children, false)? > MAX_RESTORED_ECHO {
+        return None;
+    }
+    let elements: Vec<&str> = children
+        .iter()
+        .map(|child| child.rendering.as_deref())
+        .collect::<Option<Vec<_>>>()?;
+    Some(rendered_list(&elements))
+}
+
+/// `children` as a structure renders: the shape's name over the members that were
+/// present, each `<member>=<value>`, in the order the value wrote them — the form the AWS
+/// SDKs print a modelled structure in. `None` when a member that WAS written has no text
+/// rendering, so a structure carrying a blob or a map states no value at all rather than
+/// one missing a part of itself. (An ABSENT member is never written, so it is not a child
+/// here and does not suppress the rendering.) `None` too when the rendering would be
+/// longer than [`MAX_RESTORED_ECHO`], measured before it is built.
+fn rendered_structure(name: &str, children: &[RenderedChild]) -> Option<String> {
+    if name.len() + rendered_length(children, true)? > MAX_RESTORED_ECHO {
+        return None;
+    }
+    let members: Vec<String> = children
+        .iter()
+        .map(|child| {
+            let member = child.name.as_deref()?;
+            let rendering = child.rendering.as_deref()?;
+            Some(format!("{member}={rendering}"))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(format!("{name}({})", members.join(", ")))
+}
+
 /// A frame of the collection stack, mirroring the one the validating walk keeps so a
 /// leaf's path is spelled identically.
 ///
@@ -688,6 +983,20 @@ struct SubmittedValues {
     leaves: Vec<(String, String)>,
     /// Owned bytes recorded so far: path plus value, both caller-sized.
     recorded: usize,
+    /// Every member position reached, paired with its clause rendering — see
+    /// [`submitted_renderings`]. Empty unless `renders`.
+    renderings: Vec<(String, Option<String>)>,
+    /// Owned bytes `renderings` holds: positions plus renderings.
+    rendered: usize,
+    /// Leaf positions VISITED, recorded or not: the walk's own stop condition
+    /// ([`Self::done`]), which must not depend on whether a leaf was kept.
+    visited: usize,
+    /// Whether this walk composes renderings at all. Off by default, so a caller that
+    /// only reads leaves pays neither the frames nor the owned text for them.
+    renders: bool,
+    /// The composites currently open, innermost last, collecting the children each
+    /// renders from. Pushed and popped with `collections`.
+    open: Vec<Composite>,
     /// Dotted path segments from the root to the value being written.
     path: Vec<String>,
     /// Active collection frames, innermost last.
@@ -706,10 +1015,14 @@ struct SubmittedValues {
 impl SubmittedValues {
     /// True once no further leaf can be recorded, so the rest of the walk is skipped.
     ///
+    /// Counted over every leaf VISITED rather than over the leaves kept: a leaf dropped
+    /// for its size is not recorded, so a request made of oversized values would
+    /// otherwise keep this false and let the walk run over every member of it.
+    ///
     /// Reaching the cap also means a leaf the walk has not got to will be dropped, so it
     /// records that the collection is incomplete.
     fn done(&mut self) -> bool {
-        let done = self.leaves.len() >= MAX_RECORDED_LEAVES;
+        let done = self.visited >= MAX_RECORDED_LEAVES;
         self.skipped |= done;
         done
     }
@@ -761,6 +1074,15 @@ impl SubmittedValues {
         }
     }
 
+    /// The walk stopped before the value now being written: the composite that value
+    /// belongs to is missing a child, so it must render as nothing rather than as a value
+    /// with a part of itself left out.
+    fn abandoned(&mut self) {
+        if let Some(open) = self.open.last_mut() {
+            open.truncated = true;
+        }
+    }
+
     /// Record the leaf now being written, when it has a string rendering and fits the
     /// bounds this walk states.
     fn record(&mut self, value: Option<&str>) {
@@ -781,11 +1103,44 @@ impl SubmittedValues {
         self.leaves.push((leaf_path, value.to_string()));
     }
 
+    /// Record the position now being written with how a clause renders the value it held,
+    /// and hand that rendering to the composite this value is a child of, if any.
+    ///
+    /// Called with the path still naming this value, and AFTER a composite's own frame is
+    /// closed, so the child lands on its PARENT.
+    fn produced(&mut self, schema: &Schema, rendering: Option<String>) {
+        if !self.renders {
+            return;
+        }
+        let position = path::join(&self.path);
+        // A rendering no clause could carry (see `MAX_RESTORED_ECHO`) is neither kept nor
+        // handed to the composite this value is a child of: holding it would retain
+        // request-sized text once per nesting level. The composite then renders as
+        // nothing, rather than as a value missing a part of itself.
+        let rendering = rendering.filter(|rendered| rendered.len() <= MAX_RESTORED_ECHO);
+        let bytes = position.len() + rendering.as_ref().map_or(0, String::len);
+        if self.renderings.len() < MAX_RECORDED_RENDERINGS
+            && self.rendered + bytes <= MAX_RECORDED_RENDERED_BYTES
+        {
+            self.rendered += bytes;
+            self.renderings.push((position, rendering.clone()));
+        }
+        if let Some(open) = self.open.last_mut() {
+            open.take(RenderedChild {
+                name: Self::segment_for(schema),
+                rendering,
+            });
+        }
+    }
+
     /// One leaf write. `value` carries the leaf's text when its echo is the caller's own
     /// bytes (a string, or a big-number rendering) and is `None` for every other leaf
-    /// kind — which is still walked, so a later leaf's path stays correct.
-    fn leaf(&mut self, schema: &Schema, value: Option<&str>) {
+    /// kind — which is still walked, so a later leaf's path stays correct. `rendering` is
+    /// how a clause states that value, which a number or a boolean has even though its
+    /// text is not the caller's own bytes, and a blob or a document has not at all.
+    fn leaf(&mut self, schema: &Schema, value: Option<&str>, rendering: Option<&str>) {
         if self.done() {
+            self.abandoned();
             return;
         }
         // A map ENTRY KEY is written as a string against the map member's schema before
@@ -801,14 +1156,22 @@ impl SubmittedValues {
                 return;
             }
         }
+        let rendering = rendering.map(str::to_string);
+        // Every leaf POSITION counts against the walk's budget, whether or not its value
+        // is kept, so the traversal is bounded by the cap even when nothing is recorded.
+        self.visited += 1;
         match self.begin_child(true) {
             Some(segment) => {
                 self.path.push(segment);
                 self.record(value);
+                self.produced(schema, rendering);
                 self.path.pop();
                 self.end_child();
             }
-            None => self.with_segment(schema, |this| this.record(value)),
+            None => self.with_segment(schema, |this| {
+                this.record(value);
+                this.produced(schema, rendering);
+            }),
         }
     }
 
@@ -822,6 +1185,7 @@ impl SubmittedValues {
         write_children: &dyn Fn(&mut dyn ShapeSerializer) -> Result<(), SerdeError>,
     ) -> Result<(), SerdeError> {
         if self.done() {
+            self.abandoned();
             return Ok(());
         }
         let element = self.begin_child(false);
@@ -830,9 +1194,9 @@ impl SubmittedValues {
             self.path.push(segment);
         }
         let out = if is_element {
-            self.walk_children(frame, write_children)
+            self.walk_children(schema, frame, write_children)
         } else {
-            self.with_segment(schema, |this| this.walk_children(frame, write_children))
+            self.with_segment(schema, |this| this.walk_children(schema, frame, write_children))
         };
         if is_element {
             self.path.pop();
@@ -841,16 +1205,51 @@ impl SubmittedValues {
         out
     }
 
-    /// Open `frame`, write the collection's children into it, then close it.
+    /// Open `frame`, write the composite's children into it, then close it and record how
+    /// the composite itself renders.
     fn walk_children(
         &mut self,
+        schema: &Schema,
         frame: Frame,
         write_children: &dyn Fn(&mut dyn ShapeSerializer) -> Result<(), SerdeError>,
     ) -> Result<(), SerdeError> {
         self.collections.push(frame);
+        if self.renders {
+            self.open.push(Composite::default());
+        }
         let out = write_children(self);
-        self.collections.pop();
+        let rendering = self.close_children(schema);
+        self.produced(schema, rendering);
         out
+    }
+
+    /// Close the innermost composite and render it from the children it collected.
+    fn close_children(&mut self, schema: &Schema) -> Option<String> {
+        let frame = self.collections.pop();
+        if !self.renders {
+            return None;
+        }
+        let composite = self.open.pop().unwrap_or_default();
+        if composite.truncated {
+            return None;
+        }
+        let rendering = match frame {
+            Some(Frame::List { .. }) => rendered_sequence(&composite.children),
+            // A structure renders under its SHAPE's name, which only the shape's own
+            // schema carries: a list element is written against the element struct's own
+            // schema (`&Inner::SCHEMA`, from the generated `serialize_members`), while a
+            // struct reached as a MEMBER carries the member schema, whose name is the
+            // member's. Rendering that one would state `<member>(…)`, a form AWS never
+            // emits, so such a structure renders as nothing and the service states no
+            // value for it.
+            Some(Frame::Struct) if schema.member_name().is_none() => {
+                rendered_structure(schema.shape_id().shape_name(), &composite.children)
+            }
+            // A map: no rule for how AWS states one inside a clause is known here, so a
+            // clause on a map member states no value rather than a form AWS never emits.
+            _ => None,
+        };
+        rendering.filter(|rendered| rendered.len() <= MAX_RESTORED_ECHO)
     }
 }
 
@@ -861,26 +1260,23 @@ impl ShapeSerializer for SubmittedValues {
         value: &dyn SerializableStruct,
     ) -> Result<(), SerdeError> {
         if self.done() {
+            self.abandoned();
             return Ok(());
         }
         // A struct is the root input (no member name, no segment), a nested struct member
         // (member name -> segment), a list element or a map value (the frame supplies the
         // segment).
+        let write_members = |s: &mut dyn ShapeSerializer| value.serialize_members(s);
         match self.begin_child(false) {
             Some(segment) => {
                 self.path.push(segment);
-                self.collections.push(Frame::Struct);
-                let out = value.serialize_members(self);
-                self.collections.pop();
+                let out = self.walk_children(schema, Frame::Struct, &write_members);
                 self.path.pop();
                 self.end_child();
                 out
             }
             None => self.with_segment(schema, |this| {
-                this.collections.push(Frame::Struct);
-                let out = value.serialize_members(this);
-                this.collections.pop();
-                out
+                this.walk_children(schema, Frame::Struct, &write_members)
             }),
         }
     }
@@ -908,70 +1304,76 @@ impl ShapeSerializer for SubmittedValues {
         )
     }
 
-    fn write_boolean(&mut self, schema: &Schema, _value: bool) -> Result<(), SerdeError> {
-        self.leaf(schema, None);
+    fn write_boolean(&mut self, schema: &Schema, value: bool) -> Result<(), SerdeError> {
+        // A number or a boolean is not the caller's own BYTES (so no leaf is recorded for
+        // re-echoing one), but a clause does state it, in the same text the validating
+        // walk renders it with.
+        self.leaf(schema, None, Some(&value.to_string()));
         Ok(())
     }
 
-    fn write_byte(&mut self, schema: &Schema, _value: i8) -> Result<(), SerdeError> {
-        self.leaf(schema, None);
+    fn write_byte(&mut self, schema: &Schema, value: i8) -> Result<(), SerdeError> {
+        self.leaf(schema, None, Some(&value.to_string()));
         Ok(())
     }
 
-    fn write_short(&mut self, schema: &Schema, _value: i16) -> Result<(), SerdeError> {
-        self.leaf(schema, None);
+    fn write_short(&mut self, schema: &Schema, value: i16) -> Result<(), SerdeError> {
+        self.leaf(schema, None, Some(&value.to_string()));
         Ok(())
     }
 
-    fn write_integer(&mut self, schema: &Schema, _value: i32) -> Result<(), SerdeError> {
-        self.leaf(schema, None);
+    fn write_integer(&mut self, schema: &Schema, value: i32) -> Result<(), SerdeError> {
+        self.leaf(schema, None, Some(&value.to_string()));
         Ok(())
     }
 
-    fn write_long(&mut self, schema: &Schema, _value: i64) -> Result<(), SerdeError> {
-        self.leaf(schema, None);
+    fn write_long(&mut self, schema: &Schema, value: i64) -> Result<(), SerdeError> {
+        self.leaf(schema, None, Some(&value.to_string()));
         Ok(())
     }
 
-    fn write_float(&mut self, schema: &Schema, _value: f32) -> Result<(), SerdeError> {
-        self.leaf(schema, None);
+    fn write_float(&mut self, schema: &Schema, value: f32) -> Result<(), SerdeError> {
+        self.leaf(schema, None, Some(&value.to_string()));
         Ok(())
     }
 
-    fn write_double(&mut self, schema: &Schema, _value: f64) -> Result<(), SerdeError> {
-        self.leaf(schema, None);
+    fn write_double(&mut self, schema: &Schema, value: f64) -> Result<(), SerdeError> {
+        self.leaf(schema, None, Some(&value.to_string()));
         Ok(())
     }
 
     fn write_big_integer(&mut self, schema: &Schema, value: &BigInteger) -> Result<(), SerdeError> {
-        self.leaf(schema, Some(value.as_ref()));
+        self.leaf(schema, Some(value.as_ref()), Some(value.as_ref()));
         Ok(())
     }
 
     fn write_big_decimal(&mut self, schema: &Schema, value: &BigDecimal) -> Result<(), SerdeError> {
-        self.leaf(schema, Some(value.as_ref()));
+        self.leaf(schema, Some(value.as_ref()), Some(value.as_ref()));
         Ok(())
     }
 
     fn write_string(&mut self, schema: &Schema, value: &str) -> Result<(), SerdeError> {
-        self.leaf(schema, Some(value));
+        self.leaf(schema, Some(value), Some(value));
         Ok(())
     }
 
     fn write_blob(&mut self, schema: &Schema, _value: &[u8]) -> Result<(), SerdeError> {
         // The walk renders a blob as its byte count, never its bytes, so there is no
-        // caller-submitted text to re-echo here.
-        self.leaf(schema, None);
+        // caller-submitted text to re-echo here — and no text rendering of the value for
+        // a clause either.
+        self.leaf(schema, None, None);
         Ok(())
     }
 
-    fn write_timestamp(&mut self, schema: &Schema, _value: &DateTime) -> Result<(), SerdeError> {
-        self.leaf(schema, None);
+    fn write_timestamp(&mut self, schema: &Schema, value: &DateTime) -> Result<(), SerdeError> {
+        self.leaf(schema, None, Some(&value.to_string()));
         Ok(())
     }
 
     fn write_document(&mut self, schema: &Schema, _value: &Document) -> Result<(), SerdeError> {
-        self.leaf(schema, None);
+        // The walk renders a document as `<document>`, which is a summary rather than the
+        // value, so this position has no text rendering.
+        self.leaf(schema, None, None);
         Ok(())
     }
 
@@ -993,11 +1395,13 @@ impl ShapeSerializer for SubmittedValues {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_elision_of, list_of_element, unanchored, unanchored_grouping_alternation, Submitted,
-        SubmittedValues, MAX_RECORDED_BYTES, MAX_RECORDED_LEAVES, MAX_RESTORED_ECHO,
-        MAX_RESTORED_TOTAL,
+        echo_of, is_elision_of, list_of_element, rendered_sequence, rendered_structure, unanchored,
+        unanchored_grouping_alternation, Composite, RenderedChild, Submitted, SubmittedEcho,
+        SubmittedValues, MAX_RECORDED_BYTES, MAX_RECORDED_LEAVES, MAX_RECORDED_RENDERED_BYTES,
+        MAX_RECORDED_RENDERINGS, MAX_RENDERED_CHILDREN, MAX_RESTORED_ECHO, MAX_RESTORED_TOTAL,
     };
     use aws_smithy_schema_server::constraints::{Violation, ViolationKind};
+    use std::collections::HashMap;
 
     /// RULE: a `@pattern` is quoted as the model's expression minus the leading `^` and the
     /// trailing `$` the model writes around the service's own full-match expression — the
@@ -1088,7 +1492,9 @@ mod tests {
     }
 
     /// RULE: reaching the leaf cap also marks the collection incomplete — the walk stops
-    /// there, so a leaf beyond it is a leaf that was dropped.
+    /// there, so a leaf beyond it is a leaf that was dropped — and the cap is counted over
+    /// every leaf VISITED, so a request whose values are all dropped for their size still
+    /// stops the walk.
     #[test]
     fn the_leaf_cap_marks_the_collection_incomplete() {
         let mut walk = SubmittedValues::default();
@@ -1098,6 +1504,7 @@ mod tests {
             "case an empty walk: expected it to be complete and not done"
         );
         for index in 0..MAX_RECORDED_LEAVES {
+            walk.visited += 1;
             walk.record(Some(&index.to_string()));
         }
         assert_eq!(
@@ -1109,6 +1516,25 @@ mod tests {
         assert!(
             walk.done() && walk.skipped,
             "case a full walk: expected it to be done and incomplete"
+        );
+
+        // Nothing is recorded for a value past the echo bound, so a walk whose stop
+        // condition counted RECORDED leaves would never stop on a request made of them.
+        let mut dropping = SubmittedValues::default();
+        dropping.path.push("member".to_string());
+        let oversized = "x".repeat(MAX_RESTORED_ECHO + 1);
+        for _ in 0..MAX_RECORDED_LEAVES {
+            dropping.visited += 1;
+            dropping.record(Some(&oversized));
+        }
+        assert!(
+            dropping.leaves.is_empty(),
+            "case a walk of oversized values: expected nothing recorded, got {} leaves",
+            dropping.leaves.len()
+        );
+        assert!(
+            dropping.done() && dropping.skipped,
+            "case a walk of oversized values: expected it to be done and incomplete"
         );
     }
 
@@ -1319,8 +1745,221 @@ mod tests {
             assert!(MAX_RESTORED_ECHO <= MAX_RESTORED_TOTAL);
             assert!(MAX_RECORDED_BYTES <= MAX_RESTORED_TOTAL);
             assert!(MAX_RECORDED_LEAVES > 0 && MAX_RECORDED_BYTES > 0);
+            assert!(MAX_RECORDED_RENDERINGS > 0 && MAX_RECORDED_RENDERED_BYTES > 0);
+            assert!(MAX_RENDERED_CHILDREN > 0);
         };
         let () = COHERENT;
+    }
+
+    /// RULE: a composite renders from its children — a list as `[<element>, …]`, a
+    /// structure as `<ShapeName>(<member>=<value>, …)` over the members that were
+    /// present — and renders as nothing at all when a child has no text rendering.
+    #[test]
+    fn a_composite_renders_from_the_children_it_was_given() {
+        let child = |name: Option<&str>, rendering: Option<&str>| RenderedChild {
+            name: name.map(str::to_string),
+            rendering: rendering.map(str::to_string),
+        };
+        let sequences: [(&str, Vec<RenderedChild>, Option<&str>); 4] = [
+            ("no elements", vec![], Some("[]")),
+            ("one element", vec![child(None, Some("a"))], Some("[a]")),
+            (
+                "three elements keep their order",
+                vec![
+                    child(None, Some("a")),
+                    child(None, Some("b")),
+                    child(None, Some("c")),
+                ],
+                Some("[a, b, c]"),
+            ),
+            (
+                "an element with no text rendering",
+                vec![child(None, Some("a")), child(None, None)],
+                None,
+            ),
+        ];
+        for (case, children, expected) in sequences {
+            let actual = rendered_sequence(&children);
+            assert_eq!(
+                actual.as_deref(),
+                expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+
+        let structures: [(&str, Vec<RenderedChild>, Option<&str>); 5] = [
+            ("no members present", vec![], Some("Thing()")),
+            (
+                "one member present",
+                vec![child(Some("name"), Some("n"))],
+                Some("Thing(name=n)"),
+            ),
+            (
+                "two members in the order they were written",
+                vec![child(Some("name"), Some("n")), child(Some("size"), Some("2"))],
+                Some("Thing(name=n, size=2)"),
+            ),
+            (
+                "a member with no text rendering suppresses the whole structure",
+                vec![child(Some("name"), Some("n")), child(Some("body"), None)],
+                None,
+            ),
+            (
+                "a child with no member name at all",
+                vec![child(None, Some("n"))],
+                None,
+            ),
+        ];
+        for (case, children, expected) in structures {
+            let actual = rendered_structure("Thing", &children);
+            assert_eq!(
+                actual.as_deref(),
+                expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// RULE: what a composite may hold is bounded by BYTES as well as by child count, and
+    /// a rendering past [`MAX_RESTORED_ECHO`] is refused before it is built — so neither
+    /// the text this walk retains nor the text it allocates is sized by the request.
+    #[test]
+    fn a_composite_is_bounded_by_the_bytes_its_children_hold() {
+        let child = |rendering: &str| RenderedChild {
+            name: Some("name".to_string()),
+            rendering: Some(rendering.to_string()),
+        };
+
+        // One child at the bound is held; the next one tips the composite over it, and a
+        // truncated composite renders as nothing rather than as a part of the value.
+        let mut composite = Composite::default();
+        composite.take(child(&"a".repeat(MAX_RESTORED_ECHO - "name".len())));
+        assert!(
+            !composite.truncated && composite.children.len() == 1,
+            "case a child at the byte bound: expected it held, got {composite:?}"
+        );
+        composite.take(child("b"));
+        assert!(
+            composite.truncated && composite.children.len() == 1,
+            "case a child past the byte bound: expected the composite truncated with the \
+             child dropped, got {composite:?}"
+        );
+
+        // A child count past the cap is the other bound, unchanged.
+        let mut counted = Composite::default();
+        for _ in 0..=MAX_RENDERED_CHILDREN {
+            counted.take(child("a"));
+        }
+        assert!(
+            counted.truncated && counted.children.len() == MAX_RENDERED_CHILDREN,
+            "case more children than the cap: expected the composite truncated at the cap, \
+             got {} children",
+            counted.children.len()
+        );
+
+        // And a rendering that would exceed the bound is refused by both renderers, which
+        // measure it before joining anything.
+        let oversized = vec![
+            child(&"a".repeat(MAX_RESTORED_ECHO)),
+            child(&"b".repeat(MAX_RESTORED_ECHO)),
+        ];
+        let sequence = rendered_sequence(&oversized);
+        assert_eq!(
+            sequence, None,
+            "case an oversized list: expected no rendering, got {sequence:?}"
+        );
+        let structure = rendered_structure("Thing", &oversized);
+        assert_eq!(
+            structure, None,
+            "case an oversized structure: expected no rendering, got {structure:?}"
+        );
+    }
+
+    /// RULE: a clause's echo is `Absent` for a member the request never sent, `Rendered`
+    /// for a position this walk rendered, and `Unrendered` for a value that was present
+    /// with no text rendering, or past the stated bounds.
+    #[test]
+    fn an_echo_distinguishes_absent_from_present_but_unrenderable() {
+        let too_long = "x".repeat(MAX_RESTORED_ECHO + 1);
+        let renderings: Vec<(String, Option<String>)> = [
+            ("name", Some("a-name")),
+            ("body", None),
+            ("tags", Some("[a, b]")),
+        ]
+        .into_iter()
+        .map(|(position, rendering)| {
+            (
+                position.to_string(),
+                rendering.map(|text: &str| text.to_string()),
+            )
+        })
+        .chain(std::iter::once((
+            "huge".to_string(),
+            Some(too_long.clone()),
+        )))
+        .collect();
+        let mut by_path: HashMap<&str, Option<&str>> = HashMap::new();
+        for (position, rendering) in &renderings {
+            by_path.insert(position.as_str(), rendering.as_deref());
+        }
+
+        let rows: [(&str, &str, ViolationKind, Option<&str>, SubmittedEcho); 6] = [
+            (
+                "an absent member",
+                "name",
+                ViolationKind::MissingRequiredMember,
+                None,
+                SubmittedEcho::Absent,
+            ),
+            (
+                "a rendered string",
+                "name",
+                ViolationKind::MaxLength(1),
+                Some("a-name"),
+                SubmittedEcho::Rendered("a-name".to_string()),
+            ),
+            (
+                "a list rendered from its elements",
+                "tags",
+                ViolationKind::MaxLength(1),
+                Some("2 items"),
+                SubmittedEcho::Rendered("[a, b]".to_string()),
+            ),
+            (
+                "a value with no text rendering",
+                "body",
+                ViolationKind::MaxLength(1),
+                Some("4000 bytes"),
+                SubmittedEcho::Unrendered,
+            ),
+            (
+                "a position this walk recorded nothing for",
+                "elsewhere",
+                ViolationKind::MaxLength(1),
+                Some("whatever"),
+                SubmittedEcho::Unrendered,
+            ),
+            (
+                "a rendering past the stated bound",
+                "huge",
+                ViolationKind::MaxLength(1),
+                Some("whatever"),
+                SubmittedEcho::Unrendered,
+            ),
+        ];
+        for (case, path, kind, value, expected) in rows {
+            let violation = Violation {
+                path: path.to_string(),
+                kind,
+                value: value.map(str::to_string),
+            };
+            let mut budget = MAX_RESTORED_TOTAL;
+            let actual = echo_of(&violation, &by_path, &mut budget);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
     }
 
     /// RULE: the two renderings drop the SAME pair ([`super::unanchored`]'s positional

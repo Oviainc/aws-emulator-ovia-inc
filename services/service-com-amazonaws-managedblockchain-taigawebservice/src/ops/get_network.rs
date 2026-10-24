@@ -148,7 +148,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // materialising the status transition the clock already owed (see
         // `crate::state::TRANSITION_SPAN`), which was due at this instant whether or not
         // anybody called. Nothing in the answer comes from the request.
-        let _ = ctx;
+        //
+        // The Region this request is addressed to — read off its own credential scope — is
+        // what the lookup below is scoped to: Managed Blockchain is a regional service, so
+        // a network created through one Region's endpoint is not a resource another
+        // Region's endpoint holds.
+        let region = crate::state::request_region(ctx);
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetNetworkErrorModeled::InternalServiceErrorException(
@@ -162,8 +167,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The network is the resource this operation was asked for, so it is the one the
         // failure names. `ResourceName` is left unset by `crate::state::not_found`: it is
-        // modelled `ArnString` and a network nothing holds has no ARN.
-        let Some(network) = guard.networks.get(&input.network_id) else {
+        // modelled `ArnString` and a network nothing holds has no ARN. A network of
+        // another Region is not found here, exactly like one that was never created.
+        let Some(network) = guard.network(&region, &input.network_id) else {
             return Err(GetNetworkErrorModeled::ResourceNotFoundException(
                 crate::state::not_found(crate::state::RESOURCE_NETWORK, &input.network_id),
             )

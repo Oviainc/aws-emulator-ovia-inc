@@ -201,11 +201,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "An idempotent operation completes no more than once" (`ClientRequestToken`):
         // a token already used answers from the accessor its first call created, so a
         // retry — or a second call with the same token — mints nothing new.
-        let token = crate::state::idempotency_key(Self::NAME, &input.client_request_token);
+        let token = crate::state::idempotency_key(&region, Self::NAME, &input.client_request_token);
         let replayed = guard
             .replay_idempotent(&token)
             .and_then(|created| created.accessor_id)
-            .and_then(|accessor_id| guard.accessors.get(&accessor_id).cloned());
+            .and_then(|accessor_id| guard.accessor(&region, &accessor_id).cloned());
         if let Some(accessor) = replayed {
             // Answered from the STORED record, so a replay carries the very id, billing
             // token and network type the first call returned. A ledger record whose
@@ -218,6 +218,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
+        // The store's ceiling counts the accessors this account holds in every Region: it
+        // is this emulator's memory ceiling (see `crate::state::MAX_ACCESSORS`), not a
+        // per-Region quota, so spreading creates over Regions cannot grow the store past
+        // it.
         if guard.accessors.len() >= crate::state::MAX_ACCESSORS {
             return Err(CreateAccessorErrorModeled::ResourceLimitExceededException(
                 ResourceLimitExceededException {
@@ -267,8 +271,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
 
         // Answer from the STORED record, so this is the id, token and network type every
-        // later read of the accessor answers with.
-        let Some(stored) = guard.accessors.get(&accessor_id) else {
+        // later read of the accessor answers with — read back through the same
+        // Region-scoped resolver every other read goes through.
+        let Some(stored) = guard.accessor(&region, &accessor_id) else {
             return Err(CreateAccessorErrorModeled::InternalServiceErrorException(
                 InternalServiceErrorException {},
             )

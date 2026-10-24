@@ -168,7 +168,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The region the invitations an approved proposal mints are named in, read off
-        // this request's own credential scope, exactly as every other create does.
+        // this request's own credential scope, exactly as every other create does — and
+        // the Region every lookup below is scoped to: a network, proposal or member of
+        // another Region is not this request's to read or to vote on.
         let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
         let mut guard = state.lock();
@@ -177,10 +179,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The PROPOSAL is the resource this call votes on; the network id only scopes the
         // lookup, so the failure names the proposal whenever that proposal cannot be read
         // — including when the network id names nothing stored.
-        let found = guard.networks.get(&input.network_id).and_then(|network| {
+        let found = guard.network(&region, &input.network_id).and_then(|network| {
             network
-                .proposals
-                .get(&input.proposal_id)
+                .proposal(&region, &input.proposal_id)
                 .map(|proposal| (network, proposal))
         });
         let Some((network, proposal)) = found else {
@@ -194,12 +195,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // single mutable borrow it needs. `OutstandingVoteCount` is "the number of members
         // minus the sum of YES votes and NO votes", so the membership at THIS instant is
         // what the threshold is measured against.
-        let members = network.members.len();
+        let members = network.members_in(&region).count();
         let voting_policy = network.voting_policy.clone();
         let proposal_status = proposal.status.clone();
         let proposal_open = proposal.is_open();
         let already_voted = proposal.votes.contains_key(&input.voter_member_id);
-        let voter = network.members.get(&input.voter_member_id).cloned();
+        let voter = network.member(&region, &input.voter_member_id).cloned();
 
         // "Casts a vote for a specified ProposalId on behalf of a member": the member to
         // vote as must be one of the voting network's own members.
@@ -261,9 +262,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // from the votes actually cast.
         let outcome = {
             let proposal = guard
-                .networks
-                .get_mut(&input.network_id)
-                .and_then(|network| network.proposals.get_mut(&input.proposal_id));
+                .network_mut(&region, &input.network_id)
+                .and_then(|network| network.proposal_mut(&region, &input.proposal_id));
             let Some(proposal) = proposal else {
                 return Err(VoteOnProposalErrorModeled::InternalServiceErrorException(
                     InternalServiceErrorException {},
@@ -300,9 +300,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // "ACTION_FAILED - One or more of the specified ProposalActions in a
                 // proposal that was approved couldn't be completed because of an error."
                 let proposal = guard
-                    .networks
-                    .get_mut(&input.network_id)
-                    .and_then(|network| network.proposals.get_mut(&input.proposal_id));
+                    .network_mut(&region, &input.network_id)
+                    .and_then(|network| network.proposal_mut(&region, &input.proposal_id));
                 let Some(proposal) = proposal else {
                     return Err(VoteOnProposalErrorModeled::InternalServiceErrorException(
                         InternalServiceErrorException {},

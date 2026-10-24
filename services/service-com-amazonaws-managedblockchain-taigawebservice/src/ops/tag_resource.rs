@@ -153,7 +153,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // A mutation the spec states this call makes: "Adds or overwrites the specified
         // tags for the specified Amazon Managed Blockchain resource."
-        let _ = ctx;
+        //
+        // The Region this request is addressed to, read off its own credential scope: a
+        // resource lives in one Region, so an ARN naming another Region's names nothing
+        // this request can tag.
+        let region = crate::state::request_region(ctx);
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(TagResourceErrorModeled::InternalServiceErrorException(
@@ -191,7 +195,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         guard.settle(::std::time::SystemTime::now());
 
         let resource_arn = input.resource_arn;
-        let Some(tags) = guard.tags_for_resource_mut(&resource_arn) else {
+        // An ARN of another Region names no resource this Region holds, which is the same
+        // answer as a resource that was never created — the answer the stored-ARN lookup
+        // below already gives for every record minted in another Region, stated here so it
+        // holds for the standing public networks too (they are read in every Region, so
+        // their stored ARN alone does not settle which Region a request addresses).
+        let Some(tags) = crate::state::arn_in_region(&resource_arn, &region)
+            .then(|| guard.tags_for_resource_mut(&resource_arn))
+            .flatten()
+        else {
             return Err(TagResourceErrorModeled::ResourceNotFoundException(
                 crate::state::not_found_arn(resource_type, &resource_arn),
             )

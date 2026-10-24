@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListThreatEntitySets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListThreatEntitySets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListThreatEntitySets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: names the threat entity sets `CreateThreatEntitySet` saved under the
+//! request's detector, in `ThreatEntitySetId` order, one page at a time. A list names the
+//! collection's MEMBERS and not their statuses, so this is a pure report: nothing it does
+//! is visible to a later caller. A detector the store does not resolve is refused with
+//! HTTP 400, never a hollow empty page. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +146,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListThreatEntitySets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListThreatEntitySetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ListThreatEntitySetsErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx);
+
+        // A pure report: nothing below writes to the store. The answer carries ids and
+        // no statuses (`ThreatEntitySetIds` is a list of ids —
+        // `smithy_query(operation="ListThreatEntitySets")`), so there is no transition the
+        // clock has made due for this answer to materialise; `GetThreatEntitySet` is where
+        // a status is reported, and where the clock-owed activation settles.
+        let state = state.lock();
+        let Some(detector) = state.detector_in(&region, &input.detector_id) else {
+            // Classified from the REQUEST: a value that cannot be a detector id is a
+            // parameter failure, a well-formed one this account/Region does not hold an
+            // ownership failure. A list over a detector the store does not resolve is a
+            // refusal, not an empty page.
+            return Err(bad_request(crate::state::detector_id_rejection(
+                &input.detector_id,
+            )));
+        };
+
+        // `ThreatEntitySetId` order, which is a total order over the threat entity sets
+        // this detector holds (the id is the key they are stored under): that is what
+        // makes a page token mean the same thing on the call that hands it back. An
+        // entity set is owned by its detector, which is regional, so this endpoint names
+        // only the entity sets the Region it serves holds.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListThreatEntitySets"))
+        // The LIVE sets: a set a delete has accepted is no longer one of the detector's
+        // entity sets, so this stops naming it even though its record is retained for
+        // `GetThreatEntitySet` to report the status the delete moved it to.
+        let ids: Vec<String> = detector.live_threat_entity_set_ids();
+        let (page, next_token) = crate::state::paginate(
+            &ids,
+            input.max_results,
+            input.next_token.as_deref(),
+            THREAT_ENTITY_SET_IDS_MAX,
+        )
+        .map_err(|_| {
+            // Under the error CLASS, naming the parameter at fault and not quoting the
+            // token back.
+            bad_request(crate::state::invalid_parameter_message(
+                crate::state::NEXT_TOKEN_MEMBER,
+            ))
+        })?;
+
+        Ok(ListThreatEntitySetsOutput {
+            threat_entity_set_ids: page,
+            next_token,
+        })
     }
+}
+
+/// `ThreatEntitySetIds` is `len 0..50` and `MaxResults` is `range 1..50`
+/// (`smithy_query(operation="ListThreatEntitySets")`), so one page can never carry more
+/// than 50 ids whatever `maxResults` asks for.
+const THREAT_ENTITY_SET_IDS_MAX: usize = 50;
+
+/// Refuse the request the way GuardDuty does: HTTP 400 under the
+/// `InvalidInputException` class, in both the body's `__type` discriminator and its
+/// `type` member.
+fn bad_request(message: impl Into<String>) -> ListThreatEntitySetsError {
+    crate::scaffolded::Scaffolded::invalid_input(message)
 }
