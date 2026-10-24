@@ -21,7 +21,8 @@
 //! reports the same entries) must answer the same catalog on every call. It lives beside
 //! the store, not inside one operation file, for the same reason the ARN rule does: two
 //! operations read it. [`query`] reads a submitted `DataQuery` against that catalog, for
-//! the two operations that accept an export definition.
+//! the two operations that accept an export definition, and [`destination`] reads the
+//! `DestinationConfigurations` of the same definition for the same two operations.
 //!
 //! Two more things the store holds, each read by a layer rather than by one handler:
 //!
@@ -50,6 +51,7 @@ use std::time::{Duration, SystemTime};
 
 pub mod authorization;
 pub mod catalog;
+pub mod destination;
 pub mod query;
 
 // The catalog's types, data and refusals are reached as `crate::state::…` by the two
@@ -59,6 +61,14 @@ pub mod query;
 pub use query::{
     effective_table_configurations, query_tables, validate_data_query, QueryRefusal,
     TableConfigurations,
+};
+
+// The destination reader is reached as `crate::state::…` by those same two operations:
+// a submitted destination configuration is judged the same way whichever of them
+// accepted it.
+pub use destination::{
+    delivers_output_encoding, supported_compressions, validate_destination_configurations,
+    SUPPORTED_OUTPUT_ENCODINGS,
 };
 
 // The authorization decision is reached as `crate::state::…` by every operation whose

@@ -23,6 +23,8 @@ mod catalog_schema_versions;
 mod data_query;
 #[path = "all/delivery_executions.rs"]
 mod delivery_executions;
+#[path = "all/destination_configuration.rs"]
+mod destination_configuration;
 #[path = "all/execution_listing.rs"]
 mod execution_listing;
 #[path = "all/execution_lookup.rs"]

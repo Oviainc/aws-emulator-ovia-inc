@@ -9,7 +9,8 @@
 //!
 //! Because the update "[overwrites] all export parameters", the REPLACEMENT definition is
 //! judged exactly as a create's is — its statement read against the table catalog and the
-//! columns that catalog publishes for the configuration the request states — and a
+//! columns that catalog publishes for the configuration the request states, and its
+//! destination configuration read against the deliveries this service writes — and a
 //! definition this service could not deliver leaves the stored one untouched.
 //!
 //! IMPLEMENTED. This is the ONLY file to touch for this operation; the notes below on
@@ -227,6 +228,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             },
         )?;
+
+        // The REPLACEMENT destination is judged exactly as a create's is, for the same
+        // reason the replacement query is: "all export parameters must be provided in the
+        // UpdateExport request", so the destination this call states is the whole of the
+        // export's destination and nothing of the stored one carries over. A destination
+        // this service could not deliver to — a file format it does not write under the
+        // stated compression, or a Region that names no bucket — is refused BEFORE
+        // anything is written, so the stored destination is left untouched. See
+        // `crate::state::destination`.
+        crate::state::validate_destination_configurations(&input.export.destination_configurations)
+            .map_err(UpdateExportErrorModeled::ValidationException)?;
 
         // The definition is stored with the table configuration IN FORCE, the same way a
         // create's is, so the stored query carries each published property of the tables

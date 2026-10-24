@@ -26,11 +26,11 @@ use serde_json::{json, Map, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_bcmdataexports_awsbillingandcostmanagementdataexports::ops::types::{
-    COMPRESSION_OPTION_VALUES, FORMAT_OPTION_VALUES, FREQUENCY_OPTION_VALUES,
-    OVERWRITE_OPTION_VALUES, S3_OUTPUT_TYPE_VALUES,
+    COMPRESSION_OPTION_VALUES, FREQUENCY_OPTION_VALUES, OVERWRITE_OPTION_VALUES,
+    S3_OUTPUT_TYPE_VALUES,
 };
 use service_com_amazonaws_bcmdataexports_awsbillingandcostmanagementdataexports::state::{
-    MAX_EXPORTS, TABLE_CATALOG,
+    MAX_EXPORTS, SUPPORTED_OUTPUT_ENCODINGS, TABLE_CATALOG,
 };
 use service_com_amazonaws_bcmdataexports_awsbillingandcostmanagementdataexports::EmulatedService;
 
@@ -413,16 +413,30 @@ pub(crate) fn restated_table_configurations(
     (!restated.is_empty()).then_some(Value::Object(restated))
 }
 
+/// The `Format` this service delivers `compression` under: the published output
+/// encodings (`state::SUPPORTED_OUTPUT_ENCODINGS`) read back from the compression, so an
+/// enum row of [`cases`] states an encoding the service writes rather than an arbitrary
+/// pairing of the two value lists (`destination_configuration` is where the pairing rule
+/// itself is under test).
+fn format_for(compression: &str) -> &'static str {
+    SUPPORTED_OUTPUT_ENCODINGS
+        .iter()
+        .find(|(_, compressions)| compressions.contains(&compression))
+        .map(|(format, _)| *format)
+        .unwrap_or_else(|| panic!("no published format is delivered as {compression}"))
+}
+
 /// The table: one row per shape of export definition the rule has to hold for.
 ///
 /// The enum rows walk the published value lists the service's own generated catalogs
-/// carry (`COMPRESSION_OPTION_VALUES`, `FORMAT_OPTION_VALUES`, `S3_OUTPUT_TYPE_VALUES`,
+/// carry (`COMPRESSION_OPTION_VALUES`, `S3_OUTPUT_TYPE_VALUES`,
 /// `OVERWRITE_OPTION_VALUES`, `FREQUENCY_OPTION_VALUES` in `ops::types::shared_types`),
-/// so a value the issue never cited is covered too.
+/// so a value the issue never cited is covered too — each `Format`/`Compression` pair one
+/// of the encodings this service delivers ([`format_for`]).
 pub(crate) fn cases() -> Vec<Case> {
     let base_output = (
         S3_OUTPUT_TYPE_VALUES[0],
-        FORMAT_OPTION_VALUES[0],
+        format_for(COMPRESSION_OPTION_VALUES[0]),
         COMPRESSION_OPTION_VALUES[0],
         OVERWRITE_OPTION_VALUES[0],
     );
@@ -540,7 +554,7 @@ pub(crate) fn cases() -> Vec<Case> {
             bucket_owner: None,
             output: (
                 S3_OUTPUT_TYPE_VALUES[index % S3_OUTPUT_TYPE_VALUES.len()],
-                FORMAT_OPTION_VALUES[index % FORMAT_OPTION_VALUES.len()],
+                format_for(compression),
                 compression,
                 OVERWRITE_OPTION_VALUES[index % OVERWRITE_OPTION_VALUES.len()],
             ),
@@ -559,7 +573,7 @@ pub(crate) fn cases() -> Vec<Case> {
             bucket_owner: None,
             output: (
                 output_type,
-                FORMAT_OPTION_VALUES[index % FORMAT_OPTION_VALUES.len()],
+                format_for(COMPRESSION_OPTION_VALUES[index % COMPRESSION_OPTION_VALUES.len()]),
                 COMPRESSION_OPTION_VALUES[index % COMPRESSION_OPTION_VALUES.len()],
                 OVERWRITE_OPTION_VALUES[index % OVERWRITE_OPTION_VALUES.len()],
             ),
@@ -764,7 +778,7 @@ async fn an_export_round_trips_through_persisted_state() {
             bucket_owner: Some("210987654321"),
             output: (
                 S3_OUTPUT_TYPE_VALUES[S3_OUTPUT_TYPE_VALUES.len() - 1],
-                FORMAT_OPTION_VALUES[FORMAT_OPTION_VALUES.len() - 1],
+                format_for(COMPRESSION_OPTION_VALUES[COMPRESSION_OPTION_VALUES.len() - 1]),
                 COMPRESSION_OPTION_VALUES[COMPRESSION_OPTION_VALUES.len() - 1],
                 OVERWRITE_OPTION_VALUES[OVERWRITE_OPTION_VALUES.len() - 1],
             ),

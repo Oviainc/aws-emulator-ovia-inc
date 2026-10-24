@@ -6,7 +6,9 @@
 //! is stored beside a fresh `ExportStatus` and the request's `ResourceTags` — with its
 //! `DataQuery` validated against the table catalog and normalised to the table
 //! configuration in force, the way the service reports it — so `GetExport`,
-//! `ListExports` and `ListTagsForResource` read back exactly what the service stored.
+//! `ListExports` and `ListTagsForResource` read back exactly what the service stored. A
+//! definition whose destination configuration names a delivery this service does not
+//! write is refused instead of stored.
 //!
 //! IMPLEMENTED. This is the ONLY file to touch for this operation; the notes below on
 //! reaching this service's state and the modelled contract still apply.
@@ -213,6 +215,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             },
         )?;
+
+        // "The compression type, file format, and overwrite preference for the data
+        // export" (smithy_query shape `S3OutputConfigurations`): a destination whose
+        // members are each modelled but which together name a delivery this service does
+        // not write — a file format it does not write under the stated compression, or a
+        // Region that names no bucket — can never be served, so it is refused rather than
+        // persisted. See `crate::state::destination`.
+        crate::state::validate_destination_configurations(&input.export.destination_configurations)
+            .map_err(CreateExportErrorModeled::ValidationException)?;
 
         // The definition is stored with the table configuration IN FORCE for the tables
         // it names: a property the request did not name takes the value the table
