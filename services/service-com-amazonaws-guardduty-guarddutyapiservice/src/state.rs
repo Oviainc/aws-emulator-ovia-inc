@@ -4152,6 +4152,21 @@ impl PublishingDestinationRecord {
             self.status = PUBLISHING.to_string();
         }
     }
+
+    /// Put the destination back in [`PENDING_VERIFICATION`] and owe the move to
+    /// [`PUBLISHING`] again, as of `now`.
+    ///
+    /// The destination properties say WHERE GuardDuty publishes and with which key,
+    /// so a destination whose properties changed is one GuardDuty has not verified
+    /// it can write to — the same state a create leaves behind, reached again by the
+    /// same clock-owed span. This is what makes the status a destination reports
+    /// follow its current properties: a destination whose properties were fixed is
+    /// verified again rather than keeping the verdict reached for the properties it
+    /// no longer has.
+    pub fn begin_verification(&mut self, now: i64) {
+        self.status = PENDING_VERIFICATION.to_string();
+        self.verification_due_millis = Some(now.saturating_add(VERIFICATION_DELAY_MILLIS));
+    }
 }
 
 /// One stored finding. Timestamps are kept as epoch milliseconds — the single
@@ -4733,24 +4748,62 @@ pub fn validate_destination_properties(
         .destination_arn
         .as_deref()
         .filter(|arn| !arn.is_empty())
-        .ok_or_else(|| missing_parameter_message(DESTINATION_ARN_MEMBER))?;
-    if !is_arn_for(destination_service, destination_arn) {
-        return Err(invalid_parameter_message(DESTINATION_ARN_MEMBER));
-    }
+        .ok_or_else(|| missing_parameter_message(DESTINATION_ARN_MEMBER))?
+        .to_string();
     let kms_key_arn = properties
         .kms_key_arn
         .as_deref()
         .filter(|arn| !arn.is_empty())
-        .ok_or_else(|| missing_parameter_message(KMS_KEY_ARN_MEMBER))?;
-    if !is_arn_for(KMS_SERVICE, kms_key_arn) {
-        return Err(invalid_parameter_message(KMS_KEY_ARN_MEMBER));
+        .ok_or_else(|| missing_parameter_message(KMS_KEY_ARN_MEMBER))?
+        .to_string();
+    // Both members the create cannot do without are present, so what is left is
+    // the FORM of each value supplied — the same rule, for the same members, that
+    // an UPDATE applies to the members it carries. Presence is checked for BOTH
+    // members before either form is: a request that leaves a required member out
+    // has not said what to publish to at all, so the missing member is the one the
+    // refusal names even when another member it did supply is also malformed.
+    validate_destination_property_forms(destination_service, properties)?;
+    Ok((destination_arn, kms_key_arn))
+}
+
+/// Refuse a `DestinationProperties` member whose supplied VALUE is not a value of
+/// that member, leaving the members the request omits alone.
+///
+/// Every member of `DestinationProperties` is optional
+/// (`smithy_query(shape="DestinationProperties")`), so this is the half of the
+/// check that does not depend on whether the operation requires a member:
+/// [`validate_destination_properties`] requires the two ARNs first and then calls
+/// this, while an update of an existing destination carries only the members it
+/// changes and calls it directly.
+///
+/// `destination_service` is the AWS service the destination's own
+/// `DestinationType` names ([`validate_destination_type`]), so the destination ARN
+/// is checked against that service rather than against a hard-coded one.
+pub fn validate_destination_property_forms(
+    destination_service: &str,
+    properties: &crate::ops::types::DestinationProperties,
+) -> Result<(), String> {
+    if let Some(destination_arn) = properties.destination_arn.as_deref() {
+        if !is_arn_for(destination_service, destination_arn) {
+            return Err(invalid_parameter_message(DESTINATION_ARN_MEMBER));
+        }
+    }
+    if let Some(kms_key_arn) = properties.kms_key_arn.as_deref() {
+        if !is_arn_for(KMS_SERVICE, kms_key_arn) {
+            return Err(invalid_parameter_message(KMS_KEY_ARN_MEMBER));
+        }
     }
     if let Some(owner) = properties.expected_bucket_owner.as_deref() {
-        if !owner.bytes().all(|b| b.is_ascii_digit()) {
+        // "The 12-digit Amazon Web Services account ID of the account that owns the
+        // Amazon S3 bucket"
+        // (`smithy_query(query="doc",shape="DestinationProperties",member="ExpectedBucketOwner")`).
+        // The model's own `len 12..12` refuses another length at the boundary; the
+        // length is checked here too so this helper states the whole rule.
+        if owner.len() != ACCOUNT_ID_LEN || !owner.bytes().all(|b| b.is_ascii_digit()) {
             return Err(invalid_parameter_message(EXPECTED_BUCKET_OWNER_MEMBER));
         }
     }
-    Ok((destination_arn.to_string(), kms_key_arn.to_string()))
+    Ok(())
 }
 
 /// The AWS service each `DestinationType` member publishes to: an `S3`

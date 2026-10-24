@@ -162,19 +162,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A `DomainNameConfigurations` the request omits is not an empty list: it is a
         // member the patch says nothing about. One it CARRIES is resolved through the
         // same helper `CreateDomainName` uses, so an entry's defaults and enum catalogs
-        // cannot drift between the two operations.
-        let requested_configurations = match input.domain_name_configurations.as_ref() {
+        // cannot drift between the two operations — and neither can the refusal of a
+        // list that names no endpoint, which a patch would strip the domain name down to.
+        let requested_configurations = match input.domain_name_configurations.as_deref() {
             ::std::option::Option::None => ::std::option::Option::None,
-            Some(requested) => {
-                let mut resolved = ::std::vec::Vec::with_capacity(requested.len());
-                for (index, entry) in requested.iter().enumerate() {
-                    match crate::state::resolve_domain_name_endpoint(index, entry) {
-                        Ok(endpoint) => resolved.push(endpoint),
-                        Err(message) => return Err(bad_request(&message)),
-                    }
-                }
-                Some(resolved)
-            }
+            Some(requested) => match crate::state::resolve_domain_name_endpoints(requested) {
+                Ok(resolved) => Some(resolved),
+                Err(message) => return Err(bad_request(&message)),
+            },
         };
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
