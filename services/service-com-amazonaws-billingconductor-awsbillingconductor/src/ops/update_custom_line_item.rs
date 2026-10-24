@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateCustomLineItem
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateCustomLineItem`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateCustomLineItem::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this handler does
+//!
+//! It REPLACES, on the stored custom line item the `Arn` names, exactly the attributes
+//! the request carries — `Name`, `Description`, the charge value of the item's own
+//! charge kind, the charge details' `LineItemFilters`, and the billing-period range the
+//! update is to apply in — keeps every attribute the request omits, advances
+//! `LastModifiedTime`, and reports the item as it now stands.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +173,174 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateCustomLineItem` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateCustomLineItemErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateCustomLineItem"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateCustomLineItemErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the billingconductor store is unavailable".to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+        let mut state = state.lock();
+
+        // "The ARN of the custom line item to be updated." The `CustomLineItemArn`
+        // pattern accepts the full ARN or the bare 10-character id, and both name the
+        // same stored item.
+        let item_arn = crate::state::normalize_custom_line_item_arn(&input.arn);
+        let Some(stored) = state.custom_line_items.get(&item_arn).cloned() else {
+            return Err(UpdateCustomLineItemErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: "the custom line item does not exist".to_string(),
+                    resource_id: item_arn,
+                    resource_type: "customlineitem".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let updated = merge(stored, &input)?;
+        let output = render(&updated);
+        state.custom_line_items.insert(item_arn.clone(), updated);
+
+        // The audit record for a state-changing call: who asked, what it addressed and
+        // that it succeeded. Never a `@sensitive` member — the item's name and its
+        // description are both `@sensitive` — only the access key id the caller
+        // presented and the ARN it addressed.
+        ::tracing::info!(
+            operation = Self::NAME,
+            akid = %::engine::extract_akid(&ctx.parts().headers),
+            custom_line_item_arn = %item_arn,
+            outcome = "updated",
+            "custom line item updated"
+        );
+        Ok(output)
     }
+}
+
+/// The stored item as this request leaves it: a member the request carries replaces
+/// the stored one, a member it omits keeps what state holds, and `LastModifiedTime`
+/// advances because the record changed ("The most recent time when the custom line
+/// item was modified").
+fn merge(
+    stored: crate::state::CustomLineItemRecord,
+    input: &UpdateCustomLineItemInput,
+) -> Result<crate::state::CustomLineItemRecord, UpdateCustomLineItemError> {
+    // The stored record is taken BY VALUE — the caller's lookup already copied it out
+    // of the map — so merging makes no second copy of it.
+    let mut updated = stored;
+    if let Some(name) = input.name.clone() {
+        updated.name = name;
+    }
+    if let Some(description) = input.description.clone() {
+        updated.description = description;
+    }
+
+    if let Some(charge_details) = input.charge_details.as_ref() {
+        // "A representation of the new charge details of a custom line item. This
+        // should contain only one of `Flat` or `Percentage`." Both at once describes
+        // two different charges for one item.
+        if charge_details.flat.is_some() && charge_details.percentage.is_some() {
+            return Err(validation(
+                "ILLEGAL_UPDATE_CHARGE_DETAILS",
+                "ChargeDetails",
+                "the charge details must contain at most one of Flat or Percentage".to_string(),
+            ));
+        }
+        // Which of the two a stored item HAS is fixed when it is created: the charge
+        // details report a `@required Type` this operation does not model, a percentage
+        // charge "is multiplied against the combined value of its associated
+        // resources" while a flat one is a fixed value no association enters into, and
+        // this input carries no `AssociatedValues` to turn a flat item into a
+        // percentage one. So a request may only restate the kind the item already is.
+        if let Some(flat) = charge_details.flat.as_ref() {
+            if updated.is_percentage() {
+                return Err(validation(
+                    "ILLEGAL_UPDATE_CHARGE_DETAILS",
+                    "ChargeDetails.Flat",
+                    format!(
+                        "the custom line item {} is a percentage custom line item, so it has \
+                         no flat charge value",
+                        updated.arn
+                    ),
+                ));
+            }
+            updated.flat_charge_value = Some(flat.charge_value);
+        }
+        if let Some(percentage) = charge_details.percentage.as_ref() {
+            if !updated.is_percentage() {
+                return Err(validation(
+                    "ILLEGAL_UPDATE_CHARGE_DETAILS",
+                    "ChargeDetails.Percentage",
+                    format!(
+                        "the custom line item {} is a flat custom line item, so it has no \
+                         percentage value",
+                        updated.arn
+                    ),
+                ));
+            }
+            updated.percentage_value = Some(percentage.percentage_value);
+        }
+        // The filters the charge applies through. The member is a LIST, so the request
+        // carrying it states the whole new membership — an empty one clears the
+        // filters — and omitting it leaves the stored filters alone. (A charge details
+        // naming neither kind and no filters therefore changes no charge at all, which
+        // is a request to change nothing rather than an illegal one.)
+        if let Some(line_item_filters) = charge_details.line_item_filters.clone() {
+            updated.line_item_filters = line_item_filters;
+        }
+    }
+
+    // "The billing period range in which the custom line item request will be
+    // applied": the periods the updated item is in effect for. The start is inclusive
+    // and the end exclusive, so an end at or before the start would cover no billing
+    // period at all.
+    //
+    // AWS keeps one VERSION of the item per billing period range, readable through
+    // `ListCustomLineItemVersions` (still a scaffold, with its own issue); this store
+    // holds the item's current generation, so the range the request names becomes the
+    // range the item — with the values this update leaves on it — applies in.
+    if let Some(range) = input.billing_period_range.as_ref() {
+        if !crate::state::billing_period_range_is_ordered(range) {
+            return Err(validation(
+                "ILLEGAL_BILLING_PERIOD_RANGE",
+                "BillingPeriodRange.ExclusiveEndBillingPeriod",
+                "the exclusive end billing period must be later than the inclusive start \
+                 billing period"
+                    .to_string(),
+            ));
+        }
+        updated.inclusive_start_billing_period = Some(range.inclusive_start_billing_period.clone());
+        updated.exclusive_end_billing_period = range.exclusive_end_billing_period.clone();
+    }
+
+    updated.last_modified_time_millis = crate::state::now_millis();
+    Ok(updated)
+}
+
+/// The stored item as this operation reports it. `ChargeDetails`, its `Type` and
+/// `AssociationSize` are DERIVED from the record rather than echoed from the request —
+/// through the SAME projection `ListCustomLineItems` reports an item with
+/// ([`crate::state::CustomLineItemRecord::charge_details`]) — so the answer is what a
+/// later read of the same item sees.
+fn render(item: &crate::state::CustomLineItemRecord) -> UpdateCustomLineItemOutput {
+    UpdateCustomLineItemOutput {
+        arn: Some(item.arn.clone()),
+        billing_group_arn: Some(item.billing_group_arn.clone()),
+        name: Some(item.name.clone()),
+        description: Some(item.description.clone()),
+        charge_details: Some(item.charge_details()),
+        last_modified_time: item.last_modified_time_millis,
+        association_size: item.association_size(),
+    }
+}
+
+/// Refuse the request with this operation's modelled 400 `ValidationException`,
+/// naming the `ValidationExceptionReason` the model enumerates and the member at
+/// fault.
+fn validation(reason: &str, field: &str, message: String) -> UpdateCustomLineItemError {
+    UpdateCustomLineItemErrorModeled::ValidationException(crate::state::validation_exception(
+        reason, field, message,
+    ))
+    .into()
 }
