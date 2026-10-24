@@ -590,6 +590,10 @@ async fn get_policy_separates_an_invalid_arn_from_an_unheld_one() {
         );
     }
 
+    // An ARN naming no policy the ACCOUNT holds is the missing entity: every row is
+    // in the account's own namespace, because the `arn:aws:iam::aws:policy/` namespace
+    // is AWS's and a policy AWS owns is never reported as absent — that resolution is
+    // asserted in `tests/all/aws_managed_policy_catalog.rs`.
     for (case, arn) in [
         ("another name at the root", expected_policy_arn("/", "absent")),
         (
@@ -599,10 +603,6 @@ async fn get_policy_separates_an_invalid_arn_from_an_unheld_one() {
         (
             "a name under a nested path",
             expected_policy_arn("/a/b/c/", "absent"),
-        ),
-        (
-            "an AWS managed policy",
-            "arn:aws:iam::aws:policy/ReadOnlyAccess".to_string(),
         ),
     ] {
         let (status, body) = call(&router, "GetPolicy", &[("PolicyArn", &arn)]).await;

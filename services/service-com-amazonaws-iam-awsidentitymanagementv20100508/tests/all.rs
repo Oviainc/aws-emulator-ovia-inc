@@ -17,6 +17,8 @@ mod access_key_deletion;
 mod access_keys;
 #[path = "all/account_aliases.rs"]
 mod account_aliases;
+#[path = "all/aws_managed_policy_catalog.rs"]
+mod aws_managed_policy_catalog;
 #[path = "all/entities_for_policy.rs"]
 mod entities_for_policy;
 #[path = "all/instance_profile_role_binding.rs"]

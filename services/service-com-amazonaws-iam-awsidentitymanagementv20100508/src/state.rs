@@ -198,6 +198,19 @@ pub const SERVICE_LINKED_ROLE_PATH_PREFIX: &str = "/aws-service-role/";
 /// customer-managed policies an account creates.
 pub const AWS_MANAGED_POLICY_ACCOUNT: &str = "aws";
 
+/// The instant every entry of the AWS-managed policy catalog
+/// ([`AWS_MANAGED_POLICIES`]) reports as its `CreateDate` and `UpdateDate`:
+/// 2015-02-06T18:39:46Z in seconds since the epoch, the creation time the AWS
+/// Managed Policy Reference publishes for the policies AWS created when managed
+/// policies launched (`AdministratorAccess` among them).
+///
+/// AWS publishes a creation instant per managed policy; this emulator carries ONE
+/// for the catalog as a whole, so a catalog entry's dates are of the modelled type
+/// (`dateType`) and stable across reads — the same value for every reader and every
+/// run — but they are the catalog's instant rather than that one policy's. Nothing
+/// derives them from a request, and no read moves them.
+const AWS_MANAGED_POLICY_CREATE_DATE_SECS: i64 = 1_423_247_986;
+
 /// How many managed policies one IAM role may carry. AWS's "IAM and STS quotas"
 /// page gives the quota "Managed policies attached to an IAM role: 10", and an
 /// attach past it is refused with `LimitExceededException`, whose documentation
@@ -566,7 +579,9 @@ pub struct ComAmazonawsIamAwsidentitymanagementv20100508State {
     /// holds, which is what makes such a policy attachable: an ARN naming a policy
     /// this map does not carry refers to no entity (see [`Self::policy_by_arn`]).
     /// AWS-managed policies (`arn:aws:iam::aws:policy/...`) are NOT in here — they
-    /// are owned by AWS, not by the account ([`AWS_MANAGED_POLICY_ACCOUNT`]).
+    /// are owned by AWS, not by the account ([`AWS_MANAGED_POLICY_ACCOUNT`]), and
+    /// are served from [`AWS_MANAGED_POLICIES`]; a read addressed by ARN resolves
+    /// against both ([`Self::resolve_policy`]).
     pub policies: BTreeMap<String, ManagedPolicy>,
     /// The persisted IAM instance profiles, keyed by [`name_key`] of the instance
     /// profile name, for the same reason users and roles are: IAM entity names are
@@ -713,6 +728,91 @@ impl ComAmazonawsIamAwsidentitymanagementv20100508State {
         let parsed = parse_policy_arn(arn)?;
         let held = self.policies.get(&name_key(&parsed.policy_name))?;
         (held.policy.arn.as_deref() == Some(arn)).then_some(held)
+    }
+
+    /// How many entities the managed policy `arn` names is attached to —
+    /// `Policy$AttachmentCount`, "the number of entities (users, groups, and roles)
+    /// that the policy is attached to".
+    ///
+    /// Counted from the attachments themselves on every read, so the number a
+    /// reader reports is the number of attachments that exist at that instant: an
+    /// attach or a detach changes it without any reader having to be told, and the
+    /// count can never drift from the attachment sets it describes. The same
+    /// measure answers for a policy the account created and for one of AWS's
+    /// ([`AWS_MANAGED_POLICIES`]) — what is counted is the attachments, not the
+    /// policy's owner.
+    ///
+    /// Only roles can hold an attachment today: `AttachUserPolicy` and
+    /// `AttachGroupPolicy` are still scaffolded, so no user or group carries one.
+    /// When they are implemented their attachment sets join this count, which is
+    /// why the policy's own record does not cache it.
+    pub fn policy_attachment_count(&self, arn: &str) -> i32 {
+        let attachments = self
+            .role_attached_policies
+            .values()
+            .filter(|attached| attached.contains(arn))
+            .count();
+        i32::try_from(attachments).unwrap_or(i32::MAX)
+    }
+
+    /// For how many entities the managed policy `arn` names is used to set the
+    /// permissions boundary — `Policy$PermissionsBoundaryUsageCount`, "the number
+    /// of entities (users and roles) for which the policy is used to set the
+    /// permissions boundary".
+    ///
+    /// Derived on every read for the same reason
+    /// [`policy_attachment_count`](Self::policy_attachment_count) is: the boundary
+    /// a role or user carries is the one record of that use.
+    pub fn permissions_boundary_usage_count(&self, arn: &str) -> i32 {
+        // One definition of "the boundary ARN an entity carries"
+        // ([`permissions_boundary_arn`]), the same one `ListEntitiesForPolicy`
+        // compares against, so the count and the listing cannot disagree about
+        // which entities a boundary policy relates to.
+        let boundary_is = |boundary: Option<&crate::ops::types::AttachedPermissionsBoundary>| {
+            permissions_boundary_arn(boundary) == Some(arn)
+        };
+        let roles = self
+            .roles
+            .values()
+            .filter(|role| boundary_is(role.permissions_boundary.as_ref()))
+            .count();
+        let users = self
+            .users
+            .values()
+            .filter(|user| boundary_is(user.permissions_boundary.as_ref()))
+            .count();
+        i32::try_from(roles + users).unwrap_or(i32::MAX)
+    }
+
+    /// The managed policy `arn` names — the account's own ([`policy_by_arn`](Self::policy_by_arn))
+    /// or AWS's ([`aws_managed_policy`]) — as every reader of a managed policy
+    /// reports it, or `None` when neither holds that ARN.
+    ///
+    /// ONE resolution shared by every read addressed by `PolicyArn`, because the
+    /// `arn:aws:iam::aws:policy/` namespace is part of every account's view of IAM:
+    /// a policy AWS owns can be attached, so it must also be readable, and a reader
+    /// that consulted only the account's store would call a policy AWS serves
+    /// absent. The two counts are recomputed here rather than read out of the
+    /// stored record, so a reader reports the attachments and boundary uses that
+    /// exist now; nothing else about the stored policy is touched, and the
+    /// resolution writes nothing.
+    pub fn resolve_policy(&self, arn: &str) -> Option<ManagedPolicy> {
+        // The counts are derived only for an ARN that resolves: a miss — an ARN of
+        // another entity, or one no policy is held under — pays no scan of the
+        // attachment sets, the roles or the users.
+        if let Some(held) = self.policy_by_arn(arn) {
+            let mut resolved = held.clone();
+            resolved.policy.attachment_count = Some(self.policy_attachment_count(arn));
+            resolved.policy.permissions_boundary_usage_count =
+                Some(self.permissions_boundary_usage_count(arn));
+            return Some(resolved);
+        }
+        aws_managed_policy(arn).map(|entry| {
+            entry.record(
+                self.policy_attachment_count(arn),
+                self.permissions_boundary_usage_count(arn),
+            )
+        })
     }
 
     /// The aggregate size, in characters, of the inline policies embedded in the
@@ -1327,6 +1427,258 @@ pub fn parse_policy_arn(arn: &str) -> Option<PolicyArn> {
         path,
         policy_name: policy_name.to_string(),
     })
+}
+
+/// One entry of AWS's own catalog of managed policies — a policy AWS owns and
+/// every account can read and attach, addressed under the
+/// `arn:aws:iam::aws:policy/` namespace ([`AWS_MANAGED_POLICY_ACCOUNT`]).
+///
+/// An AWS-managed policy is not account state: no call creates or deletes one, so
+/// an entry carries no counter and no minted id. Its identity is its path and
+/// friendly name (which is what its ARN spells, [`Self::arn`]), its id is catalog
+/// data fixed per entry ([`Self::policy_id`]), and its content is the ONE version
+/// this emulator carries — the default version, reported under
+/// [`FIRST_POLICY_VERSION_ID`].
+///
+/// AWS publishes a managed policy's own default version number (`v3`, `v12`, …) and
+/// bumps it as it updates the policy; the number it is at right now is not something
+/// this emulator can know, so the catalog promises only the invariant the API has:
+/// `GetPolicy`'s `DefaultVersionId` names the version `GetPolicyVersion` serves.
+/// AWS's friendly `Description` prose is not carried either — the catalog holds a
+/// policy's identity and document, so `Description` is reported only for a policy
+/// this ACCOUNT created with one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AwsManagedPolicy {
+    /// The policy's path, beginning and ending with `/`: `/` for a policy at the
+    /// root, `/service-role/` for one AWS files under that path.
+    pub path: &'static str,
+    /// The policy's friendly name, as the AWS Managed Policy Reference spells it.
+    pub policy_name: &'static str,
+    /// This entry's `PolicyId`, carried as catalog data beside the path, name and
+    /// document.
+    ///
+    /// Stable and unique, the two properties `Policy$PolicyId` documents ("the stable
+    /// and unique string identifying the policy"): it is fixed per entry, so every
+    /// read in every run reports the same id for the same policy, and the suite
+    /// asserts the catalog's ids are distinct. AWS's own `PolicyId` for a managed
+    /// policy is not published in the reference the catalog copies from, so this is a
+    /// value the EMULATOR assigns, of the modelled `idType` (len 16..128, `^[\w]+$`).
+    /// Every one carries `_`, which the base32 alphabet a MINTED id is drawn from does
+    /// not ([`unique_id`]), so a catalog id can never collide with the id the account's
+    /// own `CreatePolicy` mints.
+    pub policy_id: &'static str,
+    /// The policy's default version document, an IAM JSON policy.
+    pub document: &'static str,
+}
+
+impl AwsManagedPolicy {
+    /// This entry's ARN: `arn:aws:iam::aws:policy<path><name>`.
+    ///
+    /// Built here rather than through `engine::emulator_arn` because that helper
+    /// always writes the emulator's own account id into the account segment, and an
+    /// AWS-managed policy is owned by AWS: its account segment is the literal
+    /// [`AWS_MANAGED_POLICY_ACCOUNT`]. The rest of the ARN is the same grammar
+    /// [`policy_arn`] builds and [`parse_policy_arn`] reads.
+    pub fn arn(&self) -> String {
+        format!(
+            "arn:aws:iam::{AWS_MANAGED_POLICY_ACCOUNT}:policy{}{}",
+            self.path, self.policy_name
+        )
+    }
+
+    /// This entry as a managed policy record: the `Policy` metadata every reader
+    /// reports, plus the single version `GetPolicyVersion` serves.
+    ///
+    /// The two counts are the caller's, not the catalog's — they are what the
+    /// account's own attachments and permissions boundaries make them, which is why
+    /// they are passed in (see
+    /// [`ComAmazonawsIamAwsidentitymanagementv20100508State::resolve_policy`]).
+    fn record(&self, attachment_count: i32, permissions_boundary_usage_count: i32) -> ManagedPolicy {
+        let created = ::aws_smithy_types::DateTime::from_secs(AWS_MANAGED_POLICY_CREATE_DATE_SECS);
+        let version = PolicyVersion {
+            document: Some(self.document.to_string()),
+            version_id: Some(FIRST_POLICY_VERSION_ID.to_string()),
+            is_default_version: true,
+            create_date: Some(created),
+        };
+        ManagedPolicy {
+            policy: Policy {
+                arn: Some(self.arn()),
+                policy_id: Some(self.policy_id.to_string()),
+                policy_name: Some(self.policy_name.to_string()),
+                path: Some(self.path.to_string()),
+                default_version_id: Some(FIRST_POLICY_VERSION_ID.to_string()),
+                attachment_count: Some(attachment_count),
+                permissions_boundary_usage_count: Some(permissions_boundary_usage_count),
+                // "Specifies whether the policy can be attached to an IAM user,
+                // group, or role" (`Policy$IsAttachable`): an AWS-managed policy is
+                // published to be attached, which is what every account uses it for.
+                is_attachable: true,
+                // See the type's documentation: AWS's prose is not carried.
+                description: None,
+                create_date: Some(created),
+                update_date: Some(created),
+                // An AWS-managed policy carries no tags: tagging is an account
+                // operation on an account's own resource.
+                tags: None,
+            },
+            versions: [(FIRST_POLICY_VERSION_ID.to_string(), version)]
+                .into_iter()
+                .collect(),
+        }
+    }
+}
+
+/// The AWS-managed policies this emulator carries, ordered by ARN.
+///
+/// AWS-managed policies "are created and managed by AWS" and exist in every
+/// account, so a read of one is NOT a read of account state — which is why they
+/// live in this constant rather than in
+/// [`ComAmazonawsIamAwsidentitymanagementv20100508State::policies`], the account's
+/// own policy store.
+///
+/// SOURCE: the AWS Managed Policy Reference ("AWS managed policies", IAM User
+/// Guide), which publishes each policy's path, friendly name and default-version
+/// document. AWS's catalog runs to well over a thousand policies and this is a
+/// SUBSET of it — the policies the emulator's own suites and fixtures attach, plus
+/// the account-wide and job-function ones a client is most likely to read. An
+/// `arn:aws:iam::aws:policy/` ARN this catalog does not carry is therefore NOT
+/// refused as absent: see `crate::ops::get_policy`, which answers 501 for it rather
+/// than claiming AWS holds no such policy.
+pub const AWS_MANAGED_POLICIES: &[AwsManagedPolicy] = &[
+    AwsManagedPolicy {
+        path: "/",
+        policy_name: "AWSLakeFormationDataAdmin",
+        policy_id: "ANPA_AWSLAKEFORMATIONDATAADMIN",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["lakeformation:*","cloudtrail:DescribeTrails","cloudtrail:LookupEvents","glue:GetDatabase","glue:GetDatabases","glue:CreateDatabase","glue:UpdateDatabase","glue:DeleteDatabase","glue:GetConnections","glue:SearchTables","glue:GetTable","glue:CreateTable","glue:UpdateTable","glue:DeleteTable","glue:GetTableVersions","glue:GetPartitions","glue:GetTables","glue:ListWorkflows","glue:BatchGetWorkflows","glue:DeleteWorkflow","glue:GetWorkflows","glue:GetTags","glue:TagResource","glue:UnTagResource","iam:ListUsers","iam:ListRoles","iam:GetRole","iam:GetRolePolicy","s3:ListAllMyBuckets","s3:GetBucketLocation"],"Resource":"*"},{"Effect":"Deny","Action":["lakeformation:PutDataLakeSettings"],"Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/",
+        policy_name: "AWSLambdaExecute",
+        policy_id: "ANPA_AWSLAMBDAEXECUTE",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["logs:*"],"Resource":"arn:aws:logs:*:*:*"},{"Effect":"Allow","Action":["s3:GetObject","s3:PutObject"],"Resource":"arn:aws:s3:::*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/",
+        policy_name: "AdministratorAccess",
+        policy_id: "ANPA_ADMINISTRATORACCESS",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"*","Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/",
+        policy_name: "AmazonEC2ReadOnlyAccess",
+        policy_id: "ANPA_AMAZONEC2READONLYACCESS",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"ec2:Describe*","Resource":"*"},{"Effect":"Allow","Action":"elasticloadbalancing:Describe*","Resource":"*"},{"Effect":"Allow","Action":["cloudwatch:ListMetrics","cloudwatch:GetMetricStatistics","cloudwatch:Describe*"],"Resource":"*"},{"Effect":"Allow","Action":"autoscaling:Describe*","Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/",
+        policy_name: "AmazonS3FullAccess",
+        policy_id: "ANPA_AMAZONS3FULLACCESS",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:*","s3-object-lambda:*"],"Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/",
+        policy_name: "AmazonS3ReadOnlyAccess",
+        policy_id: "ANPA_AMAZONS3READONLYACCESS",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:Get*","s3:List*","s3:Describe*","s3-object-lambda:Get*","s3-object-lambda:List*"],"Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/",
+        policy_name: "AmazonSNSFullAccess",
+        policy_id: "ANPA_AMAZONSNSFULLACCESS",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["sns:*"],"Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/",
+        policy_name: "AmazonSQSFullAccess",
+        policy_id: "ANPA_AMAZONSQSFULLACCESS",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["sqs:*"],"Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/",
+        policy_name: "CloudWatchLogsFullAccess",
+        policy_id: "ANPA_CLOUDWATCHLOGSFULLACCESS",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["logs:*"],"Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/",
+        policy_name: "IAMReadOnlyAccess",
+        policy_id: "ANPA_IAMREADONLYACCESS",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["iam:GenerateCredentialReport","iam:GenerateServiceLastAccessedDetails","iam:Get*","iam:List*","iam:SimulateCustomPolicy","iam:SimulatePrincipalPolicy"],"Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/",
+        policy_name: "PowerUserAccess",
+        policy_id: "ANPA_POWERUSERACCESS",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","NotAction":["iam:*","organizations:*","account:*"],"Resource":"*"},{"Effect":"Allow","Action":["iam:CreateServiceLinkedRole","iam:DeleteServiceLinkedRole","iam:ListRoles","organizations:DescribeOrganization","account:ListRegions","account:GetAccountInformation"],"Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/service-role/",
+        policy_name: "AWSGlueServiceRole",
+        policy_id: "ANPA_SERVICEROLE_AWSGLUESERVICEROLE",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["glue:*","s3:GetBucketLocation","s3:ListBucket","s3:ListAllMyBuckets","s3:GetBucketAcl","ec2:DescribeVpcEndpoints","ec2:DescribeRouteTables","ec2:CreateNetworkInterface","ec2:DeleteNetworkInterface","ec2:DescribeNetworkInterfaces","ec2:DescribeSecurityGroups","ec2:DescribeSubnets","ec2:DescribeVpcAttribute","iam:ListRolePolicies","iam:GetRole","iam:GetRolePolicy","cloudwatch:PutMetricData"],"Resource":["*"]},{"Effect":"Allow","Action":["s3:CreateBucket"],"Resource":["arn:aws:s3:::aws-glue-*"]},{"Effect":"Allow","Action":["s3:GetObject","s3:PutObject","s3:DeleteObject"],"Resource":["arn:aws:s3:::aws-glue-*/*","arn:aws:s3:::*/*aws-glue-*/*"]},{"Effect":"Allow","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::crawler-public*","arn:aws:s3:::aws-glue-*"]},{"Effect":"Allow","Action":["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],"Resource":["arn:aws:logs:*:*:/aws-glue/*"]}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/service-role/",
+        policy_name: "AWSLambdaBasicExecutionRole",
+        policy_id: "ANPA_SERVICEROLE_AWSLAMBDABASICEXECUTIONROLE",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["logs:CreateLogGroup","logs:CreateLogStream","logs:PutLogEvents"],"Resource":"*"}]}"#,
+    },
+    AwsManagedPolicy {
+        path: "/service-role/",
+        policy_name: "AmazonECSTaskExecutionRolePolicy",
+        policy_id: "ANPA_SERVICEROLE_AMAZONECSTASKEXECUTIONROLEPOLICY",
+        document: r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["ecr:GetAuthorizationToken","ecr:BatchCheckLayerAvailability","ecr:GetDownloadUrlForLayer","ecr:BatchGetImage","logs:CreateLogStream","logs:PutLogEvents"],"Resource":"*"}]}"#,
+    },
+];
+
+/// The catalog entry `arn` names, or `None` when `arn` names no AWS-managed policy
+/// this emulator carries.
+///
+/// The ARN is read through the one grammar this crate holds
+/// ([`parse_policy_arn`]), so a value that is not a managed-policy ARN at all names
+/// nothing here either; the account segment is what says the ARN is in AWS's
+/// namespace rather than an account's, and the entry answers only when its own ARN
+/// is exactly the one asked for — the same identity test
+/// [`ComAmazonawsIamAwsidentitymanagementv20100508State::policy_by_arn`] applies to
+/// the account's policies.
+pub fn aws_managed_policy(arn: &str) -> Option<&'static AwsManagedPolicy> {
+    let parsed = parse_policy_arn(arn)?;
+    if parsed.account != AWS_MANAGED_POLICY_ACCOUNT {
+        return None;
+    }
+    AWS_MANAGED_POLICIES
+        .iter()
+        .find(|entry| entry.path == parsed.path && entry.policy_name == parsed.policy_name)
+        .filter(|entry| entry.arn() == arn)
+}
+
+/// Whether `arn` is an ARN in AWS's own managed-policy namespace — well formed and
+/// carrying [`AWS_MANAGED_POLICY_ACCOUNT`] as its account — whether or not
+/// [`AWS_MANAGED_POLICIES`] carries that policy.
+///
+/// This is what separates "AWS owns this policy" from "the account was asked about
+/// a policy it does not hold": the first is never reported as a missing entity.
+pub fn is_aws_managed_policy_arn(arn: &str) -> bool {
+    parse_policy_arn(arn).is_some_and(|parsed| parsed.account == AWS_MANAGED_POLICY_ACCOUNT)
+}
+
+/// The scaffold's 501 payload for an ARN in AWS's own managed-policy namespace
+/// that [`AWS_MANAGED_POLICIES`] does not carry — `what` naming the part of the
+/// policy the caller asked about ("metadata", "document").
+///
+/// ONE wording, shared by every read addressed by `PolicyArn`, so no reader can
+/// answer "AWS serves no such policy" where another answers "the catalog is short
+/// of it": the emulator carries a SUBSET of AWS's catalog, and the only honest
+/// answer for an entry it does not carry is that nobody has written it down yet.
+pub fn uncarried_aws_managed_policy(arn: &str, what: &str) -> crate::scaffolded::NotImplemented {
+    crate::scaffolded::NotImplemented {
+        message: format!(
+            "AWS-managed policy {arn} is not in this emulator's catalog of AWS-managed \
+             policies, so its {what} cannot be reported; the policy is not claimed to \
+             be absent"
+        ),
+    }
 }
 
 /// Encode a state map key as the opaque pagination `Marker` a client echoes back.

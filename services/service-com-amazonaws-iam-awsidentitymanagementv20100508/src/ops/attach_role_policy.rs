@@ -242,11 +242,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A managed policy is attachable only if it exists. An AWS-managed policy
         // (account segment `aws`) belongs to AWS rather than to this account, so it
-        // is not account state and is taken as present: this emulator does not carry
-        // AWS's catalog of managed policies, and a per-request entry invented for one
-        // would not be knowledge it has. A customer-managed policy, by contrast,
-        // exists exactly when this account holds it — which is what the policy store
-        // `CreatePolicy` writes records.
+        // is not account state and is taken as present: AWS's catalog runs to well
+        // over a thousand policies and `crate::state::AWS_MANAGED_POLICIES` carries
+        // a subset of it, so refusing the ARNs outside that subset would refuse
+        // attachments AWS accepts. The reads of such a policy
+        // (`crate::ops::get_policy`) answer from the catalog where it is carried and
+        // 501 where it is not — never that AWS holds no such policy. A
+        // customer-managed policy, by contrast, exists exactly when this account
+        // holds it — which is what the policy store `CreatePolicy` writes records.
         let aws_managed = policy.account == crate::state::AWS_MANAGED_POLICY_ACCOUNT;
         if !aws_managed && store.policy_by_arn(&input.policy_arn).is_none() {
             return Err(AttachRolePolicyErrorModeled::NoSuchEntityException(

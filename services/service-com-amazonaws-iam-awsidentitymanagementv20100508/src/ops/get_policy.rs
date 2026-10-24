@@ -2,16 +2,17 @@
 
 //! @op GetPolicy
 //!
-//! IMPLEMENTED: this is the reporting half of `CreatePolicy` — it reports the managed
-//! policy the request's ARN names, as this service's state (`crate::state`) holds it,
-//! and writes nothing.
+//! IMPLEMENTED: it reports the managed policy the request's ARN names — the account's
+//! own (`CreatePolicy`'s record in `crate::state`) or AWS's
+//! (`crate::state::AWS_MANAGED_POLICIES`) — and writes nothing.
 //!
-//! An AWS-managed policy's ARN (`arn:aws:iam::aws:policy/...`) names no policy this
-//! emulator holds: it carries none of AWS's catalog, so such a read answers the
-//! modelled `NoSuchEntityException` rather than an invented `Policy` record. That is
-//! deliberately NOT what `AttachRolePolicy` does with one — an attach records the ARN
-//! the caller named without claiming to know the catalog, while a read would have to
-//! fabricate the policy's id, dates and counts to answer at all.
+//! The `arn:aws:iam::aws:policy/` namespace is AWS's own: those policies exist in every
+//! account, which is why one can be attached to a role, so a read of one must answer
+//! from AWS's catalog rather than from the account's policy store. This emulator carries
+//! a SUBSET of that catalog, so an `aws:policy` ARN it does not carry answers 501 — "the
+//! emulator does not hold this policy" — and NOT `NoSuchEntityException`, which would
+//! claim AWS serves no such policy. `NoSuchEntityException` is reserved for the ARN of
+//! an account policy the account does not hold.
 //!
 //! A 501 from an operation in this service means "nobody has written it yet", never
 //! "the emulator is broken".
@@ -181,16 +182,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A read: it reports the stored record and writes nothing.
+        // A read: it reports the resolved record — the account's policy or AWS's
+        // catalog entry, with the attachment and permissions-boundary counts taken
+        // from the live state — and writes nothing.
         let store = state.lock();
-        match store.policy_by_arn(&input.policy_arn) {
-            Some(held) => Ok(GetPolicyOutput {
-                policy: Some(held.policy.clone()),
-            }),
-            None => Err(GetPolicyErrorModeled::NoSuchEntityException(NoSuchEntityException {
-                message: Some(format!("Policy {} does not exist.", input.policy_arn)),
-            })
-            .into()),
+        if let Some(resolved) = store.resolve_policy(&input.policy_arn) {
+            return Ok(GetPolicyOutput {
+                policy: Some(resolved.policy),
+            });
         }
+
+        // An ARN in AWS's own namespace names a policy AWS owns, and this emulator
+        // carries only part of AWS's catalog: answering `NoSuchEntity` here would
+        // assert that AWS holds no such policy, which this emulator cannot know.
+        // The 501 says what is true — the catalog entry is not carried yet — and is
+        // the same answer every unimplemented behaviour gives.
+        if crate::state::is_aws_managed_policy_arn(&input.policy_arn) {
+            return Err(crate::scaffolded::Scaffolded::NotImplemented(
+                crate::state::uncarried_aws_managed_policy(&input.policy_arn, "metadata"),
+            ));
+        }
+
+        // An account-owned ARN the account does not hold "referenced a resource
+        // entity that does not exist".
+        Err(GetPolicyErrorModeled::NoSuchEntityException(NoSuchEntityException {
+            message: Some(format!("Policy {} does not exist.", input.policy_arn)),
+        })
+        .into())
     }
 }

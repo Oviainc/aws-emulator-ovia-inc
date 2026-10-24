@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPolicyVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetPolicyVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetPolicyVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: it reports ONE version of the managed policy the request's ARN names
+//! — the account's own (`CreatePolicy`'s record in `crate::state`) or AWS's
+//! (`crate::state::AWS_MANAGED_POLICIES`) — including that version's policy document,
+//! and writes nothing. It is the half of `GetPolicy` that carries the document: the
+//! `Policy` shape has none, so `GetPolicy` names the default version and this
+//! operation serves it.
+//!
+//! The document is handed back as the plain JSON text the version holds, which is how
+//! every reader in this crate reports a policy document (`GetRolePolicy`,
+//! `GetUserPolicy`): a URL-decoding client reads plain JSON unchanged, since RFC 3986
+//! only escapes characters an IAM policy document need not carry.
+//!
+//! An `arn:aws:iam::aws:policy/` ARN whose catalog entry this emulator does not carry
+//! answers 501 rather than `NoSuchEntityException`, for the reason `crate::ops::get_policy`
+//! states: the policy is AWS's, and the emulator carries a subset of AWS's catalog.
+//! `NoSuchEntityException` is reserved for a policy the account does not hold, and for a
+//! version the resolved policy does not carry.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +169,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetPolicyVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetPolicyVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetPolicyVersion"))
+        // `ctx` carries request metadata only; a read addressed by ARN depends on
+        // none of it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetPolicyVersionErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // `arnType` constrains only the length, so a value that is not a
+        // managed-policy ARN at all is an "invalid … value … supplied for an input
+        // parameter" — a different refusal from an ARN naming a policy that is not
+        // held. The form is checked through the one definition of the ARN grammar
+        // this crate holds.
+        if crate::state::parse_policy_arn(&input.policy_arn).is_none() {
+            return Err(GetPolicyVersionErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!("ARN {} is not valid.", input.policy_arn)),
+                },
+            )
+            .into());
+        }
+
+        // A read: it reports the stored version and writes nothing. The policy is
+        // resolved the one way every managed-policy read resolves it, so AWS's own
+        // policies are served from the catalog beside the account's.
+        let store = state.lock();
+        let Some(resolved) = store.resolve_policy(&input.policy_arn) else {
+            if crate::state::is_aws_managed_policy_arn(&input.policy_arn) {
+                return Err(crate::scaffolded::Scaffolded::NotImplemented(
+                    crate::state::uncarried_aws_managed_policy(&input.policy_arn, "document"),
+                ));
+            }
+            return Err(GetPolicyVersionErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!("Policy {} does not exist.", input.policy_arn)),
+                },
+            )
+            .into());
+        };
+
+        // "Policy version identifiers always begin with v (always lowercase)"
+        // (`PolicyVersion$VersionId`), and the version map is keyed by exactly that
+        // identifier: a version the policy does not carry "referenced a resource
+        // entity that does not exist".
+        match resolved.versions.get(&input.version_id) {
+            Some(version) => Ok(GetPolicyVersionOutput {
+                policy_version: Some(version.clone()),
+            }),
+            None => Err(GetPolicyVersionErrorModeled::NoSuchEntityException(
+                NoSuchEntityException {
+                    message: Some(format!(
+                        "Policy {} version {} does not exist.",
+                        input.policy_arn, input.version_id
+                    )),
+                },
+            )
+            .into()),
+        }
     }
 }
