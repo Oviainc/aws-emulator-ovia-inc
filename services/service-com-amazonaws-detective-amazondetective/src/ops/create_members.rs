@@ -279,12 +279,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
 
             // "CreateMembers verifies the accounts and then invites the verified
-            // accounts": the membership starts in VERIFICATION_IN_PROGRESS and the
-            // move to INVITED is owed by the clock alone, so the due instant is
-            // recorded here and materialised by whichever call first reads the record
-            // after it passes. `DisableEmailNotification` only suppresses the
-            // invitation email, which this emulator sends to nobody either way, so it
-            // changes nothing about the stored membership.
+            // accounts": the membership starts in VERIFICATION_IN_PROGRESS and the move
+            // out of it — to INVITED when the account identifier and email address
+            // match, to VERIFICATION_FAILED when they do not — is owed by the clock
+            // alone, so the due instant is recorded here and materialised by whichever
+            // call first reads the record after it passes. Each membership carries its
+            // own due instant and its own pair, so a batch resolves independently per
+            // account. `DisableEmailNotification` only suppresses the invitation email,
+            // which this emulator sends to nobody either way, so it changes nothing
+            // about the stored membership.
             let member = crate::state::Member {
                 account_id: account.account_id.clone(),
                 email_address: account.email_address.clone(),
