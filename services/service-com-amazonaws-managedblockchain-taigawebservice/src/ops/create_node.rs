@@ -180,6 +180,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The reserved tag-key namespace is Amazon Web Services' own: a caller may not
+        // create a key in it, through a create's `Tags` any more than through
+        // `TagResource`, so the request is refused before the node is provisioned.
+        if let Some(why) = crate::state::reserved_input_tag_keys_refusal([input.tags.as_ref()]) {
+            return Err(CreateNodeErrorModeled::InvalidRequestException(
+                InvalidRequestException { message: Some(why) },
+            )
+            .into());
+        }
+
         let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
         let mut guard = state.lock();

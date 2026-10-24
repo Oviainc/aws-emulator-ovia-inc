@@ -1956,6 +1956,63 @@ pub fn not_found_arn(resource_type: &str, arn: &str) -> ResourceNotFoundExceptio
 /// hold, so a write is held to the documented 50.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
+/// The tag-key namespace Amazon Web Services keeps for the tags it creates itself.
+///
+/// AWS's tagging rules reserve this prefix for AWS use: a caller may neither create,
+/// overwrite nor remove a tag whose key carries it. `TagKey` is `@length(1, 128)` with no
+/// `@pattern`, so the reserved namespace is service behaviour a handler enforces rather
+/// than a constraint the boundary validator can apply.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Whether `key` lies in the reserved tag-key namespace ([`RESERVED_TAG_KEY_PREFIX`]).
+///
+/// Matched without regard to ASCII case: the prefix is reserved as a NAMESPACE, so a key
+/// does not leave it by spelling the prefix differently. A key that merely contains the
+/// prefix later on, or starts with those letters and no colon, is an ordinary caller key.
+pub fn is_reserved_tag_key(key: &str) -> bool {
+    let prefix = RESERVED_TAG_KEY_PREFIX.as_bytes();
+    key.as_bytes()
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
+/// How this service words the `InvalidRequestException` for a request that names a tag key
+/// in the reserved namespace ([`is_reserved_tag_key`]), or `None` when every key named is
+/// the caller's own to write.
+///
+/// Every reserved key the request named travels in the prose, deduplicated and in a stable
+/// order, so the refusal says which keys were refused whichever order the request's map was
+/// serialized in.
+pub fn reserved_tag_keys_refusal<'a>(keys: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    let mut named: Vec<&str> = keys
+        .into_iter()
+        .filter(|key| is_reserved_tag_key(key))
+        .collect();
+    if named.is_empty() {
+        return None;
+    }
+    named.sort_unstable();
+    named.dedup();
+    Some(format!(
+        "the {RESERVED_TAG_KEY_PREFIX} tag-key prefix is reserved for Amazon Web Services use \
+         and cannot be created, overwritten or removed by a caller: {}",
+        named.join(", ")
+    ))
+}
+
+/// The same refusal as [`reserved_tag_keys_refusal`], for the optional `Tags` members a
+/// create carries: a request that omits one simply names no key through it.
+pub fn reserved_input_tag_keys_refusal<'a>(
+    maps: impl IntoIterator<Item = Option<&'a std::collections::HashMap<String, String>>>,
+) -> Option<String> {
+    reserved_tag_keys_refusal(
+        maps.into_iter()
+            .flatten()
+            .flat_map(|map| map.keys())
+            .map(String::as_str),
+    )
+}
+
 /// The resource types this service tags: the `<type>` of an ARN's `<type>/<id>` resource
 /// part, paired with how a failure names that type.
 ///
