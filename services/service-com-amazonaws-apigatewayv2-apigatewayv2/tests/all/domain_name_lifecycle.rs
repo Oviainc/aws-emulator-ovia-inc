@@ -17,13 +17,17 @@
 //!   request carries replaces the stored one, a member it omits leaves the stored value
 //!   as it was, and the identifiers the resource was minted with (`DomainNameArn`, the
 //!   `ApiGatewayDomainName` host) never move.
+//! * A custom domain name is served by the endpoints its `DomainNameConfigurations`
+//!   describe, so a request that would leave it with no entry is refused with the
+//!   modelled `BadRequestException` (400) — the table in
+//!   `domain_name_endpoint_required` asserts that rule over both writers.
 //! * `DomainNameStatus` is `UPDATING` while the endpoint migration an update started is
 //!   still due and `AVAILABLE` once it is not, and "if the status is UPDATING, the
 //!   domain cannot be modified further until the existing operation is complete"
 //!   (`DomainNameConfiguration$DomainNameStatus`).
 //!
 //! The rows vary what each rule generalises over: how many configurations a request
-//! carries (none, one, several), which members of a configuration it sets, which members
+//! carries (one, several), which members of a configuration it sets, which members
 //! of the patch it names (none, one, several, all), every value of the modelled
 //! `RoutingMode` enum, the published bounds of the domain name's length, and the form of
 //! an absent name.
@@ -53,12 +57,12 @@ const REGION: &str = "eu-central-1";
 /// documents ("AWS Certificate Manager is the only supported source"). Built through the
 /// emulator's own ARN helper rather than written out, so the account segment is the
 /// canonical one.
-fn certificate_arn(name: &str) -> String {
+pub(crate) fn certificate_arn(name: &str) -> String {
     engine::emulator_arn("acm", REGION, &format!("certificate/{name}"))
 }
 
 /// Send one request to `/v2/domainnames…` and answer `(status, body)`.
-async fn call(
+pub(crate) async fn call(
     emulator: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -67,18 +71,18 @@ async fn call(
     call_in_region(emulator, REGION, method, uri, body).await
 }
 
-async fn create_domain_name(
+pub(crate) async fn create_domain_name(
     emulator: &MultiServiceRouter,
     request: &Value,
 ) -> (u16, Value) {
     call(emulator, "POST", "/v2/domainnames", Some(request.clone())).await
 }
 
-async fn get_domain_name(emulator: &MultiServiceRouter, domain: &str) -> (u16, Value) {
+pub(crate) async fn get_domain_name(emulator: &MultiServiceRouter, domain: &str) -> (u16, Value) {
     call(emulator, "GET", &format!("/v2/domainnames/{domain}"), None).await
 }
 
-async fn update_domain_name(
+pub(crate) async fn update_domain_name(
     emulator: &MultiServiceRouter,
     domain: &str,
     patch: &Value,
@@ -104,7 +108,7 @@ async fn created(emulator: &MultiServiceRouter, case: &str, request: &Value) -> 
 }
 
 /// The `domainNameConfigurations` of a response, as a list.
-fn configurations(body: &Value) -> Vec<Value> {
+pub(crate) fn configurations(body: &Value) -> Vec<Value> {
     body.get("domainNameConfigurations")
         .and_then(Value::as_array)
         .cloned()
@@ -135,11 +139,16 @@ struct CreateCase {
 fn create_cases() -> Vec<CreateCase> {
     vec![
         CreateCase {
-            label: "nothing but the name",
+            label: "one configuration that names nothing itself",
             domain: "bare.example.com",
-            extra: json!({}),
+            extra: json!({"domainNameConfigurations": [{}]}),
             expect_routing_mode: DEFAULT_ROUTING_MODE.to_string(),
-            expect_configurations: Vec::new(),
+            expect_configurations: vec![(
+                DEFAULT_ENDPOINT_TYPE.to_string(),
+                DEFAULT_SECURITY_POLICY.to_string(),
+                DEFAULT_IP_ADDRESS_TYPE.to_string(),
+                String::new(),
+            )],
             expect_tags: json!({}),
         },
         CreateCase {
@@ -223,9 +232,16 @@ fn create_cases() -> Vec<CreateCase> {
         CreateCase {
             label: "the shortest name the target shape allows",
             domain: "a",
-            extra: json!({}),
+            extra: json!({
+                "domainNameConfigurations": [{"certificateArn": certificate_arn("shortest")}]
+            }),
             expect_routing_mode: DEFAULT_ROUTING_MODE.to_string(),
-            expect_configurations: Vec::new(),
+            expect_configurations: vec![(
+                DEFAULT_ENDPOINT_TYPE.to_string(),
+                DEFAULT_SECURITY_POLICY.to_string(),
+                DEFAULT_IP_ADDRESS_TYPE.to_string(),
+                certificate_arn("shortest"),
+            )],
             expect_tags: json!({}),
         },
     ]
@@ -464,14 +480,6 @@ fn patch_cases() -> Vec<PatchCase> {
             expect_status: DOMAIN_NAME_STATUS_UPDATING,
         },
         PatchCase {
-            label: "an empty configuration list removes every endpoint",
-            patch: json!({"domainNameConfigurations": []}),
-            expect_routing_mode: "ROUTING_RULE_ONLY".to_string(),
-            expect_truststore_uri: "s3://truststores/seed.pem",
-            expect_certificates: Vec::new(),
-            expect_status: DOMAIN_NAME_STATUS_UPDATING,
-        },
-        PatchCase {
             label: "every patchable member at once",
             patch: json!({
                 "domainNameConfigurations": [{
@@ -587,7 +595,11 @@ async fn every_modelled_routing_mode_round_trips() {
         let created_body = created(
             &emulator,
             mode,
-            &json!({"domainName": domain, "routingMode": mode}),
+            &json!({
+                "domainName": domain,
+                "domainNameConfigurations": [{"certificateArn": certificate_arn(mode)}],
+                "routingMode": mode
+            }),
         )
         .await;
         assert_eq!(
@@ -598,7 +610,15 @@ async fn every_modelled_routing_mode_round_trips() {
 
         // Every mode is also reachable by patching a domain name created without one.
         let patched_domain = format!("patched-{domain}");
-        created(&emulator, mode, &json!({"domainName": patched_domain})).await;
+        created(
+            &emulator,
+            mode,
+            &json!({
+                "domainName": patched_domain,
+                "domainNameConfigurations": [{"certificateArn": certificate_arn(mode)}]
+            }),
+        )
+        .await;
         let (status, patched) =
             update_domain_name(&emulator, &patched_domain, &json!({"routingMode": mode})).await;
         assert_eq!(
@@ -621,7 +641,10 @@ async fn an_absent_domain_name_is_not_found() {
     created(
         &emulator,
         "neighbour",
-        &json!({"domainName": "held.example.com"}),
+        &json!({
+            "domainName": "held.example.com",
+            "domainNameConfigurations": [{"certificateArn": certificate_arn("held")}]
+        }),
     )
     .await;
 
@@ -675,10 +698,15 @@ async fn an_absent_domain_name_is_not_found() {
 #[tokio::test]
 async fn a_name_the_account_already_holds_is_a_conflict() {
     let emulator = emulator();
-    // The rows vary what the second create asks for: the same request, a different
-    // configuration, and different tags. None of them may replace the stored record.
+    // The rows vary what the second create asks for: the same request, an entry naming
+    // nothing itself, a different configuration, and different tags. None of them may
+    // replace the stored record.
     let rows = [
         ("the same request", json!({})),
+        (
+            "an entry naming nothing itself",
+            json!({"domainNameConfigurations": [{}]}),
+        ),
         (
             "a different configuration",
             json!({"domainNameConfigurations": [{"certificateArn": certificate_arn("other")}]}),
@@ -686,15 +714,16 @@ async fn a_name_the_account_already_holds_is_a_conflict() {
         ("different tags", json!({"tags": {"owner": "second"}})),
     ];
     let domain = "taken.example.com";
-    let first = created(
-        &emulator,
-        "first create",
-        &json!({"domainName": domain, "tags": {"owner": "first"}}),
-    )
-    .await;
+    // The request every row starts from: the name, one endpoint configuration and tags.
+    let base = json!({
+        "domainName": domain,
+        "domainNameConfigurations": [{"certificateArn": certificate_arn("taken")}],
+        "tags": {"owner": "first"}
+    });
+    let first = created(&emulator, "first create", &base).await;
 
     for (label, extra) in rows {
-        let mut request = json!({"domainName": domain});
+        let mut request = base.clone();
         for (member, value) in extra.as_object().expect("the extra members") {
             request[member] = value.clone();
         }
@@ -833,15 +862,26 @@ async fn a_domain_name_outside_the_documented_length_is_refused() {
         ("513 characters", past_bound.as_str()),
     ];
 
+    // Every row carries one endpoint configuration, so the name's length is the only
+    // thing that can decide the answer.
+    let configurations = json!([{"certificateArn": certificate_arn("length")}]);
     for (label, domain) in accepted {
-        let (status, body) = create_domain_name(&emulator, &json!({"domainName": domain})).await;
+        let (status, body) = create_domain_name(
+            &emulator,
+            &json!({"domainName": domain, "domainNameConfigurations": configurations.clone()}),
+        )
+        .await;
         assert_eq!(
             status, 201,
             "case {label:?}: expected 201 from CreateDomainName, got {status} {body}"
         );
     }
     for (label, domain) in refused {
-        let (status, body) = create_domain_name(&emulator, &json!({"domainName": domain})).await;
+        let (status, body) = create_domain_name(
+            &emulator,
+            &json!({"domainName": domain, "domainNameConfigurations": configurations.clone()}),
+        )
+        .await;
         assert_eq!(
             status, 400,
             "case {label:?}: expected 400 from CreateDomainName, got {status} {body}"

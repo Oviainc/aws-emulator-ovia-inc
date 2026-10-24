@@ -26,7 +26,7 @@
 //!   transient one a caller would have to wait out.
 
 use crate::harness::{
-    call, expected_dictionary_arn, output_config, past_the_transition_span, router,
+    call, enabled_output, expected_dictionary_arn, past_the_transition_span, router,
     subtitling_output,
 };
 use serde_json::{json, Value};
@@ -70,11 +70,6 @@ async fn export_entries(router: &MultiServiceRouter, id: &str) -> (u16, Value) {
         None,
     )
     .await
-}
-
-/// One output of the `kind` config the harness builds, which names no dictionary.
-fn plain_output(name: &str, kind: &str) -> Value {
-    json!({"name": name, "outputConfig": output_config(kind), "status": "ENABLED"})
 }
 
 /// Create one feed carrying `outputs` and return its id.
@@ -543,7 +538,7 @@ async fn a_dictionary_is_referenced_exactly_while_a_feed_output_names_it() {
             }
             "update" => {
                 let feed_id =
-                    create_feed(&router, "to-be-updated", json!([plain_output("crop1", "cropping")]))
+                    create_feed(&router, "to-be-updated", json!([enabled_output("crop1", "cropping")]))
                         .await;
                 let (status, updated) = call(
                     &router,
@@ -565,7 +560,7 @@ async fn a_dictionary_is_referenced_exactly_while_a_feed_output_names_it() {
                 let feed_id = create_feed(
                     &router,
                     "to-be-associated",
-                    json!([plain_output("crop1", "cropping")]),
+                    json!([enabled_output("crop1", "cropping")]),
                 )
                 .await;
                 past_the_transition_span();
@@ -598,9 +593,9 @@ async fn a_dictionary_is_referenced_exactly_while_a_feed_output_names_it() {
                     &router,
                     "other-kinds-feed",
                     json!([
-                        plain_output("crop1", "cropping"),
-                        plain_output("clip1", "clipping"),
-                        plain_output("meta1", "contextualMetadata"),
+                        enabled_output("crop1", "cropping"),
+                        enabled_output("clip1", "clipping"),
+                        enabled_output("meta1", "contextualMetadata"),
                     ]),
                 )
                 .await
@@ -652,7 +647,7 @@ async fn a_dictionary_is_referenced_exactly_while_a_feed_output_names_it() {
             &format!("/v1/feed/{feed_id}"),
             Some(json!({
                 "name": "dereferenced-feed",
-                "outputs": [plain_output("crop1", "cropping")],
+                "outputs": [enabled_output("crop1", "cropping")],
             })),
         )
         .await;
@@ -803,7 +798,7 @@ async fn delete_dictionary_is_refused_while_a_feed_references_it() {
                     &format!("/v1/feed/{feed_id}"),
                     Some(json!({
                         "name": "holding-feed",
-                        "outputs": [plain_output("crop1", "cropping")],
+                        "outputs": [enabled_output("crop1", "cropping")],
                     })),
                 )
                 .await;
@@ -861,22 +856,22 @@ async fn update_feed_reports_the_status_the_feed_holds() {
             "a feed read right after its creation",
             "AVAILABLE",
             "AVAILABLE",
-            json!([plain_output("crop1", "cropping")]),
+            json!([enabled_output("crop1", "cropping")]),
         ),
         (
             "a settled, unassociated feed",
             "AVAILABLE",
             "AVAILABLE",
             json!([
-                plain_output("crop1", "cropping"),
-                plain_output("clip1", "clipping"),
+                enabled_output("crop1", "cropping"),
+                enabled_output("clip1", "clipping"),
             ]),
         ),
         (
             "a feed a resource holds",
             "ACTIVE",
             "ACTIVE",
-            json!([plain_output("meta1", "contextualMetadata")]),
+            json!([enabled_output("meta1", "contextualMetadata")]),
         ),
         (
             "a feed whose resource has been released",
@@ -891,7 +886,7 @@ async fn update_feed_reports_the_status_the_feed_holds() {
         let feed_id = create_feed(
             &router,
             "status-feed",
-            json!([plain_output("crop1", "cropping")]),
+            json!([enabled_output("crop1", "cropping")]),
         )
         .await;
 

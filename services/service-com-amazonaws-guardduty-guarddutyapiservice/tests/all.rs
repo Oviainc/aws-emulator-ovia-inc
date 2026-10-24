@@ -83,6 +83,8 @@ mod object_malware_scan;
 mod publishing_destination_lifecycle;
 #[path = "all/publishing_destination_listing.rs"]
 mod publishing_destination_listing;
+#[path = "all/publishing_destination_update.rs"]
+mod publishing_destination_update;
 #[path = "all/request_region_partition_bounds.rs"]
 mod request_region_partition_bounds;
 #[path = "all/sample_finding_catalog.rs"]

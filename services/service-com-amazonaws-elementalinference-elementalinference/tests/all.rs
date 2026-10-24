@@ -39,6 +39,8 @@ mod fixture_search;
 mod harness;
 #[path = "all/output_provenance.rs"]
 mod output_provenance;
+#[path = "all/put_feed_policy_scope.rs"]
+mod put_feed_policy_scope;
 #[path = "all/refusals_from_state.rs"]
 mod refusals_from_state;
 #[path = "all/region_isolation.rs"]

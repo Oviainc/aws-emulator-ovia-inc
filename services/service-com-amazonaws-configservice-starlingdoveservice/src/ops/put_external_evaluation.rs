@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutExternalEvaluation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutExternalEvaluation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutExternalEvaluation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This operation records an evaluation Config did not compute itself: a Config
+//! Process Check rule is evaluated by whoever runs the process, who delivers the
+//! verdict here. The evaluation is persisted against the named rule as the rule's
+//! result for the evaluated account — which is the one account this store stands for,
+//! so a rule holds at most one and a delivery revises it in place — and
+//! `GetComplianceDetailsByConfigRule` reports it while the rule's own compliance rolls
+//! it up. That the evaluated account can only be THIS store's is an emulator scoping
+//! decision following from one store standing for one account, not a modelled
+//! constraint on `ComplianceResourceId`.
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +139,133 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutExternalEvaluation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutExternalEvaluationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutExternalEvaluation"))
+        // `ctx` carries request metadata only; the evaluation is written to state.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        let delivered = input.external_evaluation;
+
+        // A process check evaluates the ACCOUNT, so the only resource type Config
+        // accepts here is the account one, and the only resource id is an account id —
+        // and the only account one engine's store stands for is its own, so an
+        // evaluation can only be delivered for that account. That is what bounds the
+        // results a rule can hold to ONE per rule: a caller cannot name a new key.
+        if delivered.compliance_resource_type != crate::state::EXTERNAL_EVALUATION_RESOURCE_TYPE {
+            return Err(
+                PutExternalEvaluationErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(crate::state::unaccepted_value_message(
+                            "ExternalEvaluation.ComplianceResourceType",
+                            &delivered.compliance_resource_type,
+                            &[crate::state::EXTERNAL_EVALUATION_RESOURCE_TYPE],
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        let evaluated_account = ::emulator_server::emulator_account_id();
+        if delivered.compliance_resource_id != evaluated_account {
+            return Err(
+                PutExternalEvaluationErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(crate::state::unaccepted_value_message(
+                            "ExternalEvaluation.ComplianceResourceId",
+                            &delivered.compliance_resource_id,
+                            &[evaluated_account],
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // `INSUFFICIENT_DATA` is what Config derives for a rule it could not evaluate,
+        // never a verdict a caller delivers, so it is a bad parameter here even though
+        // the enum publishes it.
+        if !crate::state::EXTERNAL_EVALUATION_COMPLIANCE_TYPES
+            .contains(&delivered.compliance_type.as_str())
+        {
+            return Err(
+                PutExternalEvaluationErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(crate::state::unaccepted_value_message(
+                            "ExternalEvaluation.ComplianceType",
+                            &delivered.compliance_type,
+                            &crate::state::EXTERNAL_EVALUATION_COMPLIANCE_TYPES,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The ordering timestamp has to be placeable as an instant before anything is
+        // written: the wire accepts any numeric epoch, and an instant is what this
+        // service stores. Converted BEFORE the store guard is taken, so no conversion
+        // of request data happens inside the critical section.
+        let ordered_at = match crate::state::instant(delivered.ordering_timestamp) {
+            Some(ordered_at) => ordered_at,
+            None => {
+                return Err(
+                    PutExternalEvaluationErrorModeled::InvalidParameterValueException(
+                        InvalidParameterValueException {
+                            message: Some(crate::state::unplaceable_timestamp_message(
+                                "ExternalEvaluation.OrderingTimestamp",
+                                delivered.ordering_timestamp,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        };
+
+        let recorded_at = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The rule has to be one this account holds AND a process check: every other
+        // rule is evaluated by Config itself, so there is no external verdict to
+        // record against it. Both read as the same refusal, which is what
+        // `NoSuchConfigRuleException` documents on this path ("Verify that the rule is
+        // an Config Process Check rule, that the rule name is correct").
+        let rule = store
+            .config_rules
+            .get_mut(&input.config_rule_name)
+            .filter(|rule| rule.is_process_check())
+            .ok_or_else(|| {
+                PutExternalEvaluationError::from(
+                    PutExternalEvaluationErrorModeled::NoSuchConfigRuleException(
+                        NoSuchConfigRuleException {
+                            message: Some(crate::state::no_such_config_rule_message(
+                                &input.config_rule_name,
+                            )),
+                        },
+                    ),
+                )
+            })?;
+
+        // One result per evaluated resource per evaluation mode: delivering again for
+        // the same resource REPLACES the verdict ("Add or updates the evaluations for
+        // process checks"). A process check is a detective evaluation — it reports on
+        // a process that has already run — and Config, not the caller, chose the mode.
+        let mut result = crate::state::EvaluationResultEntry::new(
+            &delivered.compliance_resource_type,
+            &delivered.compliance_resource_id,
+            crate::state::EVALUATION_MODE_DETECTIVE,
+            &delivered.compliance_type,
+            ordered_at,
+        );
+        result.annotation = delivered.annotation;
+        // The caller's `OrderingTimestamp` is "the time when the compliance was
+        // recorded", i.e. the instant the evaluation itself happened, which is also
+        // when the rule was invoked; Config recorded the result when this call
+        // arrived.
+        result.result_recorded_time = recorded_at;
+        rule.evaluation_results.insert(result.key(), result);
+
+        Ok(PutExternalEvaluationOutput {})
     }
 }

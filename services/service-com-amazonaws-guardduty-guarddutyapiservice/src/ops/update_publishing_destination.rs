@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdatePublishingDestination
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdatePublishingDestination`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: writes the supplied `DestinationProperties` onto the publishing
+//! destination `CreatePublishingDestination` persisted in [`crate::state`]. A PARTIAL
+//! update: a member the request carries replaces the stored one, a member it omits
+//! leaves the stored one alone. A destination whose properties actually changed is
+//! verified again, so it reports `PENDING_VERIFICATION` until the clock moves it back
+//! to `PUBLISHING`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdatePublishingDestination::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -137,18 +136,107 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdatePublishingDestination` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdatePublishingDestinationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdatePublishingDestination"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdatePublishingDestinationErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+
+        let region = crate::state::request_region(ctx);
+        let mut state = state.lock();
+
+        // Resolve the destination and refuse an unacceptable request BEFORE anything
+        // is written, so a rejected update leaves the destination exactly as it was.
+        // A destination ARN is checked against the service the destination's own
+        // `DestinationType` names, which is why the stored record is read first.
+        let destination_service = {
+            let Some(detector) = state.detector_in(&region, &input.detector_id) else {
+                return Err(bad_request(crate::state::detector_id_rejection(
+                    &input.detector_id,
+                )));
+            };
+            let Some(destination) = detector.publishing_destinations.get(&input.destination_id)
+            else {
+                return Err(bad_request(crate::state::destination_id_rejection(
+                    &input.destination_id,
+                )));
+            };
+            crate::state::validate_destination_type(&destination.destination_type)
+                .map_err(bad_request)?
+        };
+        if let Some(properties) = input.destination_properties.as_ref() {
+            crate::state::validate_destination_property_forms(destination_service, properties)
+                .map_err(bad_request)?;
+        }
+
+        // A MUTATION: the instant this hands out is the destination's new `UpdatedAt`
+        // and, where the properties changed, what the verification the clock owes is
+        // counted from.
+        let now = state.tick_millis();
+        let Some(destination) = state
+            .detector_in_mut(&region, &input.detector_id)
+            .and_then(|detector| detector.publishing_destinations.get_mut(&input.destination_id))
+        else {
+            // Unreachable: the same two lookups resolved above under the same lock.
+            // The branch is kept rather than unwrapped so a lookup that ever stops
+            // resolving answers the caller's own refusal instead of panicking.
+            return Err(bad_request(crate::state::destination_id_rejection(
+                &input.destination_id,
+            )));
+        };
+        // Materialise the verification the clock already made due before this call's
+        // own change is applied, so an update neither skips it nor replays it.
+        destination.settle(now);
+
+        // `DestinationProperties` is OPTIONAL, and so is every member of it
+        // (`smithy_query(operation="UpdatePublishingDestination")`), while the
+        // operation "updates information about the publishing destination": a member
+        // the request carries replaces the stored value, a member it omits leaves the
+        // stored value where it was. `DestinationType` is not among them — the type of
+        // an existing destination cannot be changed.
+        let mut changed = false;
+        if let Some(properties) = input.destination_properties.as_ref() {
+            if let Some(destination_arn) = properties.destination_arn.as_ref() {
+                changed |= destination.destination_arn != *destination_arn;
+                destination.destination_arn = destination_arn.clone();
+            }
+            if let Some(kms_key_arn) = properties.kms_key_arn.as_ref() {
+                changed |= destination.kms_key_arn != *kms_key_arn;
+                destination.kms_key_arn = kms_key_arn.clone();
+            }
+            // `ExpectedBucketOwner` "appears in the response only if it was provided
+            // when the publishing destination was created or updated"
+            // (`smithy_query(query="doc",shape="DestinationProperties",member="ExpectedBucketOwner")`),
+            // so an update that provides it records it and one that does not leaves
+            // whatever the create or an earlier update recorded.
+            if let Some(owner) = properties.expected_bucket_owner.as_ref() {
+                changed |= destination.expected_bucket_owner.as_deref() != Some(owner.as_str());
+                destination.expected_bucket_owner = Some(owner.clone());
+            }
+        }
+        if changed {
+            destination.updated_at_millis = now;
+            // The properties say where GuardDuty publishes and with which key, so a
+            // destination that now names different ones is one GuardDuty has not
+            // verified it can write to: the same clock-owed `PENDING_VERIFICATION` ->
+            // `PUBLISHING` span a create opens. An update asking for the values the
+            // destination already holds changes nothing and so owes nothing.
+            destination.begin_verification(now);
+        }
+
+        // `Unit` output: success is the modelled 200 and an empty body. The detector's
+        // own `UpdatedAt` does not move — it holds the same destinations it did
+        // before, and only this destination's record changed.
+        Ok(UpdatePublishingDestinationOutput {})
     }
+}
+
+/// Refuse the request the way GuardDuty does: HTTP 400 under the
+/// `InvalidInputException` class, in both the body's `__type` and its `type`
+/// member.
+fn bad_request(message: impl Into<String>) -> UpdatePublishingDestinationError {
+    crate::scaffolded::Scaffolded::invalid_input(message)
 }
