@@ -11,10 +11,13 @@
 //! ([`MedicalVocabularyRecord`]), a family of the same shape projected onto the same
 //! `VocabularyInfo` — the Call Analytics categories, each a record of the rules
 //! and input type it was created with and its projection onto `CategoryProperties` —
-//! and the custom LANGUAGE models ([`LanguageModelRecord`]), each a record of the
+//! the custom LANGUAGE models ([`LanguageModelRecord`]), each a record of the
 //! base model, language and training data a create named, with its
 //! `IN_PROGRESS` -> `FAILED` transition and its projection onto the modelled
-//! `LanguageModel` shape.
+//! `LanguageModel` shape — and the Medical Scribe (AWS HealthScribe) jobs, each a
+//! record of the media, settings and channel definitions it was started with, with
+//! its own `IN_PROGRESS` -> `COMPLETED` transition and its projection onto
+//! `MedicalScribeJob`.
 //! Several operations read each record, so
 //! the projections are single-homed here rather than copied into each handler; the
 //! three tagging operations reach every family's tag set through one lookup
@@ -49,16 +52,24 @@
 //! training and tuning data can only be read from the Amazon S3 location a create
 //! names ([`LanguageModelRecord`]), so the record is real and the training it cannot
 //! run ends in the service's own modelled `FAILED` state — nothing here reports a
-//! `COMPLETED` model, because nothing trained one.
+//! `COMPLETED` model, because nothing trained one. A Medical Scribe job is the job
+//! RECORD too, and the strongest case of the same limit: no conversation is
+//! transcribed, no speaker role is identified and no clinical note is generated, so
+//! the `MedicalScribeOutput.TranscriptFileUri` / `ClinicalDocumentUri` a completed
+//! job reports name locations nothing writes to or serves (see
+//! [`medical_scribe_output_uri`]), and a `FailureReason` stays absent because nothing
+//! this emulator does can fail a job it accepted.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     CategoryProperties, ContentRedaction, EncryptionConfiguration, InputDataConfig,
-    JobExecutionSettings, LanguageIdSettings, LanguageModel, Media, ModelSettings, Rule, Settings,
-    SubtitlesOutput, Tag, ToxicityDetectionSettings, Transcript, TranscriptionJob,
-    TranscriptionJobSummary, VocabularyFilterInfo, VocabularyInfo,
+    JobExecutionSettings, LanguageIdSettings, LanguageModel, Media,
+    MedicalScribeChannelDefinition, MedicalScribeJob, MedicalScribeOutput,
+    MedicalScribeSettings, ModelSettings, Rule, Settings, SubtitlesOutput, Tag,
+    ToxicityDetectionSettings, Transcript, TranscriptionJob, TranscriptionJobSummary,
+    VocabularyFilterInfo, VocabularyInfo, MEDICAL_SCRIBE_LANGUAGE_CODE_VALUES,
 };
 
 /// `TranscriptionJobStatus` values, from the model's enum
@@ -79,8 +90,58 @@ pub const STATUS_FAILED: &str = "FAILED";
 /// (`smithy_query(query="shape", shape="TranscriptionJobStatus")`); the first two are
 /// the non-terminal ones a delete is refused for, per `BadRequestException`'s own
 /// documentation ("if it's in a non-terminal state (such as IN PROGRESS)").
+///
+/// `MedicalScribeJobStatus` is modelled with the same four values
+/// (`smithy_query(query="shape", shape="MedicalScribeJobStatus")`) and its deletes
+/// carry the same `BadRequestException`, so this one predicate answers for both job
+/// families rather than each handler spelling its own list.
 pub fn is_terminal_job_status(status: &str) -> bool {
     status == STATUS_COMPLETED || status == STATUS_FAILED
+}
+
+/// The one language an AWS HealthScribe job runs in.
+///
+/// `MedicalScribeLanguageCode` is modelled as an enum with the single value `en-US`
+/// (`smithy_query(query="shape", shape="MedicalScribeLanguageCode")`, also
+/// [`MEDICAL_SCRIBE_LANGUAGE_CODE_VALUES`]) and `StartMedicalScribeJob` takes no
+/// language member at all, so the language a recorded Medical Scribe job reports is
+/// that value rather than anything the request chose.
+pub const MEDICAL_SCRIBE_LANGUAGE_CODE: &str = MEDICAL_SCRIBE_LANGUAGE_CODE_VALUES[0];
+
+/// The most Medical Scribe jobs this emulator holds for an account.
+///
+/// A CHOSEN ceiling, not a published one — AWS gives no per-account figure for
+/// HealthScribe jobs in the model — applying the same figure the other families use
+/// so the store stays bounded: a caller that never deletes cannot grow it without
+/// end, and `DeleteMedicalScribeJob` is what makes room again. A start beyond it
+/// answers the `LimitExceededException` the operation models for an exceeded quota.
+pub const MAX_MEDICAL_SCRIBE_JOBS: usize = MAX_TRANSCRIPTION_JOBS;
+
+/// The object name of the transcript a completed Medical Scribe job reports, under
+/// the prefix [`medical_scribe_output_uri`] builds.
+///
+/// CHOSEN, like the prefix: `MedicalScribeOutput$TranscriptFileUri` documents only
+/// that it "Holds the Amazon S3 URI for the Transcript"
+/// (`smithy_query(query="doc", shape="MedicalScribeOutput", member="TranscriptFileUri")`),
+/// and neither the model nor the operation's documentation states an object key.
+pub const MEDICAL_SCRIBE_TRANSCRIPT_FILE: &str = "transcript.json";
+
+/// The object name of the clinical document a completed Medical Scribe job reports.
+/// See [`MEDICAL_SCRIBE_TRANSCRIPT_FILE`].
+pub const MEDICAL_SCRIBE_CLINICAL_DOCUMENT_FILE: &str = "summary.json";
+
+/// Where one of a Medical Scribe job's two output files is reported to live.
+///
+/// Reported, not served — exactly as a transcription job's
+/// `Transcript.TranscriptFileUri` is (see this module's header): nothing writes an
+/// object at this URI, because nothing transcribes the conversation or generates the
+/// clinical note. `OutputBucketName` is REQUIRED for this family
+/// (`smithy_query(query="operation", operation="StartMedicalScribeJob")`), so there is
+/// no service-managed branch as [`output_uri`] has: both files are in the caller's
+/// bucket, under a prefix named for the job so two jobs writing to one bucket do not
+/// collide.
+pub fn medical_scribe_output_uri(bucket: &str, job_name: &str, file: &str) -> String {
+    format!("s3://{bucket}/{job_name}/{file}")
 }
 
 /// `OutputLocationType` values, from the model's enum
@@ -367,6 +428,18 @@ pub struct ComAmazonawsTranscribeTranscribeState {
     /// create a new custom language model with the same name as an existing custom
     /// language model, you get a `ConflictException` error").
     pub language_models: BTreeMap<String, LanguageModelRecord>,
+    /// Every Medical Scribe job this account has started, keyed by its name (which
+    /// `StartMedicalScribeJob` requires to be "unique within an Amazon Web Services
+    /// account").
+    ///
+    /// A job of this family carries the tags its start request asked for and reports
+    /// them through its own operations, but it is NOT reachable from
+    /// [`Self::tags`] / [`Self::tags_mut`]: this emulator has no recorded spelling for
+    /// the ARN `<type>` segment of a Medical Scribe job, which is the same reason the
+    /// Call Analytics categories are absent from that lookup. An ARN naming one
+    /// therefore answers the three tagging operations' modelled not-found error rather
+    /// than an empty tag set.
+    pub medical_scribe_jobs: BTreeMap<String, MedicalScribeJobRecord>,
     /// Source of [`TranscriptionJobRecord::sequence`]: a monotonic counter, so
     /// creation order is total even when two jobs start in the same clock tick.
     next_sequence: u64,
@@ -389,6 +462,21 @@ impl ComAmazonawsTranscribeTranscribeState {
         let mut records: Vec<&TranscriptionJobRecord> = self.transcription_jobs.values().collect();
         records.sort_by_key(|record| std::cmp::Reverse(record.sequence));
         records
+    }
+
+    /// The Medical Scribe job named `name`, with every clock-owed transition of it
+    /// already materialised, or `None` when this account has started no such job.
+    ///
+    /// The single lookup for this family, so every operation that reads or deletes a
+    /// Medical Scribe job sees the same status: the one the clock already owed it.
+    pub fn medical_scribe_job_mut(
+        &mut self,
+        name: &str,
+        now: SystemTime,
+    ) -> Option<&mut MedicalScribeJobRecord> {
+        let record = self.medical_scribe_jobs.get_mut(name)?;
+        record.advance_clock(now);
+        Some(record)
     }
 
     /// The custom vocabulary named `name`, with every clock-owed transition of it
@@ -1329,6 +1417,112 @@ impl TranscriptionJobRecord {
             identified_language_score: None,
             language_codes: None,
             toxicity_detection: self.toxicity_detection.clone(),
+        }
+    }
+}
+
+/// One stored Medical Scribe job (AWS HealthScribe): exactly what the request asked
+/// for, plus the lifecycle facts the service itself owns (status, timestamps and the
+/// location its output would be written to).
+///
+/// `StartMedicalScribeJob` has no deferred-execution member of any kind
+/// (`smithy_query(query="operation", operation="StartMedicalScribeJob")`), so a job
+/// of this family is processing from the moment it is started and has exactly one
+/// clock-owed transition, `IN_PROGRESS` -> `COMPLETED`.
+#[derive(Debug, Clone)]
+pub struct MedicalScribeJobRecord {
+    /// `MedicalScribeJobName`, also this record's key in the store.
+    pub name: String,
+    /// Creation order, newest = largest. Also the cursor a listing of this family
+    /// would page with.
+    pub sequence: u64,
+    /// `MedicalScribeJobStatus`: [`STATUS_IN_PROGRESS`] until the clock owes it
+    /// [`STATUS_COMPLETED`]. The enum's other two values are modelled but unreached —
+    /// nothing queues such a job and nothing this emulator does can fail one.
+    pub status: String,
+    pub media: Media,
+    /// `OutputBucketName`, a REQUIRED member of the start request: the bucket both
+    /// reported output URIs name.
+    pub output_bucket_name: String,
+    /// `OutputEncryptionKMSKeyId`: the key the output would be encrypted with.
+    /// Recorded as asked for; nothing encrypts anything, because nothing is written.
+    pub output_encryption_kms_key_id: Option<String>,
+    /// `KMSEncryptionContext`, recorded for the same reason as
+    /// [`Self::output_encryption_kms_key_id`].
+    pub kms_encryption_context: Option<std::collections::HashMap<String, String>>,
+    pub data_access_role_arn: String,
+    pub settings: MedicalScribeSettings,
+    pub channel_definitions: Option<Vec<MedicalScribeChannelDefinition>>,
+    /// Whether the start request carried a `MedicalScribeContext`, which is the ONLY
+    /// thing the model reports about it (`MedicalScribeJob$MedicalScribeContextProvided`
+    /// "Indicates whether the MedicalScribeContext object was provided"). The context
+    /// itself is not kept: no operation of this service reports it, and its one member
+    /// (`MedicalScribePatientContext$Pronouns`) is modelled `@sensitive`.
+    pub context_provided: bool,
+    /// Where the transcript and the clinical note would be written; `None` until the
+    /// job completes. See [`medical_scribe_output_uri`].
+    pub output: Option<MedicalScribeOutput>,
+    /// `FailureReason`, set only on a `FAILED` job — which none of this emulator's are.
+    pub failure_reason: Option<String>,
+    pub creation_time: SystemTime,
+    pub start_time: Option<SystemTime>,
+    pub completion_time: Option<SystemTime>,
+    /// When `IN_PROGRESS` -> `COMPLETED` falls due.
+    pub completion_due: SystemTime,
+    pub tags: Vec<Tag>,
+}
+
+impl MedicalScribeJobRecord {
+    /// Materialise the status transition the CLOCK already owes this job: it was due
+    /// at the stored instant whether or not anybody called. A reporting operation
+    /// (`Get`) runs this before projecting the record, and that is the only write it
+    /// performs.
+    ///
+    /// Completing a job records WHERE its output would be written (see the module
+    /// header); it does not write anything there.
+    pub fn advance_clock(&mut self, now: SystemTime) {
+        if self.status != STATUS_IN_PROGRESS || now < self.completion_due {
+            return;
+        }
+        self.status = STATUS_COMPLETED.to_string();
+        self.completion_time = Some(self.completion_due);
+        self.output = Some(MedicalScribeOutput {
+            transcript_file_uri: medical_scribe_output_uri(
+                &self.output_bucket_name,
+                &self.name,
+                MEDICAL_SCRIBE_TRANSCRIPT_FILE,
+            ),
+            clinical_document_uri: medical_scribe_output_uri(
+                &self.output_bucket_name,
+                &self.name,
+                MEDICAL_SCRIBE_CLINICAL_DOCUMENT_FILE,
+            ),
+        });
+    }
+
+    /// This record as the modelled `MedicalScribeJob` shape, which is the whole answer
+    /// of `StartMedicalScribeJob` and `GetMedicalScribeJob`.
+    ///
+    /// `Tags` is left ABSENT for a job carrying none rather than reported as an empty
+    /// list, for the reason [`CallAnalyticsCategoryRecord::to_properties`] gives:
+    /// `TagList` is modelled `length {min 1, max 200}`, so an empty list is not a
+    /// value of that shape.
+    pub fn to_job(&self) -> MedicalScribeJob {
+        MedicalScribeJob {
+            medical_scribe_job_name: Some(self.name.clone()),
+            medical_scribe_job_status: Some(self.status.clone()),
+            language_code: Some(MEDICAL_SCRIBE_LANGUAGE_CODE.to_string()),
+            media: Some(self.media.clone()),
+            medical_scribe_output: self.output.clone(),
+            start_time: self.start_time.map(to_date_time),
+            creation_time: Some(to_date_time(self.creation_time)),
+            completion_time: self.completion_time.map(to_date_time),
+            failure_reason: self.failure_reason.clone(),
+            settings: Some(self.settings.clone()),
+            data_access_role_arn: Some(self.data_access_role_arn.clone()),
+            channel_definitions: self.channel_definitions.clone(),
+            medical_scribe_context_provided: Some(self.context_provided),
+            tags: (!self.tags.is_empty()).then(|| self.tags.clone()),
         }
     }
 }

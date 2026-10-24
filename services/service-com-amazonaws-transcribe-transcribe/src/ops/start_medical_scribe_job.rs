@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartMedicalScribeJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartMedicalScribeJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Records one Medical Scribe (AWS HealthScribe) job and answers the record it just
+//! stored, which `GetMedicalScribeJob` reads back and `DeleteMedicalScribeJob`
+//! removes. A job is `IN_PROGRESS` from the moment it is started — the operation
+//! models no deferred execution — and the clock owes it `COMPLETED` a
+//! [`crate::state::JOB_TRANSITION_DELAY`] later.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartMedicalScribeJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! NOTHING IS TRANSCRIBED: no conversation is transcribed, no speaker role is
+//! identified and no clinical note is generated, so the `MedicalScribeOutput` URIs a
+//! completed job reports name locations nothing writes to (see
+//! [`crate::state::medical_scribe_output_uri`]). The job RECORD is what this
+//! emulates.
+//!
+//! The member combinations the request documents but the model cannot express —
+//! `Media.MediaFileUri`, exactly one of `Settings.ShowSpeakerLabels` /
+//! `Settings.ChannelIdentification`, `MaxSpeakerLabels` with speaker labels,
+//! `ChannelDefinitions` if and only if channel identification, and
+//! `VocabularyFilterMethod` with a `VocabularyFilterName` — are refused with the
+//! modelled `BadRequestException`.
 //!
 //! ## Shape of an operation
 //!
@@ -222,18 +231,180 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartMedicalScribeJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartMedicalScribeJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartMedicalScribeJob"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StartMedicalScribeJobErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some(
+                        "this service is mounted on an engine that holds no Transcribe state"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // `Media` is required but every member of it is optional, so the boundary
+        // validator cannot refuse a `Media` that names no media file. The operation
+        // documents `Media (MediaFileUri)` as a required request parameter.
+        if input
+            .media
+            .media_file_uri
+            .as_deref()
+            .is_none_or(|uri| uri.trim().is_empty())
+        {
+            return Err(bad_request(
+                "The required parameter Media.MediaFileUri is missing from your request. \
+                 Specify the Amazon S3 location of your media file and try your request again.",
+            ));
+        }
+
+        // "One and only one of ChannelIdentification and ShowSpeakerLabels must be
+        // set. If ShowSpeakerLabels is set, MaxSpeakerLabels must also be set." and
+        // "A MedicalScribeChannelDefinitions array should be set if and only if the
+        // ChannelIdentification value of Settings is set to true."
+        let speaker_labels = input.settings.show_speaker_labels == Some(true);
+        let channel_identification = input.settings.channel_identification == Some(true);
+        if speaker_labels == channel_identification {
+            return Err(bad_request(
+                "Your request must set exactly one of Settings.ShowSpeakerLabels and \
+                 Settings.ChannelIdentification to true. Correct your request and try again.",
+            ));
+        }
+        if speaker_labels && input.settings.max_speaker_labels.is_none() {
+            return Err(bad_request(
+                "Settings.MaxSpeakerLabels is required when Settings.ShowSpeakerLabels is \
+                 true. Correct your request and try again.",
+            ));
+        }
+        if channel_identification != input.channel_definitions.is_some() {
+            return Err(bad_request(
+                "ChannelDefinitions must be set if and only if Settings.ChannelIdentification \
+                 is true. Correct your request and try again.",
+            ));
+        }
+        // One definition per channel, each naming a different participant: "set
+        // ChannelId of the first ChannelDefinition in the list to 0 ... and
+        // ParticipantRole to CLINICIAN ... the ChannelId of the second
+        // ChannelDefinition in the list to 1 ... and ParticipantRole to PATIENT"
+        // (model doc for `StartMedicalScribeJobRequest$ChannelDefinitions`). The
+        // boundary validator has already refused a list that is not exactly two long
+        // and a `ChannelId` outside `@range(min: 0, max: 1)`, so what is left to
+        // refuse is two definitions that name the same channel or the same role.
+        if let Some(definitions) = input.channel_definitions.as_deref() {
+            let distinct_channels = definitions
+                .iter()
+                .map(|definition| definition.channel_id)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len();
+            let distinct_roles = definitions
+                .iter()
+                .map(|definition| definition.participant_role.as_str())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len();
+            if distinct_channels != definitions.len() || distinct_roles != definitions.len() {
+                return Err(bad_request(
+                    "Each ChannelDefinition must name a different ChannelId and a different \
+                     ParticipantRole. Correct your request and try again.",
+                ));
+            }
+        }
+
+        // "VocabularyFilterMethod must be specified if VocabularyFilterName is set."
+        if input.settings.vocabulary_filter_name.is_some()
+            && input.settings.vocabulary_filter_method.is_none()
+        {
+            return Err(bad_request(
+                "Settings.VocabularyFilterMethod is required when \
+                 Settings.VocabularyFilterName is set. Correct your request and try again.",
+            ));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // "This name is case sensitive, cannot contain spaces, and must be unique
+        // within an Amazon Web Services account. If you try to create a new job with
+        // the same name as an existing job, you get a ConflictException error."
+        if store.medical_scribe_jobs.contains_key(&input.medical_scribe_job_name) {
+            return Err(StartMedicalScribeJobErrorModeled::ConflictException(
+                ConflictException {
+                    // The kind, not the caller's name — see
+                    // [`crate::state::name_already_exists_message`].
+                    message: Some(crate::state::name_already_exists_message(
+                        crate::state::KIND_JOB,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The account's job quota: a start beyond
+        // `crate::state::MAX_MEDICAL_SCRIBE_JOBS` is refused with the error this
+        // operation models for an exceeded quota rather than growing the store
+        // without bound.
+        if store.medical_scribe_jobs.len() >= crate::state::MAX_MEDICAL_SCRIBE_JOBS {
+            return Err(StartMedicalScribeJobErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "You have reached the limit of {} Medical Scribe jobs for this account. \
+                         Delete a job you no longer need and try your request again.",
+                        crate::state::MAX_MEDICAL_SCRIBE_JOBS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let sequence = store.next_sequence();
+        let record = crate::state::MedicalScribeJobRecord {
+            name: input.medical_scribe_job_name.clone(),
+            sequence,
+            // No member of this operation asks for deferred execution, so the job is
+            // processing from the moment it is started.
+            status: crate::state::STATUS_IN_PROGRESS.to_string(),
+            media: input.media,
+            output_bucket_name: input.output_bucket_name,
+            output_encryption_kms_key_id: input.output_encryption_kms_key_id,
+            kms_encryption_context: input.kms_encryption_context,
+            data_access_role_arn: input.data_access_role_arn,
+            settings: input.settings,
+            channel_definitions: input.channel_definitions,
+            // Only WHETHER a context was given is reported; see the record's own
+            // documentation for why the context itself is not kept.
+            context_provided: input.medical_scribe_context.is_some(),
+            // Filled in when the job completes and the output locations exist.
+            output: None,
+            failure_reason: None,
+            creation_time: now,
+            start_time: Some(now),
+            completion_time: None,
+            completion_due: now + crate::state::JOB_TRANSITION_DELAY,
+            tags: input.tags.unwrap_or_default(),
+        };
+
+        // The response is the record just stored, never the request echoed back.
+        let job = record.to_job();
+        ::tracing::info!(
+            operation = "StartMedicalScribeJob",
+            job = %record.name,
+            status = %record.status,
+            "medical scribe job started"
+        );
+        store.medical_scribe_jobs.insert(record.name.clone(), record);
+
+        Ok(StartMedicalScribeJobOutput {
+            medical_scribe_job: Some(job),
+        })
     }
+}
+
+/// A `BadRequestException` (HTTP 400) refusing a request the model's own constraint
+/// traits cannot express — the error this operation models for a request that "didn't
+/// pass one or more validation tests".
+fn bad_request(message: &str) -> StartMedicalScribeJobError {
+    StartMedicalScribeJobErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }
