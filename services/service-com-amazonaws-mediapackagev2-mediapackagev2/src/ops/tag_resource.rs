@@ -173,8 +173,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Tagging needs nothing from the request beyond its deserialized input.
-        let _ = ctx;
+        // The Region the request was signed for: a resource ARN names a resource in one
+        // Region, so from this endpoint only that Region's resources are reachable.
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::unmodeled(
                 "InternalServerException",
@@ -201,7 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and it is judged BEFORE anything is written: a tag map grows by one entry per
         // distinct caller-chosen key and shrinks only on an explicit `UntagResource`, so
         // the ceiling is what keeps its size from being set by how many requests arrive.
-        let Some(current) = store.tags_of(&target).cloned() else {
+        let Some(current) = store.tags_of(&region, &target).cloned() else {
             return Err(crate::scaffolded::Scaffolded::unmodeled(
                 crate::state::RESOURCE_NOT_FOUND_CODE,
                 404,
@@ -223,7 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(TagResourceErrorModeled::ValidationException(rejection).into());
         }
 
-        let tagged = store.with_tags_mut(&target, at, |tags| {
+        let tagged = store.with_tags_mut(&region, &target, at, |tags| {
             // Assigning a tag whose key is already there replaces that tag's value and
             // leaves every other tag alone.
             *tags = merged;

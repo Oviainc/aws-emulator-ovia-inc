@@ -68,15 +68,42 @@ impl Emulator {
         body: Option<Value>,
         headers: &[(&str, &str)],
     ) -> (u16, Value) {
+        self.send_in_region(
+            method,
+            path,
+            body,
+            &format!("mediapackagev2.{REGION}.amazonaws.com"),
+            REGION,
+            headers,
+        )
+        .await
+    }
+
+    /// As [`Emulator::call_with_headers`], addressing `host` and signing for `region`.
+    ///
+    /// Every MediaPackage hostname is regional — the control-plane endpoint names its
+    /// Region, and so does every data-plane hostname the service publishes — and a signed
+    /// request names the same Region in its SigV4 credential scope, which is where the
+    /// service reads it from. A suite that exercises more than one Region sends through
+    /// here (see `tests/all/regional_partitioning.rs`).
+    pub(crate) async fn send_in_region(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        host: &str,
+        region: &str,
+        headers: &[(&str, &str)],
+    ) -> (u16, Value) {
         let payload = body.map(|b| b.to_string()).unwrap_or_default();
         let mut builder = http::Request::builder()
             .method(method)
             .uri(path)
-            .header("host", format!("mediapackagev2.{REGION}.amazonaws.com"))
+            .header("host", host)
             .header(
                 "authorization",
                 format!(
-                    "AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/{REGION}/mediapackagev2/\
+                    "AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/{region}/mediapackagev2/\
                      aws4_request, SignedHeaders=host, Signature=0123456789abcdef"
                 ),
             )

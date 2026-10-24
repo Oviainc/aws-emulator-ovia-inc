@@ -346,8 +346,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // Every derived value this update reports (ARN, manifest URLs) is a function of
-        // the stored resource, so nothing is needed from the request's own metadata.
-        let _ = ctx;
+        // the stored resource; what the request's own metadata decides is WHICH resource
+        // that is — the names it carries resolve in the Region it was signed for.
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateOriginEndpointErrorModeled::InternalServerException(
                 InternalServerException {
@@ -389,7 +390,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let Some(group) = store.channel_groups.get_mut(&input.channel_group_name) else {
+        let Some(group) = store.channel_group_mut(&region, &input.channel_group_name) else {
             return Err(UpdateOriginEndpointErrorModeled::ResourceNotFoundException(
                 crate::state::ResourceKind::ChannelGroup.not_found(),
             )

@@ -277,7 +277,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // handler could still call incomplete.
 
         let mut store = state.lock();
-        let Some(group) = store.channel_groups.get_mut(&input.channel_group_name) else {
+        let Some(group) = store.channel_group_mut(&region, &input.channel_group_name) else {
             return Err(CreateHarvestJobErrorModeled::ResourceNotFoundException(
                 crate::state::ResourceKind::ChannelGroup.not_found(),
             )

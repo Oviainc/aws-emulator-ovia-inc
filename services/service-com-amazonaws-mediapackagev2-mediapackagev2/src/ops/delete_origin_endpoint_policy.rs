@@ -152,8 +152,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // A delete needs nothing from the request beyond its deserialized input.
-        let _ = ctx;
+        // The Region the request was signed for: a delete resolves the names it carries
+        // only among the resources that Region holds.
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 DeleteOriginEndpointPolicyErrorModeled::InternalServerException(
@@ -170,8 +171,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // an unresolved parent chain, are both already the state this operation promises,
         // so neither is an error: the model declares no 404 for this operation.
         if let Some(endpoint) = store
-            .channel_groups
-            .get_mut(&input.channel_group_name)
+            .channel_group_mut(&region, &input.channel_group_name)
             .and_then(|group| group.channels.get_mut(&input.channel_name))
             .and_then(|channel| channel.origin_endpoints.get_mut(&input.origin_endpoint_name))
         {

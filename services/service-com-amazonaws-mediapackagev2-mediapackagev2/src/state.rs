@@ -12,6 +12,14 @@
 //! function of its content and of the commit count the store holds it at (see
 //! [`ChannelGroup::version`]), so a write that changed the resource rotates it.
 //!
+//! MediaPackage v2 is a REGIONAL control plane, so the Region a request is served in is
+//! part of the identity of every resource it touches: a channel group is stored under
+//! its Region AND its name ([`ChannelGroupKey`]), the same name in two Regions is two
+//! independent groups with their own channels, endpoints and harvest jobs, and a request
+//! served in one Region resolves, lists, mutates and deletes only what was created in
+//! it. Every accessor on the store therefore takes the request's Region
+//! ([`request_region`]) beside the name.
+//!
 //! The maps are [`BTreeMap`]s: `ListOriginEndpoints` pages in name order, and an
 //! ordered map makes that order a property of the store rather than of each read.
 //!
@@ -67,12 +75,26 @@ const INGEST_ENDPOINTS_PER_CHANNEL: u8 = 2;
 /// `channel_groups` grows by one record per `CreateChannelGroup` request and shrinks only
 /// on an explicit delete, so without a ceiling its entry COUNT is set by how many
 /// requests a caller makes. AWS bounds the same thing with a per-account, per-Region
-/// service quota and refuses a create past it; that quota's value is adjustable and is
+/// service quota and refuses a create past it, so this ceiling is applied per Region too
+/// ([`ComAmazonawsMediapackagev2Mediapackagev2State::channel_group_count`]); that quota's value is adjustable and is
 /// not in the model, so this number is the EMULATOR's own bound rather than a claim about
 /// AWS's, while the refusal it produces is the error the model declares for exactly this
 /// case: `ServiceQuotaExceededException` (HTTP 402, "The request would cause a service
 /// quota to be exceeded.").
 pub const MAX_CHANNEL_GROUPS: usize = 100;
+
+/// The most channel groups this emulator holds at once across EVERY Region together.
+///
+/// [`MAX_CHANNEL_GROUPS`] bounds one Region's share, and the Region a create is served in
+/// is read from that request's own credential scope — so a per-Region ceiling alone would
+/// leave the store growing by one record per request again, for a caller that names a
+/// fresh Region each time. This is the bound on the whole map, so what the emulator holds
+/// is set by this number rather than by how many requests arrive, and it is the same kind
+/// of store-wide ceiling [`MAX_INGESTED_BYTES`] is for ingested content. It is a small
+/// multiple of the per-Region bound, so a handful of Regions each still reach their own
+/// ceiling, and a create past it is refused with the SAME error the per-Region ceiling
+/// produces (`ServiceQuotaExceededException`): both are the service's quota refusal.
+pub const MAX_CHANNEL_GROUPS_TOTAL: usize = 500;
 
 /// The most channels one channel group holds at once — the same bound, one level down:
 /// `channels` grows per `CreateChannel` and shrinks only on an explicit delete.
@@ -435,33 +457,117 @@ pub fn merged_tags(
     merged
 }
 
+/// The key a channel group is stored under: the AWS Region the group was created in,
+/// then the group's own name.
+///
+/// The name is the group's primary identifier, and the model says it "must be unique for
+/// your account in the AWS Region" — so the Region is part of the identity, not a
+/// decoration on the record: two Regions holding the same name hold two independent
+/// groups, each with its own channels, origin endpoints and harvest jobs. A
+/// [`BTreeMap`] keyed this way orders by Region first, so one Region's groups are a
+/// contiguous range and a listing pages them in name order (see [`region_slice`]).
+pub type ChannelGroupKey = (String, String);
+
+/// The key the group `name` is stored under when the request that created it was served
+/// in `region`.
+pub fn channel_group_key(region: &str, name: &str) -> ChannelGroupKey {
+    (region.to_string(), name.to_string())
+}
+
+/// The records of ONE Region, as `(name, record)` pairs in name order.
+///
+/// The scan starts at the Region's smallest possible key and stops at the first key
+/// naming another Region, so nothing another Region holds is ever reported.
+fn region_slice<'map, V>(
+    map: &'map BTreeMap<ChannelGroupKey, V>,
+    region: &str,
+) -> impl Iterator<Item = (&'map String, &'map V)> {
+    let region = region.to_string();
+    map.range((region.clone(), String::new())..)
+        .take_while(move |((stored, _), _)| *stored == region)
+        .map(|((_, name), record)| (name, record))
+}
+
 /// Per-service state for com-amazonaws-mediapackagev2-mediapackagev2. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsMediapackagev2Mediapackagev2State {
-    /// Every channel group, keyed by its name — the group's primary identifier.
-    pub channel_groups: BTreeMap<String, ChannelGroup>,
+    /// Every channel group, keyed by [`ChannelGroupKey`] — its Region and its name.
+    ///
+    /// PRIVATE, and reached only through the accessors below, so no operation can resolve
+    /// a name without naming the Region its request was served in.
+    channel_groups: BTreeMap<ChannelGroupKey, ChannelGroup>,
 }
 
 impl ComAmazonawsMediapackagev2Mediapackagev2State {
+    /// The channel group `name` names IN `region`, or `None` for a name only another
+    /// Region holds: that group does not exist here.
+    pub fn channel_group(&self, region: &str, name: &str) -> Option<&ChannelGroup> {
+        self.channel_groups.get(&channel_group_key(region, name))
+    }
+
+    /// The channel group `name` names in `region`, for an operation that writes to the
+    /// group or to a resource beneath it.
+    pub fn channel_group_mut(&mut self, region: &str, name: &str) -> Option<&mut ChannelGroup> {
+        self.channel_groups
+            .get_mut(&channel_group_key(region, name))
+    }
+
+    /// Whether `region` already holds a channel group under `name`.
+    pub fn has_channel_group(&self, region: &str, name: &str) -> bool {
+        self.channel_groups
+            .contains_key(&channel_group_key(region, name))
+    }
+
+    /// Store `group` under its own Region and name.
+    pub fn insert_channel_group(&mut self, group: ChannelGroup) {
+        let key = channel_group_key(&group.region, &group.name);
+        self.channel_groups.insert(key, group);
+    }
+
+    /// Remove the channel group `name` names in `region`, reporting what was stored.
+    pub fn remove_channel_group(&mut self, region: &str, name: &str) -> Option<ChannelGroup> {
+        self.channel_groups.remove(&channel_group_key(region, name))
+    }
+
+    /// Every channel group stored in `region`, as `(name, record)` pairs in name order —
+    /// what `ListChannelGroups` pages over.
+    pub fn channel_groups_in(
+        &self,
+        region: &str,
+    ) -> impl Iterator<Item = (&String, &ChannelGroup)> {
+        region_slice(&self.channel_groups, region)
+    }
+
+    /// How many channel groups `region` holds — the count the per-Region ceiling is
+    /// judged against, since a group of another Region takes nothing from this one.
+    pub fn channel_group_count(&self, region: &str) -> usize {
+        self.channel_groups_in(region).count()
+    }
+
+    /// How many channel groups this emulator holds across every Region — the count the
+    /// store-wide ceiling ([`MAX_CHANNEL_GROUPS_TOTAL`]) is judged against.
+    pub fn channel_group_total(&self) -> usize {
+        self.channel_groups.len()
+    }
+
     /// The tags of the resource `target` names, or `None` when this emulator holds no
-    /// such resource.
+    /// such resource in `region`.
     ///
     /// Tags live on the resource itself, so this walks the one containment hierarchy the
     /// store keeps rather than keeping a second index beside it.
-    pub fn tags_of(&self, target: &TaggedResource) -> Option<&HashMap<String, String>> {
-        match target {
-            TaggedResource::ChannelGroup { group } => Some(&self.channel_groups.get(group)?.tags),
-            TaggedResource::Channel { group, channel } => {
-                Some(&self.channel_groups.get(group)?.channels.get(channel)?.tags)
-            }
+    pub fn tags_of(
+        &self,
+        region: &str,
+        target: &TagTarget,
+    ) -> Option<&HashMap<String, String>> {
+        let group = self.resolved_group(region, target)?;
+        match &target.resource {
+            TaggedResource::ChannelGroup { .. } => Some(&group.tags),
+            TaggedResource::Channel { channel, .. } => Some(&group.channels.get(channel)?.tags),
             TaggedResource::OriginEndpoint {
-                group,
-                channel,
-                endpoint,
+                channel, endpoint, ..
             } => Some(
-                &self
-                    .channel_groups
-                    .get(group)?
+                &group
                     .channels
                     .get(channel)?
                     .origin_endpoints
@@ -471,31 +577,42 @@ impl ComAmazonawsMediapackagev2Mediapackagev2State {
         }
     }
 
+    /// The channel group a tagging ARN reaches from a request served in `region`.
+    ///
+    /// `None` when the ARN names another Region: the resource it names lives in that
+    /// Region's namespace, so from this endpoint there is nothing of that name to tag,
+    /// report or untag.
+    fn resolved_group(&self, region: &str, target: &TagTarget) -> Option<&ChannelGroup> {
+        (target.region == region).then_some(())?;
+        self.channel_group(region, target.resource.group())
+    }
+
     /// Apply `mutate` to the tags of the resource `target` names and COMMIT the change
     /// (new `ModifiedAt`, new entity tag), reporting whether the resource was there.
     ///
-    /// `false` means nothing was written: the resource the ARN names does not exist.
+    /// `false` means nothing was written: the resource the ARN names does not exist in
+    /// `region` (see [`Self::resolved_group`]).
     pub fn with_tags_mut(
         &mut self,
-        target: &TaggedResource,
+        region: &str,
+        target: &TagTarget,
         at: ::aws_smithy_types::DateTime,
         mutate: impl FnOnce(&mut HashMap<String, String>),
     ) -> bool {
-        match target {
-            TaggedResource::ChannelGroup { group } => {
-                let Some(group) = self.channel_groups.get_mut(group) else {
-                    return false;
-                };
+        if target.region != region {
+            return false;
+        }
+        let Some(group) = self.channel_group_mut(region, target.resource.group()) else {
+            return false;
+        };
+        match &target.resource {
+            TaggedResource::ChannelGroup { .. } => {
                 mutate(&mut group.tags);
                 group.commit(at);
                 true
             }
-            TaggedResource::Channel { group, channel } => {
-                let Some(channel) = self
-                    .channel_groups
-                    .get_mut(group)
-                    .and_then(|group| group.channels.get_mut(channel))
-                else {
+            TaggedResource::Channel { channel, .. } => {
+                let Some(channel) = group.channels.get_mut(channel) else {
                     return false;
                 };
                 mutate(&mut channel.tags);
@@ -503,14 +620,11 @@ impl ComAmazonawsMediapackagev2Mediapackagev2State {
                 true
             }
             TaggedResource::OriginEndpoint {
-                group,
-                channel,
-                endpoint,
+                channel, endpoint, ..
             } => {
-                let Some(endpoint) = self
-                    .channel_groups
-                    .get_mut(group)
-                    .and_then(|group| group.channels.get_mut(channel))
+                let Some(endpoint) = group
+                    .channels
+                    .get_mut(channel)
                     .and_then(|channel| channel.origin_endpoints.get_mut(endpoint))
                 else {
                     return false;
@@ -522,22 +636,24 @@ impl ComAmazonawsMediapackagev2Mediapackagev2State {
         }
     }
 
-    /// The origin endpoint an egress request addresses, or `None` when any level of the
-    /// path does not resolve.
-    pub fn endpoint_at(&self, target: &EgressTarget) -> Option<&OriginEndpoint> {
-        self.channel_groups
-            .get(&target.group)?
+    /// The origin endpoint an egress request to `region`'s data plane addresses, or
+    /// `None` when any level of the path does not resolve there.
+    pub fn endpoint_at(&self, region: &str, target: &EgressTarget) -> Option<&OriginEndpoint> {
+        self.channel_group(region, &target.group)?
             .channels
             .get(&target.channel)?
             .origin_endpoints
             .get(&target.endpoint)
     }
 
-    /// The channel an ingest request addresses, or `None` when the group or the channel
-    /// does not resolve.
-    pub fn channel_at_mut(&mut self, target: &IngestTarget) -> Option<&mut Channel> {
-        self.channel_groups
-            .get_mut(&target.group)?
+    /// The channel an ingest request to `region`'s data plane addresses, or `None` when
+    /// the group or the channel does not resolve there.
+    pub fn channel_at_mut(
+        &mut self,
+        region: &str,
+        target: &IngestTarget,
+    ) -> Option<&mut Channel> {
+        self.channel_group_mut(region, &target.group)?
             .channels
             .get_mut(&target.channel)
     }
@@ -572,11 +688,12 @@ impl ComAmazonawsMediapackagev2Mediapackagev2State {
     /// what keeps a single push from being read into memory unbounded.
     pub fn record_ingested_object(
         &mut self,
+        region: &str,
         target: &IngestTarget,
         body: Vec<u8>,
     ) -> IngestOutcome {
         let retained = self.retained_ingested_bytes();
-        let Some(channel) = self.channel_at_mut(target) else {
+        let Some(channel) = self.channel_at_mut(region, target) else {
             return IngestOutcome::NoSuchChannel;
         };
         let replaced = channel
@@ -601,6 +718,10 @@ impl ComAmazonawsMediapackagev2Mediapackagev2State {
 #[derive(Debug, Clone)]
 pub struct ChannelGroup {
     pub name: String,
+    /// The Region this group was created in — the one its ARN and its egress domain
+    /// carry, and the only one it resolves, lists and mutates in. See
+    /// [`ChannelGroupKey`].
+    pub region: String,
     pub arn: String,
     pub egress_domain: String,
     pub description: Option<String>,
@@ -1156,6 +1277,30 @@ pub enum TaggedResource {
     },
 }
 
+impl TaggedResource {
+    /// The channel group at the root of this resource's path — the record every
+    /// taggable level of the hierarchy is reached through.
+    pub fn group(&self) -> &str {
+        match self {
+            Self::ChannelGroup { group }
+            | Self::Channel { group, .. }
+            | Self::OriginEndpoint { group, .. } => group,
+        }
+    }
+}
+
+/// What a tagging `ResourceArn` names: the Region the ARN is scoped to, and the resource
+/// its path names inside that Region.
+///
+/// The Region is read rather than skipped because it is part of the resource's identity
+/// (see [`ChannelGroupKey`]): the same path in two Regions names two different
+/// resources, so a request can only reach the one its own Region holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TagTarget {
+    pub region: String,
+    pub resource: TaggedResource,
+}
+
 /// The resource a tagging `ResourceArn` names, or `None` when the string is not a
 /// syntactically valid ARN for a resource of THIS service.
 ///
@@ -1164,9 +1309,9 @@ pub enum TaggedResource {
 /// is `channelGroup/<g>[/channel/<c>[/originEndpoint/<e>]]`. Anything else cannot name a
 /// MediaPackage resource, which is a different failure from naming one that is absent:
 /// the caller has to fix the ARN rather than create the resource.
-pub fn parse_tag_arn(arn: &str) -> Option<TaggedResource> {
+pub fn parse_tag_arn(arn: &str) -> Option<TagTarget> {
     let mut fields = arn.splitn(6, ':');
-    let (Some("arn"), Some(partition), Some(service), Some(_region), Some(_account), Some(resource)) = (
+    let (Some("arn"), Some(partition), Some(service), Some(region), Some(_account), Some(resource)) = (
         fields.next(),
         fields.next(),
         fields.next(),
@@ -1183,23 +1328,27 @@ pub fn parse_tag_arn(arn: &str) -> Option<TaggedResource> {
     if segments.iter().any(|segment| segment.is_empty()) {
         return None;
     }
-    match segments.as_slice() {
-        ["channelGroup", group] => Some(TaggedResource::ChannelGroup {
+    let resource = match segments.as_slice() {
+        ["channelGroup", group] => TaggedResource::ChannelGroup {
             group: (*group).to_string(),
-        }),
-        ["channelGroup", group, "channel", channel] => Some(TaggedResource::Channel {
+        },
+        ["channelGroup", group, "channel", channel] => TaggedResource::Channel {
             group: (*group).to_string(),
             channel: (*channel).to_string(),
-        }),
+        },
         ["channelGroup", group, "channel", channel, "originEndpoint", endpoint] => {
-            Some(TaggedResource::OriginEndpoint {
+            TaggedResource::OriginEndpoint {
                 group: (*group).to_string(),
                 channel: (*channel).to_string(),
                 endpoint: (*endpoint).to_string(),
-            })
+            }
         }
-        _ => None,
-    }
+        _ => return None,
+    };
+    Some(TagTarget {
+        region: region.to_string(),
+        resource,
+    })
 }
 
 /// Whether `policy` lets an UNAUTHENTICATED caller perform `action`.
@@ -1400,8 +1549,7 @@ pub enum DataPlane {
 /// The half of the data plane `host` addresses, or `None` for any other hostname
 /// (the control-plane endpoint included).
 pub fn data_plane_of_host(host: &str) -> Option<DataPlane> {
-    let host = host.rsplit('@').next().unwrap_or(host);
-    let host = host.split(':').next().unwrap_or(host);
+    let host = host_name(host);
     if !host.contains(&format!(".{SIGNING_NAME}.")) {
         return None;
     }
@@ -1412,6 +1560,26 @@ pub fn data_plane_of_host(host: &str) -> Option<DataPlane> {
         return Some(DataPlane::Egress);
     }
     None
+}
+
+/// The Region a published data-plane hostname is served in, or `None` when the host
+/// carries no region label.
+///
+/// MediaPackage's data plane is regional exactly as its control plane is: the hostnames
+/// [`egress_domain`] and [`ingest_domain`] publish end in `<service>.<region>.amazonaws.com`,
+/// so the published URL itself names the Region whose resources it serves — which is how
+/// a push or a fetch resolves the group it addresses without a credential scope to read.
+pub fn data_plane_region(host: &str) -> Option<String> {
+    let host = host_name(host);
+    let (_, after_service) = host.split_once(&format!(".{SIGNING_NAME}."))?;
+    let region = after_service.split('.').next()?;
+    (!region.is_empty()).then(|| region.to_string())
+}
+
+/// The bare hostname of a `Host` header or URI authority: no userinfo, no port.
+fn host_name(host: &str) -> &str {
+    let host = host.rsplit('@').next().unwrap_or(host);
+    host.split(':').next().unwrap_or(host)
 }
 
 /// What an egress request path names: the endpoint whose policy gates it, plus the

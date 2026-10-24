@@ -99,6 +99,12 @@
 //!   store-wide retained bytes (`state::MAX_INGESTED_BYTES`), since the channel count is
 //!   itself caller-driven.
 //!
+//! Both halves resolve the group, channel and endpoint their path names in the REGION the
+//! published hostname belongs to ([`crate::state::data_plane_region`]): the data plane is
+//! regional exactly as the control plane is, and a data-plane request carries no
+//! credential scope to read a Region from, so the URL this service handed the client is
+//! what says which Region's resources it reaches.
+//!
 //! ## Why this file validates input
 //!
 //! MediaPackage's `ValidationException` is modelled with TWO members — `Message` and
@@ -569,8 +575,15 @@ fn serve_egress<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> Rt
             "the MediaPackageV2 store is unavailable",
         );
     };
+    let Some(region) = data_plane_region_of_request(req) else {
+        return error_response(
+            404,
+            "NotFound",
+            "The requested host is not an egress host this service publishes",
+        );
+    };
     let store = state.lock();
-    let granted = store.endpoint_at(&target).is_some_and(|endpoint| {
+    let granted = store.endpoint_at(&region, &target).is_some_and(|endpoint| {
         endpoint.policy.as_ref().is_some_and(|attached| {
             crate::state::policy_allows_anonymous(
                 &attached.policy,
@@ -637,10 +650,17 @@ fn serve_ingest<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> Rt
             "The ingested object is larger than this emulator retains",
         );
     }
+    let Some(region) = data_plane_region_of_request(req) else {
+        return error_response(
+            404,
+            "NotFound",
+            "The requested host is not an ingest host this service publishes",
+        );
+    };
     let mut store = state.lock();
     // Both store bounds are judged under this one hold of the lock, so two concurrent
     // pushes cannot both see room that only one of them has.
-    match store.record_ingested_object(&target, body.to_vec()) {
+    match store.record_ingested_object(&region, &target, body.to_vec()) {
         crate::state::IngestOutcome::Recorded => {}
         crate::state::IngestOutcome::NoSuchChannel => {
             return error_response(
@@ -679,8 +699,25 @@ fn serve_ingest<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> Rt
 /// The `Host` header is what a buffered HTTP/1 request carries; an HTTP/2 request carries
 /// the same authority on its URI instead.
 fn data_plane_of_request(req: &RtRequest) -> Option<crate::state::DataPlane> {
-    let host = req.headers().get("host").or_else(|| authority_of(req.uri()))?;
-    crate::state::data_plane_of_host(host)
+    crate::state::data_plane_of_host(data_plane_host(req)?)
+}
+
+/// The Region a data-plane request's `Host` names — the Region whose resources that
+/// published hostname serves.
+///
+/// A data-plane request carries no credential scope to read a Region from (an anonymous
+/// player presents none at all), but the hostname this service handed out does name it:
+/// `EgressDomain` and every `IngestEndpoints[].Url` are built for the Region their group
+/// was created in, so the URL a client was given is what decides which Region's groups it
+/// reaches.
+fn data_plane_region_of_request(req: &RtRequest) -> Option<String> {
+    crate::state::data_plane_region(data_plane_host(req)?)
+}
+
+/// The `Host` header of a runtime request, or the authority of its URI when it carries
+/// none (an HTTP/2 request carries `:authority` on the URI instead).
+fn data_plane_host(req: &RtRequest) -> Option<&str> {
+    req.headers().get("host").or_else(|| authority_of(req.uri()))
 }
 
 /// The action an anonymous player needs on an origin endpoint to fetch its content with

@@ -159,8 +159,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Untagging needs nothing from the request beyond its deserialized input.
-        let _ = ctx;
+        // The Region the request was signed for: a resource ARN names a resource in one
+        // Region, so from this endpoint only that Region's resources are reachable.
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::scaffolded::Scaffolded::unmodeled(
                 "InternalServerException",
@@ -189,7 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             return Err(UntagResourceErrorModeled::ValidationException(rejection).into());
         }
-        let untagged = store.with_tags_mut(&target, at, |tags| {
+        let untagged = store.with_tags_mut(&region, &target, at, |tags| {
             // A key the resource does not carry is not an error: the state this call
             // promises is "these keys are absent".
             for key in &input.tag_keys {

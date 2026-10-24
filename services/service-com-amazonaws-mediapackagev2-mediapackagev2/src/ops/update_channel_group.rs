@@ -175,10 +175,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The conditional entity tag is bound to a header by the model, so it arrives on
-        // the deserialized input: nothing else is needed from the request.
+        // the deserialized input; the Region the request was signed for decides which
+        // group the name it carries resolves to.
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpdateChannelGroupErrorModeled::InternalServerException(
                 InternalServerException {
@@ -188,9 +189,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         // ONE hold of the lock covers the precondition check and the write.
+        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
 
-        let Some(group) = store.channel_groups.get_mut(&input.channel_group_name) else {
+        let Some(group) = store.channel_group_mut(&region, &input.channel_group_name) else {
             return Err(UpdateChannelGroupErrorModeled::ResourceNotFoundException(
                 crate::state::ResourceKind::ChannelGroup.not_found(),
             )

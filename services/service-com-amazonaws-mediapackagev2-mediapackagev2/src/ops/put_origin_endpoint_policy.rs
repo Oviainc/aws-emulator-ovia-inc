@@ -171,8 +171,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // A write needs nothing from the request beyond its deserialized input.
-        let _ = ctx;
+        // A write needs nothing else from the request beyond its deserialized input.
+        // The Region it was signed for decides which endpoint this policy attaches to: a
+        // name is resolved only among the resources that Region holds.
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(PutOriginEndpointPolicyErrorModeled::InternalServerException(
                 InternalServerException {
@@ -200,7 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Each level of the address is resolved on its own, because the service words a
         // not-found by the resource type that is missing. Every sentence comes from the
         // shared builders in `crate::state`, so the wording is decided in ONE place.
-        let Some(group) = store.channel_groups.get_mut(&input.channel_group_name) else {
+        let Some(group) = store.channel_group_mut(&region, &input.channel_group_name) else {
             return Err(
                 PutOriginEndpointPolicyErrorModeled::ResourceNotFoundException(
                     crate::state::ResourceKind::ChannelGroup.not_found(),

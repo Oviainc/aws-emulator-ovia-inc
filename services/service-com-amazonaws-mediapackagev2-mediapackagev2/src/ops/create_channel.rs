@@ -369,7 +369,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A channel only exists inside a channel group, so the parent has to be there.
         // An absent parent is reported exactly as `GetChannelGroup` reports it: the
         // fixed channel-group not-found, with no name in it.
-        let Some(group) = store.channel_groups.get_mut(&input.channel_group_name) else {
+        let Some(group) = store.channel_group_mut(&region, &input.channel_group_name) else {
             return Err(CreateChannelErrorModeled::ResourceNotFoundException(
                 crate::state::ResourceKind::ChannelGroup.not_found(),
             )

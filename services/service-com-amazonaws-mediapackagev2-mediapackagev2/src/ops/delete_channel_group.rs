@@ -149,8 +149,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // A delete needs nothing from the request beyond its deserialized input.
-        let _ = ctx;
+        // A delete resolves the name in the Region the request was signed for: a group
+        // of that name in another Region is another resource.
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteChannelGroupErrorModeled::InternalServerException(
                 InternalServerException {
@@ -161,7 +162,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut store = state.lock();
 
-        let Some(group) = store.channel_groups.get(&input.channel_group_name) else {
+        let Some(group) = store.channel_group(&region, &input.channel_group_name) else {
             // `@idempotent`: an absent group is already the state this call promises.
             return Ok(DeleteChannelGroupOutput {});
         };
@@ -177,7 +178,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        store.channel_groups.remove(&input.channel_group_name);
+        store.remove_channel_group(&region, &input.channel_group_name);
 
         Ok(DeleteChannelGroupOutput {})
     }

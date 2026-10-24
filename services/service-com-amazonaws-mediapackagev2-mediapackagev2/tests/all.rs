@@ -68,3 +68,5 @@ mod attached_multiview_channels;
 mod delete_channel_multiview_source;
 #[path = "all/multiview_configuration_validation.rs"]
 mod multiview_configuration_validation;
+#[path = "all/regional_partitioning.rs"]
+mod regional_partitioning;

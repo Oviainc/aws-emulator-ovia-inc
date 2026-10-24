@@ -150,8 +150,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // A delete needs nothing from the request beyond its deserialized input.
-        let _ = ctx;
+        // The Region the request was signed for: a delete resolves the names it carries
+        // only among the resources that Region holds.
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteChannelPolicyErrorModeled::InternalServerException(
                 InternalServerException {
@@ -162,7 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut store = state.lock();
 
-        let Some(group) = store.channel_groups.get_mut(&input.channel_group_name) else {
+        let Some(group) = store.channel_group_mut(&region, &input.channel_group_name) else {
             // `@idempotent`, and the model declares no not-found error here: with no
             // such group there is no such policy, which is the state this call
             // promises.
