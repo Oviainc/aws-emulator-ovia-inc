@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AcceptAgreementCancellationRequest
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AcceptAgreementCancellationRequest`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AcceptAgreementCancellationRequest::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Approves a stored cancellation request that is in `PENDING_APPROVAL` status —
+//! moving it to `APPROVED` and processing the cancellation of the agreement it
+//! belongs to — and refuses one in any other status with a `ConflictException`.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -154,6 +149,27 @@ impl<Eng> AcceptAgreementCancellationRequest<Eng> {
     }
 }
 
+/// The `AcceptAgreementCancellationRequest` answer for a stored cancellation
+/// request, read from the record this call has just approved.
+///
+/// Every member comes from the record — `createdAt` is "when the cancellation
+/// request was originally created" and `reasonCode`/`description` are "the
+/// original" ones "provided when the cancellation request was created" — so
+/// nothing here is echoed from this call's own input.
+fn to_output(
+    stored: &crate::state::AgreementCancellationRequest,
+) -> AcceptAgreementCancellationRequestOutput {
+    AcceptAgreementCancellationRequestOutput {
+        agreement_id: Some(stored.agreement_id.clone()),
+        agreement_cancellation_request_id: Some(stored.id.clone()),
+        status: Some(stored.status.clone()),
+        reason_code: Some(stored.reason_code.clone()),
+        description: stored.description.clone(),
+        created_at: Some(::aws_smithy_types::DateTime::from(stored.created_at)),
+        updated_at: Some(::aws_smithy_types::DateTime::from(stored.updated_at)),
+    }
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for AcceptAgreementCancellationRequest<Eng>
 {
@@ -171,18 +187,113 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AcceptAgreementCancellationRequest` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AcceptAgreementCancellationRequestErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AcceptAgreementCancellationRequest"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                AcceptAgreementCancellationRequestErrorModeled::InternalServerException(
+                    crate::state::store_unavailable(),
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // A cancellation request is a child of the agreement it was sent over,
+        // and this call names both. Resolution goes PARENT-FIRST, so
+        // `ResourceNotFoundException`'s `resourceType` and `resourceId` — the
+        // machine-readable half of the refusal — name the OUTERMOST resource
+        // that failed to resolve: an `agreementId` that names no agreement is
+        // reported as the missing `Agreement`, not as a missing child under an
+        // agreement that does not exist. This is the same order
+        // `GetBillingAdjustmentRequest` resolves its own parent/child pair in.
+        if !store.agreements.contains_key(&input.agreement_id) {
+            // The lookup found nothing: the modelled not-found body, at the
+            // status this service answers it with (`state::NOT_FOUND_STATUS`).
+            return Err(crate::state::not_found(
+                AcceptAgreementCancellationRequestErrorModeled::ResourceNotFoundException(
+                    crate::state::agreement_not_found(&input.agreement_id),
+                ),
+            ));
+        }
+
+        // The agreement resolved, so the child is what this call acts on. Both
+        // ids are required and both select: a cancellation request of another
+        // agreement is not the one this call names.
+        let found = store
+            .agreement_cancellation_requests
+            .get_mut(&input.agreement_cancellation_request_id)
+            .filter(|request| request.agreement_id == input.agreement_id);
+        let Some(request) = found else {
+            return Err(crate::state::not_found(
+                AcceptAgreementCancellationRequestErrorModeled::ResourceNotFoundException(
+                    crate::state::agreement_cancellation_request_not_found(
+                        &input.agreement_cancellation_request_id,
+                    ),
+                ),
+            ));
+        };
+
+        // "Only cancellation requests in PENDING_APPROVAL status can be
+        // accepted. A ConflictException is thrown if the cancellation request is
+        // in any other status." Every other value of
+        // `AgreementCancellationRequestStatus` is one the request has already
+        // been moved to, so accepting it now would move it a second time — which
+        // also makes a replayed accept of the same request a conflict rather
+        // than a second approval.
+        if request.status != crate::state::CANCELLATION_STATUS_PENDING_APPROVAL {
+            let status = request.status.clone();
+            return Err(
+                AcceptAgreementCancellationRequestErrorModeled::ConflictException(
+                    crate::state::conflict(
+                        crate::state::RESOURCE_TYPE_AGREEMENT_CANCELLATION_REQUEST,
+                        &input.agreement_cancellation_request_id,
+                        format!(
+                            "agreement cancellation request {} is {status}, and only a {} \
+                             cancellation request can be accepted",
+                            input.agreement_cancellation_request_id,
+                            crate::state::CANCELLATION_STATUS_PENDING_APPROVAL
+                        ),
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        // "Once accepted, the cancellation request transitions to APPROVED
+        // status"; `updatedAt` is "when the cancellation request was accepted",
+        // so it becomes this call's instant while `createdAt` keeps the one the
+        // record was created with.
+        request.status = crate::state::CANCELLATION_STATUS_APPROVED.to_string();
+        request.updated_at = now;
+        let output = to_output(request);
+        crate::state::audit(
+            Self::NAME,
+            "approved",
+            &input.agreement_cancellation_request_id,
+            ctx.parts(),
+        );
+
+        // "… and the agreement cancellation will be processed": the approval is
+        // what cancels the agreement, so the agreement reaches `CANCELLED` here
+        // rather than being left active with an approved cancellation standing
+        // over it — through [`crate::state::Agreement::cancel`], the one writer
+        // of that transition, which `CancelAgreement` makes when the acceptor
+        // cancels directly and which every later report of the agreement is
+        // computed from. Nothing is owed to the clock: this call returns no
+        // resource in a non-terminal status, so there is no transient for a
+        // caller to observe, and an agreement that has already reached a
+        // terminal status (cancelled, replaced, expired) keeps it rather than
+        // being moved backwards — so the audit record is emitted only for a
+        // cancellation this call actually made.
+        let cancelled = store
+            .agreements
+            .get_mut(&input.agreement_id)
+            .is_some_and(|agreement| agreement.cancel(now));
+        if cancelled {
+            crate::state::audit(Self::NAME, "cancelled", &input.agreement_id, ctx.parts());
+        }
+
+        Ok(output)
     }
 }

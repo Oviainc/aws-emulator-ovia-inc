@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAgreementCancellationRequest
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAgreementCancellationRequest`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAgreementCancellationRequest::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one stored cancellation request, selected by the agreement it belongs
+//! to and its own id. A report: every member is computed from the stored record
+//! and nothing is written. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -166,20 +160,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAgreementCancellationRequest` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAgreementCancellationRequestErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAgreementCancellationRequest"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetAgreementCancellationRequestErrorModeled::InternalServerException(
+                    crate::state::store_unavailable(),
+                )
+                .into(),
+            );
+        };
+
+        let store = state.lock();
+
+        // A cancellation request is a child of the agreement it was sent over,
+        // and this call names both. Resolution goes PARENT-FIRST, so
+        // `ResourceNotFoundException`'s `resourceType` and `resourceId` name the
+        // OUTERMOST resource that failed to resolve, the way
+        // `GetBillingAdjustmentRequest` resolves its own parent/child pair.
+        if !store.agreements.contains_key(&input.agreement_id) {
+            // The lookup found nothing: the modelled not-found body, at the
+            // status this service answers it with (`state::NOT_FOUND_STATUS`).
+            return Err(crate::state::not_found(
+                GetAgreementCancellationRequestErrorModeled::ResourceNotFoundException(
+                    crate::state::agreement_not_found(&input.agreement_id),
+                ),
+            ));
+        }
+
+        // The agreement resolved, so the child is what this call looks for.
+        // Both ids are required and both select: a cancellation request of
+        // another agreement is not the one this call names.
+        let found = store
+            .agreement_cancellation_requests
+            .get(&input.agreement_cancellation_request_id)
+            .filter(|request| request.agreement_id == input.agreement_id);
+        let Some(stored) = found else {
+            return Err(crate::state::not_found(
+                GetAgreementCancellationRequestErrorModeled::ResourceNotFoundException(
+                    crate::state::agreement_cancellation_request_not_found(
+                        &input.agreement_cancellation_request_id,
+                    ),
+                ),
+            ));
+        };
+
+        Ok(GetAgreementCancellationRequestOutput {
+            agreement_cancellation_request_id: Some(stored.id.clone()),
+            agreement_id: Some(stored.agreement_id.clone()),
+            reason_code: Some(stored.reason_code.clone()),
+            description: stored.description.clone(),
+            status: Some(stored.status.clone()),
+            // `statusMessage` is "a message providing additional context about
+            // the cancellation request status", which the model only ever gives
+            // a value for on the calls that supply one: the buyer's
+            // `rejectionReason` (`RejectAgreementCancellationRequest`) and the
+            // seller's `cancellationReason`
+            // (`CancelAgreementCancellationRequest`). Both are still scaffolds
+            // with issues of their own, so no stored request carries a message
+            // and the member is reported absent rather than invented.
+            status_message: None,
+            created_at: Some(::aws_smithy_types::DateTime::from(stored.created_at)),
+            updated_at: Some(::aws_smithy_types::DateTime::from(stored.updated_at)),
+        })
     }
 }

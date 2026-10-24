@@ -27,7 +27,10 @@ use super::agreement_lifecycle::{
 /// `smithy_query(query="shape", shape="AgreementCancellationRequestReasonCode")`
 /// (also listed in the operation header of
 /// `src/ops/send_agreement_cancellation_request.rs`).
-const REASON_CODES: &[&str] = &[
+///
+/// `pub(crate)` because the approval suite beside this one spans the same class
+/// of reason codes rather than keeping a second copy of the catalog.
+pub(crate) const REASON_CODES: &[&str] = &[
     "ALTERNATIVE_PROCUREMENT_CHANNEL",
     "BUYER_DISSATISFACTION",
     "INCORRECT_TERMS_ACCEPTED",
@@ -47,27 +50,27 @@ const CATALOG: &str = "AWSMarketplace";
 
 /// `AgreementCancellationRequestStatus`'s documented initial value: "The
 /// cancellation request is created in PENDING_APPROVAL status".
-const PENDING_APPROVAL: &str = "PENDING_APPROVAL";
+pub(crate) const PENDING_APPROVAL: &str = "PENDING_APPROVAL";
 
 /// `AgreementCancellationRequestId`'s `^acr-[a-zA-Z0-9]+$`, checked here rather
 /// than through the crate's own code so a wrong minter cannot make this test
 /// pass.
-fn is_cancellation_request_id(value: &str) -> bool {
+pub(crate) fn is_cancellation_request_id(value: &str) -> bool {
     value
         .strip_prefix("acr-")
         .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphanumeric()))
 }
 
-async fn send(router: &MultiServiceRouter, body: Value) -> Answer {
+pub(crate) async fn send(router: &MultiServiceRouter, body: Value) -> Answer {
     call(router, "SendAgreementCancellationRequest", body).await
 }
 
-async fn list(router: &MultiServiceRouter, body: Value) -> Answer {
+pub(crate) async fn list(router: &MultiServiceRouter, body: Value) -> Answer {
     call(router, "ListAgreementCancellationRequests", body).await
 }
 
 /// Send one cancellation request over `agreement_id` and answer its id.
-async fn cancellation_over(
+pub(crate) async fn cancellation_over(
     router: &MultiServiceRouter,
     agreement_id: &str,
     reason_code: &str,
@@ -105,7 +108,7 @@ fn listed_ids(answer: &Answer) -> Vec<String> {
 ///
 /// `proposal` is an `AgreementProposalIdentifier`, whose pattern is
 /// `^(at-|ap-)[A-Za-z0-9]+$`.
-async fn agreement(router: &MultiServiceRouter, proposal: &str) -> String {
+pub(crate) async fn agreement(router: &MultiServiceRouter, proposal: &str) -> String {
     agreement_over(router, proposal, vec![term("eula.v1")]).await
 }
 

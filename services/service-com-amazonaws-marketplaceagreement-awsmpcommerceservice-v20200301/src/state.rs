@@ -454,6 +454,12 @@ pub const PARTY_TYPE_VALUES: &[&str] = &[PARTY_TYPE_PROPOSER, PARTY_TYPE_ACCEPTO
 /// stored request stays `PENDING_APPROVAL` until one of those runs.
 pub const CANCELLATION_STATUS_PENDING_APPROVAL: &str = "PENDING_APPROVAL";
 
+/// The `AgreementCancellationRequestStatus` an accepted cancellation request
+/// carries: "Once accepted, the cancellation request transitions to APPROVED
+/// status and the agreement cancellation will be processed"
+/// (`AcceptAgreementCancellationRequest`).
+pub const CANCELLATION_STATUS_APPROVED: &str = "APPROVED";
+
 /// `ResourceType` for a cancellation request, reported on a
 /// `ResourceNotFoundException` or a `ConflictException` about one.
 pub const RESOURCE_TYPE_AGREEMENT_CANCELLATION_REQUEST: &str = "AgreementCancellationRequest";
@@ -825,6 +831,27 @@ pub struct Agreement {
 }
 
 impl Agreement {
+    /// Cancel this agreement at `now`: the one transition to
+    /// [`STATUS_CANCELLED`], which both the acceptor's direct `CancelAgreement`
+    /// and the approval of a cancellation request
+    /// (`AcceptAgreementCancellationRequest`) perform, so the status and the
+    /// `updated_at` that goes with it have exactly one writer.
+    ///
+    /// Only an [`STATUS_ACTIVE`] agreement is cancelled; one that has already
+    /// reached a terminal status (cancelled, replaced, expired) keeps it rather
+    /// than being moved backwards. The answer says whether this call is what
+    /// cancelled it, so a caller that owes an audit record emits one only for
+    /// the transition it actually made.
+    #[must_use]
+    pub fn cancel(&mut self, now: SystemTime) -> bool {
+        if self.status != STATUS_ACTIVE {
+            return false;
+        }
+        self.status = STATUS_CANCELLED.to_string();
+        self.updated_at = now;
+        true
+    }
+
     /// Whether the acceptor asked for auto-renewal, as the accepted renewal
     /// term's `enableAutoRenew` records it.
     fn auto_renew(&self) -> Option<bool> {
@@ -2131,6 +2158,17 @@ pub fn billing_adjustment_not_found(id: &str) -> ResourceNotFoundException {
         message: Some(does_not_exist("billing adjustment request")),
         resource_id: Some(id.to_string()),
         resource_type: Some(RESOURCE_TYPE_BILLING_ADJUSTMENT_REQUEST.to_string()),
+    }
+}
+
+/// The `ResourceNotFoundException` for an agreement and cancellation request id
+/// pair that names no stored cancellation request.
+pub fn agreement_cancellation_request_not_found(id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        request_id: Some(next_request_id()),
+        message: Some(does_not_exist("agreement cancellation request")),
+        resource_id: Some(id.to_string()),
+        resource_type: Some(RESOURCE_TYPE_AGREEMENT_CANCELLATION_REQUEST.to_string()),
     }
 }
 
