@@ -2,8 +2,9 @@
 
 //! @op ListWorkflowRuns
 //! IMPLEMENTED: one `WorkflowRunSummary` per run the named workflow holds in this
-//! service's store (`crate::state`), in `RunId` order, at most `MaxResults` per page,
-//! optionally narrowed to one `WorkflowVersion`. A workflow the store does not hold is
+//! service's store (`crate::state`), oldest first by the instant each run was created,
+//! at most `MaxResults` per page, optionally narrowed to one `WorkflowVersion`. A
+//! workflow the store does not hold is
 //! the service's lookup miss, not an empty page. The only writes are the changes the
 //! clock already owed — the teardown of a workflow past its `DELETING` span and each
 //! run's own status schedule — so a read never changes what a later caller sees. The
@@ -215,18 +216,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // gone with it — the same step every handler that touches `workflows` takes.
         store.reap_deleted_workflows(now);
 
-        // The cursor is the `RunId` of the last item on the previous page, so a run
-        // started or removed between pages cannot restart or skip the walk. Decoded
-        // BEFORE the workflow lookup so a foreign token is one refusal whatever the ARN
-        // resolves to.
-        let after = match input.next_token.as_deref() {
+        // The cursor is the POSITION IN CREATION ORDER of the last item on the previous
+        // page (`crate::state::WorkflowRun::listing_key`), not the identifier that run
+        // is stored under: a run created between pages therefore sorts after the cursor
+        // and is still reached by a later page, and a run removed between pages cannot
+        // restart the walk. Decoded BEFORE the workflow lookup so a foreign token is one
+        // refusal whatever the ARN resolves to.
+        let after: Option<crate::state::RunListingKey> = match input.next_token.as_deref() {
             None => None,
             Some(token) => Some(
-                crate::state::decode_page_token(PAGE_KIND, token).ok_or_else(|| {
-                    ListWorkflowRunsErrorModeled::ValidationException(
-                        crate::state::invalid_page_token("ListWorkflowRuns"),
-                    )
-                })?,
+                crate::state::decode_page_token(PAGE_KIND, token)
+                    .as_deref()
+                    .and_then(crate::state::parse_run_listing_key)
+                    .ok_or_else(|| {
+                        ListWorkflowRunsErrorModeled::ValidationException(
+                            crate::state::invalid_page_token("ListWorkflowRuns"),
+                        )
+                    })?,
             ),
         };
 
@@ -252,31 +258,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this handler runs, so the value is already a usable page size.
         let page_size = usize::try_from(input.max_results).unwrap_or(0);
 
-        let lower = match after.as_deref() {
-            Some(last) => std::ops::Bound::Excluded(last),
-            None => std::ops::Bound::Unbounded,
-        };
         // `WorkflowVersion` is a FILTER, not a resolution: "If not specified, runs for
         // all versions are returned" (`smithy_query(query="operation",
         // operation="ListWorkflowRuns")`, `WorkflowVersion`). A version no run carries
         // therefore yields an empty page rather than a refusal.
         let wanted_version = input.workflow_version.as_deref();
-        let mut matching = workflow
-            .runs
-            .range::<str, _>((lower, std::ops::Bound::Unbounded))
-            .map(|(_, run)| run)
-            .filter(|run| wanted_version.is_none_or(|version| run.workflow_version == version));
 
-        let workflow_runs: Vec<WorkflowRunSummary> =
-            matching.by_ref().take(page_size).map(summarize).collect();
+        // The listing is a CHRONOLOGICAL view of the workflow's runs: oldest first by
+        // the instant each run was created — the instant the summary itself reports as
+        // `CreatedOn`/`StartedAt` — with the creation sequence separating two runs the
+        // clock cannot. The identifier a run is stored under says nothing about when it
+        // started, so it is not the order a client is paged in; walking creation order
+        // forward also means a run created after a page was served sorts after that
+        // page's cursor and is still reached by a later page.
+        let mut remaining: Vec<&crate::state::WorkflowRun> = workflow
+            .runs
+            .values()
+            .filter(|run| wanted_version.is_none_or(|version| run.workflow_version == version))
+            .filter(|run| after.is_none_or(|cursor| run.listing_key() > cursor))
+            .collect();
+        remaining.sort_by_key(|run| run.listing_key());
+
+        let page = &remaining[..page_size.min(remaining.len())];
+        let workflow_runs: Vec<WorkflowRunSummary> = page.iter().copied().map(summarize).collect();
 
         // A token only when a further MATCHING page exists, so a client stops without an
-        // extra empty round trip.
-        let next_token = match workflow_runs.last() {
-            Some(last) if matching.next().is_some() => last
-                .run_id
-                .as_deref()
-                .map(|run_id| crate::state::encode_page_token(PAGE_KIND, run_id)),
+        // extra empty round trip. It carries the position of the last run on this page,
+        // so the next page resumes immediately after it.
+        let next_token = match page.last() {
+            Some(last) if remaining.len() > page.len() => Some(crate::state::encode_page_token(
+                PAGE_KIND,
+                &crate::state::format_run_listing_key(last.listing_key()),
+            )),
             _ => None,
         };
 

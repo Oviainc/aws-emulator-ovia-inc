@@ -194,9 +194,35 @@ pub struct WorkflowRun {
     /// The instant the clock owes this run's NEXT status change. Stored, never
     /// slept on, and advanced by [`WorkflowRun::settle`] as each change lands.
     pub next_status_at: SystemTime,
+    /// Where this run falls in the store's creation order: the value of the
+    /// monotonic mint counter ([`ComAmazonawsMwaaserverlessAmazonmwaaserverlessState::mint_seq`])
+    /// at the moment the run was recorded. It breaks a tie between two runs the
+    /// clock cannot separate, so [`WorkflowRun::listing_key`] is a TOTAL order
+    /// that still only ever grows as runs are created.
+    pub sequence: u64,
 }
 
+/// The position of a run in the order a run listing walks: its creation instant
+/// (nanoseconds since the epoch) and, for two runs created at the same instant,
+/// the creation sequence that separates them.
+///
+/// Ordering runs by this key — rather than by the identifier they are stored
+/// under — is what makes a listing chronological, and what keeps a run created
+/// after a page was served sorting AFTER that page's cursor instead of before it.
+pub type RunListingKey = (u128, u64);
+
 impl WorkflowRun {
+    /// This run's position in the listing order (see [`RunListingKey`]).
+    pub fn listing_key(&self) -> RunListingKey {
+        (
+            self.created_at
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos(),
+            self.sequence,
+        )
+    }
+
     /// The `TaskInstanceId`s this run holds, in the store's order — what
     /// `GetWorkflowRun` reports as `RunDetail.TaskInstances`.
     pub fn task_instance_ids(&self) -> Vec<String> {
@@ -651,6 +677,22 @@ pub fn decode_page_token(kind: &str, token: &str) -> Option<String> {
     let rest = decoded.strip_prefix(PAGE_TOKEN_PREFIX)?;
     let (token_kind, key) = rest.split_once('\u{1f}')?;
     (token_kind == kind).then(|| key.to_string())
+}
+
+/// The cursor key for a position in a run listing: the two components of a
+/// [`RunListingKey`], zero-padded so the key a cursor carries is fixed-width and
+/// orders the same way the tuple does.
+pub fn format_run_listing_key(key: RunListingKey) -> String {
+    let (nanos, sequence) = key;
+    format!("{nanos:039}.{sequence:020}")
+}
+
+/// Read back a key [`format_run_listing_key`] wrote. `None` for anything else,
+/// which a listing refuses as a `ValidationException` just like a token it did
+/// not issue.
+pub fn parse_run_listing_key(key: &str) -> Option<RunListingKey> {
+    let (nanos, sequence) = key.split_once('.')?;
+    Some((nanos.parse().ok()?, sequence.parse().ok()?))
 }
 
 /// The HTTP status this service answers a resource-lookup miss with.
