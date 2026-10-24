@@ -199,7 +199,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreatePricingRuleErrorModeled::InternalServerException(
                 InternalServerException {
@@ -277,27 +276,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A `TIERING` rule IS its tiering configuration ("The set of tiering
         // configurations for the pricing rule"); a `MARKUP` or `DISCOUNT` rule is the
         // percentage it moves the public rates by ("A percentage modifier that's
-        // applied on the public pricing rates").
-        match input.r#type.as_str() {
-            "TIERING" if input.tiering.is_none() => {
-                return Err(validation(
-                    "ILLEGAL_TIERING_INPUT",
-                    "Tiering",
-                    "a TIERING pricing rule must carry a Tiering configuration",
-                ));
-            }
-            "MARKUP" | "DISCOUNT" if input.modifier_percentage.is_none() => {
-                return Err(validation(
-                    "ILLEGAL_MODIFIER_PERCENTAGE",
-                    "ModifierPercentage",
-                    format!(
-                        "a {} pricing rule must carry a ModifierPercentage",
-                        input.r#type
-                    ),
-                ));
-            }
-            _ => {}
-        }
+        // applied on the public pricing rates"). A rule therefore holds EXACTLY ONE
+        // of the two rate members: the one its `Type` prices by has to be there, and
+        // naming the other one describes a rule the service cannot apply, which is
+        // what `ValidationExceptionReason` enumerates `ILLEGAL_MODIFIER_PERCENTAGE` /
+        // `ILLEGAL_TIERING_INPUT` for. That is one rule for the whole service, so it
+        // is decided by the shared [`crate::state::reconcile_pricing_rule_rate`] —
+        // the same function `UpdatePricingRule` merges through — and a create simply
+        // has no stored record behind it: the request's own members are the whole
+        // rate.
+        //
+        // "Your entry will be rounded to the nearest 2 decimal places." — the
+        // `ModifierPercentage` member's own documentation, applied on this path as
+        // well as on the update path so one documented rule has one behaviour
+        // ([`crate::state::round_modifier_percentage`]).
+        let (modifier_percentage, tiering) = crate::state::reconcile_pricing_rule_rate(
+            &input.r#type,
+            input
+                .modifier_percentage
+                .map(crate::state::round_modifier_percentage),
+            input
+                .tiering
+                .as_ref()
+                .map(|tiering| crate::state::TieringRecord {
+                    free_tier_activated: tiering.free_tier.as_ref().map(|free| free.activated),
+                    custom_tiers: tiering.custom_tiers.clone(),
+                }),
+            input.modifier_percentage.is_some(),
+            input.tiering.is_some(),
+        )
+        .map_err(|(reason, member, message)| validation(reason, member, message))?;
 
         // The store is bounded by an explicit maximum and a create past it is refused
         // rather than served by evicting a rule a later caller must still be able to
@@ -329,19 +337,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             description: input.description,
             scope: input.scope,
             rule_type: input.r#type,
-            // "Your entry will be rounded to the nearest 2 decimal places." — the
-            // member's own documentation, applied here as well as on the update path
-            // so one documented rule has one behaviour
-            // ([`crate::state::round_modifier_percentage`]).
-            modifier_percentage: input
-                .modifier_percentage
-                .map(crate::state::round_modifier_percentage),
+            // The rate members the rule holds, as the shared rule above decided them.
+            modifier_percentage,
             service: input.service,
             billing_entity: input.billing_entity,
-            tiering: input.tiering.map(|tiering| crate::state::TieringRecord {
-                free_tier_activated: tiering.free_tier.map(|free_tier| free_tier.activated),
-                custom_tiers: tiering.custom_tiers,
-            }),
+            tiering,
             usage_type: input.usage_type,
             operation: input.operation,
             tags: input.tags.unwrap_or_default().into_iter().collect(),
@@ -352,6 +352,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.pricing_rule_names.insert(input.name, arn.clone());
         state.record_idempotent_arn(Self::NAME, input.client_token.as_deref(), &arn);
 
+        // The audit record for a state-changing call, as `UpdatePricingRule` writes
+        // it for the same resource: who asked, what was minted and that it
+        // succeeded. Never a secret, and never a `@sensitive` member (the rule's
+        // name and description) — only the access key id the caller presented and
+        // the ARN this call created.
+        ::tracing::info!(
+            operation = Self::NAME,
+            akid = %::engine::extract_akid(&ctx.parts().headers),
+            pricing_rule_arn = %arn,
+            outcome = "created",
+            "pricing rule created"
+        );
         Ok(CreatePricingRuleOutput { arn: Some(arn) })
     }
 }

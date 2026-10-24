@@ -47,6 +47,8 @@ mod pricing_plans_associated_with_pricing_rule;
 mod pricing_rule_core_loop;
 #[path = "all/pricing_rule_lifecycle.rs"]
 mod pricing_rule_lifecycle;
+#[path = "all/pricing_rule_rate_exclusivity.rs"]
+mod pricing_rule_rate_exclusivity;
 #[path = "all/pricing_rule_update.rs"]
 mod pricing_rule_update;
 #[path = "all/pricing_rules_associated_to_pricing_plan.rs"]
