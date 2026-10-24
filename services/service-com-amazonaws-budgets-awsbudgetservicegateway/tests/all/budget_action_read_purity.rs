@@ -19,7 +19,8 @@
 //!    exactly as they were.
 //! 2. Over every `*_IN_PROGRESS` status (and the settled status its own execution names),
 //!    a read whose settle has fallen due reports the settled status, discharges the
-//!    settle, appends no history record, and changes NO other member of the action.
+//!    settle, appends exactly the ONE record that status change is — the event the
+//!    service generated rather than a caller — and changes NO other member of the action.
 //! 3. Over the ways a read can fail to locate an action, the refusal changes nothing: a
 //!    later read of the action that does exist answers exactly as it did before.
 
@@ -36,7 +37,7 @@ use service_com_amazonaws_budgets_awsbudgetservicegateway::ops::types::{
 };
 use service_com_amazonaws_budgets_awsbudgetservicegateway::state::{
     action_execution, action_is_in_progress, ComAmazonawsBudgetsAwsbudgetservicegatewayState,
-    PendingSettle,
+    PendingSettle, EVENT_TYPE_SYSTEM,
 };
 
 use super::budget_lifecycle::{account, call, is_error, router_with_engine, same};
@@ -132,12 +133,12 @@ async fn describe_action(
 }
 
 /// The history a LATER caller sees for this action, read over the wire.
-async fn history_len(
+async fn history_records(
     router: &MultiServiceRouter,
     account_id: &str,
     budget_name: &str,
     action_id: &str,
-) -> usize {
+) -> Vec<Value> {
     let (status, body) = call(
         router,
         "DescribeBudgetActionHistories",
@@ -154,8 +155,20 @@ async fn history_len(
     );
     body["ActionHistories"]
         .as_array()
-        .map(Vec::len)
+        .cloned()
         .unwrap_or_default()
+}
+
+/// How many records that history holds.
+async fn history_len(
+    router: &MultiServiceRouter,
+    account_id: &str,
+    budget_name: &str,
+    action_id: &str,
+) -> usize {
+    history_records(router, account_id, budget_name, action_id)
+        .await
+        .len()
 }
 
 /// Everything about the stored action that a read must not change: its status, the
@@ -451,11 +464,29 @@ async fn a_read_materialises_only_the_settle_the_clock_already_owed() {
             "case {status:?}: expected the stored status to be {settled}, got {:?}",
             held.status
         );
-        let history_after = history_len(&router, &account_id, &budget_name, &action_id).await;
+        // The settle is itself a status change of the action, and an action's history is
+        // the log of its status changes — so it leaves exactly ONE record: the one no
+        // caller triggered, carrying the status the action now holds.
+        let records = history_records(&router, &account_id, &budget_name, &action_id).await;
         assert_eq!(
-            history_after, history_before,
-            "case {status:?}: expected a settle to append no history record, the history held \
-             {history_before} and now holds {history_after}"
+            records.len(),
+            history_before + 1,
+            "case {status:?}: expected the settle to append exactly its own record, the \
+             history held {history_before} and now holds {}",
+            records.len()
+        );
+        let appended = records.last().expect("the history is not empty");
+        assert_eq!(
+            appended["EventType"].as_str(),
+            Some(EVENT_TYPE_SYSTEM),
+            "case {status:?}: expected the settle to be recorded as the service's own event, \
+             got {appended}"
+        );
+        assert_eq!(
+            appended["Status"].as_str(),
+            Some(settled.as_str()),
+            "case {status:?}: expected the appended record to carry the settled status \
+             {settled}, got {appended}"
         );
 
         // And it is a settle, not a step: reading again reports the same settled status.

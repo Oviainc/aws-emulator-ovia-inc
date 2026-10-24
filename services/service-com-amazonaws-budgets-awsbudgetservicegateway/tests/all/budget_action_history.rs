@@ -34,8 +34,8 @@ use service_com_amazonaws_budgets_awsbudgetservicegateway::ops::types::{
 use service_com_amazonaws_budgets_awsbudgetservicegateway::state::{
     encode_next_token, ComAmazonawsBudgetsAwsbudgetservicegatewayState,
     ACTION_STATUS_EXECUTION_IN_PROGRESS, ACTION_STATUS_STANDBY, EVENT_TYPE_CREATE_ACTION,
-    EVENT_TYPE_EXECUTE_ACTION, EVENT_TYPE_UPDATE_ACTION, EXECUTION_TYPE_APPROVE,
-    MAX_ACTIONS_PER_BUDGET, MAX_ACTION_HISTORY_RECORDS,
+    EVENT_TYPE_EXECUTE_ACTION, EVENT_TYPE_SYSTEM, EVENT_TYPE_UPDATE_ACTION,
+    EXECUTION_TYPE_APPROVE, MAX_ACTIONS_PER_BUDGET, MAX_ACTION_HISTORY_RECORDS,
 };
 
 use super::budget_lifecycle::{account, call, is_error, router, router_with_engine, same};
@@ -310,7 +310,10 @@ async fn describe_action(
 
 /// Every history record of one action, walking `NextToken` until the service stops
 /// handing one back. `max_results` is the page size the walk asks for.
-async fn read_history(
+///
+/// `pub(crate)` so the sibling suites in this test target read a history the same way
+/// rather than copying the pagination walk.
+pub(crate) async fn read_history(
     router: &MultiServiceRouter,
     account_id: &str,
     budget_name: &str,
@@ -622,23 +625,26 @@ async fn executing_an_action_records_one_execute_action_event() {
         "approve",
     )
     .await;
-    assert_eq!(
-        records.len(),
-        2,
+    // The create and the execute event. The settle the clock owes may already have
+    // fallen due by the time this read ran, and that settle records an event of its own,
+    // so the execute record is named by its POSITION rather than assumed to be the
+    // newest; the settle's own record is asserted in `budget_action_settle_history`.
+    assert!(
+        records.len() >= 2,
         "case approve: expected the create and the execute event, got {records:?}"
     );
-    let latest = records.last().expect("the history is not empty");
+    let executed = &records[1];
     assert_eq!(
-        latest.get("EventType").and_then(Value::as_str),
+        executed.get("EventType").and_then(Value::as_str),
         Some(EVENT_TYPE_EXECUTE_ACTION),
-        "case approve: expected an EXECUTE_ACTION record, got {latest}"
+        "case approve: expected an EXECUTE_ACTION record, got {executed}"
     );
     assert_eq!(
-        latest.get("Status").and_then(Value::as_str),
+        executed.get("Status").and_then(Value::as_str),
         Some(ACTION_STATUS_EXECUTION_IN_PROGRESS),
-        "case approve: expected the status at the time of the event, got {latest}"
+        "case approve: expected the status at the time of the event, got {executed}"
     );
-    let recorded_status = latest
+    let recorded_status = executed
         .get("ActionHistoryDetails")
         .and_then(|details| details.get("Action"))
         .and_then(|action| action.get("Status"))
@@ -647,8 +653,16 @@ async fn executing_an_action_records_one_execute_action_event() {
         recorded_status,
         Some(ACTION_STATUS_EXECUTION_IN_PROGRESS),
         "case approve: expected the record to carry the action as the event left it, got \
-         {latest}"
+         {executed}"
     );
+    for later in &records[2..] {
+        assert_eq!(
+            later.get("EventType").and_then(Value::as_str),
+            Some(EVENT_TYPE_SYSTEM),
+            "case approve: only the settle this service makes on its own may follow the \
+             execute event, got {later}"
+        );
+    }
     assert_eq!(
         records[0].get("Status").and_then(Value::as_str),
         Some(ACTION_STATUS_STANDBY),
