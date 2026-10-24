@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeStreamSummary
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeStreamSummary`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeStreamSummary::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Projects the stream `CreateStream` stored onto `StreamDescriptionSummary` — the same
+//! record `DescribeStream` reports, without the shard map — resolving the request's
+//! `StreamName` / `StreamARN` pair against `crate::state`'s `streams` store
+//! ([`crate::state::ComAmazonawsKinesisKinesis20131202State::resolve_stream`]). Reporting
+//! only: the status it reports is derived from the instant the create armed, so no read
+//! writes anything a later caller could see.
 //!
 //! ## Shape of an operation
 //!
@@ -96,13 +94,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-kinesis-kinesis-2013120
 // here — hence the `DescribeStreamSummaryError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.kinesis#DescribeStreamSummary")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.kinesis#DescribeStreamSummary",
+    // `InternalFailureException` is widened in with `extra_errors`: this SERVICE models
+    // it, the operation shape does not list it, and it is the only honest answer for a
+    // service mounted on an engine that holds no state for it.
+    extra_errors = ["InternalFailureException"]
+)]
 #[derive(Debug)]
 pub enum DescribeStreamSummaryErrorModeled {
     AccessDeniedException(AccessDeniedException),
     InvalidArgumentException(InvalidArgumentException),
     LimitExceededException(LimitExceededException),
     ResourceNotFoundException(ResourceNotFoundException),
+    InternalFailureException(InternalFailureException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -128,6 +133,41 @@ impl From<DescribeStreamSummaryErrorModeled> for DescribeStreamSummaryError {
 /// concrete engine where it mounts the service, not here.
 pub struct DescribeStreamSummary<Eng> {
     engine: ::std::sync::Arc<Eng>,
+}
+
+/// The modelled refusal for a request whose `StreamName` / `StreamARN` pair names no
+/// stream of this account and region, worded exactly as `DescribeStream` words it: one
+/// rule, one phrasing, for every operation that addresses a stream.
+fn lookup_refusal(
+    failure: crate::state::StreamLookupFailure,
+    input: &DescribeStreamSummaryInput,
+) -> DescribeStreamSummaryError {
+    match failure {
+        crate::state::StreamLookupFailure::Unspecified => {
+            DescribeStreamSummaryErrorModeled::InvalidArgumentException(InvalidArgumentException {
+                message: Some(crate::state::STREAM_IDENTIFIER_REQUIRED_MESSAGE.to_string()),
+            })
+        }
+        crate::state::StreamLookupFailure::Mismatch => {
+            DescribeStreamSummaryErrorModeled::InvalidArgumentException(InvalidArgumentException {
+                message: Some(crate::state::STREAM_IDENTIFIER_MISMATCH_MESSAGE.to_string()),
+            })
+        }
+        crate::state::StreamLookupFailure::NotFound => {
+            DescribeStreamSummaryErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::stream_not_found_message(
+                        input
+                            .stream_name
+                            .as_deref()
+                            .or(input.stream_arn.as_deref())
+                            .unwrap_or_default(),
+                    )),
+                },
+            )
+        }
+    }
+    .into()
 }
 
 impl<Eng> DescribeStreamSummary<Eng> {
@@ -156,18 +196,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeStreamSummary` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeStreamSummaryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeStreamSummary"))
+        let region = crate::state::request_region(ctx);
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeStreamSummaryError::from(
+                DescribeStreamSummaryErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: Some("the stream store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+
+        let now = ::std::time::SystemTime::now();
+        let store = state.lock();
+        // `StreamId` is documented "Not Implemented. Reserved for future use", so no
+        // stream carries one and a request naming only that member names no stream.
+        let stream = store
+            .resolve_stream(
+                &region,
+                input.stream_name.as_deref(),
+                input.stream_arn.as_deref(),
+            )
+            .map_err(|failure| lookup_refusal(failure, &input))?;
+
+        Ok(DescribeStreamSummaryOutput {
+            stream_description_summary: stream.to_summary(now),
+        })
     }
 }

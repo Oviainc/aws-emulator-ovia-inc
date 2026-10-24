@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateDestination
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateDestination`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateDestination::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Applies the members its request names to the destination `crate::state`'s
+//! `destinations` store holds under the region and `Name` the URI names, leaving every
+//! member the request does not name as it was, and moving the record's `UpdatedAt` to the
+//! instant the update ran. A name this region holds no destination under is the modelled
+//! `ResourceNotFoundException`; `GetDestination` reports what this wrote.
 //!
 //! ## Shape of an operation
 //!
@@ -148,6 +145,20 @@ pub struct UpdateDestination<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
 
+/// Record this state-changing call for attribution: the access key id the caller
+/// presented (a public identifier, never a secret), the region the destination lives in,
+/// and how the call ended — worded exactly as `CreateDestination` records its own.
+fn audit(akid: &str, region: &str, outcome: &str) {
+    ::tracing::info!(
+        target: "emulator::audit",
+        operation = "UpdateDestination",
+        akid = %akid,
+        region = %region,
+        outcome = %outcome,
+        "state-changing operation"
+    );
+}
+
 impl<Eng> UpdateDestination<Eng> {
     /// Construct the operation from the shared engine. INFALLIBLE — the engine is a
     /// construction-time dependency, so engine access is guaranteed by the time any
@@ -174,18 +185,93 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateDestination` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateDestinationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateDestination"))
+        // The credential scope's access key id is read only to ATTRIBUTE the change
+        // ([`audit`]); the region it names is the region this destination lives in.
+        let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
+        let region = crate::state::request_region(ctx.parts());
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            audit(&akid, &region, "unavailable");
+            UpdateDestinationErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the destination store is unavailable".to_string()),
+            })
+        })?;
+
+        // `DeliveryDestinationType` is a modelled enum, so a value outside
+        // `DELIVERY_DESTINATION_TYPE_VALUES` is a client error rather than a stored
+        // record. The model's own constraint walk refuses one before this handler runs;
+        // this line states it through the SAME formatter the create uses, so the two
+        // cannot word one refusal two ways.
+        if let Some(delivery_destination_type) = input
+            .delivery_destination_type
+            .as_deref()
+            .filter(|value| !DELIVERY_DESTINATION_TYPE_VALUES.contains(value))
+        {
+            audit(&akid, &region, "refused");
+            return Err(UpdateDestinationErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::service::enum_value_set_refusal(
+                        "deliveryDestinationType",
+                        DELIVERY_DESTINATION_TYPE_VALUES,
+                        delivery_destination_type,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A destination delivers to a target of the SAME region as the call, exactly as on
+        // the create path, so an ARN naming a target of another region is refused rather
+        // than stored.
+        if input
+            .delivery_destination_arn
+            .as_deref()
+            .is_some_and(|arn| crate::state::delivery_destination_is_cross_region(&region, arn))
+        {
+            audit(&akid, &region, "refused");
+            return Err(UpdateDestinationErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(
+                        crate::state::DELIVERY_DESTINATION_REGION_MISMATCH_MESSAGE.to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let updated_at = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A destination is regional, as every resource of this service is: only the region
+        // that created it resolves — and updates — it.
+        let Some(stored) = store.destination_in_mut(&region, &input.name) else {
+            drop(store);
+            audit(&akid, &region, "not-found");
+            return Err(UpdateDestinationErrorModeled::ResourceNotFoundException(
+                // A mutation states the reason through the one formatter every mutating
+                // path of this service shares.
+                crate::state::destination_not_found_on_mutation(&input.name),
+            )
+            .into());
+        };
+
+        // Each member the request names REPLACES the stored one; a member it does not name
+        // is left alone, so an update of one member does not drop the rest of the record.
+        if let Some(delivery_destination_arn) = input.delivery_destination_arn {
+            stored.delivery_destination_arn = delivery_destination_arn;
+        }
+        if let Some(delivery_destination_type) = input.delivery_destination_type {
+            stored.delivery_destination_type = delivery_destination_type;
+        }
+        if let Some(role_arn) = input.role_arn {
+            stored.role_arn = role_arn;
+        }
+        if input.description.is_some() {
+            stored.description = input.description;
+        }
+        stored.updated_at = updated_at;
+        drop(store);
+
+        audit(&akid, &region, "updated");
+        Ok(UpdateDestinationOutput)
     }
 }

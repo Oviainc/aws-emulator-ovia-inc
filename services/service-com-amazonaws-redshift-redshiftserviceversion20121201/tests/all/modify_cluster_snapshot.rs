@@ -86,7 +86,10 @@ async fn seeded_emulator(snapshot: &str) -> Emulator {
 /// the current instant) or one Redshift took on its own schedule, so seeding the
 /// same store the handlers read is the only way to observe a retention window
 /// that has already ended.
-fn seed_snapshot(emulator: &Emulator, identifier: &str, snapshot_type: &str, age_days: u64, period: i32) {
+///
+/// `pub(crate)` so the sibling batch suite seeds such a record through this one
+/// helper rather than writing a second copy of it.
+pub(crate) fn seed_snapshot(emulator: &Emulator, identifier: &str, snapshot_type: &str, age_days: u64, period: i32) {
     let store = state::service_state(&*emulator.engine).expect("the Redshift store");
     let mut store = store.lock();
     let created_at = aws_smithy_types::DateTime::from(
@@ -142,7 +145,10 @@ fn assert_refused(case: &str, answer: &Answer, status: u16, code: &str) {
 
 /// Assert the retention bookkeeping one answer reports for `period`: the period
 /// itself, and the two members it derives.
-fn assert_retention(case: &str, answer: &Answer, period: i32) {
+///
+/// `pub(crate)` so the sibling batch suite asserts the derived members through
+/// this one helper, and the two suites cannot drift on what they must be.
+pub(crate) fn assert_retention(case: &str, answer: &Answer, period: i32) {
     assert_eq!(
         answer.text("ManualSnapshotRetentionPeriod").as_deref(),
         Some(period.to_string().as_str()),
