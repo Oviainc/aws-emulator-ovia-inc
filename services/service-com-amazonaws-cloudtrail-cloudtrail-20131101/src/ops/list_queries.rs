@@ -1,15 +1,44 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListQueries
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListQueries`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListQueries::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the query runs of ONE event data store, read from the query registry in
+//! [`crate::state`]. It is a reporting operation: its ONLY write is to materialise
+//! the end the clock already owed each run ([`crate::state::QueryRecord::settle`],
+//! the same call `DescribeQuery` and `CancelQuery` make), so every status it
+//! answers with is the status the run had already reached whether or not anybody
+//! listed it.
+//!
+//! What a listing holds, each rule from the model doc for this operation:
+//!
+//! * "You must specify an ARN value for `EventDataStore`" — the store resolves
+//!   FIRST, because that is where a query lives: an unreadable identifier ⇒
+//!   `EventDataStoreARNInvalidException`, a readable one naming no store in the
+//!   Region it addresses ⇒ `EventDataStoreNotFoundException`, a store awaiting
+//!   deletion ⇒ `InactiveEventDataStoreException`. Only that store's runs are
+//!   listed, in the Region the store lives in — the ARN's own Region, or, for a
+//!   bare store id, the Region the call was made in.
+//! * "Returns a list of queries and query statuses for the past seven days" —
+//!   runs older than [`QUERY_HISTORY_WINDOW`] are not listed, even
+//!   when `StartTime` reaches further back.
+//! * "Optionally, to shorten the list of results, you can specify a time range …
+//!   and a `QueryStatus` value" — `StartTime`/`EndTime` bound the run's creation
+//!   time inclusively, and `QueryStatus` keeps only runs in that state. A range
+//!   whose start is not chronologically before its end ⇒
+//!   `InvalidDateRangeException`.
+//! * `MaxResults` bounds one page and `NextToken` resumes the next, in the
+//!   registry's own key order. A token this service did not issue, or one issued
+//!   for a request with different parameters — a different store, time range,
+//!   status filter or page size — ⇒ `InvalidNextTokenException` ("a token that is
+//!   not valid, or a token that was previously used in a request with different
+//!   parameters"). `InvalidMaxResultsException` and `InvalidQueryStatusException`
+//!   have no reachable case here: the model's `@range(min: 1, max: 1000)` on
+//!   `MaxResults` and its `QueryStatus` enum are refused by the boundary
+//!   validator before this handler runs, and every `QueryStatus` value the model
+//!   accepts is valid for this operation.
+//!
+//! `EventDataStoreNotFoundException` answers HTTP 400, not the `@httpError(404)`
+//! the model annotates: see `NOT_FOUND_STATUS` below.
 //!
 //! ## Shape of an operation
 //!
@@ -190,18 +219,310 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListQueries` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListQueriesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListQueries"))
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListQueriesErrorModeled::UnsupportedOperationException(UnsupportedOperationException {
+                message: Some(
+                    "ListQueries needs the CloudTrail Lake query registry, which this \
+                     engine does not carry"
+                        .to_string(),
+                ),
+            })
+        })?;
+        let mut store = state.lock();
+        // The transition the clock owed each run is applied before any of them is
+        // listed, exactly as `DescribeQuery` applies it: a run due to end before
+        // this call was made had ended whether or not anybody asked, so the status
+        // this listing reports is the one the run was already in. It is the ONLY
+        // write this reporting operation makes.
+        store.settle_queries(now);
+
+        // "You must specify an ARN value for EventDataStore": the store a query
+        // ran on is what the listing is OF, so it resolves before anything else.
+        // The identifier is read here rather than through
+        // `ComAmazonawsCloudtrailCloudtrail20131101State::event_data_store` so the
+        // refusal below can name the ARN it addressed.
+        let identifier = crate::state::parse_event_data_store_identifier(&input.event_data_store)
+            .map_err(|rejection| {
+                ListQueriesErrorModeled::EventDataStoreARNInvalidException(
+                    EventDataStoreARNInvalidException {
+                        message: Some(rejection.message(&region)),
+                    },
+                )
+            })?;
+        let Some(record) = store.addressed_event_data_store(&identifier, &region) else {
+            return Err(event_data_store_not_found(&identifier.arn(&region)));
+        };
+        if !record.status.is_queryable() {
+            return Err(ListQueriesErrorModeled::InactiveEventDataStoreException(
+                InactiveEventDataStoreException {
+                    message: Some(format!(
+                        "The event data store {} is {} and does not serve queries.",
+                        record.id,
+                        record.status.as_wire()
+                    )),
+                },
+            )
+            .into());
+        }
+        let store_id = record.id.clone();
+        // A query lives IN an event data store, and a store lives in exactly one
+        // Region, so the Region this listing reports is the STORE's own — the one
+        // the identifier addressed, which for an ARN is the ARN's Region and for a
+        // bare id the caller's.
+        let store_region = record.region.clone();
+
+        // "Optionally … you can specify a time range, formatted as timestamps, by
+        // adding StartTime and EndTime parameters": both bound the run's creation
+        // time, inclusively. "Be sure that the start time is chronologically
+        // before the end time" is what `InvalidDateRangeException` reports.
+        let start = input.start_time.as_ref().map(date_time_as_nanos);
+        let end = input.end_time.as_ref().map(date_time_as_nanos);
+        if let (Some(start), Some(end)) = (start, end) {
+            // Strictly before: the doc asks for a start "chronologically before"
+            // the end, so a single-instant range (start == end) is refused even
+            // though each bound on its own is inclusive.
+            if start >= end {
+                return Err(ListQueriesErrorModeled::InvalidDateRangeException(
+                    InvalidDateRangeException {
+                        message: Some(
+                            "StartTime must be chronologically before EndTime.".to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // "Returns a list of queries and query statuses for the past seven days":
+        // the window clips the caller's own lower bound, so a StartTime reaching
+        // further back still lists only what the service keeps.
+        let window_start = instant_as_nanos(
+            now.checked_sub(QUERY_HISTORY_WINDOW)
+                .unwrap_or(::std::time::SystemTime::UNIX_EPOCH),
+        );
+        let lower = start.map_or(window_start, |start| start.max(window_start));
+
+        // `MaxResults` is "the maximum number of queries to show on a page"; a
+        // request naming none gets the model's own maximum
+        // ([`LIST_QUERIES_MAX_RESULTS`]). The model's `@range(min: 1, max: 1000)`
+        // is refused by the boundary validator before this handler runs, so
+        // neither branch below is reachable from the wire: the clamp re-states the
+        // model's bound in code a reader can see, so the work one call does is
+        // bounded here too.
+        let page_size = input.max_results.map_or(LIST_QUERIES_MAX_RESULTS, |max_results| {
+            usize::try_from(max_results)
+                .unwrap_or(LIST_QUERIES_MAX_RESULTS)
+                .clamp(1, LIST_QUERIES_MAX_RESULTS)
+        });
+
+        // The filter set this traversal belongs to: a token issued for one set is
+        // not valid for another, which is what `InvalidNextTokenException` ("a
+        // token that was previously used in a request with different parameters")
+        // reports. It mixes every parameter of the request that shapes the
+        // traversal — the page size among them — and NOT the seven-day window,
+        // which moves with the clock between two calls of one traversal. The
+        // mixing is `service_common::stable_hex_id`, this repo's one derived-id
+        // helper.
+        let fingerprint = ::service_common::stable_hex_id(&[
+            &store_id,
+            &store_region,
+            &start.map(|start| start.to_string()).unwrap_or_default(),
+            &end.map(|end| end.to_string()).unwrap_or_default(),
+            input.query_status.as_deref().unwrap_or_default(),
+            &page_size.to_string(),
+        ]);
+        let resume_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                PageCursor::decode(token)
+                    .filter(|cursor| cursor.fingerprint == fingerprint)
+                    .ok_or_else(invalid_next_token)?
+                    .resume_at,
+            ),
+        };
+
+        // A run is listed when it belongs to this store and Region, its creation
+        // time falls inside the bounds, and — when the request names one — its
+        // status is the one asked for. A record carrying NO creation time cannot
+        // be placed inside the seven-day window, so it is not listed: every run
+        // the service mints has one.
+        let matches = |record: &crate::state::QueryRecord| {
+            if !record.addressed_by(&store_region, Some(&store_id)) {
+                return false;
+            }
+            if let Some(status) = input.query_status.as_deref() {
+                // The model's `QueryStatus` enum is checked by the boundary
+                // validator, so a value reaching here is one of its own.
+                if record.status.as_wire() != status {
+                    return false;
+                }
+            }
+            record.created_at.is_some_and(|created_at| {
+                let at = instant_as_nanos(created_at);
+                at >= lower && end.is_none_or(|end| at <= end)
+            })
+        };
+
+        // The registry is keyed by query id, so a page resumes at the id the token
+        // carries — the same way `ListTrails` resumes at its own registry key. The
+        // model documents no order for `Queries`, and a key-ordered traversal keeps
+        // a page boundary stable while runs are added and removed.
+        let from = match &resume_at {
+            Some(resume_at) => ::std::ops::Bound::Included(resume_at.as_str()),
+            None => ::std::ops::Bound::Unbounded,
+        };
+        let remaining = store
+            .queries
+            .range::<str, _>((from, ::std::ops::Bound::Unbounded))
+            .map(|(_, record)| record);
+        let mut queries: Vec<Query> = Vec::new();
+        let mut next_token = None;
+        for record in remaining.filter(|record| matches(record)) {
+            if queries.len() == page_size {
+                // One run past a full page: report where to resume rather than
+                // carrying it.
+                next_token = Some(
+                    PageCursor {
+                        fingerprint: fingerprint.clone(),
+                        resume_at: record.query_id.clone(),
+                    }
+                    .encode(),
+                );
+                break;
+            }
+            queries.push(Query {
+                query_id: Some(record.query_id.clone()),
+                query_status: Some(record.status.as_wire().to_string()),
+                creation_time: record.created_at.map(::aws_smithy_types::DateTime::from),
+            });
+        }
+
+        Ok(ListQueriesOutput {
+            queries: Some(queries),
+            next_token,
+        })
     }
+}
+
+/// The HTTP status this service answers a not-found refusal with.
+///
+/// The model annotates `EventDataStoreNotFoundException` `@httpError(404)`, but
+/// CloudTrail answers 400 for it on the wire: the recorded `ListQueries` response
+/// for an unknown store is `HTTP 400` with `__type`
+/// `EventDataStoreNotFoundException`. The error CODE is the model's; only the
+/// status is stated here, through
+/// [`crate::scaffolded::Scaffolded::modeled_with_status`].
+const NOT_FOUND_STATUS: u16 = 400;
+
+/// How far back this listing reaches, from the model doc for this operation:
+/// "Returns a list of queries and query statuses for the past seven days."
+pub const QUERY_HISTORY_WINDOW: ::std::time::Duration =
+    ::std::time::Duration::from_secs(7 * 24 * 60 * 60);
+
+/// How many query runs one page carries when the request names no `MaxResults`,
+/// and the most it may ask for: the model's own bound on the member
+/// (`ListQueriesRequest$MaxResults` targets `ListQueriesMaxResultsCount`,
+/// `@range(min: 1, max: 1000)`), so the page bound is the model's rather than one
+/// this emulator invents.
+pub const LIST_QUERIES_MAX_RESULTS: usize = 1_000;
+
+/// The version prefix of a `NextToken` this operation issues, so a token's shape
+/// can change later without a stale one being read as a current one.
+const PAGE_TOKEN_VERSION: &str = "v1";
+
+/// The longest `NextToken` this operation reads back, from the model's own
+/// `PaginationToken` length constraint (`@length(min: 4, max: 1000)`): a longer
+/// value is no token this service issued, so it is refused without being parsed.
+const PAGE_TOKEN_MAX_LEN: usize = 1_000;
+
+/// An instant as whole nanoseconds since the epoch — negative before it — so two
+/// instants carried in different types are compared on one integer scale.
+fn instant_as_nanos(at: ::std::time::SystemTime) -> i128 {
+    match at.duration_since(::std::time::SystemTime::UNIX_EPOCH) {
+        Ok(since) => i128::try_from(since.as_nanos()).unwrap_or(i128::MAX),
+        Err(before) => -(i128::try_from(before.duration().as_nanos()).unwrap_or(i128::MAX)),
+    }
+}
+
+/// A modelled timestamp as whole nanoseconds since the epoch, on the same scale as
+/// [`instant_as_nanos`], so a caller's bound and a stored instant compare directly.
+fn date_time_as_nanos(at: &::aws_smithy_types::DateTime) -> i128 {
+    i128::from(at.secs()) * 1_000_000_000 + i128::from(at.subsec_nanos())
+}
+
+/// Where a page of this listing resumes, and which request the token was issued
+/// for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PageCursor {
+    /// `service_common::stable_hex_id` over the filters the token was issued for,
+    /// so a token replayed against a different filter set is refused rather than
+    /// silently skipping results — which is what `InvalidNextTokenException` ("a
+    /// token that was previously used in a request with different parameters")
+    /// reports.
+    fingerprint: String,
+    /// The registry key the next page starts at.
+    resume_at: String,
+}
+
+impl PageCursor {
+    /// Render the cursor as the `NextToken` a caller echoes back. The token
+    /// CARRIES the cursor — it is not a secret and nothing authenticates on it —
+    /// so handing one out writes no state, which is what lets this reporting
+    /// operation paginate. The fingerprint is what keeps a token from being
+    /// replayed against a DIFFERENT request.
+    fn encode(&self) -> String {
+        format!(
+            "{PAGE_TOKEN_VERSION}:{}:{}",
+            self.fingerprint, self.resume_at
+        )
+    }
+
+    /// Read back a token this operation issued. `None` for anything else.
+    fn decode(token: &str) -> Option<Self> {
+        if token.len() > PAGE_TOKEN_MAX_LEN {
+            return None;
+        }
+        // A query id holds no `:`, so three fields is the whole token.
+        let mut fields = token.split(':');
+        match (fields.next(), fields.next(), fields.next(), fields.next()) {
+            (Some(PAGE_TOKEN_VERSION), Some(fingerprint), Some(resume_at), None)
+                if !fingerprint.is_empty() && !resume_at.is_empty() =>
+            {
+                Some(Self {
+                    fingerprint: fingerprint.to_string(),
+                    resume_at: resume_at.to_string(),
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Refuse the request because the identifier names no event data store in the
+/// Region it addresses. The text names the ARN the request addressed, through the
+/// shared [`crate::state::event_data_store_not_found_message`].
+fn event_data_store_not_found(arn: &str) -> ListQueriesError {
+    crate::scaffolded::Scaffolded::modeled_with_status(
+        ListQueriesErrorModeled::EventDataStoreNotFoundException(
+            EventDataStoreNotFoundException {
+                message: Some(crate::state::event_data_store_not_found_message(arn)),
+            },
+        ),
+        NOT_FOUND_STATUS,
+    )
+}
+
+/// Refuse a `NextToken` this service did not issue, or issued for a different
+/// filter set — the two cases the modelled error names.
+fn invalid_next_token() -> ListQueriesError {
+    ListQueriesErrorModeled::InvalidNextTokenException(InvalidNextTokenException {
+        message: Some(
+            "The NextToken value is not valid, or was issued for a request with different \
+             parameters."
+                .to_string(),
+        ),
+    })
+    .into()
 }

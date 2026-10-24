@@ -139,3 +139,5 @@ mod zz_diagnostic;
 mod resource_policy;
 #[path = "all/resource_policy_isolation.rs"]
 mod resource_policy_isolation;
+#[path = "all/lake_query_listing.rs"]
+mod lake_query_listing;
