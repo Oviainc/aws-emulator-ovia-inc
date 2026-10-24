@@ -27,6 +27,8 @@ mod not_found_messages;
 mod request_validation;
 #[path = "all/s3_recording_buckets.rs"]
 mod s3_recording_buckets;
+#[path = "all/satellite_catalog.rs"]
+mod satellite_catalog;
 #[path = "all/scheduling_loop.rs"]
 mod scheduling_loop;
 #[path = "all/state_roundtrip.rs"]

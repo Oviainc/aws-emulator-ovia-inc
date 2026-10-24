@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AppsListData, DiscoveredResource, Policy, PolicySummary, ProtocolsListData,
-    ResourceNotFoundException, ResourceSet, Tag,
+    ProtocolsListDataSummary, ResourceNotFoundException, ResourceSet, Tag,
 };
 
 /// The Region an emulated service reports when the request carries no SigV4
@@ -307,6 +307,19 @@ impl ProtocolsListRecord {
         list.create_time = Some(::aws_smithy_types::DateTime::from(self.created_at));
         list.last_update_time = Some(::aws_smithy_types::DateTime::from(self.updated_at));
         list
+    }
+
+    /// The `ProtocolsListDataSummary` projection `ListProtocolsLists` reports:
+    /// the four members that shape declares, every one of them read off this
+    /// record, so an enumeration and a `GetProtocolsList` of the same list can
+    /// never disagree about its ARN, its name or its protocols.
+    pub fn summary(&self) -> ProtocolsListDataSummary {
+        ProtocolsListDataSummary {
+            list_arn: Some(self.list_arn.clone()),
+            list_id: Some(self.list_id.clone()),
+            list_name: Some(self.list.list_name.clone()),
+            protocols_list: Some(self.list.protocols_list.clone()),
+        }
     }
 }
 
@@ -823,17 +836,19 @@ pub fn decode_key_token(token: &str) -> Option<String> {
 /// Decode a `PaginationToken` produced by [`encode_page_token`]. `None` when the
 /// token was not produced by this service.
 ///
-/// The decoded value must still be a `PolicyId` (the model's
-/// `com.amazonaws.fms#PolicyId`: 36 characters matching `^[a-z0-9A-Z-]{36}$`),
-/// so a foreign token that happens to be valid hex is refused rather than
-/// resumed from as an arbitrary key.
+/// The decoded value must still be a 36-character identifier this service mints
+/// — the form the model gives both `com.amazonaws.fms#PolicyId` and
+/// `com.amazonaws.fms#ListId` (36 characters matching `^[a-z0-9A-Z-]{36}$`), so
+/// one check serves the policy-keyed and the list-keyed pages — and a foreign
+/// token that happens to be valid hex is refused rather than resumed from as an
+/// arbitrary key.
 pub fn decode_page_token(token: &str) -> Option<String> {
     let decoded = decode_key_token(token)?;
-    let is_policy_id = decoded.len() == 36
+    let is_minted_id = decoded.len() == 36
         && decoded
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-');
-    is_policy_id.then_some(decoded)
+    is_minted_id.then_some(decoded)
 }
 
 /// Decode an account-keyed `PaginationToken` produced by

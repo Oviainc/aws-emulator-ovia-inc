@@ -13,6 +13,9 @@
 // points it into `tests/all/`.
 #[path = "all/byte_match_set_lifecycle.rs"]
 mod byte_match_set_lifecycle;
+// Not one resource kind's lifecycle but the refusal messages of EVERY kind.
+#[path = "all/exception_messages.rs"]
+mod exception_messages;
 #[path = "all/geo_match_set_lifecycle.rs"]
 mod geo_match_set_lifecycle;
 // The WebACL fixtures the web-ACL suites share, on top of the wire harness.

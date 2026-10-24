@@ -147,15 +147,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetIPSetErrorModeled::WAFInternalErrorException(WAFInternalErrorException {
-                message: Some("the AWS WAF IPSet store is unavailable".to_string()),
+                message: Some(crate::state::MESSAGE_INTERNAL_ERROR.to_string()),
             })
         })?;
         // A read: it writes nothing, so what a later caller sees is unchanged.
         let state = state.lock();
 
         let entry = state.ip_sets.get(&input.ip_set_id).ok_or_else(|| {
+            // The message is this exception type's own fixed sentence: it says nothing
+            // about the id that was asked for, so a never-created id and a deleted one
+            // are refused byte-identically.
             GetIPSetErrorModeled::WAFNonexistentItemException(WAFNonexistentItemException {
-                message: Some(format!("IPSet {} does not exist", input.ip_set_id)),
+                message: Some(crate::state::MESSAGE_NONEXISTENT_ITEM.to_string()),
             })
         })?;
 

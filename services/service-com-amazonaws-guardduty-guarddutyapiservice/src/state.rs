@@ -2947,9 +2947,9 @@ impl EntitySetRecord {
     }
 }
 
-/// A saved finding filter. `CreateFilter` writes it, `GetFilter` reports it,
-/// `ListFilters` names it and `DeleteDetector`'s cascade drops it with its
-/// detector; `UpdateFilter` / `DeleteFilter` are still scaffolded.
+/// A saved finding filter. `CreateFilter` writes it, `UpdateFilter` changes it,
+/// `GetFilter` reports it, `ListFilters` names it, `DeleteFilter` drops it and
+/// `DeleteDetector`'s cascade drops it with its detector.
 #[derive(Debug, Clone, Default)]
 pub struct FilterRecord {
     pub name: String,

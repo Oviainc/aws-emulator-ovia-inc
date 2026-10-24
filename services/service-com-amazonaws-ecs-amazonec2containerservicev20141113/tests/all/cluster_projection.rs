@@ -14,7 +14,7 @@
 
 use serde_json::{json, Value};
 
-use crate::ecs_wire::{list, ok, service, string};
+use crate::ecs_wire::{list, ok, register_capacity, service, string};
 
 /// Every cluster setting name the model defines:
 /// `smithy_query(query="shape", shape="ClusterSettingName")` -> values
@@ -27,8 +27,11 @@ const CLUSTER_SETTING_NAMES: [&str; 1] = ["containerInsights"];
 const INHERITED_SETTING_VALUE: &str = "disabled";
 
 /// The launch-type metrics `Cluster$statistics` carries for a read that asks for
-/// `STATISTICS`, from that member's own doc.
-const STATISTIC_NAMES: [&str; 8] = [
+/// `STATISTICS`: four counters for each launch type the `LaunchType` enum defines
+/// (`smithy_query(query="shape", shape="LaunchType")` -> `EC2`, `FARGATE`, `EXTERNAL`,
+/// `MANAGED_INSTANCES`), in the order a recorded `DescribeClusters` reports them. The
+/// first eight are the ones the `Cluster$statistics` doc lists by name.
+const STATISTIC_NAMES: [&str; 16] = [
     "runningEC2TasksCount",
     "runningFargateTasksCount",
     "pendingEC2TasksCount",
@@ -37,6 +40,14 @@ const STATISTIC_NAMES: [&str; 8] = [
     "activeFargateServiceCount",
     "drainingEC2ServiceCount",
     "drainingFargateServiceCount",
+    "runningExternalTasksCount",
+    "pendingExternalTasksCount",
+    "runningManagedInstancesTasksCount",
+    "pendingManagedInstancesTasksCount",
+    "activeExternalServiceCount",
+    "drainingExternalServiceCount",
+    "activeManagedInstancesServiceCount",
+    "drainingManagedInstancesServiceCount",
 ];
 
 /// One row of the projection table: the case name, the `containerInsights` value the
@@ -202,12 +213,12 @@ async fn cluster_mutation_responses_report_configured_state_and_no_unasked_colle
             case,
             "CreateCluster",
         );
-        // The account holds exactly the cluster this row created: every earlier row
-        // deleted its own.
+        // The cluster this row created is the one cluster the account holds under that
+        // name: `clusterCount` counts it once, whatever the row called it.
         assert_eq!(
             created["clusterCount"],
             json!(1),
-            "case {case:?}: CreateCluster must report the account's cluster count, got \
+            "case {case:?}: CreateCluster must report the cluster it created, got \
              {created}"
         );
 
@@ -307,14 +318,14 @@ async fn cluster_mutation_responses_report_configured_state_and_no_unasked_colle
 }
 
 #[tokio::test]
-async fn cluster_count_tracks_the_clusters_the_account_holds() {
+async fn cluster_count_reports_the_cluster_the_call_named_whatever_else_is_live() {
     let router = service();
 
-    // The rule generalises over how many clusters exist: each create raises the count
-    // by one and each delete lowers it by one, whatever the cluster is called.
+    // The rule generalises over how many OTHER clusters the account holds and over the
+    // cluster name, so each row creates one more cluster beside the ones already live.
     let names = ["alpha", "beta-2", "gamma_3", "default"];
     for (index, name) in names.iter().enumerate() {
-        let case = format!("create {name}");
+        let case = format!("create {name} with {index} other clusters live");
         let created = ok(
             &router,
             "CreateCluster",
@@ -324,14 +335,30 @@ async fn cluster_count_tracks_the_clusters_the_account_holds() {
         .await;
         assert_eq!(
             created["clusterCount"],
-            json!(index as i64 + 1),
-            "case {case:?}: expected clusterCount {}, got {created}",
-            index + 1
+            json!(1),
+            "case {case:?}: a create answers with the one cluster the account now holds \
+             under that name, got {created}"
+        );
+        // A repeated create is the SAME cluster, not a second one under that name.
+        let again = ok(
+            &router,
+            "CreateCluster",
+            json!({ "clusterName": name }),
+            &case,
+        )
+        .await;
+        assert_eq!(
+            again["clusterCount"],
+            json!(1),
+            "case {case:?}: a repeated create reports the same single cluster, got {again}"
         );
     }
 
+    // A delete leaves a tombstone, which the account no longer holds — whatever other
+    // clusters are still live beside it.
     for (index, name) in names.iter().enumerate() {
-        let case = format!("delete {name}");
+        let still_live = names.len() - index - 1;
+        let case = format!("delete {name} with {still_live} other clusters live");
         let deleted = ok(
             &router,
             "DeleteCluster",
@@ -339,13 +366,41 @@ async fn cluster_count_tracks_the_clusters_the_account_holds() {
             &case,
         )
         .await;
-        let expected = names.len() - index - 1;
         assert_eq!(
             deleted["clusterCount"],
-            json!(expected as i64),
-            "case {case:?}: expected clusterCount {expected}, got {deleted}"
+            json!(0),
+            "case {case:?}: a delete answers with no cluster left under that name, got \
+             {deleted}"
+        );
+        // `@idempotent`: deleting it again reports the same tombstone and the same count.
+        let repeat = ok(
+            &router,
+            "DeleteCluster",
+            json!({ "cluster": name }),
+            &case,
+        )
+        .await;
+        assert_eq!(
+            repeat["clusterCount"],
+            json!(0),
+            "case {case:?}: a repeated delete reports the same count, got {repeat}"
         );
     }
+
+    // A cluster created over a tombstone is one the account holds again.
+    let case = "create over a tombstone";
+    let recreated = ok(
+        &router,
+        "CreateCluster",
+        json!({ "clusterName": names[0] }),
+        case,
+    )
+    .await;
+    assert_eq!(
+        recreated["clusterCount"],
+        json!(1),
+        "case {case:?}: a create over a tombstone holds the cluster again, got {recreated}"
+    );
 }
 
 #[tokio::test]
@@ -360,6 +415,9 @@ async fn statistics_stay_empty_on_a_mutation_even_when_the_cluster_holds_tasks()
         case,
     )
     .await;
+    // A task placed with the EC2 launch type runs on an instance registered to the
+    // cluster, so the cluster needs one before `RunTask` will place anything.
+    register_capacity(&router, "counted", case).await;
     ok(
         &router,
         "RegisterTaskDefinition",

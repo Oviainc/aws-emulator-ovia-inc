@@ -185,6 +185,10 @@ fn gated_calls() -> Vec<Gated> {
             body: json!({ "ListId": UNKNOWN_LIST_ID, "DefaultList": true }),
         },
         Gated {
+            operation: "ListProtocolsLists",
+            body: json!({ "MaxResults": 100 }),
+        },
+        Gated {
             operation: "PutProtocolsList",
             body: json!({
                 "ProtocolsList": {
@@ -1519,6 +1523,7 @@ async fn reads_are_stable_across_repeated_calls() {
         ("GetNotificationChannel", json!({})),
         ("GetResourceSet", json!({ "Identifier": id })),
         ("GetProtocolsList", json!({ "ListId": UNKNOWN_LIST_ID })),
+        ("ListProtocolsLists", json!({ "MaxResults": 100 })),
         (
             "ListDiscoveredResources",
             json!({ "MemberAccountIds": [ACCOUNT], "ResourceType": "AWS::EC2::Instance" }),

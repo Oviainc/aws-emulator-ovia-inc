@@ -149,7 +149,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             GetSqlInjectionMatchSetErrorModeled::WAFInternalErrorException(
                 WAFInternalErrorException {
                     message: Some(
-                        "the AWS WAF SqlInjectionMatchSet store is unavailable".to_string(),
+                        crate::state::MESSAGE_INTERNAL_ERROR.to_string(),
                     ),
                 },
             )
@@ -163,10 +163,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 GetSqlInjectionMatchSetErrorModeled::WAFNonexistentItemException(
                     WAFNonexistentItemException {
-                        message: Some(format!(
-                            "SqlInjectionMatchSet {} does not exist",
-                            input.sql_injection_match_set_id
-                        )),
+                        // This exception type's own fixed sentence: it says nothing
+                        // about the id that was asked for.
+                        message: Some(
+                            crate::state::MESSAGE_NONEXISTENT_ITEM.to_string(),
+                        ),
                     },
                 )
             })?;

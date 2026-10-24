@@ -29,7 +29,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::scheduling_loop::{
     antenna_uplink_config_data, config_data_table, create_config, create_mission_profile, harness,
-    send,
+    list_pages, send,
 };
 
 /// What a `ConfigListItem` must say about one stored config, keyed in the tables below by
@@ -53,55 +53,7 @@ fn member(item: &Value, name: &str) -> String {
 /// Every item `ListConfigs` returns, across as many pages as it takes, in the order the
 /// listing gave them. `page_size` is the caller's `maxResults`, or `None` to name none.
 async fn list_all(router: &MultiServiceRouter, page_size: Option<i64>) -> Vec<Value> {
-    let mut items: Vec<Value> = Vec::new();
-    let mut token: Option<String> = None;
-    // One more page than the store could possibly need at a page size of one, so a token
-    // that failed to advance is caught as a bounded failure instead of looping forever.
-    for page in 0..64 {
-        let mut query: Vec<String> = Vec::new();
-        if let Some(size) = page_size {
-            query.push(format!("maxResults={size}"));
-        }
-        if let Some(token) = &token {
-            query.push(format!("nextToken={token}"));
-        }
-        let path = if query.is_empty() {
-            "/config".to_string()
-        } else {
-            format!("/config?{}", query.join("&"))
-        };
-
-        let reply = send(router, "GET", &path, None).await;
-        assert_eq!(
-            reply.status, 200,
-            "case maxResults={page_size:?} page-{page}: expected ListConfigs 200, got {} {}",
-            reply.status, reply.body
-        );
-        let items_on_page = reply
-            .field("configList")
-            .as_array()
-            .unwrap_or_else(|| {
-                panic!(
-                    "case maxResults={page_size:?} page-{page}: configList must be a list, got {}",
-                    reply.body
-                )
-            })
-            .clone();
-        if let Some(size) = page_size {
-            assert!(
-                items_on_page.len() as i64 <= size,
-                "case maxResults={page_size:?} page-{page}: a page must hold at most {size} items, got {}",
-                items_on_page.len()
-            );
-        }
-        items.extend(items_on_page);
-
-        token = reply.field("nextToken").as_str().map(str::to_string);
-        if token.is_none() {
-            return items;
-        }
-    }
-    panic!("case maxResults={page_size:?}: the listing never closed");
+    list_pages(router, "/config", "configList", page_size).await
 }
 
 /// Assert the listing reports exactly `expected`, and that every item it reports reads

@@ -2305,6 +2305,7 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     ELB_LOAD_BALANCER,
     ELB_TARGET_GROUP,
     FIS_EXPERIMENT_TEMPLATE,
+    GUARDDUTY_DETECTOR,
     "AWS::IAM::Role",
     FIREHOSE_DELIVERY_STREAM,
     "AWS::Lambda::Function",
@@ -2935,6 +2936,23 @@ fn return_values(
             attributes.insert("Id".to_string(), id.clone());
             (id, attributes)
         }
+        // "Ref returns the detector's id"; Fn::GetAtt: Id. GuardDuty ASSIGNS that id —
+        // `CreateDetector` takes no identifier of any kind — so a declaration reports an
+        // identifier of GuardDuty's own shape (32 lowercase hexadecimal characters) rather
+        // than CloudFormation's `<stack>-<logical id>-<unique id>` name. This is also the
+        // type `super::provisioning` creates in GuardDuty itself, which reports the id IT
+        // minted back over the `Id` attribute — and THAT id, not this one, is what the stack
+        // reports for a detector GuardDuty created.
+        GUARDDUTY_DETECTOR => {
+            let id = derived_digits(
+                DETECTOR_ID_SALT,
+                name,
+                DETECTOR_ID_HEX_DIGITS,
+                Alphabet::Lower,
+            );
+            attributes.insert("Id".to_string(), id.clone());
+            (id, attributes)
+        }
         _ => (name.to_string(), attributes),
     }
 }
@@ -3004,6 +3022,7 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         "AWS::CloudWatch::Alarm" => &["Arn"],
         CLOUDWATCH_METRIC_STREAM => &["Arn"],
         FIS_EXPERIMENT_TEMPLATE => &["Id"],
+        GUARDDUTY_DETECTOR => &["Id"],
         _ => &[],
     }
 }
@@ -3017,16 +3036,18 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
 /// ([`super::StoredStack::deploy_template`]). Every other type's physical id is a function
 /// of its declared or generated name, which any deployment recomputes identically.
 ///
-/// Two types this emulator provisions are in that position: an experiment template's id is
-/// minted by FIS (`Ref` returns it, and the type has no name property at all), and an AWS
+/// Four types this emulator provisions are in that position: an experiment template's id
+/// is minted by FIS (`Ref` returns it, and the type has no name property at all), an AWS
 /// WAF Classic regional IPSet's id is minted by `CreateIPSet` ("Ref returns the IPSet ID"),
-/// where that type's `Name` is only what the create asks for. An Amazon EMR cluster is the
-/// third: `RunJobFlow` mints the `j-` job-flow id "Ref returns the cluster ID" answers, and
-/// the type's `Name` is only the name the flow runs under.
+/// where that type's `Name` is only what the create asks for, an Amazon EMR cluster's is
+/// the `j-` job-flow id `RunJobFlow` mints ("Ref returns the cluster ID"), where the type's
+/// `Name` is only the name the flow runs under, and a GuardDuty detector's is minted by
+/// `CreateDetector`, which takes no identifier at all.
 pub fn identity_is_service_assigned(resource_type: &str) -> bool {
     resource_type == FIS_EXPERIMENT_TEMPLATE
         || resource_type == WAF_REGIONAL_IP_SET
         || resource_type == EMR_CLUSTER
+        || resource_type == GUARDDUTY_DETECTOR
 }
 
 /// The `AWS::<cloudFormationName>::<Resource>` type of an Amazon Data Firehose stream.
@@ -3093,6 +3114,22 @@ pub const FIS_EXPERIMENT_TEMPLATE: &str = "AWS::FIS::ExperimentTemplate";
 /// service itself, and "Ref returns the IPSet ID" — an id only AWS WAF Classic mints — so
 /// the id a stack's output reports for it is the one that service answered with.
 pub const WAF_REGIONAL_IP_SET: &str = "AWS::WAFRegional::IPSet";
+
+/// An Amazon GuardDuty detector's resource type (the GuardDuty model:
+/// `cloudFormationName: GuardDuty`). This is a type `super::provisioning` creates in
+/// GuardDuty itself, and "Ref returns the detector's id" — `CreateDetector` takes no
+/// identifier and MINTS one — so the id a stack's output reports for it is the one that
+/// service answered with.
+pub const GUARDDUTY_DETECTOR: &str = "AWS::GuardDuty::Detector";
+
+/// How many characters the id Amazon GuardDuty mints for a detector carries: 32 lowercase
+/// hexadecimal, the form that service's own `mint_id` produces (`DETECTOR_ID_LEN` in
+/// `services/service-com-amazonaws-guardduty-guarddutyapiservice/src/state.rs`).
+const DETECTOR_ID_HEX_DIGITS: usize = 32;
+
+/// The salt the stand-in detector id is derived under (see [`derived_digits`]), so it
+/// cannot collide with another identifier derived for the same resource.
+const DETECTOR_ID_SALT: &str = "guardduty/detector-id";
 
 /// The prefix of an experiment-template id, as FIS mints one (`EXT` + a base-36 suffix;
 /// FIS's own `TEMPLATE_ID_PREFIX`).

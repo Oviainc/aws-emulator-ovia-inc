@@ -11,6 +11,14 @@
 //! (`crate::state::provisioning`) and settles the stack in the FAILED status of the
 //! operation it opened when one of them refuses.
 //!
+//! Executing a change set DEPLOYS its template, so the resources this emulator really
+//! CREATES (rather than only records) are created here through their own service, exactly
+//! as `CreateStack` creates them: the stack's `Ref` values are the ids those services
+//! minted, and a resource one of them refuses makes the STACK operation fail. The deployed
+//! template is RECONCILED with what the stack already had, the way `UpdateStack` reconciles
+//! it — what the template declares again is kept, what it declares anew is created, and
+//! what it no longer declares is deleted in the owning service.
+//!
 //! The change set itself moves to `EXECUTE_IN_PROGRESS` and reaches `EXECUTE_COMPLETE`
 //! with the stack, and "CloudFormation deletes all other change sets associated with the
 //! stack because they aren't valid for the updated stack". A change set whose creation has
