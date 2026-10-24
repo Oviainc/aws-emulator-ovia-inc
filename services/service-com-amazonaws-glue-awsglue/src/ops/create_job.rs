@@ -340,6 +340,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // "Only jobs with Glue version 3.0 and above and command type `glueetl` will be
+        // allowed to set `ExecutionClass` to `FLEX`": the restriction is over the command
+        // AND the version, so a request setting FLEX on any other pair asks for an
+        // execution class that job cannot run under.
+        if input.execution_class.as_deref() == Some(crate::state::EXECUTION_CLASS_FLEX) {
+            let glue_version = input
+                .glue_version
+                .clone()
+                .unwrap_or_else(|| crate::state::DEFAULT_GLUE_VERSION.to_string());
+            if !crate::state::admits_flex_execution_class(&input.command, &glue_version) {
+                return Err(CreateJobErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(format!(
+                            "ExecutionClass {} is allowed only on a {} job with Glue version \
+                             {} or above, not on a {command_name:?} job with Glue version \
+                             {glue_version}",
+                            crate::state::EXECUTION_CLASS_FLEX,
+                            crate::state::SPARK_ETL_COMMAND,
+                            crate::state::MIN_FLEX_GLUE_VERSION
+                        )),
+                        from_federation_source: None,
+                    },
+                )
+                .into());
+            }
+        }
+
         let mut store = state.lock();
         // "It must be unique in your account."
         if store.jobs.contains_key(&input.name) {

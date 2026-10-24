@@ -96,3 +96,10 @@ mod trail_update;
 mod wire;
 #[path = "all/zz_diagnostic.rs"]
 mod zz_diagnostic;
+// Declared after the alphabetical block above, not inside it: this file is edited by
+// every fix that adds a suite to this crate, and a declaration appended here cannot
+// collide with one inserted alphabetically beside a neighbouring suite.
+#[path = "all/resource_policy.rs"]
+mod resource_policy;
+#[path = "all/resource_policy_isolation.rs"]
+mod resource_policy_isolation;

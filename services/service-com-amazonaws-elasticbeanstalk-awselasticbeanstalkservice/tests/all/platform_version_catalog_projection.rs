@@ -1,0 +1,645 @@
+// SPDX-License-Identifier: CC0-1.0
+
+//! What a platform-version response REPORTS about a published platform version,
+//! driven end to end over the service's awsQuery HTTP surface.
+//!
+//! The rule under test: a platform-version response projects every member its
+//! catalog record defines — the platform's category, the operating system it
+//! runs on, the add-ons and tiers it supports, the languages and frameworks it
+//! runs, its description, its maintainer, its publication instants and the
+//! life-cycle state of the version and of its branch — and `ListPlatformVersions`
+//! and `DescribePlatformVersion` project the SAME record, the summary carrying
+//! the members `PlatformSummary` models and the description the members
+//! `PlatformDescription` models.
+//!
+//! The table is the service's OWN published catalog, `eb::state::SOLUTION_STACKS`
+//! (what `ListAvailableSolutionStacks` reports), read row by row rather than
+//! written out here: its 22 rows span the categories, the two operating systems
+//! and their versions, platforms that run one language and platforms that run
+//! none, platforms that ship a framework and platforms that ship none, and
+//! branches that support both environment tiers as well as one that supports only
+//! the web-server tier. Every expectation is computed from the catalog row plus
+//! this suite's own statement of the rule, so no row is a transcription of a
+//! recorded response.
+//!
+//! The HTTP harness ([`crate::lifecycle::Emulator`]) is the one the lifecycle
+//! suite drives the service with.
+
+use service_com_amazonaws_elasticbeanstalk_awselasticbeanstalkservice as eb;
+
+use crate::lifecycle::{instant, Answer, Emulator, TEST_REGION};
+
+/// The add-ons EVERY platform version this service publishes supports: logs to
+/// Amazon S3 and to CloudWatch Logs, and enhanced health through the health
+/// daemon. Source: `PlatformFilter$Values` names `Log/S3`,
+/// `Monitoring/Healthd` and `WorkerDaemon/SQSD` as `SupportedAddon` values, and
+/// the recorded platform-version responses carry `Log/CloudWatch` beside them.
+/// Sorted, which is the order a version reports them in.
+const ALWAYS_SUPPORTED_ADDONS: &[&str] = &["Log/CloudWatch", "Log/S3", "Monitoring/Healthd"];
+
+/// The add-on that runs a WORKER environment, so an add-on only of a version
+/// whose branch supports [`WORKER_TIER`]. See [`ALWAYS_SUPPORTED_ADDONS`].
+const WORKER_ADDON: &str = "WorkerDaemon/SQSD";
+
+/// The worker tier, from `PlatformBranchSummary$SupportedTierList`: "Possible
+/// values: `WebServer/Standard` | `Worker/SQS/HTTP`".
+const WORKER_TIER: &str = "Worker/SQS/HTTP";
+
+/// `PlatformLifecycleState` of a version that is its branch's recommended one,
+/// from `PlatformDescription$PlatformLifecycleState` ("Possible values:
+/// `Recommended` | `null`").
+const RECOMMENDED: &str = "Recommended";
+
+/// The runtime and the operating system text a branch name is built from:
+/// `<runtime> running on <os>`. This suite's own split of the published form, so
+/// the expectations do not come from the service's.
+fn runtime_and_operating_system(branch_name: &str) -> (&str, &str) {
+    branch_name
+        .split_once(" running on ")
+        .unwrap_or_else(|| panic!("the catalog branch {branch_name:?} names its operating system"))
+}
+
+/// The `OperatingSystemName` and `OperatingSystemVersion` a branch name states:
+/// the operating system text is `64bit <name> <version>`, so the width prefix
+/// goes, a trailing numeric component is the version and what precedes it is the
+/// name.
+fn operating_system(branch_name: &str) -> (String, Option<String>) {
+    let (_, os) = runtime_and_operating_system(branch_name);
+    let os = os.strip_prefix("64bit ").unwrap_or(os);
+    match os.rsplit_once(' ') {
+        Some((name, version))
+            if !version.is_empty()
+                && version
+                    .chars()
+                    .all(|character| character.is_ascii_digit() || character == '.') =>
+        {
+            (name.to_string(), Some(version.to_string()))
+        }
+        _ => (os.to_string(), None),
+    }
+}
+
+/// The `Description` a published version reports: its solution stack name
+/// without the version component, i.e. `<os> running <runtime>`.
+fn description(branch_name: &str) -> String {
+    let (runtime, os) = runtime_and_operating_system(branch_name);
+    format!("{os} running {runtime}")
+}
+
+/// `state` with its first letter capitalized — this suite's statement of the
+/// form a PLATFORM VERSION reports a branch life-cycle state in
+/// (`PlatformDescription$PlatformBranchLifecycleState`: "`Beta` | `Supported` |
+/// `Deprecated` | `Retired`").
+fn capitalized(state: &str) -> String {
+    let mut characters = state.chars();
+    match characters.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + characters.as_str(),
+        None => String::new(),
+    }
+}
+
+/// The add-ons a version whose branch supports `tiers` must report.
+fn expected_addons(tiers: &[String]) -> Vec<String> {
+    let mut addons: Vec<String> = ALWAYS_SUPPORTED_ADDONS
+        .iter()
+        .map(|addon| (*addon).to_string())
+        .collect();
+    if tiers.iter().any(|tier| tier == WORKER_TIER) {
+        addons.push(WORKER_ADDON.to_string());
+    }
+    addons.sort();
+    addons
+}
+
+/// The branch record the store holds for `branch_name`, as
+/// `(LifecycleState, SupportedTierList)` — the one place a version's branch
+/// attributes are held, so the expectation for them is read from there rather
+/// than written out per row.
+fn branch_of(emulator: &Emulator, branch_name: &str) -> (String, Vec<String>) {
+    let state = emulator.store();
+    let store = state.lock();
+    let branch = store
+        .platform_branch_named(branch_name)
+        .unwrap_or_else(|| panic!("the catalog holds the branch {branch_name:?}"));
+    (branch.lifecycle_state.clone(), branch.supported_tiers.clone())
+}
+
+/// The ONE summary `ListPlatformVersions` reports for the platform branch
+/// `branch_name`, as its own XML.
+///
+/// Asked for with the `PlatformBranchName` filter the operation models, so this
+/// is also the single-version filtered answer; the catalog publishes exactly one
+/// version per branch, so the answer must hold exactly one member.
+async fn summary_of(emulator: &Emulator, branch_name: &str, case: &str) -> Answer {
+    let answer = emulator
+        .call(
+            "ListPlatformVersions",
+            &[
+                ("Filters.member.1.Type", "PlatformBranchName"),
+                ("Filters.member.1.Operator", "="),
+                ("Filters.member.1.Values.member.1", branch_name),
+            ],
+        )
+        .await;
+    assert_eq!(
+        answer.status, 200,
+        "case {case:?}: expected 200 from ListPlatformVersions, got {} and body {}",
+        answer.status, answer.body
+    );
+    let mut members = answer.elements_at("PlatformSummaryList/member");
+    assert_eq!(
+        members.len(),
+        1,
+        "case {case:?}: the branch publishes exactly one version, got {} in {}",
+        members.len(),
+        answer.body
+    );
+    members.remove(0)
+}
+
+/// The `PlatformDescription` `DescribePlatformVersion` reports for `arn`, as its
+/// own XML.
+async fn description_of(emulator: &Emulator, arn: &str, case: &str) -> Answer {
+    let answer = emulator
+        .call("DescribePlatformVersion", &[("PlatformArn", arn)])
+        .await;
+    assert_eq!(
+        answer.status, 200,
+        "case {case:?}: expected 200 from DescribePlatformVersion, got {} and body {}",
+        answer.status, answer.body
+    );
+    let mut described = answer.elements_at("PlatformDescription");
+    assert_eq!(
+        described.len(),
+        1,
+        "case {case:?}: expected one PlatformDescription, got {}",
+        answer.body
+    );
+    described.remove(0)
+}
+
+/// The `<member>` values of the list `wrapper` inside `answer`.
+fn list(answer: &Answer, wrapper: &str) -> Vec<String> {
+    answer
+        .values_at(&format!("{wrapper}/member"))
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+/// The `(Name, Version)` pairs of the `wrapper` list inside `answer` — how both
+/// `ProgrammingLanguages` and `Frameworks` are modelled.
+fn named_versions(answer: &Answer, wrapper: &str) -> Vec<(String, Option<String>)> {
+    answer
+        .elements_at(&format!("{wrapper}/member"))
+        .into_iter()
+        .map(|member| {
+            (
+                member.value("Name").unwrap_or_default().to_string(),
+                member.value("Version").map(str::to_string),
+            )
+        })
+        .collect()
+}
+
+/// A catalog row's `(Name, Version)` pairs as the response must carry them: a
+/// row that states no version for a name reports the name without one.
+fn catalog_pairs(pairs: &[(&str, &str)]) -> Vec<(String, Option<String>)> {
+    pairs
+        .iter()
+        .map(|(name, version)| {
+            (
+                (*name).to_string(),
+                (!version.is_empty()).then(|| (*version).to_string()),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn every_published_version_summarises_its_catalog_record() {
+    let emulator = Emulator::new();
+
+    for stack in eb::state::SOLUTION_STACKS {
+        let case = stack.branch_name;
+        let (branch_state, tiers) = branch_of(&emulator, stack.branch_name);
+        let summary = summary_of(&emulator, stack.branch_name, case).await;
+        let (os_name, os_version) = operating_system(stack.branch_name);
+
+        assert_eq!(
+            summary.value("PlatformArn"),
+            Some(stack.platform_arn(TEST_REGION).as_str()),
+            "case {case:?}: the summary must name this catalog version, got {}",
+            summary.body
+        );
+        assert_eq!(
+            summary.value("PlatformCategory"),
+            Some(stack.platform_category),
+            "case {case:?}: expected the catalog's PlatformCategory {:?}, got {}",
+            stack.platform_category,
+            summary.body
+        );
+        assert_eq!(
+            summary.value("OperatingSystemName"),
+            Some(os_name.as_str()),
+            "case {case:?}: expected OperatingSystemName {os_name:?}, got {}",
+            summary.body
+        );
+        assert_eq!(
+            summary.value("OperatingSystemVersion").map(str::to_string),
+            os_version,
+            "case {case:?}: expected OperatingSystemVersion {os_version:?}, got {}",
+            summary.body
+        );
+        assert_eq!(
+            list(&summary, "SupportedAddonList"),
+            expected_addons(&tiers),
+            "case {case:?}: expected the add-ons the branch's tiers {tiers:?} imply, got {}",
+            summary.body
+        );
+        assert_eq!(
+            list(&summary, "SupportedTierList"),
+            tiers,
+            "case {case:?}: a version runs exactly the tiers its branch supports, got {}",
+            summary.body
+        );
+        assert_eq!(
+            summary.value("PlatformLifecycleState"),
+            Some(RECOMMENDED),
+            "case {case:?}: the published version of a branch is its recommended one, got {}",
+            summary.body
+        );
+        assert_eq!(
+            summary.value("PlatformBranchLifecycleState").map(str::to_string),
+            Some(capitalized(&branch_state)),
+            "case {case:?}: expected the branch's own state {branch_state:?}, capitalized, got {}",
+            summary.body
+        );
+        assert_eq!(
+            summary.value("PlatformBranchName"),
+            Some(stack.branch_name),
+            "case {case:?}: expected the branch the version belongs to, got {}",
+            summary.body
+        );
+        assert_eq!(
+            summary.value("PlatformVersion"),
+            Some(stack.platform_version),
+            "case {case:?}: expected the catalog's PlatformVersion, got {}",
+            summary.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn every_published_version_is_described_in_full_from_the_same_record() {
+    let emulator = Emulator::new();
+    // Every machine image the catalog published, so no two versions can be
+    // reported as sharing one.
+    let mut minted_image_ids: Vec<String> = Vec::new();
+
+    for stack in eb::state::SOLUTION_STACKS {
+        let case = stack.branch_name;
+        let (branch_state, tiers) = branch_of(&emulator, stack.branch_name);
+        let arn = stack.platform_arn(TEST_REGION);
+        let described = description_of(&emulator, &arn, case).await;
+        let (os_name, os_version) = operating_system(stack.branch_name);
+
+        // The members a summary carries too, from the one record.
+        assert_eq!(
+            described.value("PlatformCategory"),
+            Some(stack.platform_category),
+            "case {case:?}: expected the catalog's PlatformCategory, got {}",
+            described.body
+        );
+        assert_eq!(
+            described.value("OperatingSystemName"),
+            Some(os_name.as_str()),
+            "case {case:?}: expected OperatingSystemName {os_name:?}, got {}",
+            described.body
+        );
+        assert_eq!(
+            described.value("OperatingSystemVersion").map(str::to_string),
+            os_version,
+            "case {case:?}: expected OperatingSystemVersion {os_version:?}, got {}",
+            described.body
+        );
+        assert_eq!(
+            list(&described, "SupportedAddonList"),
+            expected_addons(&tiers),
+            "case {case:?}: expected the add-ons the branch's tiers {tiers:?} imply, got {}",
+            described.body
+        );
+        assert_eq!(
+            list(&described, "SupportedTierList"),
+            tiers,
+            "case {case:?}: a version runs exactly the tiers its branch supports, got {}",
+            described.body
+        );
+        assert_eq!(
+            described.value("PlatformLifecycleState"),
+            Some(RECOMMENDED),
+            "case {case:?}: the published version of a branch is its recommended one, got {}",
+            described.body
+        );
+        assert_eq!(
+            described
+                .value("PlatformBranchLifecycleState")
+                .map(str::to_string),
+            Some(capitalized(&branch_state)),
+            "case {case:?}: expected the branch's own state {branch_state:?}, capitalized, got {}",
+            described.body
+        );
+
+        // And the detail only the description models.
+        assert_eq!(
+            described.value("Description").map(str::to_string),
+            Some(description(stack.branch_name)),
+            "case {case:?}: expected the solution stack without its version component, got {}",
+            described.body
+        );
+        assert_eq!(
+            described.value("Maintainer"),
+            Some(eb::state::MANAGED_PLATFORM_MAINTAINER),
+            "case {case:?}: a service-published version is maintained by the service, got {}",
+            described.body
+        );
+        assert_eq!(
+            named_versions(&described, "ProgrammingLanguages"),
+            catalog_pairs(stack.programming_languages),
+            "case {case:?}: expected the languages the catalog states, got {}",
+            described.body
+        );
+        assert_eq!(
+            named_versions(&described, "Frameworks"),
+            catalog_pairs(stack.frameworks),
+            "case {case:?}: expected the frameworks the catalog states, got {}",
+            described.body
+        );
+        // One AMI entry per virtualization type the platform publishes images
+        // for, each naming a machine image in the `ami-` long-id form EC2 issues
+        // one in.
+        let amis: Vec<(String, Option<String>)> = described
+            .elements_at("CustomAmiList/member")
+            .into_iter()
+            .map(|member| {
+                (
+                    member
+                        .value("VirtualizationType")
+                        .unwrap_or_default()
+                        .to_string(),
+                    member.value("ImageId").map(str::to_string),
+                )
+            })
+            .collect();
+        assert_eq!(
+            amis.iter()
+                .map(|(virtualization_type, _)| virtualization_type.as_str())
+                .collect::<Vec<&str>>(),
+            // The two EC2 virtualization types, spelled out here rather than
+            // read from the service, so this assertion stands on its own.
+            vec!["pv", "hvm"],
+            "case {case:?}: expected one AMI per virtualization type, got {}",
+            described.body
+        );
+        for (virtualization_type, image_id) in &amis {
+            let image_id = image_id.clone().unwrap_or_default();
+            assert!(
+                image_id
+                    .strip_prefix("ami-")
+                    .is_some_and(|body| body.len() == 17
+                        && body.chars().all(|character| character.is_ascii_hexdigit()
+                            && !character.is_ascii_uppercase())),
+                "case {case:?}: the {virtualization_type} image must carry an ami- id of 17 \
+                 lowercase hex characters, got {image_id:?}"
+            );
+            minted_image_ids.push(image_id);
+        }
+        // The publication instants: both present, both the same instant, since
+        // the catalog has not been re-published since it was seeded.
+        let created = described.expect("DateCreated", case);
+        let updated = described.expect("DateUpdated", case);
+        assert_eq!(
+            instant(created, case),
+            instant(updated, case),
+            "case {case:?}: a catalog version was published once, got {created:?} and {updated:?}"
+        );
+    }
+
+    // An image id identifies one image: no two of the catalog's published images
+    // share one.
+    let mut unique = minted_image_ids.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(
+        unique.len(),
+        minted_image_ids.len(),
+        "case \"published images\": every published ImageId must be unique, got \
+         {minted_image_ids:?}"
+    );
+}
+
+#[tokio::test]
+async fn the_two_calls_report_one_record_and_reading_it_changes_nothing() {
+    let emulator = Emulator::new();
+    // The rows the issue did not cite: a Windows platform (one tier, a
+    // framework, a language with no version) and a Docker platform (no language
+    // at all), plus the first row of the catalog.
+    let rows = [
+        "IIS 10.0 running on 64bit Windows Server 2019",
+        "Docker running on 64bit Amazon Linux 2023",
+        eb::state::SOLUTION_STACKS
+            .first()
+            .expect("the catalog publishes at least one version")
+            .branch_name,
+    ];
+
+    for branch_name in rows {
+        let case = branch_name;
+        let stack = eb::state::SOLUTION_STACKS
+            .iter()
+            .find(|stack| stack.branch_name == branch_name)
+            .unwrap_or_else(|| panic!("case {case:?}: the catalog publishes this branch"));
+        let arn = stack.platform_arn(TEST_REGION);
+
+        let summary = summary_of(&emulator, branch_name, case).await;
+        let first = description_of(&emulator, &arn, case).await;
+        // Every member both shapes model must carry the same value in both.
+        for member in [
+            "PlatformArn",
+            "PlatformOwner",
+            "PlatformStatus",
+            "PlatformCategory",
+            "OperatingSystemName",
+            "OperatingSystemVersion",
+            "PlatformLifecycleState",
+            "PlatformVersion",
+            "PlatformBranchName",
+            "PlatformBranchLifecycleState",
+        ] {
+            assert_eq!(
+                summary.value(member),
+                first.value(member),
+                "case {case:?}: ListPlatformVersions and DescribePlatformVersion must report one \
+                 record, they disagree on {member}: {:?} against {:?}",
+                summary.value(member),
+                first.value(member)
+            );
+        }
+        for wrapper in ["SupportedTierList", "SupportedAddonList"] {
+            assert_eq!(
+                list(&summary, wrapper),
+                list(&first, wrapper),
+                "case {case:?}: the two calls must report one {wrapper}"
+            );
+        }
+
+        // A read reports; it does not move what a later caller sees.
+        let second = description_of(&emulator, &arn, case).await;
+        assert_eq!(
+            second.body, first.body,
+            "case {case:?}: describing a published version twice must answer the same record"
+        );
+    }
+}
+
+/// One filter term over a member this change projects, and the rule it selects
+/// by — stated over the catalog row and the tiers its branch supports, rather
+/// than over a recorded answer.
+struct FilterCase {
+    case: &'static str,
+    attribute: &'static str,
+    value: &'static str,
+    holds: fn(&eb::state::SolutionStack, &[String]) -> bool,
+}
+
+#[tokio::test]
+async fn a_filter_term_on_a_projected_member_selects_by_the_catalog() {
+    let emulator = Emulator::new();
+
+    let cases: &[FilterCase] = &[
+        // The operating system, on both of the two the catalog publishes.
+        FilterCase {
+            case: "OperatingSystemName = Amazon Linux",
+            attribute: "OperatingSystemName",
+            value: "Amazon Linux",
+            holds: |stack, _tiers| operating_system(stack.branch_name).0 == "Amazon Linux",
+        },
+        FilterCase {
+            case: "OperatingSystemName = Windows Server",
+            attribute: "OperatingSystemName",
+            value: "Windows Server",
+            holds: |stack, _tiers| operating_system(stack.branch_name).0 == "Windows Server",
+        },
+        FilterCase {
+            case: "OperatingSystemName = an operating system nothing runs on",
+            attribute: "OperatingSystemName",
+            value: "Plan 9",
+            holds: |_stack, _tiers| false,
+        },
+        // The add-ons: one every published version carries, and the worker
+        // daemon, which only a branch supporting the worker tier does.
+        FilterCase {
+            case: "SupportedAddon = Log/CloudWatch",
+            attribute: "SupportedAddon",
+            value: "Log/CloudWatch",
+            holds: |_stack, _tiers| true,
+        },
+        FilterCase {
+            case: "SupportedAddon = WorkerDaemon/SQSD",
+            attribute: "SupportedAddon",
+            value: WORKER_ADDON,
+            holds: |_stack, tiers| tiers.iter().any(|tier| tier == WORKER_TIER),
+        },
+        // The languages, which only the catalog states: one language it
+        // publishes, and one it does not.
+        FilterCase {
+            case: "ProgrammingLanguageName = Java",
+            attribute: "ProgrammingLanguageName",
+            value: "Java",
+            holds: |stack, _tiers| {
+                stack
+                    .programming_languages
+                    .iter()
+                    .any(|(name, _)| *name == "Java")
+            },
+        },
+        FilterCase {
+            case: "ProgrammingLanguageName = Node.js",
+            attribute: "ProgrammingLanguageName",
+            value: "Node.js",
+            holds: |stack, _tiers| {
+                stack
+                    .programming_languages
+                    .iter()
+                    .any(|(name, _)| *name == "Node.js")
+            },
+        },
+        FilterCase {
+            case: "ProgrammingLanguageName = a language no platform runs",
+            attribute: "ProgrammingLanguageName",
+            value: "COBOL",
+            holds: |_stack, _tiers| false,
+        },
+        // The version life-cycle state, in the spelling the response carries and
+        // in the lower-case one `PlatformFilter$Values` documents: every
+        // published version is its branch's recommended one.
+        FilterCase {
+            case: "PlatformLifecycleState = Recommended",
+            attribute: "PlatformLifecycleState",
+            value: "Recommended",
+            holds: |_stack, _tiers| true,
+        },
+        FilterCase {
+            case: "PlatformLifecycleState = recommended",
+            attribute: "PlatformLifecycleState",
+            value: "recommended",
+            holds: |_stack, _tiers| true,
+        },
+    ];
+
+    for FilterCase {
+        case,
+        attribute,
+        value,
+        holds,
+    } in cases
+    {
+        let answer = emulator
+            .call(
+                "ListPlatformVersions",
+                &[
+                    ("Filters.member.1.Type", attribute),
+                    ("Filters.member.1.Operator", "="),
+                    ("Filters.member.1.Values.member.1", value),
+                ],
+            )
+            .await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: expected 200, got {} and body {}",
+            answer.status, answer.body
+        );
+        let selected: Vec<String> = answer
+            .values_at("PlatformSummaryList/member/PlatformArn")
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let mut expected: Vec<String> = eb::state::SOLUTION_STACKS
+            .iter()
+            .filter(|stack| {
+                let (_, tiers) = branch_of(&emulator, stack.branch_name);
+                holds(stack, &tiers)
+            })
+            .map(|stack| stack.platform_arn(TEST_REGION))
+            .collect();
+        expected.sort();
+        let mut selected_sorted = selected.clone();
+        selected_sorted.sort();
+        assert_eq!(
+            selected_sorted, expected,
+            "case {case:?}: the term must select exactly the catalog versions it holds for, got \
+             {selected:?} and body {}",
+            answer.body
+        );
+    }
+}

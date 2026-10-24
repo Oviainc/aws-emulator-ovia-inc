@@ -355,12 +355,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
 
-        // The stack record, built and its template DEPLOYED before the store is locked:
-        // reading a caller-sized template body and evaluating its expressions is work the
-        // request paid for, and doing it outside the critical section keeps one caller's
-        // template from holding the lock every other CloudFormation request needs. The
-        // stack id is minted here too (it is drawn, not read from the store), so nothing
-        // below the lock has to compute anything from the body.
+        // The stack record, built before the store is locked: reading a caller-sized
+        // template body is work the request paid for, and doing it outside the critical
+        // section keeps one caller's template from holding the lock every other
+        // CloudFormation request needs. The stack id is minted here too (it is drawn, not
+        // read from the store), so nothing below the lock has to compute anything from the
+        // body.
         let operation_id = crate::state::new_operation_id();
         let mut stack = StoredStack::new(
             crate::state::new_stack_id(&region, &input.stack_name),
@@ -393,6 +393,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         stack.client_request_token = input.client_request_token.clone();
         stack.stack_policy_body = input.stack_policy_body.clone();
         stack.resource_types = input.resource_types.clone().unwrap_or_default();
+
         // Everything the template's resources and outputs are computed from is now in
         // place: materialise the resources it declares and evaluate its outputs, which
         // `DescribeStacks` reports once the create completes.
