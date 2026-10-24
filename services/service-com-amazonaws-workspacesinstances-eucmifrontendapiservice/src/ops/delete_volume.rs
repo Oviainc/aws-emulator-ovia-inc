@@ -136,7 +136,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // A regional resource is deletable only through the Region it was created in,
+        // which travels in the request's credential scope.
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteVolumeErrorModeled::InternalServerException(
                 InternalServerException {
@@ -149,28 +151,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
 
         // "Deletes a specified volume": the record goes, so a second delete of the same
-        // id is not-found, and the volume quota — which is derived by counting
-        // `state.volumes` (`has_volume_capacity`), not a separate counter — regains the
+        // id is not-found, and the volume quota — which is derived by counting the
+        // Region's volumes (`has_volume_capacity`), not a separate counter — regains the
         // capacity this record held. An id that satisfies the modelled `VolumeId` shape
-        // but names no stored volume is `ResourceNotFoundException`, never a success;
-        // it goes through `crate::state::volume_not_found_error` so this path answers
-        // the same (status, code) pair as every other not-found in this service.
+        // but names no volume THIS REGION holds — because it was never minted, or
+        // because the volume it names belongs to another Region — is
+        // `ResourceNotFoundException`, never a success; it goes through
+        // `crate::state::volume_not_found_error` so this path answers the same
+        // (status, code) pair as every other not-found in this service.
         //
         // The modelled `ConflictException` covers the real service's refusal to delete a
         // volume that is in use; nothing can put a volume in use while `AssociateVolume`
         // is still a scaffold (its own stub issue), so no attachment state exists to
         // check here and the refusal is deliberately not invented.
-        let Some(removed) = state.volumes.remove(&input.volume_id) else {
+        // The removal also retires the creating `ClientToken` with the record (the
+        // token identifies that create call, and replaying it must not hand back an id
+        // that no longer exists), so nothing is left to clean up here.
+        if state.remove_volume(&region, &input.volume_id).is_none() {
             return Err(crate::state::volume_not_found_error(
                 &input.volume_id,
                 DeleteVolumeErrorModeled::ResourceNotFoundException,
             ));
-        };
-
-        // Retire the creating `ClientToken` with the record: the token identifies that
-        // create call, and replaying it must not hand back an id that no longer exists.
-        if let Some(token) = removed.client_token {
-            state.volume_client_tokens.remove(&token);
         }
 
         Ok(DeleteVolumeOutput {})

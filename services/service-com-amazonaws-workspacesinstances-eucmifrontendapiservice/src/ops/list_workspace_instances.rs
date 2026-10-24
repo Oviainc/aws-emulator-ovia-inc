@@ -141,7 +141,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // A regional resource is listed only through the Region it was created in,
+        // which travels in the request's credential scope: this page reports the
+        // account's instances IN THAT REGION and no other's.
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListWorkspaceInstancesErrorModeled::InternalServerException(
                 InternalServerException {
@@ -197,6 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let matching = from_resume
             .map(|(_, record)| record)
+            .filter(|record| record.region == region)
             .filter(|record| {
                 // An absent `ProvisionStates` is no filter, and so is an empty list:
                 // the member asks which states to keep, and naming none asks for no

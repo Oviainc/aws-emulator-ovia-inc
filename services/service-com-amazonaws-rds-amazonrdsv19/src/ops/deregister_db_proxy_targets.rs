@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeregisterDBProxyTargets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeregisterDBProxyTargets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Removes DB instances or DB clusters from a proxy's target group, so
+//! `DescribeDBProxyTargets` no longer reports them. This is the ONLY file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeregisterDBProxyTargets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The three not-found faults this operation models answer three different misses, and a
+//! client branches on which: an unknown `DBProxyName` is `DBProxyNotFoundFault`, a target
+//! group that is not the proxy's one group is `DBProxyTargetGroupNotFoundFault`, and a
+//! database that is not registered with it is `DBProxyTargetNotFoundFault`.
 //!
 //! ## Shape of an operation
 //!
@@ -150,18 +149,116 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeregisterDBProxyTargets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeregisterDBProxyTargetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeregisterDBProxyTargets"))
+        let region =
+            crate::state::request_region(ctx).map_err(DeregisterDBProxyTargetsError::validation)?;
+        let instances = input.db_instance_identifiers.unwrap_or_default();
+        let clusters = input.db_cluster_identifiers.unwrap_or_default();
+        for (member, values) in [
+            ("DBInstanceIdentifiers", &instances),
+            ("DBClusterIdentifiers", &clusters),
+        ] {
+            crate::state::check_request_list_len(
+                member,
+                values.len(),
+                crate::state::DB_PROXY_TARGET_QUOTA_PER_PROXY,
+            )
+            .map_err(DeregisterDBProxyTargetsError::invalid_parameter_value)?;
+        }
+        if instances.is_empty() && clusters.is_empty() {
+            return Err(
+                DeregisterDBProxyTargetsError::invalid_parameter_combination(
+                    "name at least one of DBInstanceIdentifiers or DBClusterIdentifiers: a \
+                     deregistration with neither deregisters nothing",
+                ),
+            );
+        }
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated deregistration.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        store.settle_due_transitions(&region);
+
+        // RDS is regional: only the region the request was signed for is in scope.
+        let key = (region.clone(), input.db_proxy_name.clone());
+        let Some(proxy) = store.db_proxies.get(&key) else {
+            return Err(DeregisterDBProxyTargetsErrorModeled::DBProxyNotFoundFault(
+                DBProxyNotFoundFault {
+                    message: Some(format!("DBProxy {} not found.", input.db_proxy_name)),
+                },
+            )
+            .into());
+        };
+        if let Err(message) = crate::state::check_target_group_name(
+            &input.db_proxy_name,
+            input.target_group_name.as_deref(),
+        ) {
+            return Err(
+                DeregisterDBProxyTargetsErrorModeled::DBProxyTargetGroupNotFoundFault(
+                    DBProxyTargetGroupNotFoundFault {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
+        if proxy.status != crate::state::DB_PROXY_STATUS_AVAILABLE {
+            return Err(
+                DeregisterDBProxyTargetsErrorModeled::InvalidDBProxyStateFault(
+                    InvalidDBProxyStateFault {
+                        message: Some(format!(
+                            "DB proxy {} is in state {} and cannot have targets deregistered",
+                            input.db_proxy_name, proxy.status
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Every target the request names is resolved in the proxy's own target group
+        // BEFORE anything is removed, so a request naming one that is not registered
+        // leaves the group exactly as it was.
+        let mut removing: Vec<(String, bool)> = Vec::new();
+        for (identifiers, is_cluster) in [(&instances, false), (&clusters, true)] {
+            for identifier in identifiers {
+                let identifier = identifier.to_ascii_lowercase();
+                if proxy.target_position(&identifier, is_cluster).is_none() {
+                    return Err(
+                        DeregisterDBProxyTargetsErrorModeled::DBProxyTargetNotFoundFault(
+                            DBProxyTargetNotFoundFault {
+                                message: Some(format!(
+                                    "{identifier} is not registered with DB proxy {}",
+                                    input.db_proxy_name
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                removing.push((identifier, is_cluster));
+            }
+        }
+
+        let now = crate::state::now_as_wire_timestamp();
+        let proxy = store
+            .db_proxies
+            .get_mut(&key)
+            .expect("the proxy was found above and the store is locked");
+        proxy.targets.retain(|target| {
+            !removing
+                .iter()
+                .any(|(identifier, is_cluster)| {
+                    target.identifier == *identifier && target.is_cluster == *is_cluster
+                })
+        });
+        proxy.updated_date = now;
+
+        // The operation's output shape carries no member: the deregistration is the whole
+        // answer, and `DescribeDBProxyTargets` is what reports what is left.
+        Ok(DeregisterDBProxyTargetsOutput {})
     }
 }

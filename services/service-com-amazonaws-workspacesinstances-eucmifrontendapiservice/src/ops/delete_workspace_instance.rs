@@ -138,7 +138,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // A regional resource is deletable only through the Region it was created in,
+        // which travels in the request's credential scope.
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteWorkspaceInstanceErrorModeled::InternalServerException(
                 InternalServerException {
@@ -159,7 +161,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ProvisionStates` filter naming that state — until the teardown has finished
         // and the record's retention has elapsed. Removing it inside the request would
         // make a state the model declares unobservable.
-        let Some(record) = state.settled_mut(&input.workspace_instance_id, now) else {
+        let Some(record) = state.settled_mut(&region, &input.workspace_instance_id, now) else {
             return Err(crate::state::instance_not_found_error(
                 &input.workspace_instance_id,
                 DeleteWorkspaceInstanceErrorModeled::ResourceNotFoundException,

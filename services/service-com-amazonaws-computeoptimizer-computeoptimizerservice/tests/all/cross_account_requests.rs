@@ -58,10 +58,11 @@ const READERS: [(&str, &str, bool); 8] = [
         "ecsServiceRecommendations",
         false,
     ),
-    // An idle resource recommendation is produced by Compute Optimizer's own analysis of an
-    // observed workload and no operation of this API creates one, so the store this suite
-    // starts with holds none.
-    ("GetIdleRecommendations", "idleRecommendations", false),
+    // The idle resource analysis is part of the store's initial value, the way the volume,
+    // group, function and license observations are: Compute Optimizer's own analysis of an
+    // observed workload is what finds a resource idle, and no operation of this API creates
+    // one.
+    ("GetIdleRecommendations", "idleRecommendations", true),
 ];
 
 /// The refusal every reader answers a request about another account with: the constant this

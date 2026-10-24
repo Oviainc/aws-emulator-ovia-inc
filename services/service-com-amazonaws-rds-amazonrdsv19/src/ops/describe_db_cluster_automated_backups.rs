@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDBClusterAutomatedBackups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDBClusterAutomatedBackups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the automated backups of the DB clusters this service holds. This is the ONLY
+//! file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDBClusterAutomatedBackups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An automated backup is not a record a caller creates: a DB cluster HAS one exactly while
+//! it retains automated backups ("the number of days for which automated backups are
+//! retained"), so every backup reported here is projected from the cluster it is of, and a
+//! cluster that retains none has none to report. An identifier that resolves to no such
+//! backup is `DBClusterAutomatedBackupNotFoundFault`.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +162,121 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDBClusterAutomatedBackups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDBClusterAutomatedBackupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDBClusterAutomatedBackups"))
+        let region = crate::state::request_region(ctx)
+            .map_err(DescribeDBClusterAutomatedBackupsError::validation)?;
+        let page_size = crate::state::check_max_records(input.max_records)
+            .map_err(DescribeDBClusterAutomatedBackupsError::invalid_parameter_value)?;
+        let filters = input.filters.unwrap_or_default();
+        check_filter_names(&filters)
+            .map_err(DescribeDBClusterAutomatedBackupsError::invalid_parameter_value)?;
+        crate::state::check_filter_terms(&filters)
+            .map_err(DescribeDBClusterAutomatedBackupsError::invalid_parameter_value)?;
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated empty list.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // A report materialises the transitions the clock already made due: the ones owed
+        // at this instant whether or not anybody called.
+        store.settle_due_transitions(&region);
+
+        // RDS is regional: a request sees only the automated backups of the region it was
+        // signed for, and only the clusters that retain any have one at all.
+        let mut candidates: Vec<&crate::state::DbClusterRecord> = store
+            .clusters_in(&region)
+            .into_iter()
+            .filter(|cluster| cluster.has_automated_backup())
+            .collect();
+        // "The user-supplied DB cluster identifier" and "the resource ID of the DB
+        // cluster" each narrow the report to one cluster's backup, and a value that
+        // resolves to no backup is the modelled not-found fault — which is also the answer
+        // for a cluster that exists but retains no automated backups.
+        if let Some(requested) = &input.db_cluster_identifier {
+            let identifier =
+                crate::state::db_cluster_identifier_of(requested).to_ascii_lowercase();
+            candidates.retain(|cluster| cluster.identifier == identifier);
+            if candidates.is_empty() {
+                return Err(not_found(requested));
+            }
+        }
+        if let Some(requested) = &input.db_cluster_resource_id {
+            candidates.retain(|cluster| cluster.resource_id == *requested);
+            if candidates.is_empty() {
+                return Err(not_found(requested));
+            }
+        }
+
+        let matching: Vec<(String, DBClusterAutomatedBackup)> = candidates
+            .into_iter()
+            .filter(|cluster| filters.iter().all(|filter| matches_filter(cluster, filter)))
+            // Keyed by the cluster's immutable resource id, so a page boundary is a cursor
+            // that cannot move when a cluster is renamed.
+            .map(|cluster| (cluster.resource_id.clone(), cluster.automated_backup_to_wire()))
+            .collect();
+
+        // A `Marker` no prior page issued is refused rather than resynchronised: see
+        // `crate::state::paginate`.
+        let page = crate::state::paginate(matching, input.marker.as_deref(), page_size)
+            .map_err(DescribeDBClusterAutomatedBackupsError::invalid_parameter_value)?;
+        Ok(DescribeDBClusterAutomatedBackupsOutput {
+            marker: page.next_marker,
+            db_cluster_automated_backups: Some(page.items),
+        })
     }
+}
+
+/// The modelled not-found fault for a value that resolves to no automated backup.
+fn not_found(requested: &str) -> DescribeDBClusterAutomatedBackupsError {
+    DescribeDBClusterAutomatedBackupsErrorModeled::DBClusterAutomatedBackupNotFoundFault(
+        DBClusterAutomatedBackupNotFoundFault {
+            message: Some(format!(
+                "No automated backup for DB cluster {requested} was found."
+            )),
+        },
+    )
+    .into()
+}
+
+/// The filter names this operation's `Filters` member documents: "`status`",
+/// "`db-cluster-id`" and "`db-cluster-resource-id`". RDS refuses any other name, and so
+/// does this operation — with a 400, because quietly ignoring a filter would report backups
+/// the caller excluded.
+const SUPPORTED_FILTER_NAMES: [&str; 3] = ["status", "db-cluster-id", "db-cluster-resource-id"];
+
+/// Refuse a filter this operation does not support. "Filter names are case-sensitive."
+fn check_filter_names(filters: &[Filter]) -> Result<(), String> {
+    for filter in filters {
+        if !SUPPORTED_FILTER_NAMES.contains(&filter.name.as_str()) {
+            return Err(format!(
+                "unrecognized filter name: {}; supported filters are {}",
+                filter.name,
+                SUPPORTED_FILTER_NAMES.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether the backup of `cluster` matches one filter: true when any of the filter's values
+/// matches the member that filter names. "Filter values are case-sensitive."
+fn matches_filter(cluster: &crate::state::DbClusterRecord, filter: &Filter) -> bool {
+    filter.values.iter().any(|wanted| match filter.name.as_str() {
+        // The member documents one value for this filter, `retained` — "automated backups
+        // for deleted clusters" — which is the status of a backup whose cluster is gone; a
+        // backup reported here belongs to a cluster that is still stored, so it is `active`
+        // and a request filtering for `retained` matches none of them.
+        "status" => *wanted == crate::state::DB_CLUSTER_AUTOMATED_BACKUP_STATUS_ACTIVE,
+        // "Accepts DB cluster identifiers and Amazon Resource Names (ARNs)."
+        "db-cluster-id" => *wanted == cluster.identifier || *wanted == cluster.arn(),
+        // "Accepts DB resource identifiers and Amazon Resource Names (ARNs)."
+        "db-cluster-resource-id" => {
+            *wanted == cluster.resource_id || *wanted == cluster.automated_backup_arn()
+        }
+        // Unreachable: `check_filter_names` has already refused every name outside
+        // `SUPPORTED_FILTER_NAMES`. A `&str` match needs the arm all the same.
+        _ => false,
+    })
 }
