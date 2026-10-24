@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetApplicationAccessScope
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetApplicationAccessScope`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports the `AuthorizedTargets` of one access scope of an application
+//! stored in this service's state (`crate::state`). This is the ONLY file to touch for
+//! this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetApplicationAccessScope::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pure REPORT: it answers from the scope `PutApplicationAccessScope` stored on the
+//! application record and writes nothing beyond the instance transitions the clock
+//! already owes. `AuthorizedTargets` is ABSENT for a scope put without any, since
+//! `ScopeTargets` is `length 1..10` and cannot express an empty list. An `ApplicationArn`
+//! this account holds no application for, and a `Scope` the application does not carry,
+//! are both refused the modelled `ResourceNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +159,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetApplicationAccessScope` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetApplicationAccessScopeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetApplicationAccessScope"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetApplicationAccessScopeErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the SSO Admin state store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // A REPORT, so the only thing it writes is what the CLOCK already owes every
+        // instance at this instant — the same transitions a read made a moment later
+        // would have applied anyway.
+        store.on_request(&region, ::std::time::SystemTime::now());
+
+        let application = store.application(&input.application_arn).ok_or_else(|| {
+            GetApplicationAccessScopeErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::application_not_found_message(
+                        &input.application_arn,
+                    )),
+                    // The model's `ResourceNotFoundExceptionReason` enum carries only
+                    // `KMS_NotFoundException`, which this is not.
+                    reason: None,
+                },
+            )
+        })?;
+        // A scope the application does not carry is as absent as an application nothing
+        // holds: "Retrieves the authorized targets for an IAM Identity Center access
+        // scope for an application" describes reading a scope that exists, and answering
+        // 200 with no targets would be indistinguishable from a scope stored without any.
+        let authorized_targets = application
+            .access_scopes
+            .get(&input.scope)
+            .ok_or_else(|| {
+                GetApplicationAccessScopeErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::access_scope_not_found_message(
+                            &input.application_arn,
+                            &input.scope,
+                        )),
+                        reason: None,
+                    },
+                )
+            })?
+            .clone();
+        Ok(GetApplicationAccessScopeOutput {
+            scope: input.scope,
+            // Reported from the STORED scope: absent for a scope put with no
+            // `AuthorizedTargets`, since `ScopeTargets` is `length 1..10` and cannot
+            // express an empty list.
+            authorized_targets,
+        })
     }
 }
