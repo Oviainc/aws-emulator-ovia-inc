@@ -25,6 +25,8 @@ mod graph_snapshot_lifecycle;
 mod import_task_lifecycle;
 #[path = "all/import_task_minting.rs"]
 mod import_task_minting;
+#[path = "all/private_graph_endpoint_lifecycle.rs"]
+mod private_graph_endpoint_lifecycle;
 #[path = "all/query_cancellation.rs"]
 mod query_cancellation;
 #[path = "all/resource_tagging.rs"]

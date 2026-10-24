@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeletePrivateGraphEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeletePrivateGraphEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeletePrivateGraphEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: accepts the deletion of the stored private graph endpoint of one graph
+//! in one VPC, and reports the record on its way out.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +145,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeletePrivateGraphEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeletePrivateGraphEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeletePrivateGraphEndpoint"))
+        // The deletion is addressed by the request's two identifiers alone, so nothing
+        // here reads `ctx`.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DeletePrivateGraphEndpointErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the neptune-graph store is not mounted on this engine"
+                            .to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::Instant::now();
+        let mut store = state.lock();
+
+        // An endpoint is addressed as the endpoint of one graph, so a request naming no
+        // stored graph is reported as the missing GRAPH rather than as a missing
+        // endpoint.
+        if store.settled_graph(&input.graph_identifier, now).is_none() {
+            return Err(
+                DeletePrivateGraphEndpointErrorModeled::ResourceNotFoundException(
+                    crate::state::graph_not_found(&input.graph_identifier),
+                )
+                .into(),
+            );
+        }
+
+        // The lookup materialises what the clock already made due, so an endpoint whose
+        // own deletion has already fallen due is gone rather than deletable twice.
+        let Some(endpoint) =
+            store.settled_private_endpoint_mut(&input.graph_identifier, &input.vpc_id, now)
+        else {
+            return Err(
+                DeletePrivateGraphEndpointErrorModeled::ResourceNotFoundException(
+                    crate::state::private_endpoint_not_found(
+                        &input.graph_identifier,
+                        &input.vpc_id,
+                    ),
+                )
+                .into(),
+            );
+        };
+
+        // An endpoint with a transition still outstanding cannot be deleted yet: it is
+        // either still being attached (`CREATING`) or already on its way out
+        // (`DELETING`), which is the same precondition `DeleteGraph` states for a graph
+        // whose status change is in flight. `AVAILABLE` is the only status an endpoint
+        // rests in, and deletion is how it goes away.
+        if endpoint.status != crate::state::PrivateGraphEndpointStatus::Available {
+            let status = endpoint.status.as_wire();
+            return Err(
+                DeletePrivateGraphEndpointErrorModeled::ConflictException(ConflictException {
+                    message: format!(
+                        "the private graph endpoint of graph {} in vpc {} is in status \
+                         {status} and cannot be deleted",
+                        input.graph_identifier, input.vpc_id
+                    ),
+                    reason: None,
+                })
+                .into(),
+            );
+        }
+
+        // The deletion is accepted, so the record this call reports is the endpoint on
+        // its way out: it answers `DELETING` to every read until the clock makes its
+        // removal due (`crate::state::ENDPOINT_DELETION_SPAN`), after which no read
+        // reports it at all.
+        endpoint.begin_deletion(now);
+        Ok(Self::Output::from(&*endpoint))
     }
 }
