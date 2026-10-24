@@ -167,6 +167,21 @@ fn is_modelled_uuid(value: &str) -> bool {
         && value.bytes().all(|b| !b.is_ascii_uppercase())
 }
 
+/// The `Uuid` and the `:<QUALIFIER>` of a reported binding id, or `None` when the value
+/// is not the modelled `UuidWithQualifier` form
+/// (`^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}(:[A-Z0-9_$]+){0,1}$`,
+/// `smithy_query(query="shape",shape="UuidWithQualifier")`) with the qualifier PRESENT:
+/// a binding the service itself made names the agent version that runs for the type.
+fn uuid_and_qualifier(value: &str) -> Option<(&str, &str)> {
+    let (uuid, qualifier) = value.split_once(':')?;
+    let qualified = is_modelled_uuid(uuid)
+        && !qualifier.is_empty()
+        && qualifier
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_' || b == b'$');
+    qualified.then_some((uuid, qualifier))
+}
+
 /// One row of the create table: what differs between rows is the create's input, never
 /// the configuration the rule says is reported.
 #[derive(Debug, Clone)]
@@ -280,8 +295,9 @@ fn assert_reported_configuration(
     for (agent_type, binding) in bound {
         let id = binding.get("aiAgentId").and_then(Value::as_str);
         assert!(
-            id.is_some_and(is_modelled_uuid),
-            "case {case:?}/{agent_type}: expected a modelled Uuid aiAgentId, got {id:?}"
+            id.is_some_and(|id| uuid_and_qualifier(id).is_some()),
+            "case {case:?}/{agent_type}: expected a UuidWithQualifier aiAgentId carrying \
+             the bound agent version, got {id:?}"
         );
         // `enabled` is reported for the one type whose binding the model lets a caller
         // turn off, and that default binding is reported disabled.

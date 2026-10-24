@@ -29,6 +29,8 @@ mod knowledge_base_lifecycle;
 mod modelled_refusals;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/session_configuration.rs"]
+mod session_configuration;
 #[path = "all/session_recommendations.rs"]
 mod session_recommendations;
 #[path = "all/state_roundtrip.rs"]
