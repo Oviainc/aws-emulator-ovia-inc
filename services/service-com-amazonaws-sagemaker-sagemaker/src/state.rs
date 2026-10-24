@@ -727,6 +727,150 @@ pub mod algorithms;
 pub use algorithms::*;
 
 // ---------------------------------------------------------------------------
+// The resource-tagging slice: the ONE `ResourceArn` -> tag-list resolution that
+// `AddTags`, `ListTags` and `DeleteTags` share. A tag belongs to the resource it was
+// attached to, so it lives on that resource's record (every taggable record carries a
+// `tags` field its `Create*` filled from the request's `Tags`) rather than in a second
+// map beside the stores — otherwise a resource would have two tag sets and the
+// `Create*` one would be invisible to `ListTags`.
+//
+// Kept here, beside the hub slice below rather than at either end of the module, for the
+// same reason that one is: this slice belongs to no single resource kind, so it must not
+// sit in the region every new resource slice is appended to.
+// ---------------------------------------------------------------------------
+
+/// The most tags one SageMaker resource holds.
+///
+/// `TagList` is `len 0..50` wherever this service models it — on `AddTags$Tags`,
+/// `ListTags$Tags` and every `Create*$Tags` (`smithy_query shape=TagList`) — so a
+/// resource carrying more than 50 could not be reported at all. A write that would take
+/// a resource past it is refused instead.
+pub const TAGS_PER_RESOURCE_QUOTA: usize = 50;
+
+/// The entity label [`does_not_exist`] names a tag operation's `ResourceArn` by.
+///
+/// `AddTags`, `ListTags` and `DeleteTags` address ANY SageMaker resource kind by ARN —
+/// `ResourceArn`'s pattern constrains only the partition, service, Region and account —
+/// so the refusal for an ARN this account holds no resource under names the generic
+/// entity and the ARN the request sent, which is the only identifier the caller supplied.
+pub const TAGGED_RESOURCE_ENTITY: &str = "Resource";
+
+/// Generates the two tag accessors over the list of stores whose records carry BOTH an
+/// `arn` and a `tags` list, so the reader (`ListTags`) and the writers (`AddTags`,
+/// `DeleteTags`) resolve one ARN through exactly the same stores and cannot disagree
+/// about which resource kinds this service tags.
+///
+/// The list below is EVERY store this service holds whose record carries both, and the
+/// invariant it keeps is checkable with one grep: a record with a `tags: Vec<Tag>` field
+/// and an `arn` that is not in the list would have its tags unreachable, and a tag call
+/// naming it falsely refused. A store that is a slice of its own rather than a plain
+/// `BTreeMap` field joins the list by answering `values`/`values_mut` the way
+/// [`cluster_policy::Store`] does, so this expansion stays one shape.
+///
+/// Every store left out is left out for ONE reason: its record holds no `tags: Vec<Tag>`
+/// field at all, so there is no tag set in it to reach. Named here in full so the
+/// omission is a statement rather than an oversight — a tag call naming one of these
+/// resources is refused with [`does_not_exist`], which is the refusal for an ARN this
+/// resolution holds no TAG SET for:
+///
+/// * `training_jobs`, `hub_contents` and `partner_apps` — AWS does tag these, but the
+///   only writer that could carry a `Tags` list into the record is still a scaffold stub
+///   here (`create_training_job.rs`, `import_hub_content.rs` /
+///   `create_hub_content_reference.rs`, `create_partner_app.rs`), so the record carries
+///   no `tags` field yet. (A test may seed one; the refusal is then approximate for that
+///   seeded record.) Contrast `hubs`, whose `CreateHub` IS implemented and stores
+///   `Tags`, and which is therefore in the list.
+/// * `lineage_groups` — materialised by [`ComAmazonawsSagemakerSagemakerState::ensure_lineage_group`]
+///   rather than created by a request, and SageMaker models no `Tags` anywhere on a
+///   lineage group.
+/// * `pipeline_executions` — `StartPipelineExecution` models no `Tags`.
+/// * `model_card_export_jobs` — `CreateModelCardExportJob` models no `Tags` either
+///   (smithy_query operation=CreateModelCardExportJob), so an export job never carried
+///   a tag set.
+/// * `image_versions` — the tags belong to the image, which is in the list.
+/// * `associations` — an edge between two entities, not a taggable resource.
+///
+/// Each becomes taggable by growing a `tags` field its writer fills and being added to
+/// this one list.
+macro_rules! tag_accessors {
+    ($($store:ident),+ $(,)?) => {
+        impl ComAmazonawsSagemakerSagemakerState {
+            /// The tags of the resource `arn` names, or `None` when no store holds a
+            /// record with that ARN.
+            ///
+            /// A pure read: `ListTags` reports this and writes nothing.
+            pub fn tags_of(&self, arn: &str) -> Option<&[Tag]> {
+                let mut found: Option<&[Tag]> = None;
+                $(
+                    if found.is_none() {
+                        found = self
+                            .$store
+                            .values()
+                            .find(|record| record.arn == arn)
+                            .map(|record| record.tags.as_slice());
+                    }
+                )+
+                found
+            }
+
+            /// The tag list of the resource `arn` names, to add to or remove from, or
+            /// `None` when no store holds a record with that ARN.
+            pub fn tags_mut(&mut self, arn: &str) -> Option<&mut Vec<Tag>> {
+                let mut found: Option<&mut Vec<Tag>> = None;
+                $(
+                    if found.is_none() {
+                        found = self
+                            .$store
+                            .values_mut()
+                            .find(|record| record.arn == arn)
+                            .map(|record| &mut record.tags);
+                    }
+                )+
+                found
+            }
+        }
+    };
+}
+
+tag_accessors!(
+    actions,
+    ai_benchmark_jobs,
+    ai_workload_configs,
+    algorithms,
+    app_image_configs,
+    apps,
+    artifacts,
+    auto_ml_jobs_v2,
+    clusters,
+    cluster_policies,
+    code_repositories,
+    compute_quotas,
+    contexts,
+    endpoint_configs,
+    endpoints,
+    experiments,
+    feature_groups,
+    hubs,
+    images,
+    inference_components,
+    inference_recommendations_jobs,
+    mlflow_apps,
+    mlflow_tracking_servers,
+    model_cards,
+    model_package_groups,
+    model_packages,
+    models,
+    notebook_instance_lifecycle_configs,
+    notebook_instances,
+    pipelines,
+    processing_jobs,
+    transform_jobs,
+    trial_components,
+    trials,
+    tuning_jobs,
+);
+
+// ---------------------------------------------------------------------------
 // The hub slice: the records `ListHubContents` reports. Kept here, beside the first
 // resource record rather than at either end of the module, so it does not sit in the
 // region every new resource slice is appended to.
@@ -1540,7 +1684,7 @@ pub struct AppImageConfig {
 ///
 /// `GitConfig` is required on create, so it is stored unconditionally; the reader's
 /// member is optional only because the model marks it so. `tags` is stored so a later
-/// `ListTags` reports what the create carried; no implemented operation surfaces it yet.
+/// `ListTags` reports what the create carried.
 /// `last_modified_time` is carried separately from `creation_time` because the modelled
 /// output reports both; a repository nothing has changed reports the creation instant.
 #[derive(Debug, Clone)]
@@ -4257,8 +4401,8 @@ pub struct Context {
     pub properties: Option<BTreeMap<String, String>>,
     pub created_by: UserContext,
     pub last_modified_by: UserContext,
-    /// Stored so a later `ListTags` reports what the create carried; no implemented
-    /// operation surfaces it yet (`AddTags` and `ListTags` are still scaffolds).
+    /// Stored so a later `ListTags` reports what the create carried; `DescribeContext`
+    /// models no `Tags` member, so this is the one reader that surfaces it.
     pub tags: Vec<Tag>,
     pub creation_time: SystemTime,
     pub last_modified_time: SystemTime,
@@ -4675,8 +4819,8 @@ pub const DEFAULT_TRACKING_SERVER_SIZE: &str = "Small";
 /// `mlflow_version` and `weekly_maintenance_window_start` stay `None` when the create
 /// named neither: the model documents no default for either, so the server reports no
 /// value rather than one the request never asked for. `tags` is stored so a later
-/// `ListTags` reports what the create carried; no implemented operation surfaces it yet,
-/// since `DescribeMlflowTrackingServer` models no tag member.
+/// `ListTags` reports what the create carried; `DescribeMlflowTrackingServer` models no
+/// tag member, so `ListTags` is the one reader that surfaces it.
 #[derive(Debug, Clone)]
 pub struct MlflowTrackingServer {
     pub name: String,

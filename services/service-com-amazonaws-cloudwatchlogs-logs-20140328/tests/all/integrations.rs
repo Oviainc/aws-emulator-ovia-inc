@@ -515,12 +515,43 @@ async fn the_status_the_clock_owes_is_reported_and_reading_changes_nothing() {
             "case {case:?}: expected one of {admissible:?}, got {status:?}"
         );
 
+        let before_second = now_ms();
         let second = logs.ok(GET, &json!({"integrationName": name})).await;
-        assert_eq!(
-            second, first,
-            "case {case:?}: reading twice must report the same thing, expected {first}, got \
-             {second}"
-        );
+        let after_second = now_ms();
+        let second_status = member(&second, "integrationStatus")
+            .unwrap_or_else(|| {
+                panic!("case {case:?}: an integration carries integrationStatus, got {second}")
+            })
+            .to_string();
+        if second_status == status {
+            assert_eq!(
+                second, first,
+                "case {case:?}: reading twice must report the same thing, expected {first}, got \
+                 {second}"
+            );
+        } else {
+            // The one change admissible between two reads is the one the CLOCK made due
+            // in between — a row created just short of its active instant crosses it
+            // while the test runs, which is a transition the clock owed and not one a
+            // read performed. So the second read must still report a status its own read
+            // window allows, and the status may only move FORWARD.
+            let admissible_second = if *pinned {
+                vec![INTEGRATION_STATUS_PROVISIONING]
+            } else {
+                admissible_statuses(*created, before_second, after_second)
+            };
+            assert!(
+                admissible_second.contains(&second_status.as_str()),
+                "case {case:?}: expected the second read to report one of \
+                 {admissible_second:?}, got {second_status:?}"
+            );
+            assert_eq!(
+                (status.as_str(), second_status.as_str()),
+                (INTEGRATION_STATUS_PROVISIONING, INTEGRATION_STATUS_ACTIVE),
+                "case {case:?}: a read may only move the status forward over the clock's \
+                 own transition, got {status:?} then {second_status:?}"
+            );
+        }
     }
 
     // The one created an hour ago has long since finished provisioning, so there is nothing
