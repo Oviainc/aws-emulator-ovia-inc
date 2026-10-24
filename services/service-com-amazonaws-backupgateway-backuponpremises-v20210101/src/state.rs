@@ -48,6 +48,14 @@
 //! they belong to: `GetHypervisorPropertyMappings` reports the mappings of the record its
 //! `ServerArn` resolves to, and a hypervisor that carries none has no mappings resource
 //! to report ([`MissingResource::PropertyMappings`]).
+//!
+//! A hypervisor also carries the METADATA SYNC last started on it
+//! ([`StoredHypervisor::metadata_sync_started`]):
+//! `StartVirtualMachinesMetadataSync` persists the instant it was requested at, and the
+//! `SyncMetadataStatus` and times a read reports are derived from that instant and the
+//! clock ([`StoredHypervisor::latest_metadata_sync_status_as_of`]) the way the
+//! hypervisor's own state is, so a read never moves a sync along and every reader agrees
+//! on where it has got to.
 
 use std::collections::BTreeMap;
 use std::ops::Bound;
@@ -122,6 +130,26 @@ pub const MAPPINGS_NOT_FOUND: &str = "MappingsNotFound";
 /// requirement is the error shape and the `ErrorCode`, and this wording is an example.
 pub const MAPPINGS_NOT_FOUND_MESSAGE: &str = "The mappings are not found.";
 
+/// `AccessDeniedException$ErrorCode` for an operation that can only run under the IAM
+/// role a hypervisor's property mappings name, asked for an ARN no mappings are set for.
+///
+/// `AccessDeniedException$ErrorCode` is REQUIRED and documented as "A description of why
+/// you have insufficient permissions"
+/// (`smithy_query(query="shape",shape="AccessDeniedException")`). A metadata sync reads
+/// and writes the virtual machines' tags under [`StoredPropertyMappings::iam_role_arn`],
+/// so with no mappings SET there is no role the service was permitted to act with — a
+/// PERMISSION answer (HTTP 403), which is why it does not depend on whether the ARN names
+/// a hypervisor this store holds.
+pub const MAPPINGS_NOT_CONFIGURED: &str = "MappingsNotConfigured";
+
+/// See [`MAPPINGS_NOT_CONFIGURED`]. The sentence the modelled shape itself states —
+/// `AccessDeniedException`'s own doc, "The operation cannot proceed because you have
+/// insufficient permissions" (`smithy_query(query="shape",shape="AccessDeniedException")`)
+/// — so the condition is named once, by the REQUIRED `ErrorCode`, and the message states
+/// the refusal in the model's own words rather than in invented ones.
+pub const MAPPINGS_NOT_CONFIGURED_MESSAGE: &str =
+    "The operation cannot proceed because you have insufficient permissions.";
+
 /// The region a minted ARN falls back to when the request carries no SigV4 credential
 /// scope to read one from (an unsigned request on an emulator with authentication off).
 pub const DEFAULT_REGION: &str = "us-east-1";
@@ -159,6 +187,50 @@ pub const HYPERVISOR_ONLINE: &str = "ONLINE";
 /// due instant is stored and every read compares the clock against it
 /// ([`StoredHypervisor::state_as_of`]).
 pub const HYPERVISOR_PENDING_FOR: Duration = Duration::from_millis(500);
+
+/// `SyncMetadataStatus` the moment a metadata sync has been asked for: the sync request
+/// exists, and the service has not started reading the hypervisor's inventory yet.
+///
+/// One of the five values the modelled enum declares — `CREATED`, `RUNNING`, `FAILED`,
+/// `PARTIALLY_FAILED`, `SUCCEEDED`
+/// (`smithy_query(query="shape",shape="SyncMetadataStatus")`).
+pub const SYNC_METADATA_CREATED: &str = "CREATED";
+
+/// `SyncMetadataStatus` while the sync is reading the hypervisor's inventory. See
+/// [`SYNC_METADATA_CREATED`].
+pub const SYNC_METADATA_RUNNING: &str = "RUNNING";
+
+/// `SyncMetadataStatus` once the sync has finished. See [`SYNC_METADATA_CREATED`].
+pub const SYNC_METADATA_SUCCEEDED: &str = "SUCCEEDED";
+
+/// How long after the start call a metadata sync stays [`SYNC_METADATA_CREATED`] before
+/// it is [`SYNC_METADATA_RUNNING`].
+///
+/// A CHOSEN span, not a documented one: AWS states no duration for a metadata sync, only
+/// the statuses one passes through. It is non-zero so a caller that reads straight after
+/// the start call still observes the sync it just requested as `CREATED`. Nothing sleeps
+/// for it — the instant the sync started at is stored and every read compares the clock
+/// against it ([`StoredHypervisor::latest_metadata_sync_status_as_of`]).
+pub const METADATA_SYNC_RUNNING_AFTER: Duration = Duration::from_millis(250);
+
+/// How long after the start call a metadata sync takes to be
+/// [`SYNC_METADATA_SUCCEEDED`]. A CHOSEN span, for the same reason as
+/// [`METADATA_SYNC_RUNNING_AFTER`], and the instant the sync's success is dated at.
+pub const METADATA_SYNC_SUCCEEDS_AFTER: Duration = Duration::from_millis(500);
+
+/// `LatestMetadataSyncStatusMessage` for each status a sync this service started passes
+/// through — "the most recent status for the indicated metadata sync"
+/// (`smithy_query(query="shape",shape="HypervisorDetails",member="LatestMetadataSyncStatusMessage")`),
+/// stated in words beside the `SyncMetadataStatus` value. AWS publishes no wording for
+/// the member, so these sentences are examples; the requirement is that the message
+/// describes the status the same record reports.
+pub const METADATA_SYNC_CREATED_MESSAGE: &str = "The metadata sync request was created.";
+
+/// See [`METADATA_SYNC_CREATED_MESSAGE`].
+pub const METADATA_SYNC_RUNNING_MESSAGE: &str = "The metadata sync is running.";
+
+/// See [`METADATA_SYNC_CREATED_MESSAGE`].
+pub const METADATA_SYNC_SUCCEEDED_MESSAGE: &str = "The metadata sync succeeded.";
 
 /// `ConflictException$ErrorCode` for an import naming a host this service has already
 /// imported a hypervisor for, and the sentence that states it.
@@ -294,6 +366,21 @@ impl StoredGateway {
     }
 }
 
+/// The `SyncMetadataStatus` a sync that started at `started` is in at `now`, and the
+/// sentence that states it.
+///
+/// The one place the spans of a sync are turned into a status, so a report of the status,
+/// of its message and of the successful-sync time are all read off the same boundaries.
+fn sync_status_as_of(started: SystemTime, now: SystemTime) -> (&'static str, &'static str) {
+    if now >= started + METADATA_SYNC_SUCCEEDS_AFTER {
+        (SYNC_METADATA_SUCCEEDED, METADATA_SYNC_SUCCEEDED_MESSAGE)
+    } else if now >= started + METADATA_SYNC_RUNNING_AFTER {
+        (SYNC_METADATA_RUNNING, METADATA_SYNC_RUNNING_MESSAGE)
+    } else {
+        (SYNC_METADATA_CREATED, METADATA_SYNC_CREATED_MESSAGE)
+    }
+}
+
 /// A stored tag map as the modelled `Tags` list, in key order. One rendering for every
 /// resource this service tags.
 fn tag_list(tags: &BTreeMap<String, String>) -> Vec<Tag> {
@@ -347,6 +434,16 @@ pub struct StoredHypervisor {
     /// The resource's tags, by key — the same representation [`StoredGateway::tags`]
     /// uses, so the tagging operations treat both resources alike.
     pub tags: BTreeMap<String, String>,
+    /// When the metadata sync last started for this hypervisor was REQUESTED, and `None`
+    /// for a record no sync has been started on.
+    ///
+    /// `StartVirtualMachinesMetadataSync` stores this instant and nothing else about the
+    /// sync's progress: the clock alone carries the sync from
+    /// [`SYNC_METADATA_CREATED`] through [`SYNC_METADATA_RUNNING`] to
+    /// [`SYNC_METADATA_SUCCEEDED`], exactly as `online_due` carries the hypervisor's own
+    /// state, so what every reader reports is a function of this record and the current
+    /// time and no read has to poll for a transition to happen.
+    pub metadata_sync_started: Option<SystemTime>,
     /// The hypervisor's property mappings, absent until they have been SET for it.
     ///
     /// An import never mints mappings: `PutHypervisorPropertyMappings` is the operation
@@ -374,6 +471,45 @@ impl StoredHypervisor {
         }
     }
 
+    /// The `LatestMetadataSyncStatus` this record reports at `now`.
+    ///
+    /// For a record with a sync in flight ([`Self::metadata_sync_started`]) the status is
+    /// the one the clock has reached since that instant; for every other record it is
+    /// whatever was last PERSISTED, so a status no sync of this service started (a
+    /// `FAILED` or `PARTIALLY_FAILED` one, say) is reported as stored.
+    pub fn latest_metadata_sync_status_as_of(&self, now: SystemTime) -> Option<String> {
+        match self.metadata_sync_started {
+            Some(started) => Some(sync_status_as_of(started, now).0.to_string()),
+            None => self.latest_metadata_sync_status.clone(),
+        }
+    }
+
+    /// The `LatestMetadataSyncStatusMessage` this record reports at `now` — the sentence
+    /// of the status [`Self::latest_metadata_sync_status_as_of`] reports, so the two
+    /// cannot disagree.
+    pub fn latest_metadata_sync_status_message_as_of(&self, now: SystemTime) -> Option<String> {
+        match self.metadata_sync_started {
+            Some(started) => Some(sync_status_as_of(started, now).1.to_string()),
+            None => self.latest_metadata_sync_status_message.clone(),
+        }
+    }
+
+    /// The `LastSuccessfulMetadataSyncTime` this record reports at `now` — "the time when
+    /// the most recent successful sync of metadata occurred".
+    ///
+    /// A sync in flight dates its success at the instant it falls due
+    /// ([`METADATA_SYNC_SUCCEEDS_AFTER`] after it started), so the time a read reports is
+    /// stable however often it is read, and until that instant the previous successful
+    /// sync's time stands: a sync that has not finished has not succeeded.
+    pub fn last_successful_metadata_sync_time_as_of(&self, now: SystemTime) -> Option<SystemTime> {
+        match self.metadata_sync_started {
+            Some(started) if now >= started + METADATA_SYNC_SUCCEEDS_AFTER => {
+                Some(started + METADATA_SYNC_SUCCEEDS_AFTER)
+            }
+            _ => self.last_successful_metadata_sync_time,
+        }
+    }
+
     /// This record as the `HypervisorDetails` shape `GetHypervisor` returns, as of `now`.
     pub fn details_as_of(&self, now: SystemTime) -> HypervisorDetails {
         HypervisorDetails {
@@ -384,10 +520,11 @@ impl StoredHypervisor {
             log_group_arn: self.log_group_arn.clone(),
             state: Some(self.state_as_of(now).to_string()),
             last_successful_metadata_sync_time: self
-                .last_successful_metadata_sync_time
+                .last_successful_metadata_sync_time_as_of(now)
                 .map(date_time),
-            latest_metadata_sync_status_message: self.latest_metadata_sync_status_message.clone(),
-            latest_metadata_sync_status: self.latest_metadata_sync_status.clone(),
+            latest_metadata_sync_status_message: self
+                .latest_metadata_sync_status_message_as_of(now),
+            latest_metadata_sync_status: self.latest_metadata_sync_status_as_of(now),
         }
     }
 
@@ -705,6 +842,9 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
             latest_metadata_sync_status_message: None,
             created_time: now,
             tags: configuration.tags,
+            // An import starts no metadata sync: `StartVirtualMachinesMetadataSync` is
+            // the operation that does, for a hypervisor that already exists.
+            metadata_sync_started: None,
             // An import sets no property mappings: they are SET for a hypervisor that
             // already exists, so a freshly imported record carries none.
             property_mappings: None,
@@ -761,6 +901,46 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
         self.hypervisors
             .values()
             .find(|hypervisor| hypervisor.host == host)
+    }
+
+    /// Whether property mappings are SET for `arn`.
+    ///
+    /// `false` both for a hypervisor this store holds that carries none and for an ARN it
+    /// holds no hypervisor under: the question is whether the mappings — and so the IAM
+    /// role a metadata sync runs under — exist, which they do not in either case. The ONE
+    /// place that question is asked, so an operation gated on the mappings cannot gate on
+    /// something subtly different.
+    pub fn property_mappings_configured(&self, arn: &str) -> bool {
+        self.hypervisor(arn)
+            .is_some_and(|hypervisor| hypervisor.property_mappings.is_some())
+    }
+
+    /// Start a metadata sync on the hypervisor stored under `arn` at `now`, and hand back
+    /// the record as it is now STORED — read out of the map after the write, so what a
+    /// caller gets is what the store holds.
+    ///
+    /// `None` — nothing written — when this store holds no hypervisor under `arn`.
+    ///
+    /// What is persisted is the instant the sync was REQUESTED, the status and message
+    /// that instant puts the record in, and the time of a sync that had already
+    /// succeeded; every later report of the new sync's progress is derived from that
+    /// instant and the clock
+    /// ([`StoredHypervisor::latest_metadata_sync_status_as_of`]), so no reader moves it.
+    /// The sync itself discovers nothing here: a hypervisor's inventory reaches this
+    /// service out of band ([`Self::record_virtual_machine`]), so a sync records the
+    /// machines that channel has reported and never invents one.
+    pub fn start_metadata_sync(&mut self, arn: &str, now: SystemTime) -> Option<StoredHypervisor> {
+        let record = self.hypervisors.get_mut(arn)?;
+        // A sync the clock had already finished is MATERIALISED before the new one
+        // replaces the instant its progress is derived from: the time of the most recent
+        // successful sync is a fact about a sync that really completed, so it never goes
+        // backwards or disappears because another sync was started.
+        record.last_successful_metadata_sync_time = record.last_successful_metadata_sync_time_as_of(now);
+        record.metadata_sync_started = Some(now);
+        let (status, message) = sync_status_as_of(now, now);
+        record.latest_metadata_sync_status = Some(status.to_string());
+        record.latest_metadata_sync_status_message = Some(message.to_string());
+        self.hypervisors.get(arn).cloned()
     }
 
     /// Record one virtual machine of `hypervisor_arn`'s inventory, and hand back the
