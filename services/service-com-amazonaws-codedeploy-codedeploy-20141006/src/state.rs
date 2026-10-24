@@ -284,11 +284,17 @@ pub fn instances_not_reported_for_platform(compute_platform: &str) -> String {
 }
 
 /// `DeploymentConfigDoesNotExistException` (HTTP 400): the configuration name
-/// after the delimiter, in the same form as the other not-found sentences. Only
-/// the delimited name is a measured requirement here; the noun phrase follows
-/// the resource's name as the model spells it (`DeploymentConfigInfo`).
+/// after the delimiter, in the same form as the other not-found sentences.
 pub fn deployment_config_not_found(deployment_config_name: &str) -> String {
-    format!("No Deployment Configuration found for name: {deployment_config_name}")
+    format!("No deployment configuration found for name: {deployment_config_name}")
+}
+
+/// `DeploymentConfigAlreadyExistsException` (HTTP 400): the conflicting
+/// configuration name FIRST, so a client can recover it by stripping the fixed
+/// tail — the same shape as [`application_already_exists`], because it is the
+/// same "this name is taken" refusal about another resource of this service.
+pub fn deployment_config_already_exists(deployment_config_name: &str) -> String {
+    format!("{deployment_config_name} already exists.")
 }
 
 /// `InvalidOperationException` (HTTP 400): the name of the deployment
@@ -321,6 +327,17 @@ pub fn application_already_exists(application_name: &str) -> String {
     format!("{application_name} already exists.")
 }
 
+/// `ApplicationAlreadyExistsException` (HTTP 400) as the RENAME answers it: the
+/// name the request asked to become, which is the member that conflicts.
+///
+/// A rename and a creation are refused by the same error shape but are not the
+/// same refusal: a creation's conflicting name is the one the caller asked to
+/// create, while a rename's is the one it asked to move TO, so the sentence says
+/// which it is.
+pub fn application_rename_target_exists(new_application_name: &str) -> String {
+    format!("The application name: {new_application_name} you want to update to already exist")
+}
+
 /// `DeploymentGroupAlreadyExistsException` (HTTP 400): the conflicting group
 /// name, with the application referred to as "this application" rather than
 /// named.
@@ -351,6 +368,10 @@ pub const DEPLOYMENT_ID_MISSING: &str = "Deployment ID is missing";
 /// `InstanceNameRequiredException` (HTTP 400). See [`APPLICATION_NAME_MISSING`].
 pub const INSTANCE_NAME_MISSING: &str = "Instance name is missing";
 
+/// `GitHubAccountTokenNameRequiredException` (HTTP 400). See
+/// [`APPLICATION_NAME_MISSING`].
+pub const GITHUB_ACCOUNT_TOKEN_NAME_MISSING: &str = "Token name is missing";
+
 /// `InstanceIdRequiredException` (HTTP 400). See [`APPLICATION_NAME_MISSING`].
 pub const INSTANCE_ID_MISSING: &str = "Instance ID is missing";
 
@@ -366,6 +387,43 @@ pub const RESOURCE_ARN_MISSING: &str = "Resource ARN is missing";
 
 /// `RevisionRequiredException` (HTTP 400). See [`APPLICATION_NAME_MISSING`].
 pub const REVISION_MISSING: &str = "Revision is missing";
+
+/// `InstanceNotRegisteredException` (HTTP 400) as the single-instance READER
+/// answers it: the host the request asked about, after the delimiter.
+///
+/// The shape is "The specified on-premises instance is not registered", which a
+/// name that never held a registration and one whose registration has ended are
+/// both in, so both are answered with this one sentence.
+pub fn host_does_not_exist(instance_name: &str) -> String {
+    format!("The requested host does not exist. Host: {instance_name}")
+}
+
+/// `InstanceNotRegisteredException` (HTTP 400) as the TAGGING operations answer
+/// it: the host whose tags the request asked to change.
+///
+/// A reader is asked for a host's record and answers that there is none
+/// ([`host_does_not_exist`]); a tagging call asks to change a REGISTERED host
+/// and answers that this host is not one, so the two sentences differ in what
+/// they state about the same name.
+pub fn host_not_registered(instance_name: &str) -> String {
+    format!("Host {instance_name} is not registered")
+}
+
+/// `InstanceNameAlreadyRegisteredException` (HTTP 400): the fixed sentence for a
+/// host name a registration already holds, interpolating nothing — the name is
+/// the one the request carried, so the refusal does not quote it back.
+///
+/// It covers both reasons the name is unavailable: a registration holds it now,
+/// or one held it recently.
+pub const INSTANCE_NAME_ALREADY_REGISTERED: &str =
+    "Host name has already been registered or recently deregistered";
+
+/// `InvalidAutoRollbackConfigException` (HTTP 400): the fixed sentence for an
+/// automatic rollback that is enabled but names no triggering event, so it could
+/// never fire. Shared by every operation that accepts an
+/// `autoRollbackConfiguration`.
+pub const AUTO_ROLLBACK_WITHOUT_EVENTS: &str =
+    "Deployment Groups need to have at least one event specified when auto rollback is enabled";
 
 /// `InvalidEC2TagCombinationException` (HTTP 400): a deployment group selects
 /// Amazon EC2 instances by EITHER the flat `ec2TagFilters` list or the grouped
@@ -487,14 +545,87 @@ pub const MAX_DEPLOYMENT_CONFIGS: usize = 1_000;
 /// deployments, oldest first, so a caller cannot grow the store without limit.
 pub const MAX_DEPLOYMENT_HISTORY: usize = 500;
 
-/// How many alarms one alarm configuration may carry.
+/// How many names or ids one `BatchGet*` request may carry.
+///
+/// The model states the figure on the refusal itself — every `BatchGet*`
+/// operation of this service models `BatchLimitExceededException`, whose own
+/// documentation
+/// (`smithy_query(query="shape",shape="BatchLimitExceededException")`) reads "The
+/// maximum number of names or IDs allowed for this request (100) was exceeded" —
+/// so this is the published REQUEST-SIZE quota of the batch readers, and it lives
+/// here, once, so no two of them can enforce a different one. The figure each
+/// operation's own prose carries ("The maximum number of deployments that can be
+/// returned is 25") is about how many records one call RETURNS, not about how
+/// many entries a request is accepted with.
+pub const MAX_BATCH_SIZE: usize = 100;
+
+/// The message a `BatchLimitExceededException` carries: the request-size quota a
+/// batch has to fit in, built from [`MAX_BATCH_SIZE`] so the figure a caller
+/// reads back is the one that is enforced.
+pub fn batch_limit_exceeded_message() -> String {
+    format!("BatchGet size limit is {MAX_BATCH_SIZE}")
+}
+
+/// How many alarms the alarm configuration OF A DEPLOYMENT GROUP may carry.
 ///
 /// The model states it on `AlarmConfiguration$alarms`
 /// (`smithy_query(query="shape",shape="AlarmConfiguration")`): "A list of alarms
 /// configured for the deployment or deployment group. A maximum of 10 alarms can
-/// be added." Past it, the request is refused with
-/// `AlarmsLimitExceededException`.
-pub const MAX_ALARMS_PER_ALARM_CONFIGURATION: usize = 10;
+/// be added", and `AlarmsLimitExceededException` — the refusal past the quota —
+/// names the same resource: "The maximum number of alarms for a deployment group
+/// (10) was exceeded."
+pub const MAX_ALARMS_PER_DEPLOYMENT_GROUP: usize = 10;
+
+/// How many alarms ONE DEPLOYMENT's `overrideAlarmConfiguration` may carry.
+///
+/// A deployment's override is a different resource from the group's own
+/// configuration, with its own quota: the deployment-group figure the model
+/// states is scoped to the deployment group by both the member's documentation
+/// and `AlarmsLimitExceededException`'s own sentence, so it does not bound what a
+/// deployment may override its group's configuration with, which is the higher
+/// per-deployment quota here.
+pub const MAX_ALARMS_PER_DEPLOYMENT: usize = 50;
+
+/// Which resource's alarm quota an operation enforces: the deployment group's own
+/// `alarmConfiguration`, or one deployment's `overrideAlarmConfiguration`.
+///
+/// The two differ in the quota and in the sentence that states it, and in nothing
+/// else — every other rule about an alarm configuration is the same for both —
+/// so [`validate_alarm_configuration`] takes this rather than being written twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlarmQuota {
+    /// A deployment group's own alarm configuration
+    /// ([`MAX_ALARMS_PER_DEPLOYMENT_GROUP`]).
+    DeploymentGroup,
+    /// One deployment's override of it ([`MAX_ALARMS_PER_DEPLOYMENT`]).
+    Deployment,
+}
+
+impl AlarmQuota {
+    /// How many alarms this resource's alarm configuration may carry.
+    pub fn max_alarms(self) -> usize {
+        match self {
+            Self::DeploymentGroup => MAX_ALARMS_PER_DEPLOYMENT_GROUP,
+            Self::Deployment => MAX_ALARMS_PER_DEPLOYMENT,
+        }
+    }
+
+    /// The `AlarmsLimitExceededException` sentence for a configuration past this
+    /// quota, which states the quota the caller has to fit in — built from the
+    /// constant, so the figure a caller reads back is the one enforced.
+    pub fn too_many_alarms_message(self, specified: usize) -> String {
+        match self {
+            Self::DeploymentGroup => format!(
+                "The maximum number of alarms for a deployment group ({}) was exceeded: \
+                 {specified} alarms were specified",
+                MAX_ALARMS_PER_DEPLOYMENT_GROUP
+            ),
+            Self::Deployment => format!(
+                "Deployments cannot contain more than {MAX_ALARMS_PER_DEPLOYMENT} alarms."
+            ),
+        }
+    }
+}
 
 /// The longest alarm name an alarm configuration may carry, from the model's
 /// `Alarm$name` (`smithy_query(query="shape",shape="Alarm")`): "Maximum length
@@ -511,11 +642,12 @@ pub const MAX_ALARM_NAME_LENGTH: usize = 255;
 /// operation's error enum.
 #[derive(Debug)]
 pub enum AlarmConfigurationRejection {
-    /// More than [`MAX_ALARMS_PER_ALARM_CONFIGURATION`] alarms were specified;
-    /// carries how many the request asked for.
-    TooManyAlarms(usize),
+    /// More alarms than the resource's [`AlarmQuota`] allows; carries the
+    /// sentence that states the quota the request has to fit in.
+    TooManyAlarms(String),
     /// Malformed in one of the ways `InvalidAlarmConfigException` documents; the
-    /// string says which, so the caller can fix the request from the message.
+    /// string is the whole sentence, so the caller can fix the request from the
+    /// message.
     Malformed(String),
 }
 
@@ -529,14 +661,17 @@ pub enum AlarmConfigurationRejection {
 /// that is how a caller turns alarm monitoring off.
 pub fn validate_alarm_configuration(
     configuration: &AlarmConfiguration,
+    quota: AlarmQuota,
 ) -> Result<(), AlarmConfigurationRejection> {
     let alarms = configuration.alarms.as_deref().unwrap_or_default();
-    if alarms.len() > MAX_ALARMS_PER_ALARM_CONFIGURATION {
-        return Err(AlarmConfigurationRejection::TooManyAlarms(alarms.len()));
+    if alarms.len() > quota.max_alarms() {
+        return Err(AlarmConfigurationRejection::TooManyAlarms(
+            quota.too_many_alarms_message(alarms.len()),
+        ));
     }
     if configuration.enabled && alarms.is_empty() {
         return Err(AlarmConfigurationRejection::Malformed(
-            "the alarm configuration is enabled but its alarm list is empty".to_string(),
+            ALARM_CONFIGURATION_WITHOUT_ALARMS.to_string(),
         ));
     }
     let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
@@ -544,21 +679,40 @@ pub fn validate_alarm_configuration(
         let name = alarm.name.as_deref().unwrap_or_default();
         if name.is_empty() {
             return Err(AlarmConfigurationRejection::Malformed(
-                "an alarm was specified with no name".to_string(),
+                invalid_alarm_configuration("an alarm was specified with no name"),
             ));
         }
         if name.chars().count() > MAX_ALARM_NAME_LENGTH {
-            return Err(AlarmConfigurationRejection::Malformed(format!(
-                "an alarm name exceeds the maximum length of {MAX_ALARM_NAME_LENGTH} characters"
-            )));
+            return Err(AlarmConfigurationRejection::Malformed(
+                invalid_alarm_configuration(&format!(
+                    "an alarm name exceeds the maximum length of {MAX_ALARM_NAME_LENGTH} characters"
+                )),
+            ));
         }
         if !seen.insert(name) {
-            return Err(AlarmConfigurationRejection::Malformed(format!(
-                "the alarm name {name} was specified more than once"
-            )));
+            return Err(AlarmConfigurationRejection::Malformed(
+                invalid_alarm_configuration(&format!(
+                    "the alarm name {name} was specified more than once"
+                )),
+            ));
         }
     }
     Ok(())
+}
+
+/// `InvalidAlarmConfigException` (HTTP 400): the fixed sentence for an alarm
+/// configuration that is monitored but lists no alarm, which is the case the
+/// shape documents as "The alarm configuration is enabled, but the alarm list is
+/// empty".
+pub const ALARM_CONFIGURATION_WITHOUT_ALARMS: &str =
+    "Deployment Groups need to have at least one alarms attached if they are monitored.";
+
+/// `InvalidAlarmConfigException` (HTTP 400) for every OTHER way the shape
+/// documents an alarm configuration as malformed (a nameless alarm, an
+/// over-long name, a repeated one): the error's own clause with `detail` saying
+/// which, so the caller can fix the request from the message.
+fn invalid_alarm_configuration(detail: &str) -> String {
+    format!("The alarm configuration is invalid: {detail}")
 }
 
 /// How many tag groups one `ec2TagSet` / `onPremisesTagSet` may hold, the bound
@@ -976,10 +1130,21 @@ impl Deployment {
     /// (`smithy_query(query="shape",shape="DeploymentType")`: IN_PLACE |
     /// BLUE_GREEN).
     pub fn is_blue_green(&self) -> bool {
+        self.deployment_type() == DEPLOYMENT_TYPE_BLUE_GREEN
+    }
+
+    /// The `DeploymentType` this deployment runs as, which is the one its
+    /// deployment group's effective `deploymentStyle` carries
+    /// ([`effective_deployment_style`] materialises that member when the group is
+    /// written, so a stored deployment always has one). A deployment that
+    /// somehow carries no style at all is CodeDeploy's own default, an in-place
+    /// deployment — stated rather than left absent, so an operation that refuses
+    /// a type can always name it.
+    pub fn deployment_type(&self) -> &str {
         self.deployment_style
             .as_ref()
             .and_then(|style| style.deployment_type.as_deref())
-            == Some(DEPLOYMENT_TYPE_BLUE_GREEN)
+            .unwrap_or(DEPLOYMENT_TYPE_IN_PLACE)
     }
 }
 
@@ -2252,12 +2417,20 @@ pub fn request_region(parts: &::http::request::Parts) -> String {
 }
 
 /// The ARN of an on-premises instance:
-/// `arn:aws:codedeploy:<region>:<account>:instance/<instanceName>`, the form the
-/// CodeDeploy User Guide shows for a registered on-premises instance
-/// ("arn:aws:codedeploy:us-west-2:111122223333:instance/AssetTag12010298EX").
-/// The account segment comes from the engine, never from a literal.
-pub fn instance_arn(region: &str, instance_name: &str) -> String {
-    ::engine::emulator_arn(ARN_SERVICE, region, &format!("instance/{instance_name}"))
+/// `arn:aws:codedeploy:<region>:<account>:instance/<instanceName>_<registrationId>`.
+///
+/// The CodeDeploy User Guide shows the name in the resource part
+/// ("arn:aws:codedeploy:us-west-2:111122223333:instance/AssetTag12010298EX"), and
+/// the ARN CodeDeploy MINTS carries the registration's own identity after it: the
+/// ARN names a REGISTRATION, not a host name, so registering a name again mints a
+/// new one and the two registrations of one name are told apart by it. The
+/// account segment comes from the engine, never from a literal.
+pub fn instance_arn(region: &str, instance_name: &str, registration_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("instance/{instance_name}_{registration_id}"),
+    )
 }
 
 /// Why CodeDeploy will not accept a name a caller sent for an on-premises
@@ -2269,7 +2442,38 @@ pub enum NameRefusal {
     Missing,
     /// The caller sent a name outside the form CodeDeploy accepts.
     Malformed,
+    /// The caller sent a name in a form CodeDeploy RESERVES, so no resource can
+    /// ever carry it; see [`check_on_premises_instance_name`].
+    Reserved,
 }
+
+/// `InvalidInstanceNameException` (HTTP 400): the sentence that refusal carries
+/// for each way a name can fail [`check_on_premises_instance_name`], so every
+/// operation taking an on-premises instance name refuses one in the same words.
+pub fn invalid_instance_name_message(refusal: NameRefusal) -> &'static str {
+    match refusal {
+        NameRefusal::Reserved => INSTANCE_NAME_RESERVED_PREFIX,
+        // A name the caller did not give is its own `…RequiredException`, which
+        // every caller answers before it reaches here; stated rather than
+        // panicked on so the mapping is total.
+        NameRefusal::Missing | NameRefusal::Malformed => INSTANCE_NAME_INVALID_CHARACTERS,
+    }
+}
+
+/// See [`invalid_instance_name_message`]: a name outside the service's
+/// resource-name character set, or longer than [`MAX_NAME_LENGTH`].
+pub const INSTANCE_NAME_INVALID_CHARACTERS: &str = "Instance name contains invalid characters.";
+
+/// See [`invalid_instance_name_message`] and
+/// [`check_on_premises_instance_name`]: a name in the form reserved for Amazon
+/// EC2 instance ids.
+pub const INSTANCE_NAME_RESERVED_PREFIX: &str = "Host name cannot start with \"i-\"";
+
+/// The prefix every Amazon EC2 instance id carries, which is therefore the
+/// prefix no on-premises HOST NAME may carry: CodeDeploy identifies an
+/// EC2/on-premises deployment target by that id, so a host registered under an
+/// id-shaped name could not be told from an EC2 instance.
+const EC2_INSTANCE_ID_PREFIX: &str = "i-";
 
 /// The longest resource name CodeDeploy accepts, as the model states it for
 /// every name member it constrains (`smithy_query(query="shape",shape="ApplicationName")`:
@@ -2297,6 +2501,36 @@ pub fn check_instance_name(name: &str) -> Result<(), NameRefusal> {
     }
     if name.chars().count() > MAX_NAME_LENGTH || !name.chars().all(is_name_character) {
         return Err(NameRefusal::Malformed);
+    }
+    Ok(())
+}
+
+/// Check `name` against the form CodeDeploy accepts for the name of an
+/// ON-PREMISES INSTANCE: [`check_instance_name`]'s form, and not one of the
+/// names the service RESERVES.
+///
+/// The reserved form is the Amazon EC2 instance id
+/// ([`EC2_INSTANCE_ID_PREFIX`]), which `InvalidInstanceNameException` ("The
+/// on-premises instance name was specified in an invalid format") is the refusal
+/// for: no on-premises host can ever hold such a name, so every operation that
+/// takes an `instanceName` of an on-premises instance — the registering,
+/// deregistering, reading and tagging ones alike — refuses it HERE, before it
+/// asks the registry anything, so a caller that passed an EC2 instance id by
+/// mistake is never told its call succeeded.
+///
+/// A deployment TARGET id is not a host name: an EC2/on-premises deployment
+/// reports its instance targets BY that id, so [`check_deployment_target_id`]
+/// goes through [`check_instance_name`] and this reservation does not apply to
+/// it.
+pub fn check_on_premises_instance_name(name: &str) -> Result<(), NameRefusal> {
+    check_instance_name(name)?;
+    // Matched case-insensitively: the names this service accepts differ in case,
+    // so a host could otherwise take the reserved form under another casing.
+    if name
+        .get(..EC2_INSTANCE_ID_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(EC2_INSTANCE_ID_PREFIX))
+    {
+        return Err(NameRefusal::Reserved);
     }
     Ok(())
 }
@@ -2816,9 +3050,10 @@ mod tests {
         tags: Vec<Tag>,
         deregistered: bool,
     ) {
+        let registration_id = mint_uuid_from(&mut state.next_id, "on-premises-registration");
         state.register_on_premises_instance(OnPremisesInstance {
             instance_name: name.to_string(),
-            instance_arn: instance_arn("us-east-1", name),
+            instance_arn: instance_arn("us-east-1", name, &registration_id),
             iam_user_arn: Some(format!("arn:aws:iam::123456789012:user/{name}")),
             iam_session_arn: None,
             register_time_ms: 1,

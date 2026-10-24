@@ -6,7 +6,8 @@
 //! request names, exactly the stored record that the single-id reader
 //! (`GetDeployment`) reports for that id, in the order the request named them,
 //! omitting the ids this store holds no deployment for; and it refuses a request
-//! that carries more ids than the operation documents (25), one that carries no
+//! that carries more ids than the shared request-size quota its
+//! `BatchLimitExceededException` states (100), one that carries no
 //! id at all (or an empty one), and one that carries a value that is not shaped
 //! like a deployment id — each with its own modelled code.
 //!
@@ -20,11 +21,11 @@ use serde_json::{json, Value};
 
 use crate::codedeploy_lifecycle::{error_code, s3_revision, seeded_group, Emulator};
 
-/// The documented maximum number of deployment ids one request may carry:
-/// `BatchGetDeploymentsInput$deploymentIds` — "The maximum number of deployment
-/// IDs you can specify is 25" — the bound the handler enforces as
-/// `MAX_BATCH_DEPLOYMENT_IDS` in `src/ops/batch_get_deployments.rs`.
-const MAX_BATCH_DEPLOYMENT_IDS: usize = 25;
+/// The request-size quota one `BatchGet*` request may carry, which is the one
+/// `BatchLimitExceededException` states for every batch reader of this service
+/// ("The maximum number of names or IDs allowed for this request (100) was
+/// exceeded") and the one `crate::state::MAX_BATCH_SIZE` holds.
+const MAX_BATCH_SIZE: usize = 100;
 
 /// The `deploymentId` of each entry of a `deploymentsInfo` answer, in order.
 fn reported_ids(body: &Value) -> Vec<String> {
@@ -136,12 +137,31 @@ async fn a_batch_answers_one_entry_per_named_id_in_request_order() {
         ),
         ("only an unknown id", vec![unknown.clone()], Vec::new()),
         (
-            // The published bound itself: 25 ids is accepted, not refused.
-            "the documented maximum of ids",
-            (0..MAX_BATCH_DEPLOYMENT_IDS)
+            // Sizes the quota accepts: the batch the operation's own prose names
+            // (25), one past it, and the quota itself.
+            "twenty-five ids",
+            (0..25)
                 .map(|index| ids[index % ids.len()].clone())
                 .collect(),
-            (0..MAX_BATCH_DEPLOYMENT_IDS)
+            (0..25)
+                .map(|index| ids[index % ids.len()].clone())
+                .collect(),
+        ),
+        (
+            "twenty-six ids",
+            (0..26)
+                .map(|index| ids[index % ids.len()].clone())
+                .collect(),
+            (0..26)
+                .map(|index| ids[index % ids.len()].clone())
+                .collect(),
+        ),
+        (
+            "the quota itself",
+            (0..MAX_BATCH_SIZE)
+                .map(|index| ids[index % ids.len()].clone())
+                .collect(),
+            (0..MAX_BATCH_SIZE)
                 .map(|index| ids[index % ids.len()].clone())
                 .collect(),
         ),
@@ -239,23 +259,21 @@ async fn a_bad_batch_is_refused_with_its_own_code() {
     let emulator = Emulator::new();
     let ids = seeded_deployments(&emulator, "refused", 1).await;
     let known = ids[0].clone();
-    // One past the documented maximum, and the far larger batch a client that
-    // ignores the limit sends.
-    let one_too_many: Vec<String> = (0..=MAX_BATCH_DEPLOYMENT_IDS)
-        .map(|_| known.clone())
-        .collect();
-    let far_too_many: Vec<String> = (0..101).map(|_| known.clone()).collect();
+    // One past the quota, and the far larger batch a client that ignores it
+    // sends.
+    let one_too_many: Vec<String> = (0..=MAX_BATCH_SIZE).map(|_| known.clone()).collect();
+    let far_too_many: Vec<String> = (0..500).map(|_| known.clone()).collect();
     // Too many ids AND every one of them malformed: the batch bound wins.
-    let too_many_malformed: Vec<String> = (0..101).map(|index| format!("bogus{index}")).collect();
+    let too_many_malformed: Vec<String> = (0..500).map(|index| format!("bogus{index}")).collect();
 
     let cases: &[(&str, Vec<String>, &str)] = &[
         (
-            "one past the documented maximum",
+            "one past the quota",
             one_too_many,
             "BatchLimitExceededException",
         ),
         (
-            "far past the documented maximum",
+            "far past the quota",
             far_too_many,
             "BatchLimitExceededException",
         ),
