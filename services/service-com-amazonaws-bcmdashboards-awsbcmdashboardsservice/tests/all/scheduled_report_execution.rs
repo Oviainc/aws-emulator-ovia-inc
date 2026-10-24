@@ -23,16 +23,16 @@ use super::scheduled_report_lifecycle::{error_code, source_dashboard, EXECUTION_
 
 /// The `HealthStatusCode` values, source:
 /// `smithy_query(query="shape",shape="HealthStatusCode")` — `HEALTHY`, `UNHEALTHY`.
-const HEALTHY: &str = "HEALTHY";
-const UNHEALTHY: &str = "UNHEALTHY";
+pub(crate) const HEALTHY: &str = "HEALTHY";
+pub(crate) const UNHEALTHY: &str = "UNHEALTHY";
 
 /// The two `StatusReason` values this store can establish, source:
 /// `smithy_query(query="shape",shape="StatusReason")` (the full list also carries
 /// `DATA_SOURCE_ACCESS_DENIED`, `EXECUTION_ROLE_ASSUME_FAILED`,
 /// `EXECUTION_ROLE_INSUFFICIENT_PERMISSIONS`, `DASHBOARD_ACCESS_DENIED` and
 /// `INTERNAL_FAILURE`, which name failures of resources outside this service).
-const DASHBOARD_NOT_FOUND: &str = "DASHBOARD_NOT_FOUND";
-const WIDGET_ID_NOT_FOUND: &str = "WIDGET_ID_NOT_FOUND";
+pub(crate) const DASHBOARD_NOT_FOUND: &str = "DASHBOARD_NOT_FOUND";
+pub(crate) const WIDGET_ID_NOT_FOUND: &str = "WIDGET_ID_NOT_FOUND";
 
 /// A well-formed `ScheduledReportArn` no report in a fresh store is keyed by.
 const MISSING_REPORT_ARN: &str =
@@ -75,8 +75,9 @@ pub(crate) async fn create_report(
         .to_string()
 }
 
-/// The stored record `GetScheduledReport` answers for `arn`.
-async fn stored_report(router: &MultiServiceRouter, arn: &str) -> Value {
+/// The stored record `GetScheduledReport` answers for `arn`. Shared with the sibling
+/// health-view suite.
+pub(crate) async fn stored_report(router: &MultiServiceRouter, arn: &str) -> Value {
     let fetched = ok_call(router, "GetScheduledReport", &json!({"arn": arn})).await;
     fetched
         .get("scheduledReport")
@@ -84,8 +85,9 @@ async fn stored_report(router: &MultiServiceRouter, arn: &str) -> Value {
         .unwrap_or_else(|| panic!("no scheduledReport in {fetched}"))
 }
 
-/// The `ScheduledReportSummary` `ListScheduledReports` pages over for `arn`.
-async fn listed_summary(router: &MultiServiceRouter, arn: &str) -> Value {
+/// The `ScheduledReportSummary` `ListScheduledReports` pages over for `arn`. Shared with
+/// the sibling health-view suite.
+pub(crate) async fn listed_summary(router: &MultiServiceRouter, arn: &str) -> Value {
     let listed = ok_call(router, "ListScheduledReports", &json!({})).await;
     listed["scheduledReports"]
         .as_array()
@@ -119,6 +121,17 @@ fn assert_health(health: &Value, label: &str, code: &str, reasons: Option<&[&str
     assert!(
         refreshed > 1_700_000_000.0,
         "case {label}: lastRefreshedAt {refreshed} is not a plausible epoch-seconds instant"
+    );
+}
+
+/// Assert the `healthStatus` of a record nothing has refreshed: HEALTHY, with neither a
+/// refresh instant nor reasons — the health a report the service accepted carries before
+/// any execution has refreshed it.
+fn assert_unrefreshed_health(report: &Value, label: &str) {
+    assert_eq!(
+        report.get("healthStatus"),
+        Some(&json!({"statusCode": HEALTHY})),
+        "case {label}: an unrefreshed report reports HEALTHY and nothing else: {report}"
     );
 }
 
@@ -186,9 +199,10 @@ async fn executing_an_enabled_report_triggers_it_and_persists_the_execution() {
 
         let before = stored_report(&router, &arn).await;
         assert!(
-            before.get("lastExecutionAt").is_none() && before.get("healthStatus").is_none(),
-            "case {label}: a report that never ran has neither member: {before}"
+            before.get("lastExecutionAt").is_none(),
+            "case {label}: a report that never ran has no lastExecutionAt: {before}"
         );
+        assert_unrefreshed_health(&before, label);
         let created_at = timestamp(&before, "createdAt", label);
         let updated_at = timestamp(&before, "updatedAt", label);
 
@@ -394,9 +408,11 @@ async fn executing_a_disabled_report_is_refused_and_writes_nothing() {
         let arn = request["arn"].as_str().expect("the request names an arn");
         let stored = stored_report(&router, arn).await;
         assert!(
-            stored.get("lastExecutionAt").is_none() && stored.get("healthStatus").is_none(),
+            stored.get("lastExecutionAt").is_none(),
             "case {label}: a refused execution writes nothing: {stored}"
         );
+        // Nothing refreshed the health, so it still reads as it did at create time.
+        assert_unrefreshed_health(&stored, label);
     }
 }
 
@@ -521,9 +537,10 @@ async fn a_client_token_suppresses_a_second_execution_within_the_window() {
     );
     let untouched = stored_report(&router, &other_arn).await;
     assert!(
-        untouched.get("lastExecutionAt").is_none() && untouched.get("healthStatus").is_none(),
+        untouched.get("lastExecutionAt").is_none(),
         "the refused call must not have executed the other report: {untouched}"
     );
+    assert_unrefreshed_health(&untouched, "conflicting token reuse");
 
     // A fresh token, and no token at all, each execute again.
     for (label, request) in [
