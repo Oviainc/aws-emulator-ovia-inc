@@ -50,7 +50,7 @@ fn step_of(status: &str) -> Option<usize> {
 /// One `(workloadName, deploymentPatternName)` pair per seeded workload, in the order
 /// the catalogue reports them — so the rows below differ in the workload and pattern
 /// they deploy as well as in when the delete arrives.
-async fn one_pattern_per_workload(harness: &Harness) -> Vec<(String, String)> {
+pub(crate) async fn one_pattern_per_workload(harness: &Harness) -> Vec<(String, String)> {
     let mut pairs = Vec::new();
     for workload in catalogue(harness).await {
         let body = harness

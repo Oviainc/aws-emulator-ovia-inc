@@ -47,3 +47,5 @@ mod service_owned_budget_members;
 mod state_roundtrip;
 #[path = "all/subscriber_creation.rs"]
 mod subscriber_creation;
+#[path = "all/subscriber_notification_reads.rs"]
+mod subscriber_notification_reads;

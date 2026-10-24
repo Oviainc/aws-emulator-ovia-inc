@@ -347,9 +347,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // COMPLETED is the honest terminal status here: what this service's control
         // plane owns IS the deployment record, and by then the record is complete and
-        // readable. Nothing in it claims infrastructure the emulator did not build —
-        // `resourceGroup` stays absent because no resource group was created, and the
-        // events describe the record's own lifecycle rather than provisioned resources.
+        // readable; the events describe the record's own lifecycle. The group holding
+        // the deployment's resources is not named here either: it comes into being with
+        // the step that starts provisioning them, which is what
+        // `Deployment::enter_status` assigns it on.
         let validating_at = now + crate::state::TRANSITION_SPAN;
         let in_progress_at = validating_at + crate::state::TRANSITION_SPAN;
         let completed_at = in_progress_at + crate::state::TRANSITION_SPAN;
@@ -402,6 +403,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             status: crate::state::STATUS_CREATING.to_string(),
             status_reason: None,
             specifications,
+            // No group yet: a deployment still in CREATING has provisioned nothing.
             resource_group: None,
             deployment_arn,
             tags: input.tags.unwrap_or_default().into_iter().collect(),

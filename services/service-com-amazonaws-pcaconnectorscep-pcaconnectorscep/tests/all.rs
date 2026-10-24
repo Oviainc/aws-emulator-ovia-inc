@@ -17,6 +17,8 @@ mod challenge_deletion;
 mod connector_deletion;
 #[path = "all/connector_lifecycle.rs"]
 mod connector_lifecycle;
+#[path = "all/connector_vpc_endpoint.rs"]
+mod connector_vpc_endpoint;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]

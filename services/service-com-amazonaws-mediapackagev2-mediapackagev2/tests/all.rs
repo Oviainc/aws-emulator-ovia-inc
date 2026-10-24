@@ -70,3 +70,5 @@ mod delete_channel_multiview_source;
 mod multiview_configuration_validation;
 #[path = "all/regional_partitioning.rs"]
 mod regional_partitioning;
+#[path = "all/manifest_count_range.rs"]
+mod manifest_count_range;

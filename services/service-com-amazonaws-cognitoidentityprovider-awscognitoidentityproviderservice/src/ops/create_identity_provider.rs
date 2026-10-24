@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateIdentityProvider
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateIdentityProvider`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Stores a third-party identity provider (IdP) configuration in a stored user
+//! pool, keyed by its `ProviderName`, and returns the STORED provider, so a
+//! later `DescribeIdentityProvider` renders the same resource. A provider name
+//! the pool already holds is refused with `DuplicateProviderException`; an
+//! unknown `UserPoolId` with `ResourceNotFoundException`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateIdentityProvider::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `ProviderDetails` is a free-form map in the model, so it is stored exactly as
+//! submitted: which keys each `ProviderType` requires is not expressed anywhere
+//! in this service's model, and refusing a detail map is deliberately left to
+//! the issue that cites that rule for `UpdateIdentityProvider`.
 //!
 //! ## Shape of an operation
 //!
@@ -195,20 +196,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateIdentityProvider` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateIdentityProviderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateIdentityProvider"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut guard = state.lock();
+        let pool = guard
+            .pool_mut(&input.user_pool_id)
+            .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+        let pool_id = pool.id.clone();
+        // This emulator holds a pool's providers in memory, so the store is
+        // bounded; read the count before the slot below borrows the map.
+        let stored_count = pool.identity_providers.len();
+
+        match pool.identity_providers.entry(input.provider_name.clone()) {
+            // "This exception is thrown when the provider is already supported by
+            // the user pool" (`DuplicateProviderException`) — a second provider
+            // under a name the pool already holds is refused, and the stored
+            // provider is left exactly as it was.
+            ::std::collections::btree_map::Entry::Occupied(_) => Err(duplicate_provider(
+                &input.provider_name,
+                &input.user_pool_id,
+            )),
+            ::std::collections::btree_map::Entry::Vacant(slot) => {
+                if stored_count >= crate::state::MAX_IDENTITY_PROVIDERS_PER_POOL {
+                    return Err(limit_exceeded(format!(
+                        "User pool {} holds at most {} identity providers.",
+                        input.user_pool_id,
+                        crate::state::MAX_IDENTITY_PROVIDERS_PER_POOL
+                    )));
+                }
+
+                // Stored first, then rendered from the stored record, so the
+                // response is exactly what a later read sees.
+                let stored = slot.insert(crate::state::IdentityProvider {
+                    user_pool_id: pool_id,
+                    provider_name: input.provider_name.clone(),
+                    provider_type: input.provider_type.clone(),
+                    provider_details: input.provider_details.clone(),
+                    // A request that maps no attributes creates a provider with
+                    // an empty mapping, not an absent one.
+                    attribute_mapping: input.attribute_mapping.clone().unwrap_or_default(),
+                    // Likewise `IdpIdentifiers`, whose modelled length starts at
+                    // 0: a provider created with none holds an empty list.
+                    idp_identifiers: input.idp_identifiers.clone().unwrap_or_default(),
+                    // `AcrMapping` is kept exactly as submitted, and stays
+                    // absent on a provider created without one rather than
+                    // being invented as an empty map.
+                    acr_mapping: input.acr_mapping.clone(),
+                    creation_date: now,
+                    last_modified_date: now,
+                });
+                Ok(CreateIdentityProviderOutput {
+                    identity_provider: stored.to_identity_provider_type(),
+                })
+            }
+        }
     }
+}
+
+/// This operation's `ResourceNotFoundException` for an absent user pool.
+fn user_pool_not_found(user_pool_id: &str) -> CreateIdentityProviderError {
+    CreateIdentityProviderErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `DuplicateProviderException` for a provider name the pool
+/// already holds.
+fn duplicate_provider(provider_name: &str, user_pool_id: &str) -> CreateIdentityProviderError {
+    CreateIdentityProviderErrorModeled::DuplicateProviderException(DuplicateProviderException {
+        message: Some(format!(
+            "Provider {provider_name} already exists in user pool {user_pool_id}."
+        )),
+    })
+    .into()
+}
+
+/// This operation's `LimitExceededException` for a store at its bound.
+fn limit_exceeded(message: String) -> CreateIdentityProviderError {
+    CreateIdentityProviderErrorModeled::LimitExceededException(LimitExceededException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> CreateIdentityProviderError {
+    CreateIdentityProviderErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }

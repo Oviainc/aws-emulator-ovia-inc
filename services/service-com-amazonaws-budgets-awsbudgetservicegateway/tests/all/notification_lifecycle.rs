@@ -52,7 +52,9 @@ fn budget(name: &str) -> Value {
 }
 
 /// Create `name` under `account_id` and fail the test if the setup call did not take.
-async fn seed_budget(router: &MultiServiceRouter, account_id: &str, name: &str) {
+///
+/// `pub(crate)` so a sibling suite seeds a budget exactly the way this one does.
+pub(crate) async fn seed_budget(router: &MultiServiceRouter, account_id: &str, name: &str) {
     let (status, body) = call(
         router,
         "CreateBudget",

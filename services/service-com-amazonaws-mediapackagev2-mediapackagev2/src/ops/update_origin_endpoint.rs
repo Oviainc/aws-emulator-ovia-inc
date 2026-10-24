@@ -360,7 +360,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // The manifest-set rules are about the request alone, so they are decided first
-        // and before anything is written.
+        // and before anything is written. An update REPLACES the whole manifest set, each
+        // manifest persisted with its computed URL, so the same count range bounds it:
+        // without that an endpoint's stored record size would be caller-chosen again.
         if let Some(violation) = crate::state::manifest_set_violation(
             &input.container_type,
             manifest_counts(&input),
@@ -375,19 +377,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
-        }
-        // An update REPLACES the whole manifest set, each manifest persisted with its
-        // computed URL, so it is bounded by the same ceiling the create is: without this
-        // an endpoint's stored record size would be caller-chosen again.
-        if let Some(message) = crate::state::manifest_ceiling_exceeded(manifest_counts(&input)) {
-            return Err(
-                UpdateOriginEndpointErrorModeled::ServiceQuotaExceededException(
-                    ServiceQuotaExceededException {
-                        message: Some(message),
-                    },
-                )
-                .into(),
-            );
         }
 
         let Some(group) = store.channel_group_mut(&region, &input.channel_group_name) else {

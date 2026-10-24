@@ -17,7 +17,8 @@ use crate::ops::types::{
     AccountRecoverySettingType, AcrLevelConfigType, AdminCreateUserConfigType,
     AnalyticsConfigurationType, AttributeType, AuthenticationResultType, CustomDomainConfigType,
     DeviceConfigurationType, DeviceType, DomainDescriptionType, EmailConfigurationType, GroupType,
-    IssuerConfigurationType, KeyConfigurationType, LambdaConfigType, MFAOptionType,
+    IdentityProviderType, IssuerConfigurationType, KeyConfigurationType, LambdaConfigType,
+    MFAOptionType,
     NumberAttributeConstraintsType, PasswordPolicyType, RefreshTokenRotationType,
     ResourceServerScopeType, ResourceServerType, RoutingType,
     SchemaAttributeType, SignInPolicyType, SmsConfigurationType, StringAttributeConstraintsType,
@@ -247,6 +248,9 @@ pub const MAX_GROUPS_PER_POOL: usize = 1_000;
 
 /// The most resource servers one user pool holds.
 pub const MAX_RESOURCE_SERVERS_PER_POOL: usize = 1_000;
+
+/// The most identity providers one user pool holds.
+pub const MAX_IDENTITY_PROVIDERS_PER_POOL: usize = 1_000;
 
 /// The most unexpired challenge sessions this emulator holds; the oldest are
 /// evicted past it.
@@ -664,6 +668,10 @@ pub struct UserPool {
     /// carries no case-insensitivity trait, so an identifier is matched exactly
     /// as it was created.
     pub resource_servers: BTreeMap<String, ResourceServer>,
+    /// This pool's third-party identity providers keyed by their `ProviderName`,
+    /// ordered so a read of several is stable. `ProviderNameType` carries no
+    /// case-insensitivity trait, so a name is matched exactly as it was created.
+    pub identity_providers: BTreeMap<String, IdentityProvider>,
     /// The key pair this pool's tokens are signed with and whose public half
     /// its key set publishes, minted with the pool and kept for its lifetime,
     /// so every token the pool ever issued stays verifiable against the key set
@@ -1392,6 +1400,48 @@ impl ResourceServer {
     }
 }
 
+/// One stored third-party identity provider of a user pool: what
+/// `CreateIdentityProvider` stored and every later read of it renders.
+#[derive(Debug, Clone)]
+pub struct IdentityProvider {
+    pub user_pool_id: String,
+    pub provider_name: String,
+    pub provider_type: String,
+    /// "The scopes, URLs, and identifiers for your external identity provider"
+    /// (`IdentityProviderType.ProviderDetails`): an opaque key/value map, kept
+    /// exactly as it was submitted.
+    pub provider_details: HashMap<String, String>,
+    /// "A mapping of IdP attributes to standard and custom user pool attributes"
+    /// (`IdentityProviderType.AttributeMapping`). A provider created with no
+    /// mapping holds an empty one.
+    pub attribute_mapping: HashMap<String, String>,
+    /// The IdP identifiers of this provider, in the order they were submitted. A
+    /// provider created with no identifiers holds none.
+    pub idp_identifiers: Vec<String>,
+    /// The ACR level mapping, which only an OIDC provider carries, so it stays
+    /// absent on a provider that was created without one.
+    pub acr_mapping: Option<HashMap<String, String>>,
+    pub creation_date: SystemTime,
+    pub last_modified_date: SystemTime,
+}
+
+impl IdentityProvider {
+    /// The modelled view of this provider, rendered from what is stored.
+    pub fn to_identity_provider_type(&self) -> IdentityProviderType {
+        IdentityProviderType {
+            user_pool_id: Some(self.user_pool_id.clone()),
+            provider_name: Some(self.provider_name.clone()),
+            provider_type: Some(self.provider_type.clone()),
+            provider_details: Some(self.provider_details.clone()),
+            attribute_mapping: Some(self.attribute_mapping.clone()),
+            idp_identifiers: Some(self.idp_identifiers.clone()),
+            acr_mapping: self.acr_mapping.clone(),
+            creation_date: Some(to_date_time(self.creation_date)),
+            last_modified_date: Some(to_date_time(self.last_modified_date)),
+        }
+    }
+}
+
 /// A challenge session: what a `RespondToAuthChallenge` for this session resumes.
 #[derive(Debug, Clone)]
 pub struct AuthSession {
@@ -1720,6 +1770,7 @@ pub fn new_user_pool(name: String, region: &str, now: SystemTime) -> UserPool {
         users: HashMap::new(),
         groups: BTreeMap::new(),
         resource_servers: BTreeMap::new(),
+        identity_providers: BTreeMap::new(),
         // A pool's token-signing key exists from the moment the pool does, as
         // on AWS, so its key set is publishable before anything signs in. One
         // scalar multiplication, so creating a pool waits on nothing.
