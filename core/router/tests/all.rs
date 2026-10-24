@@ -116,6 +116,13 @@ mod keyspaces_streams_routing;
 mod lambda_bundled_wire_operations;
 #[path = "all/lambda_signing_name_routing.rs"]
 mod lambda_signing_name_routing;
+// Declared HERE, in the sorted list, rather than appended at the end of this file: the
+// tail is where every concurrently landing router suite appends its line, so a
+// declaration placed there conflicts with every one of them. (The build script requires
+// every suite under `tests/all/` to be declared in this file, so it cannot live anywhere
+// else.) These neighbouring lines are stable.
+#[path = "all/lex_runtime_v2_sessions_through_the_router.rs"]
+mod lex_runtime_v2_sessions_through_the_router;
 #[path = "all/marketplace_signing_name_routing.rs"]
 mod marketplace_signing_name_routing;
 #[path = "all/partnercentral_channel_target_routing.rs"]

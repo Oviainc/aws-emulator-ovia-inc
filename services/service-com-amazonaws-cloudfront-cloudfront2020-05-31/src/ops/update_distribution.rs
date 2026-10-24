@@ -377,13 +377,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             IfMatch::Current => {}
             IfMatch::Invalid => {
                 return Err(UpdateDistributionErrorModeled::InvalidIfMatchVersion(
-                    InvalidIfMatchVersion {
-                        message: Some(
-                            "The If-Match version is missing or not valid: supply the ETag of \
-                             the distribution's current version"
-                                .to_string(),
-                        ),
-                    },
+                    crate::state::invalid_if_match_version(),
                 )
                 .into());
             }

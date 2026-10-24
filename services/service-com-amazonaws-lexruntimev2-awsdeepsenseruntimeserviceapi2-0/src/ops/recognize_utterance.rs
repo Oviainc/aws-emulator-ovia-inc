@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RecognizeUtterance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RecognizeUtterance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RecognizeUtterance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Advances the conversation one turn from a request PAYLOAD rather than from a
+//! JSON body: the same turn as `RecognizeText`, with the input carried as the
+//! `inputStream` blob and the dialog state and request attributes carried as
+//! gzipped, base64-encoded headers.
 //!
 //! ## Shape of an operation
 //!
@@ -169,6 +165,118 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::headers::{
+    decode_string_map, decode_struct, encode_json, encode_text, member_schema, HeaderRejected,
+};
+use crate::state::{
+    asks_for_speech, AttributesRefused, SessionKey, SessionStoreFull, TurnRefused, AUDIO_PREFIX,
+    TEXT_CONTENT_TYPE,
+};
+use aws_smithy_schema::serde::ShapeSerializer;
+use std::time::SystemTime;
+
+/// The prefix a `requestContentType` carries when the input stream is text
+/// rather than audio: the model's "Text format — `text/plain; charset=utf-8`"
+/// (`RecognizeUtteranceRequest$requestContentType`, which lists every accepted
+/// prefix). The audio prefixes and the response content type are
+/// [`crate::state`]'s, shared with the sibling operation that takes the same
+/// member.
+const TEXT_REQUEST_PREFIX: &str = "text/plain";
+
+/// `Text`, the `inputMode` of a turn whose input was text — the member
+/// "indicates whether the input mode to the operation was text, speech, or from
+/// a touch-tone keypad" (`RecognizeUtteranceResponse$inputMode`), and this
+/// operation serves only the text one.
+const INPUT_MODE_TEXT: &str = "Text";
+
+/// How the bytes of `inputStream` are to be read, per `requestContentType`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputFormat {
+    /// The stream is the user's utterance as text.
+    Text,
+    /// The stream is encoded speech, which has to be transcribed before any
+    /// intent can be recognized from it.
+    Speech,
+}
+
+/// Which format `content_type` declares, or `None` for a value that is none of
+/// the ones the model lists.
+///
+/// "The header must start with one of the following prefixes"
+/// (`RecognizeUtteranceRequest$requestContentType`), so the value is matched by
+/// prefix, case-insensitively as a media type is compared.
+fn input_format(content_type: &str) -> Option<InputFormat> {
+    let normalized = content_type.trim_start().to_ascii_lowercase();
+    if normalized.starts_with(TEXT_REQUEST_PREFIX) {
+        Some(InputFormat::Text)
+    } else if normalized.starts_with(AUDIO_PREFIX) {
+        Some(InputFormat::Speech)
+    } else {
+        None
+    }
+}
+
+/// A server fault this operation declares, for a failure that is the emulator's
+/// own and not the caller's.
+fn internal(message: impl Into<String>) -> RecognizeUtteranceError {
+    RecognizeUtteranceErrorModeled::InternalServerException(InternalServerException {
+        message: message.into(),
+    })
+    .into()
+}
+
+/// A request the caller has to fix, worded so the member and the rule it broke
+/// are both in the message.
+fn invalid(message: impl Into<String>) -> RecognizeUtteranceError {
+    RecognizeUtteranceErrorModeled::ValidationException(ValidationException {
+        message: message.into(),
+    })
+    .into()
+}
+
+/// A header payload that is not the encoding the model documents, or that does
+/// not decode to the member's shape: the caller's to fix.
+fn rejected(error: HeaderRejected) -> RecognizeUtteranceError {
+    invalid(error.message())
+}
+
+/// An attribute map the caller has to fix.
+fn refused(error: AttributesRefused) -> RecognizeUtteranceError {
+    invalid(error.message())
+}
+
+/// The store is at capacity, so this request cannot start a session: a refusal
+/// of the request rate, not a fault of the request itself.
+fn store_full(error: SessionStoreFull) -> RecognizeUtteranceError {
+    RecognizeUtteranceErrorModeled::ThrottlingException(ThrottlingException {
+        message: error.message(),
+    })
+    .into()
+}
+
+/// A turn this service would not take, in this operation's own error channel.
+fn turn_refused(error: TurnRefused) -> RecognizeUtteranceError {
+    match error {
+        TurnRefused::Attributes(attributes) => refused(attributes),
+        TurnRefused::StoreFull(full) => store_full(full),
+    }
+}
+
+/// Speech this emulator cannot produce or cannot read, reported as the modelled
+/// dependency failure.
+///
+/// Amazon Lex V2 reaches other services for speech — Amazon Polly to synthesize
+/// it, and its own speech recognition to transcribe it. Neither is available
+/// here, and an invented transcript or an empty audio stream would be a worse
+/// answer than saying so: nothing recognized the audio, so no `inputTranscript`,
+/// intent or interpretation of it can be reported. The same refusal the sibling
+/// `PutSession` gives an audio `responseContentType`.
+fn speech_unavailable(message: String) -> RecognizeUtteranceError {
+    RecognizeUtteranceErrorModeled::DependencyFailedException(DependencyFailedException {
+        message,
+    })
+    .into()
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -245,18 +353,216 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RecognizeUtterance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RecognizeUtteranceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RecognizeUtterance"))
+        let _ = ctx;
+
+        // --- what the request carries, and whether this emulator can read it ---
+
+        // The format of the input stream decides what can be recognized from
+        // it. A value outside the prefixes the model lists is the caller's to
+        // fix, and audio is input nothing here can transcribe.
+        match input_format(&input.request_content_type) {
+            Some(InputFormat::Text) => {}
+            Some(InputFormat::Speech) => {
+                return Err(speech_unavailable(format!(
+                    "requestContentType {} declares audio input, which this emulator cannot \
+                     transcribe; send the utterance as {TEXT_REQUEST_PREFIX}; charset=utf-8",
+                    input.request_content_type
+                )));
+            }
+            None => {
+                return Err(invalid(format!(
+                    "requestContentType must start with one of the prefixes Amazon Lex V2 \
+                     accepts (audio/l16, audio/x-l16, audio/lpcm, \
+                     audio/x-cbr-opus-with-preamble or {TEXT_REQUEST_PREFIX}), got {}",
+                    input.request_content_type
+                )));
+            }
+        }
+
+        // "The message that Amazon Lex V2 returns in the response can be either
+        // text or speech based on the responseContentType value", and the
+        // response reports it back as `contentType`.
+        let content_type = input
+            .response_content_type
+            .unwrap_or_else(|| TEXT_CONTENT_TYPE.to_string());
+        if asks_for_speech(&content_type) {
+            return Err(speech_unavailable(format!(
+                "responseContentType {content_type} requests synthesized speech, which this \
+                 emulator cannot produce; ask for {TEXT_CONTENT_TYPE}"
+            )));
+        }
+
+        // The utterance itself: `inputStream` holds "user input in … text format
+        // as described in the requestContentType parameter", so with a text
+        // content type the stream is the text that is processed.
+        let transcript = String::from_utf8(input.input_stream).map_err(|e| {
+            invalid(format!(
+                "inputStream must be UTF-8 text when requestContentType is \
+                 {TEXT_REQUEST_PREFIX}: {e}"
+            ))
+        })?;
+        if transcript.is_empty() {
+            return Err(invalid(
+                "inputStream must carry the user's utterance; it is empty".to_string(),
+            ));
+        }
+
+        // The two members carried as gzipped, base64-encoded headers rather than
+        // in a body. Both are optional, and both are decoded BEFORE the session
+        // is touched, so a request that misstates one changes nothing.
+        let session_state = input
+            .session_state
+            .as_deref()
+            .map(|value| decode_struct::<SessionState>("sessionState", value))
+            .transpose()
+            .map_err(rejected)?;
+        let request_attributes = input
+            .request_attributes
+            .as_deref()
+            .map(|value| decode_string_map("requestAttributes", value))
+            .transpose()
+            .map_err(rejected)?;
+
+        // --- the turn ---
+
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(|| internal("the Lex V2 runtime session store is unavailable"))?;
+
+        let now = SystemTime::now();
+        let key = SessionKey::new(
+            &input.bot_id,
+            &input.bot_alias_id,
+            &input.locale_id,
+            &input.session_id,
+        );
+
+        // The same one turn `RecognizeText` takes: the two operations are two
+        // encodings of "sends user input to Amazon Lex V2", so they share the
+        // turn in `crate::state` and answer with the same session state,
+        // messages and interpretations for the same input.
+        let turn = state
+            .lock()
+            .advance_turn(key, now, session_state, request_attributes)
+            .map_err(turn_refused)?;
+
+        // --- the response, encoded as the model documents ---
+
+        let turn_schema = super::types::RECOGNIZE_TEXT_OUTPUT_SCHEMA;
+        // The structured payloads are the SAME shapes the sibling operations
+        // carry in a body, so their schemas are read off the model rather than
+        // declared here: `RecognizeText`'s output binds each of them by name,
+        // while this operation's own output declares them as the strings they
+        // travel as.
+        let state_schema = member_schema(turn_schema, "sessionState")
+            .ok_or_else(|| internal("the model declares no sessionState member"))?;
+        let messages_schema = member_schema(turn_schema, "messages")
+            .ok_or_else(|| internal("the model declares no messages member"))?;
+        let interpretations_schema = member_schema(turn_schema, "interpretations")
+            .ok_or_else(|| internal("the model declares no interpretations member"))?;
+        let attributes_schema = member_schema(turn_schema, "requestAttributes")
+            .ok_or_else(|| internal("the model declares no requestAttributes member"))?;
+
+        let session_state = encode_json(|serializer| {
+            serializer.write_struct(state_schema, &turn.session_state)
+        })
+        .map_err(internal)?;
+
+        // Every other structured header is an optional `NonEmptyString`: with
+        // nothing stored there is nothing to report, so the header is absent
+        // rather than an encoded empty collection.
+        let messages = if turn.messages.is_empty() {
+            None
+        } else {
+            let element_schema = messages_schema
+                .member()
+                .ok_or_else(|| internal("the model declares no messages element member"))?;
+            Some(
+                encode_json(|serializer| {
+                    serializer.write_list(messages_schema, &|element| {
+                        for message in &turn.messages {
+                            element.write_struct(element_schema, message)?;
+                        }
+                        Ok(())
+                    })
+                })
+                .map_err(internal)?,
+            )
+        };
+        let interpretations = if turn.interpretations.is_empty() {
+            None
+        } else {
+            let element_schema = interpretations_schema
+                .member()
+                .ok_or_else(|| internal("the model declares no interpretations element member"))?;
+            Some(
+                encode_json(|serializer| {
+                    serializer.write_list(interpretations_schema, &|element| {
+                        for interpretation in &turn.interpretations {
+                            element.write_struct(element_schema, interpretation)?;
+                        }
+                        Ok(())
+                    })
+                })
+                .map_err(internal)?,
+            )
+        };
+        let request_attributes = if turn.request_attributes.is_empty() {
+            None
+        } else {
+            // A map entry is written with its own key and value member schemas:
+            // `Schema::key()` is the map's key member and `Schema::member()` its
+            // value member.
+            let key_schema = attributes_schema
+                .key()
+                .ok_or_else(|| internal("the model declares no requestAttributes key member"))?;
+            let value_schema = attributes_schema
+                .member()
+                .ok_or_else(|| internal("the model declares no requestAttributes value member"))?;
+            Some(
+                encode_json(|serializer| {
+                    serializer.write_map(attributes_schema, &|entry| {
+                        for (name, value) in &turn.request_attributes {
+                            entry.write_string(key_schema, name)?;
+                            entry.write_string(value_schema, value)?;
+                        }
+                        Ok(())
+                    })
+                })
+                .map_err(internal)?,
+            )
+        };
+
+        // "The prompt or statement to send to the user": with a text
+        // `responseContentType` that prompt is the text of the messages the
+        // session carries, which is what the `x-amz-lex-messages` header reports
+        // in full. One message is its own content; several are run together one
+        // per line, so nothing the session holds is dropped and nothing is
+        // invented.
+        let audio_stream = turn
+            .messages
+            .iter()
+            .filter_map(|message| message.content.as_deref())
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into_bytes();
+
+        Ok(RecognizeUtteranceOutput {
+            // The input was text, so that is the mode this turn ran in.
+            input_mode: Some(INPUT_MODE_TEXT.to_string()),
+            content_type: Some(content_type),
+            messages,
+            interpretations,
+            session_state: Some(session_state),
+            request_attributes,
+            session_id: Some(turn.session_id),
+            // "The text used to process the request" — for a text stream, the
+            // stream itself, carried under the same gzip-then-base64 encoding as
+            // every other payload header.
+            input_transcript: Some(encode_text(&transcript).map_err(internal)?),
+            audio_stream,
+            // A bot member is recognized only for a bot in a network of bots,
+            // which this runtime holds no definition of.
+            recognized_bot_member: None,
+        })
     }
 }

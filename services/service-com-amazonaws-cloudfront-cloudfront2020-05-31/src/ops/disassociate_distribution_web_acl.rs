@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateDistributionWebACL
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateDistributionWebACL`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: takes the WAF web ACL off a stored distribution.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateDistributionWebACL::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The distribution's persisted configuration has its `WebACLId` cleared — that member
+//! is what names the web ACL a distribution is associated with — and the distribution is
+//! versioned and re-propagated the way every configuration change is. So a later read of
+//! the distribution answers from the record this call wrote rather than from the one it
+//! replaced.
 //!
 //! ## Shape of an operation
 //!
@@ -73,6 +71,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::time::SystemTime;
+
+use crate::state::IfMatch;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -144,20 +146,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateDistributionWebACL` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateDistributionWebACLErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let now = SystemTime::now();
+        let mut store = state.lock();
+        store.settle(now);
+
+        // This operation's model names `EntityNotFound` — not `NoSuchDistribution` — for
+        // an id no stored distribution carries, so that is what an unknown id answers.
+        let Some((current_etag, mut config)) = store
+            .distribution(&input.id)
+            .map(|stored| (stored.etag.clone(), stored.config.clone()))
+        else {
+            return Err(DisassociateDistributionWebACLErrorModeled::EntityNotFound(
+                crate::state::distribution_not_found(&input.id),
+            )
+            .into());
+        };
+
+        // `If-Match` is a conditional header the model leaves optional, so an absent one
+        // is no precondition at all and the disassociation proceeds. A header that IS
+        // present is evaluated against the stored version the way HTTP evaluates one, so
+        // a caller holding a version that is no longer current never writes over a
+        // configuration it has not read.
+        if let Some(if_match) = input.if_match.as_deref() {
+            match crate::state::check_if_match(&current_etag, Some(if_match)) {
+                IfMatch::Current => {}
+                IfMatch::Invalid => {
+                    return Err(
+                        DisassociateDistributionWebACLErrorModeled::InvalidIfMatchVersion(
+                            crate::state::invalid_if_match_version(),
+                        )
+                        .into(),
+                    );
+                }
+                IfMatch::Stale => {
+                    return Err(
+                        DisassociateDistributionWebACLErrorModeled::PreconditionFailed(
+                            crate::state::precondition_failed(),
+                        )
+                        .into(),
+                    );
+                }
+            }
+        }
+
+        // `DistributionConfig$WebACLId` is the web ACL "to associate with this
+        // distribution", and an EMPTY value is what names no association — so clearing
+        // that one member is the whole of the disassociation. Every other member the
+        // distribution runs under is carried over untouched.
+        config.web_acl_id = Some(String::new());
+
+        // Stored through the one configuration-mutating path, so this call versions and
+        // re-propagates the distribution exactly as an update does: a fresh `ETag`, a new
+        // `LastModifiedTime` and `InProgress` until the change reaches the edge locations.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateDistributionWebACL"))
+        // The record was read above under this same held lock, so the store still holds
+        // it; the `None` arm is defensive — the modelled not-found is answered rather than
+        // panicking if it ever does not.
+        let Some(stored) = store.apply_config(&input.id, config, now) else {
+            return Err(DisassociateDistributionWebACLErrorModeled::EntityNotFound(
+                crate::state::distribution_not_found(&input.id),
+            )
+            .into());
+        };
+
+        Ok(DisassociateDistributionWebACLOutput {
+            id: Some(stored.id.clone()),
+            // "The current version of the distribution" — the token this mutation just
+            // minted, so the version from before it no longer satisfies an `If-Match`.
+            e_tag: Some(stored.etag.clone()),
+        })
     }
 }

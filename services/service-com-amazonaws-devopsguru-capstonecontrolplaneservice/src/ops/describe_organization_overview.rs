@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeOrganizationOverview
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeOrganizationOverview`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports an ORGANIZATION's overview for a day-granular time range: how many of its
+//! member accounts' insights are OPEN, by `InsightType`, among the insights that were
+//! created inside that range. A pure read: it never writes to the store.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeOrganizationOverview::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! An organization-wide view belongs to the account that administers DevOps Guru for
+//! that organization — its management account or its registered delegated administrator
+//! — so this read is available to that caller alone and is otherwise the modelled HTTP
+//! 403 `AccessDeniedException`, decided before any lookup, exactly as in
+//! [`crate::ops::describe_organization_resource_collection_health`]. This emulator serves
+//! one account and records no organization administrator (see
+//! [`crate::state::ComAmazonawsDevopsguruCapstonecontrolplaneserviceState::organization_admin_account_id`]),
+//! so every caller a client can present is refused; the counts themselves are tallied
+//! over the insights the store holds for the member accounts the request's `AccountIds` /
+//! `OrganizationalUnitIds` filters leave in scope.
+//!
+//! The range is a range of whole UTC DAYS ([`crate::state::DayRange`]): both `FromTime`
+//! and `ToTime` are documented "The start time granularity is at the day level. The floor
+//! of the start time is used", so each bound names a day and both of those days count in
+//! full. The model's "Returned information occurred after this day" / "before this day"
+//! is read as naming the FIRST and the LAST day of the range rather than excluding them,
+//! which is the only reading under which a one-day request — or the documented `ToTime`
+//! default of "the current day" — holds any instant at all.
 //!
 //! ## Shape of an operation
 //!
@@ -121,6 +134,45 @@ impl From<DescribeOrganizationOverviewErrorModeled> for DescribeOrganizationOver
     }
 }
 
+/// The day-granular range `input` names, or the `ValidationException` refusing a bound
+/// that is not an instant this service can represent.
+///
+/// The span itself is [`crate::state::DayRange`], which every day-granular read of this
+/// store shares; this function is only the per-operation translation of the two modelled
+/// members into it.
+fn requested_range(
+    input: &DescribeOrganizationOverviewInput,
+) -> Result<crate::state::DayRange, DescribeOrganizationOverviewError> {
+    let from = bound(&input.from_time, "FromTime")?;
+    // An absent `ToTime` is "the current day", which `DayRange::of_days` substitutes.
+    let to = match input.to_time.as_ref() {
+        Some(to_time) => Some(bound(to_time, "ToTime")?),
+        None => None,
+    };
+    Ok(crate::state::DayRange::of_days(from, to))
+}
+
+/// A submitted `Timestamp` in the milliseconds the store keeps, or the
+/// `ValidationException` naming `member` when the instant is not one this service can
+/// represent.
+fn bound(
+    at: &::aws_smithy_types::DateTime,
+    member: &str,
+) -> Result<i64, DescribeOrganizationOverviewError> {
+    crate::state::millis_of(at).ok_or_else(|| {
+        DescribeOrganizationOverviewErrorModeled::ValidationException(ValidationException {
+            message: format!("{member} is not an instant this service can represent"),
+            reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+            fields: Some(vec![ValidationExceptionField {
+                name: member.to_string(),
+                message: "must be an instant representable in milliseconds since the epoch"
+                    .to_string(),
+            }]),
+        })
+        .into()
+    })
+}
+
 /// The `DescribeOrganizationOverview` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -155,20 +207,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeOrganizationOverview` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeOrganizationOverviewErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeOrganizationOverview"))
+        // This overview is computed from the store alone: no request metadata beyond the
+        // deserialized input takes part, so the context is unused.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(
+            || -> DescribeOrganizationOverviewError {
+                DescribeOrganizationOverviewErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the DevOps Guru insight store is unavailable".to_string(),
+                        retry_after_seconds: 0,
+                    },
+                )
+                .into()
+            },
+        )?;
+
+        // The caller: the one account this emulator serves. An organization-wide view
+        // belongs to the account that administers DevOps Guru for the organization, so a
+        // caller that administers none is refused — decided BEFORE any lookup, so the
+        // refusal reports nothing about what the organization holds.
+        let caller = crate::state::requested_account_id(None);
+        let scope = crate::state::OrganizationAccountScope::of(
+            &input.account_ids,
+            &input.organizational_unit_ids,
+        );
+        let window = requested_range(&input)?;
+
+        let guard = state.lock();
+        if !guard.administers_organization(&caller) {
+            return Err(
+                DescribeOrganizationOverviewErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: format!(
+                            "Access denied when reading an organization-wide overview: account \
+                             {caller} does not administer DevOps Guru for an organization"
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The member accounts of the organization this store records: the ONE account
+        // this emulator serves, which belongs to no organizational unit (see
+        // `OrganizationAccountScope::holds_served_member`).
+        let member_in_scope = scope.holds_served_member(&caller);
+
+        // The counts are the OPEN insights of each type — "the number of open proactive
+        // insights" — among those CREATED inside the requested range, which is the same
+        // tally every other health read of this store computes, taken over the insights
+        // whose own start instant the window holds. An out-of-scope member contributes
+        // nothing, and a store over which no analysis has run counts zeros rather than
+        // inventing an insight.
+        let tally = if member_in_scope {
+            crate::state::InsightTally::over(guard.insights.values(), |insight| {
+                window.holds(insight.start_time_millis)
+            })
+        } else {
+            crate::state::InsightTally::default()
+        };
+
+        Ok(DescribeOrganizationOverviewOutput {
+            proactive_insights: tally.open_proactive,
+            reactive_insights: tally.open_reactive,
+        })
     }
 }

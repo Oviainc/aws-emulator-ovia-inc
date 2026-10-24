@@ -320,12 +320,6 @@ const STAGING_MUST_BE_TRUE: &str =
     "The only valid value for Staging is true: CopyDistribution copies a primary \
      distribution to a staging distribution.";
 
-/// The `If-Match` refusal wording, as `InvalidIfMatchVersion` documents the condition:
-/// "The If-Match version is missing or not valid."
-const INVALID_IF_MATCH_MESSAGE: &str =
-    "The If-Match version is not valid: supply the ETag of the primary distribution's \
-     current version";
-
 /// Report a refusal from the shared create path as this operation's modelled error.
 ///
 /// The copy is created through the same path `CreateDistribution` uses, so it is refused
@@ -436,10 +430,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             match crate::state::check_if_match(&primary_etag, input.if_match.as_deref()) {
                 IfMatch::Current => {}
                 IfMatch::Invalid => {
+                    // The refusal wording is `crate::state`'s: the sentence is a property
+                    // of the header the request carried, so every operation that
+                    // evaluates an `If-Match` answers with the same service text rather
+                    // than wording of its own.
                     return Err(CopyDistributionErrorModeled::InvalidIfMatchVersion(
-                        InvalidIfMatchVersion {
-                            message: Some(INVALID_IF_MATCH_MESSAGE.to_string()),
-                        },
+                        crate::state::invalid_if_match_version(),
                     )
                     .into());
                 }

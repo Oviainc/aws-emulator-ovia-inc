@@ -1,9 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetImport
-//! Reports one CloudTrail Lake import, addressed by its import id. It is a pure
-//! read: every member of the answer comes from the stored import record, and
-//! nothing in the registry changes.
+//! Reports one CloudTrail Lake import, addressed by its import id — the same
+//! records `StartImport` writes and `StopImport` moves. Every member of the answer
+//! comes from the stored import record, and nothing in the registry changes except
+//! the one transition the clock already owes the job: the read materialises
+//! `INITIALIZING` -> `IN_PROGRESS` ([`crate::state::ImportRecord::settle`]), which
+//! was due whether or not anybody read the import, so applying it changes nothing a
+//! later caller would otherwise have seen.
 //!
 //! ## Shape of an operation
 //!
@@ -159,6 +163,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
         // request metadata.
         let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetImportErrorModeled::UnsupportedOperationException(UnsupportedOperationException {
                 message: Some(
@@ -168,13 +173,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             })
         })?;
-        let store = state.lock();
+        // The lookup is mutable only to materialise the clock-owed transition
+        // below; nothing else here writes.
+        let mut store = state.lock();
 
         // An import belongs to the Region it was created in, so an id naming no import
         // THIS Region holds was not found — the same answer as an id naming no import
         // at all. The modelled `UUID` pattern and length are already enforced by the
         // boundary validator, so an id reaching here is well formed.
-        let Some(record) = store.import(&input.import_id, &region) else {
+        let Some(record) = store.import_mut(&input.import_id, &region) else {
             return Err(crate::scaffolded::Scaffolded::modeled_with_status(
                 GetImportErrorModeled::ImportNotFoundException(ImportNotFoundException {
                     message: Some(crate::state::import_not_found_message(&input.import_id)),
@@ -182,6 +189,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::IMPORT_NOT_FOUND_HTTP_STATUS,
             ));
         };
+
+        // The transition the clock owes this job, materialised before it is
+        // reported; see the module docs.
+        record.settle(now);
 
         Ok(report(record))
     }

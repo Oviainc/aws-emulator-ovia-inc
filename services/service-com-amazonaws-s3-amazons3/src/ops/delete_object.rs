@@ -1,10 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteObject
-//! IMPLEMENTED: removes the (bucket, key) entry from the store, idempotently.
+//! IMPLEMENTED: removes the version a `versionId` names, or lays a delete marker over the
+//! key when the bucket carries a versioning state, idempotently.
 //!
 //! S3's delete is idempotent: deleting a key that is not there is the same 204 success
-//! as deleting one that is, so a caller retrying a delete sees one outcome.
+//! as deleting one that is, so a caller retrying a delete sees one outcome. On a bucket
+//! with a versioning state the delete takes nothing away — "the operation inserts a delete
+//! marker, which becomes the current version of the object", and "to permanently delete an
+//! object in a versioned bucket, you must include the object's versionId in the request".
 //!
 //! ## Shape of an operation
 //!
@@ -156,28 +160,75 @@ use super::types::*;
 // `DeleteObjectError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 
-/// This operation's output, as the wire carries it: NOTHING.
+/// This operation's output, as the wire carries it: the two members that describe the
+/// DELETE MARKER, bound to response headers, and NO body.
 ///
-/// A successful delete answers "204 No Content", and an HTTP 204 response has no body, so
-/// the generated output shape would still serialize an empty `DeleteObjectOutput` document
-/// into that 204. The local empty structure is what keeps the body empty, the way
-/// `DeleteBucket`'s does; `with_http` carries the modelled 204, without which the status
-/// falls back to the protocol default of 200.
+/// A successful delete answers "204 No Content", and an HTTP 204 response has no body. The
+/// modelled `DeleteObjectOutput` cannot be used for it: the protocol only leaves the body
+/// empty for a `smithy.api#Unit` output shape (`rest_xml::serialize_output`), so the
+/// generated shape serializes an empty `<DeleteObjectOutput>` document into that 204. This
+/// LOCAL shape keeps the Unit shape id — hence the empty body — while declaring the two
+/// members as `@httpHeader` bindings, which the protocol still captures for a Unit output;
+/// `with_http` carries the modelled 204, without which the status falls back to the
+/// protocol default of 200.
 ///
-/// It reports none of the modelled output's three header members either:
-/// `x-amz-request-charged` is a Requester Pays charge this emulator does not model, and
-/// `x-amz-delete-marker` / `x-amz-version-id` describe the delete marker a versioned
-/// delete creates, which this handler does not record (see `handle`). A delete that names
-/// a `versionId` is answered by removing exactly that version, and the caller already
-/// holds the id it named.
+/// The third modelled member, `x-amz-request-charged`, is a Requester Pays charge this
+/// emulator does not model, so it is not declared here.
+///
+/// KNOWN FRAGILITY: this leans on the protocol keying body suppression off the Unit SHAPE
+/// ID while still running the members through the HTTP binder
+/// (`rest_xml::serialize_output`'s `is_unit` branch). A protocol change that treated a
+/// Unit output as memberless would silently stop reporting these two headers. The
+/// structural fix belongs in that serializer — suppress the body for any 204 or
+/// payload-less output — not in a per-operation shape; until then, the test
+/// `a_delete_that_names_no_version_lays_a_marker_and_takes_nothing_away` pins both the
+/// empty body and the two headers, so the pairing cannot break unnoticed.
 #[derive(Debug, Clone, Default)]
-pub struct DeleteObjectNoContent;
+pub struct DeleteObjectNoContent {
+    /// `x-amz-delete-marker`: "Indicates whether the specified object version that was
+    /// permanently deleted was (true) or was not (false) a delete marker before deletion"
+    /// — and, for a delete that named no version, that this call CREATED one. Reported
+    /// only when true, the way S3 omits the header otherwise.
+    pub delete_marker: Option<bool>,
+    /// `x-amz-version-id`: "Returns the version ID of the delete marker created as a
+    /// result of the DELETE operation", or the version a delete that named one removed.
+    pub version_id: Option<String>,
+}
+
+/// `x-amz-delete-marker`, as [`DeleteObjectNoContent`] binds it.
+static DELETE_MARKER_HEADER: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+    ::aws_smithy_schema::ShapeId::from_static(
+        "com.amazonaws.s3#DeleteObjectOutput$DeleteMarker",
+        "com.amazonaws.s3#DeleteObjectOutput",
+        "DeleteMarker",
+    ),
+    ::aws_smithy_schema::ShapeType::Boolean,
+    "DeleteMarker",
+    0,
+)
+.with_http_header("x-amz-delete-marker");
+
+/// `x-amz-version-id`, as [`DeleteObjectNoContent`] binds it.
+static VERSION_ID_HEADER: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_member(
+    ::aws_smithy_schema::ShapeId::from_static(
+        "com.amazonaws.s3#DeleteObjectOutput$VersionId",
+        "com.amazonaws.s3#DeleteObjectOutput",
+        "VersionId",
+    ),
+    ::aws_smithy_schema::ShapeType::String,
+    "VersionId",
+    1,
+)
+.with_http_header("x-amz-version-id");
+
+static DELETE_OBJECT_NO_CONTENT_MEMBERS: &[&::aws_smithy_schema::Schema] =
+    &[&DELETE_MARKER_HEADER, &VERSION_ID_HEADER];
 
 impl DeleteObjectNoContent {
     pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
         ::aws_smithy_schema::ShapeId::from_static("smithy.api#Unit", "smithy.api", "Unit"),
         ::aws_smithy_schema::ShapeType::Structure,
-        &[],
+        DELETE_OBJECT_NO_CONTENT_MEMBERS,
     )
     .with_http(::aws_smithy_schema::traits::HttpTrait::new(
         "DELETE",
@@ -190,7 +241,18 @@ pub static DELETE_OBJECT_NO_CONTENT_SCHEMA: &::aws_smithy_schema::Schema =
     &DeleteObjectNoContent::SCHEMA;
 
 impl ::aws_smithy_schema::serde::SerializableStruct for DeleteObjectNoContent {
-    fn serialize_members(&self, _s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer) -> Result<(), ::aws_smithy_schema::serde::SerdeError> { Ok(()) }
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        if let Some(delete_marker) = self.delete_marker {
+            serializer.write_boolean(&DELETE_MARKER_HEADER, delete_marker)?;
+        }
+        if let Some(version_id) = self.version_id.as_deref() {
+            serializer.write_string(&VERSION_ID_HEADER, version_id)?;
+        }
+        Ok(())
+    }
 }
 
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
@@ -287,6 +349,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // code this model carries no shape for, so it goes out through the unmodelled
         // channel rather than as a success that deleted nothing.
         if let Some(version_id) = input.version_id.as_deref() {
+            // "Indicates whether the specified object version that was permanently deleted
+            // was (true) or was not (false) a delete marker before deletion"
+            // (`DeleteObjectOutput$DeleteMarker`) — read off the stored version BEFORE it
+            // is removed, so the flag describes what this call actually took away.
+            let removed_marker = store
+                .bucket(&input.bucket)
+                .and_then(|bucket| bucket.stored_version(&input.key, version_id))
+                .is_some_and(|held| held.as_delete_marker().is_some());
             return match store.remove_object_version(&input.bucket, &input.key, version_id) {
                 None => Err(DeleteObjectErrorModeled::NoSuchBucket(NoSuchBucket {}).into()),
                 Some(false) => Err(crate::scaffolded::Scaffolded::unmodeled(
@@ -294,25 +364,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     404,
                     crate::state::NO_SUCH_VERSION_MESSAGE,
                 )),
-                Some(true) => Ok(DeleteObjectNoContent),
+                // "Returns the version ID of the delete marker created as a result of the
+                // DELETE operation" (`DeleteObjectOutput$VersionId`): for a delete that
+                // named a version, the version it removed.
+                Some(true) => Ok(DeleteObjectNoContent {
+                    delete_marker: removed_marker.then_some(true),
+                    version_id: Some(version_id.to_string()),
+                }),
             };
         }
 
         // Deleting a key that is not there is a success — "Removes an object from a
         // bucket… if there isn't a null version, Amazon S3 does not remove anything" —
         // so what the answer turns on is only whether the BUCKET exists: `None` is the
-        // bucket this emulator does not hold. On a bucket that is not versioning-enabled
-        // the removal releases everything the object retained, which is what lets a later
-        // write back into the store's byte budgets; on one that is, the version the delete
-        // displaces is kept and stays addressable by its id, which is the state behind
-        // "the operation inserts a delete marker, which becomes the current version of the
-        // object" — a read without a `versionId` answers `NoSuchKey` afterwards, and the
-        // marker itself is not recorded because this operation answers 204 with no body
-        // and so can report neither it nor its version id.
-        if store.remove_object(&input.bucket, &input.key).is_none() {
+        // bucket this emulator does not hold. What the delete DOES turns on the bucket's
+        // versioning state (`crate::state::Bucket::remove_object` documents each case):
+        // on a bucket with no versioning state the object is removed and everything it
+        // retained is released; on one that carries a versioning state "the operation
+        // inserts a delete marker, which becomes the current version of the object", so
+        // the version it hides stays stored and addressable by its id and a read without a
+        // `versionId` answers `NoSuchKey` afterwards.
+        let Some(outcome) = store.remove_object(&input.bucket, &input.key) else {
             return Err(DeleteObjectErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+        };
+        match outcome {
+            // Nothing versioned happened, so there is no marker and no version id to
+            // report: the 204 carries no header of its own.
+            crate::state::ObjectDeletion::Removed
+            | crate::state::ObjectDeletion::NothingThere => {
+                Ok(DeleteObjectNoContent::default())
+            }
+            // "Indicates whether the specified object version that was permanently deleted
+            // was (true) or was not (false) a delete marker" / "Returns the version ID of
+            // the delete marker created as a result of the DELETE operation": this delete
+            // CREATED one, so both are reported, the `null` marker of a suspended bucket
+            // under the id a request names it by.
+            crate::state::ObjectDeletion::MarkerLaid { version_id, .. } => {
+                Ok(DeleteObjectNoContent {
+                    delete_marker: Some(true),
+                    version_id: Some(
+                        version_id.unwrap_or_else(|| crate::state::NULL_VERSION_ID.to_string()),
+                    ),
+                })
+            }
+            // A delete marker is a stored version, so the emulator's own ceilings bound it
+            // like a write: past them the marker is refused rather than recorded, through
+            // the same 400 `ValidationException` channel `PutObject` uses for them (S3
+            // itself bounds neither the number of versions nor their size, so no AWS error
+            // code describes this).
+            crate::state::ObjectDeletion::VersionCountReached => {
+                Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "the bucket {:?} already holds the maximum of {} object versions this \
+                     emulator keeps per bucket, so the delete marker for {:?} cannot be \
+                     recorded; delete a version first",
+                    input.bucket,
+                    crate::state::MAX_OBJECTS_PER_BUCKET,
+                    input.key
+                )))
+            }
+            crate::state::ObjectDeletion::TotalVersionCountReached => {
+                Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "this emulator already holds the maximum of {} object versions across \
+                     every bucket, so the delete marker for {:?} cannot be recorded; delete \
+                     a version first",
+                    crate::state::MAX_OBJECTS_TOTAL, input.key
+                )))
+            }
         }
-
-        Ok(DeleteObjectNoContent)
     }
 }

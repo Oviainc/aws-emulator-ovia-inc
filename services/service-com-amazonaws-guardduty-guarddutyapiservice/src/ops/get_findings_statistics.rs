@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetFindingsStatistics
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetFindingsStatistics`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports statistics COMPUTED over the findings the detector holds —
+//! the set `FindingCriteria` selects, the same filter `ListFindings` applies.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetFindingsStatistics::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The caller picks ONE of the two shapes of answer: the deprecated
+//! `findingStatisticTypes` (`COUNT_BY_SEVERITY`, a count per severity) or `groupBy`
+//! (one group per account, date, finding type, resource or severity). Naming both, or
+//! neither, is refused, and so is a `maxResults` / `orderBy` sent without `groupBy`.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +156,486 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetFindingsStatistics` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetFindingsStatisticsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetFindingsStatistics"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetFindingsStatisticsErrorModeled::InternalServerErrorException(
+                    crate::state::state_unavailable(),
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx);
+
+        // The two ways of asking for statistics are EXCLUSIVE and one of them is
+        // required: "You must provide either findingStatisticTypes or groupBy
+        // parameter, and not both"
+        // (`smithy_query(query="doc",shape="GetFindingsStatistics")`). Decided from the
+        // request alone, before the store is looked at.
+        let group_by = input.group_by.as_deref().filter(|value| !value.is_empty());
+        let statistic_types = input.finding_statistic_types.as_deref();
+        match (statistic_types.is_some(), group_by.is_some()) {
+            (false, false) => return Err(bad_request(MISSING_STATISTICS_SELECTOR_MESSAGE)),
+            (true, true) => return Err(bad_request(BOTH_STATISTICS_SELECTORS_MESSAGE)),
+            _ => {}
+        }
+        // "You can use the maxResults and orderBy parameters only when using groupBy"
+        // (same doc): both describe a list of GROUPS, so neither means anything for a
+        // `findingStatisticTypes` answer, which is a single map.
+        let order_by = input.order_by.as_deref().filter(|value| !value.is_empty());
+        if group_by.is_none() {
+            for (member, present) in [
+                (MAX_RESULTS_MEMBER, input.max_results.is_some()),
+                (ORDER_BY_MEMBER, order_by.is_some()),
+            ] {
+                if present {
+                    return Err(bad_request(group_by_only_message(member)));
+                }
+            }
+        }
+
+        // A pure report: nothing below writes to the store.
+        let state = state.lock();
+        let Some(detector) = state.detector_in(&region, &input.detector_id) else {
+            // Classified from the REQUEST: a value that cannot be a detector id is a
+            // parameter failure, a well-formed one this account does not hold an
+            // ownership failure.
+            return Err(bad_request(crate::state::detector_id_rejection(
+                &input.detector_id,
+            )));
+        };
+
+        // Validated up front, so a detector with no findings refuses an unevaluable
+        // criterion exactly as a populated one does.
+        crate::state::validate_finding_criteria(input.finding_criteria.as_ref())
+            .map_err(|path| unsupported_attribute(&path))?;
+        let mut matched: Vec<&crate::state::FindingRecord> = Vec::new();
+        for finding in detector.findings.values() {
+            match crate::state::finding_matches(finding, input.finding_criteria.as_ref()) {
+                Ok(true) => matched.push(finding),
+                Ok(false) => {}
+                Err(path) => return Err(unsupported_attribute(&path)),
+            }
+        }
+
+        let finding_statistics = match group_by {
+            Some(group) => grouped_statistics(group, &matched, order_by, input.max_results)?,
+            // `COUNT_BY_SEVERITY` is the only `FindingStatisticType` the model declares
+            // (`smithy_query(shape="FindingStatisticType")`) and the list may be empty
+            // (`len 0..10`): a request that names no statistic type asked for none, so
+            // the statistics object carries none rather than a canned map.
+            None => FindingStatistics {
+                count_by_severity: statistic_types
+                    .is_some_and(|types| types.iter().any(|kind| kind == COUNT_BY_SEVERITY))
+                    .then(|| count_by_severity(&matched)),
+                ..FindingStatistics::default()
+            },
+        };
+
+        Ok(GetFindingsStatisticsOutput {
+            finding_statistics,
+            // "The pagination parameter to be used on the next list operation to
+            // retrieve more items. This parameter is currently not supported"
+            // (`smithy_query(operation="GetFindingsStatistics")`), so this operation
+            // hands out no page token at all: `maxResults` truncates the groups and
+            // there is nothing to continue from.
+            next_token: None,
+        })
     }
+}
+
+/// The `FindingStatisticType` the model declares — the only one
+/// (`smithy_query(shape="FindingStatisticType")`).
+const COUNT_BY_SEVERITY: &str = "COUNT_BY_SEVERITY";
+
+/// The `GroupByType` values (`smithy_query(shape="GroupByType")`).
+const GROUP_BY_ACCOUNT: &str = "ACCOUNT";
+/// See [`GROUP_BY_ACCOUNT`].
+const GROUP_BY_DATE: &str = "DATE";
+/// See [`GROUP_BY_ACCOUNT`].
+const GROUP_BY_FINDING_TYPE: &str = "FINDING_TYPE";
+/// See [`GROUP_BY_ACCOUNT`].
+const GROUP_BY_RESOURCE: &str = "RESOURCE";
+/// See [`GROUP_BY_ACCOUNT`].
+const GROUP_BY_SEVERITY: &str = "SEVERITY";
+
+/// The ascending `OrderBy` value; `DESC` is the other one and the default
+/// (`smithy_query(shape="OrderBy")`, and "The default value of orderBy is DESC" —
+/// `smithy_query(operation="GetFindingsStatistics")`).
+const ORDER_BY_ASCENDING: &str = "ASC";
+
+/// How many groups a request that names no `maxResults` gets: "The maximum number of
+/// results to be returned in the response. The default value is 25"
+/// (`smithy_query(query="doc",shape="GetFindingsStatisticsRequest",member="MaxResults")`).
+/// The modelled `@range` 1..100 is enforced at the boundary, so a value that reaches
+/// here is already within it.
+const DEFAULT_MAX_RESULTS: usize = 25;
+
+/// The input members these refusals name, spelled as the wire spells them
+/// (`smithy_query(operation="GetFindingsStatistics")`).
+const MAX_RESULTS_MEMBER: &str = "maxResults";
+/// See [`MAX_RESULTS_MEMBER`].
+const ORDER_BY_MEMBER: &str = "orderBy";
+/// See [`MAX_RESULTS_MEMBER`].
+const GROUP_BY_MEMBER: &str = "groupBy";
+/// See [`MAX_RESULTS_MEMBER`].
+const FINDING_CRITERIA_MEMBER: &str = "findingCriteria";
+
+/// Milliseconds in one UTC day, the span [`utc_day_millis`] folds a timestamp onto.
+const MILLIS_PER_DAY: i64 = 24 * 60 * 60 * 1000;
+
+/// Separates the parts of a composite group key, so two groups whose parts concatenate
+/// to the same text are still different groups. A unit separator cannot occur in an
+/// account id, a finding type or a resource type.
+const KEY_SEPARATOR: char = '\u{1f}';
+
+/// The refusal for a request that names neither selector. The HTTP status (400) and the
+/// error class are the requirement; the text states the rule and quotes no value from
+/// the request, as this service's other refusals do.
+const MISSING_STATISTICS_SELECTOR_MESSAGE: &str =
+    "The request is rejected because either the parameter findingStatisticTypes or the parameter groupBy is required.";
+
+/// The refusal for a request that names both selectors. See
+/// [`MISSING_STATISTICS_SELECTOR_MESSAGE`].
+const BOTH_STATISTICS_SELECTORS_MESSAGE: &str =
+    "The request is rejected because the parameters findingStatisticTypes and groupBy cannot be specified together.";
+
+/// The refusal for a member that is only meaningful beside `groupBy`.
+fn group_by_only_message(member: &str) -> String {
+    format!(
+        "The request is rejected because the parameter {member} can be specified only with the parameter {GROUP_BY_MEMBER}."
+    )
+}
+
+/// Refuse the request the way GuardDuty does: HTTP 400 under the
+/// `InvalidInputException` class, in both the body's `__type` and its `type` member.
+fn bad_request(message: impl Into<String>) -> GetFindingsStatisticsError {
+    crate::scaffolded::Scaffolded::invalid_input(message)
+}
+
+/// Refuse a finding attribute path this emulator does not model, naming the member and
+/// the paths it does support. Silently ignoring a criterion would count findings the
+/// caller asked to exclude.
+fn unsupported_attribute(path: &str) -> GetFindingsStatisticsError {
+    bad_request(format!(
+        "{FINDING_CRITERIA_MEMBER}: '{path}' is not a finding attribute this service can filter on. Supported attributes are {}.",
+        crate::state::FINDING_ATTRIBUTES.join(", ")
+    ))
+}
+
+/// A count of findings per severity: the deprecated `COUNT_BY_SEVERITY` answer.
+///
+/// The key is the severity rendered the way every other read of this service renders a
+/// finding's numeric attribute ([`crate::state::Attribute`]), so the map's keys and a
+/// `findingCriteria` equality on `severity` agree on the same text.
+fn count_by_severity(
+    findings: &[&crate::state::FindingRecord],
+) -> std::collections::HashMap<String, i32> {
+    let mut counts: std::collections::HashMap<String, i32> = std::collections::HashMap::new();
+    for finding in findings {
+        let severity = crate::state::Attribute::Number(finding.severity).as_text();
+        let count = counts.entry(severity).or_insert(0);
+        *count = count.saturating_add(1);
+    }
+    counts
+}
+
+/// The UTC midnight of the day `millis` falls on, in epoch milliseconds: the DATE a
+/// group of findings is keyed by.
+fn utc_day_millis(millis: i64) -> i64 {
+    millis.div_euclid(MILLIS_PER_DAY) * MILLIS_PER_DAY
+}
+
+/// One group's own identity, ordered.
+///
+/// Every grouping keys its groups either by numbers (a date, a severity) or by text (an
+/// account id, a finding type, a resource), so one key type serves them all and the
+/// ordering below cannot drift between groupings.
+#[derive(Debug, Clone, Default)]
+struct GroupOrder {
+    primary: f64,
+    secondary: f64,
+    text: String,
+}
+
+impl GroupOrder {
+    /// A group keyed by text.
+    fn text(value: &str) -> Self {
+        Self {
+            text: value.to_string(),
+            ..Self::default()
+        }
+    }
+
+    /// A group keyed by one number.
+    fn number(value: f64) -> Self {
+        Self {
+            primary: value,
+            ..Self::default()
+        }
+    }
+
+    /// A group keyed by two numbers.
+    fn numbers(primary: f64, secondary: f64) -> Self {
+        Self {
+            primary,
+            secondary,
+            ..Self::default()
+        }
+    }
+
+    /// The map key two findings of the SAME group share: the key's own parts, which is
+    /// what makes the grouping a grouping.
+    fn identity(&self) -> String {
+        format!(
+            "{}{KEY_SEPARATOR}{}{KEY_SEPARATOR}{}",
+            self.primary, self.secondary, self.text
+        )
+    }
+
+    /// A TOTAL order over group keys, so `maxResults` takes a well-defined prefix.
+    fn compare(&self, other: &Self) -> std::cmp::Ordering {
+        self.primary
+            .total_cmp(&other.primary)
+            .then_with(|| self.secondary.total_cmp(&other.secondary))
+            .then_with(|| self.text.cmp(&other.text))
+    }
+}
+
+/// One aggregated group of findings: its key, how many findings it holds and the
+/// members the grouping's own statistics shape reports.
+#[derive(Debug, Clone)]
+struct Group {
+    order: GroupOrder,
+    total_findings: i32,
+    /// "The timestamp at which the last finding in the findings count, was generated"
+    /// (`smithy_query(query="doc",shape="DateStatistics",member="LastGeneratedAt")`):
+    /// the latest instant at which the activity behind one of this group's findings was
+    /// observed, which is the record's `Service.EventLastSeen` clock. A change to a
+    /// finding's own metadata (archiving it, submitting feedback) generates no finding,
+    /// so it does not move this.
+    last_generated_millis: i64,
+    account_id: Option<String>,
+    date_millis: Option<i64>,
+    finding_type: Option<String>,
+    resource_type: Option<String>,
+    severity: Option<f64>,
+}
+
+impl Group {
+    /// An EMPTY group under `order`; [`aggregate`] folds the findings into it.
+    fn new(order: GroupOrder) -> Self {
+        Self {
+            order,
+            total_findings: 0,
+            last_generated_millis: i64::MIN,
+            account_id: None,
+            date_millis: None,
+            finding_type: None,
+            resource_type: None,
+            severity: None,
+        }
+    }
+
+    /// [`Self::last_generated_millis`] as the modelled timestamp.
+    fn last_generated_at(&self) -> ::aws_smithy_types::DateTime {
+        ::aws_smithy_types::DateTime::from_millis(self.last_generated_millis)
+    }
+}
+
+/// Fold `findings` into groups, one per distinct key `group_of` hands back.
+///
+/// `group_of` states the grouping ONCE — the key and the members that key implies — so
+/// a finding can never be counted under one key and reported under another.
+fn aggregate(
+    findings: &[&crate::state::FindingRecord],
+    group_of: impl Fn(&crate::state::FindingRecord) -> Group,
+) -> Vec<Group> {
+    let mut groups: std::collections::BTreeMap<String, Group> = std::collections::BTreeMap::new();
+    for finding in findings {
+        let seed = group_of(finding);
+        let group = groups.entry(seed.order.identity()).or_insert(seed);
+        group.total_findings = group.total_findings.saturating_add(1);
+        group.last_generated_millis = group
+            .last_generated_millis
+            .max(finding.event_last_seen_millis);
+    }
+    groups.into_values().collect()
+}
+
+/// Order the groups and take the first `limit` of them.
+///
+/// The statistics are COUNTS, so the requested order is the order of those counts:
+/// `DESC` (the default) puts the groups holding the most findings first, which is what
+/// makes a `maxResults` answer the "top" groups
+/// (`smithy_query(query="doc",shape="FindingStatistics",member="GroupedByResource")`).
+/// The group's own key breaks a tie in the same direction, so the order is total and the
+/// prefix `maxResults` takes is well defined.
+fn ordered(mut groups: Vec<Group>, descending: bool, limit: usize) -> Vec<Group> {
+    groups.sort_by(|left, right| {
+        let order = left
+            .total_findings
+            .cmp(&right.total_findings)
+            .then_with(|| left.order.compare(&right.order));
+        if descending {
+            order.reverse()
+        } else {
+            order
+        }
+    });
+    groups.truncate(limit);
+    groups
+}
+
+/// The statistics for one `groupBy` value, computed over the findings `FindingCriteria`
+/// selected.
+fn grouped_statistics(
+    group_by: &str,
+    findings: &[&crate::state::FindingRecord],
+    order_by: Option<&str>,
+    max_results: Option<i32>,
+) -> Result<FindingStatistics, GetFindingsStatisticsError> {
+    let descending = order_by != Some(ORDER_BY_ASCENDING);
+    let limit = max_results
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MAX_RESULTS);
+
+    let statistics = match group_by {
+        GROUP_BY_ACCOUNT => {
+            let groups = aggregate(findings, |finding| Group {
+                account_id: Some(finding.account_id.clone()),
+                ..Group::new(GroupOrder::text(&finding.account_id))
+            });
+            FindingStatistics {
+                grouped_by_account: Some(
+                    ordered(groups, descending, limit)
+                        .iter()
+                        .map(|group| AccountStatistics {
+                            account_id: group.account_id.clone(),
+                            last_generated_at: Some(group.last_generated_at()),
+                            total_findings: Some(group.total_findings),
+                        })
+                        .collect(),
+                ),
+                ..FindingStatistics::default()
+            }
+        }
+        // "a list of map of dates with a count of total findings generated on each date
+        // per severity level"
+        // (`smithy_query(query="doc",shape="FindingStatistics",member="GroupedByDate")`):
+        // the group is the (date, severity) pair, which is why `DateStatistics` carries
+        // a severity of its own. The date is the UTC day the finding was GENERATED on,
+        // so it never moves once the finding exists.
+        GROUP_BY_DATE => {
+            let groups = aggregate(findings, |finding| {
+                let day = utc_day_millis(finding.created_at_millis);
+                Group {
+                    date_millis: Some(day),
+                    severity: Some(finding.severity),
+                    ..Group::new(GroupOrder::numbers(day as f64, finding.severity))
+                }
+            });
+            FindingStatistics {
+                grouped_by_date: Some(
+                    ordered(groups, descending, limit)
+                        .iter()
+                        .map(|group| DateStatistics {
+                            date: group
+                                .date_millis
+                                .map(::aws_smithy_types::DateTime::from_millis),
+                            last_generated_at: Some(group.last_generated_at()),
+                            severity: group.severity,
+                            total_findings: Some(group.total_findings),
+                        })
+                        .collect(),
+                ),
+                ..FindingStatistics::default()
+            }
+        }
+        GROUP_BY_FINDING_TYPE => {
+            let groups = aggregate(findings, |finding| Group {
+                finding_type: Some(finding.r#type.clone()),
+                ..Group::new(GroupOrder::text(&finding.r#type))
+            });
+            FindingStatistics {
+                grouped_by_finding_type: Some(
+                    ordered(groups, descending, limit)
+                        .iter()
+                        .map(|group| FindingTypeStatistics {
+                            finding_type: group.finding_type.clone(),
+                            last_generated_at: Some(group.last_generated_at()),
+                            total_findings: Some(group.total_findings),
+                        })
+                        .collect(),
+                ),
+                ..FindingStatistics::default()
+            }
+        }
+        // "Information about each resource type associated with the groupedByResource
+        // statistics" (`smithy_query(query="doc",shape="ResourceStatistics")`), so the
+        // group is the affected resource of one account. `ResourceId` is the id of the
+        // per-resource detail structure the finding carries
+        // (`smithy_query(query="doc",shape="ResourceStatistics",member="ResourceId")`)
+        // and this emulator describes no resource INSTANCE — `GetFindings` reports
+        // `Resource` with its type and nothing else — so the member stays absent rather
+        // than carrying an invented identifier, and the resource type is the identity
+        // the store knows.
+        GROUP_BY_RESOURCE => {
+            let groups = aggregate(findings, |finding| {
+                let key = format!(
+                    "{}{KEY_SEPARATOR}{}",
+                    finding.account_id, finding.resource_type
+                );
+                Group {
+                    account_id: Some(finding.account_id.clone()),
+                    resource_type: Some(finding.resource_type.clone()),
+                    ..Group::new(GroupOrder::text(&key))
+                }
+            });
+            FindingStatistics {
+                grouped_by_resource: Some(
+                    ordered(groups, descending, limit)
+                        .iter()
+                        .map(|group| ResourceStatistics {
+                            account_id: group.account_id.clone(),
+                            last_generated_at: Some(group.last_generated_at()),
+                            resource_id: None,
+                            resource_type: group.resource_type.clone(),
+                            total_findings: Some(group.total_findings),
+                        })
+                        .collect(),
+                ),
+                ..FindingStatistics::default()
+            }
+        }
+        GROUP_BY_SEVERITY => {
+            let groups = aggregate(findings, |finding| Group {
+                severity: Some(finding.severity),
+                ..Group::new(GroupOrder::number(finding.severity))
+            });
+            FindingStatistics {
+                grouped_by_severity: Some(
+                    ordered(groups, descending, limit)
+                        .iter()
+                        .map(|group| SeverityStatistics {
+                            last_generated_at: Some(group.last_generated_at()),
+                            severity: group.severity,
+                            total_findings: Some(group.total_findings),
+                        })
+                        .collect(),
+                ),
+                ..FindingStatistics::default()
+            }
+        }
+        // The boundary validator refuses a value outside `GroupByType` before the
+        // handler runs, so this is unreachable through the wire; it stays a REFUSAL
+        // rather than a default grouping, because answering some other grouping would
+        // report statistics the caller did not ask for.
+        _ => {
+            return Err(bad_request(crate::state::invalid_parameter_message(
+                GROUP_BY_MEMBER,
+            )))
+        }
+    };
+    Ok(statistics)
 }

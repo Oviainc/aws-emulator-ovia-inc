@@ -29,6 +29,8 @@ mod filter_listing;
 mod findings_archive_state;
 #[path = "all/findings_feedback.rs"]
 mod findings_feedback;
+#[path = "all/findings_statistics.rs"]
+mod findings_statistics;
 #[path = "all/investigation_lifecycle.rs"]
 mod investigation_lifecycle;
 #[path = "all/ip_set_lifecycle.rs"]

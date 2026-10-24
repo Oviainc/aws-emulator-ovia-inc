@@ -1372,6 +1372,7 @@ const CLOUD_TRAIL_COMPONENTS: &str = r##"{
       "eventTime": {"pattern": "yyyy-MM-dd'T'HH:mm:ss'Z'", "type": "string", "format": "date-time"},
       "eventType": {"type": "string"},
       "eventVersion": {"type": "string"},
+      "insightDetails": {"type": "object", "nullable": true},
       "managementEvent": {"type": "boolean"},
       "readOnly": {"type": "boolean"},
       "recipientAccountId": {"type": "string"},

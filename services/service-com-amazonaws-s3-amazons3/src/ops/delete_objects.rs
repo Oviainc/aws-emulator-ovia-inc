@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteObjects
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteObjects`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: performs one delete per `Object` the `Delete` payload names — the version
+//! a `VersionId` names, or the simple delete that lays a delete marker on a bucket
+//! carrying a versioning state — and reports the result of each.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteObjects::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "For each key, Amazon S3 performs a delete operation and returns the result of that
+//! delete, success or failure, in the response. If the object specified in the request
+//! isn't found, Amazon S3 confirms the deletion by returning the result as deleted." A
+//! per-key failure is an `Errors` entry beside the keys that did delete, not a failure of
+//! the request; `Quiet` leaves the successes out. The bucket is addressed once, so a bucket
+//! this emulator does not hold refuses the whole request with `NoSuchBucket` (404), a code
+//! this model declares no shape for — see `crate::scaffolded`.
 //!
 //! ## Shape of an operation
 //!
@@ -214,18 +216,211 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteObjects` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteObjectsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteObjects"))
+        // Everything this delete needs is in its deserialized input; the expected owner
+        // and the MFA token travel as members, not as raw headers.
+        let _ = ctx;
+
+        // "If the account ID that you provide does not match the actual owner of the
+        // bucket, the request fails with the HTTP status code 403 Forbidden (access
+        // denied)" (`DeleteObjectsRequest$ExpectedBucketOwner`), judged the way every
+        // other handler here judges it: this emulator serves one account, so that account
+        // owns every bucket it holds.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                "AccessDenied",
+                403,
+                "Access Denied",
+            ));
+        }
+
+        // "When performing this action on an MFA Delete enabled bucket, that attempts to
+        // delete any versioned objects, you must include an MFA token… If you provide an
+        // invalid token, whether there are versioned keys in the request or not, the entire
+        // Multi-Object Delete request will fail." This emulator holds no authentication
+        // device, so it can neither accept nor reject a token: a request that carries one
+        // is answered with the scaffold's 501 rather than with a success that ignored it.
+        if input.mfa.is_some() {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DeleteObjects with an MFA token (x-amz-mfa)",
+            ));
+        }
+
+        // "The request can contain a list of up to 1,000 keys that you want to delete"
+        // (this operation's own documentation), and the `Delete` container the XSD
+        // publishes carries at least one `Object`. A payload outside either bound is
+        // malformed, which is what `MalformedXML` reports (HTTP 400) — a code this model
+        // carries no shape for, so it goes out through the unmodelled channel.
+        let identifiers = &input.delete.objects;
+        if identifiers.is_empty() || identifiers.len() > MAX_KEYS_PER_DELETE {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::MALFORMED_XML_CODE,
+                400,
+                format!(
+                    "The XML you provided was not well-formed or did not validate against \
+                     our published schema: a Delete request carries from 1 to \
+                     {MAX_KEYS_PER_DELETE} Object elements, and this one carries {}",
+                    identifiers.len()
+                ),
+            ));
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::unmodeled(
+                "InternalError",
+                500,
+                "the shared S3 store is unreachable from this engine",
+            )
+        })?;
+        let mut store = state.lock();
+
+        // The whole request is addressed to one bucket, so a bucket this emulator does not
+        // hold refuses it entirely rather than reporting a per-key error: `NoSuchBucket`
+        // (404), the code every other object operation here answers it with.
+        if store.bucket(&input.bucket).is_none() {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::NO_SUCH_BUCKET_CODE,
+                404,
+                crate::state::NO_SUCH_BUCKET_MESSAGE,
+            ));
+        }
+
+        // "For each key, Amazon S3 performs a delete operation and returns the result of
+        // that delete, success or failure, in the response" — one entry per identifier, in
+        // request order, each performing exactly what a `DeleteObject` for that identifier
+        // would.
+        let mut deleted: Vec<DeletedObject> = Vec::new();
+        let mut errors: Vec<Error> = Vec::new();
+        for identifier in identifiers {
+            let key = identifier.key.as_str();
+            match identifier.version_id.as_deref() {
+                // "optionally, version IDs if you want to delete a specific version of the
+                // object from a versioning-enabled bucket" — the permanent delete, which
+                // removes exactly the version named.
+                Some(version_id) => {
+                    let removed_marker = store
+                        .bucket(&input.bucket)
+                        .and_then(|bucket| bucket.stored_version(key, version_id))
+                        .is_some_and(|held| held.as_delete_marker().is_some());
+                    match store.remove_object_version(&input.bucket, key, version_id) {
+                        Some(true) => deleted.push(DeletedObject {
+                            key: Some(key.to_string()),
+                            version_id: Some(version_id.to_string()),
+                            // "Indicates whether the specified object version that was
+                            // permanently deleted was (true) or was not (false) a delete
+                            // marker before deletion" (`DeletedObject$DeleteMarker`).
+                            delete_marker: removed_marker.then_some(true),
+                            delete_marker_version_id: None,
+                        }),
+                        // A version the bucket holds none of is this key's own failure,
+                        // reported beside the keys that did delete rather than failing the
+                        // whole request: `NoSuchVersion`, the code a single-object delete
+                        // of the same identifier answers with.
+                        _ => errors.push(Error {
+                            key: Some(key.to_string()),
+                            version_id: Some(version_id.to_string()),
+                            code: Some(crate::state::NO_SUCH_VERSION_CODE.to_string()),
+                            message: Some(crate::state::NO_SUCH_VERSION_MESSAGE.to_string()),
+                        }),
+                    }
+                }
+                // Without a version id this is the simple delete: "If the object specified
+                // in the request isn't found, Amazon S3 confirms the deletion by returning
+                // the result as deleted", so nothing-there is a success too.
+                None => match store.remove_object(&input.bucket, key) {
+                    Some(crate::state::ObjectDeletion::Removed)
+                    | Some(crate::state::ObjectDeletion::NothingThere)
+                    | None => deleted.push(DeletedObject {
+                        key: Some(key.to_string()),
+                        ..DeletedObject::default()
+                    }),
+                    // The delete laid a delete marker, which "becomes the current version
+                    // of the object": `DeleteMarkerVersionId` is "the version ID of the
+                    // delete marker created as a result of the DELETE operation", the
+                    // `null` marker of a suspended bucket under the id a request names it
+                    // by.
+                    Some(crate::state::ObjectDeletion::MarkerLaid { version_id, .. }) => {
+                        deleted.push(DeletedObject {
+                            key: Some(key.to_string()),
+                            version_id: None,
+                            delete_marker: Some(true),
+                            delete_marker_version_id: Some(
+                                version_id
+                                    .unwrap_or_else(|| crate::state::NULL_VERSION_ID.to_string()),
+                            ),
+                        });
+                    }
+                    // A delete marker is a stored version, so the emulator's own ceilings
+                    // bound it like a write: past them the marker is not recorded. That is
+                    // THIS identifier's failure, not the request's — "for each key, Amazon
+                    // S3 performs a delete operation and returns the result of that
+                    // delete, success or failure, in the response" — so it is reported as
+                    // this key's `Errors` entry beside the keys that did delete, rather
+                    // than as a status that would leave the deletes already applied
+                    // unreported. The code is the one the rest of this service answers its
+                    // own ceilings with (`ValidationException`, the framework's 400
+                    // channel): S3 bounds neither the number of versions nor their size,
+                    // so no AWS error code describes them.
+                    Some(crate::state::ObjectDeletion::VersionCountReached) => {
+                        errors.push(Error {
+                            key: Some(key.to_string()),
+                            version_id: None,
+                            code: Some(VERSION_CEILING_CODE.to_string()),
+                            message: Some(format!(
+                                "the bucket {:?} already holds the maximum of {} object \
+                                 versions this emulator keeps per bucket, so the delete \
+                                 marker for {key:?} cannot be recorded; delete a version \
+                                 first",
+                                input.bucket,
+                                crate::state::MAX_OBJECTS_PER_BUCKET
+                            )),
+                        });
+                    }
+                    Some(crate::state::ObjectDeletion::TotalVersionCountReached) => {
+                        errors.push(Error {
+                            key: Some(key.to_string()),
+                            version_id: None,
+                            code: Some(VERSION_CEILING_CODE.to_string()),
+                            message: Some(format!(
+                                "this emulator already holds the maximum of {} object \
+                                 versions across every bucket, so the delete marker for \
+                                 {key:?} cannot be recorded; delete a version first",
+                                crate::state::MAX_OBJECTS_TOTAL
+                            )),
+                        });
+                    }
+                },
+            }
+        }
+
+        // "The operation supports two modes for the response: verbose and quiet. By
+        // default, the operation uses verbose mode… In quiet mode the response includes
+        // only keys where the delete operation encountered an error."
+        let quiet = input.delete.quiet.unwrap_or(false);
+        Ok(DeleteObjectsOutput {
+            deleted: (!quiet && !deleted.is_empty()).then_some(deleted),
+            errors: (!errors.is_empty()).then_some(errors),
+            // A Requester Pays charge this emulator does not model.
+            request_charged: None,
+        })
     }
 }
+
+/// How many `Object` elements one `Delete` payload may carry.
+///
+/// Published by this operation's own documentation: "The request can contain a list of up
+/// to 1,000 keys that you want to delete." The model constrains the list not at all, so
+/// nothing refuses a longer one before the handler.
+const MAX_KEYS_PER_DELETE: usize = 1_000;
+
+/// The `Code` an `Errors` entry carries when the delete marker an identifier needs could
+/// not be recorded because this emulator is at its own ceiling on stored versions.
+///
+/// Not an AWS code: S3 bounds neither the number of object versions nor their total size,
+/// so none of its codes describes this. It is the name of the framework's own 400 refusal
+/// channel, which is how every other ceiling in this service is reported (`PutObject`'s
+/// count and byte budgets, `CreateBucket`'s bucket quota).
+const VERSION_CEILING_CODE: &str = "ValidationException";

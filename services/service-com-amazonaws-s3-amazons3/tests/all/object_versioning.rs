@@ -50,7 +50,11 @@ const VERSION_ID_HEADER: &str = "x-amz-version-id";
 
 /// `PUT /<bucket>?versioning` with the given `BucketVersioningStatus`, failing the test
 /// when the service did not accept it.
-async fn set_versioning(router: &MultiServiceRouter, name: &str, status: &str) {
+///
+/// `pub(crate)`, like [`list_object_versions`], [`version_listing_of`] and
+/// [`VersionListing`]: the bucket-deletion-emptiness suite in this same test crate builds
+/// its versioned buckets through these rather than standing up a second set.
+pub(crate) async fn set_versioning(router: &MultiServiceRouter, name: &str, status: &str) {
     let payload = format!(
         "<VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
          <Status>{status}</Status></VersioningConfiguration>"
@@ -66,17 +70,31 @@ async fn set_versioning(router: &MultiServiceRouter, name: &str, status: &str) {
 }
 
 /// `HEAD /<bucket>/<key><query>` — `HeadObject`, with whatever query the case carries.
-async fn head_object(router: &MultiServiceRouter, name: &str, key: &str, query: &str) -> Answer {
+pub(crate) async fn head_object(
+    router: &MultiServiceRouter,
+    name: &str,
+    key: &str,
+    query: &str,
+) -> Answer {
     send_bytes(router, "HEAD", &format!("/{name}/{key}{query}"), &[], b"").await
 }
 
 /// `DELETE /<bucket>/<key><query>` — `DeleteObject`, with whatever query the case carries.
-async fn delete_object(router: &MultiServiceRouter, name: &str, key: &str, query: &str) -> Answer {
+pub(crate) async fn delete_object(
+    router: &MultiServiceRouter,
+    name: &str,
+    key: &str,
+    query: &str,
+) -> Answer {
     send_bytes(router, "DELETE", &format!("/{name}/{key}{query}"), &[], b"").await
 }
 
 /// `GET /<bucket>?versions<query>` — `ListObjectVersions`.
-async fn list_object_versions(router: &MultiServiceRouter, name: &str, query: &str) -> Answer {
+pub(crate) async fn list_object_versions(
+    router: &MultiServiceRouter,
+    name: &str,
+    query: &str,
+) -> Answer {
     send(router, "GET", &format!("/{name}?versions{query}"), &[], "").await
 }
 
@@ -84,7 +102,7 @@ async fn list_object_versions(router: &MultiServiceRouter, name: &str, query: &s
 /// elements, one map per `Version` entry and the `CommonPrefixes` prefixes, each in
 /// document order.
 #[derive(Debug, Default)]
-struct VersionListing {
+pub(crate) struct VersionListing {
     /// The elements directly under the result: `Name`, `IsTruncated`, `MaxKeys`, the
     /// markers and the echoed request parameters.
     top: BTreeMap<String, String>,
@@ -102,12 +120,12 @@ impl VersionListing {
     }
 
     /// One entry's element, or the empty string when it carries none.
-    fn entry(index: &BTreeMap<String, String>, name: &str) -> String {
+    pub(crate) fn entry(index: &BTreeMap<String, String>, name: &str) -> String {
         index.get(name).cloned().unwrap_or_default()
     }
 
     /// Every listed version as `(key, version id)`, in response order.
-    fn entries(&self) -> Vec<(String, String)> {
+    pub(crate) fn entries(&self) -> Vec<(String, String)> {
         self.versions
             .iter()
             .map(|entry| {
@@ -118,12 +136,22 @@ impl VersionListing {
             })
             .collect()
     }
+
+    /// The listed entry whose `VersionId` is `version_id` — a `Version` or a
+    /// `DeleteMarker`, whichever container carried it — or `None` when the listing reports
+    /// no such version.
+    pub(crate) fn entry_for(&self, version_id: &str) -> Option<BTreeMap<String, String>> {
+        self.versions
+            .iter()
+            .find(|entry| Self::entry(entry, "VersionId") == version_id)
+            .cloned()
+    }
 }
 
 /// Read a version listing with an XML reader, rather than by slicing the body — the same
 /// accumulate-per-element walk [`super::object_storage::listing_of`] does for
 /// `ListObjectsV2`, over this operation's `Version` and `DeleteMarker` containers.
-fn version_listing_of(answer: &Answer) -> VersionListing {
+pub(crate) fn version_listing_of(answer: &Answer) -> VersionListing {
     let body = String::from_utf8_lossy(&answer.body).into_owned();
     let mut reader = Reader::from_str(&body);
 
@@ -869,32 +897,62 @@ async fn a_version_listing_reports_every_stored_version_newest_first() {
         );
     }
 
-    // A delete that names no version leaves every version listed, with NONE of that key's
-    // versions marked latest: the key has no current version any more.
+    // A delete that names no version lays a DELETE MARKER: it becomes the key's current
+    // version, every version it displaced is still listed, and none of THOSE is latest any
+    // more.
     let deleted = delete_object(&router, name, "source.zip", "").await;
     assert_eq!(
         deleted.status, 204,
         "case \"delete the current version of one key\": expected HTTP 204, got {}",
         deleted.status
     );
-    let listing = version_listing_of(&list_object_versions(&router, name, "").await);
     assert_eq!(
-        listing.entries(),
+        deleted.header("x-amz-delete-marker").as_deref(),
+        Some("true"),
+        "case \"delete the current version of one key\": the delete reports that it \
+         created a delete marker, got {:?}",
+        deleted.header("x-amz-delete-marker")
+    );
+    let marker_id = deleted.header(VERSION_ID_HEADER).unwrap_or_default();
+    assert!(
+        !marker_id.is_empty(),
+        "case \"delete the current version of one key\": the delete reports the version id \
+         of the marker it created, got {marker_id:?}"
+    );
+    let listing = version_listing_of(&list_object_versions(&router, name, "").await);
+    let mut listed = listing.entries();
+    let marker_entry = ("source.zip".to_string(), marker_id.clone());
+    let at = listed
+        .iter()
+        .position(|entry| *entry == marker_entry)
+        .unwrap_or_else(|| {
+            panic!(
+                "case \"delete the current version of one key\": the delete marker must be \
+                 listed, got {listed:?}"
+            )
+        });
+    listed.remove(at);
+    assert_eq!(
+        listed,
         expected,
-        "case \"delete the current version of one key\": every version is still listed, \
-         got {:?}",
+        "case \"delete the current version of one key\": every version is still listed \
+         beside the marker, got {:?}",
         listing.entries()
     );
     for entry in &listing.versions {
         if VersionListing::entry(entry, "Key") != "source.zip" {
             continue;
         }
+        // The marker is the key's current version, so it is the latest one and nothing
+        // behind it is.
+        let is_latest = VersionListing::entry(entry, "VersionId") == marker_id;
         assert_eq!(
             VersionListing::entry(entry, "IsLatest"),
-            "false",
-            "case \"delete the current version of one key\": a key with no current \
-             version marks none of its versions latest, got {:?}",
-            VersionListing::entry(entry, "IsLatest")
+            is_latest.to_string(),
+            "case \"delete the current version of one key\": only the delete marker is \
+             latest, got IsLatest {:?} for version {:?}",
+            VersionListing::entry(entry, "IsLatest"),
+            VersionListing::entry(entry, "VersionId")
         );
     }
 }

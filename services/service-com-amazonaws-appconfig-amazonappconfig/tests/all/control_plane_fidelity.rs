@@ -60,8 +60,9 @@ async fn account_settings_are_served_and_round_trip_through_every_patch_shape() 
 
     // Before any write: `DeletionProtection` reports the documented default interval
     // ("The default interval specified by ProtectionPeriodInMinutes is 60") with
-    // protection off, and `VendedMetrics` — for which the model states no default — is
-    // not reported at all rather than invented.
+    // protection off, and the `VendedMetrics` group is reported as the empty document —
+    // the group is always there, while its `Enabled` member, for which the model states
+    // no default, is absent rather than invented.
     let defaults = get_settings(&router).await;
     assert_eq!(
         defaults.status,
@@ -76,7 +77,8 @@ async fn account_settings_are_served_and_round_trip_through_every_patch_shape() 
             "DeletionProtection": {
                 "Enabled": false,
                 "ProtectionPeriodInMinutes": state::DEFAULT_PROTECTION_PERIOD_IN_MINUTES,
-            }
+            },
+            "VendedMetrics": {}
         }),
         "case \"defaults\": expected AppConfig's documented defaults, got {}",
         defaults.json()
@@ -97,28 +99,32 @@ async fn account_settings_are_served_and_round_trip_through_every_patch_shape() 
             case: "enable protection only, leaving the interval alone",
             patch: json!({ "DeletionProtection": { "Enabled": true } }),
             expected: json!({
-                "DeletionProtection": { "Enabled": true, "ProtectionPeriodInMinutes": 60 }
+                "DeletionProtection": { "Enabled": true, "ProtectionPeriodInMinutes": 60 },
+                "VendedMetrics": {}
             }),
         },
         Row {
             case: "the published minimum interval, leaving Enabled alone",
             patch: json!({ "DeletionProtection": { "ProtectionPeriodInMinutes": 15 } }),
             expected: json!({
-                "DeletionProtection": { "Enabled": true, "ProtectionPeriodInMinutes": 15 }
+                "DeletionProtection": { "Enabled": true, "ProtectionPeriodInMinutes": 15 },
+                "VendedMetrics": {}
             }),
         },
         Row {
             case: "the published maximum interval",
             patch: json!({ "DeletionProtection": { "ProtectionPeriodInMinutes": 1440 } }),
             expected: json!({
-                "DeletionProtection": { "Enabled": true, "ProtectionPeriodInMinutes": 1440 }
+                "DeletionProtection": { "Enabled": true, "ProtectionPeriodInMinutes": 1440 },
+                "VendedMetrics": {}
             }),
         },
         Row {
             case: "an empty patch changes nothing",
             patch: json!({}),
             expected: json!({
-                "DeletionProtection": { "Enabled": true, "ProtectionPeriodInMinutes": 1440 }
+                "DeletionProtection": { "Enabled": true, "ProtectionPeriodInMinutes": 1440 },
+                "VendedMetrics": {}
             }),
         },
         Row {

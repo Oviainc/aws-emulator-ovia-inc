@@ -23,8 +23,9 @@ const TARGET_PREFIX: &str = "EUCMIFrontendAPIService";
 /// A router carrying only this service, over one shared engine — the same
 /// `EmulatedService::new(engine)` seam `core/router` mounts. The engine is returned
 /// alongside so a test can read the stored record directly where the wire cannot
-/// show what it needs (the clock deadline on a record).
-fn harness() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+/// show what it needs (the clock deadline on a record, or that a refused request
+/// stored nothing).
+pub(crate) fn harness() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Signatures are the emulator's concern, not this service's; the tests drive
@@ -42,17 +43,34 @@ pub(crate) fn router() -> MultiServiceRouter {
     harness().0
 }
 
+/// The Region the wire helpers sign for unless a test asks for another one.
+pub(crate) const DEFAULT_TEST_REGION: &str = "us-east-1";
+
 /// One awsJson1_0 call. Returns the HTTP status and the parsed JSON body.
 pub(crate) async fn call(router: &MultiServiceRouter, operation: &str, body: Value) -> (u16, Value) {
+    call_in_region(router, DEFAULT_TEST_REGION, operation, body).await
+}
+
+/// [`call`], signed for `region`: the Region a request belongs to travels in its
+/// SigV4 credential scope, so this is how a test drives the same operation in two
+/// Regions.
+pub(crate) async fn call_in_region(
+    router: &MultiServiceRouter,
+    region: &str,
+    operation: &str,
+    body: Value,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
-        .header("host", "workspaces-instances.us-east-1.amazonaws.com")
+        .header("host", format!("workspaces-instances.{region}.amazonaws.com"))
         .header("content-type", "application/x-amz-json-1.0")
         .header("x-amz-target", format!("{TARGET_PREFIX}.{operation}"))
         .header(
             "authorization",
-            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/us-east-1/workspaces-instances/aws4_request, SignedHeaders=host, Signature=0",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/workspaces-instances/aws4_request, SignedHeaders=host, Signature=0"
+            ),
         )
         .body(bytes::Bytes::from(body.to_string()))
         .expect("build the request");

@@ -48,6 +48,12 @@
 //! about the preference that no modelled member reports, and a version counts the writes
 //! the resource took rather than the members a reader can see change.
 //!
+//! `ListProcurementPortalSuppliers` is served from those same preferences rather than
+//! from a registry of its own: the suppliers CONFIGURED for a portal are the supplier
+//! identities the stored preferences name against that portal, which
+//! [`ComAmazonawsInvoicingInvoicingState::procurement_portal_suppliers`] computes — so a
+//! portal no preference configures reports no suppliers, and nothing is invented for one.
+//!
 //! Beside the invoice units sits the INVOICE registry [`ComAmazonawsInvoicingInvoicingState::invoices`],
 //! the one copy of the invoices this emulator holds, which `ListInvoiceSummaries`
 //! reports. An invoice is ISSUED by AWS out of a billing period's activity: no
@@ -66,7 +72,8 @@ use ::aws_smithy_types::DateTime;
 use crate::ops::types::{
     AccessDeniedException, InternalServerException, InvoiceProfile, InvoiceSummary, InvoiceUnit,
     InvoiceUnitRule, MessageKey, ProcurementPortalPreference, ProcurementPortalPreferenceSummary,
-    ResourceNotFoundException, ResourceTag, ValidationException,
+    ProcurementPortalSupplier, ResourceNotFoundException, ResourceTag, ValidationException,
+    PROCUREMENT_PORTAL_NAME_VALUES,
 };
 
 /// Per-service state for com-amazonaws-invoicing-invoicing. A handler reaches it through [`service_state`].
@@ -314,6 +321,89 @@ impl ComAmazonawsInvoicingInvoicingState {
         self.procurement_portal_preferences
             .values()
             .find(|preference| preference.identity() == identity)
+    }
+
+    /// The suppliers CONFIGURED for the procurement portal `portal_name`, keyed by
+    /// [`procurement_portal_supplier_key`] so the walk is in one stable order and a
+    /// pagination token (a position in that order) stays meaningful across calls.
+    ///
+    /// A supplier of a portal is not a resource of its own: no operation of this service
+    /// creates one (`smithy_query(query="list_operations")` lists one portal-plane create,
+    /// `CreateProcurementPortalPreference`), so the suppliers configured for a portal are
+    /// exactly the supplier identities the preferences stored AGAINST THAT PORTAL name
+    /// configure, and nothing is reported for a portal no preference names. Each
+    /// configured identity is reported once however many preferences carry it, because
+    /// the answer is a list of SUPPLIERS rather than of preferences.
+    ///
+    /// One preference configures one supplier identity per ENVIRONMENT it describes: its
+    /// own members describe the production environment and its `TestEnvPreference` — "the
+    /// test environment of the procurement portal" — the test one, which is what
+    /// `ProcurementPortalSupplier$Environment`'s `PROD`/`TEST`
+    /// ([`crate::ops::types::PROCUREMENT_PORTAL_ENV_VALUES`]) distinguishes. A preference
+    /// that configures no test environment therefore contributes no `TEST` supplier.
+    ///
+    /// `SellerOfRecord` is singular on a supplier while a preference's
+    /// `Selector$SellerOfRecords` is "the list of seller of record IDs to which this
+    /// preference applies", so a preference that selects seller-of-record ids configures
+    /// its supplier identity once per selected id; one that selects none applies to every
+    /// seller of record and so configures it with no `SellerOfRecord` at all.
+    ///
+    /// `CountryCode` is left absent: no member of a stored preference carries a country
+    /// (`smithy_query(query="shape", shape="ProcurementPortalPreference")`), so this
+    /// reader reports what state holds rather than inventing one.
+    ///
+    /// The derived set is BOUNDED by the registry and the model rather than by the
+    /// request: at most [`MAX_PROCUREMENT_PORTAL_PREFERENCES`] preferences exist (a
+    /// create past that is refused), each contributing at most the two environments
+    /// above times the `@length(min: 0, max: 100)` of
+    /// `ProcurementPortalPreferenceSelector$SellerOfRecords` (`smithy_query(query="shape",
+    /// shape="ProcurementPortalPreferenceSelector")`, which a write outside that length
+    /// is refused against) — so this walk and the map it builds hold at most
+    /// `MAX_PROCUREMENT_PORTAL_PREFERENCES * 2 * 100` entries, whatever a reader asks
+    /// for. It is derived per call rather than cached, which is what keeps this read
+    /// from writing anything, and the response itself is bounded far lower by
+    /// `MaxResults`.
+    pub fn procurement_portal_suppliers(
+        &self,
+        portal_name: &str,
+    ) -> BTreeMap<String, ProcurementPortalSupplier> {
+        let mut suppliers = BTreeMap::new();
+        for stored in self.procurement_portal_preferences.values() {
+            let preference = &stored.preference;
+            if preference.procurement_portal_name != portal_name {
+                continue;
+            }
+            // The seller-of-record ids this preference applies to, or one `None` for a
+            // preference that selects none and so applies to all of them.
+            let selected_sellers: Vec<Option<&str>> = match preference
+                .selector
+                .as_ref()
+                .and_then(|selector| selector.seller_of_records.as_deref())
+            {
+                Some(ids) if !ids.is_empty() => ids.iter().map(|id| Some(id.as_str())).collect(),
+                _ => vec![None],
+            };
+            let environments = [(PORTAL_ENV_PROD, preference.supplier_identifier.as_str())]
+                .into_iter()
+                .chain(
+                    preference
+                        .test_env_preference
+                        .as_ref()
+                        .map(|test| (PORTAL_ENV_TEST, test.supplier_identifier.as_str())),
+                );
+            for (environment, supplier_identifier) in environments {
+                for seller_of_record in &selected_sellers {
+                    let supplier = ProcurementPortalSupplier {
+                        supplier_identifier: supplier_identifier.to_string(),
+                        seller_of_record: seller_of_record.map(str::to_string),
+                        country_code: None,
+                        environment: Some(environment.to_string()),
+                    };
+                    suppliers.insert(procurement_portal_supplier_key(&supplier), supplier);
+                }
+            }
+        }
+        suppliers
     }
 
     /// A procurement-portal validation code: six decimal digits, the form the
@@ -607,6 +697,85 @@ pub fn procurement_portal_preference_identity(
     .map(|part| format!("{}:{part}", part.len()))
     .collect::<Vec<String>>()
     .join("|")
+}
+
+/// `ProcurementPortalEnv$PROD` — the environment a preference's own members configure,
+/// one of [`crate::ops::types::PROCUREMENT_PORTAL_ENV_VALUES`].
+pub const PORTAL_ENV_PROD: &str = "PROD";
+
+/// `ProcurementPortalEnv$TEST` — the environment a preference's `TestEnvPreference`
+/// ("the test environment of the procurement portal") configures, one of
+/// [`crate::ops::types::PROCUREMENT_PORTAL_ENV_VALUES`].
+pub const PORTAL_ENV_TEST: &str = "TEST";
+
+/// What distinguishes one configured portal supplier from another, and the position a
+/// paginated walk of them resumes at: its identifier, the environment it is configured
+/// in and the seller of record it applies to (empty when it applies to all of them).
+///
+/// The parts are joined with a SPACE, which none of them can contain: a supplier
+/// identifier and a seller-of-record id both come from a preference's
+/// `BasicStringWithoutSpace` members (`@pattern ^\S+$`, which the boundary validator
+/// refuses a space-bearing value against before any write can store one) and an
+/// environment is one of [`crate::ops::types::PROCUREMENT_PORTAL_ENV_VALUES`]. A space
+/// also sorts below every character those parts admit, so this key orders the walk by
+/// identifier, then environment, then seller of record.
+pub fn procurement_portal_supplier_key(supplier: &ProcurementPortalSupplier) -> String {
+    format!(
+        "{} {} {}",
+        supplier.supplier_identifier,
+        supplier.environment.as_deref().unwrap_or_default(),
+        supplier.seller_of_record.as_deref().unwrap_or_default(),
+    )
+}
+
+/// The `PortalIdentifier` of the portal `portal_name`: the portal name lowercased with
+/// its underscores hyphenated, a `ProcurementPortalIdString` (`@length min 1`, no
+/// pattern).
+///
+/// The model publishes no identifier for a portal, only the portal NAMES
+/// (`smithy_query(query="shape", shape="ProcurementPortalName")`, as
+/// [`crate::ops::types::PROCUREMENT_PORTAL_NAME_VALUES`]), so this emulator derives one
+/// identifier per name: stable across calls and across runs, and unique per portal
+/// because the names are.
+pub fn procurement_portal_identifier(portal_name: &str) -> String {
+    portal_name.to_ascii_lowercase().replace('_', "-")
+}
+
+/// The `ProcurementPortalName` the `PortalIdentifier` `identifier` names, or `None` when
+/// it names no portal this service serves — which every reader that takes a
+/// `PortalIdentifier` answers as the modelled `ResourceNotFoundException`
+/// ([`no_such_procurement_portal`]) rather than as an empty listing.
+///
+/// The portals are exactly the values of `ProcurementPortalName`
+/// ([`crate::ops::types::PROCUREMENT_PORTAL_NAME_VALUES`]): a preference can name no
+/// portal outside that enum, so neither can a portal this service reports.
+pub fn procurement_portal_name_for_identifier(identifier: &str) -> Option<&'static str> {
+    PROCUREMENT_PORTAL_NAME_VALUES
+        .iter()
+        .copied()
+        .find(|name| procurement_portal_identifier(name) == identifier)
+}
+
+/// The kind of resource a `PortalIdentifier` names, as the prose form of the portals
+/// this service serves.
+const PROCUREMENT_PORTAL_KIND: &str = "Procurement portal";
+
+/// The 404 a reader answers for a `PortalIdentifier` that names no portal this service
+/// serves, worded from the REQUEST the way the rest of the procurement-portal plane
+/// words its refusals (see [`no_such_procurement_portal_preference`]) and keyed the way
+/// that plane keys them ([`MessageKey::Capitalised`]).
+///
+/// `resourceName` is left absent: the model types it as an `InvoiceUnitArnString`
+/// (`smithy_query(query="shape", shape="ResourceNotFoundException")`), so a portal
+/// identifier — which is not an ARN — cannot be reported in it.
+pub fn no_such_procurement_portal(portal_identifier: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            "{PROCUREMENT_PORTAL_KIND} with identifier {portal_identifier} does not exist"
+        )),
+        resource_id: None,
+        message_key: MessageKey::Capitalised,
+    }
 }
 
 /// One invoice unit as it is stored: the members that can never change, plus the

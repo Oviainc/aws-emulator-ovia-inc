@@ -32,6 +32,12 @@ fn is_modelled_volume_id(id: &str) -> bool {
     (1..=63).contains(&suffix.len()) && suffix.chars().all(|c| c.is_ascii_alphanumeric())
 }
 
+/// The smallest `CreateVolume` body the service accepts in `zone`: a volume needs a
+/// zone of the signed Region and a capacity source, and nothing else.
+fn simple_create(zone: &str) -> Value {
+    json!({ "AvailabilityZone": zone, "SizeInGB": 4 })
+}
+
 /// `CreateVolume`, returning the minted id.
 async fn create_volume(router: &MultiServiceRouter, body: Value) -> String {
     let payload = ok(router, "CreateVolume", body).await;
@@ -92,10 +98,31 @@ struct CreateRow {
     body: Value,
 }
 
+/// A size and the IOPS `volume_type` needs, read off the service's own per-type
+/// catalog (`wsinst::state::VOLUME_TYPE_SPECS`): the smallest volume of that type,
+/// with provisioned IOPS only where the type takes them.
+fn minimal_for(volume_type: &str) -> Value {
+    let spec = wsinst::state::volume_type_spec(volume_type)
+        .unwrap_or_else(|| panic!("case {volume_type:?}: the service publishes no rules for it"));
+    let mut body = json!({
+        "AvailabilityZone": "us-east-1a",
+        "VolumeType": volume_type,
+        "SizeInGB": spec.size_range().0,
+    });
+    if let Some((min, _)) = spec.iops {
+        body["Iops"] = json!(min);
+    }
+    body
+}
+
 /// The create bodies the delete rule is asserted over: one row per dimension of the
-/// input it generalises over — the required `AvailabilityZone` alone, each published
-/// `VolumeType`, both ends of `SizeInGB`'s modelled range, the performance members,
-/// encryption, a snapshot source, tags, and an idempotency token.
+/// input it generalises over — each Availability Zone of the signed Region, each
+/// published `VolumeType` at its own minimum size, both ends of what `SizeInGB`
+/// admits, the performance members, encryption, a snapshot source, tags, and an
+/// idempotency token.
+///
+/// Every row is a configuration the backing EBS volume service would accept; the
+/// sibling `volume_configuration_validation` suite asserts the refusals.
 fn create_rows() -> Vec<CreateRow> {
     // `VolumeTypeEnum`'s full value list, from the model
     // (`smithy_query(query="shape",shape="VolumeTypeEnum")`); the `VOLUME_TYPE_ENUM_VALUES`
@@ -108,50 +135,41 @@ fn create_rows() -> Vec<CreateRow> {
 
     let mut rows = vec![
         CreateRow {
-            case: "the required AvailabilityZone alone",
-            body: json!({ "AvailabilityZone": "us-east-1a" }),
-        },
-        CreateRow {
-            case: "an empty AvailabilityZone (len 0..64 admits it)",
-            body: json!({ "AvailabilityZone": "" }),
-        },
-        CreateRow {
-            case: "a 64-character AvailabilityZone (the modelled maximum)",
-            body: json!({ "AvailabilityZone": "a".repeat(64) }),
-        },
-        CreateRow {
-            case: "SizeInGB at the bottom of the modelled range",
-            body: json!({ "AvailabilityZone": "eu-west-1b", "SizeInGB": 1 }),
+            case: "the smallest volume of the default type",
+            body: json!({ "AvailabilityZone": "us-east-1a", "SizeInGB": 1 }),
         },
         CreateRow {
             case: "SizeInGB at the top of the modelled range",
-            body: json!({ "AvailabilityZone": "eu-west-1b", "SizeInGB": 16384 }),
+            body: json!({ "AvailabilityZone": "us-east-1b", "SizeInGB": 16384 }),
         },
         CreateRow {
-            case: "Iops and Throughput at the bottom of their range",
+            case: "gp3 with Iops and Throughput at the bottom of their ranges",
             body: json!({
-                "AvailabilityZone": "ap-southeast-2c",
-                "Iops": 0,
-                "Throughput": 0,
+                "AvailabilityZone": "us-east-1c",
+                "VolumeType": "gp3",
                 "SizeInGB": 125,
+                "Iops": 3000,
+                "Throughput": 125,
             }),
         },
         CreateRow {
             case: "an encrypted volume with a KMS key",
             body: json!({
-                "AvailabilityZone": "us-west-2a",
+                "AvailabilityZone": "us-east-1a",
+                "SizeInGB": 20,
                 "Encrypted": true,
-                "KmsKeyId": "arn:aws:kms:us-west-2:123456789012:key/abcd",
+                "KmsKeyId": "arn:aws:kms:us-east-1:123456789012:key/abcd",
             }),
         },
         CreateRow {
-            case: "restored from a snapshot",
-            body: json!({ "AvailabilityZone": "us-west-2b", "SnapshotId": "snap-0123456789abcdef" }),
+            case: "restored from a snapshot, which carries the size",
+            body: json!({ "AvailabilityZone": "us-east-1b", "SnapshotId": "snap-0123456789abcdef" }),
         },
         CreateRow {
             case: "tagged for the volume resource type",
             body: json!({
-                "AvailabilityZone": "us-east-2a",
+                "AvailabilityZone": "us-east-1c",
+                "SizeInGB": 4,
                 "TagSpecifications": [{
                     "ResourceType": "volume",
                     "Tags": [{ "Key": "env", "Value": "test" }],
@@ -160,14 +178,18 @@ fn create_rows() -> Vec<CreateRow> {
         },
         CreateRow {
             case: "carrying an idempotency token",
-            body: json!({ "AvailabilityZone": "us-east-1c", "ClientToken": "tok-row-volume" }),
+            body: json!({
+                "AvailabilityZone": "us-east-1c",
+                "SizeInGB": 8,
+                "ClientToken": "tok-row-volume",
+            }),
         },
     ];
 
     for volume_type in volume_types {
         rows.push(CreateRow {
-            case: "a published VolumeType",
-            body: json!({ "AvailabilityZone": "us-east-1a", "VolumeType": volume_type }),
+            case: "a published VolumeType at its minimum size",
+            body: minimal_for(volume_type),
         });
     }
 
@@ -208,7 +230,7 @@ async fn an_unknown_but_well_formed_volume_id_is_not_found() {
     let router = router();
     // A populated store, so the refusal is the result of a lookup and not a blanket
     // answer.
-    let stored = create_volume(&router, json!({ "AvailabilityZone": "us-east-1a" })).await;
+    let stored = create_volume(&router, simple_create("us-east-1a")).await;
 
     // Well-formed per `^vol-[0-9a-zA-Z]{1,63}$`, stored by nobody: the shortest legal
     // id, the longest legal id, a mixed-case one and an all-digit one.
@@ -296,7 +318,7 @@ async fn deleting_one_volume_touches_no_other_resource() {
     let volumes: Vec<String> = {
         let mut ids = Vec::new();
         for zone in ["us-east-1a", "us-east-1b", "us-east-1c"] {
-            ids.push(create_volume(&router, json!({ "AvailabilityZone": zone })).await);
+            ids.push(create_volume(&router, simple_create(zone)).await);
         }
         ids
     };
@@ -327,7 +349,8 @@ async fn an_idempotency_token_replays_one_volume_and_the_token_is_retired_by_del
     let router = router();
 
     for token in ["tok-1", "a token with spaces", &"t".repeat(64)] {
-        let body = json!({ "AvailabilityZone": "us-east-1a", "ClientToken": token });
+        let mut body = simple_create("us-east-1a");
+        body["ClientToken"] = json!(token);
         let first = create_volume(&router, body.clone()).await;
         let replay = create_volume(&router, body.clone()).await;
         assert_eq!(
@@ -357,8 +380,7 @@ async fn the_volume_quota_is_bounded_and_released_by_delete() {
 
     let mut created = Vec::new();
     for n in 1..=quota {
-        let (status, payload) =
-            call(&router, "CreateVolume", json!({ "AvailabilityZone": "us-east-1a" })).await;
+        let (status, payload) = call(&router, "CreateVolume", simple_create("us-east-1a")).await;
         assert_eq!(
             status, 200,
             "case volume {n} of the quota {quota}: expected HTTP 200, got {status} with {payload}"
@@ -371,8 +393,7 @@ async fn the_volume_quota_is_bounded_and_released_by_delete() {
         );
     }
 
-    let (status, payload) =
-        call(&router, "CreateVolume", json!({ "AvailabilityZone": "us-east-1a" })).await;
+    let (status, payload) = call(&router, "CreateVolume", simple_create("us-east-1a")).await;
     assert_eq!(
         status, 402,
         "case one past the quota: expected HTTP 402, got {status} with {payload}"
@@ -391,8 +412,7 @@ async fn the_volume_quota_is_bounded_and_released_by_delete() {
     // DeleteVolume releases the capacity it was holding, which is only true if the
     // record really left the store.
     ok(&router, "DeleteVolume", json!({ "VolumeId": &created[0] })).await;
-    let (status, payload) =
-        call(&router, "CreateVolume", json!({ "AvailabilityZone": "us-east-1a" })).await;
+    let (status, payload) = call(&router, "CreateVolume", simple_create("us-east-1a")).await;
     assert_eq!(
         status, 200,
         "case create after a delete freed capacity: expected HTTP 200, got {status} with {payload}"
@@ -406,7 +426,7 @@ async fn volumes_live_in_the_engine_the_service_was_built_from() {
     let first = router();
     let second = router();
 
-    let id = create_volume(&first, json!({ "AvailabilityZone": "us-east-1a" })).await;
+    let id = create_volume(&first, simple_create("us-east-1a")).await;
     assert_not_found(&second, "a cross-engine delete", &id).await;
     ok(&first, "DeleteVolume", json!({ "VolumeId": &id })).await;
 }

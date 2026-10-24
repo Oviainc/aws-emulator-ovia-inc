@@ -25,16 +25,14 @@
 //! the one [`crate::distribution_lifecycle`] builds, so these assertions travel the same
 //! path a client takes.
 
-use std::time::Duration;
-
 use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::{
-    PROPAGATION_DELAY, STATUS_DEPLOYED, STATUS_IN_PROGRESS,
+    STATUS_DEPLOYED, STATUS_IN_PROGRESS,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::distribution_lifecycle::{
-    call, config_table, create_distribution, emulator, get_distribution, is_version_token, Answer,
-    API_VERSION,
+    call, config_table, create_distribution, emulator, get_distribution, is_version_token,
+    past_propagation, Answer, API_VERSION,
 };
 
 /// Web ACL identifiers this suite associates, spanning the forms the member takes: the
@@ -47,7 +45,9 @@ use crate::distribution_lifecycle::{
 /// `arn:aws:wafv2:us-east-1:123456789012:global/webacl/ExampleWebACL/a1b2c3d4-5678-90ab-cdef-EXAMPLE11111`
 /// … To specify a web ACL created using WAF Classic, use the ACL ID, for example
 /// `a1b2c3d4-5678-90ab-cdef-EXAMPLE11111`".
-const WEB_ACLS: &[(&str, &str)] = &[
+///
+/// `pub(crate)` so the disassociation suite takes a web ACL off each of these same forms.
+pub(crate) const WEB_ACLS: &[(&str, &str)] = &[
     (
         "wafv2-global",
         "arn:aws:wafv2:us-east-1:123456789012:global/webacl/ExampleWebACL/\
@@ -94,7 +94,10 @@ fn config_xml(caller_reference: &str, connection_mode: &str) -> String {
 
 /// One `AssociateDistributionWebACL` call: the web ACL travels in the request document,
 /// the version (when the row states one) in the `If-Match` header.
-async fn associate_web_acl(
+///
+/// `pub(crate)` so the disassociation suite can reach an association the way a client
+/// does rather than only through a create's own configuration.
+pub(crate) async fn associate_web_acl(
     router: &MultiServiceRouter,
     id: &str,
     web_acl_arn: &str,
@@ -116,7 +119,11 @@ async fn associate_web_acl(
 }
 
 /// Create one distribution from `body` and report `(Id, ETag)`.
-async fn create(router: &MultiServiceRouter, case: &str, body: &str) -> (String, String) {
+pub(crate) async fn create(
+    router: &MultiServiceRouter,
+    case: &str,
+    body: &str,
+) -> (String, String) {
     let created = create_distribution(router, body).await;
     assert_eq!(
         created.status, 201,
@@ -134,7 +141,11 @@ async fn create(router: &MultiServiceRouter, case: &str, body: &str) -> (String,
 }
 
 /// What a read of the distribution reports: `(WebACLId, ETag, Status)`.
-async fn read_back(router: &MultiServiceRouter, id: &str, case: &str) -> (String, String, String) {
+pub(crate) async fn read_back(
+    router: &MultiServiceRouter,
+    id: &str,
+    case: &str,
+) -> (String, String, String) {
     let fetched = get_distribution(router, id).await;
     assert_eq!(
         fetched.status, 200,
@@ -266,7 +277,7 @@ async fn the_clock_settles_the_association() {
          {status:?}"
     );
 
-    tokio::time::sleep(PROPAGATION_DELAY + Duration::from_millis(250)).await;
+    tokio::time::sleep(past_propagation()).await;
 
     let (stored, _, status) = read_back(&router, &id, "settle").await;
     assert_eq!(
@@ -281,8 +292,10 @@ async fn the_clock_settles_the_association() {
 }
 
 /// What a request states as its `If-Match`.
+///
+/// `pub(crate)` so the disassociation suite states its preconditions in the same terms.
 #[derive(Debug, Clone, Copy)]
-enum Stated {
+pub(crate) enum Stated {
     /// No header at all.
     Absent,
     /// The distribution's current version, bare — the form CloudFront's own `ETag`
@@ -292,6 +305,22 @@ enum Stated {
     QuotedCurrent,
     /// Whatever the row names, verbatim.
     Literal(&'static str),
+}
+
+impl Stated {
+    /// The `If-Match` header value this form sends against the version `current`, or
+    /// `None` where the form states no header at all.
+    ///
+    /// The ONE place the form-to-header mapping lives, so the association and
+    /// disassociation suites state their preconditions identically.
+    pub(crate) fn header(self, current: &str) -> Option<String> {
+        match self {
+            Stated::Absent => None,
+            Stated::Current => Some(current.to_string()),
+            Stated::QuotedCurrent => Some(format!("\"{current}\"")),
+            Stated::Literal(value) => Some(value.to_string()),
+        }
+    }
 }
 
 /// One row of the precondition table: what the request states as its `If-Match`, and what
@@ -374,12 +403,7 @@ async fn if_match_governs_the_association() {
         let reference = format!("ref-if-match-{case}");
         let (id, etag) = create(&router, case, &config_xml(&reference, "direct")).await;
 
-        let stated: Option<String> = match row.stated {
-            Stated::Absent => None,
-            Stated::Current => Some(etag.clone()),
-            Stated::QuotedCurrent => Some(format!("\"{etag}\"")),
-            Stated::Literal(value) => Some(value.to_string()),
-        };
+        let stated: Option<String> = row.stated.header(&etag);
         let web_acl = WEB_ACLS[0].1;
         let answer = associate_web_acl(&router, &id, web_acl, stated.as_deref()).await;
         assert_eq!(
