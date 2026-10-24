@@ -31,3 +31,16 @@ botocore.exceptions.ClientError: An error occurred (NotImplemented) when calling
 Boot the logs emulator
 Call CreateLookupTable and observe HTTP 501 with no state persisted
 Replay any of the blocked units above and observe it fail on that refusal
+
+## Resolution
+`CreateLookupTable` is implemented in
+`services/service-com-amazonaws-cloudwatchlogs-logs-20140328/src/ops/create_lookup_table.rs`
+and its `SCAFFOLDED, NOT IMPLEMENTED` census line is deleted. The account's lookup tables
+are stored in `ComAmazonawsCloudwatchlogsLogs20140328State::lookup_tables`.
+
+`GetLookupTable` was implemented in the same change (`src/ops/get_lookup_table.rs`, census
+line deleted), because a create has to be proved through a reader; the repository carries no
+separate issue record for that operation, so nothing is left open for it. The other
+lookup-table operations — `UpdateLookupTable`, `DeleteLookupTable` and
+`DescribeLookupTables` — keep their census line and their 501, and remain open under their
+own issue records.

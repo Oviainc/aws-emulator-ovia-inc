@@ -315,6 +315,9 @@ async fn each_destination_form_mints_the_file_system_it_asks_for() {
             json!({ "AvailabilityZoneName": "eu-central-1c", "AvailabilityZoneId": "euc1-az3" }),
         ),
         (
+            // An alias is a pointer to one key, so the description reports the key it
+            // resolves to; the resolution is asserted by form below and by invariant in
+            // `mutation_results.rs`.
             "a KMS key alias",
             json!({ "KmsKeyId": "alias/efs-replica" }),
             json!({ "Region": "us-east-1" }),
@@ -392,6 +395,13 @@ async fn each_destination_form_mints_the_file_system_it_asks_for() {
                 "case {case:?}: expected destination file system {member} {value}, got {stored:?}"
             );
         }
+        // Whatever form the request named its key in, the destination file system
+        // reports the KEY it resolves to.
+        let stored_key = stored["KmsKeyId"].as_str().unwrap_or_default();
+        assert!(
+            stored_key.contains(":key/") && !stored_key.contains(":alias/"),
+            "case {case:?}: KmsKeyId must name a key, got {stored_key:?}"
+        );
         assert_eq!(
             stored["FileSystemArn"],
             json!(format!(

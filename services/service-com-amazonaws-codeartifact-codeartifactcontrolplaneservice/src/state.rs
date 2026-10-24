@@ -925,6 +925,21 @@ impl PackageGroup {
             .get(restriction_type)
             .map_or(&NONE, |restriction| &restriction.allowed_repositories)
     }
+
+    /// This group's restriction of `restriction_type`, for a writer: the stored entry,
+    /// materialised in [`ORIGIN_MODE_INHERIT`] when the group carries none.
+    ///
+    /// A missing entry already READS as `INHERIT` with no allowed repositories
+    /// ([`PackageGroup::restriction_mode`], [`PackageGroup::allowed_repositories`]), so
+    /// materialising it changes nothing any reader reports.
+    pub fn restriction_mut(&mut self, restriction_type: &str) -> &mut OriginRestriction {
+        self.restrictions
+            .entry(restriction_type.to_string())
+            .or_insert_with(|| OriginRestriction {
+                mode: ORIGIN_MODE_INHERIT.to_string(),
+                allowed_repositories: BTreeSet::new(),
+            })
+    }
 }
 
 /// One stored origin restriction of a package group.
@@ -1524,6 +1539,18 @@ fn sha256_hex(content: &[u8]) -> String {
 /// another repository's listing (or in a domain or repository listing).
 pub fn package_cursor_scope(domain: &str, repository: &str) -> String {
     format!("packages/{domain}/{repository}")
+}
+
+/// The cursor scope of `ListAllowedRepositoriesForGroup` for one package group's
+/// restriction of one type. Scoped per group AND per restriction type, because each
+/// restriction carries its OWN allowed-repository list ([`OriginRestriction`]): a cursor
+/// minted while listing one restriction's list must not resolve as a key in another's.
+pub fn allowed_repository_cursor_scope(
+    domain: &str,
+    package_group: &str,
+    restriction_type: &str,
+) -> String {
+    format!("allowed-repositories/{domain}/{restriction_type}/{package_group}")
 }
 
 // ---------------------------------------------------------------------------
@@ -2346,23 +2373,7 @@ where
 {
     use std::ops::Bound;
 
-    // CodeArtifact's `maxResults` is modelled 1..=1000 on every paginated operation
-    // here, so the boundary validator has already refused anything outside that range;
-    // an absent value means "the service's own page size", which is the maximum.
-    const DEFAULT_PAGE_SIZE: usize = 1000;
-
-    let limit = max_results
-        .and_then(|n| usize::try_from(n).ok())
-        .unwrap_or(DEFAULT_PAGE_SIZE)
-        .max(1);
-    // The clamp above is a floor, not a policy: a `maxResults` under the modelled minimum
-    // is refused at the boundary and must never reach here, and a page size of zero would
-    // return an empty page with no cursor forever. Assert it in debug builds so a model
-    // or validator change shows up as a test failure rather than as silent coercion.
-    debug_assert!(
-        max_results.is_none_or(|n| n >= 1),
-        "maxResults below the modelled minimum reached page_of: {max_results:?}"
-    );
+    let limit = page_limit(max_results);
 
     let start = match after {
         Some(cursor) => Bound::Excluded(cursor.to_string()),
@@ -2392,4 +2403,64 @@ where
         _ => None,
     };
     (page, next_token)
+}
+
+/// One page of a stored SET of names, in sort order: everything strictly after the `after`
+/// cursor (when one was supplied), capped at `max_results`.
+///
+/// The same contract as [`page_of`] — the cursor is the last name returned, resolved
+/// against the live order with `BTreeSet::range`, and the `nextToken` is reported only
+/// when a name is actually left — for the listings whose records ARE their key
+/// ([`OriginRestriction::allowed_repositories`]), where there is nothing to project.
+pub fn page_of_names(
+    names: &BTreeSet<String>,
+    scope: &str,
+    after: Option<&str>,
+    max_results: Option<i32>,
+) -> (Vec<String>, Option<String>) {
+    use std::ops::Bound;
+
+    let limit = page_limit(max_results);
+
+    let start = match after {
+        Some(cursor) => Bound::Excluded(cursor.to_string()),
+        None => Bound::Unbounded,
+    };
+    let mut remaining = names.range((start, Bound::Unbounded)).peekable();
+
+    let mut page: Vec<String> = Vec::new();
+    while page.len() < limit {
+        match remaining.next() {
+            Some(name) => page.push(name.clone()),
+            None => break,
+        }
+    }
+
+    let next_token = match (remaining.peek().is_some(), page.last()) {
+        (true, Some(last)) => Some(encode_token(scope, last)),
+        _ => None,
+    };
+    (page, next_token)
+}
+
+/// How many records one page carries.
+///
+/// CodeArtifact's `maxResults` is modelled 1..=1000 on every paginated operation here, so
+/// the boundary validator has already refused anything outside that range; an absent value
+/// means "the service's own page size", which is the maximum.
+fn page_limit(max_results: Option<i32>) -> usize {
+    const DEFAULT_PAGE_SIZE: usize = 1000;
+
+    // The floor below is a floor, not a policy: a `maxResults` under the modelled minimum
+    // is refused at the boundary and must never reach here, and a page size of zero would
+    // return an empty page with no cursor forever. Assert it in debug builds so a model
+    // or validator change shows up as a test failure rather than as silent coercion.
+    debug_assert!(
+        max_results.is_none_or(|n| n >= 1),
+        "maxResults below the modelled minimum reached page_limit: {max_results:?}"
+    );
+    max_results
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(DEFAULT_PAGE_SIZE)
+        .max(1)
 }
