@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAttachmentRoutingPolicyAssociations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAttachmentRoutingPolicyAssociations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAttachmentRoutingPolicyAssociations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the routing policy associations of ONE core network: one summary per attachment
+//! of that core network that carries a routing policy label, narrowed by the `AttachmentId`
+//! the query string may name and paginated by `MaxResults`/`NextToken`. A reporting
+//! operation — it only reads the store. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -155,17 +151,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAttachmentRoutingPolicyAssociations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAttachmentRoutingPolicyAssociationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // request metadata.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListAttachmentRoutingPolicyAssociationsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the networkmanager store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+        })?;
+        let store = state.lock();
+
+        // Of the stored state this read consults, the resource the PATH addresses is checked
+        // first: an unknown core network is not found whatever selector or page token the
+        // query string carries, the rule every other listing of a child resource of this
+        // service follows.
+        if !store.core_networks.contains_key(&input.core_network_id) {
+            return Err(
+                ListAttachmentRoutingPolicyAssociationsErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(
+                        crate::state::CORE_NETWORK_KIND,
+                        &input.core_network_id,
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        // A token this service did not mint names no position in the listing, so it is
+        // refused on the member rather than answered with an empty page.
+        let after = match input.next_token.as_deref() {
+            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
+                ListAttachmentRoutingPolicyAssociationsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: "NextToken is not a token this service issued".to_string(),
+                        reason: Some(crate::state::REASON_FIELD_VALIDATION_FAILED.to_string()),
+                        fields: Some(vec![ValidationExceptionField {
+                            name: crate::state::FIELD_NEXT_TOKEN.to_string(),
+                            message: "the token could not be parsed".to_string(),
+                        }]),
+                    },
+                )
+            })?),
+            None => None,
+        };
+
+        // One entry per attachment of this core network that carries a routing policy label;
+        // an attachment with no label has no routing policy association, so it is absent
+        // (`AttachmentRecord::to_routing_policy_association`). The attachments are held in a
+        // `BTreeMap` keyed by attachment id, so the listing order is stable and the page
+        // token below can name a key offset into it.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAttachmentRoutingPolicyAssociations"))
+        // `AttachmentId` narrows that listing the way every other selector of this service
+        // does: an id naming nothing stored — or an attachment of another core network —
+        // matches no entry rather than failing the read.
+        let entries: Vec<(String, AttachmentRoutingPolicyAssociationSummary)> = store
+            .attachments
+            .iter()
+            .filter(|(_, record)| {
+                record.core_network_id == input.core_network_id
+                    && input
+                        .attachment_id
+                        .as_deref()
+                        .is_none_or(|want| record.id == want)
+            })
+            .filter_map(|(key, record)| {
+                record
+                    .to_routing_policy_association()
+                    .map(|summary| (key.clone(), summary))
+            })
+            .collect();
+        drop(store);
+
+        let page = crate::state::paginate(entries, after.as_deref(), input.max_results);
+        Ok(ListAttachmentRoutingPolicyAssociationsOutput {
+            attachment_routing_policy_associations: Some(page.items),
+            next_token: page.next_token,
+        })
     }
 }
