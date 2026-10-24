@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetDistributionConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetDistributionConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetDistributionConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the CONFIGURATION half of the stored distribution: the configuration exactly
+//! as created or updated, and the version token (`ETag`) its last mutation handed back -
+//! the same record and the same token `GetDistribution` reports, so two reads of one
+//! distribution can never disagree about either.
+//!
+//! The model declares `AccessDenied` (HTTP 403) for this operation, and this emulator
+//! never answers it: the emulator verifies request signatures but models no IAM policy,
+//! so no caller is unauthorized for a stored distribution and a read that succeeds here
+//! implies nothing about a permission grant in real CloudFront.
+//!
+//! The input's doc note — "if the ID is empty, an empty distribution configuration is
+//! returned" — is unreachable over the wire: `Id` is a required `@httpLabel` of
+//! `/2020-05-31/distribution/{Id}/config`, so an empty label matches no route and never
+//! arrives here. Every id that does arrive either names a stored distribution or is
+//! answered with `NoSuchDistribution`.
 //!
 //! ## Shape of an operation
 //!
@@ -137,20 +144,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetDistributionConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetDistributionConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetDistributionConfig"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let store = state.lock();
+
+        let Some(stored) = store.distribution(&input.id) else {
+            return Err(GetDistributionConfigErrorModeled::NoSuchDistribution(
+                crate::state::no_such_distribution(),
+            )
+            .into());
+        };
+
+        Ok(GetDistributionConfigOutput {
+            // "The distribution's configuration information" — the configuration as
+            // stored, which is the very one `GetDistribution` nests in its
+            // `Distribution`. Neither the configuration nor the version token depends on
+            // the clock, so this read settles nothing and writes nothing.
+            distribution_config: Some(stored.config.clone()),
+            // "The current version of the configuration": the token the last mutation
+            // handed back, the single value every `If-Match` is checked against.
+            e_tag: Some(stored.etag.clone()),
+        })
     }
 }
