@@ -118,6 +118,151 @@ impl From<CreateVolumeErrorModeled> for CreateVolumeError {
     }
 }
 
+/// The configuration rules the backing Amazon EBS volume service applies to a create,
+/// which this service's model cannot express — so they are this handler's to apply.
+///
+/// Each one is a CROSS-FIELD rule: every member here already satisfies its own
+/// modelled constraint by the time the handler runs (the boundary validator refuses
+/// the rest), and what is left is whether the members are consistent with ONE volume
+/// the service can provision:
+///
+/// * a volume is created IN an Availability Zone, so `AvailabilityZone` must name one
+///   of the zones the Region this request was signed for has
+///   ([`crate::state::availability_zones_in_region`]) — the modelled `len 0..64` admits
+///   the empty string and any other text, neither of which is a zone;
+/// * a volume needs a capacity source: "You must specify either a snapshot ID or a
+///   volume size" (Amazon EBS `CreateVolume$Size`);
+/// * `SizeInGB`, `Iops` and `Throughput` must be ones the named volume type accepts,
+///   per [`crate::state::VOLUME_TYPE_SPECS`], whose doc carries the published ranges
+///   and the sentences they come from;
+/// * "If KmsKeyId is specified, the encrypted state must be true" (Amazon EBS
+///   `CreateVolume$KmsKeyId`).
+///
+/// Returns the modelled `ValidationException` naming the ONE member the request is
+/// refused for; the member is named in `FieldList` as well as the wording, and no
+/// submitted value is echoed ([`crate::state::field_validation_failed`]).
+fn validate_configuration(
+    input: &CreateVolumeInput,
+    region: &str,
+) -> Result<(), ValidationException> {
+    use crate::state::{
+        availability_zones_in_region, field_validation_failed, volume_type_spec,
+        DEFAULT_VOLUME_TYPE,
+    };
+
+    if !availability_zones_in_region(region)
+        .iter()
+        .any(|zone| zone == &input.availability_zone)
+    {
+        return Err(field_validation_failed(
+            "AvailabilityZone",
+            "AvailabilityZone must name an Availability Zone of the Region this request \
+             was signed for",
+        ));
+    }
+
+    // The type every other rule is read for: the one the request names, or the
+    // backing service's documented default when it names none.
+    let volume_type = input.volume_type.as_deref().unwrap_or(DEFAULT_VOLUME_TYPE);
+    let Some(spec) = volume_type_spec(volume_type) else {
+        // Unreachable while the table covers the modelled enum, which its doc pins;
+        // the member is still named rather than the request silently accepted.
+        return Err(field_validation_failed(
+            "VolumeType",
+            "VolumeType must name a volume type this service provisions",
+        ));
+    };
+
+    let (size_min, size_max) = spec.size_range();
+    match input.size_in_gb {
+        None if input.snapshot_id.is_none() => {
+            return Err(field_validation_failed(
+                "SizeInGB",
+                "SizeInGB is required unless SnapshotId names the snapshot the volume \
+                 is restored from",
+            ));
+        }
+        Some(size) if size < size_min || size > size_max => {
+            return Err(field_validation_failed(
+                "SizeInGB",
+                format!(
+                    "SizeInGB must be from {size_min} to {size_max} GiB for a \
+                     {volume_type} volume"
+                ),
+            ));
+        }
+        // No size with a snapshot source takes the snapshot's size, and a size inside
+        // the type's range stands as asked for.
+        None | Some(_) => {}
+    }
+
+    match (input.iops, spec.iops) {
+        (Some(_), None) => {
+            return Err(field_validation_failed(
+                "Iops",
+                format!(
+                    "Iops must be omitted for a {volume_type} volume, which does not \
+                     provision IOPS"
+                ),
+            ));
+        }
+        (Some(iops), Some((min, max))) if iops < min || iops > max => {
+            return Err(field_validation_failed(
+                "Iops",
+                format!("Iops must be from {min} to {max} for a {volume_type} volume"),
+            ));
+        }
+        (None, _) if spec.iops_required => {
+            return Err(field_validation_failed(
+                "Iops",
+                format!("Iops is required for a {volume_type} volume"),
+            ));
+        }
+        (Some(_), Some(_)) | (None, _) => {}
+    }
+
+    match (input.throughput, spec.throughput_mib) {
+        (Some(_), None) => {
+            return Err(field_validation_failed(
+                "Throughput",
+                format!(
+                    "Throughput must be omitted for a {volume_type} volume, whose \
+                     throughput is not configurable"
+                ),
+            ));
+        }
+        (Some(throughput), Some((min, max))) if throughput < min || throughput > max => {
+            return Err(field_validation_failed(
+                "Throughput",
+                format!(
+                    "Throughput must be from {min} to {max} MiB/s for a {volume_type} volume"
+                ),
+            ));
+        }
+        (Some(_), Some(_)) | (None, _) => {}
+    }
+
+    if let Some(kms_key_id) = input.kms_key_id.as_deref() {
+        // `KmsKeyId`'s modelled `len 0..128` admits the empty string, which names no
+        // KMS key at all.
+        if kms_key_id.is_empty() {
+            return Err(field_validation_failed(
+                "KmsKeyId",
+                "KmsKeyId must name a KMS key when it is specified",
+            ));
+        }
+        if input.encrypted != Some(true) {
+            return Err(field_validation_failed(
+                "KmsKeyId",
+                "KmsKeyId may be specified only for an encrypted volume: Encrypted must \
+                 be true",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 /// The `CreateVolume` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -154,7 +299,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // The configuration is checked BEFORE the store is reached, so a volume the
+        // backing EBS service could not provision is refused whatever the store holds:
+        // it neither replays an idempotency token nor is charged against the quota, and
+        // nothing is written for a request that is going to be refused.
+        //
+        // A regional resource belongs to the Region its create call was signed for, so
+        // the Region comes from the credential scope, never from a member.
+        let region = crate::state::request_region(ctx.parts());
+        validate_configuration(&input, &region)
+            .map_err(CreateVolumeErrorModeled::ValidationException)?;
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateVolumeErrorModeled::InternalServerException(
                 InternalServerException {

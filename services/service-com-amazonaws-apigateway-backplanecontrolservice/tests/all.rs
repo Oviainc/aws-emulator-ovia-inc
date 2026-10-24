@@ -104,3 +104,5 @@ mod validation_message_rules;
 mod update_deployment;
 #[path = "all/delete_documentation_part.rs"]
 mod delete_documentation_part;
+#[path = "all/update_stage_setting_spellings.rs"]
+mod update_stage_setting_spellings;
