@@ -17569,6 +17569,29 @@ impl ComAmazonawsEc2Amazonec2State {
 /// `available` (`smithy_query(query="shape",shape="AllocationState")`).
 pub const HOST_STATE_AVAILABLE: &str = "available";
 
+/// A Dedicated Host the account has given back: `AllocationState`'s `released` — "On-Demand
+/// billing is stopped and the host goes into released state" (`ReleaseHosts`).
+pub const HOST_STATE_RELEASED: &str = "released";
+
+/// A Dedicated Host given back after its hardware failed permanently:
+/// `AllocationState`'s `released-permanent-failure`. Released as much as
+/// [`HOST_STATE_RELEASED`] is, which is what [`host_is_released`] reads the two for.
+pub const HOST_STATE_RELEASED_PERMANENT_FAILURE: &str = "released-permanent-failure";
+
+/// Whether `host` has been released, so that its id "can no longer be specified in another
+/// request" (`ReleaseHosts`).
+///
+/// A released host is one in either released member of the modelled `AllocationState` enum,
+/// so a host released after a permanent hardware failure is as released as one a caller
+/// gave back — the one definition every operation that has to tell the two apart from a held
+/// host reads.
+pub fn host_is_released(host: &Host) -> bool {
+    matches!(
+        host.state.as_deref(),
+        Some(HOST_STATE_RELEASED) | Some(HOST_STATE_RELEASED_PERMANENT_FAILURE)
+    )
+}
+
 /// The auto-placement a Dedicated Host gets when the request names none: "Default:
 /// `off`" (`AllocateHostsRequest$AutoPlacement`). A value of the modelled
 /// `AutoPlacement` enum ([`crate::ops::types::AUTO_PLACEMENT_VALUES`]).
@@ -17783,6 +17806,28 @@ pub fn unresolvable_host_id<E>(host_id: &str) -> Scaffolded<E> {
         INVALID_HOST_ID_MALFORMED,
         400,
         format!("Invalid id: '{host_id}'"),
+    )
+}
+
+/// The message EC2 answers Dedicated Host ids it cannot resolve with, built from the ids the
+/// request named.
+///
+/// To EC2 a host id it never issued is NOT VALID rather than merely absent, whatever its
+/// shape, and the recorded contract for this service's host operations answers a well-formed
+/// id no host has in exactly this form — so the wording lives HERE, in one place, rather
+/// than once per operation that has to report an id it could not resolve. Whether an
+/// operation reports it as a refusal of the whole request or as one item of a batch is that
+/// operation's own contract.
+pub fn unresolvable_host_ids_message<'a>(
+    host_ids: impl IntoIterator<Item = &'a str>,
+) -> String {
+    let quoted: Vec<String> = host_ids
+        .into_iter()
+        .map(|host_id| format!("'{host_id}'"))
+        .collect();
+    format!(
+        "The specified Dedicated host IDs [{}] are not valid.",
+        quoted.join(", ")
     )
 }
 

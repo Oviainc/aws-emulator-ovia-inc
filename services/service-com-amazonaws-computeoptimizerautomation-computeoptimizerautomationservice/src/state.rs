@@ -18,7 +18,8 @@ use sha2::{Digest, Sha256};
 use smithy_server_runtime::{Violation, ViolationKind};
 
 use crate::ops::types::{
-    AutomationEvent, AutomationEventFilter, AutomationEventStep, AutomationRule, Criteria,
+    AccountInfo, AutomationEvent, AutomationEventFilter, AutomationEventStep, AutomationRule,
+    Criteria,
     DoubleCriteriaCondition, EbsVolumeConfiguration, EstimatedMonthlySavings, Filter,
     IntegerCriteriaCondition,
     OptInRequiredException, OrganizationConfiguration, OrganizationScope, PreviewResult,
@@ -72,6 +73,17 @@ pub const ENROLLED_STATUS: &str = "Active";
 /// is automatically set to \"Any allowed,\" which permits the management account
 /// to create Automation rules that automatically apply actions to that account."
 pub const ORGANIZATION_RULE_MODE_ANY_ALLOWED: &str = "AnyAllowed";
+
+/// The other `OrganizationRuleMode`: the management account may NOT create
+/// Automation rules that apply actions to the account.
+///
+/// It is what an account that carries no association reports, because an
+/// association is exactly what grants that permission
+/// (`AssociateAccounts`: "Once associated, the management account (or a
+/// delegated administrator) can apply recommended actions to the member
+/// account"), and `AccountInfo$organizationRuleMode` is a REQUIRED member, so a
+/// listing has to name one of the two values for every account it reports.
+pub const ORGANIZATION_RULE_MODE_NONE_ALLOWED: &str = "NoneAllowed";
 
 /// How many account ids one organization-association request may name.
 ///
@@ -717,6 +729,41 @@ impl Default for EnrollmentConfig {
             status_reason: None,
             organization_rule_mode: None,
             last_updated_timestamp: None,
+        }
+    }
+}
+
+impl EnrollmentConfig {
+    /// This stored configuration as the `AccountInfo` a listing reports for
+    /// `account_id`: its enrollment status ("The enrollment status of the
+    /// account"), the reason that explains it, its organization rule mode and
+    /// the instant it was last updated.
+    ///
+    /// `organizationRuleMode` and `lastUpdatedTimestamp` are REQUIRED on
+    /// `AccountInfo` while a stored configuration holds each only once something
+    /// has set it, so the projection has to name a value for a configuration
+    /// that holds none:
+    ///
+    /// * no rule mode means the account carries no association, which is
+    ///   [`ORGANIZATION_RULE_MODE_NONE_ALLOWED`];
+    /// * `at` stands in for a missing update instant. Every call that writes a
+    ///   configuration stamps one, so a stored entry without one is not
+    ///   reachable over the wire; this keeps the required member present rather
+    ///   than reporting an instant (the epoch, say) at which nothing happened.
+    pub fn to_account_info(
+        &self,
+        account_id: &str,
+        at: ::aws_smithy_types::DateTime,
+    ) -> AccountInfo {
+        AccountInfo {
+            account_id: account_id.to_string(),
+            status: self.status.clone(),
+            organization_rule_mode: self
+                .organization_rule_mode
+                .clone()
+                .unwrap_or_else(|| ORGANIZATION_RULE_MODE_NONE_ALLOWED.to_string()),
+            status_reason: self.status_reason.clone(),
+            last_updated_timestamp: self.last_updated_timestamp.unwrap_or(at),
         }
     }
 }
@@ -2315,6 +2362,34 @@ impl ComAmazonawsComputeoptimizerautomationComputeoptimizerautomationserviceStat
     /// when that account has never configured one. A READ: it stores nothing.
     pub fn enrollment(&self, account_id: &str) -> EnrollmentConfig {
         self.enrollments.get(account_id).cloned().unwrap_or_default()
+    }
+
+    /// Every account the enrollment store holds a configuration for, projected
+    /// through [`EnrollmentConfig::to_account_info`], ordered by account id.
+    ///
+    /// These are the accounts this service KNOWS: one entry is written when an
+    /// account configures its own enrollment and one when it is associated with
+    /// the organization's management account, and each entry's `status` is what
+    /// says whether that account has the Automation feature enabled. An account
+    /// the store has no entry for has never been seen and so is reported by
+    /// nothing.
+    ///
+    /// The store is a map, whose iteration order is its own business, so the
+    /// ORDER is imposed here: ascending account id is the same sequence on every
+    /// call, which is what paging over it requires — the pages of one walk must
+    /// be windows onto ONE sequence rather than samples of a shifting one.
+    ///
+    /// A READ: it stores nothing. `at` is only what
+    /// [`EnrollmentConfig::to_account_info`] falls back to for an entry that
+    /// carries no update instant.
+    pub fn accounts_in_order(&self, at: ::aws_smithy_types::DateTime) -> Vec<AccountInfo> {
+        let mut accounts: Vec<AccountInfo> = self
+            .enrollments
+            .iter()
+            .map(|(account_id, enrollment)| enrollment.to_account_info(account_id, at))
+            .collect();
+        accounts.sort_by(|left, right| left.account_id.cmp(&right.account_id));
+        accounts
     }
 
     /// Is `account_id` opted in to Compute Optimizer Automation, i.e. does its

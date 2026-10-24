@@ -21,9 +21,10 @@
 //! The caller's OWN association is read back over the wire through
 //! `GetEnrollmentConfiguration`, which reports the stored configuration of the
 //! calling account. A MEMBER account's configuration is reported by
-//! `ListAccounts`, which is still a scaffold answering 501 (its own stub issue,
-//! `…-computeoptimizerautomation-listaccounts-stub`), so those rows read the
-//! store where the handler writes it instead of asserting through a 501.
+//! `ListAccounts`, whose own suite ([`crate::account_listing`]) asserts that
+//! projection over the wire; the rows here read the store where the handler
+//! writes it, so a case about what an association PERSISTS does not depend on a
+//! second operation's projection of it.
 
 use std::sync::Arc;
 
@@ -50,7 +51,9 @@ fn member_account_ids(n: usize) -> Vec<String> {
 
 /// The stored enrollment configuration of `account_id`, read where the handlers
 /// write it.
-fn stored_enrollment(
+///
+/// `pub(crate)` so the sibling suites assert against ONE reader of the store.
+pub(crate) fn stored_enrollment(
     engine: &Arc<engine::InMemoryEngine>,
     account_id: &str,
 ) -> state::EnrollmentConfig {
@@ -67,7 +70,9 @@ fn stored_enrollment(
 /// this API sets another account's enrollment status, and two of the four
 /// `EnrollmentStatus` values ("The Pending and Failed options cannot be used to
 /// update the enrollment status of an account") have no wire path at all.
-fn seed_enrollment(
+///
+/// `pub(crate)` so the sibling suites seed the store through ONE writer.
+pub(crate) fn seed_enrollment(
     engine: &Arc<engine::InMemoryEngine>,
     account_id: &str,
     status: &str,

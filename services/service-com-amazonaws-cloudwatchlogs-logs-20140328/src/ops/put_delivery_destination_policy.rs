@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutDeliveryDestinationPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutDeliveryDestinationPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutDeliveryDestinationPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Assigns the IAM policy the request carries to the delivery destination it names, so the
+//! destination holds exactly that policy afterwards and a later assignment replaces it.
+//! The policy is stored on the destination it is assigned to
+//! (`crate::state::DeliveryDestinationRecord::policy`) — nothing but that destination names
+//! one — and the policy this call reports is read back out of the store, so
+//! `GetDeliveryDestinationPolicy` reports the same contents.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +157,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutDeliveryDestinationPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutDeliveryDestinationPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutDeliveryDestinationPolicy"))
+        // Assigning a policy names the destination it is assigned to and the policy to
+        // assign; nothing else on the request takes part.
+        let _ = ctx;
+
+        // "Creates and assigns an IAM policy": an IAM policy is a JSON document, so a
+        // `deliveryDestinationPolicy` that is not a JSON object is not one. Its statements
+        // are not interpreted here — they govern a cross-account delivery nothing in this
+        // store performs — so the document is kept and reported verbatim.
+        if !::serde_json::from_str::<::serde_json::Value>(&input.delivery_destination_policy)
+            .is_ok_and(|document| document.is_object())
+        {
+            return Err(
+                PutDeliveryDestinationPolicyErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(
+                            "deliveryDestinationPolicy must be an IAM policy document \
+                             (a JSON object)"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutDeliveryDestinationPolicyError::from(
+                PutDeliveryDestinationPolicyErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let mut store = state.lock();
+
+        // The policy is assigned TO a delivery destination, so there is nothing to assign it
+        // to until that destination exists — `PutDeliveryDestination` creates one.
+        let Some(destination) = store
+            .delivery_destinations
+            .get_mut(&input.delivery_destination_name)
+        else {
+            return Err(
+                PutDeliveryDestinationPolicyErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(
+                            crate::state::DELIVERY_DESTINATION_NOT_FOUND_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A destination holds at most one delivery destination policy, so assigning one
+        // REPLACES whatever it held: the contents assigned last are the contents every later
+        // reader sees.
+        destination.policy = Some(input.delivery_destination_policy);
+
+        Ok(PutDeliveryDestinationPolicyOutput {
+            // "The contents of the policy that you just created" — read back off the stored
+            // destination, so what this call reports is what `GetDeliveryDestinationPolicy`
+            // reports afterwards.
+            policy: Some(Policy {
+                delivery_destination_policy: destination.policy.clone(),
+            }),
+        })
     }
 }

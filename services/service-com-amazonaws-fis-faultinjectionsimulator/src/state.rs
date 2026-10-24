@@ -24,8 +24,9 @@
 //! Besides those caller-owned records it holds the service's own data: the built-in FIS
 //! ACTION catalog ([`ACTION_CATALOG`]), which `GetAction` reports from, and the TARGET
 //! RESOURCE TYPE catalog ([`TARGET_RESOURCE_TYPE_CATALOG`]) of the types those actions
-//! target, which `ListTargetResourceTypes` reports from. No API creates, updates or
-//! deletes either, so both are constant tables rather than maps a handler writes.
+//! target, which `ListTargetResourceTypes` and `GetTargetResourceType` report from. No
+//! API creates, updates or deletes either, so both are constant tables rather than maps a
+//! handler writes.
 //!
 //! Both records are the one copy every handler reads and writes, so a value a create
 //! call returns is the value a later read reports. An experiment also owes the clock a
@@ -117,7 +118,8 @@ use crate::ops::types::{
     ReportConfigurationS3Output, ReportConfigurationS3OutputInput, ResolvedTarget,
     ResourceNotFoundException, SafetyLever, SafetyLeverState, ServiceQuotaExceededException,
     StartExperimentInput,
-    TargetAccountConfiguration, TargetAccountConfigurationSummary, TargetResourceTypeSummary,
+    TargetAccountConfiguration, TargetAccountConfigurationSummary, TargetResourceType,
+    TargetResourceTypeParameter, TargetResourceTypeSummary,
     UpdateExperimentTemplateActionInputItem, UpdateExperimentTemplateInput,
     UpdateExperimentTemplateLogConfigurationInput, UpdateExperimentTemplateReportConfigurationInput,
     UpdateExperimentTemplateStopConditionInput, UpdateExperimentTemplateTargetInput,
@@ -2228,6 +2230,19 @@ pub fn template_not_found() -> ResourceNotFoundException {
 pub fn action_not_found(id: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(format!("No action found with id {id}")),
+    }
+}
+
+/// The `ResourceNotFoundException` payload for a target resource type the catalog does not
+/// hold — "the specified resource cannot be found".
+///
+/// Built from the request, as the sibling catalog's miss is: the message names the
+/// resource type that was looked up.
+pub fn target_resource_type_not_found(resource_type: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            "No target resource type found with id {resource_type}"
+        )),
     }
 }
 
@@ -4423,11 +4438,30 @@ pub fn action_catalog_entry(id: &str) -> Option<&'static ActionCatalogEntry> {
     ACTION_CATALOG.iter().find(|entry| entry.id == id)
 }
 
+/// One parameter of a target resource type, as [`TARGET_RESOURCE_TYPE_CATALOG`] records
+/// it.
+///
+/// A target resource type parameter is what an experiment template's target sets in its
+/// own `parameters` map to narrow target resolution, which is why the catalog records the
+/// same two things the modelled `TargetResourceTypeParameter` carries: what the parameter
+/// means and whether a target of this type has to set it.
+#[derive(Debug, Clone, Copy)]
+pub struct TargetResourceTypeCatalogParameter {
+    /// The key the parameter is named by in `TargetResourceType$parameters`, which is also
+    /// the key an experiment template's target sets it under.
+    pub name: &'static str,
+    /// `TargetResourceTypeParameter$description`.
+    pub description: &'static str,
+    /// `TargetResourceTypeParameter$required` — whether a target of this resource type has
+    /// to set the parameter.
+    pub required: bool,
+}
+
 /// One target resource type FIS publishes, as [`TARGET_RESOURCE_TYPE_CATALOG`] records it.
 ///
 /// Like an action, a target resource type is SERVICE-owned: no API creates, updates or
-/// deletes one, so `ListTargetResourceTypes` reports from this table rather than from
-/// anything a caller stored.
+/// deletes one, so `ListTargetResourceTypes` and `GetTargetResourceType` report from this
+/// table rather than from anything a caller stored.
 #[derive(Debug, Clone, Copy)]
 pub struct TargetResourceTypeCatalogEntry {
     /// `TargetResourceTypeId` — the fully qualified resource type (`aws:<service>:<type>`),
@@ -4436,6 +4470,13 @@ pub struct TargetResourceTypeCatalogEntry {
     pub id: &'static str,
     /// `TargetResourceTypeSummary$description`.
     pub description: &'static str,
+    /// The parameters a target of this resource type may set, empty for a type that takes
+    /// none — which is most of them, because a target is usually named by its resource ids,
+    /// ARNs or tags alone.
+    ///
+    /// NOT part of `TargetResourceTypeSummary`, which a list reports: only the full
+    /// `TargetResourceType` of `GetTargetResourceType` carries them.
+    pub parameters: &'static [TargetResourceTypeCatalogParameter],
 }
 
 impl TargetResourceTypeCatalogEntry {
@@ -4445,6 +4486,33 @@ impl TargetResourceTypeCatalogEntry {
         TargetResourceTypeSummary {
             resource_type: Some(self.id.to_string()),
             description: Some(self.description.to_string()),
+        }
+    }
+
+    /// The `TargetResourceType` `GetTargetResourceType` reports for this entry.
+    ///
+    /// A resource type is service-owned and belongs to no account or region, so there is
+    /// nothing here to scope: the reported value is the catalogued row and the parameter
+    /// contract that row records, with an EMPTY parameter map for a type that takes no
+    /// parameters rather than an absent one — the type has a parameter contract either way.
+    pub fn to_target_resource_type(&self) -> TargetResourceType {
+        TargetResourceType {
+            resource_type: Some(self.id.to_string()),
+            description: Some(self.description.to_string()),
+            parameters: Some(
+                self.parameters
+                    .iter()
+                    .map(|parameter| {
+                        (
+                            parameter.name.to_string(),
+                            TargetResourceTypeParameter {
+                                description: Some(parameter.description.to_string()),
+                                required: Some(parameter.required),
+                            },
+                        )
+                    })
+                    .collect(),
+            ),
         }
     }
 }
@@ -4459,86 +4527,148 @@ impl TargetResourceTypeCatalogEntry {
 /// A resource type is a TARGET of an action, so an entry with no action to target it would
 /// be a type no experiment template could use.
 ///
-/// Each entry records the id the reference states and a one-line description of the
-/// resource it names.
+/// Each entry records the id the reference states, a one-line description of the resource
+/// it names, and the parameters a target of that type may set — the resource types the
+/// reference documents parameters for are the ones whose targets cannot be named by ids,
+/// ARNs or tags alone (an ECS task is named through its cluster and service, an EKS pod
+/// through its cluster, namespace and selector), and a row records parameters only where
+/// that reference states them, so no parameter contract here is invented for a type
+/// documented without one.
 ///
-/// Kept sorted by id, which is the order `ListTargetResourceTypes` enumerates in.
+/// Kept sorted by id, which is the order `ListTargetResourceTypes` enumerates in; each
+/// row's parameters are kept sorted by name too.
 pub const TARGET_RESOURCE_TYPE_CATALOG: &[TargetResourceTypeCatalogEntry] = &[
     TargetResourceTypeCatalogEntry {
         id: "aws:dynamodb:global-table",
         description: "An Amazon DynamoDB global table.",
+        parameters: &[],
     },
     TargetResourceTypeCatalogEntry {
         id: "aws:ec2:autoscaling-group",
         description: "An Amazon EC2 Auto Scaling group.",
+        parameters: &[],
     },
     TargetResourceTypeCatalogEntry {
         id: "aws:ec2:ebs-volume",
         description: "An Amazon EBS volume.",
+        parameters: &[],
     },
     TargetResourceTypeCatalogEntry {
         id: "aws:ec2:instance",
         description: "An Amazon EC2 instance.",
+        parameters: &[],
     },
     TargetResourceTypeCatalogEntry {
         id: "aws:ec2:route-table",
         description: "A route table of an Amazon VPC.",
+        parameters: &[],
     },
     TargetResourceTypeCatalogEntry {
         id: "aws:ec2:spot-instance",
         description: "An Amazon EC2 Spot Instance.",
+        parameters: &[],
     },
     TargetResourceTypeCatalogEntry {
         id: "aws:ec2:subnet",
         description: "A subnet of an Amazon VPC.",
+        parameters: &[],
     },
     TargetResourceTypeCatalogEntry {
         id: "aws:ec2:transit-gateway",
         description: "A transit gateway.",
+        parameters: &[],
     },
     TargetResourceTypeCatalogEntry {
         id: "aws:ecs:cluster",
         description: "An Amazon ECS cluster.",
+        parameters: &[],
     },
     TargetResourceTypeCatalogEntry {
         id: "aws:ecs:task",
         description: "An Amazon ECS task.",
+        parameters: &[
+            TargetResourceTypeCatalogParameter {
+                name: "cluster",
+                description: "The name or ARN of the cluster the tasks run on.",
+                required: true,
+            },
+            TargetResourceTypeCatalogParameter {
+                name: "service",
+                description: "The name of the service whose tasks are identified.",
+                required: true,
+            },
+        ],
     },
     TargetResourceTypeCatalogEntry {
         id: "aws:eks:cluster",
         description: "An Amazon EKS cluster.",
+        parameters: &[],
     },
     TargetResourceTypeCatalogEntry {
         id: "aws:eks:nodegroup",
         description: "An Amazon EKS managed node group.",
+        parameters: &[],
     },
     TargetResourceTypeCatalogEntry {
         id: "aws:eks:pod",
         description: "A pod running on an Amazon EKS cluster.",
+        parameters: &[
+            TargetResourceTypeCatalogParameter {
+                name: "availabilityZoneIdentifier",
+                description: "The Availability Zone the pods are identified in.",
+                required: false,
+            },
+            TargetResourceTypeCatalogParameter {
+                name: "clusterIdentifier",
+                description: "The name or ARN of the cluster the pods run on.",
+                required: true,
+            },
+            TargetResourceTypeCatalogParameter {
+                name: "namespace",
+                description: "The namespace the pods are identified in.",
+                required: true,
+            },
+            TargetResourceTypeCatalogParameter {
+                name: "selectorType",
+                description: "The type of selector the pods are identified by.",
+                required: true,
+            },
+            TargetResourceTypeCatalogParameter {
+                name: "selectorValue",
+                description: "The value the selector matches on.",
+                required: false,
+            },
+        ],
     },
     TargetResourceTypeCatalogEntry {
         id: "aws:elasticache:replicationgroup",
         description: "An Amazon ElastiCache replication group.",
+        parameters: &[],
     },
     TargetResourceTypeCatalogEntry {
         id: "aws:iam:role",
         description: "An AWS Identity and Access Management (IAM) role.",
+        parameters: &[],
     },
     TargetResourceTypeCatalogEntry {
         id: "aws:lambda:function",
         description: "An AWS Lambda function.",
+        parameters: &[],
     },
     TargetResourceTypeCatalogEntry {
         id: "aws:rds:cluster",
         description: "An Amazon Aurora DB cluster.",
+        parameters: &[],
     },
     TargetResourceTypeCatalogEntry {
         id: "aws:rds:db",
         description: "An Amazon RDS DB instance.",
+        parameters: &[],
     },
     TargetResourceTypeCatalogEntry {
         id: "aws:s3:bucket",
         description: "An Amazon S3 bucket.",
+        parameters: &[],
     },
 ];
 

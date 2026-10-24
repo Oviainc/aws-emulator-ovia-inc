@@ -103,6 +103,8 @@ mod threat_entity_set_listing;
 mod threat_intel_set_delete;
 #[path = "all/threat_intel_set_listing.rs"]
 mod threat_intel_set_listing;
+#[path = "all/threat_intel_set_update.rs"]
+mod threat_intel_set_update;
 #[path = "all/threat_intel_sets.rs"]
 mod threat_intel_sets;
 #[path = "all/trusted_entity_set_delete.rs"]

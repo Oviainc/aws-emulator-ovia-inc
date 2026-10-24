@@ -195,6 +195,18 @@ pub const ENTITY_TYPES: &[&str] = &[
 /// there instead, which is how one resource ARN form names both.
 pub const CHANGE_SET_RESOURCE_TYPE: &str = "ChangeSet";
 
+/// The policy document a resource carrying no resource-based policy reports.
+///
+/// `GetResourcePolicy` reports the policy OF a resource in a member targeting
+/// `ResourcePolicyJson` (`@length(min: 1)`), which has no representation for
+/// "no document", so the document reported for a resource nothing is attached
+/// to is the EMPTY policy document: a JSON object with no statements, which
+/// grants exactly what a resource with no policy attached grants — nothing.
+/// `PutResourcePolicy` refuses a document with no statements
+/// (`::service_common::iam_policy`), so this value is never one a caller
+/// stored: reading it back says only that the resource carries no policy.
+pub const EMPTY_RESOURCE_POLICY: &str = "{}";
+
 /// How many tags one resource holds.
 ///
 /// `TagList` is `@length(min: 1, max: 200)`, which is the bound on the tags a
@@ -818,6 +830,38 @@ impl ComAmazonawsMarketplacecatalogAwsmpseymourState {
                 .get(id)
                 .is_some_and(|held| &held.entity_type == entity_type),
             CatalogResource::ChangeSet { id } => self.change_sets.contains_key(id),
+        }
+    }
+
+    /// Whether the resource a resource ARN named is a resource of this catalog
+    /// that a resource-based policy can be attached to, reported for and
+    /// cleared on.
+    ///
+    /// A resource policy is recorded per resource in
+    /// [`Self::resource_policies`] rather than on this catalog's own record of
+    /// the resource, and the records here are only the resources this
+    /// emulator's own change sets created — an account's catalog holds entities
+    /// no change set of this run created — so absence from them is not evidence
+    /// that an ARN names no resource. What IS such evidence: a resource type
+    /// this catalog does not have at all ([`ENTITY_TYPES`] and
+    /// [`CHANGE_SET_RESOURCE_TYPE`] are every type one of its resource ARNs
+    /// carries), and an id this catalog does hold a record of under a DIFFERENT
+    /// resource kind or entity type, which the ARN then contradicts.
+    pub fn may_carry_policy(&self, resource: &CatalogResource) -> bool {
+        match resource {
+            CatalogResource::Entity { entity_type, id } => {
+                is_entity_type(entity_type)
+                    // An id this catalog holds as a CHANGE SET is not an entity
+                    // of any type, whatever type the ARN carries.
+                    && !self.change_sets.contains_key(id)
+                    && self
+                        .entities
+                        .get(id)
+                        .is_none_or(|held| &held.entity_type == entity_type)
+            }
+            // And the same the other way: an id this catalog holds as an entity
+            // is not a change set.
+            CatalogResource::ChangeSet { id } => !self.entities.contains_key(id),
         }
     }
 
@@ -2069,24 +2113,6 @@ pub fn resource_not_found(resource: &CatalogResource) -> ResourceNotFoundExcepti
     match resource {
         CatalogResource::Entity { id, .. } => entity_not_found(id),
         CatalogResource::ChangeSet { id } => change_set_not_found(id),
-    }
-}
-
-/// The modelled `ResourceNotFoundException` payload for a resource of this
-/// catalog that carries no resource-based policy.
-///
-/// The policy IS what `GetResourcePolicy` reports, and the output member it
-/// reports it in targets `ResourcePolicyJson` (`@length(min: 1)`): a resource
-/// none is attached to has no document to report, so the read is refused as not
-/// found rather than answered with a document the resource does not carry. The
-/// sentence is built from the request, naming the resource whose policy was
-/// asked for, in the form this service states a missing thing in.
-pub fn resource_policy_not_found(resource: &CatalogResource) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: Some(format!(
-            "Requested resource policy of '{}' does not exist.",
-            resource.id()
-        )),
     }
 }
 

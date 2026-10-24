@@ -318,6 +318,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(|stored| stored.tags.clone())
                 .unwrap_or_default(),
         };
+        // The delivery destination policy is not one of the delivery parameters the sentence
+        // above overwrites either: it is assigned by `PutDeliveryDestinationPolicy` and
+        // removed by `DeleteDeliveryDestinationPolicy`, so a put that updates this
+        // destination's parameters leaves the policy it was assigned in place.
+        record.policy = store
+            .delivery_destinations
+            .get(&input.name)
+            .and_then(|stored| stored.policy.clone());
         store.delivery_destinations.insert(input.name.clone(), record);
 
         Ok(PutDeliveryDestinationOutput {

@@ -163,21 +163,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // which is a change the clock owes rather than one this call makes.
         store.settle(now);
 
-        // An ARN the catalog holds no record of identifies no resource to clear
-        // a policy on — the same existence test every ARN-addressed operation of
-        // this service applies, so the policy surface agrees with the tagging
-        // surface about whether a resource exists.
-        if !store.holds_resource(&resource) {
+        // An ARN that identifies no resource of this catalog at all — a resource
+        // type the catalog does not have, or an id it holds under another type —
+        // identifies no resource to clear a policy on; the catalog's own record
+        // of a resource is NOT what a policy is attached to, so an id no change
+        // set of this emulator created is not an ARN to refuse.
+        if !store.may_carry_policy(&resource) {
             return Err(DeleteResourcePolicyErrorModeled::ResourceNotFoundException(
                 crate::state::resource_not_found(&resource),
             )
             .into());
         }
 
-        // For a resource the catalog DOES hold, deleting asks for an END STATE —
-        // no policy attached — which a resource that carries none is already in,
-        // so clearing an absent policy is the same success and the answer carries
-        // no members either way.
+        // Deleting asks for an END STATE — no policy attached — which a resource
+        // that carries none is already in, so clearing an absent policy is the
+        // same success and the answer carries no members either way.
         store.resource_policies.remove(&resource.policy_key());
 
         Ok(DeleteResourcePolicyOutput {})

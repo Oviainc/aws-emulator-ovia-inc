@@ -6,13 +6,12 @@
 //! deserialization, the boundary validator, the handler, the persisted state and
 //! serialization — the same path a client takes.
 //!
-//! The rule under test: an operation addressed by a resource ARN answers from the one
-//! record the store holds for the resource that ARN names, and refuses with the modelled
-//! `ResourceNotFoundException` (HTTP 404) when the thing it was asked for is not held —
-//! the resource, for an ARN of this catalog the store holds no record of, and the policy
-//! document itself, for a reader of a resource that carries none. Nothing is ever
-//! synthesised for what the store does not hold, and nothing a read answers makes a later
-//! read answer differently.
+//! The rule under test: a resource-based policy is recorded per RESOURCE ARN, so a report
+//! of one answers the document attached to that ARN — or the EMPTY policy document when
+//! none is attached — and is refused with the modelled `ResourceNotFoundException` (HTTP
+//! 404) only for an ARN that identifies no resource of this catalog. The catalog's own
+//! record of a resource gates ATTACHING a policy, not reporting or clearing one, and
+//! nothing a read answers makes a later read answer differently.
 //!
 //! The rows differ along the resource kind (entity or change set), the entity type, the
 //! policy document attached (shape and size), the region and partition the ARN naming the
@@ -50,6 +49,12 @@ const JSON: &str = "application/json";
 
 /// The resource type segment a change set's ARN carries, as this service mints it.
 const CHANGE_SET_RESOURCE_TYPE: &str = "ChangeSet";
+
+/// The document a resource carrying no resource-based policy reports: the empty JSON
+/// policy document, which states no `Statement` and so grants what no attached policy
+/// grants. `PutResourcePolicy` refuses it, so reading it back can only mean that nothing
+/// is attached (see `resource_policy_lifecycle.rs`).
+const EMPTY_POLICY_DOCUMENT: &str = "{}";
 
 /// The product entity types `CreateProduct` creates, from `EntitySummary`'s per-type
 /// summary members (`smithy_query(query="shape", shape="EntitySummary")`:
@@ -319,9 +324,8 @@ fn policy_document(statements: usize) -> String {
 }
 
 /// A policy read reports the document that was attached and nothing else: before any
-/// attachment, and after the attachment is cleared, there is no document to report and the
-/// read is refused 404 `ResourceNotFoundException` naming the resource whose policy was
-/// asked for — never a synthesised empty document.
+/// attachment, and after the attachment is cleared, the resource carries no document and
+/// the read answers the empty policy document instead of one no caller attached.
 ///
 /// The rows differ along the entity type, the resource kind (the entity and the change set
 /// that created it), the number of statements in the attached document, and the partition
@@ -341,27 +345,15 @@ async fn a_policy_read_reports_only_what_was_attached() {
             assert_eq!(
                 (
                     fresh.status,
-                    fresh.error_code(),
-                    fresh.content_type.as_str(),
-                    fresh.errortype.as_str(),
+                    fresh.text("/Policy"),
+                    fresh.content_type.clone(),
                 ),
-                (
-                    404,
-                    "ResourceNotFoundException",
-                    JSON,
-                    "ResourceNotFoundException",
-                ),
-                "case {case:?}: a resource carrying no policy must be refused 404 \
-                 ResourceNotFoundException as application/json, got {} {:?} with {:?}",
+                (200, EMPTY_POLICY_DOCUMENT.to_string(), JSON.to_string()),
+                "case {case:?}: a resource carrying no policy must report the empty policy \
+                 document with 200 application/json, got {} {:?} with {:?}",
                 fresh.status,
                 fresh.content_type,
                 fresh.body
-            );
-            assert!(
-                fresh.message().contains(&id),
-                "case {case:?}: the refusal must name the resource whose policy was asked \
-                 for, got {:?}",
-                fresh.message()
             );
 
             // The rows' documents: one, two, three and many statements.
@@ -416,10 +408,10 @@ async fn a_policy_read_reports_only_what_was_attached() {
 
             let after_clear = get_resource_policy(&router, arn).await;
             assert_eq!(
-                (after_clear.status, after_clear.error_code()),
-                (404, "ResourceNotFoundException"),
-                "case {case:?}: a resource whose policy was cleared must be refused 404 \
-                 ResourceNotFoundException again, got {} with {:?}",
+                (after_clear.status, after_clear.text("/Policy")),
+                (200, EMPTY_POLICY_DOCUMENT.to_string()),
+                "case {case:?} ({id}): a resource whose policy was cleared must report the \
+                 empty policy document again, got {} with {:?}",
                 after_clear.status,
                 after_clear.body
             );
@@ -457,14 +449,15 @@ async fn a_policy_read_reports_only_what_was_attached() {
     }
 }
 
-/// An ARN of this catalog naming a resource the store holds no record of is refused 404
-/// `ResourceNotFoundException` naming that resource by EVERY operation of the policy
-/// surface — the read as much as the write — and the refusal states the resource is
-/// missing, not its policy.
+/// The catalog's own record of a resource gates ATTACHING a policy and nothing else: for
+/// an ARN of this catalog naming a resource the store holds no record of,
+/// `PutResourcePolicy` is refused 404 `ResourceNotFoundException` naming that resource,
+/// while reporting answers the empty policy document and clearing answers the same empty
+/// 200 it answers for a resource that carries none.
 ///
-/// The rows differ along the resource kind and type the absent ARN names, and the id.
+/// The rows differ along the resource kind and type the ARN names, and the id.
 #[tokio::test]
-async fn a_policy_operation_refuses_a_resource_the_catalog_does_not_hold() {
+async fn the_catalogs_record_gates_attaching_a_policy_and_not_reporting_one() {
     // (case, resource type segment, id, the sentence this service states that resource
     // kind missing in) — ids of `ResourceId`'s `^[\w\-]+$` that nothing ever created.
     let rows: Vec<(&str, &str, &str, String)> = vec![
@@ -495,7 +488,7 @@ async fn a_policy_operation_refuses_a_resource_the_catalog_does_not_hold() {
     ];
 
     let router = emulator();
-    // A resource that IS held, carrying a policy, so each refusal below is shown to be
+    // A resource that IS held, carrying a policy, so each answer below is shown to be
     // about the ARN rather than about the operation — and is shown to leave that policy
     // alone.
     let (held_arn, _) = created_resources(&router, "AmiProduct").await;
@@ -510,87 +503,105 @@ async fn a_policy_operation_refuses_a_resource_the_catalog_does_not_hold() {
     for (case, resource_type, id, missing) in rows {
         let arn = absent_arn(resource_type, id);
 
-        for operation in ["GetResourcePolicy", "PutResourcePolicy", "DeleteResourcePolicy"] {
-            let answer = match operation {
-                "GetResourcePolicy" => get_resource_policy(&router, &arn).await,
-                "PutResourcePolicy" => {
-                    put_resource_policy(&router, &arn, &policy_document(1)).await
-                }
-                _ => delete_resource_policy(&router, &arn).await,
-            };
+        let refused = put_resource_policy(&router, &arn, &policy_document(1)).await;
+        assert_eq!(
+            (
+                refused.status,
+                refused.error_code(),
+                refused.content_type.as_str(),
+                refused.errortype.as_str(),
+                refused.message(),
+            ),
+            (
+                404,
+                "ResourceNotFoundException",
+                JSON,
+                "ResourceNotFoundException",
+                missing.clone(),
+            ),
+            "case {case:?}: attaching a policy to a resource the catalog holds no record \
+             of must be refused 404 ResourceNotFoundException naming it, got {} {:?} with \
+             {:?}",
+            refused.status,
+            refused.error_code(),
+            refused.body
+        );
+
+        // Reporting and clearing are not gated on that record: nothing is attached, which
+        // the report says with the empty policy document and the clear with its empty 200.
+        for round in 0..2 {
+            let read = get_resource_policy(&router, &arn).await;
             assert_eq!(
-                (
-                    answer.status,
-                    answer.error_code(),
-                    answer.content_type.as_str(),
-                    answer.errortype.as_str(),
-                    answer.message(),
-                ),
-                (
-                    404,
-                    "ResourceNotFoundException",
-                    JSON,
-                    "ResourceNotFoundException",
-                    missing.clone(),
-                ),
-                "case {case:?}/{operation}: an ARN naming a resource the catalog does not \
-                 hold must be refused 404 ResourceNotFoundException naming it, got {} \
-                 {:?} with {:?}",
-                answer.status,
-                answer.error_code(),
-                answer.body
+                (read.status, read.text("/Policy")),
+                (200, EMPTY_POLICY_DOCUMENT.to_string()),
+                "case {case:?} round {round}: the report must answer the empty policy \
+                 document, got {} with {:?}",
+                read.status,
+                read.body
+            );
+
+            let cleared = delete_resource_policy(&router, &arn).await;
+            assert_eq!(
+                (cleared.status, &cleared.body),
+                (200, &json!({})),
+                "case {case:?} round {round}: the clear must answer an empty 200, got {} \
+                 with {:?}",
+                cleared.status,
+                cleared.body
             );
         }
 
-        // Nothing the refused calls touched: the ARN still names no resource, so a
-        // repeated read is refused identically, and the held resource's own policy is
+        // Neither answer made the resource exist, and the held resource's own policy is
         // exactly what was attached to it.
-        let again = get_resource_policy(&router, &arn).await;
+        let described = call(
+            &router,
+            "GET",
+            &format!("/DescribeEntity?catalog={CATALOG}&entityId={id}"),
+            None,
+        )
+        .await;
         assert_eq!(
-            (again.status, again.message()),
-            (404, missing.clone()),
-            "case {case:?}: a refused read must not make the next read answer differently, \
-             got {} with {:?}",
-            again.status,
-            again.body
+            (described.status, described.error_code()),
+            (404, "ResourceNotFoundException"),
+            "case {case:?}: a policy call must not make the resource exist, got {} with \
+             {:?}",
+            described.status,
+            described.body
         );
         let held = get_resource_policy(&router, &held_arn).await;
         assert_eq!(
             (held.status, held.text("/Policy")),
             (200, held_document.clone()),
-            "case {case:?}: a refused call on another ARN must leave the held resource's \
-             policy alone, got {} with {:?}",
+            "case {case:?}: a call on another ARN must leave the held resource's policy \
+             alone, got {} with {:?}",
             held.status,
             held.body
         );
     }
 }
 
-/// A refused read creates nothing: after `GetResourcePolicy` has been refused for an ARN
-/// the catalog holds no record of, that ARN still names no resource — `DescribeEntity` and
-/// `PutResourcePolicy` answer exactly as they did before the read — and after it has been
-/// refused for a held resource carrying no policy, attaching one still works and is what
-/// the next read reports.
+/// A policy read creates nothing: after `GetResourcePolicy` has reported the empty policy
+/// document for an ARN the catalog holds no record of, that ARN still names no resource —
+/// `DescribeEntity` and `PutResourcePolicy` answer exactly as they did before the read —
+/// and for a held resource carrying no policy, attaching one after the read still works
+/// and is what the next read reports.
 #[tokio::test]
-async fn a_refused_policy_read_changes_nothing_a_later_caller_sees() {
+async fn a_policy_read_changes_nothing_a_later_caller_sees() {
     const ABSENT_ENTITY: &str = "prod-absent0entity0";
 
     let router = emulator();
     let absent = absent_arn("AmiProduct", ABSENT_ENTITY);
 
-    // Three reads of the absent resource, with the entity read between them: each one
-    // answers the same, so no read materialised the resource it was asked about.
+    // Three reads of the resource the catalog holds no record of, with the entity read
+    // and the attach between them: each one answers the same, so no read materialised
+    // the resource it was asked about or a policy for it.
     for round in 0..3 {
         let read = get_resource_policy(&router, &absent).await;
         assert_eq!(
-            (read.status, read.error_code(), read.message()),
-            (
-                404,
-                "ResourceNotFoundException",
-                format!("Requested entity '{ABSENT_ENTITY}' does not exist."),
-            ),
-            "round {round}: every read of an absent resource must answer the same 404, \
-             got {} with {:?}",
+            (read.status, read.text("/Policy")),
+            (200, EMPTY_POLICY_DOCUMENT.to_string()),
+            "round {round}: every read of a resource with no policy must answer the same \
+             empty policy document, got {} with {:?}",
             read.status,
             read.body
         );
@@ -605,21 +616,32 @@ async fn a_refused_policy_read_changes_nothing_a_later_caller_sees() {
         assert_eq!(
             (described.status, described.error_code()),
             (404, "ResourceNotFoundException"),
-            "round {round}: a refused policy read must not make the entity exist, got {} \
+            "round {round}: a policy read must not make the entity exist, got {} \
              with {:?}",
             described.status,
             described.body
         );
+
+        let attach = put_resource_policy(&router, &absent, &policy_document(1)).await;
+        assert_eq!(
+            (attach.status, attach.error_code()),
+            (404, "ResourceNotFoundException"),
+            "round {round}: a policy read must not make the resource one a policy can be \
+             attached to, got {} with {:?}",
+            attach.status,
+            attach.body
+        );
     }
 
-    // The held resource: the refused read leaves it able to take a policy, which the next
-    // read then reports.
+    // The held resource: the read before any attachment leaves it able to take a policy,
+    // which the next read then reports.
     let (held_arn, _) = created_resources(&router, "SaaSProduct").await;
     let first = get_resource_policy(&router, &held_arn).await;
     assert_eq!(
-        (first.status, first.error_code()),
-        (404, "ResourceNotFoundException"),
-        "a held resource carrying no policy must be refused 404, got {} with {:?}",
+        (first.status, first.text("/Policy")),
+        (200, EMPTY_POLICY_DOCUMENT.to_string()),
+        "a held resource carrying no policy must report the empty policy document, got {} \
+         with {:?}",
         first.status,
         first.body
     );
@@ -628,7 +650,7 @@ async fn a_refused_policy_read_changes_nothing_a_later_caller_sees() {
     let attached = put_resource_policy(&router, &held_arn, &document).await;
     assert_eq!(
         attached.status, 200,
-        "attaching after a refused read must answer 200, got {} with {:?}",
+        "attaching after a read must answer 200, got {} with {:?}",
         attached.status, attached.body
     );
     for round in 0..3 {
