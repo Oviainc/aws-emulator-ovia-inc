@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListLensReviews
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListLensReviews`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListLensReviews::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports ONE page of the lens reviews of ONE workload: one summary per lens attached to
+//! the reviewed workload, each carrying that lens's own metadata and the risk roll-up
+//! derived from the answers the workload stores for that lens's questions.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +151,154 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListLensReviews` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListLensReviewsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListLensReviews"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListLensReviewsErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool workload store is unavailable".to_string(),
+            })
+        })?;
+
+        // `MaxResults` is modelled `@range(min: 1, max: 50)`; a request that omits it asks
+        // for a full page, so the modelled maximum is the default. One helper restates that
+        // bound for every paginated operation of this service.
+        let page_size = crate::state::page_size(input.max_results);
+
+        // An opaque token this service did not issue is a bad request, not an empty page.
+        // A token is this service's own cursor, not a value a caller composes: it cannot
+        // be corrected, only obtained again, so the refusal is classified `CANNOT_PARSE`
+        // ("restart the pagination") rather than as a field rule to fix — and it still
+        // names the member whose value could not be decoded.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_lens_review_next_token(token) {
+                Some(alias) => Some(alias),
+                None => return Err(invalid_next_token()),
+            },
+        };
+
+        let store = state.lock();
+        // "List lens reviews for a particular workload": the path id is resolved by this
+        // lookup, so an id no workload carries is the lookup's 404 whatever its syntax —
+        // never an empty page.
+        let live = store.workloads.get(&input.workload_id).ok_or_else(|| {
+            ListLensReviewsErrorModeled::ResourceNotFoundException(
+                crate::state::workload_not_found(&input.workload_id),
+            )
+        })?;
+
+        // "A milestone records the state of a workload at a particular point in time"
+        // (`CreateMilestone` doc): a request that names one lists the reviews the RECORDED
+        // workload carried, not the live ones.
+        let workload = match input.milestone_number {
+            None => live,
+            Some(number) => {
+                &store
+                    .milestone(&input.workload_id, number)
+                    .ok_or_else(|| {
+                        ListLensReviewsErrorModeled::ResourceNotFoundException(
+                            crate::state::milestone_not_found(&input.workload_id, number),
+                        )
+                    })?
+                    .workload
+            }
+        };
+
+        // A lens review exists only while that lens is associated with the workload, so the
+        // reviews to report are exactly the workload's attached lenses — in the stable
+        // total order the cursor resumes from, start-EXCLUSIVE, so every review is
+        // enumerated exactly once across the pages.
+        let reviews = workload.lens_reviews();
+        let remaining: Vec<(&str, &str)> = reviews
+            .iter()
+            .filter_map(|(&alias, &lens)| {
+                resume_after
+                    .as_deref()
+                    .is_none_or(|last| alias > last)
+                    .then_some((alias, lens))
+            })
+            .collect();
+
+        let page = &remaining[..remaining.len().min(page_size)];
+        let next_token = match page.last() {
+            Some((alias, _)) if remaining.len() > page.len() => {
+                Some(crate::state::encode_lens_review_next_token(alias))
+            }
+            _ => None,
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let lens_review_summaries: Vec<LensReviewSummary> = page
+            .iter()
+            .map(|(_, lens)| lens_review_summary(&store, workload, lens, &region))
+            .collect();
+
+        Ok(ListLensReviewsOutput {
+            workload_id: Some(workload.workload_id.clone()),
+            // Echoed only when the request scoped the read to a milestone: a read of the
+            // live reviews is not a read of any milestone.
+            milestone_number: input.milestone_number,
+            lens_review_summaries: Some(lens_review_summaries),
+            next_token,
+        })
     }
+}
+
+/// The `LensReviewSummary` of ONE lens review of `workload`: the lens as the workload
+/// records it, the lens's own metadata, and the risk roll-up over the questions THAT lens
+/// asks.
+///
+/// Every member is derived from the stored workload and the lens catalog on each read, so
+/// a summary moves when an answer does and cannot disagree with what `GetLensReview`
+/// reports about the same review — the metadata and the roll-up come from the same two
+/// places (`crate::state::lens_metadata` and `WorkloadRecord::lens_risk_counts`) that read
+/// builds its answer from.
+fn lens_review_summary(
+    store: &crate::state::ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState,
+    workload: &crate::state::WorkloadRecord,
+    lens: &str,
+    region: &str,
+) -> LensReviewSummary {
+    let metadata = crate::state::lens_metadata(lens);
+    LensReviewSummary {
+        // "Each lens is identified by its `LensSummary$LensAlias`" (`WorkloadLenses` doc):
+        // the name the workload records the lens under — for a custom lens its ARN, which
+        // is the only `LensAlias` such a lens has. A single-review read echoes the spelling
+        // the REQUEST named the lens by (`GetLensReview`); a listing has no such spelling,
+        // so it reports the one the attach recorded, which resolves to the same lens.
+        lens_alias: Some(lens.to_string()),
+        lens_arn: Some(store.lens_arn_of(lens, region)),
+        // A lens's name, version and status are lens CONTENT, reported for the lens whose
+        // definition this emulator ships and omitted rather than guessed at for one it
+        // holds no content for.
+        lens_version: metadata.map(|content| content.version.to_string()),
+        lens_name: metadata.map(|content| content.name.to_string()),
+        lens_status: metadata.map(|content| content.status.to_string()),
+        // "The date and time when the lens review was last updated": a review's content —
+        // the answers recorded against it — is part of the workload record, so the instant
+        // the workload last changed is the instant its reviews last changed. A milestone
+        // read reports the instant the RECORDED workload carried, which is what that
+        // milestone froze.
+        updated_at: Some(::aws_smithy_types::DateTime::from(workload.updated_at)),
+        // The roll-up over THIS lens's questions alone, derived from the stored answers on
+        // every read: it moves when an answer does.
+        risk_counts: Some(crate::state::risk_counts_to_map(
+            &workload.lens_risk_counts(lens),
+        )),
+        // A review carries profiles, and risk counts restricted to the questions they
+        // prioritise, only once a profile is associated with the workload;
+        // `AssociateProfiles` is still a stub with its own issue, so there is nothing to
+        // project.
+        profiles: None,
+        prioritized_risk_counts: None,
+    }
+}
+
+/// What a `NextToken` this service did not issue is answered with. The token is this
+/// service's own opaque cursor, so the only thing a caller can do is start the pagination
+/// again — which is what `CANNOT_PARSE` tells it.
+fn invalid_next_token() -> ListLensReviewsError {
+    ListLensReviewsErrorModeled::ValidationException(crate::state::cannot_parse_exception(
+        crate::state::NEXT_TOKEN_MEMBER,
+        crate::state::INVALID_NEXT_TOKEN_MESSAGE,
+    ))
+    .into()
 }
