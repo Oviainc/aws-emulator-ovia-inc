@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetApplicationComponentDetails
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetApplicationComponentDetails`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetApplicationComponentDetails::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports ONE application component of this account's portfolio: the
+//! [`crate::state::ApplicationComponentRecord`] the `applicationComponentId` names, as the
+//! `ApplicationComponentDetail` the model declares
+//! ([`crate::state::ApplicationComponentRecord::to_detail`]), beside the associations that
+//! record holds — the ids of the servers the component runs on and the application groups
+//! it belongs to — and whether it belongs to more than one of those groups.
+//!
+//! A read (`@readonly`): it computes its answer from the stored record and writes nothing,
+//! so two identical calls answer the same thing. An `applicationComponentId` naming no
+//! component of the portfolio is refused with the modelled 404
+//! `ResourceNotFoundException`, never answered with a detail nothing holds.
 //!
 //! ## Shape of an operation
 //!
@@ -77,6 +80,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::application_component_not_found;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -148,18 +153,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetApplicationComponentDetails` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetApplicationComponentDetailsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetApplicationComponentDetails"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                GetApplicationComponentDetailsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the migrationhub-strategy application component inventory is \
+                             unavailable"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A read: the store is only looked at here, so running
+        // GetApplicationComponentDetails changes nothing a later caller sees.
+        let store = state.lock();
+        let Some(component) = store
+            .application_components
+            .get(&input.application_component_id)
+        else {
+            return Err(
+                GetApplicationComponentDetailsErrorModeled::ResourceNotFoundException(
+                    application_component_not_found(),
+                )
+                .into(),
+            );
+        };
+
+        Ok(GetApplicationComponentDetailsOutput {
+            application_component_detail: Some(component.to_detail()),
+            // Both associations are reported as the record holds them, in the stored
+            // order: a component no association was recorded for answers an empty list
+            // rather than an application or a server nothing holds.
+            associated_applications: Some(component.associated_applications.clone()),
+            associated_server_ids: Some(component.associated_server_ids.clone()),
+            // Counted off the application list this same answer reports.
+            more_application_resource: Some(component.more_application_resource()),
+        })
     }
 }

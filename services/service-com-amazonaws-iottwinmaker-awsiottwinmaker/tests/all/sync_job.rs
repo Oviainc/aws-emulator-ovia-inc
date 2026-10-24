@@ -448,6 +448,88 @@ async fn a_sync_job_belongs_to_its_workspace() {
     );
 }
 
+/// RULE: `GetSyncJob` REPORTS — a read, and a refused read, change nothing a
+/// later caller sees: once the outcome the clock owed has been materialised, the
+/// job reads back byte-for-byte identically however often it is read, and a read
+/// that finds no job materialises none.
+///
+/// The rows differ along WHAT the refused lookup misses — the workspace holds no
+/// job for the source, the workspace is not held at all, and the request names
+/// no workspace — because the rule is that none of them writes anything, whatever
+/// the refusal is.
+#[tokio::test]
+async fn reading_a_sync_job_changes_nothing_a_later_caller_sees() {
+    const WORKSPACE: &str = "pureReadWorkspace";
+    const EMPTY_WORKSPACE: &str = "jobFreeWorkspace";
+    let emulator = emulator_with_workspaces(&[WORKSPACE, EMPTY_WORKSPACE]).await;
+    assert_eq!(
+        emulator
+            .create_sync_job(
+                WORKSPACE,
+                SYNC_SOURCE_SITEWISE,
+                json!({"syncRole": "arn:aws:iam::000000000000:role/TwinMakerSyncRole"}),
+            )
+            .await
+            .status,
+        200,
+        "the sync job the reads report must exist"
+    );
+    // Past the settle span, so the repeated reads are of a job the clock has
+    // already moved and cannot move again: what remains is the read itself.
+    wait_until_settled();
+
+    let first = emulator
+        .get_sync_job(Some(WORKSPACE), SYNC_SOURCE_SITEWISE)
+        .await;
+    assert_eq!(
+        first.status, 200,
+        "the settled job must still be readable, got {first:?}"
+    );
+    for attempt in 1..=3 {
+        let again = emulator
+            .get_sync_job(Some(WORKSPACE), SYNC_SOURCE_SITEWISE)
+            .await;
+        assert_eq!(
+            again.body, first.body,
+            "read {attempt}: a read must report the same job it reported before, got {again:?}"
+        );
+    }
+
+    let rows: Vec<(&str, Option<&str>)> = vec![
+        ("a workspace holding no such job", Some(EMPTY_WORKSPACE)),
+        ("a workspace the service does not hold", Some("absentWorkspace")),
+        ("no workspace at all", None),
+    ];
+    for (case, workspace_id) in &rows {
+        let missed = emulator
+            .get_sync_job(*workspace_id, SYNC_SOURCE_SITEWISE)
+            .await;
+        assert!(
+            missed.status >= 400,
+            "case {case:?}: a read that finds no job must be refused, got {missed:?}"
+        );
+        assert_eq!(
+            emulator
+                .state()
+                .lock()
+                .workspaces
+                .values()
+                .map(|workspace| workspace.sync_jobs.len())
+                .sum::<usize>(),
+            1,
+            "case {case:?}: a refused read must materialise no sync job"
+        );
+    }
+
+    let after = emulator
+        .get_sync_job(Some(WORKSPACE), SYNC_SOURCE_SITEWISE)
+        .await;
+    assert_eq!(
+        after.body, first.body,
+        "the refused reads must leave the stored job exactly as it was, got {after:?}"
+    );
+}
+
 /// RULE: the services a workspace reports as `linkedServices` are the sources of
 /// the sync jobs it holds — omitted while it holds none — and every operation
 /// that reports a workspace reports the same list.
