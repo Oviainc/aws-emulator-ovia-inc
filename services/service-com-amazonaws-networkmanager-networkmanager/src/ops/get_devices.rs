@@ -156,6 +156,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let now = ::std::time::SystemTime::now();
+        // `DeviceIds` documents a maximum of 10 ids that the modelled `DeviceIdList` does
+        // not express as `@length`, so a longer filter is refused — before anything is
+        // listed — rather than silently honoured.
         let requested = input.device_ids.unwrap_or_default();
         let store = state.lock();
         // The resource the path addresses is checked first: an unknown global network is
@@ -169,6 +172,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+
+        crate::state::check_filter_ids("DeviceIds", &requested)
+            .map_err(GetDevicesErrorModeled::ValidationException)?;
 
         let after = match input.next_token.as_deref() {
             Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
