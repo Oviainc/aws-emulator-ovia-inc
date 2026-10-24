@@ -43,6 +43,10 @@ const ABSENT_EVENT_ID: &str = "gateevent0000001";
 /// action carries.
 const ABSENT_ACTION_ID: &str = "gateaction000001";
 
+/// A member account id, modelled `^[0-9]{12}$`, for the organization-association
+/// call this suite drives through the gate.
+const GATE_MEMBER_ACCOUNT_ID: &str = "123456789012";
+
 /// Every operation the gate covers, with a well-formed request for it and the
 /// status it answers once the account IS opted in and the store is empty — the
 /// operation's own outcome, which the gate is what stands in front of.
@@ -95,6 +99,11 @@ fn gated_calls() -> Vec<(&'static str, Value, u16)> {
             "UntagResource",
             json!({"resourceArn": arn, "ruleRevision": 1, "tagKeys": ["team"]}),
             404,
+        ),
+        (
+            "AssociateAccounts",
+            json!({"accountIds": [GATE_MEMBER_ACCOUNT_ID]}),
+            200,
         ),
     ]
 }
@@ -187,6 +196,7 @@ async fn an_unenrolled_account_is_refused_every_action() {
             absent_rule_arn(),
             ABSENT_EVENT_ID.to_string(),
             ABSENT_ACTION_ID.to_string(),
+            GATE_MEMBER_ACCOUNT_ID.to_string(),
             operation.to_string(),
         ] {
             assert!(

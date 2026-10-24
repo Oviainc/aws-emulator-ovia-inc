@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateConfigurationDefinition
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateConfigurationDefinition`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateConfigurationDefinition::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mutates the ONE stored configuration definition the `{ManagerArn}/{Id}` pair names:
+//! every member the request carries replaces the stored one, every member it omits is
+//! left exactly as it was stored, and the configuration the service deploys from that
+//! definition is re-deployed with the new values — so a later `GetConfigurationManager`
+//! and `ListConfigurations` report them. The modelled 404 when no manager has that ARN
+//! or that manager holds no definition with that id; an empty body on success.
 //!
 //! ## Shape of an operation
 //!
@@ -80,6 +77,43 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// Why this update cannot be served, or `None` when it can.
+///
+/// `TypeVersion`'s `^\d{1,3}(\.\d{1,3})?$|^LATEST$` pattern,
+/// `LocalDeploymentExecutionRoleName`'s `^[\w+=,.@-]{1,64}$` pattern, both
+/// `@httpLabel` patterns and every parameter key's and value's length are MODELLED
+/// constraints, so the centralized walk has already refused anything outside them with
+/// a 400 `ValidationException` before the handler body runs. What is checked here is
+/// what the model cannot say:
+///
+/// * `ConfigurationParametersMap` bounds each key and value but not the map's size, so
+///   a parameter set past [`crate::state::MAX_PARAMETERS`] is refused rather than
+///   stored — the same bound `CreateConfigurationManager` applies to the definitions it
+///   stores, so an update can never put a definition past what a create may hold;
+/// * `LocalDeploymentAdministrationRoleArn` is an `IAMRoleArn`, whose
+///   `@arnReference` to `AWS::IAM::Role` the model states with no `@pattern` to enforce
+///   it; [`crate::state::iam_role_arn_rejection`] is the one place that rule lives,
+///   shared with every other `IAMRoleArn` member of this service.
+fn update_rejection(input: &UpdateConfigurationDefinitionInput) -> Option<String> {
+    let parameters = input
+        .parameters
+        .as_ref()
+        .map_or(0, std::collections::HashMap::len);
+    if parameters > crate::state::MAX_PARAMETERS {
+        return Some(format!(
+            "Parameters carries {parameters} entries, more than the {} one configuration \
+             definition may hold",
+            crate::state::MAX_PARAMETERS
+        ));
+    }
+    input
+        .local_deployment_administration_role_arn
+        .as_deref()
+        .and_then(|arn| {
+            crate::state::iam_role_arn_rejection("LocalDeploymentAdministrationRoleArn", arn)
+        })
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -178,18 +212,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateConfigurationDefinition` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateConfigurationDefinitionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateConfigurationDefinition"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateConfigurationDefinitionErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the configuration manager store is unavailable".to_string()),
+                },
+            )
+        })?;
+
+        if let Some(why) = update_rejection(&input) {
+            return Err(
+                UpdateConfigurationDefinitionErrorModeled::ValidationException(
+                    ValidationException { message: Some(why) },
+                )
+                .into(),
+            );
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        let Some(manager) = store.managers.get_mut(&input.manager_arn) else {
+            return Err(
+                UpdateConfigurationDefinitionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "no configuration manager with ARN {} exists",
+                            input.manager_arn
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let Some(definition) = manager
+            .definitions
+            .iter_mut()
+            .find(|definition| definition.id == input.id)
+        else {
+            return Err(
+                UpdateConfigurationDefinitionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(format!(
+                            "configuration manager {} holds no configuration definition with ID {}",
+                            input.manager_arn, input.id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Every member but the two labels is optional, and only what the request
+        // carries is replaced, so an update naming one member leaves the others as they
+        // were stored. `Parameters` is the definition's whole parameter set — the model
+        // names no per-entry update — so a request carrying it replaces that set rather
+        // than merging into it, which is also what keeps the operation `@idempotent`:
+        // replaying one request leaves exactly the same definition.
+        if let Some(type_version) = input.type_version {
+            definition.type_version = Some(type_version);
+        }
+        if let Some(parameters) = input.parameters {
+            definition.parameters = crate::state::to_btree_map(Some(parameters));
+        }
+        if let Some(role_name) = input.local_deployment_execution_role_name {
+            definition.local_deployment_execution_role_name = Some(role_name);
+        }
+        if let Some(role_arn) = input.local_deployment_administration_role_arn {
+            definition.local_deployment_administration_role_arn = Some(role_arn);
+        }
+        let type_version = definition.type_version.clone();
+        let parameters = definition.parameters.clone();
+
+        // Monotonic: the stamp never moves backwards, whatever the host clock does.
+        manager.last_modified_at = now.max(manager.last_modified_at);
+        // Updating a definition submits it for deployment again, so the deployment is
+        // reported in its transient status once more and settles the way the create's
+        // did — the one clock-owed transition this service models.
+        crate::state::restart_deployment(&mut manager.status_summaries, now);
+
+        // A configuration IS the deployment of one definition, so the definition's new
+        // values are what that configuration now carries: leaving the two copies to
+        // disagree would let `ListConfigurations` report a parameter set no definition
+        // holds. `Type` is not an input of this operation, so it is untouched.
+        for configuration in store.configurations.values_mut() {
+            if configuration.manager_arn != input.manager_arn
+                || configuration.configuration_definition_id != input.id
+            {
+                continue;
+            }
+            configuration.type_version = type_version.clone();
+            configuration.parameters = parameters.clone();
+            configuration.last_modified_at = now.max(configuration.last_modified_at);
+            crate::state::restart_deployment(&mut configuration.status_summaries, now);
+        }
+
+        Ok(UpdateConfigurationDefinitionOutput)
     }
 }

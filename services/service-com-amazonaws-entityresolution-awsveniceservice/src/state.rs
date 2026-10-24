@@ -1145,11 +1145,12 @@ pub mod messages {
     /// uses.
     pub const CREATE_ID_NAMESPACE_CONFLICT: &str = "IdNamespace already exists.";
 
-    /// `GetIdNamespace`'s `ResourceNotFoundException$message` (HTTP 404). Not itself
-    /// recorded; this reader's own constant, in the same form as the recorded
-    /// [`GET_SCHEMA_MAPPING_NOT_FOUND`], and — like every other reader here — it does
+    /// `GetIdNamespace`'s `ResourceNotFoundException$message` (HTTP 404). The recorded
+    /// corpus shows AWS answering this CONSTANT for an ID namespace that is not there
+    /// — the same `<ResourceType> Not Found` form as the recorded
+    /// [`GET_MATCHING_WORKFLOW_NOT_FOUND`] — and, like every other reader here, it does
     /// NOT name the namespace that was asked for.
-    pub const GET_ID_NAMESPACE_NOT_FOUND: &str = "IdNamespace does not exist";
+    pub const GET_ID_NAMESPACE_NOT_FOUND: &str = "IdNamespace Not Found";
 
     /// `UpdateMatchingWorkflow`'s `ResourceNotFoundException$message` (HTTP 404) when
     /// no workflow carries the `workflowName` @httpLabel. Not itself recorded; it is
@@ -1163,11 +1164,10 @@ pub mod messages {
     /// `UpdateIdNamespace`'s `ResourceNotFoundException$message` (HTTP 404) when no ID
     /// namespace is stored under the `idNamespaceName` @httpLabel. Not itself recorded;
     /// it is this operation's own constant, in the same constant, no-name form as the
-    /// recorded [`GET_SCHEMA_MAPPING_NOT_FOUND`] and spelled with the resource type the
-    /// API uses — the update addresses the SAME resource by the SAME key as
-    /// `GetIdNamespace`, whose text ([`GET_ID_NAMESPACE_NOT_FOUND`]) names no namespace
+    /// recorded [`GET_ID_NAMESPACE_NOT_FOUND`] — the update addresses the SAME resource
+    /// by the SAME key as `GetIdNamespace`, whose recorded text names no namespace
     /// either.
-    pub const UPDATE_ID_NAMESPACE_NOT_FOUND: &str = "IdNamespace does not exist";
+    pub const UPDATE_ID_NAMESPACE_NOT_FOUND: &str = "IdNamespace Not Found";
 
     /// `UpdateIdMappingWorkflow`'s `ResourceNotFoundException$message` (HTTP 404) when
     /// no ID mapping workflow carries the `workflowName` @httpLabel. Not itself
@@ -1211,6 +1211,24 @@ pub mod messages {
     pub fn delete_schema_mapping_not_found(schema_name: &str) -> String {
         format!("SchemaMapping {schema_name} does not exist")
     }
+
+    /// `DeleteIdNamespaceOutput$message` — modelled @required, target `String`, doc "A
+    /// successful operation message"
+    /// (`smithy_query(query="operation",operation="DeleteIdNamespace")`). Not itself
+    /// recorded; it is this operation's own constant, spelled with the resource type the
+    /// API uses, in the same form as the recorded [`DELETE_SCHEMA_MAPPING_SUCCESS`]. It
+    /// carries nothing of the record that was removed.
+    pub const DELETE_ID_NAMESPACE_SUCCESS: &str = "IdNamespace Deleted.";
+
+    /// `DeleteIdNamespace`'s `ResourceNotFoundException$message` (HTTP 404) — the
+    /// refusal its own doc describes ("This operation returns a
+    /// ResourceNotFoundException if an ID namespace with the given name does not
+    /// exist"). Not itself recorded; it is this operation's own constant, in the same
+    /// constant, no-name form as the recorded [`GET_ID_NAMESPACE_NOT_FOUND`] — the
+    /// delete addresses the SAME resource by the SAME key as `GetIdNamespace` — rather
+    /// than the templated [`delete_matching_workflow_not_found`], so it composes
+    /// nothing from the request.
+    pub const DELETE_ID_NAMESPACE_NOT_FOUND: &str = "IdNamespace Not Found";
 
     /// `GenerateMatchId`'s `ResourceNotFoundException$message` (HTTP 404) when the
     /// `workflowName` @httpLabel names no matching workflow — the precondition its own

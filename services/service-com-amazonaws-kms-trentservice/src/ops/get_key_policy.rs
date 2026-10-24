@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetKeyPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetKeyPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the key policy a KMS key holds — the document `CreateKey` attached or
+//! `PutKeyPolicy` last replaced it with, served verbatim under the only name KMS
+//! serves a policy under (`crate::state::KEY_POLICY_NAME_DEFAULT`).
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetKeyPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A pure report: it reads the stored key and writes nothing, so a key's policy is
+//! readable in every key state its metadata is — including while the key is pending
+//! deletion, which `DescribeKey` reports too.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +165,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetKeyPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetKeyPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetKeyPolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetKeyPolicyErrorModeled::KMSInternalException(KMSInternalException {
+                message: Some("the KMS state store is unavailable".to_string()),
+            })
+            .into());
+        };
+
+        // "If no policy name is specified, the default value is default. The only
+        // valid name is default."
+        // (`smithy_query(query="doc",shape="GetKeyPolicyRequest",member="PolicyName")`)
+        let policy_name = input
+            .policy_name
+            .clone()
+            .unwrap_or_else(|| crate::state::KEY_POLICY_NAME_DEFAULT.to_string());
+
+        let region = crate::state::request_region(ctx);
+        let state = state.lock();
+        let key = match state.resolve(&region, &input.key_id) {
+            crate::state::KeyRef::Found(key) => key,
+            crate::state::KeyRef::MalformedArn => {
+                return Err(GetKeyPolicyErrorModeled::InvalidArnException(InvalidArnException {
+                    message: Some(crate::state::invalid_arn_message(&input.key_id)),
+                })
+                .into());
+            }
+            crate::state::KeyRef::NotFound => {
+                return Err(GetKeyPolicyErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::key_not_found_message(&region, &input.key_id)),
+                })
+                .into());
+            }
+        };
+
+        // A key holds a policy under one name only, so any other name asks for a
+        // policy the key does not have — the same judgement `PutKeyPolicy` makes.
+        if policy_name != crate::state::KEY_POLICY_NAME_DEFAULT {
+            return Err(GetKeyPolicyErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::policy_not_found_message(key, &policy_name)),
+            })
+            .into());
+        }
+
+        Ok(GetKeyPolicyOutput {
+            policy: Some(key.policy.clone()),
+            policy_name: Some(policy_name),
+        })
     }
 }

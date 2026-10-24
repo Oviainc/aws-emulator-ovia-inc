@@ -206,11 +206,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             vocabulary_state: Some(record.state.clone()),
             last_modified_time: Some(crate::state::to_date_time(record.last_modified_time)),
             failure_reason: record.failure_reason.clone(),
-            // Where the vocabulary's file is reported to live. Nothing is served
-            // there — see the `crate::state` header. This answer carries no terms:
-            // `GetVocabularyResponse` has no member for them, so the vocabulary's
-            // content is not reported by this operation at all.
-            download_uri: Some(record.download_uri()),
+            // Where the vocabulary's file is reported to live, for one this service
+            // built from the terms the request listed. Nothing is served there — see
+            // the `crate::state` header — and a vocabulary whose terms would have
+            // come from a file nothing read has no file to download at all, so the
+            // member is absent for it (`crate::state::VocabularyRecord::download_uri`).
+            // This answer carries no terms either way: `GetVocabularyResponse` has no
+            // member for them, so the vocabulary's content is not reported by this
+            // operation at all.
+            download_uri: record.download_uri(),
             data_access_role_arn: record.data_access_role_arn.clone(),
             encryption_configuration: record.encryption_configuration.clone(),
         })
