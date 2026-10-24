@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetProtectionStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetProtectionStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetProtectionStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the DDoS attacks recorded against the resources ONE Shield Advanced
+//! policy protects, as a page of the `ProtectionData` JSON document.
+//!
+//! The read is organisation-scoped, so with no Firewall Manager administrator
+//! association in this account/Region it is refused by
+//! [`crate::state::require_administrator`] BEFORE any identifier is looked up —
+//! and the administrator it resolves is the `AdminAccountId` the response
+//! carries. The attacks come from the store's attack inventory
+//! ([`crate::state::ComAmazonawsFmsAwsfms20180101State::shield_attacks`]),
+//! filtered by the request's policy, member account and time period; nothing is
+//! invented and nothing is written.
 //!
 //! ## Shape of an operation
 //!
@@ -142,6 +145,12 @@ impl From<GetProtectionStatusErrorModeled> for GetProtectionStatusError {
     }
 }
 
+/// The largest page `GetProtectionStatus` serves, which is the maximum the
+/// model's `com.amazonaws.fms#PaginationMaxResults` declares for `MaxResults`
+/// (range 1..100). It bounds the response for EVERY caller, including one that
+/// sends no `MaxResults` at all.
+const MAX_PAGE_SIZE: usize = 100;
+
 /// The `GetProtectionStatus` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -178,18 +187,132 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetProtectionStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetProtectionStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetProtectionStatus"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetProtectionStatusErrorModeled::InternalErrorException(
+                InternalErrorException {
+                    message: Some("the Firewall Manager store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let store = state.lock();
+        // Authorization FIRST, before any identifier is looked up: the
+        // administrator association is also what the response's
+        // `AdminAccountId` reports, so a caller with no administrator has
+        // nothing to be told about this policy.
+        let admin = crate::state::require_administrator(&store, &region)?;
+
+        let Some(policy) = store.policies.get(&input.policy_id) else {
+            return Err(GetProtectionStatusErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(),
+            )
+            .into());
+        };
+
+        // "If you created a Shield Advanced policy, returns policy-level attack
+        // summary information … Other policy types are currently unsupported."
+        // The stored policy's own `SecurityServicePolicyData.Type` is what
+        // decides it, which is why `ServiceType` below is read off the policy
+        // rather than written as a literal: it is always SHIELD_ADVANCED
+        // BECAUSE every other type is refused here.
+        let service_type = policy.policy.security_service_policy_data.r#type.clone();
+        if service_type != crate::state::SECURITY_SERVICE_SHIELD_ADVANCED {
+            return Err(GetProtectionStatusErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "GetProtectionStatus supports only {} policies; policy {} is a {} policy",
+                        crate::state::SECURITY_SERVICE_SHIELD_ADVANCED,
+                        input.policy_id,
+                        service_type
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A token this service did not mint, or one minted for ANOTHER policy's
+        // page, names no boundary in this policy's attacks: every key of this
+        // policy's range carries the policy's prefix.
+        let prefix = crate::state::shield_attack_key_prefix(&input.policy_id);
+        let start = match input.next_token.as_deref() {
+            Some(token) => match crate::state::decode_key_token(token)
+                .filter(|key| key.starts_with(&prefix))
+            {
+                Some(start) => Some(start),
+                None => {
+                    return Err(GetProtectionStatusErrorModeled::InvalidInputException(
+                        InvalidInputException {
+                            message: Some(format!(
+                                "NextToken is not a pagination token issued by \
+                                 GetProtectionStatus for policy {}",
+                                input.policy_id
+                            )),
+                        },
+                    )
+                    .into());
+                }
+            },
+            None => None,
+        };
+
+        // The inventory is keyed by policy, then by the instant the attack
+        // started, so this policy's attacks are a contiguous range in
+        // chronological order and a page boundary is a key: resume at the first
+        // key at or after the token's, and stop at the first key outside this
+        // policy's prefix.
+        let lower = start.unwrap_or_else(|| prefix.clone());
+        let mut remaining = store
+            .shield_attacks
+            .range(lower..)
+            .take_while(|(key, _)| key.starts_with(&prefix))
+            .map(|(_, attack)| attack)
+            // `MemberAccountId` names "the Amazon Web Services account that is
+            // in scope of the policy that you want to get the details for", so
+            // it selects the attacks on THAT account's resources; absent, every
+            // account in the policy's scope is reported.
+            .filter(|attack| {
+                input
+                    .member_account_id
+                    .as_deref()
+                    .is_none_or(|account| attack.account_id == account)
+            })
+            // `StartTime` / `EndTime` are "the start / end of the time period to
+            // query for the attacks", so an attack is reported when it overlaps
+            // that period; an absent bound leaves that side unbounded.
+            .filter(|attack| attack.overlaps(input.start_time, input.end_time));
+
+        // Bounded whether or not the caller asked for a bound, and clamped
+        // rather than only capped, for the reasons `ListPolicies` states.
+        let page_size = input
+            .max_results
+            .map_or(MAX_PAGE_SIZE, |max| usize::try_from(max).unwrap_or(0))
+            .clamp(1, MAX_PAGE_SIZE);
+        // `Data` is the documented JSON document: one entry per reported attack,
+        // in the order the page is served. With no attack in the period it is an
+        // empty JSON array rather than an absent member, so a client parses the
+        // same document either way.
+        let data = ::serde_json::Value::Array(
+            remaining
+                .by_ref()
+                .take(page_size)
+                .map(crate::state::ShieldAttackRecord::protection_data_entry)
+                .collect(),
+        )
+        .to_string();
+        // A token only when an attack is left AFTER this page, so the last page
+        // carries none. It is the next attack's own key, which is where the
+        // following page resumes.
+        let next_token = remaining
+            .next()
+            .map(|attack| crate::state::encode_key_token(&attack.key()));
+
+        Ok(GetProtectionStatusOutput {
+            admin_account_id: Some(admin.account_id.clone()),
+            service_type: Some(service_type),
+            data: Some(data),
+            next_token,
+        })
     }
 }

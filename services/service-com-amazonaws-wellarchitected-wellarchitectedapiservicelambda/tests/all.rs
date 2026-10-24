@@ -65,5 +65,8 @@ mod workload_harness;
 #[path = "all/workload_lifecycle.rs"]
 mod workload_lifecycle;
 
+#[path = "all/workload_share_permissions.rs"]
+mod workload_share_permissions;
+
 #[path = "all/workload_shares.rs"]
 mod workload_shares;
