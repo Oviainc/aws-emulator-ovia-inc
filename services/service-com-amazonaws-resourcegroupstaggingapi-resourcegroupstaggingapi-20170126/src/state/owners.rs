@@ -233,6 +233,9 @@ pub fn tagged_resources<Eng: Send + Sync + 'static>(
         for cluster in state.clusters.values() {
             record(cluster.arn.clone(), option_tag_pairs!(cluster.tags));
         }
+        for provider in state.capacity_providers.values() {
+            record(provider.arn.clone(), option_tag_pairs!(provider.tags));
+        }
         for definition in state.task_definitions.values() {
             record(definition.arn.clone(), option_tag_pairs!(definition.tags));
         }
@@ -311,13 +314,20 @@ fn sqs<Eng: Send + Sync + 'static>(
     }
 }
 
-/// Amazon ECS: clusters, task definitions, services, tasks and container
-/// instances all carry their own `tags`.
+/// Amazon ECS: clusters, capacity providers, task definitions, services, tasks
+/// and container instances all carry their own `tags`.
+///
+/// The ARN is resolved against those records by the ECS crate's OWN resolver
+/// ([`owner_ecs::state::TaggedResourceKind`] plus `resource_tags_mut`), so the
+/// kinds this API can tag and the records it writes to are the ones that service
+/// recognises, with no second copy of the resolution here to drift from it.
 fn ecs<Eng: Send + Sync + 'static>(
     engine: &Eng,
     arn: &ParsedArn,
     change: Option<&Change<'_>>,
 ) -> Resolution {
+    use owner_ecs::state::TaggedResourceKind;
+
     /// One ECS tag record from a pair.
     fn tag(key: &str, value: &str) -> owner_ecs::ops::types::Tag {
         owner_ecs::ops::types::Tag {
@@ -329,52 +339,26 @@ fn ecs<Eng: Send + Sync + 'static>(
     let Some(state) = owner_ecs::state::service_state(engine) else {
         return Resolution::Unowned;
     };
+    let kind = TaggedResourceKind::from_arn(&arn.arn);
     let mut state = state.lock();
-    if let Some(cluster) = state
-        .clusters
-        .values_mut()
-        .find(|cluster| cluster.arn == arn.arn)
-    {
-        return option_tag_list!(&mut cluster.tags, change, tag);
-    }
-    if let Some(definition) = state
-        .task_definitions
-        .values_mut()
-        .find(|definition| definition.arn == arn.arn)
-    {
-        return option_tag_list!(&mut definition.tags, change, tag);
-    }
-    if let Some(service) = state
-        .services
-        .values_mut()
-        .find(|service| service.arn == arn.arn)
-    {
-        return option_tag_list!(&mut service.tags, change, tag);
-    }
-    if let Some(task) = state
-        .tasks
-        .values_mut()
-        .find(|task| task.task_arn == arn.arn)
-    {
-        return option_tag_list!(&mut task.tags, change, tag);
-    }
-    if let Some(instance) = state
-        .container_instances
-        .values_mut()
-        .find(|instance| instance.arn == arn.arn)
-    {
-        return option_tag_list!(&mut instance.tags, change, tag);
+    if let Some(kind) = kind {
+        if let Some(tags) = state.resource_tags_mut(kind, &arn.arn) {
+            return option_tag_list!(tags, change, tag);
+        }
     }
     // ECS's own `TagResource` models both refusals
     // (`smithy_query(query="operation", operation="TagResource")` on the ECS
     // model): the cluster-specific one for a cluster ARN, the generic one
     // otherwise.
-    if arn.resource.starts_with("cluster/") {
-        absent("ClusterNotFoundException", "Cluster not found.".to_string())
+    if kind == Some(TaggedResourceKind::Cluster) {
+        absent(
+            "ClusterNotFoundException",
+            owner_ecs::state::CLUSTER_NOT_FOUND_MESSAGE.to_string(),
+        )
     } else {
         absent(
             "ResourceNotFoundException",
-            format!("The specified resource wasn't found: {}", arn.arn),
+            owner_ecs::state::resource_not_found_message(&arn.arn),
         )
     }
 }

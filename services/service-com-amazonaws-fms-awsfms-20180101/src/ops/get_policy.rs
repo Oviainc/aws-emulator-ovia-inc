@@ -8,6 +8,10 @@
 //! writes nothing. An id no stored policy carries is
 //! `ResourceNotFoundException`.
 //!
+//! Policy management is organisation-scoped, so with no Firewall Manager
+//! administrator association in the account/Region the read is refused by
+//! [`crate::state::require_administrator`] BEFORE the identifier is looked up.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -146,7 +150,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetPolicyErrorModeled::InternalErrorException(
                 InternalErrorException {
@@ -157,6 +160,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let store = state.lock();
+        // The authorization gate, BEFORE the identifier is looked up, so an
+        // unauthorized caller cannot tell a policy that exists from one that does
+        // not.
+        crate::state::require_administrator(&store, &crate::state::request_region(ctx.parts()))?;
+
         let Some(record) = store.policies.get(&input.policy_id) else {
             return Err(GetPolicyErrorModeled::ResourceNotFoundException(
                 crate::state::resource_not_found(),

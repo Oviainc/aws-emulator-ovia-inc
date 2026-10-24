@@ -334,7 +334,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut nodes = Vec::with_capacity(initial_cluster_size);
         for node_index in 0..initial_cluster_size {
             let node_id = store.mint_job_id();
-            let mut node = cluster.node_job(node_id, created);
+            let unlock_code = store.mint_unlock_code();
+            let mut node = cluster.node_job(node_id, created, unlock_code);
             node.long_term_pricing_id = cluster.long_term_pricing_ids.get(node_index).cloned();
             nodes.push(node);
         }

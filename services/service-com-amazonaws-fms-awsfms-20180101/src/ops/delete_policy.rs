@@ -7,6 +7,11 @@
 //! longer reports it. Deleting an id no stored policy carries is
 //! `ResourceNotFoundException`.
 //!
+//! Policy management is organisation-scoped, so with no Firewall Manager
+//! administrator association in the account/Region the call is refused by
+//! [`crate::state::require_administrator`] BEFORE the identifier is looked up
+//! and before anything is removed.
+//!
 //! `DeleteAllPolicyResources` asks the real service to clean up the protections
 //! and managed resources the policy created in member accounts. This emulator
 //! creates none — no WAF web ACL, Shield protection or Network Firewall exists
@@ -179,7 +184,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeletePolicyErrorModeled::InternalErrorException(
                 InternalErrorException {
@@ -190,6 +194,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let mut store = state.lock();
+        // The authorization gate, BEFORE the identifier is looked up and before
+        // anything is removed, so a refused call deletes nothing and leaks
+        // nothing about what the organisation holds.
+        crate::state::require_administrator(&store, &crate::state::request_region(ctx.parts()))?;
+
         let Some(removed) = store.policies.remove(&input.policy_id) else {
             return Err(DeletePolicyErrorModeled::ResourceNotFoundException(
                 crate::state::resource_not_found(),

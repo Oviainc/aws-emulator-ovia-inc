@@ -61,18 +61,18 @@ use crate::site_and_outpost_lifecycle::{
 /// account every capacity task here was initiated by: the one `Outpost$OwnerId` and
 /// `Site$AccountId` carry. Read from the engine itself, the same place the handler reads
 /// it, so the suite follows that account id rather than pinning a copy of it.
-fn own_account() -> &'static str {
+pub(crate) fn own_account() -> &'static str {
     ::engine::emulator_account_id()
 }
 
 /// An account that is NOT the one initiating the tasks below — an account the Outpost is
 /// shared with. Its instances run on the Outpost and are reported by
 /// `ListAssetInstances` ("belonging to all accounts"), never by this list.
-const OTHER_ACCOUNT: &str = "210987654321";
+pub(crate) const OTHER_ACCOUNT: &str = "210987654321";
 
 /// A second such account, so a row can exclude one foreign account without touching the
 /// other. Both satisfy the modelled `AccountId` pattern `^\d{12}$`.
-const THIRD_ACCOUNT: &str = "123456789012";
+pub(crate) const THIRD_ACCOUNT: &str = "123456789012";
 
 /// The route `ListBlockingInstancesForCapacityTask` binds, for one Outpost identifier
 /// form, one capacity task id and one query string.
@@ -87,7 +87,7 @@ fn route(outpost_identifier: &str, capacity_task_id: &str, query: &str) -> Strin
 /// One recorded instance, spelled out. Every member of the modelled `AssetInstance` but
 /// the id is optional, so a row can record an instance whose type, asset, owning account
 /// or owning service was never recorded.
-fn instance(
+pub(crate) fn instance(
     id: &str,
     instance_type: Option<&str>,
     asset_id: Option<&str>,
@@ -105,7 +105,7 @@ fn instance(
 
 /// An `InstanceId` of the modelled form `^i-[0-9a-z]+$` (`length(11..32)`), minted from
 /// a row's own counter so every recorded instance in a set is a distinct one.
-fn instance_id(number: u32) -> String {
+pub(crate) fn instance_id(number: u32) -> String {
     format!("i-{number:017x}")
 }
 
@@ -119,7 +119,7 @@ fn instance_id(number: u32) -> String {
 /// instances carry no owning service at all, which is what a customer's own instance is;
 /// one recorded nothing but its id and its account; two belong to other accounts (one of
 /// them owned by a service); and one recorded no owning account at all.
-fn running() -> Vec<AssetInstance> {
+pub(crate) fn running() -> Vec<AssetInstance> {
     let mut instances = vec![
         // The initiating account's own instance, every member recorded, owned by no
         // Amazon Web Services service.
@@ -291,7 +291,7 @@ async fn an_outpost(outposts: &Outposts, name: &str) -> String {
 
 /// Record `instances` as the Amazon EC2 instances running on the stored Outpost. See
 /// this module's header for why a row records them through the store.
-fn record(outposts: &Outposts, outpost_id: &str, instances: &[AssetInstance], case: &str) {
+pub(crate) fn record(outposts: &Outposts, outpost_id: &str, instances: &[AssetInstance], case: &str) {
     let store = outposts.store();
     let mut store = store.lock();
     let record = store

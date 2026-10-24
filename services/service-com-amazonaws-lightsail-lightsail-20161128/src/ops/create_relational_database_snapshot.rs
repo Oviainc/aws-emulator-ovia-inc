@@ -208,14 +208,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     "a relational database snapshot named '{name}' already exists"
                 )));
             }
-            if store.relational_database_snapshots.len()
-                >= crate::state::MAX_RELATIONAL_DATABASE_SNAPSHOTS
-            {
-                return Err(invalid(format!(
-                    "creating a relational database snapshot would take this account past the {} \
-                     this emulator holds",
-                    crate::state::MAX_RELATIONAL_DATABASE_SNAPSHOTS
-                )));
+            if let Some(message) = store.relational_database_snapshot_capacity_refusal() {
+                return Err(invalid(message));
             }
 
             // Everything about the source is read out of the SOURCE record as it

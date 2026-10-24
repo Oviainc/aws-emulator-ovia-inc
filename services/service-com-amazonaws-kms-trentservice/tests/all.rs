@@ -29,5 +29,7 @@ mod key_lifecycle;
 mod key_policy;
 #[path = "all/key_specs.rs"]
 mod key_specs;
+#[path = "all/multi_region_primary.rs"]
+mod multi_region_primary;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

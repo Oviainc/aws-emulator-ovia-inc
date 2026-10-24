@@ -2,10 +2,15 @@
 
 //! @op GetReport
 //! Serves the report document for one report version, but ONLY under a term grant this
-//! service issued for that same report and version: the `termToken` is checked against
-//! the grants [`crate::state`] holds, so a token nobody was ever given is refused and a
-//! token accepted for another report version is a conflict. The grant is not consumed —
-//! this handler only READS.
+//! service issued for the TERM governing that report: the `termToken` is checked against
+//! the grants [`crate::state`] holds, so a token nobody was ever given and a token
+//! accepted under another term are both refused with the modelled `ValidationException`.
+//! The grant is not consumed — this handler only READS.
+//!
+//! A `reportId` the catalog does not hold is refused by the front door's 401
+//! `UnauthorizedException`, because AWS Artifact authorises the report resource before
+//! looking it up; `ResourceNotFoundException` is left for a VERSION a reachable report
+//! never published.
 //!
 //! The grant is the ONLY authorisation this handler applies. The emulator verifies every
 //! request signature before a handler runs, but it models no IAM, so the modelled
@@ -173,7 +178,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        let region = crate::state::request_region(ctx.parts());
+        // The URL announced below names the endpoint the CALLER reached this emulator
+        // on, because this emulator serves the document it points at.
+        let host = crate::state::document_url_host(ctx.parts());
         let store = state.lock();
 
         let Some(report) = store.reports.get(&input.report_id) else {
@@ -183,28 +190,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::unauthorized());
         };
         let Some(version) = report.resolve(input.report_version) else {
-            // Total in both shapes: the request either named a version this report never
-            // published, or named none and the report publishes none at all. Nothing a
-            // request carries may abort the handler, so neither arm unwraps.
-            let missing = match input.report_version {
-                Some(requested) => {
-                    crate::state::report_version_not_found(&input.report_id, requested)
-                }
-                None => crate::state::report_not_found(&input.report_id),
-            };
+            // The report is reachable; this version of it does not exist.
+            let missing =
+                crate::state::report_version_not_found(&input.report_id, input.report_version);
             return Err(GetReportErrorModeled::ResourceNotFoundException(missing).into());
         };
 
-        // The term token is the acceptance receipt: a token that was never issued is not
-        // a token at all, and one issued for another report version does not authorise
-        // THIS download. Either way no URL is served.
-        let Some(grant) = store.term_tokens.get(&input.term_token) else {
+        // The term token is the acceptance receipt, and it is bound to the TERM: a token
+        // that was never issued is not a token at all, and one accepted under a
+        // different term document does not authorise this download. Either way no URL is
+        // served, and the refusal names neither the token nor the term it covers.
+        if !store.grant_covers(&input.term_token, report) {
             ::tracing::info!(
                 operation = "GetReport",
                 report_id = %input.report_id,
                 report_version = version.version,
                 outcome = "denied",
-                reason = "term token not issued",
+                reason = "termToken does not cover this report's term",
                 "refused a report download"
             );
             return Err(GetReportErrorModeled::ValidationException(
@@ -214,20 +216,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // reason this refusal happened is on the log line above, where an
                 // operator reads it; the modelled `reason` tells a client it was a token.
                 crate::state::invalid_token(),
-            )
-            .into());
-        };
-        if grant.report_id != report.id || grant.report_version != version.version {
-            ::tracing::info!(
-                operation = "GetReport",
-                report_id = %input.report_id,
-                report_version = version.version,
-                outcome = "denied",
-                reason = "term token accepted for another report version",
-                "refused a report download"
-            );
-            return Err(GetReportErrorModeled::ConflictException(
-                crate::state::grant_does_not_cover(&input.term_token, grant),
             )
             .into());
         }
@@ -242,9 +230,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(GetReportOutput {
             document_presigned_url: Some(crate::state::report_document_url(
-                &region,
+                &host,
                 report,
-                version.version,
+                version,
                 &input.term_token,
             )),
         })

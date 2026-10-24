@@ -36,6 +36,7 @@ use service_com_amazonaws_budgets_awsbudgetservicegateway::state::{
     ACTION_STATUS_EXECUTION_IN_PROGRESS, ACTION_STATUS_STANDBY, EVENT_TYPE_CREATE_ACTION,
     EVENT_TYPE_EXECUTE_ACTION, EVENT_TYPE_SYSTEM, EVENT_TYPE_UPDATE_ACTION,
     EXECUTION_TYPE_APPROVE, MAX_ACTIONS_PER_BUDGET, MAX_ACTION_HISTORY_RECORDS,
+    MAX_SNS_SUBSCRIBERS_PER_NOTIFICATION,
 };
 
 use super::budget_lifecycle::{account, call, is_error, router, router_with_engine, same};
@@ -110,17 +111,33 @@ fn other_definition_for(action_type: &str) -> Value {
     }
 }
 
-/// `count` subscribers, alternating through every `SubscriptionType` the model lists.
+/// `count` subscribers spanning every `SubscriptionType` the model lists, within the
+/// documented per-type split of a subscriber set ("a notification can have one SNS
+/// subscriber and up to 10 email subscribers, for a total of 11 subscribers" —
+/// `Notification`): the first entries are the SNS subscribers a set may hold, the rest
+/// are email. A `count` past the modelled `@length(1, 11)` total therefore overflows the
+/// total rather than a per-type half.
 fn subscribers(count: usize) -> Value {
+    // The catalog this helper spans is the model's own, so a third subscription type
+    // fails the suite rather than silently going untested.
+    assert_eq!(
+        SUBSCRIPTION_TYPE_VALUES,
+        &["EMAIL", "SNS"],
+        "the subscription-type catalog this helper spans changed: {SUBSCRIPTION_TYPE_VALUES:?}"
+    );
     let items: Vec<Value> = (0..count)
         .map(|index| {
-            let subscription_type = SUBSCRIPTION_TYPE_VALUES[index % SUBSCRIPTION_TYPE_VALUES.len()];
-            let address = if subscription_type == "EMAIL" {
-                format!("budget-ops+{index}@example.com")
+            if index < MAX_SNS_SUBSCRIBERS_PER_NOTIFICATION {
+                json!({
+                    "SubscriptionType": "SNS",
+                    "Address": format!("arn:aws:sns:us-east-1:123456789012:budget-topic-{index}")
+                })
             } else {
-                format!("arn:aws:sns:us-east-1:123456789012:budget-topic-{index}")
-            };
-            json!({"SubscriptionType": subscription_type, "Address": address})
+                json!({
+                    "SubscriptionType": "EMAIL",
+                    "Address": format!("budget-ops+{index}@example.com")
+                })
+            }
         })
         .collect();
     Value::Array(items)

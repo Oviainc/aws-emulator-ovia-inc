@@ -384,8 +384,8 @@ impl<E: std::error::Error + 'static> std::error::Error for Scaffolded<E> {
 
 /// Every `OperationError` method delegates to the modeled error, so wrapping an
 /// implemented operation's error channel changes NOTHING about how that error is
-/// rendered. Only the synthetic variant behaves differently — and it is the one that
-/// must answer 501.
+/// rendered. Only the synthetic variants behave differently — and they are the ones that
+/// must answer 501 and the front door's recorded statuses.
 impl<E: OperationError> OperationError for Scaffolded<E> {
     fn as_serializable(&self) -> &dyn SerializableStruct {
         match self {

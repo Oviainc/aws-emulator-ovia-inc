@@ -12,8 +12,17 @@
 //!
 //! The one thing a caller does create is a TERM GRANT: `GetTermForReport` mints the
 //! acceptance receipt (`termToken`) that `GetReport` requires, and that token is
-//! persisted here so `GetReport` can check it against the report and version it was
-//! issued for.
+//! persisted here so `GetReport` can check it against the TERM it was issued for. A
+//! grant is bound to the term document the caller accepted, not to the report it was
+//! requested through: every version of a report is governed by one term document, so a
+//! token minted for any report version governed by that document covers the others too,
+//! and a token minted under a different term document covers none of them.
+//!
+//! Every report and term DOCUMENT lives here as bytes beside the record it belongs to,
+//! so the URL `GetReport` and `GetTermForReport` announce resolves to a document this
+//! service actually holds: the data plane behind that URL ([`crate::service`]) reads the
+//! same [`Document`] this module seeded, and the URL names the endpoint the caller
+//! reached this emulator on ([`document_url_host`]) rather than a real AWS host.
 //!
 //! The other caller-owned record is the account's SETTINGS: `PutAccountSettings` writes
 //! the one `AccountSettings` record this store holds and `GetAccountSettings` reports it
@@ -59,11 +68,10 @@
 //!
 //! The CUSTOMER-AGREEMENT set is held the same way as the catalog, and for the same
 //! reason: the API has no operation that creates, accepts or terminates one — an
-//! account's agreements are
-//! established outside this API — so the set a caller can see is persisted state built by
-//! this struct's [`Default`], and `ListCustomerAgreements` only reads it. Unlike a report,
-//! a customer-agreement belongs to the calling identity's ACCOUNT, which is what its ARN
-//! and its `awsAccountId` name.
+//! account's agreements are established outside this API — so the set a caller can see is
+//! persisted state built by this struct's [`Default`], and `ListCustomerAgreements` only
+//! reads it. Unlike a report, a customer-agreement belongs to the calling identity's
+//! ACCOUNT, which is what its ARN and its `awsAccountId` name.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
@@ -81,12 +89,17 @@ use crate::ops::types::{
 /// read one from.
 pub const DEFAULT_REGION: &str = "us-east-1";
 
-/// The `resourceType` the modelled `ResourceNotFoundException` / `ConflictException`
-/// report for a report id or version that names nothing.
+/// The `resourceType` the modelled `ResourceNotFoundException` reports for a report
+/// version that names nothing.
 pub const REPORT_RESOURCE_TYPE: &str = "Report";
 
-/// The `resourceType` reported for a term grant that does not cover the request.
-pub const TERM_RESOURCE_TYPE: &str = "Term";
+/// This service's ONE invalid-token text, independent of the envelope it is stated in: a
+/// token (a `nextToken` or a `termToken`) this service did not issue, or one that does not
+/// cover the requested term, is refused with this fixed text, which neither names the
+/// check that rejected it nor echoes the token. The control plane states it as its
+/// modelled `ValidationException` and the document data plane as its own refusal, so one
+/// text covers both planes.
+pub const INVALID_TOKEN_MESSAGE: &str = "The provided token is invalid.";
 
 /// The largest page every paginated operation of this service serves, and the page size
 /// used when a request names no `maxResults`: every one of them takes its `maxResults`
@@ -125,6 +138,82 @@ pub const TERM_GRANT_CAPACITY: usize = 1_000;
 /// `ValidationExceptionReason`'s value for a pagination or term token the service did
 /// not issue.
 pub const REASON_INVALID_TOKEN: &str = "invalidToken";
+
+/// The first label of the host this service publishes its compliance-inquiry EXPORT URLs
+/// under (`<DOCUMENT_HOST>.<region>.amazonaws.com`, see [`inquiry_export_url`]). It names
+/// no service, which is why [`is_document_host`] exists: `crate::service` claims a request
+/// addressed to it, so a URL this service handed out routes back here.
+const DOCUMENT_HOST: &str = "artifact-documents";
+
+/// The host a REPORT or TERM document URL names when the request carries neither a `Host`
+/// header nor an authority to read the emulator's own endpoint from. A LOOPBACK literal:
+/// this emulator serves the document the URL names, so a caller that follows it must come
+/// back here.
+const LOOPBACK_HOST: &str = "127.0.0.1";
+
+/// The path prefix the document data plane serves, under this service's own endpoint.
+///
+/// It is not a modelled operation URI — every modelled one is `/v1/report/<verb>` — so a
+/// document fetch can never be mistaken for a control-plane call, and no control-plane
+/// call can be mistaken for a document fetch.
+pub const DOCUMENT_PATH_PREFIX: &str = "/v1/report/download";
+
+/// The path segment naming a REPORT document, the thing `GetReport` hands a URL for.
+pub const REPORT_DOCUMENT_KIND: &str = "report";
+
+/// The path segment naming a TERM document, the thing `GetTermForReport` hands a URL for.
+pub const TERM_DOCUMENT_KIND: &str = "term";
+
+/// One stored document: the bytes this service serves for it, and what it is served as.
+///
+/// A document is PERSISTED, not rendered per request: the report and term URLs
+/// `GetReport` and `GetTermForReport` announce resolve to the bytes held here, so two
+/// fetches of one URL serve the same document and a fetch changes nothing.
+#[derive(Debug, Clone)]
+pub struct Document {
+    /// The file name this document is published under — the last segment of its URL path.
+    pub object: String,
+    /// The `Content-Type` the data plane answers with, from the object's extension.
+    pub content_type: &'static str,
+    /// This document's IDENTITY: the SHA-256 of its bytes, hex-encoded.
+    ///
+    /// Two reports governed by the same term carry the same term document, and the term a
+    /// download grant covers is identified by this digest rather than by the file name the
+    /// document is published under — so the rule holds on content, not on a naming
+    /// discipline the catalog happens to keep.
+    pub digest: String,
+    /// The document itself.
+    pub bytes: Vec<u8>,
+}
+
+/// The `Content-Type` a published document's file name implies. The catalog publishes
+/// report documents as PDF and term documents as plain text; anything else is served as
+/// opaque bytes rather than mislabelled.
+fn content_type_of(object: &str) -> &'static str {
+    match object.rsplit_once('.').map(|(_, extension)| extension) {
+        Some("pdf") => "application/pdf",
+        Some("txt") => "text/plain",
+        _ => "application/octet-stream",
+    }
+}
+
+impl Document {
+    /// A document published as `object`, carrying `bytes`.
+    pub fn new(object: &str, bytes: Vec<u8>) -> Self {
+        let digest = {
+            use ::sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(&bytes);
+            ::hex::encode(hasher.finalize())
+        };
+        Self {
+            object: object.to_string(),
+            content_type: content_type_of(object),
+            digest,
+            bytes,
+        }
+    }
+}
 
 /// The `NotificationSubscriptionStatus` an account carries before any
 /// `PutAccountSettings` call.
@@ -262,11 +351,6 @@ pub const REVIEW_TYPE_AI: &str = "AI";
 /// could not be reported at all: the bound is the resource's, not just one request's.
 pub const TAGS_PER_RESOURCE_LIMIT: usize = 50;
 
-/// The host this emulator publishes report and term documents under. Nothing serves it;
-/// it is the stable location a document URL points at, built from the stored object
-/// path rather than from the request.
-const DOCUMENT_HOST: &str = "artifact-documents";
-
 /// The visibility of a report AWS publishes in the Artifact catalog: it is visible to
 /// every account, as opposed to a report scoped to one customer.
 pub const VISIBILITY_PUBLIC: &str = "PUBLIC";
@@ -296,6 +380,9 @@ pub struct ReportVersion {
     pub published_at: SystemTime,
     /// "Sequence number to enforce optimistic locking", `@range(min: 1)`.
     pub sequence_number: i64,
+    /// The report document THIS version publishes. Each version has its own: a version
+    /// is published because its document differs from the previous one's.
+    pub document: Document,
 }
 
 /// One AWS Artifact report: the members every version of it shares, plus its versions.
@@ -311,13 +398,17 @@ pub struct Report {
     /// One of `AcceptanceType`'s values: `EXPLICIT` requires click-through acceptance
     /// of the report's term, `PASSTHROUGH` does not.
     pub acceptance_type: String,
+    /// The TERM document governing this report: the thing a caller accepts to download
+    /// any version of it. One per report, not per version — which is why a term grant
+    /// minted through one version covers the others.
+    ///
+    /// The document carries its own published file name ([`Document::object`]), which is
+    /// what the term URL is built from, so the name is held once beside the bytes it
+    /// names rather than a second time on this record.
+    pub term: Document,
     /// Who can see this report — [`VISIBILITY_PUBLIC`] for everything AWS publishes in
     /// the catalog. Stored rather than assumed, so the projections report the record.
     pub visibility: String,
-    /// The file name of the report document, used to build its URL.
-    pub document_object: String,
-    /// The file name of the term document, used to build its URL.
-    pub term_object: String,
     /// Every published version, keyed by version number. A `BTreeMap` is what gives
     /// `ListReportVersions` the ascending total order its pagination token indexes into,
     /// and what makes "the latest version" the last entry.
@@ -467,17 +558,32 @@ impl CustomerAgreement {
     }
 }
 
-/// A term grant: the acceptance receipt `GetTermForReport` minted, and the report
-/// version it covers. `GetReport` serves a document only for a token it finds here
-/// whose report and version match the request.
+/// A term grant: the acceptance receipt `GetTermForReport` minted, and the TERM it
+/// covers.
+///
+/// The grant records the term document the caller accepted, because that is what the
+/// receipt is for: `GetReport` serves a document for a token whose term is the term
+/// governing the requested report, whichever report version the acceptance was
+/// requested through.
 #[derive(Debug, Clone)]
 pub struct TermGrant {
     /// The `termToken` handed to the caller. Matches `ShortStringAttribute`'s
     /// `^[a-zA-Z0-9_\-\s]*$` within 1..256 bytes, which is what `GetReport`'s
     /// `termToken` member admits.
     pub token: String,
+    /// The term document this acceptance covers, by its CONTENT digest — the grant's
+    /// subject. Identity is the document's own bytes, so two reports governed by the same
+    /// term share one grant and two different terms never do, whatever file names the
+    /// catalog publishes them under.
+    pub term_digest: String,
+    /// The report version the acceptance was requested through, kept so an acceptance can
+    /// be told apart from another acceptance of the same term in the store. It is NOT
+    /// what the grant authorises — the term above is — and no check reads it.
     pub report_id: String,
     pub report_version: i64,
+    /// When the acceptance was recorded. Grants are released by [`TERM_GRANT_CAPACITY`]
+    /// rather than by age, so nothing expires on this: it is the record of when the
+    /// caller accepted.
     pub issued_at: SystemTime,
 }
 
@@ -1219,6 +1325,9 @@ impl ComAmazonawsArtifactArtifactState {
 
     /// Mint and persist a term grant for one report version, returning its token.
     ///
+    /// The grant covers the TERM document governing `report`, so the token it returns
+    /// authorises every version of every report that document governs.
+    ///
     /// The counter advances on every call and the loop skips a token the store already
     /// holds, so no OUTSTANDING grant ever shares a token with another — which is what
     /// makes a grant the receipt for one acceptance. (Short of the counter's wrap, which
@@ -1229,7 +1338,7 @@ impl ComAmazonawsArtifactArtifactState {
     /// so a caller accepting terms in a loop cannot grow this map without end.
     pub fn mint_term_grant(
         &mut self,
-        report_id: &str,
+        report: &Report,
         report_version: i64,
         now: SystemTime,
     ) -> String {
@@ -1249,12 +1358,41 @@ impl ComAmazonawsArtifactArtifactState {
             token.clone(),
             TermGrant {
                 token: token.clone(),
-                report_id: report_id.to_string(),
+                term_digest: report.term.digest.clone(),
+                report_id: report.id.clone(),
                 report_version,
                 issued_at: now,
             },
         );
         token
+    }
+
+    /// Whether `token` is a grant this service issued that covers `report`'s term.
+    ///
+    /// The one place the term-token rule is decided, so `GetReport` and the document
+    /// data plane cannot disagree about which token downloads which document. A term is
+    /// identified by its document's CONTENT digest: the same term text, published for two
+    /// reports, is one term, and two different texts are two terms whatever they are
+    /// named.
+    pub fn grant_covers(&self, token: &str, report: &Report) -> bool {
+        self.term_tokens
+            .get(token)
+            .is_some_and(|grant| grant.term_digest == report.term.digest)
+    }
+
+    /// The stored document a data-plane path names, when this service holds it: the
+    /// report document of one version, or the term document governing that report.
+    ///
+    /// A pure read — the data plane serves what [`Default`] seeded and never writes.
+    pub fn document(&self, kind: &str, report_id: &str, version: i64) -> Option<&Document> {
+        let report = self.reports.get(report_id)?;
+        match kind {
+            REPORT_DOCUMENT_KIND => report.versions.get(&version).map(|held| &held.document),
+            // A term document is the report's, so it is served under any version the
+            // report published — and under none it did not.
+            TERM_DOCUMENT_KIND => report.versions.get(&version).map(|_| &report.term),
+            _ => None,
+        }
     }
 
     /// The taggable resource `arn` names, for a WRITE to its tag set, or `None` when this
@@ -1377,41 +1515,107 @@ pub fn agreement_arn(agreement_id: &str) -> String {
     format!("arn:aws:artifact:::agreement/{agreement_id}")
 }
 
+/// The path a stored document is published at: its kind, the report version it belongs
+/// to, and the document's own file name. Built from the STORED record, never from the
+/// request, so the URL names where the document is rather than what was asked for.
+pub fn document_path(kind: &str, report_id: &str, version: i64, object: &str) -> String {
+    format!("{DOCUMENT_PATH_PREFIX}/{kind}/{report_id}/v{version}/{object}")
+}
+
 /// The URL a caller downloads a stored document from.
 ///
-/// `kind` is `report` or `term`, and `object` the stored file name, so the path is the
-/// document's own location. The token the grant was issued under is carried as a query
-/// parameter: it is the receipt that authorises the download, and it is what makes two
-/// acceptances of the same report yield two distinct URLs. NO SigV4 signature is
-/// attached — this emulator does not sign documents, and a fabricated signature would
-/// claim a computation nothing performed.
+/// `host` is the endpoint the CALLER reached this emulator on (see [`document_url_host`])
+/// and the path is the document's own, so the announced URL resolves: a GET of it comes
+/// back to this service's document data plane, which serves the stored bytes. It names
+/// the caller's own endpoint rather than a host of this service's choosing — this
+/// emulator holds the document, so a client or test that follows the URL must come back
+/// here.
+///
+/// The token the grant was issued under is carried as a query parameter: it is the receipt
+/// that authorises the download, and it is what makes two acceptances of the same report
+/// yield two distinct URLs. It is PERCENT-ENCODED on the way in, so the announced URL is
+/// well formed for every token `TermToken`'s `^[a-zA-Z0-9_\-\s]*$` admits (a space among
+/// them) rather than only for the ones [`mint_term_grant`](
+/// ComAmazonawsArtifactArtifactState::mint_term_grant) happens to produce; the data plane
+/// reads it back through the framework's query decoder, which undoes exactly this.
+///
+/// NO SigV4 signature is attached — this emulator does not sign documents, and a
+/// fabricated signature would claim a computation nothing performed.
 fn document_url(
-    region: &str,
+    host: &str,
     kind: &str,
     report_id: &str,
     version: i64,
     object: &str,
     term_token: &str,
 ) -> String {
-    format!(
-        "https://{DOCUMENT_HOST}.{region}.amazonaws.com/{kind}/{report_id}/v{version}/{object}\
-         ?termToken={term_token}"
-    )
+    let path = document_path(kind, report_id, version, object);
+    let token = ::percent_encoding::utf8_percent_encode(term_token, QUERY_VALUE);
+    format!("https://{host}{path}?termToken={token}")
+}
+
+/// What a query-string VALUE must escape: everything but RFC 3986's unreserved set
+/// (`ALPHA / DIGIT / "-" / "." / "_" / "~"`), so a value carrying a space, an `&` or a
+/// `=` cannot be read as the end of the parameter.
+const QUERY_VALUE: &::percent_encoding::AsciiSet = &::percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
+
+/// The endpoint the request reached this emulator on, as a REPORT or TERM document URL
+/// names it: the request's own `Host`, else the authority its URI carries, else
+/// [`LOOPBACK_HOST`].
+///
+/// Read from the request rather than built from the model's endpoint template, because
+/// the URL has to resolve for whoever was handed it — a client addressing the emulator by
+/// socket is handed that socket.
+///
+/// The value is a value the CALLER chose, and it is interpolated into a URL this service
+/// announces, so only a BARE AUTHORITY is honoured: anything else is not an endpoint, and
+/// the loopback literal is announced instead of reflecting it. (`crate::service`'s own
+/// `request_host` reads the same two sources without that filter, because recognising the
+/// published export host is all it has to do.)
+pub fn document_url_host(parts: &::http::request::Parts) -> String {
+    parts
+        .headers
+        .get(::http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        // The URI's AUTHORITY, not its host: a request that carries its endpoint on the
+        // URI (HTTP/2, or an SDK-built absolute form) carries the PORT there too, and a
+        // URL announced without the port would not resolve back to the socket the caller
+        // reached.
+        .or_else(|| parts.uri.authority().map(::http::uri::Authority::as_str))
+        .filter(|candidate| is_bare_authority(candidate))
+        .unwrap_or(LOOPBACK_HOST)
+        .to_string()
+}
+
+/// True when `value` is a bare authority: a host with an optional port and nothing else.
+///
+/// A path, query, fragment, userinfo or space makes it something other than an endpoint —
+/// a URL built around it would not resolve back to this emulator — so the parse is
+/// `::http::uri::Authority`'s, with those separators refused first because an authority
+/// accepts userinfo.
+fn is_bare_authority(value: &str) -> bool {
+    !value.is_empty()
+        && !value.contains(['/', '?', '#', '@', '\\', ' ', '\t'])
+        && value.parse::<::http::uri::Authority>().is_ok()
 }
 
 /// The URL of the report document for one version, under the grant `term_token`.
 pub fn report_document_url(
-    region: &str,
+    host: &str,
     report: &Report,
-    version: i64,
+    version: &ReportVersion,
     term_token: &str,
 ) -> String {
     document_url(
-        region,
-        "report",
+        host,
+        REPORT_DOCUMENT_KIND,
         &report.id,
-        version,
-        &report.document_object,
+        version.version,
+        &version.document.object,
         term_token,
     )
 }
@@ -1430,14 +1634,14 @@ pub fn inquiry_export_url(region: &str, inquiry_id: &str, export_id: &str) -> St
     )
 }
 
-/// The URL of the term document for one version, under the grant `term_token`.
-pub fn term_document_url(region: &str, report: &Report, version: i64, term_token: &str) -> String {
+/// The URL of the term document governing `report`, under the grant `term_token`.
+pub fn term_document_url(host: &str, report: &Report, version: i64, term_token: &str) -> String {
     document_url(
-        region,
-        "term",
+        host,
+        TERM_DOCUMENT_KIND,
         &report.id,
         version,
-        &report.term_object,
+        &report.term.object,
         term_token,
     )
 }
@@ -1491,22 +1695,19 @@ pub fn is_customer_agreement_id(value: &str) -> bool {
     is_id_shaped(value, "customer-agreement-")
 }
 
-/// True when `value` is `prefix` followed by 16 alphanumerics — the shape every
-/// `<resource>-[a-zA-Z0-9]{16}` id attribute in this model declares.
-fn is_id_shaped(value: &str, prefix: &str) -> bool {
-    let Some(suffix) = value.strip_prefix(prefix) else {
-        return false;
-    };
-    suffix.len() == 16 && suffix.bytes().all(|b| b.is_ascii_alphanumeric())
-}
-
 /// True when `value` satisfies `InquiryId`'s `^compliance-inquiry-[a-zA-Z0-9]{16}$` —
 /// the id of a compliance inquiry, as every `complianceInquiryId` member targets one.
 ///
 /// Spelled the same way as [`is_report_id`], and for the same caller: the front door
 /// judges the target of a request before the boundary validator sees the member.
 pub fn is_inquiry_id(value: &str) -> bool {
-    let Some(suffix) = value.strip_prefix("compliance-inquiry-") else {
+    is_id_shaped(value, "compliance-inquiry-")
+}
+
+/// True when `value` is `prefix` followed by 16 alphanumerics — the shape every
+/// `<resource>-[a-zA-Z0-9]{16}` id attribute in this model declares.
+fn is_id_shaped(value: &str, prefix: &str) -> bool {
+    let Some(suffix) = value.strip_prefix(prefix) else {
         return false;
     };
     suffix.len() == 16 && suffix.bytes().all(|b| b.is_ascii_alphanumeric())
@@ -1705,19 +1906,19 @@ pub fn parse_inquiries_page_token(token: &str) -> Option<usize> {
     decode_position(INQUIRIES_CURSOR, None, token)
 }
 
-/// The `ResourceNotFoundException` payload for a report id the catalog does not hold.
-pub fn report_not_found(report_id: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: format!("Report {report_id} not found"),
-        resource_id: report_id.to_string(),
-        resource_type: REPORT_RESOURCE_TYPE.to_string(),
-    }
-}
-
 /// The `ResourceNotFoundException` payload for a version the named report never had.
-pub fn report_version_not_found(report_id: &str, version: i64) -> ResourceNotFoundException {
+///
+/// A report the catalog does not hold is NOT this error: the front door refuses that
+/// call before the catalog is consulted (see [`crate::scaffolded::Scaffolded`]). This
+/// error is for a report that IS visible and simply never published the version asked
+/// for — or, when the request named no version, never published any at all.
+pub fn report_version_not_found(report_id: &str, version: Option<i64>) -> ResourceNotFoundException {
+    let message = match version {
+        Some(version) => format!("Report {report_id} has no version {version}"),
+        None => format!("Report {report_id} has no published version"),
+    };
     ResourceNotFoundException {
-        message: format!("Report {report_id} has no version {version}"),
+        message,
         resource_id: report_id.to_string(),
         resource_type: REPORT_RESOURCE_TYPE.to_string(),
     }
@@ -1875,11 +2076,6 @@ pub fn unknown_query_identifier_clause(member: &str) -> String {
 pub const UNKNOWN_QUERY_IDENTIFIER_REQUIREMENT: &str =
     "every query identifier must name a query of the compliance inquiry";
 
-/// The `ValidationException` message every token refusal in this service states: a token
-/// (a `nextToken` or a `termToken`) this service did not issue is refused with this one
-/// fixed text, which neither names the check that rejected it nor echoes the token.
-pub const INVALID_TOKEN_MESSAGE: &str = "The provided token is invalid.";
-
 /// The `ValidationException` message this service states for a request the boundary
 /// validator refused against the model's own constraints.
 ///
@@ -1919,19 +2115,6 @@ fn clause_without_rejected_value(violation: &Violation) -> String {
     match rendered.strip_prefix(&format!("Value '{shown}' at ")) {
         Some(rest) => format!("Value at {rest}"),
         None => rendered,
-    }
-}
-
-/// The modelled `ConflictException` for a term grant that exists but covers a different
-/// report version than the one requested.
-pub fn grant_does_not_cover(token: &str, grant: &TermGrant) -> ConflictException {
-    ConflictException {
-        message: format!(
-            "the term token was accepted for {} version {}, not for the requested report version",
-            grant.report_id, grant.report_version
-        ),
-        resource_id: token.to_string(),
-        resource_type: TERM_RESOURCE_TYPE.to_string(),
     }
 }
 
@@ -2111,7 +2294,12 @@ struct SeedReport {
     series: &'static str,
     category: &'static str,
     acceptance_type: &'static str,
+    /// The file name each version's report document is published under. The version
+    /// lives in the document's PATH, so two versions of one report publish the same
+    /// file name and different documents.
     document_object: &'static str,
+    /// The file name of the TERM document governing this report, which is also the
+    /// term's identity: a grant minted under it covers every report it governs.
     term_object: &'static str,
     versions: &'static [SeedVersion],
 }
@@ -2151,6 +2339,11 @@ const PRODUCT_NAME: &str = "AWS";
 /// Every value satisfies the member's modelled constraints — `id` matches `ReportId`'s
 /// `^report-[a-zA-Z0-9]{16}$`, and `name`, `series` and `category` match
 /// `ShortStringAttribute`'s `^[a-zA-Z0-9_\-\s]*$`.
+///
+/// Each report publishes its OWN term document, so a term grant minted for one report
+/// covers every version of that report and no other report here. (Nothing in the rule
+/// requires that: were two reports to share a term document, one acceptance would cover
+/// both, which is what makes the grant a receipt for the TERM.)
 const SEED: &[SeedReport] = &[
     SeedReport {
         id: "report-073F0fUCdVVNKJrF",
@@ -2576,6 +2769,7 @@ fn seed_catalog() -> BTreeMap<String, Report> {
     SEED.iter()
         .map(|seed| {
             let report = Report {
+                term: Document::new(seed.term_object, term_document(seed).into_bytes()),
                 id: seed.id.to_string(),
                 name: seed.name.to_string(),
                 series: seed.series.to_string(),
@@ -2586,8 +2780,6 @@ fn seed_catalog() -> BTreeMap<String, Report> {
                 // Every report AWS publishes in the Artifact catalog is visible to every
                 // account; a report scoped to one customer is not part of this catalog.
                 visibility: VISIBILITY_PUBLIC.to_string(),
-                document_object: seed.document_object.to_string(),
-                term_object: seed.term_object.to_string(),
                 versions: seed
                     .versions
                     .iter()
@@ -2604,6 +2796,10 @@ fn seed_catalog() -> BTreeMap<String, Report> {
                                 period_end: at(version.period_end),
                                 published_at: at(version.published_at),
                                 sequence_number: version.sequence_number,
+                                document: Document::new(
+                                    seed.document_object,
+                                    report_document(seed, version),
+                                ),
                             },
                         )
                     })
@@ -2612,6 +2808,102 @@ fn seed_catalog() -> BTreeMap<String, Report> {
             (report.id.clone(), report)
         })
         .collect()
+}
+
+/// The term document governing one seeded report.
+///
+/// Plain text, and it says what it is: the real AWS Artifact term text is AWS's, so this
+/// document states the acceptance the emulator records rather than inventing an
+/// agreement. Accepting it through `GetTermForReport` is what mints the `termToken`
+/// `GetReport` requires.
+fn term_document(seed: &SeedReport) -> String {
+    format!(
+        "AWS Artifact term document for {name} ({series})\n\
+         \n\
+         Acceptance type: {acceptance_type}\n\
+         Term document: {object}\n\
+         \n\
+         This term document is published by the AWS Artifact emulator. Accepting it with\n\
+         GetTermForReport mints the termToken that GetReport requires to serve any\n\
+         version of a report this term governs. It is not the text of AWS's own\n\
+         agreement.\n",
+        name = seed.name,
+        series = seed.series,
+        acceptance_type = seed.acceptance_type,
+        object = seed.term_object,
+    )
+}
+
+/// The report document one published version carries: a one-page PDF naming the report,
+/// the version and the period it covers.
+///
+/// The bytes are written by the `pdf-writer` crate, so what the data plane serves is a
+/// document a PDF reader opens rather than bytes shaped like one. What the page SAYS is
+/// the stored record — an AWS Artifact report's real contents are AWS's, and nothing
+/// here invents them.
+fn report_document(seed: &SeedReport, version: &SeedVersion) -> Vec<u8> {
+    pdf_page(&[
+        format!("{} - version {}", seed.name, version.version),
+        String::new(),
+        format!("Report id: {}", seed.id),
+        format!("Series: {}  Category: {}", seed.series, seed.category),
+        format!("Description: {}", version.description),
+        format!(
+            "Reporting period: {} to {} (seconds since the Unix epoch)",
+            version.period_start, version.period_end
+        ),
+        String::new(),
+        "Published by the AWS Artifact emulator. The contents of the real report are".to_string(),
+        "AWS's own and are not reproduced here.".to_string(),
+    ])
+}
+
+/// A one-page PDF document showing `lines`, one per line, in the Base-14 Helvetica face
+/// every PDF reader carries (so nothing is embedded and the document stands alone).
+fn pdf_page(lines: &[String]) -> Vec<u8> {
+    use pdf_writer::{Content, Finish, Name, Pdf, Rect, Ref, Str};
+
+    // The ISO 216 A4 page box in PDF points (1/72 inch), the size AWS Artifact publishes
+    // its reports at.
+    let a4 = Rect::new(0.0, 0.0, 595.28, 841.89);
+    /// Point size of the body text, and the baseline-to-baseline distance that goes with
+    /// it.
+    const FONT_SIZE: f32 = 11.0;
+    /// See [`FONT_SIZE`].
+    const LEADING: f32 = 15.0;
+
+    let catalog_id = Ref::new(1);
+    let page_tree_id = Ref::new(2);
+    let page_id = Ref::new(3);
+    let font_id = Ref::new(4);
+    let content_id = Ref::new(5);
+    let font_name = Name(b"F1");
+
+    let mut content = Content::new();
+    content.begin_text();
+    content.set_font(font_name, FONT_SIZE);
+    // The first move is from the page origin to the top-left text start; every later one
+    // steps down one line.
+    content.next_line(56.0, 785.0);
+    for line in lines {
+        content.show(Str(line.as_bytes()));
+        content.next_line(0.0, -LEADING);
+    }
+    content.end_text();
+    let content = content.finish();
+
+    let mut pdf = Pdf::new();
+    pdf.catalog(catalog_id).pages(page_tree_id);
+    pdf.pages(page_tree_id).kids([page_id]).count(1);
+    let mut page = pdf.page(page_id);
+    page.parent(page_tree_id);
+    page.media_box(a4);
+    page.contents(content_id);
+    page.resources().fonts().pair(font_name, font_id);
+    page.finish();
+    pdf.type1_font(font_id).base_font(Name(b"Helvetica"));
+    pdf.stream(content_id, &content);
+    pdf.finish()
 }
 
 // ---------------------------------------------------------------------------

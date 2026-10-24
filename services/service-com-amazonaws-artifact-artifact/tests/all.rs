@@ -27,6 +27,10 @@ mod compliance_inquiry_name_projection;
 mod compliance_inquiry_queries;
 #[path = "all/customer_agreements.rs"]
 mod customer_agreements;
+#[path = "all/document_data_plane.rs"]
+mod document_data_plane;
+#[path = "all/front_door.rs"]
+mod front_door;
 #[path = "all/front_door_errors.rs"]
 mod front_door_errors;
 #[path = "all/harness.rs"]

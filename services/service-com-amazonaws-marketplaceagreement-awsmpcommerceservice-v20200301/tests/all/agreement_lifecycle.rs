@@ -60,6 +60,18 @@ fn is_resource_id(value: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '/' | '-'))
 }
 
+/// Whether `value` is money as this service reports it: decimal units, a point
+/// and exactly two minor digits. What the amounts ARE is pinned in
+/// `tests/all/charge_amounts.rs`; here an amount only has to be money.
+fn is_amount(value: &str) -> bool {
+    value.split_once('.').is_some_and(|(units, minor)| {
+        !units.is_empty()
+            && units.chars().all(|digit| digit.is_ascii_digit())
+            && minor.len() == 2
+            && minor.chars().all(|digit| digit.is_ascii_digit())
+    })
+}
+
 /// `NextToken`'s `^[a-zA-Z0-9+/=_-]+$` and `@length(max: 8192)`.
 pub(crate) fn is_next_token(value: &str) -> bool {
     !value.is_empty()
@@ -186,7 +198,10 @@ pub(crate) fn term(id: &str) -> Value {
 
 /// A requested term configuring a prepaid purchase, with the dimensions and
 /// quantities the acceptor asked for.
-fn upfront_term(id: &str, selector: &str, dimensions: &[(&str, i32)]) -> Value {
+///
+/// `pub(crate)` because the `charge_amounts` suite prices the same configured
+/// terms rather than spelling a second copy of the request shape.
+pub(crate) fn upfront_term(id: &str, selector: &str, dimensions: &[(&str, i32)]) -> Value {
     let dimensions: Vec<Value> = dimensions
         .iter()
         .map(|(key, value)| json!({"dimensionKey": key, "dimensionValue": value}))
@@ -302,9 +317,12 @@ struct Quote {
     timings: Vec<&'static str>,
     /// `ItemizedCharge` `dimensionKey` / `newQuantity` pairs.
     itemized: Vec<(&'static str, i64)>,
-    /// `ChargeSummary$newAgreementValue`, absent when a term commits the
-    /// acceptor to an amount the proposal's rate card prices.
-    agreement_value: Option<&'static str>,
+    /// Whether any requested term commits the acceptor to an amount. A quote
+    /// over terms that commit nothing carries
+    /// `ChargeSummary$newAgreementValue`'s documented `0`; one over terms that
+    /// commit something carries the total the proposal's rate card prices them
+    /// at, which `tests/all/charge_amounts.rs` pins.
+    commits: bool,
 }
 
 /// `CreateAgreementRequest` computes its `chargeSummary` from the terms it was
@@ -324,21 +342,21 @@ async fn a_quote_is_computed_from_the_terms_it_was_asked_for() {
             terms: vec![term("eula.v1")],
             timings: vec![],
             itemized: vec![],
-            agreement_value: Some("0"),
+            commits: false,
         },
         Quote {
             case: "a usage-based term is charged each billing period",
             terms: vec![term("UsageBasedPricingTerm")],
             timings: vec!["BILLING_PERIOD"],
             itemized: vec![],
-            agreement_value: Some("0"),
+            commits: false,
         },
         Quote {
             case: "a fixed upfront term is charged on acceptance",
             terms: vec![term("FixedUpfrontPricingTerm")],
             timings: vec!["ON_ACCEPTANCE"],
             itemized: vec![],
-            agreement_value: None,
+            commits: true,
         },
         Quote {
             case: "a configured upfront term itemizes every dimension it buys",
@@ -349,21 +367,21 @@ async fn a_quote_is_computed_from_the_terms_it_was_asked_for() {
             )],
             timings: vec!["ON_ACCEPTANCE"],
             itemized: vec![("Users", 10), ("Admins", 2)],
-            agreement_value: None,
+            commits: true,
         },
         Quote {
             case: "an auto-renewal choice is not a charge",
             terms: vec![renewal_term("renew-1", true)],
             timings: vec![],
             itemized: vec![],
-            agreement_value: Some("0"),
+            commits: false,
         },
         Quote {
             case: "a variable payment term is charged at a future date",
             terms: vec![variable_payment_term("vpt-1")],
             timings: vec!["SCHEDULED"],
             itemized: vec![],
-            agreement_value: Some("0"),
+            commits: false,
         },
         Quote {
             case: "several terms, each charged the way its own kind is",
@@ -374,7 +392,7 @@ async fn a_quote_is_computed_from_the_terms_it_was_asked_for() {
             ],
             timings: vec!["SCHEDULED", "BILLING_PERIOD"],
             itemized: vec![],
-            agreement_value: None,
+            commits: true,
         },
         Quote {
             case: "two configured upfront terms, one dimension each",
@@ -384,7 +402,7 @@ async fn a_quote_is_computed_from_the_terms_it_was_asked_for() {
             ],
             timings: vec!["ON_ACCEPTANCE", "ON_ACCEPTANCE"],
             itemized: vec![("Users", 1), ("Storage", 500)],
-            agreement_value: None,
+            commits: true,
         },
     ];
 
@@ -428,11 +446,13 @@ async fn a_quote_is_computed_from_the_terms_it_was_asked_for() {
                     "case {:?}: an expected charge needs a ResourceId, got {id:?}",
                     case.case
                 );
-                assert!(
-                    charge["amount"].is_null(),
-                    "case {:?}: no rate card is known, so no amount may be reported: {charge:?}",
-                    case.case
-                );
+                if let Some(amount) = charge["amount"].as_str() {
+                    assert!(
+                        is_amount(amount),
+                        "case {:?}: a charge is priced in money, got {amount:?}",
+                        case.case
+                    );
+                }
                 id
             })
             .collect();
@@ -481,14 +501,21 @@ async fn a_quote_is_computed_from_the_terms_it_was_asked_for() {
             );
         }
 
-        assert_eq!(
-            summary["newAgreementValue"].as_str(),
-            case.agreement_value,
-            "case {:?}: expected newAgreementValue {:?}, got {:?}",
-            case.case,
-            case.agreement_value,
-            summary
-        );
+        let value = summary["newAgreementValue"].as_str().unwrap_or_default();
+        if case.commits {
+            assert!(
+                is_amount(value) && value != "0.00",
+                "case {:?}: the terms commit an amount, so the quote carries its total, got {:?}",
+                case.case,
+                summary
+            );
+        } else {
+            assert_eq!(
+                value, "0",
+                "case {:?}: terms that commit nothing are worth 0, got {:?}",
+                case.case, summary
+            );
+        }
     }
 }
 
@@ -767,6 +794,10 @@ async fn an_amendment_is_quoted_against_the_source_agreements_quantities() {
 /// proposal and the estimated charges all come from what the accept stored.
 #[tokio::test]
 async fn an_accepted_request_is_described_from_what_was_stored() {
+    // The third element is `EstimatedCharges$agreementValue` where the model
+    // states it outright — the documented `0` for terms that commit nothing —
+    // and `None` where the value is whatever the quote priced the terms at,
+    // which the describe is checked against either way.
     let cases = vec![
         (
             "a legal term only, so nothing is committed",
@@ -867,10 +898,19 @@ async fn an_accepted_request_is_described_from_what_was_stored() {
              got {body:?}"
         );
         assert_eq!(
-            described.body["estimatedCharges"]["agreementValue"].as_str(),
-            agreement_value,
-            "case {case:?}: expected agreementValue {agreement_value:?}, got {body:?}"
+            described.body["estimatedCharges"]["agreementValue"],
+            created.body["chargeSummary"]["newAgreementValue"],
+            "case {case:?}: the agreement is worth what its own quote calculated ({:?}), got \
+             {body:?}",
+            created.body["chargeSummary"]["newAgreementValue"]
         );
+        if let Some(agreement_value) = agreement_value {
+            assert_eq!(
+                described.body["estimatedCharges"]["agreementValue"].as_str(),
+                Some(agreement_value),
+                "case {case:?}: expected agreementValue {agreement_value:?}, got {body:?}"
+            );
+        }
 
         // The quote is spent: a second accept would mint a second agreement
         // from it.
