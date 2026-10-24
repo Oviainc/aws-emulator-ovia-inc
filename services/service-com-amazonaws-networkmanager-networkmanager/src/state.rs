@@ -6,7 +6,9 @@
 //! Manager: a global network owns sites, a site owns links, and a global network owns
 //! devices (each optionally assigned to one of its sites). A device and a link that sit at
 //! the same site can be tied together by a LINK ASSOCIATION, which has no id of its own
-//! and is therefore keyed by that pair. A global network also owns its
+//! and is therefore keyed by that pair. Two devices of one global network can instead be
+//! tied together by a CONNECTION, which unlike that association IS a resource of its own,
+//! with an id, an ARN and tags. A global network also owns its
 //! CORE network — the Cloud WAN managed network
 //! whose segments and edges are a function of the core network policy document it holds.
 //! A core network in turn owns its ATTACHMENTS: each joins one resource to ONE of the
@@ -16,8 +18,8 @@
 //! network — which segment or network function group it joins, and whether its attachment
 //! request has to be ACCEPTED first, which is what holds it in
 //! `PENDING_ATTACHMENT_ACCEPTANCE` until `AcceptAttachment` grants that acceptance.
-//! Beside that tree a global network holds the CONNECTIONS registered with it (a Connect
-//! peer of either kind, a VPN connection), whose session health is what
+//! Beside that tree a global network holds the telemetry-bearing connections registered
+//! with it (a Connect peer of either kind, a VPN connection), whose session health is what
 //! `GetNetworkTelemetry` reports.
 //! Everything
 //! the implemented operations answer is computed from the records below — no handler
@@ -28,7 +30,7 @@ use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AWSLocation, AccountStatus, Attachment, Bandwidth, ConnectAttachment, ConnectAttachmentOptions,
-    ConnectionHealth, CoreNetwork, CoreNetworkEdge, CoreNetworkNetworkFunctionGroup,
+    Connection, ConnectionHealth, CoreNetwork, CoreNetworkEdge, CoreNetworkNetworkFunctionGroup,
     CoreNetworkPolicyError, CoreNetworkPolicyException, CoreNetworkSegment, Device, GlobalNetwork,
     Link, LinkAssociation, Location, NetworkTelemetry, OrganizationStatus,
     ResourceNotFoundException, Site, Tag, ValidationException, ValidationExceptionField,
@@ -76,6 +78,12 @@ pub const SITE_KIND: &str = "site";
 pub const LINK_KIND: &str = "link";
 /// See [`GLOBAL_NETWORK_KIND`].
 pub const DEVICE_KIND: &str = "device";
+/// See [`GLOBAL_NETWORK_KIND`]. A connection hangs off the global network and ties two of
+/// its devices together ("Creates a connection between two devices", `smithy_query
+/// query="doc" shape="CreateConnection"`), so one name serves the id prefix
+/// (`connection-<hex>`), the ARN resource type (`connection/<id>`) and the `connection`
+/// entry of [`NETWORK_RESOURCE_TYPES`].
+pub const CONNECTION_KIND: &str = "connection";
 /// The resource kind a link ASSOCIATION reports in a refusal that names it.
 ///
 /// Unlike the kinds above this one is not an ARN resource type and no id is minted for
@@ -128,6 +136,9 @@ pub const LIMIT_DEVICES_PER_GLOBAL_NETWORK: &str = "devices-per-global-network";
 /// See [`LIMIT_GLOBAL_NETWORKS_PER_ACCOUNT`]; the quota
 /// [`MAX_CORE_NETWORKS_PER_GLOBAL_NETWORK`] bounds.
 pub const LIMIT_CORE_NETWORKS_PER_GLOBAL_NETWORK: &str = "core-networks-per-global-network";
+/// See [`LIMIT_GLOBAL_NETWORKS_PER_ACCOUNT`]; the quota
+/// [`MAX_CONNECTIONS_PER_GLOBAL_NETWORK`] bounds.
+pub const LIMIT_CONNECTIONS_PER_GLOBAL_NETWORK: &str = "connections-per-global-network";
 /// See [`LIMIT_GLOBAL_NETWORKS_PER_ACCOUNT`]; the quota [`MAX_TAGS_PER_RESOURCE`] bounds.
 pub const LIMIT_TAGS_PER_RESOURCE: &str = "tags-per-resource";
 
@@ -178,6 +189,15 @@ pub const FIELD_EDGE_LOCATION: &str = "edgeLocation";
 pub const FIELD_VPC_ARN: &str = "vpcArn";
 /// See [`FIELD_CORE_NETWORK_ID`].
 pub const FIELD_SUBNET_ARNS: &str = "subnetArns";
+/// See [`FIELD_GLOBAL_NETWORK_ID`]: the same lowerCamelCase spelling of the request
+/// member, for the device and link references a connection carries.
+pub const FIELD_DEVICE_ID: &str = "deviceId";
+/// See [`FIELD_DEVICE_ID`].
+pub const FIELD_CONNECTED_DEVICE_ID: &str = "connectedDeviceId";
+/// See [`FIELD_DEVICE_ID`].
+pub const FIELD_LINK_ID: &str = "linkId";
+/// See [`FIELD_DEVICE_ID`].
+pub const FIELD_CONNECTED_LINK_ID: &str = "connectedLinkId";
 
 /// How a resource kind of this service reads in prose: the ARN resource type
 /// ([`GLOBAL_NETWORK_KIND`] and friends) with its hyphens as spaces and a leading
@@ -415,6 +435,10 @@ pub const MAX_LINKS_PER_SITE: usize = 100;
 /// [`MAX_SITES_PER_GLOBAL_NETWORK`]: the model carries no number and the published quota
 /// is per-account adjustable, so this one only bounds the store.
 pub const MAX_DEVICES_PER_GLOBAL_NETWORK: usize = 100;
+/// How many connections one global network may hold. CHOSEN for the same reason as
+/// [`MAX_SITES_PER_GLOBAL_NETWORK`]: the model carries no number and the published quota
+/// is per-account adjustable, so this one only bounds the store.
+pub const MAX_CONNECTIONS_PER_GLOBAL_NETWORK: usize = 100;
 
 /// The documented maximum length, in characters, of a device's `Vendor`, `Model` and
 /// `SerialNumber`: "Constraints: Maximum length of 128 characters" on each of the three
@@ -722,6 +746,71 @@ impl LinkAssociationRecord {
 /// in a not-found refusal, where no single resource id would.
 pub fn link_association_key(device_id: &str, link_id: &str) -> String {
     format!("{device_id}/{link_id}")
+}
+
+/// A stored connection: the tie between two devices of one global network.
+///
+/// "Creates a connection between two devices" (`smithy_query query="doc"
+/// shape="CreateConnection"`), so a connection hangs off the GLOBAL NETWORK and names two
+/// of its devices; the two link members are optional, each naming the link that device
+/// reaches the connection over. Unlike a link association this one IS a resource: it has
+/// an id, an ARN and tags of its own. Like every record above, its state is a function of
+/// the clock rather than a field, so reading one never writes.
+#[derive(Debug, Clone)]
+pub struct ConnectionRecord {
+    pub id: String,
+    pub arn: String,
+    pub global_network_id: String,
+    /// The first device in the connection.
+    pub device_id: String,
+    /// The second device in the connection.
+    pub connected_device_id: String,
+    /// The link the first device reaches the connection over, when the request named one.
+    pub link_id: Option<String>,
+    /// The link the second device reaches the connection over, when the request named one.
+    pub connected_link_id: Option<String>,
+    pub description: Option<String>,
+    pub created_at: SystemTime,
+    /// The instant the `PENDING` -> `AVAILABLE` transition the clock owes becomes due.
+    pub available_at: SystemTime,
+    pub tags: Vec<Tag>,
+}
+
+impl ConnectionRecord {
+    /// This connection's lifecycle state as of `now`. `ConnectionState` carries the same
+    /// four values as the enums above (`smithy_query shape=ConnectionState`: PENDING,
+    /// AVAILABLE, DELETING, UPDATING, mirrored in `ops::types::CONNECTION_STATE_VALUES`),
+    /// so a connection waits in [`STATE_PENDING`] too.
+    pub fn state_at(&self, now: SystemTime) -> &'static str {
+        if now >= self.available_at {
+            STATE_AVAILABLE
+        } else {
+            STATE_PENDING
+        }
+    }
+
+    /// The modelled `Connection` for this record, as of `now`.
+    pub fn to_shape(&self, now: SystemTime) -> Connection {
+        self.to_shape_with_state(self.state_at(now))
+    }
+
+    /// The modelled `Connection` for this record, forcing `state` — for an operation that
+    /// reports the record it just removed as `DELETING`.
+    pub fn to_shape_with_state(&self, state: &str) -> Connection {
+        Connection {
+            connection_id: Some(self.id.clone()),
+            connection_arn: Some(self.arn.clone()),
+            global_network_id: Some(self.global_network_id.clone()),
+            device_id: Some(self.device_id.clone()),
+            connected_device_id: Some(self.connected_device_id.clone()),
+            link_id: self.link_id.clone(),
+            connected_link_id: self.connected_link_id.clone(),
+            description: self.description.clone(),
+            created_at: Some(epoch_seconds(self.created_at)),
+            state: Some(state.to_string()),
+            tags: Some(self.tags.clone()),
+        }
+    }
 }
 
 /// A stored core network: the Cloud WAN managed network a global network owns.
@@ -1275,6 +1364,9 @@ pub struct ComAmazonawsNetworkmanagerNetworkmanagerState {
     /// link that are both stored and sit at the same site, so the per-global-network
     /// device quota and the per-site link quota already bound how many pairs can exist.
     pub link_associations: BTreeMap<String, LinkAssociationRecord>,
+    /// Connections by `ConnectionId`, each carrying the `GlobalNetworkId` that owns it and
+    /// the two devices of that global network it ties together.
+    pub connections: BTreeMap<String, ConnectionRecord>,
     /// Core networks by `CoreNetworkId`, each carrying its owning `GlobalNetworkId`.
     pub core_networks: BTreeMap<String, CoreNetworkRecord>,
     /// Attachments by `AttachmentId`, of every kind, each carrying the `CoreNetworkId` it
@@ -1419,6 +1511,15 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
             .count()
     }
 
+    /// How many connections the global network `global_network_id` holds, for the
+    /// per-global-network quota and the network-resource inventory.
+    pub fn connection_count_of(&self, global_network_id: &str) -> usize {
+        self.connections
+            .values()
+            .filter(|connection| connection.global_network_id == global_network_id)
+            .count()
+    }
+
     /// The ids of the devices assigned to `site_id`, in `DeviceId` order.
     pub fn device_ids_of_site(&self, site_id: &str) -> Vec<String> {
         self.devices
@@ -1483,6 +1584,7 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
             SITE_KIND => self.site_count_of(global_network_id),
             LINK_KIND => self.link_count_of_network(global_network_id),
             DEVICE_KIND => self.device_count_of(global_network_id),
+            CONNECTION_KIND => self.connection_count_of(global_network_id),
             CORE_NETWORK_KIND => self.core_network_count_of(global_network_id),
             ATTACHMENT_KIND => self.attachment_count_of_global_network(global_network_id),
             _ => 0,
@@ -1546,6 +1648,11 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
                 .get(parts.id)
                 .filter(|record| record.arn == arn)
                 .map(|record| &record.tags),
+            CONNECTION_KIND => self
+                .connections
+                .get(parts.id)
+                .filter(|record| record.arn == arn)
+                .map(|record| &record.tags),
             CORE_NETWORK_KIND => self
                 .core_networks
                 .get(parts.id)
@@ -1581,6 +1688,11 @@ impl ComAmazonawsNetworkmanagerNetworkmanagerState {
                 .map(|record| &mut record.tags),
             DEVICE_KIND => self
                 .devices
+                .get_mut(parts.id)
+                .filter(|record| record.arn == arn)
+                .map(|record| &mut record.tags),
+            CONNECTION_KIND => self
+                .connections
                 .get_mut(parts.id)
                 .filter(|record| record.arn == arn)
                 .map(|record| &mut record.tags),

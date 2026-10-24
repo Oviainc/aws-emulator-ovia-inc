@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateConnection
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateConnection`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates a connection between two devices of one global network and stores it, so every
+//! later reader answers from the stored record. This is the only file to touch for this
+//! operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateConnection::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The references the request carries, the two devices and each optional link, are
+//! resolved WITHIN the global network the path addresses before anything is minted, so a
+//! stored connection never holds a dangling reference. This operation models no
+//! `ResourceNotFoundException`, so an unresolvable reference is a FIELD failure (400
+//! `ValidationException`) on the member that carried it, exactly as `CreateDevice` and
+//! `CreateLink` answer theirs.
+//!
+//! The connection's own lifecycle state is a function of the clock, never a stored field,
+//! so reading one back never writes.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +164,149 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateConnection` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateConnectionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateConnection"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateConnectionErrorModeled::InternalServerException(InternalServerException {
+                message: "the networkmanager store is unavailable".to_string(),
+                retry_after_seconds: None,
+            })
+        })?;
+
+        let mut store = state.lock();
+
+        // The same tag rules `TagResource` applies hold for the tags a create carries:
+        // the AWS-reserved key prefix, the documented key/value lengths and the
+        // per-resource tag quota are all refused before anything is stored.
+        if let Err(problem) = crate::state::check_requested_tags(input.tags.as_ref()) {
+            return Err(match problem {
+                crate::state::TagProblem::Invalid(rejection) => {
+                    CreateConnectionErrorModeled::ValidationException(rejection.to_exception())
+                }
+                crate::state::TagProblem::TooMany(requested) => {
+                    CreateConnectionErrorModeled::ServiceQuotaExceededException(
+                        ServiceQuotaExceededException {
+                            message: crate::state::too_many_tags_message(requested),
+                            resource_id: None,
+                            resource_type: Some(crate::state::CONNECTION_KIND.to_string()),
+                            limit_code: crate::state::LIMIT_TAGS_PER_RESOURCE.to_string(),
+                            service_code: crate::state::SERVICE_CODE.to_string(),
+                        },
+                    )
+                }
+            }
+            .into());
+        }
+
+        // A connection hangs off the global network the path addresses, so a
+        // `GlobalNetworkId` that names nothing would leave the record with a dangling
+        // back-reference. A create validates the references its input carries before
+        // anything is minted, so an unresolvable one is a FIELD failure on the member that
+        // carried it — `ValidationException` (400) with `Reason=FieldValidationFailed` and
+        // a `Fields` entry naming that member — not the missing-resource answer an
+        // operation acting on an existing resource gives.
+        if !store.global_networks.contains_key(&input.global_network_id) {
+            return Err(CreateConnectionErrorModeled::ValidationException(
+                crate::state::unknown_reference(
+                    crate::state::FIELD_GLOBAL_NETWORK_ID,
+                    crate::state::GLOBAL_NETWORK_KIND,
+                ),
+            )
+            .into());
+        }
+
+        // "Creates a connection between two devices" (`smithy_query query="doc"
+        // shape="CreateConnection"`): both devices are required references, each resolved
+        // WITHIN that global network — a device that never existed, one that was deleted
+        // and one stored under a different global network all leave the member naming
+        // nothing, which one lookup answers.
+        for (member, device_id) in [
+            (crate::state::FIELD_DEVICE_ID, &input.device_id),
+            (
+                crate::state::FIELD_CONNECTED_DEVICE_ID,
+                &input.connected_device_id,
+            ),
+        ] {
+            let resolves = store
+                .devices
+                .get(device_id)
+                .is_some_and(|device| device.global_network_id == input.global_network_id);
+            if !resolves {
+                return Err(CreateConnectionErrorModeled::ValidationException(
+                    crate::state::unknown_reference(member, crate::state::DEVICE_KIND),
+                )
+                .into());
+            }
+        }
+
+        // Each link member is OPTIONAL — it names the link that end of the connection is
+        // reached over — so a connection that names none is a connection over no recorded
+        // link. One the request does carry is a reference like any other, resolved within
+        // the same global network.
+        for (member, link_id) in [
+            (crate::state::FIELD_LINK_ID, input.link_id.as_deref()),
+            (
+                crate::state::FIELD_CONNECTED_LINK_ID,
+                input.connected_link_id.as_deref(),
+            ),
+        ] {
+            let Some(link_id) = link_id else { continue };
+            let resolves = store
+                .links
+                .get(link_id)
+                .is_some_and(|link| link.global_network_id == input.global_network_id);
+            if !resolves {
+                return Err(CreateConnectionErrorModeled::ValidationException(
+                    crate::state::unknown_reference(member, crate::state::LINK_KIND),
+                )
+                .into());
+            }
+        }
+
+        // A quota bounds how many connections one global network can be made to hold: at
+        // the cap the create is refused with the modelled quota error and nothing is
+        // stored, so a repeated call cannot grow the store without end.
+        if store.connection_count_of(&input.global_network_id)
+            >= crate::state::MAX_CONNECTIONS_PER_GLOBAL_NETWORK
+        {
+            return Err(CreateConnectionErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "global network {} already holds the maximum of {} connections",
+                        input.global_network_id,
+                        crate::state::MAX_CONNECTIONS_PER_GLOBAL_NETWORK
+                    ),
+                    resource_id: Some(input.global_network_id.clone()),
+                    resource_type: Some(crate::state::CONNECTION_KIND.to_string()),
+                    limit_code: crate::state::LIMIT_CONNECTIONS_PER_GLOBAL_NETWORK.to_string(),
+                    service_code: crate::state::SERVICE_CODE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        let id = store.next_id(crate::state::CONNECTION_KIND);
+        let now = ::std::time::SystemTime::now();
+        let record = crate::state::ConnectionRecord {
+            arn: crate::state::ComAmazonawsNetworkmanagerNetworkmanagerState::resource_arn(
+                crate::state::CONNECTION_KIND,
+                &id,
+            ),
+            id: id.clone(),
+            global_network_id: input.global_network_id,
+            device_id: input.device_id,
+            connected_device_id: input.connected_device_id,
+            link_id: input.link_id,
+            connected_link_id: input.connected_link_id,
+            description: input.description,
+            created_at: now,
+            available_at: now + crate::state::SETTLE_DELAY,
+            tags: input.tags.unwrap_or_default(),
+        };
+        let connection = record.to_shape(now);
+        store.connections.insert(id, record);
+
+        Ok(CreateConnectionOutput {
+            connection: Some(connection),
+        })
     }
 }
