@@ -23,6 +23,8 @@ mod keyspace_table_lifecycle;
 mod list_keyspaces;
 #[path = "all/list_types.rs"]
 mod list_types;
+#[path = "all/multi_region_table_replicas.rs"]
+mod multi_region_table_replicas;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/service_managed_catalog.rs"]

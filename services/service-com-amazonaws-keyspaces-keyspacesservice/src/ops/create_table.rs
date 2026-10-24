@@ -243,11 +243,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let region = crate::state::request_region(ctx);
 
-        // Members this slice cannot serve faithfully yet. Each is reported by `GetTable`'s
-        // replica, CDC and warm-throughput summaries, which are still scaffolded, so
-        // accepting them would mean storing a request and never answering for it. Answer
-        // the honest 501 instead, worded so it is not counted as "CreateTable is a stub":
-        // the operation IS implemented, this part of its surface is not.
+        // Members this slice cannot serve faithfully yet, so accepting them would mean
+        // storing a request and never answering for it: `replicaSpecifications` overrides
+        // the read capacity and read capacity auto scaling PER Region, which no report here
+        // can distinguish from the table's own (`GetTable` and `GetTableAutoScalingSettings`
+        // report the table's settings in each Region the owning keyspace replicates it to),
+        // and the CDC and warm-throughput summaries are still scaffolded. Answer the honest
+        // 501 instead, worded so it is not counted as "CreateTable is a stub": the operation
+        // IS implemented, this part of its surface is not.
         let unimplemented: Vec<&str> = [
             ("replicaSpecifications", input.replica_specifications.is_some()),
             ("cdcSpecification", input.cdc_specification.is_some()),

@@ -606,6 +606,25 @@ impl Keyspace {
         (self.replication_strategy == MULTI_REGION_STRATEGY)
             .then(|| self.replication_regions.clone())
     }
+
+    /// The Amazon Web Services Regions a report of ANY table of this keyspace carries
+    /// Region-specific settings for: every Region a `MULTI_REGION` keyspace is replicated
+    /// in, and none at all under any other strategy.
+    ///
+    /// A table belongs to its keyspace's replication group — `UpdateKeyspace` "adds a new
+    /// Amazon Web Services Region to the keyspace ... Amazon Keyspaces is going to
+    /// replicate all tables in the keyspace to the new Region" — so a table of a
+    /// `MULTI_REGION` keyspace IS a multi-Region table, and is replicated in exactly the
+    /// keyspace's [`replication_regions`][Self::replication_regions]. That is what
+    /// `GetTableResponse$replicaSpecifications` ("the ... Region specific settings of all
+    /// Regions a multi-Region table is replicated in") and
+    /// `GetTableAutoScalingSettingsResponse$replicaSpecifications` ("the settings for all
+    /// Regions the table is replicated in") each report one entry per; a table of a
+    /// single-Region keyspace is replicated in one Region only, so it has none.
+    pub fn table_replica_regions(&self) -> Option<&[String]> {
+        (self.replication_strategy == MULTI_REGION_STRATEGY)
+            .then_some(self.replication_regions.as_slice())
+    }
 }
 
 /// One table: everything `CreateTable` was given, plus what the service derives.

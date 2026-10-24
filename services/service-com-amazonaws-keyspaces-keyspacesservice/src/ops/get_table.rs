@@ -2,8 +2,9 @@
 
 //! @op GetTable
 //! IMPLEMENTED: reports one table from [`crate::state`] — exactly what `CreateTable`
-//! stored, plus the status the clock has settled it into. This is the ONLY file to touch
-//! for `GetTable`.
+//! stored, plus the status the clock has settled it into, plus (for a table of a
+//! `MULTI_REGION` keyspace, which is a multi-Region table) one Region-specific summary per
+//! Region the keyspace replicates it to. This is the ONLY file to touch for `GetTable`.
 //!
 //! The paragraphs below are the scaffold's own notes on how an operation is shaped and
 //! how it reaches state; they still describe this file.
@@ -216,6 +217,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // The table's throughput summary, reported both for the table as a whole and, for a
+        // multi-Region table, once per Region it is replicated in: a per-Region read
+        // capacity override is `replicaSpecifications` on `CreateTable`/`UpdateTable`,
+        // which this slice refuses with a 501, so no stored table's Region differs from the
+        // table's own capacity.
+        let capacity_specification = table.capacity_specification.as_ref().map(|capacity| {
+            CapacitySpecificationSummary {
+                throughput_mode: capacity.throughput_mode.clone(),
+                read_capacity_units: capacity.read_capacity_units,
+                write_capacity_units: capacity.write_capacity_units,
+                // Set by an `UpdateTable` that moved this table's throughput mode to
+                // PAY_PER_REQUEST, and absent while no update ever has.
+                last_update_to_pay_per_request_timestamp: table
+                    .last_update_to_pay_per_request
+                    .map(::aws_smithy_types::DateTime::from),
+            }
+        });
+
         Ok(GetTableOutput {
             keyspace_name: table.keyspace_name.clone(),
             table_name: table.table_name.clone(),
@@ -228,18 +247,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             creation_timestamp: table.creation_timestamp.map(::aws_smithy_types::DateTime::from),
             status: Some(table.status.clone()),
             schema_definition: table.schema_definition.clone(),
-            capacity_specification: table.capacity_specification.as_ref().map(|capacity| {
-                CapacitySpecificationSummary {
-                    throughput_mode: capacity.throughput_mode.clone(),
-                    read_capacity_units: capacity.read_capacity_units,
-                    write_capacity_units: capacity.write_capacity_units,
-                    // Set by an `UpdateTable` that moved this table's throughput mode to
-                    // PAY_PER_REQUEST, and absent while no update ever has.
-                    last_update_to_pay_per_request_timestamp: table
-                        .last_update_to_pay_per_request
-                        .map(::aws_smithy_types::DateTime::from),
-                }
-            }),
+            capacity_specification: capacity_specification.clone(),
             encryption_specification: table.encryption_specification.clone(),
             point_in_time_recovery: table.point_in_time_recovery.as_ref().map(|recovery| {
                 PointInTimeRecoverySummary {
@@ -257,11 +265,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             default_time_to_live: table.default_time_to_live,
             comment: table.comment.clone(),
             client_side_timestamps: table.client_side_timestamps.clone(),
-            // A replica summary, a stream ARN, CDC and warm throughput are never
-            // configured by anything this slice implements: `RestoreTable` is still
-            // scaffolded, and `CreateTable` and `UpdateTable` answer 501 for exactly
-            // those members rather than storing a setting no operation can report.
-            replica_specifications: None,
+            // "Returns the Amazon Web Services Region specific settings of all Regions a
+            // multi-Region table is replicated in": one entry per Region the OWNING
+            // keyspace replicates this table to, each carrying the table's status and
+            // throughput in that Region. A table of a single-Region keyspace is replicated
+            // in one Region and reports none.
+            replica_specifications: keyspace.table_replica_regions().map(|regions| {
+                regions
+                    .iter()
+                    .map(|replication_region| ReplicaSpecificationSummary {
+                        region: Some(replication_region.clone()),
+                        status: Some(table.status.clone()),
+                        capacity_specification: capacity_specification.clone(),
+                        // Warm throughput is configured by a member `CreateTable` and
+                        // `UpdateTable` answer 501 for, so no table has one to report —
+                        // per Region or overall (see `warmThroughputSpecification` below).
+                        warm_throughput_specification: None,
+                    })
+                    .collect()
+            }),
+            // A stream ARN, CDC and warm throughput are never configured by anything this
+            // slice implements: `RestoreTable` is still scaffolded, and `CreateTable` and
+            // `UpdateTable` answer 501 for exactly those members rather than storing a
+            // setting no operation can report.
             latest_stream_arn: None,
             cdc_specification: None,
             warm_throughput_specification: None,

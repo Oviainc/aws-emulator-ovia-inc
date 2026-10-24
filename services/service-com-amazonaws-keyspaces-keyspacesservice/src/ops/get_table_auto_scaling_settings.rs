@@ -2,7 +2,9 @@
 
 //! @op GetTableAutoScalingSettings
 //! IMPLEMENTED: reports the auto scaling settings `CreateTable` stored for the named
-//! table. This is the ONLY file to touch for `GetTableAutoScalingSettings`.
+//! table, and — when the owning keyspace is `MULTI_REGION`, which makes its tables
+//! multi-Region tables — one Region-specific entry per Region the keyspace replicates the
+//! table to. This is the ONLY file to touch for `GetTableAutoScalingSettings`.
 //!
 //! A table's auto scaling settings are a resource of their own — the scalable target this
 //! operation needs `application-autoscaling:DescribeScalableTargets` to read — so a table
@@ -232,11 +234,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             keyspace_name: table.keyspace_name.clone(),
             table_name: table.table_name.clone(),
             resource_arn: table.resource_arn.clone(),
-            auto_scaling_specification: Some(auto_scaling_specification),
-            // "Returns the settings for all Regions the table is replicated in" — a
-            // per-Region override is `replicaSpecifications` on `CreateTable`, which this
-            // slice refuses with a 501, so no stored table has one.
-            replica_specifications: None,
+            auto_scaling_specification: Some(auto_scaling_specification.clone()),
+            // "The Amazon Web Services Region specific settings of a multi-Region table.
+            // Returns the settings for all Regions the table is replicated in": one entry
+            // per Region the OWNING keyspace replicates this table to, each carrying the
+            // table's auto scaling settings in that Region. A per-Region read capacity
+            // auto scaling override is `replicaSpecifications` on `CreateTable` /
+            // `UpdateTable`, which this slice refuses with a 501, so no stored table's
+            // Region differs from the table's own settings; a table of a single-Region
+            // keyspace is replicated in one Region and reports none.
+            replica_specifications: keyspace.table_replica_regions().map(|regions| {
+                regions
+                    .iter()
+                    .map(|replication_region| ReplicaAutoScalingSpecification {
+                        region: Some(replication_region.clone()),
+                        auto_scaling_specification: Some(auto_scaling_specification.clone()),
+                    })
+                    .collect()
+            }),
         })
     }
 }

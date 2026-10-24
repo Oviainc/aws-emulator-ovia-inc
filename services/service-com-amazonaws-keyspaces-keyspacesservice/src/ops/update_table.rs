@@ -221,12 +221,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
 
         // Members this slice cannot serve faithfully yet — the same four `CreateTable`
-        // refuses, each reported by an operation that is still scaffolded
-        // (`autoScalingSpecification` by `GetTableAutoScalingSettings`, the other three by
-        // `GetTable`'s replica, CDC and warm-throughput summaries). Accepting one would
-        // mean storing a setting nothing here can answer for. The honest 501 says so, and
-        // is worded so it is not read as "UpdateTable is a stub": the operation IS
-        // implemented, this part of its surface is not.
+        // refuses, for the same reasons: an update of `autoScalingSpecification` is not
+        // applied here, `replicaSpecifications` overrides read capacity and read capacity
+        // auto scaling PER Region, which no report here can distinguish from the table's own
+        // (`GetTable` and `GetTableAutoScalingSettings` report the table's settings in each
+        // Region the owning keyspace replicates it to), and the CDC and warm-throughput
+        // summaries are still scaffolded. Accepting one would mean storing a setting nothing
+        // here can answer for. The honest 501 says so, and is worded so it is not read as
+        // "UpdateTable is a stub": the operation IS implemented, this part of its surface is
+        // not.
         let unimplemented: Vec<&str> = [
             (
                 "autoScalingSpecification",
