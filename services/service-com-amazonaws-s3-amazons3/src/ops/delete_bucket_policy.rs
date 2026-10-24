@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteBucketPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteBucketPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteBucketPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes a bucket's policy subresource and answers the operation's modelled
+//! `204 No Content`.
+//!
+//! The rule this handler serves: deleting a bucket subresource clears that subresource
+//! from the bucket holding it and reports the operation's no-content status, whether or
+//! not the subresource was configured — a subresource DELETE is IDEMPOTENT, so a repeat
+//! is as successful as the first call — while a bucket this account does not hold is
+//! `NoSuchBucket` (404) and a request naming another owner is `AccessDenied` (403).
+//! Once the policy is cleared, [`crate::ops::get_bucket_policy`] reports
+//! [`crate::state::NO_SUCH_BUCKET_POLICY_CODE`] again, because both operations read and
+//! write the SAME `Bucket::policy` record.
 //!
 //! ## Shape of an operation
 //!
@@ -168,6 +171,23 @@ pub struct DeleteBucketPolicy<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
 
+/// The code S3 answers a request whose `x-amz-expected-bucket-owner` names an account
+/// other than the bucket's owner: "AccessDenied - Access Denied" (Amazon S3 "Error
+/// responses", list of error codes).
+const ACCESS_DENIED_CODE: &str = "AccessDenied";
+
+/// The HTTP status [`ACCESS_DENIED_CODE`] is rendered with, which this operation's own
+/// documentation states for an owner mismatch: "the request fails with the HTTP status
+/// code 403 Forbidden (access denied)".
+const ACCESS_DENIED_STATUS: u16 = 403;
+
+/// The message that accompanies [`ACCESS_DENIED_CODE`] in the same published list.
+const ACCESS_DENIED_MESSAGE: &str = "Access Denied";
+
+/// The HTTP status [`crate::state::NO_SUCH_BUCKET_CODE`] is rendered with: 404, from the
+/// same published list of S3 error codes.
+const NO_SUCH_BUCKET_STATUS: u16 = 404;
+
 impl<Eng> DeleteBucketPolicy<Eng> {
     /// Construct the operation from the shared engine. INFALLIBLE — the engine is a
     /// construction-time dependency, so engine access is guaranteed by the time any
@@ -194,18 +214,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteBucketPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteBucketPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteBucketPolicy"))
+        // The delete needs nothing from the request beyond its deserialized input.
+        let _ = ctx;
+
+        // "The account ID of the expected bucket owner. If the account ID that you provide
+        // does not match the actual owner of the bucket, the request fails with the HTTP
+        // status code 403 Forbidden (access denied)"
+        // (`DeleteBucketPolicyRequest$ExpectedBucketOwner`): this emulator serves one
+        // account, so that account owns every bucket it holds.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                ACCESS_DENIED_CODE,
+                ACCESS_DENIED_STATUS,
+                ACCESS_DENIED_MESSAGE,
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INTERNAL_ERROR_CODE,
+                crate::state::INTERNAL_ERROR_STATUS,
+                "the S3 store is unavailable",
+            ));
+        };
+
+        let mut store = state.lock();
+        let Some(bucket) = store.bucket_mut(&input.bucket) else {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::NO_SUCH_BUCKET_CODE,
+                NO_SUCH_BUCKET_STATUS,
+                crate::state::NO_SUCH_BUCKET_MESSAGE,
+            ));
+        };
+
+        // Idempotent: the record is cleared whether or not a policy was configured, and
+        // either way the answer is the modelled 204. Nothing else about the bucket is
+        // touched, so a bucket whose policy is withdrawn keeps its objects and its other
+        // subresources.
+        bucket.policy = None;
+
+        Ok(DeleteBucketPolicyOutput)
     }
 }
