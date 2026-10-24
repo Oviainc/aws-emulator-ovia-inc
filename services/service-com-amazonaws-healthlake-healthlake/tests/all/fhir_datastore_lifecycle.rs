@@ -1142,9 +1142,23 @@ async fn an_unimplemented_operation_still_answers_501() {
     // written it yet", never an empty success. (`UpdateFHIRDatastore` is NOT in
     // this list any more — it is implemented; see
     // `control_plane_error_semantics`. Neither is `ListFHIRExportJobs` — see
-    // `fhir_export_job_listing`, nor `UntagResource` — see
+    // `fhir_export_job_listing`, nor `ListFHIRImportJobs` — see
+    // `fhir_import_job_listing`, nor `UntagResource` — see
     // `resource_untagging`.)
-    let cases = [("ListFHIRImportJobs", json!({ "DatastoreId": &id }))];
+    let cases = [(
+        "StartFHIRImportJob",
+        json!({
+            "DatastoreId": &id,
+            "InputDataConfig": { "S3Uri": "s3://healthlake-import-bucket/input" },
+            "JobOutputDataConfig": {
+                "S3Configuration": {
+                    "S3Uri": "s3://healthlake-import-bucket/output",
+                    "KmsKeyId": "1234abcd-12ab-34cd-56ef-1234567890ab",
+                }
+            },
+            "DataAccessRoleArn": "arn:aws:iam::111122223333:role/HealthLakeImport",
+        }),
+    )];
     for (operation, request) in cases {
         let (status, payload) = service.call(operation, &request).await;
         assert_eq!(
