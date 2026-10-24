@@ -266,6 +266,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let fingerprint = request_fingerprint(&input);
         let mut store = state.lock();
 
+        // Finish every workflow teardown the clock already made due, so a name held
+        // by a workflow whose `DELETING` span has elapsed is free for this create and
+        // one still tearing down still holds it.
+        store.reap_deleted_workflows(now);
+
         // A repeated @idempotencyToken replays its first answer rather than minting a
         // second workflow; the same token with a different request is a conflict.
         if let Some(token) = input.client_token.as_deref() {
@@ -292,12 +297,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "You must use unique workflow names within your account" — a second create
-        // under a name already in the store is a conflict, not a second workflow.
+        // under a name already in the store is a conflict, not a second workflow. A
+        // workflow whose teardown has not finished still holds its name, so the
+        // conflict says which state the holder is in.
         if let Some(existing) = store.workflow_names.get(&input.name) {
+            let existing = existing.clone();
+            let deleting = store
+                .workflows
+                .get(&existing)
+                .is_some_and(crate::state::Workflow::is_deleting);
+            let message = if deleting {
+                format!(
+                    "A workflow named {} is {} and still holds that name",
+                    input.name,
+                    crate::state::WORKFLOW_STATUS_DELETING
+                )
+            } else {
+                format!("A workflow named {} already exists", input.name)
+            };
             return Err(
                 CreateWorkflowErrorModeled::ConflictException(ConflictException {
-                    message: format!("A workflow named {} already exists", input.name),
-                    resource_id: existing.clone(),
+                    message,
+                    resource_id: existing,
                     resource_type: "workflow".to_string(),
                 })
                 .into(),
@@ -366,6 +387,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into_iter()
                 .collect::<BTreeMap<String, String>>(),
             runs: BTreeMap::new(),
+            // Nothing is deleting a workflow this call just created, so the clock
+            // owes it no removal.
+            deletion_due_at: None,
         };
 
         store.workflow_names.insert(input.name.clone(), arn.clone());

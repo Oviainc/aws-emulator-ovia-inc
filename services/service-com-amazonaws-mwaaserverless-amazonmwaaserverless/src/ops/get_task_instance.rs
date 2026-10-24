@@ -136,6 +136,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -232,7 +233,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             ))
         })?;
-        let store = state.lock();
+        let mut store = state.lock();
+
+        // The ONE write a read may make: finish every workflow teardown the clock
+        // already made due, so a task instance of a workflow past its `DELETING`
+        // span is gone with it.
+        store.reap_deleted_workflows(SystemTime::now());
 
         // The TASK INSTANCE is what this operation resolves, so an absent workflow,
         // an absent run and a run holding no such instance are one failure to the
