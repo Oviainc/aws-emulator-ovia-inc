@@ -410,6 +410,22 @@
 //! instance's [`PendingTransition`] and a `pending` VPC's `available` move, applied by
 //! [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`].
 //!
+//! ## NAT gateways
+//!
+//! [`ComAmazonawsEc2Amazonec2State::nat_gateways`] holds the account's NAT gateways as the
+//! modelled [`NatGateway`] shape itself, keyed by `NatGatewayId` in a [`BTreeMap`], for the
+//! same reasons the VPC store holds [`Vpc`]s. An address of a NAT gateway is a PART of the
+//! gateway rather than a resource of its own — `NatGatewayAddress` has no store of its own
+//! and is reached only through the gateway that holds it — so the addresses live on that
+//! shape, and the Elastic IP address each one names stays the
+//! [`ComAmazonawsEc2Amazonec2State::addresses`] record it already was, now carrying the
+//! association: one address, one record, whichever operation reports it.
+//! `AssociateNatGatewayAddress` leaves a new address in the non-terminal `associating`
+//! status, so the clock owes it `succeeded` one [`TRANSITION_DELAY`] later
+//! ([`NatGatewayAddressTransition`], keyed by the address's `AssociationId` beside the
+//! gateway store because the modelled shape carries no member for when a transient status
+//! resolves).
+//!
 //! ## AMIs: the published catalog, plus whatever a writer stores
 //!
 //! [`ComAmazonawsEc2Amazonec2State::images`] holds the AMIs the account can see as the
@@ -710,7 +726,7 @@ use crate::ops::types::{
     IpamResourceTag, IpamRoutingPolicyRegistrationDelta, IpamScope,
     MemoryInfo, NetworkInfo, NitroTpmInfo, PlacementGroupInfo, ProcessorInfo, VCpuInfo,
     InstanceState, InstanceTypeOffering, IpPermission, IpRange, LOCATION_TYPE_VALUES,
-    LaunchTemplate, MacHost, Monitoring, NetworkInsightsAccessScope,
+    LaunchTemplate, MacHost, Monitoring, NatGateway, NetworkInsightsAccessScope,
     NetworkInsightsAccessScopeAnalysis, OperatorResponse, PeeringAttachmentStatus, Placement,
     PlacementGroup,
     PrivateDnsNameOptionsOnLaunch,
@@ -892,8 +908,19 @@ pub const MAX_TAG_VALUE_CHARS: usize = 256;
 /// chose the length of.
 pub const MAX_STORED_BYTES: usize = 64 * 1024 * 1024;
 
-/// How many candidate addresses [`ComAmazonawsEc2Amazonec2State::allocate_private_ip`]
-/// may probe before giving up, so the search cannot spin.
+/// How many candidate addresses a free-address search may probe before giving up, so
+/// neither search can spin: [`ComAmazonawsEc2Amazonec2State::allocate_private_ip`], which
+/// draws from the default VPC's `/16`, and
+/// [`ComAmazonawsEc2Amazonec2State::free_subnet_address`], which draws from one subnet's
+/// own block.
+///
+/// ONE budget for both, because both scan the addresses of a block of at most a `/16`:
+/// "the allowed block size is between a /28 netmask and /16 netmask"
+/// (`CreateSubnetRequest$CidrBlock`), so 65 536 candidates cover every address such a block
+/// has and a search that ends in `None` has seen all of them. The budget is what stops a
+/// block wider than any subnet — a CIDR member is a string, so `/0` parses — turning one
+/// request into a scan of billions of addresses and wedging the process for every other
+/// caller.
 const MAX_PRIVATE_IP_PROBES: u32 = 1 << 16;
 
 /// How long after the call that starts it a clock-owed instance transition falls
@@ -1870,6 +1897,21 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// same request answers with that task instead of starting a second import: "The token
     /// to enable idempotency for VM import requests" (`ImportImageRequest$ClientToken`).
     pub import_image_task_client_tokens: HashMap<String, String>,
+    /// Every NAT gateway the account holds, by `NatGatewayId`, as the modelled
+    /// [`NatGateway`] shape itself — so a member a writer sets round-trips through
+    /// `DescribeNatGateways` without a field-by-field copy that can silently drop one. The
+    /// gateway's `NatGatewayAddresses` live ON that shape, because an address of a NAT
+    /// gateway is a part of the gateway and not a resource of its own. Ordered by id, which
+    /// is the order a report of them pages over.
+    pub nat_gateways: BTreeMap<String, NatGateway>,
+    /// When the move the clock owes one NAT gateway address falls due, by the
+    /// `AssociationId` of the address it belongs to — see [`NatGatewayAddressTransition`].
+    ///
+    /// Beside the gateway store rather than inside it for the same reason as
+    /// [`Self::vpc_endpoint_connection_moves`]: that store holds the modelled shape itself,
+    /// which has no member for when a transient `NatGatewayAddressStatus` resolves. An
+    /// address whose status is terminal has no entry here.
+    pub nat_gateway_address_transitions: BTreeMap<String, NatGatewayAddressTransition>,
     /// Every Capacity Reservation Fleet the account holds, by `CapacityReservationFleetId`,
     /// as a [`CapacityReservationFleetRecord`] — see the module docs. Ordered by id, which
     /// is the order `DescribeCapacityReservationFleets` reports and pages over.
@@ -2023,6 +2065,8 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             vpc_block_public_access_exclusions: BTreeMap::new(),
             import_image_tasks: BTreeMap::new(),
             import_image_task_client_tokens: HashMap::new(),
+            nat_gateways: BTreeMap::new(),
+            nat_gateway_address_transitions: BTreeMap::new(),
             capacity_reservation_fleets: BTreeMap::new(),
             capacity_reservation_fleet_client_tokens: HashMap::new(),
             spot_instance_requests: BTreeMap::new(),
@@ -3064,6 +3108,91 @@ impl ComAmazonawsEc2Amazonec2State {
         self.assigned_private_ips.remove(address);
     }
 
+    /// Take `address` for the caller that asked for it by name, answering `false` when
+    /// anything in the account already holds it.
+    ///
+    /// The counterpart of [`Self::allocate_private_ip`] for a request that names the
+    /// private address it wants instead of letting the service choose. "Already held" is
+    /// the one question [`Self::subnet_address_in_use`] answers, so a named address cannot
+    /// collide with a minted one NOR with an address recorded somewhere else than in the
+    /// set this insert writes — a route server endpoint's network interface, say.
+    pub fn reserve_private_ip(&mut self, address: &str) -> bool {
+        if self.subnet_address_in_use(address) {
+            return false;
+        }
+        self.assigned_private_ips.insert(address.to_string())
+    }
+
+    /// Every subnet address the account's interfaces hold, from the TWO places one is
+    /// recorded: the private addresses this emulator has handed out
+    /// ([`Self::private_ip_in_use`] reads the same set) and the elastic network interface
+    /// addresses kept on the route server endpoint records themselves.
+    ///
+    /// The ONE definition of "held", so the point question
+    /// ([`Self::subnet_address_in_use`]) and the search ([`Self::free_subnet_address`])
+    /// cannot disagree about who holds what.
+    fn held_subnet_addresses(&self) -> impl Iterator<Item = &str> {
+        self.assigned_private_ips.iter().map(String::as_str).chain(
+            self.route_server_endpoints
+                .values()
+                .filter_map(|endpoint| endpoint.eni_address.as_deref()),
+        )
+    }
+
+    /// Whether anything in the account already holds the subnet address `candidate`.
+    ///
+    /// Asking about both records ([`Self::held_subnet_addresses`]) is what stops one subnet
+    /// giving the same address to a NAT gateway address and to a route server interface.
+    pub fn subnet_address_in_use(&self, candidate: &str) -> bool {
+        self.held_subnet_addresses()
+            .any(|address| address == candidate)
+    }
+
+    /// The lowest address of `cidr_block` a network interface may be given that nothing in
+    /// the account holds, WITHOUT taking it — or `None` when the block has none (or is not
+    /// a readable IPv4 block).
+    ///
+    /// The candidates are the window [`assignable_subnet_window`] admits — every address
+    /// of the block but the four at its bottom and its last, the
+    /// [`SUBNET_RESERVED_ADDRESSES`] AWS reserves — the SAME computation
+    /// [`is_assignable_subnet_address`] judges a caller-named address by, so a
+    /// service-chosen address is one a caller could have named. They are judged against
+    /// [`Self::held_subnet_addresses`], so free means free for every resource of the
+    /// subnet.
+    ///
+    /// The addresses already held are read ONCE into a set of numbers and the probe itself
+    /// is a lookup in it, so neither the account's records nor the width of the block turns
+    /// one call into unbounded work: the search probes at most
+    /// [`MAX_PRIVATE_IP_PROBES`] candidates, which is every assignable address of a
+    /// subnet-sized block.
+    pub fn free_subnet_address(&self, cidr_block: &str) -> Option<String> {
+        let window = assignable_subnet_window(cidr_block)?;
+        let held: BTreeSet<u32> = self
+            .held_subnet_addresses()
+            .filter_map(|address| address.parse::<::std::net::Ipv4Addr>().ok())
+            .map(u32::from)
+            .filter(|address| window.contains(address))
+            .collect();
+        window
+            .take(MAX_PRIVATE_IP_PROBES as usize)
+            .find(|candidate| !held.contains(candidate))
+            .map(|address| ::std::net::Ipv4Addr::from(address).to_string())
+    }
+
+    /// The next free private IPv4 address inside `cidr_block`, TAKEN for the caller, or
+    /// `None` when the block holds none (or is not a readable IPv4 block).
+    ///
+    /// For a resource whose address comes out of ITS OWN subnet rather than out of the
+    /// default VPC's block, which is what [`Self::allocate_private_ip`] draws from. The
+    /// choice is [`Self::free_subnet_address`]'s — the one scan every subnet address comes
+    /// out of — and the address is recorded in the set [`Self::private_ip_in_use`] reads,
+    /// so a service-chosen address and a caller-named one can never collide.
+    pub fn mint_private_ip_in_cidr(&mut self, cidr_block: &str) -> Option<String> {
+        let address = self.free_subnet_address(cidr_block)?;
+        self.assigned_private_ips.insert(address.clone());
+        Some(address)
+    }
+
     /// Store a launched instance, appending it to its reservation.
     pub fn insert_instance(&mut self, record: InstanceRecord) {
         if let Some(reservation) = self.reservations.get_mut(&record.reservation_id) {
@@ -3119,8 +3248,9 @@ impl ComAmazonawsEc2Amazonec2State {
     ///
     /// An `active` import image task becoming `completed` with the AMI it created is one of
     /// them too; it is documented on [`Self::complete_due_import_image_tasks`], which this
-    /// calls. A `running` Network Access Scope analysis reaching its terminal
-    /// `AnalysisStatus` is one as well.
+    /// calls. So is a NAT gateway address an association left `associating` reaching
+    /// `succeeded` ([`NatGatewayAddressTransition`]), and a `running` Network Access Scope
+    /// analysis reaching its terminal `AnalysisStatus`.
     pub fn materialize_due_transitions(&mut self) {
         let now = Instant::now();
         for instance in self.instances.values_mut() {
@@ -3527,6 +3657,27 @@ impl ComAmazonawsEc2Amazonec2State {
             // The move is applied once; nothing is owed on this connection any more.
             false
         });
+        // A NAT gateway address an association or an assignment left in a transient
+        // `NatGatewayAddressStatus` reaches its terminal status once its instant has
+        // passed, whether or not anybody called again — the same contract as the moves
+        // above. The address is reached through the gateway its `AssociationId` names, so
+        // this costs one lookup per owed move rather than a scan of every gateway.
+        let nat_gateways = &mut self.nat_gateways;
+        self.nat_gateway_address_transitions
+            .retain(|association_id, transition| {
+                if now < transition.due_at {
+                    return true;
+                }
+                if let Some(gateway) = nat_gateways.get_mut(&transition.nat_gateway_id) {
+                    for address in gateway.nat_gateway_addresses.iter_mut().flatten() {
+                        if address.association_id.as_deref() == Some(association_id.as_str()) {
+                            address.status = Some(transition.to.to_string());
+                        }
+                    }
+                }
+                // The move is applied once; nothing is owed on this address any more.
+                false
+            });
         // An Elastic IP address transfer the clock has taken past the end of what the
         // source account is shown: the offer expired and ownership returned to that
         // account, or an accepted transfer's 14 days of visibility ran out. Both were due
@@ -4154,6 +4305,32 @@ pub fn availability_zones_in_region(region: &str) -> Vec<AvailabilityZoneRecord>
             }
         })
         .collect()
+}
+
+/// The Availability Zone of `zones` whose `select`ed form is `value`, or the refusal EC2
+/// answers for a zone the Region does not have.
+///
+/// ONE lookup for both spellings of a zone — its name
+/// ([`AvailabilityZoneRecord::zone_name`]) and its id ([`AvailabilityZoneRecord::zone_id`])
+/// — so the two members a request may name a zone by cannot resolve it two ways, and
+/// `member` only says which one a refusal is about. `zones` is the Region's zones, as
+/// [`availability_zones_in_region`] gives them.
+pub fn availability_zone_of_region<'zones, E>(
+    zones: &'zones [AvailabilityZoneRecord],
+    region: &str,
+    member: &str,
+    value: &str,
+    select: fn(&AvailabilityZoneRecord) -> &str,
+) -> Result<&'zones AvailabilityZoneRecord, Scaffolded<E>> {
+    zones
+        .iter()
+        .find(|zone| select(zone) == value)
+        .ok_or_else(|| {
+            invalid_parameter_value(format!(
+                "Invalid value '{value}' for {member}. \
+                 Region '{region}' has no such Availability Zone"
+            ))
+        })
 }
 
 /// A Region's zone-id prefix: its leading component, then every further component
@@ -9730,6 +9907,45 @@ pub fn ipv4_cidr_block_contains(outer: &str, inner: &str) -> bool {
     }
 }
 
+/// The addresses of `cidr_block` a network interface may be given, as a range of numbers.
+///
+/// "AWS reserves five IP addresses in each subnet CIDR block"
+/// ([`SUBNET_RESERVED_ADDRESSES`]) — the first four and the last — so the window starts
+/// four above the block's base and stops below its broadcast address. The ONE computation
+/// of that window: the point question ([`is_assignable_subnet_address`]) and the search
+/// ([`ComAmazonawsEc2Amazonec2State::free_subnet_address`]) both read it, so the two cannot
+/// drift. A block this emulator cannot read has no window at all, and one too small to
+/// hold an assignable address has an empty one, rather than a guess.
+fn assignable_subnet_window(cidr_block: &str) -> Option<::std::ops::Range<u32>> {
+    let (base, prefix_length) = parse_ipv4_cidr_block(cidr_block)?;
+    let size = 1u64 << (32 - u64::from(prefix_length));
+    // The block's own base, masked here rather than trusted from the parser, so the window
+    // is the block's even if a stored CIDR ever carries host bits.
+    let base = u64::from(base) & !(size - 1);
+    let lowest = u32::try_from(base + u64::from(SUBNET_RESERVED_ADDRESSES) - 1).ok()?;
+    let broadcast = u32::try_from(base + size - 1).ok()?;
+    Some(lowest..broadcast)
+}
+
+/// Is `address` an address of `cidr_block` that a network interface may be given?
+///
+/// "AWS reserves five IP addresses in each subnet CIDR block"
+/// ([`SUBNET_RESERVED_ADDRESSES`]) — the first four and the last — so an address of the
+/// block is assignable exactly when it is neither of those
+/// ([`assignable_subnet_window`]). The ONE definition of that question:
+/// [`ComAmazonawsEc2Amazonec2State::mint_private_ip_in_cidr`] draws from exactly these
+/// addresses, so a service-chosen address and a caller-named one are judged the same way.
+/// An unreadable block has no assignable address, rather than a guess.
+pub fn is_assignable_subnet_address(cidr_block: &str, address: &str) -> bool {
+    let Some(window) = assignable_subnet_window(cidr_block) else {
+        return false;
+    };
+    let Ok(candidate) = address.parse::<::std::net::Ipv4Addr>() else {
+        return false;
+    };
+    window.contains(&u32::from(candidate))
+}
+
 /// The tags a create assigns to the ONE resource it creates, from the request's
 /// `TagSpecifications`.
 ///
@@ -12108,17 +12324,20 @@ pub fn is_ipv4_address(candidate: &str) -> bool {
 
 /// Refuse an allocation id the request named that this service cannot resolve: a
 /// malformed one before an unknown one, the way the service orders the two.
-pub fn require_known_address<E>(
-    store: &ComAmazonawsEc2Amazonec2State,
+///
+/// Answers the stored address, so a caller that resolves an id reads the record it resolved
+/// to rather than looking it up a second time.
+pub fn require_known_address<'store, E>(
+    store: &'store ComAmazonawsEc2Amazonec2State,
     allocation_id: &str,
-) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+) -> Result<&'store Address, crate::scaffolded::Scaffolded<E>> {
     if !allocation_id_is_well_formed(allocation_id) {
         return Err(invalid_allocation_id_malformed(allocation_id));
     }
-    if !store.addresses.contains_key(allocation_id) {
-        return Err(invalid_allocation_id_not_found(allocation_id));
-    }
-    Ok(())
+    store
+        .addresses
+        .get(allocation_id)
+        .ok_or_else(|| invalid_allocation_id_not_found(allocation_id))
 }
 
 /// Refuse a request that named something that is not an allocation id: HTTP 400
@@ -16041,7 +16260,7 @@ impl ComAmazonawsEc2Amazonec2State {
     /// id is minted here beside the endpoint's own.
     pub fn insert_route_server_endpoint(&mut self, spec: RouteServerEndpointSpec) -> String {
         let route_server_endpoint_id = self.next_id("rse");
-        let eni_id = self.next_id("eni");
+        let eni_id = self.next_id(NETWORK_INTERFACE_ID_PREFIX);
         let endpoint = RouteServerEndpoint {
             route_server_id: Some(spec.route_server_id),
             route_server_endpoint_id: Some(route_server_endpoint_id.clone()),
@@ -16128,29 +16347,15 @@ impl ComAmazonawsEc2Amazonec2State {
     /// elastic network interface, or `None` when the block holds no free address.
     ///
     /// The lowest assignable address of the block that nothing in the account already holds
-    /// — not another route server endpoint, and not an instance's primary private address
-    /// ([`Self::private_ip_in_use`], the one record of the addresses this emulator has
-    /// handed out), so one subnet cannot give the same address to two interfaces. AWS
+    /// — not another route server endpoint, and not an instance's primary private address —
+    /// so one subnet cannot give the same address to two interfaces. That is
+    /// [`Self::free_subnet_address`], the one scan every subnet address comes out of: AWS
     /// "reserves the first four IPv4 addresses and the last IPv4 address in each subnet
     /// CIDR block" (the [`SUBNET_RESERVED_ADDRESSES`] this crate already counts against a
     /// subnet's available addresses), and the address is the service's choice, never the
     /// caller's.
     pub fn mint_route_server_eni_address(&self, cidr_block: &str) -> Option<String> {
-        let (first, last) = ipv4_cidr_bounds(cidr_block)?;
-        let held: BTreeSet<&str> = self
-            .route_server_endpoints
-            .values()
-            .filter_map(|endpoint| endpoint.eni_address.as_deref())
-            .collect();
-        // The first four addresses of the block and its last are reserved, so the
-        // assignable window starts four above the base and stops one below the broadcast
-        // address.
-        let lowest = first.checked_add(SUBNET_RESERVED_ADDRESSES - 1)?;
-        (lowest..last)
-            .map(|address| ::std::net::Ipv4Addr::from(address).to_string())
-            .find(|candidate| {
-                !held.contains(candidate.as_str()) && !self.private_ip_in_use(candidate)
-            })
+        self.free_subnet_address(cidr_block)
     }
 }
 
@@ -17619,6 +17824,126 @@ impl ComAmazonawsEc2Amazonec2State {
             },
         );
         stored
+    }
+}
+
+// =============================================================================
+// NAT gateways
+// =============================================================================
+
+/// The id prefix every NAT gateway carries (`nat-…`), which is what lets an id of another
+/// kind be answered as [`NAT_GATEWAY_MALFORMED`] before it is looked up.
+pub const NAT_GATEWAY_ID_PREFIX: &str = "nat";
+
+// The association of an Elastic IP address with a NAT gateway is named by the SAME id
+// space as its association with any other resource — `Address$AssociationId` and
+// `NatGatewayAddress$AssociationId` are one id, and
+// `DisassociateNatGatewayAddressRequest$AssociationIds` takes it — so this module spells
+// that prefix once, as [`ELASTIC_IP_ASSOCIATION_ID_PREFIX`] with the Elastic IP address
+// constants above.
+
+// The network interface a NAT gateway's addresses sit on is named by the SAME id space as
+// every other network interface — "The ID of the network interface associated with the NAT
+// gateway" (`NatGatewayAddress$NetworkInterfaceId`) — so this module spells that prefix
+// once, as [`NETWORK_INTERFACE_ID_PREFIX`] with the network interface constants above.
+
+/// "`available`: The NAT gateway is able to process traffic" (`NatGateway$State`) — the
+/// one state of the `NatGatewayState` enum in which a NAT gateway is serving, and so the
+/// one in which its addresses can be changed.
+///
+/// The other members of that enum (`pending`, `failed`, `deleting`, `deleted`) are not
+/// spelled here: nothing in this module needs to name one, and the generated
+/// `crate::ops::types::NAT_GATEWAY_STATE_VALUES` is the catalog of them.
+pub const NAT_GATEWAY_STATE_AVAILABLE: &str = "available";
+
+/// A NAT gateway that reaches the internet: the `ConnectivityType` enum's `public` member
+/// (`NatGateway$ConnectivityType`). Only such a gateway has Elastic IP addresses —
+/// "[Public NAT gateway only] The allocation ID of the Elastic IP address that's
+/// associated with the NAT gateway" (`NatGatewayAddress$AllocationId`).
+pub const CONNECTIVITY_TYPE_PUBLIC: &str = "public";
+
+/// The `ConnectivityType` enum's other member, a NAT gateway that reaches other VPCs and
+/// on-premises networks only.
+pub const CONNECTIVITY_TYPE_PRIVATE: &str = "private";
+
+/// "Indicates whether this is a zonal (single-AZ) or regional (multi-AZ) NAT gateway"
+/// (`NatGateway$AvailabilityMode`): the `AvailabilityMode` enum's `zonal` member, the NAT
+/// gateway that lives in the one Availability Zone of its subnet.
+pub const AVAILABILITY_MODE_ZONAL: &str = "zonal";
+
+/// The `AvailabilityMode` enum's `regional` member: "A regional NAT gateway is a single
+/// NAT Gateway that works across multiple availability zones (AZs) in your VPC" — the one
+/// kind for which `AssociateNatGatewayAddress` takes an Availability Zone, because such a
+/// gateway "uses a separate EIP in each AZ"
+/// (`AssociateNatGatewayAddressRequest$AvailabilityZone`).
+pub const AVAILABILITY_MODE_REGIONAL: &str = "regional";
+
+/// The transient `NatGatewayAddressStatus` an `AssociateNatGatewayAddress` leaves an
+/// address in: `associating`.
+pub const NAT_GATEWAY_ADDRESS_STATUS_ASSOCIATING: &str = "associating";
+
+/// The terminal `NatGatewayAddressStatus` the clock owes an `associating` address:
+/// `succeeded`.
+pub const NAT_GATEWAY_ADDRESS_STATUS_SUCCEEDED: &str = "succeeded";
+
+/// `NatGatewayNotFound` (HTTP 400): the request named a NAT gateway id this account holds
+/// no NAT gateway for.
+pub const NAT_GATEWAY_NOT_FOUND: &str = "NatGatewayNotFound";
+
+/// `NatGatewayMalformed` (HTTP 400): the request named something that is not a NAT gateway
+/// id at all, so there is nothing to look up.
+pub const NAT_GATEWAY_MALFORMED: &str = "NatGatewayMalformed";
+
+// `Resource.AlreadyAssociated` — "one of the failures `NatGateway$FailureCode` itself
+// names" for this family of requests — is the SAME code an Elastic IP address already
+// associated with another resource is refused with, so this module spells it once, as
+// [`RESOURCE_ALREADY_ASSOCIATED`] with the Elastic IP address codes above, and reaches it
+// through [`resource_already_associated`].
+
+/// How many Elastic IP addresses one public NAT gateway holds.
+///
+/// "By default, you can associate up to 2 Elastic IP addresses per public NAT gateway. You
+/// can increase the limit by requesting a quota adjustment" (`AssociateNatGatewayAddress`)
+/// — this emulator serves an account at that published default, so the third address is
+/// refused the way a quota adjustment would be needed for.
+///
+/// What the count is taken over is CHOSEN for a REGIONAL gateway: the quota sentence names
+/// no Availability Zone, while that gateway "uses a separate EIP in each AZ to handle
+/// outbound NAT traffic from that AZ" (`AssociateNatGatewayAddressRequest$AvailabilityZone`),
+/// and counting the whole gateway would leave a gateway serving three zones unable to hold
+/// any address for its third — so this emulator counts a regional gateway's addresses per
+/// zone and a single-zone gateway's over the gateway, which is the same thing for a gateway
+/// that has one zone and is what every recorded unit exercises
+/// ([`ComAmazonawsEc2Amazonec2State::nat_gateway_eip_count`]).
+pub const MAX_EIPS_PER_PUBLIC_NAT_GATEWAY: usize = 2;
+
+/// The move the clock owes one NAT gateway address: which gateway holds it, the terminal
+/// `NatGatewayAddressStatus` it is going to, and when that falls due.
+///
+/// `to` is a `&'static str` so only a word of the modelled `NatGatewayAddressStatus`
+/// catalog, out of this module's own constants, can ever be stored — never text from a
+/// request. Applied by [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`].
+#[derive(Debug, Clone)]
+pub struct NatGatewayAddressTransition {
+    /// The `NatGatewayId` of the gateway whose address this move belongs to.
+    pub nat_gateway_id: String,
+    /// The status the address reaches at [`Self::due_at`].
+    pub to: &'static str,
+    /// The instant the move falls due, on the same monotonic clock and the same
+    /// [`TRANSITION_DELAY`] as a `pending` VPC's.
+    pub due_at: Instant,
+}
+
+impl NatGatewayAddressTransition {
+    /// The move an operation starting NOW owes an address of `nat_gateway_id`: `to`, one
+    /// [`TRANSITION_DELAY`] from now. The span is never zero, so a caller acting straight
+    /// after the call still sees the transient status.
+    pub fn starting_now(nat_gateway_id: &str, to: &'static str) -> Self {
+        Self {
+            nat_gateway_id: nat_gateway_id.to_string(),
+            to,
+            due_at: Instant::now() + TRANSITION_DELAY,
+        }
     }
 }
 
@@ -19104,6 +19429,83 @@ impl Default for AllowedImagesSettings {
             state: ALLOWED_IMAGES_SETTINGS_DISABLED.to_string(),
             image_criteria: Vec::new(),
         }
+    }
+}
+
+/// Refuse a request that named a NAT gateway id the account holds no NAT gateway for:
+/// HTTP 400 [`NAT_GATEWAY_NOT_FOUND`].
+pub fn nat_gateway_not_found<E>(nat_gateway_id: &str) -> Scaffolded<E> {
+    id_not_found(NAT_GATEWAY_NOT_FOUND, "natgateway ID", nat_gateway_id)
+}
+
+/// The NAT gateway `nat_gateway_id` names, refusing a malformed id before an unknown one —
+/// the order the service asks the two questions in, so "not a NAT gateway id" is never
+/// reported as "no such NAT gateway".
+///
+/// The ONE place every operation of the NAT gateway family resolves its gateway, so they
+/// cannot answer an id two ways.
+pub fn require_known_nat_gateway<'store, E>(
+    store: &'store ComAmazonawsEc2Amazonec2State,
+    nat_gateway_id: &str,
+) -> Result<&'store NatGateway, Scaffolded<E>> {
+    require_well_formed_id(NAT_GATEWAY_ID_PREFIX, nat_gateway_id, NAT_GATEWAY_MALFORMED)?;
+    store
+        .nat_gateways
+        .get(nat_gateway_id)
+        .ok_or_else(|| nat_gateway_not_found(nat_gateway_id))
+}
+
+/// The caller-chosen bytes one stored NAT gateway holds: its tags. Everything else on the
+/// record — the ids, the state, the addresses, the connectivity — is derived by this
+/// module or bounded by the model, so it is fixed-size.
+pub fn nat_gateway_payload_bytes(gateway: &NatGateway) -> usize {
+    tag_list_bytes(gateway.tags.as_deref().unwrap_or_default())
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Store a NAT gateway under the `NatGatewayId` it already carries, charging the
+    /// caller-chosen bytes it holds against the store's byte budget so no path can store
+    /// them uncharged, and answer that id.
+    ///
+    /// The same contract as [`Self::insert_address`]: the record IS the modelled shape
+    /// every operation that reports this gateway answers with, so a member a writer sets
+    /// round-trips without a field-by-field copy.
+    pub fn insert_nat_gateway(&mut self, gateway: NatGateway) -> String {
+        let nat_gateway_id = gateway.nat_gateway_id.clone().unwrap_or_default();
+        self.add_stored_bytes(nat_gateway_payload_bytes(&gateway));
+        self.nat_gateways.insert(nat_gateway_id.clone(), gateway);
+        nat_gateway_id
+    }
+
+    /// How many Elastic IP addresses the NAT gateway `nat_gateway_id` holds right now,
+    /// counting only those of the Availability Zone `zone` when one is named: the addresses
+    /// on it that name an allocation, which is what the quota
+    /// [`MAX_EIPS_PER_PUBLIC_NAT_GATEWAY`] counts. A private address of the gateway names
+    /// no allocation and is not one of them.
+    ///
+    /// A zone is named for a REGIONAL gateway, which "uses a separate EIP in each AZ to
+    /// handle outbound NAT traffic from that AZ"
+    /// (`AssociateNatGatewayAddressRequest$AvailabilityZone`): the published default is "up
+    /// to 2 Elastic IP addresses per public NAT gateway", and the NAT that holds an
+    /// address is the one of its zone, so a gateway serving several zones is not held to
+    /// the addresses of one. A single-zone gateway has only that one zone, so its count is
+    /// every address it holds.
+    pub fn nat_gateway_eip_count(&self, nat_gateway_id: &str, zone: Option<&str>) -> usize {
+        self.nat_gateways
+            .get(nat_gateway_id)
+            .and_then(|gateway| gateway.nat_gateway_addresses.as_ref())
+            .map(|addresses| {
+                addresses
+                    .iter()
+                    .filter(|address| {
+                        address.allocation_id.is_some()
+                            && zone.is_none_or(|zone| {
+                                address.availability_zone.as_deref() == Some(zone)
+                            })
+                    })
+                    .count()
+            })
+            .unwrap_or_default()
     }
 }
 
