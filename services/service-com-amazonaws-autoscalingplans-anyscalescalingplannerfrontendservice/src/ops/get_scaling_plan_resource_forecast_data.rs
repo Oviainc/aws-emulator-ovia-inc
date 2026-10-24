@@ -7,14 +7,12 @@
 //! The forecast for ONE scalable resource over ONE time window, in two steps:
 //!
 //! 1. the request's own members are refused first — the forecast window (its two
-//!    endpoints in order, and the documented seven-day maximum width measured at the
-//!    hourly granularity the forecast has), the resource coordinates (forecasts are
-//!    issued for an Auto Scaling group's desired capacity and nothing else) and the
-//!    `ForecastDataType` enum — so a bad window is refused whether or not the named plan
-//!    exists. Every one of those relations is a property of the REQUEST: where the window
-//!    sits relative to the serving process's clock decides nothing, because the 56-day
-//!    figure the model states is how far back forecast data exists, and a window with no
-//!    data in it is the empty forecast below rather than a refusal;
+//!    endpoints in order, the documented seven-day maximum width measured on the
+//!    instants themselves, and the documented 56-day limit on how far before the current
+//!    date and time the start may sit), the scaling plan version (the model documents a
+//!    single valid value), the resource coordinates (forecasts are issued for an Auto
+//!    Scaling group's desired capacity and nothing else) and the `ForecastDataType` enum —
+//!    so a bad request is refused whether or not the named plan exists;
 //! 2. the clock-owed plan transitions are settled and the data points are reported.
 //!
 //! Step 2 reports no data point, and that is the faithful answer rather than a shortcut:
@@ -201,7 +199,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             FORECAST_DATA_TYPE_VALUES,
         )
         .map_err(validation)?;
-        validate_forecast_window(input.start_time, input.end_time).map_err(validation)?;
+        validate_plan_version(input.scaling_plan_version).map_err(validation)?;
+        validate_forecast_window(input.start_time, input.end_time, now).map_err(validation)?;
         validate_forecast_resource(&input).map_err(validation)?;
 
         let mut state = state.lock();
@@ -252,31 +251,15 @@ pub const FORECAST_SCALABLE_DIMENSION: &str = "autoscaling:autoScalingGroup:Desi
 /// between the start and end time is seven days."
 pub const MAX_FORECAST_WINDOW_DAYS: i64 = 7;
 
-/// How far back forecast data EXISTS, in days.
+/// How far before the current date and time a forecast window may START, in days.
 ///
-/// This operation's own documentation: "Data points are available for up to 56 days";
-/// `GetScalingPlanResourceForecastDataRequest$StartTime` states the same horizon from
-/// the other side ("The date and time can be at most 56 days before the current date and
-/// time").
-///
-/// It is an AVAILABILITY horizon, not a refusal: a window that reaches further back than
-/// it simply holds no data point, which is the empty `Datapoints` list this operation
-/// already answers with. Nothing in this handler compares a request against it, and that
-/// is deliberate — see [`validate_forecast_window`].
+/// `GetScalingPlanResourceForecastDataRequest$StartTime`: "The inclusive start time of
+/// the time range for the forecast data to get. The date and time can be at most 56 days
+/// before the current date and time." That sentence bounds the REQUEST member, so a start
+/// further back than this is refused rather than served; this operation's own
+/// documentation states the same figure from the data's side ("Data points are available
+/// for up to 56 days").
 pub const MAX_FORECAST_HISTORY_DAYS: i64 = 56;
-
-/// The interval between forecast data points, and so the granularity a forecast window
-/// is measured at.
-///
-/// This service's own model names it: "the forecast interval duration of 3600 seconds (60
-/// minutes)" (`smithy_query(query="doc",shape="ScalingInstruction",member="ScheduledActionBufferTime")`),
-/// and AWS Auto Scaling's predictive scaling computes one load and capacity data point
-/// per such interval. A window's two endpoints therefore name the forecast periods that
-/// contain them rather than bare instants, which is why a window that overshoots the
-/// documented seven-day maximum WITHIN one period is still a seven-day window. (The
-/// maximum itself is documented in prose only, with nothing said about granularity:
-/// `smithy_query(query="doc",shape="GetScalingPlanResourceForecastDataRequest",member="EndTime")`.)
-pub const FORECAST_PERIOD_SECONDS: i64 = 3_600;
 
 /// Seconds in a day, for turning the documented day count into a span.
 const SECONDS_PER_DAY: i64 = 86_400;
@@ -287,12 +270,14 @@ fn epoch_nanos(at: ::aws_smithy_types::DateTime) -> i128 {
     i128::from(at.secs()) * 1_000_000_000 + i128::from(at.subsec_nanos())
 }
 
-/// The instant `at_nanos` falls in, snapped back to the start of its forecast period:
-/// the hourly data point a window endpoint names. Floors towards minus infinity, so an
-/// instant before the epoch names the period that contains it too.
-fn forecast_period_start(at_nanos: i128) -> i128 {
-    let period = i128::from(FORECAST_PERIOD_SECONDS) * 1_000_000_000;
-    at_nanos.div_euclid(period) * period
+/// A wall-clock instant as whole nanoseconds since the epoch, so the serving clock
+/// compares against a request's timestamps at the same precision. A host clock before
+/// the epoch yields a negative count rather than panicking.
+fn clock_nanos(at: ::std::time::SystemTime) -> i128 {
+    match at.duration_since(::std::time::UNIX_EPOCH) {
+        Ok(since) => i128::try_from(since.as_nanos()).unwrap_or(i128::MAX),
+        Err(before) => -i128::try_from(before.duration().as_nanos()).unwrap_or(i128::MAX),
+    }
 }
 
 /// `days` as a span in nanoseconds.
@@ -303,40 +288,60 @@ fn days_in_nanos(days: i64) -> i128 {
 /// The forecast window a caller asked for, refused where it is not one AWS issues
 /// forecast data over.
 ///
-/// TWO relations hold, and only these two:
+/// THREE relations hold, each a documented bound on a request member, checked in the
+/// order below:
 ///
 /// 1. `StartTime` is "the inclusive start time" and `EndTime` "the exclusive end time" of
 ///    a time range, so an end at or before the start spans no time at all;
 /// 2. the documented maximum width — "The maximum time duration between the start and end
-///    time is seven days" — is measured at the granularity the forecast itself has, the
-///    forecast-interval periods ([`FORECAST_PERIOD_SECONDS`]) that contain the two
-///    endpoints. A window may therefore run a few minutes past seven days of wall time
-///    while still being a seven-day window, and is refused once its endpoints land in
-///    periods more than seven days apart.
+///    time is seven days" — is a duration between the two instants the request carries, so
+///    it is measured on those instants and nothing coarser: a window even one second past
+///    seven days is refused;
+/// 3. `StartTime` "can be at most [`MAX_FORECAST_HISTORY_DAYS`] days before the current
+///    date and time", so a start further back than that span before `now` is refused.
 ///
-/// Nothing else about the window is refused, and in particular NOT where it sits relative
-/// to the serving process's clock: [`MAX_FORECAST_HISTORY_DAYS`] is how far back forecast
-/// data EXISTS, so a window reaching further back is a forecast with no data point in it —
-/// the empty `Datapoints` list this operation answers with anyway — not an illegal
-/// request. Deciding a refusal by the serving clock would also make one fixed request earn
-/// different verdicts as the process runs on, while every relation above is a property of
-/// the request alone.
+/// Nothing bounds how far into the FUTURE the window may reach: `EndTime` "can accept a
+/// date and time that is more than two days in the future", and a window AWS issues no
+/// forecast for is the empty `Datapoints` list this operation answers with.
 ///
 /// `Err` carries the refusal message naming the constraint the window broke.
 fn validate_forecast_window(
     start_time: ::aws_smithy_types::DateTime,
     end_time: ::aws_smithy_types::DateTime,
+    now: ::std::time::SystemTime,
 ) -> Result<(), String> {
     let start = epoch_nanos(start_time);
     let end = epoch_nanos(end_time);
     if end <= start {
         return Err("Start time must be before end time".to_string());
     }
-    if forecast_period_start(end) - forecast_period_start(start)
-        > days_in_nanos(MAX_FORECAST_WINDOW_DAYS)
-    {
+    if end - start > days_in_nanos(MAX_FORECAST_WINDOW_DAYS) {
         return Err(format!(
             "The maximum allowed time range is {MAX_FORECAST_WINDOW_DAYS} days"
+        ));
+    }
+    if start < clock_nanos(now) - days_in_nanos(MAX_FORECAST_HISTORY_DAYS) {
+        return Err(format!(
+            "Start time must be at most {MAX_FORECAST_HISTORY_DAYS} days before the \
+             current date and time"
+        ));
+    }
+    Ok(())
+}
+
+/// The scaling plan version a caller asked a forecast for.
+///
+/// `GetScalingPlanResourceForecastDataRequest$ScalingPlanVersion` documents exactly one
+/// valid value ([`crate::state::ONLY_VERSION`]), so any other version is a request this
+/// service refuses rather than a lookup that misses: this operation models no not-found
+/// error at all
+/// (`smithy_query(query="operation",operation="GetScalingPlanResourceForecastData")` binds
+/// only `InternalServiceException` and `ValidationException`).
+fn validate_plan_version(version: i64) -> Result<(), String> {
+    if version != crate::state::ONLY_VERSION {
+        return Err(format!(
+            "ScalingPlanVersion {version} is not valid: the only valid value is {}",
+            crate::state::ONLY_VERSION
         ));
     }
     Ok(())
