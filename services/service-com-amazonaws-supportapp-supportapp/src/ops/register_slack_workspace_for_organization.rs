@@ -16,9 +16,12 @@
 //! reports `crate::state::ACCOUNT_TYPE` for that reason. The documented workspace
 //! quota is enforced instead — see [`crate::state::MAX_SLACK_WORKSPACE_CONFIGURATIONS`].
 //!
-//! `teamName` is the name the Slack workspace carries in Slack, which this emulator
-//! never learns (there is no Slack to ask and no request member for it), so the
-//! optional member is reported absent rather than invented. The stored record's
+//! `teamName` is the name the Slack workspace carries in Slack. A registered workspace
+//! has one, and this operation and `ListSlackWorkspaceConfigurations` both report it, so
+//! the registration RECORDS a name for the workspace — derived from the workspace's own
+//! identifier by [`crate::state::derived_slack_workspace_name`], because the emulator has
+//! no Slack directory to ask and no request member carries it — and every later report of
+//! that workspace reads back the stored value. The stored record's
 //! `allowOrganizationMemberAccount` is set on every successful call, including one for
 //! a workspace the account already held: registering a workspace for the organization
 //! from its management account is what lets member accounts authorize the same
@@ -230,9 +233,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .entry(input.team_id.clone())
             .or_insert_with(|| crate::state::SlackWorkspaceConfig {
                 team_id: input.team_id.clone(),
-                // The workspace's Slack name is not in the request and this emulator
-                // has no Slack to ask, so the optional member stays absent.
-                team_name: None,
+                // A registered workspace has a name, which this operation and the
+                // listing both report, so one is recorded here ONCE, when the workspace
+                // enters the registry: every later report reads this stored value back,
+                // and a second registration of the same workspace leaves it alone.
+                team_name: crate::state::derived_slack_workspace_name(&input.team_id),
                 allow_organization_member_account: None,
             });
         // Registering a workspace FOR THE ORGANIZATION from its management account is
@@ -244,7 +249,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(RegisterSlackWorkspaceForOrganizationOutput {
             team_id: Some(record.team_id.clone()),
-            team_name: record.team_name.clone(),
+            team_name: Some(record.team_name.clone()),
             account_type: Some(crate::state::ACCOUNT_TYPE.to_string()),
         })
     }
