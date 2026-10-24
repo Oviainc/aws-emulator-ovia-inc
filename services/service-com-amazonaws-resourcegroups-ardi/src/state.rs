@@ -76,6 +76,114 @@ pub const MAX_GROUPS: usize = 1_000;
 /// [`MAX_GROUPS`] and with the same refusal.
 pub const MAX_MEMBERS_PER_GROUP: usize = 1_000;
 
+/// The most tags one group carries at once, for the same reason as
+/// [`MAX_GROUPS`] and with the same refusal: it bounds in-memory fixture state,
+/// so a client looping on `Tag` is refused rather than growing a record without
+/// end. Removing a tag makes room again.
+pub const MAX_TAGS_PER_GROUP: usize = 50;
+
+/// The prefix AWS keeps for the tags it sets itself.
+///
+/// AWS's resource-tagging documentation states that a caller can neither edit nor
+/// delete a tag whose key carries this prefix, so a request that writes one is
+/// refused rather than stored. Tag keys are case-sensitive, but a key does not
+/// leave the reserved namespace by re-casing the prefix, so the comparison below
+/// ignores case.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Whether `key` names a tag in the reserved [`RESERVED_TAG_KEY_PREFIX`]
+/// namespace.
+pub fn is_reserved_tag_key(key: &str) -> bool {
+    key.get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
+}
+
+/// The longest tag key this service accepts: the maximum the modelled `TagKey`
+/// declares (`length 1..128`).
+///
+/// Source: `smithy_query(query="shape",shape="TagKey")`. A tag key is a map KEY,
+/// whose constraints the request boundary does not walk, so this service decides
+/// them itself — in [`check_tag`], the one place it decides them.
+pub const MAX_TAG_KEY_LENGTH: usize = 128;
+
+/// The longest tag value this service accepts: the maximum the modelled
+/// `TagValue` declares (`length 0..256`), whose minimum of zero makes an empty
+/// value legal.
+///
+/// Source: `smithy_query(query="shape",shape="TagValue")`.
+pub const MAX_TAG_VALUE_LENGTH: usize = 256;
+
+/// Whether `c` is a character a tag key or a tag value may carry.
+///
+/// The modelled `TagKey` and `TagValue` share one pattern,
+/// `^([\p{L}\p{Z}\p{N}_.:/=+\-@]*)$`: Unicode letters and numbers (which is what
+/// [`char::is_alphanumeric`] answers), the separator categories, and the eight
+/// punctuation characters it lists. A whitespace character that is not a control
+/// character is exactly a separator, so a tab or a newline is NOT one.
+fn is_tag_character(c: char) -> bool {
+    c.is_alphanumeric()
+        || (c.is_whitespace() && !c.is_control())
+        || matches!(c, '_' | '.' | ':' | '/' | '=' | '+' | '-' | '@')
+}
+
+/// `Ok(())` when the pair `key`/`value` is one a caller may write to a group,
+/// else the message the refusal reports.
+///
+/// The ONE place this service decides whether a tag may be written, so every path
+/// that stores tags — a create that carries them and a later tagging call —
+/// refuses the same pairs the same way:
+///
+/// * the key and the value stay inside the modelled lengths and character set
+///   ([`MAX_TAG_KEY_LENGTH`], [`MAX_TAG_VALUE_LENGTH`], [`is_tag_character`]);
+/// * the key is outside the reserved [`RESERVED_TAG_KEY_PREFIX`] namespace.
+pub fn check_tag(key: &str, value: &str) -> Result<(), String> {
+    let key_length = key.chars().count();
+    if !(1..=MAX_TAG_KEY_LENGTH).contains(&key_length) {
+        return Err(format!(
+            "Tags is not valid: a tag key is 1 to {MAX_TAG_KEY_LENGTH} characters long, \
+             and this one is {key_length}",
+        ));
+    }
+    if let Some(character) = key.chars().find(|c| !is_tag_character(*c)) {
+        return Err(format!(
+            "Tags is not valid: the tag key {key} carries {character:?}, which is not one of \
+             the letters, numbers, separators and `_ . : / = + - @` a tag may use",
+        ));
+    }
+    let value_length = value.chars().count();
+    if value_length > MAX_TAG_VALUE_LENGTH {
+        return Err(format!(
+            "Tags is not valid: a tag value is at most {MAX_TAG_VALUE_LENGTH} characters long, \
+             and the value of {key} is {value_length}",
+        ));
+    }
+    if let Some(character) = value.chars().find(|c| !is_tag_character(*c)) {
+        return Err(format!(
+            "Tags is not valid: the value of the tag key {key} carries {character:?}, which is \
+             not one of the letters, numbers, separators and `_ . : / = + - @` a tag may use",
+        ));
+    }
+    if is_reserved_tag_key(key) {
+        return Err(format!(
+            "Tags is not valid: the {RESERVED_TAG_KEY_PREFIX} prefix is reserved, so the tag \
+             key {key} cannot be written",
+        ));
+    }
+    Ok(())
+}
+
+/// `Ok(())` when every pair in `tags` is one a caller may write, else the message
+/// the refusal reports.
+///
+/// The whole batch is judged BEFORE anything is written, so a request holding one
+/// pair this service refuses stores none of its pairs.
+pub fn check_tags<'a>(tags: impl IntoIterator<Item = (&'a str, &'a str)>) -> Result<(), String> {
+    for (key, value) in tags {
+        check_tag(key, value)?;
+    }
+    Ok(())
+}
+
 /// The modelled `GroupConfigurationStatus` of a service configuration that is in
 /// effect: nothing is being applied to the group.
 ///
@@ -179,6 +287,43 @@ impl GroupRecord {
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
+    }
+
+    /// Merge `tags` into this record's tags: a key the batch names is set or
+    /// overwritten, and a key it does not name keeps the value it had ("Existing
+    /// tags on a resource group are not changed if they are not specified in the
+    /// request parameters").
+    ///
+    /// The whole batch is judged against [`MAX_TAGS_PER_GROUP`] BEFORE anything
+    /// is written, so a batch that would push the record past the bound is
+    /// refused with the message in the `Err` and stores none of its pairs.
+    ///
+    /// `Ok` carries the pairs now STORED for the keys the batch named, read back
+    /// out of the record, so a caller reports what the store holds rather than
+    /// what the request said.
+    pub fn merge_tags<'a>(
+        &mut self,
+        tags: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> Result<std::collections::HashMap<String, String>, String> {
+        let batch: Vec<(&str, &str)> = tags.into_iter().collect();
+        let new_keys = batch
+            .iter()
+            .filter(|(key, _)| !self.tags.contains_key(*key))
+            .count();
+        if self.tags.len() + new_keys > MAX_TAGS_PER_GROUP {
+            return Err(format!(
+                "this emulator holds at most {MAX_TAGS_PER_GROUP} tags per resource group; \
+                 remove a tag before adding another",
+            ));
+        }
+        for (key, value) in &batch {
+            self.tags.insert((*key).to_string(), (*value).to_string());
+        }
+        Ok(batch
+            .iter()
+            .filter_map(|(key, _)| self.tags.get_key_value(*key))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect())
     }
 
     /// Record `resource_arn` as a member, keeping [`GroupRecord::members`] sorted
