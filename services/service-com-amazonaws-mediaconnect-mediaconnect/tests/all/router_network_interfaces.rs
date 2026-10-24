@@ -37,7 +37,9 @@ use crate::router_input_restart::{union, union_member};
 
 /// An ARN satisfying the modelled `RouterNetworkInterfaceArn` pattern that no create minted,
 /// so no store holds a router network interface for it.
-const UNKNOWN_ARN: &str =
+///
+/// `pub(crate)` because `update_router_network_interface` addresses the same absent interface.
+pub(crate) const UNKNOWN_ARN: &str =
     "arn:aws:mediaconnect:us-east-1:000000000000:routerNetworkInterface:ffffffffffff";
 /// A second one, for the cases that name more than one absent interface.
 const OTHER_UNKNOWN_ARN: &str =
@@ -45,9 +47,14 @@ const OTHER_UNKNOWN_ARN: &str =
 
 /// A `FlowArn` matching the modelled pattern — an ARN of this service that is NOT a router
 /// network interface ARN, so the batch read's modelled `Arns` pattern refuses it.
-const FLOW_ARN: &str = "arn:aws:mediaconnect:us-east-1:000000000000:flow:1-0000000a:rni-target";
+pub(crate) const FLOW_ARN: &str =
+    "arn:aws:mediaconnect:us-east-1:000000000000:flow:1-0000000a:rni-target";
 
-async fn create_network_interface(emulator: &Emulator, body: Value) -> (u16, Option<String>, Value) {
+/// `pub(crate)` because `update_router_network_interface` mints its subjects the same way.
+pub(crate) async fn create_network_interface(
+    emulator: &Emulator,
+    body: Value,
+) -> (u16, Option<String>, Value) {
     emulator
         .send("POST", "/v1/routerNetworkInterface", Some(body))
         .await
@@ -57,7 +64,10 @@ async fn create_network_interface(emulator: &Emulator, body: Value) -> (u16, Opt
 /// parameter per ARN
 /// (`smithy_query(query="operation",operation="BatchGetRouterNetworkInterface")`:
 /// `GET /v1/routerNetworkInterfaces`, `Arns` `@httpQuery("arns")`).
-async fn batch_get_network_interfaces(
+///
+/// `pub(crate)` because `update_router_network_interface` reads its subjects back through the
+/// same implemented reader.
+pub(crate) async fn batch_get_network_interfaces(
     emulator: &Emulator,
     arns: &[&str],
 ) -> (u16, Option<String>, Value) {
@@ -130,7 +140,7 @@ fn assert_minted_interface_arn(case: &str, arn: &str, id: &str) {
 /// epoch-seconds form — the framework's generated member schemas carry no
 /// `@timestampFormat`, for every service alike — so that is the form asserted here. The
 /// value is read from the clock either way, which is what these cases are about.
-fn reported_timestamp(case: &str, member: &str, value: &Value) -> f64 {
+pub(crate) fn reported_timestamp(case: &str, member: &str, value: &Value) -> f64 {
     value.as_f64().unwrap_or_else(|| {
         panic!("case {case:?}: {member} must be reported as a timestamp, got {value}")
     })
@@ -166,15 +176,24 @@ const PERSISTED_MEMBERS: [&str; 10] = [
 /// pattern (`smithy_query(query="shape",shape="PublicRouterNetworkInterfaceRule")`:
 /// `^(?:[0-9]{1,3}\.){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$`), from the RFC 5737
 /// documentation range.
-fn public_configuration(count: usize) -> Value {
+pub(crate) fn public_configuration(count: usize) -> Value {
     let allow_rules: Vec<Value> = (0..count)
         .map(|index| json!({ "cidr": format!("198.51.{index}.0/24") }))
         .collect();
     union("Public", "public", json!({ "allowRules": allow_rules }))
 }
 
-/// A VPC configuration listing `count` security groups.
-fn vpc_configuration(count: usize) -> Value {
+/// A VPC configuration listing `count` security groups, in this suite's one subnet.
+pub(crate) fn vpc_configuration(count: usize) -> Value {
+    vpc_configuration_in_subnet(count, "subnet-0123456789abcdef0")
+}
+
+/// A VPC configuration listing `count` security groups in the subnet `subnet`.
+///
+/// The one definition of the VPC configuration shape in this test tree: `update_router_
+/// network_interface` needs a row whose subnet DIFFERS from the stored one, which is the
+/// only thing it varies.
+pub(crate) fn vpc_configuration_in_subnet(count: usize, subnet: &str) -> Value {
     let security_group_ids: Vec<Value> = (0..count)
         .map(|index| json!(format!("sg-{index:017x}")))
         .collect();
@@ -183,7 +202,7 @@ fn vpc_configuration(count: usize) -> Value {
         "vpc",
         json!({
             "securityGroupIds": security_group_ids,
-            "subnetId": "subnet-0123456789abcdef0",
+            "subnetId": subnet,
         }),
     )
 }
@@ -583,7 +602,7 @@ async fn batch_get_reports_each_requested_arn_once_and_errors_for_the_rest() {
 }
 
 /// How many router network interfaces the store holds.
-fn stored_count(emulator: &Emulator) -> usize {
+pub(crate) fn stored_count(emulator: &Emulator) -> usize {
     emulator
         .engine
         .state::<mc::ComAmazonawsMediaconnectMediaconnectState>()

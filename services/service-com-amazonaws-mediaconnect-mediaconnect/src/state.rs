@@ -2277,14 +2277,20 @@ pub const ROUTER_OUTPUT_TYPE_MEDIALIVE_INPUT: &str = "MEDIALIVE_INPUT";
 
 /// The `RouterNetworkInterfaceState` enum the model declares for a router network
 /// interface (`smithy_query(query="shape",shape="RouterNetworkInterfaceState")`: CREATING |
-/// ACTIVE | UPDATING | DELETING | ERROR | RECOVERING). Only the two a network interface's
-/// creation reaches are named here; the rest belong to operations that are still
+/// ACTIVE | UPDATING | DELETING | ERROR | RECOVERING). Only the three a network interface's
+/// creation and update reach are named here; the rest belong to operations that are still
 /// scaffolded.
 pub const ROUTER_NETWORK_INTERFACE_STATE_CREATING: &str = "CREATING";
 /// See [`ROUTER_NETWORK_INTERFACE_STATE_CREATING`]. A network interface that finished being
 /// created is usable: unlike a router input or output there is no start call for one, so
 /// `ACTIVE` is where its creation settles.
 pub const ROUTER_NETWORK_INTERFACE_STATE_ACTIVE: &str = "ACTIVE";
+/// See [`ROUTER_NETWORK_INTERFACE_STATE_CREATING`]. The non-terminal state a network
+/// interface is answered in while an accepted UpdateRouterNetworkInterface is being applied
+/// (that operation answers HTTP 202, `smithy_query(query="operation",
+/// operation="UpdateRouterNetworkInterface")`); the clock settles it back into
+/// [`ROUTER_NETWORK_INTERFACE_STATE_ACTIVE`] one [`TRANSITION_SPAN`] later.
+pub const ROUTER_NETWORK_INTERFACE_STATE_UPDATING: &str = "UPDATING";
 
 /// The `RouterNetworkInterfaceType` enum the model declares
 /// (`smithy_query(query="shape",shape="RouterNetworkInterfaceType")`: PUBLIC | VPC). Like a
@@ -3207,6 +3213,8 @@ pub struct StoredRouterNetworkInterface {
     /// record instead of minting a second one.
     pub client_token: Option<String>,
     pub created_at: SystemTime,
+    /// When this record was last changed. An accepted UpdateRouterNetworkInterface that
+    /// changes a member moves it; a read never moves it.
     pub updated_at: SystemTime,
 }
 
@@ -3224,6 +3232,26 @@ impl StoredRouterNetworkInterface {
                 self.pending = Some(pending);
             }
         }
+    }
+
+    /// Enter `transient` now and owe `settled` once [`TRANSITION_SPAN`] has passed — the
+    /// router network interface counterpart of [`StoredFlow::begin_transition`], so every
+    /// state an interface is answered in while the clock still owes a change is started one
+    /// way.
+    pub fn begin_transition(&mut self, transient: &str, settled: &str, now: SystemTime) {
+        self.state = transient.to_string();
+        self.pending = Some(PendingStatus {
+            status: settled.to_string(),
+            due_at: now + TRANSITION_SPAN,
+        });
+    }
+
+    /// Whether a state change is in flight for this interface: the clock still owes it one,
+    /// so the interface is between two states rather than settled in one — the same reading
+    /// as [`StoredRouterInput::is_transitioning`], which is what an operation that MOVES the
+    /// state (UpdateRouterNetworkInterface) refuses on.
+    pub fn is_transitioning(&self) -> bool {
+        self.pending.is_some()
     }
 
     /// `RouterNetworkInterface$NetworkInterfaceType`, the variant of the interface's

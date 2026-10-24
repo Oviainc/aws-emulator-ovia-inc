@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateRouterNetworkInterface
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateRouterNetworkInterface`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateRouterNetworkInterface::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Updates the router network interface the request's `Arn` addresses: the members the
+//! request names replace the stored ones, everything else is left as it was, and the answer
+//! is the STORED record read back through the one projection every router network interface
+//! operation answers from (so BatchGetRouterNetworkInterface reports exactly what this call
+//! wrote).
 //!
 //! ## Shape of an operation
 //!
@@ -87,6 +84,31 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// Refuse the request with the service's own client-input error, `BadRequestException`
+/// (HTTP 400): "thrown if the request contains a semantic error. The precise meaning depends
+/// on the API, and is documented in the error message".
+///
+/// This is the envelope for a WELL-FORMED request the addressed resource itself does not
+/// admit ([`crate::state::bad_request_message`]), exactly as UpdateBridge words one: the
+/// request's CONTENT is acceptable (every modelled constraint is already satisfied by the
+/// time this handler runs), it is the interface it addresses that refuses it.
+fn refused_by_interface(detail: impl Into<String>) -> UpdateRouterNetworkInterfaceError {
+    UpdateRouterNetworkInterfaceErrorModeled::BadRequestException(BadRequestException {
+        message: crate::state::bad_request_message(&detail.into()),
+    })
+    .into()
+}
+
+/// The server-side failure for a store this service cannot reach.
+fn store_unavailable(detail: &str) -> UpdateRouterNetworkInterfaceError {
+    UpdateRouterNetworkInterfaceErrorModeled::InternalServerErrorException(
+        InternalServerErrorException {
+            message: detail.to_string(),
+        },
+    )
+    .into()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -157,21 +179,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
     async fn handle(
         &self,
-        input: Self::Input,
+        mut input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateRouterNetworkInterface` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateRouterNetworkInterfaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateRouterNetworkInterface"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(store_unavailable(
+                "the mediaconnect router network interface store is unavailable",
+            ));
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The state changes the clock already owes are materialised before anything is read
+        // or written, exactly as the reporting operations do it, so an interface whose create
+        // has settled is updated rather than refused for a transition that is no longer in
+        // flight.
+        store.settle_due_transitions(now);
+
+        // The model declares NO `NotFoundException` for this operation
+        // (`smithy_query(query="operation",operation="UpdateRouterNetworkInterface")` lists
+        // BadRequestException, ConflictException, ForbiddenException,
+        // InternalServerErrorException, ServiceUnavailableException and
+        // TooManyRequestsException), so an ARN that addresses no interface is answered with
+        // the client-input error this operation DOES model rather than with a 404 it does
+        // not: there is nothing to update, which is the semantic error `BadRequestException`
+        // describes.
+        let Some(interface) = store.router_network_interfaces.get_mut(&input.arn) else {
+            return Err(refused_by_interface(format!(
+                "No router network interface exists for {}.",
+                input.arn
+            )));
+        };
+
+        // An update moves the interface's state (see below), so it cannot be accepted while
+        // the clock already owes it a different one: the interface is between two states,
+        // which is the conflict `ConflictException` describes ("would cause a conflict with
+        // the current state of a service resource associated with the request", 409 and
+        // retryable — the caller retries once the transition it is waiting on has settled).
+        // The same precondition, read the same way, as RestartRouterInput's.
+        if interface.is_transitioning() {
+            return Err(
+                UpdateRouterNetworkInterfaceErrorModeled::ConflictException(ConflictException {
+                    message: format!(
+                        "Router network interface {} is in state {} and a state change is \
+                         already in progress, so it cannot be updated yet.",
+                        interface.arn, interface.state
+                    ),
+                })
+                .into(),
+            );
+        }
+
+        // "The updated configuration settings for the router network interface. Changing the
+        // type of the configuration is not supported"
+        // (`smithy_query(query="doc",shape="UpdateRouterNetworkInterfaceRequest",
+        // member="Configuration")`). The interface's type IS the variant of its
+        // configuration union (`crate::state::router_network_interface_type`), so a request
+        // naming the other variant asks for a type change and is refused — before anything
+        // is written, so a refused update leaves the interface exactly as it was.
+        if let Some(requested) = input.configuration.as_ref() {
+            let requested_type = crate::state::router_network_interface_type(requested);
+            let stored_type = interface.network_interface_type();
+            if requested_type != stored_type {
+                return Err(refused_by_interface(format!(
+                    "Changing the configuration type of a router network interface is not \
+                     supported: {} is a {stored_type} interface and the request's \
+                     Configuration is a {requested_type} one.",
+                    interface.arn
+                )));
+            }
+        }
+
+        // Both updatable members are optional: each one the request names replaces the
+        // stored value, and each one it omits leaves the stored value alone. A request that
+        // names NEITHER asks for no change, so it changes nothing — not the record's
+        // `UpdatedAt` and not its state — and simply reports the interface as it stands.
+        let mut changed = false;
+        if let Some(name) = input.name.take() {
+            interface.name = name;
+            changed = true;
+        }
+        if let Some(configuration) = input.configuration.take() {
+            interface.configuration = configuration;
+            changed = true;
+        }
+        if changed {
+            // The update changed the resource, so the record's `UpdatedAt` moves with it.
+            interface.updated_at = now;
+            // Applying it is not instantaneous — this operation answers HTTP 202, and
+            // `RouterNetworkInterfaceState` carries `UPDATING` for exactly this — so the
+            // interface reports `UPDATING` and the clock owes it `ACTIVE` one transition
+            // span later: a caller reading it straight afterwards still sees the update in
+            // flight.
+            interface.begin_transition(
+                crate::state::ROUTER_NETWORK_INTERFACE_STATE_UPDATING,
+                crate::state::ROUTER_NETWORK_INTERFACE_STATE_ACTIVE,
+                now,
+            );
+        }
+
+        // The response is the STORED record, read back out of the store through the same
+        // projection the batch read answers from — never the request — so the association
+        // counts are counted from the router inputs and outputs that name this interface.
+        let router_network_interface = store
+            .router_network_interface_projection(&input.arn)
+            .ok_or_else(|| {
+                store_unavailable(
+                    "the router network interface could not be read back after it was updated",
+                )
+            })?;
+        Ok(UpdateRouterNetworkInterfaceOutput {
+            router_network_interface,
+        })
     }
 }
+
