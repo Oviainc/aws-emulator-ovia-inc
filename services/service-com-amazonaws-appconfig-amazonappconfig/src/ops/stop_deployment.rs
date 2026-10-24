@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopDeployment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopDeployment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopDeployment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: stops a deployment of this environment — rolling back one the service is
+//! still working on, or reverting a completed one the request allows a revert of — and
+//! answers the stored deployment record.
 //!
 //! ## Shape of an operation
 //!
@@ -160,6 +154,63 @@ impl From<StopDeploymentErrorModeled> for StopDeploymentError {
     }
 }
 
+/// A `ResourceNotFoundException` (HTTP 404) naming the resource the stop could not
+/// resolve.
+fn not_found(message: String, resource_name: String) -> StopDeploymentError {
+    StopDeploymentErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+        resource_name: Some(resource_name),
+    })
+    .into()
+}
+
+/// A `BadRequestException` (HTTP 400): the request addressed a real deployment that is
+/// not in a state this operation applies to. A cross-request rule about the STATE of the
+/// resource, which the schema walk cannot refuse, so it is this operation's own modelled
+/// client error rather than the unmodelled `ValidationException`.
+fn bad_request(message: String) -> StopDeploymentError {
+    StopDeploymentErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+        reason: None,
+        details: None,
+    })
+    .into()
+}
+
+/// The Deployment document for a stored deployment.
+///
+/// Every member is read off the record, exactly as `StartDeployment` and `GetDeployment`
+/// read it. `KmsKeyArn` is deliberately left unset, not overlooked: it is the ARN of the
+/// key `KmsKeyIdentifier` resolves to, which this emulator does not resolve, so any value
+/// here would be fabricated.
+fn document(deployment: &crate::state::Deployment) -> StopDeploymentOutput {
+    StopDeploymentOutput {
+        application_id: Some(deployment.application_id.clone()),
+        environment_id: Some(deployment.environment_id.clone()),
+        deployment_strategy_id: Some(deployment.deployment_strategy_id.clone()),
+        configuration_profile_id: Some(deployment.configuration_profile_id.clone()),
+        deployment_number: deployment.deployment_number,
+        configuration_name: Some(deployment.configuration_name.clone()),
+        configuration_location_uri: Some(deployment.configuration_location_uri.clone()),
+        configuration_version: Some(deployment.configuration_version.clone()),
+        description: deployment.description.clone(),
+        deployment_duration_in_minutes: deployment.deployment_duration_in_minutes,
+        growth_type: Some(deployment.growth_type.clone()),
+        growth_factor: Some(deployment.growth_factor),
+        final_bake_time_in_minutes: deployment.final_bake_time_in_minutes,
+        state: Some(deployment.state.clone()),
+        event_log: Some(deployment.event_log_newest_first()),
+        percentage_complete: Some(deployment.percentage_complete),
+        started_at: Some(crate::state::to_date_time(deployment.started_at)),
+        completed_at: deployment.completed_at.map(crate::state::to_date_time),
+        applied_extensions: Some(deployment.applied_extensions.clone()),
+        kms_key_arn: None,
+        kms_key_identifier: deployment.kms_key_identifier.clone(),
+        version_label: deployment.version_label.clone(),
+        r#type: Some(deployment.deployment_type.clone()),
+    }
+}
+
 /// The `StopDeployment` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -194,20 +245,78 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopDeployment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopDeploymentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopDeployment"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StopDeploymentErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("AppConfig state is not reachable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        let now = std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // Resolve every resource the request names before anything is written.
+        let Some(application) = store.applications.get_mut(&input.application_id) else {
+            return Err(not_found(
+                crate::state::application_not_found(&input.application_id),
+                input.application_id,
+            ));
+        };
+        let Some(environment) = application.environments.get_mut(&input.environment_id) else {
+            return Err(not_found(
+                crate::state::environment_not_found(&input.application_id, &input.environment_id),
+                input.environment_id,
+            ));
+        };
+
+        // Bring the environment up to date first: whether a stop applies depends on the
+        // state the CLOCK already owes this deployment — one whose rollout and bake time
+        // have both elapsed has completed, and can then only be reverted.
+        environment.materialize(now);
+
+        let Some(deployment) = environment.deployments.get_mut(&input.deployment_number) else {
+            return Err(not_found(
+                crate::state::deployment_not_found(
+                    &input.application_id,
+                    &input.environment_id,
+                    input.deployment_number,
+                ),
+                input.deployment_number.to_string(),
+            ));
+        };
+
+        // The state the refusal reports is the one the stop was judged against.
+        let state_before = deployment.state.clone();
+        if let Err(refusal) = deployment.stop(input.allow_revert.unwrap_or(false), now) {
+            return Err(bad_request(match refusal {
+                crate::state::StopRefusal::NotStoppable => {
+                    crate::state::deployment_cannot_be_stopped(
+                        &input.application_id,
+                        &input.environment_id,
+                        input.deployment_number,
+                        &state_before,
+                    )
+                }
+                crate::state::StopRefusal::RevertWindowElapsed => {
+                    crate::state::deployment_revert_window_elapsed(
+                        &input.application_id,
+                        &input.environment_id,
+                        input.deployment_number,
+                    )
+                }
+            }));
+        }
+
+        // Answered from the stored record, after the stop was written to it.
+        let output = document(deployment);
+
+        // The environment follows the deployment a caller just stopped: it is rolling
+        // back for as long as that deployment is.
+        environment.materialize(now);
+
+        Ok(output)
     }
 }
