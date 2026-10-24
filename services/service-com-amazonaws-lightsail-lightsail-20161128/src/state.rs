@@ -470,6 +470,8 @@ pub const OPERATION_TYPE_CREATE_RELATIONAL_DATABASE: &str = "CreateRelationalDat
 pub const OPERATION_TYPE_CREATE_RELATIONAL_DATABASE_SNAPSHOT: &str =
     "CreateRelationalDatabaseSnapshot";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_DELETE_RELATIONAL_DATABASE: &str = "DeleteRelationalDatabase";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_RELATIONAL_DATABASE_FROM_SNAPSHOT: &str =
     "CreateRelationalDatabaseFromSnapshot";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
@@ -8270,6 +8272,22 @@ impl ComAmazonawsLightsailLightsail20161128State {
         self.relational_databases.get_mut(name)
     }
 
+    /// Remove the managed relational database `name` names, answering the record
+    /// it removed. `None` when nothing matched.
+    ///
+    /// Nothing else in the store names a database it is attached to — a database
+    /// attaches to no instance, disk or load balancer — so this removes exactly
+    /// one record. A SNAPSHOT of it is deliberately left where it is: a snapshot
+    /// is a point-in-time copy that carries its own copy of everything it reports
+    /// about its source ([`StoredRelationalDatabaseSnapshot`]), which is what lets
+    /// the final snapshot a delete takes outlive the database it was taken of.
+    pub fn remove_relational_database(
+        &mut self,
+        name: &str,
+    ) -> Option<StoredRelationalDatabase> {
+        self.relational_databases.remove(name)
+    }
+
     /// The managed relational database snapshot `name` names, for a reporting
     /// operation.
     pub fn relational_database_snapshot(
@@ -8286,6 +8304,71 @@ impl ComAmazonawsLightsailLightsail20161128State {
     ) {
         self.relational_database_snapshots
             .insert(snapshot.name.clone(), snapshot);
+    }
+
+    /// Take a point-in-time copy of `source` under the snapshot name `name`,
+    /// store it and answer the record that was stored.
+    ///
+    /// The ONE place a database snapshot is built, whichever call asks for it —
+    /// `CreateRelationalDatabaseSnapshot` on its own, or the final snapshot a
+    /// `DeleteRelationalDatabase` takes before it removes the database — so both
+    /// report the same copy of the same source.
+    ///
+    /// Everything the snapshot says about its SOURCE — and the master database
+    /// name and credentials a later `CreateRelationalDatabaseFromSnapshot`
+    /// restores it with — is read out of `source` as it stands now and never
+    /// followed afterwards, which is what lets a snapshot outlive the database it
+    /// was taken of. The copy is not restorable yet: the
+    /// clock owes it [`RELATIONAL_DATABASE_SNAPSHOT_STATE_AVAILABLE`], named by
+    /// the `due` the answered record carries, so the caller can log the operation
+    /// that settle completes.
+    ///
+    /// PRECONDITION: `name` is a snapshot name this account does not already hold
+    /// and the store is below [`MAX_RELATIONAL_DATABASE_SNAPSHOTS`] — a caller
+    /// that skipped either check would replace a record a restore may be using,
+    /// or grow the store past its bound.
+    pub fn snapshot_relational_database(
+        &mut self,
+        source: &StoredRelationalDatabase,
+        name: String,
+        tags: Vec<Tag>,
+        now_ms: i64,
+    ) -> StoredRelationalDatabaseSnapshot {
+        let id = self.mint_uuid();
+        let snapshot = StoredRelationalDatabaseSnapshot {
+            name,
+            arn: relational_database_snapshot_arn(&source.location.region_name, &id),
+            support_code: support_code(&id),
+            created_at_ms: now_ms,
+            location: source.location.clone(),
+            tags,
+            engine: source.blueprint.engine.to_string(),
+            engine_version: source.blueprint.engine_version.to_string(),
+            // The snapshotted disk is the database bundle's own storage — the
+            // size `GetRelationalDatabase` reports as its hardware disk size.
+            size_in_gb: source.bundle.disk_size_in_gb,
+            // A snapshot is a copy of the DATABASE, so the database name and the
+            // master credentials it was created with are captured here too: a
+            // later `CreateRelationalDatabaseFromSnapshot` restores a database
+            // reached with them, and it must still do so after the source has
+            // been deleted. No member of `RelationalDatabaseSnapshot` reports
+            // them, exactly as no member of `RelationalDatabase` reports a
+            // password.
+            master_database_name: source.master_database_name.clone(),
+            master_username: source.master_username.clone(),
+            master_user_password: source.master_user_password.clone(),
+            state: RELATIONAL_DATABASE_SNAPSHOT_STATE_CREATING,
+            due: Some(DueNamedState::after(
+                now_ms,
+                RELATIONAL_DATABASE_SNAPSHOT_STATE_AVAILABLE,
+            )),
+            from_relational_database_name: source.name.clone(),
+            from_relational_database_arn: source.arn.clone(),
+            from_relational_database_bundle_id: source.bundle.bundle_id.to_string(),
+            from_relational_database_blueprint_id: source.blueprint.blueprint_id(),
+        };
+        self.insert_relational_database_snapshot(snapshot.clone());
+        snapshot
     }
 
     /// The alarm `name` names, for a reporting operation.
