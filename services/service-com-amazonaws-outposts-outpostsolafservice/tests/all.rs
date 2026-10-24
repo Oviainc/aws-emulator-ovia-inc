@@ -19,6 +19,8 @@ mod availability_zone_identity;
 mod blocking_instances;
 #[path = "all/capacity_task_lifecycle.rs"]
 mod capacity_task_lifecycle;
+#[path = "all/catalog_items.rs"]
+mod catalog_items;
 #[path = "all/error_classification.rs"]
 mod error_classification;
 #[path = "all/error_message_rules.rs"]

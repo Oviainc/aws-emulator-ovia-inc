@@ -211,6 +211,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the networkmonitor monitor store is unavailable".to_string()),
             })
         })?;
+        // The region this request addresses: both the region every ARN minted
+        // here names and the partition of the store the monitor is kept in, so
+        // the monitor exists only through this region's endpoint.
         let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
 
@@ -240,21 +243,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A repeat create is a retry of the ORIGINAL request only when it
         // carries the same idempotency token; a request with no token is not a
-        // retry of anything.
+        // retry of anything. A token replays only in the region it was sent to,
+        // since that is where the monitor it minted lives.
         if let Some(token) = input.client_token.as_deref() {
             let replayed = store
-                .client_tokens
-                .get(token)
+                .client_token_record(&region, token)
                 .filter(|record| {
                     record.probe_id.is_none() && record.monitor_name == input.monitor_name
                 })
                 .map(|record| record.monitor_name.clone());
-            if let Some(monitor) = replayed.and_then(|name| store.monitors.get(&name)) {
+            if let Some(monitor) = replayed.and_then(|name| store.monitor(&region, &name)) {
                 return Ok(output_for(monitor));
             }
         }
 
-        if store.monitors.contains_key(&input.monitor_name) {
+        // `monitorName` is unique per account PER REGION, so the conflict is
+        // raised only against a monitor of the region this request addresses:
+        // the same name is a separate, independently created monitor elsewhere.
+        if store.monitor(&region, &input.monitor_name).is_some() {
             // The conflict is stated from the request and the caller identity
             // alone (see `crate::state::monitor_conflict_message`), so it names
             // nothing this emulator generated.
@@ -267,7 +273,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        if store.monitors.len() >= crate::state::MAX_MONITORS {
+        if store.monitor_count() >= crate::state::MAX_MONITORS {
             return Err(CreateMonitorErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException {
                     message: Some(format!(
@@ -329,7 +335,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             monitor.schedule_activation(now);
         }
         if let Some(token) = input.client_token {
-            store.client_tokens.insert(
+            store.record_client_token(
+                &region,
                 token,
                 crate::state::ClientTokenRecord {
                     monitor_name: monitor.monitor_name.clone(),
@@ -339,10 +346,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
         let name = monitor.monitor_name.clone();
-        store.monitors.insert(name.clone(), monitor);
+        store.insert_monitor(&region, monitor);
         // Answered from the STORED record, so what the caller is told is what a
-        // later `GetMonitor` reads back.
-        let stored = store.monitors.get(&name).ok_or_else(|| {
+        // later `GetMonitor` of the SAME region reads back.
+        let stored = store.monitor(&region, &name).ok_or_else(|| {
             CreateMonitorErrorModeled::InternalServerException(InternalServerException {
                 message: Some(format!("monitor {name} was not stored")),
             })

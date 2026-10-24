@@ -245,6 +245,29 @@ impl RestApiEntry {
         ordered
     }
 
+    /// This API's documentation versions in creation order — the oldest snapshot first,
+    /// by the creation rank stamped on each record, which is what
+    /// [`DocumentationVersionEntry::sequence`] is for: the records are KEYED by version
+    /// identifier, so their map order is identifier order rather than the order the
+    /// snapshots were taken in.
+    pub fn documentation_versions_in_creation_order(&self) -> Vec<&DocumentationVersionEntry> {
+        let mut ordered: Vec<&DocumentationVersionEntry> =
+            self.documentation_versions.values().collect();
+        ordered.sort_by_key(|version| (version.sequence, version.version.clone()));
+        ordered
+    }
+
+    /// The version identifiers of [`Self::documentation_versions_in_creation_order`], the
+    /// stable sequence [`page_of`] cuts a `GetDocumentationVersions` page out of. A
+    /// snapshot's identifier IS its key, so it is also the `position` cursor a page hands
+    /// back.
+    pub fn documentation_version_ids_in_creation_order(&self) -> Vec<String> {
+        self.documentation_versions_in_creation_order()
+            .into_iter()
+            .map(|version| version.version.clone())
+            .collect()
+    }
+
     /// This API's deployments in creation order — the oldest deployment first, by the
     /// creation rank stamped on each record, exactly as this crate's other collections of
     /// an API's children are ordered.

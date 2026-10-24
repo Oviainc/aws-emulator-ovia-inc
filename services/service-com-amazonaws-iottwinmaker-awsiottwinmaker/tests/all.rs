@@ -32,6 +32,9 @@ mod component_type_update_references;
 #[path = "all/entity_composite_components.rs"]
 mod entity_composite_components;
 
+#[path = "all/entity_external_id_filter.rs"]
+mod entity_external_id_filter;
+
 #[path = "all/execute_query.rs"]
 mod execute_query;
 

@@ -21,8 +21,8 @@
 //! `IN_PROGRESS` -> `COMPLETED` transition and its projections onto `CallAnalyticsJob`
 //! and `CallAnalyticsJobSummary` — and the Medical Scribe (AWS HealthScribe) jobs, each a
 //! record of the media, settings and channel definitions it was started with, with
-//! its own `IN_PROGRESS` -> `COMPLETED` transition and its projection onto
-//! `MedicalScribeJob`.
+//! its own `IN_PROGRESS` -> `COMPLETED` transition and its projections onto
+//! `MedicalScribeJob` and `MedicalScribeJobSummary`.
 //! Several operations read each record, so
 //! the projections are single-homed here rather than copied into each handler; the
 //! three tagging operations reach every family's tag set through one lookup
@@ -82,7 +82,8 @@ use crate::ops::types::{
     CallAnalyticsJob, CallAnalyticsJobSettings, CallAnalyticsJobSummary, CategoryProperties,
     ChannelDefinition, ContentRedaction, EncryptionConfiguration, InputDataConfig,
     JobExecutionSettings, LanguageIdSettings, LanguageModel, Media,
-    MedicalScribeChannelDefinition, MedicalScribeJob, MedicalScribeOutput,
+    MedicalScribeChannelDefinition, MedicalScribeJob, MedicalScribeJobSummary,
+    MedicalScribeOutput,
     MedicalScribeSettings, MedicalTranscript, MedicalTranscriptionJob,
     MedicalTranscriptionJobSummary, MedicalTranscriptionSetting, ModelSettings, Rule, Settings,
     SubtitlesOutput, Tag,
@@ -786,6 +787,21 @@ impl ComAmazonawsTranscribeTranscribeState {
         let record = self.medical_scribe_jobs.get_mut(name)?;
         record.advance_clock(now);
         Some(record)
+    }
+
+    /// Materialise every clock-owed Medical Scribe job transition, then the stored
+    /// jobs newest first — the order `ListMedicalScribeJobs` documents ("Jobs are
+    /// ordered by creation date, with the newest job first").
+    pub fn medical_scribe_jobs_newest_first(
+        &mut self,
+        now: SystemTime,
+    ) -> Vec<&MedicalScribeJobRecord> {
+        for record in self.medical_scribe_jobs.values_mut() {
+            record.advance_clock(now);
+        }
+        let mut records: Vec<&MedicalScribeJobRecord> = self.medical_scribe_jobs.values().collect();
+        records.sort_by_key(|record| std::cmp::Reverse(record.sequence));
+        records
     }
 
     /// The Call Analytics job named `name`, with every clock-owed transition of it
@@ -2066,6 +2082,28 @@ impl MedicalScribeJobRecord {
             channel_definitions: self.channel_definitions.clone(),
             medical_scribe_context_provided: Some(self.context_provided),
             tags: (!self.tags.is_empty()).then(|| self.tags.clone()),
+        }
+    }
+
+    /// This record as the modelled `MedicalScribeJobSummary` shape, which is what
+    /// `ListMedicalScribeJobs` reports one stored job as.
+    ///
+    /// The summary is a strict projection of the same record `GetMedicalScribeJob`
+    /// reports: it carries only the seven members the shape declares
+    /// (`smithy_query(query="shape", shape="MedicalScribeJobSummary")`), so the
+    /// media, settings, channel definitions, output locations and tags of a job are
+    /// read through `GetMedicalScribeJob` rather than from a listing. `LanguageCode`
+    /// is [`MEDICAL_SCRIBE_LANGUAGE_CODE`] for every job of this family, for the
+    /// reason that constant gives.
+    pub fn to_summary(&self) -> MedicalScribeJobSummary {
+        MedicalScribeJobSummary {
+            medical_scribe_job_name: Some(self.name.clone()),
+            creation_time: Some(to_date_time(self.creation_time)),
+            start_time: self.start_time.map(to_date_time),
+            completion_time: self.completion_time.map(to_date_time),
+            language_code: Some(MEDICAL_SCRIBE_LANGUAGE_CODE.to_string()),
+            medical_scribe_job_status: Some(self.status.clone()),
+            failure_reason: self.failure_reason.clone(),
         }
     }
 }

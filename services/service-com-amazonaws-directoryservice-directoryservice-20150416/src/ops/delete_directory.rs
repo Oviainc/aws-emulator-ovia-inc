@@ -175,6 +175,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .trusts
             .retain(|_, trust| trust.directory_id != removed.directory_id);
 
+        // A directory share is the consumer account's handle on THIS directory, so it
+        // does not outlive it either: keeping it would leave records naming an owner id
+        // no caller can resolve, and a store a create/delete cycle could grow without
+        // end.
+        store
+            .shared_directories
+            .retain(|_, share| share.owner_directory_id != removed.directory_id);
+
         Ok(DeleteDirectoryOutput {
             directory_id: Some(removed.directory_id),
         })

@@ -57,8 +57,10 @@ const SNAPSHOTS: &[(&str, &str, Option<&str>)] = &[
     ("a single character identifier", "7", Some("the seventh")),
 ];
 
-/// `CreateDocumentationVersion` for `api`, with the request body sent as given.
-async fn create_version(gateway: &Gateway, api: &str, request: Value) -> Answer {
+/// `CreateDocumentationVersion` for `api`, with the request body sent as given. Shared
+/// with the `documentation_version_collection` suite, which creates the snapshots it then
+/// lists.
+pub(crate) async fn create_version(gateway: &Gateway, api: &str, request: Value) -> Answer {
     gateway
         .call(
             "POST",
@@ -68,8 +70,10 @@ async fn create_version(gateway: &Gateway, api: &str, request: Value) -> Answer 
         .await
 }
 
-/// `GetDocumentationVersion` for one snapshot of `api`.
-async fn get_version(gateway: &Gateway, api: &str, version: &str) -> Answer {
+/// `GetDocumentationVersion` for one snapshot of `api`. Shared with the
+/// `documentation_version_collection` suite, which reads a listed snapshot back through
+/// the single-snapshot reader.
+pub(crate) async fn get_version(gateway: &Gateway, api: &str, version: &str) -> Answer {
     gateway
         .call(
             "GET",
@@ -79,8 +83,9 @@ async fn get_version(gateway: &Gateway, api: &str, version: &str) -> Answer {
         .await
 }
 
-/// The create request one table row sends.
-fn snapshot_request(version: &str, description: Option<&str>) -> Value {
+/// The create request one table row sends. Shared with the
+/// `documentation_version_collection` suite.
+pub(crate) fn snapshot_request(version: &str, description: Option<&str>) -> Value {
     let mut request = json!({ "documentationVersion": version });
     if let Some(description) = description {
         request["description"] = json!(description);

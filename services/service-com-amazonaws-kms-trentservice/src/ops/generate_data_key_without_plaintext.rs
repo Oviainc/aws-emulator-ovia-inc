@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GenerateDataKeyWithoutPlaintext
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GenerateDataKeyWithoutPlaintext`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: draws a data key of the requested length from the OS CSPRNG, seals it
+//! under the key material of the symmetric encryption KMS key a `KeyId` names, and
+//! answers the sealed copy ALONE. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GenerateDataKeyWithoutPlaintext::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The data key is never persisted and never returned in the clear: the response
+//! carries no plaintext member at all, so the only way back to the bytes is `Decrypt`
+//! on the `CiphertextBlob` with the same encryption context. The blob is the same
+//! AES-256-GCM envelope [`crate::state::seal`] builds for `Encrypt`, so `Decrypt`
+//! inverts it unchanged.
+//!
+//! The length comes from `KeySpec` or from `NumberOfBytes`, never from both and never
+//! from neither: "You must also specify the length of the data key. Use either the
+//! KeySpec or NumberOfBytes parameters (but not both)" (the operation doc below), so a
+//! request that gives both, or gives neither, is refused and nothing is generated.
+//!
+//! "You cannot use an asymmetric KMS key or a key in a custom key store to generate a
+//! data key" (same doc), so a key whose material is not a symmetric encryption key is
+//! refused with the modelled `InvalidKeyUsageException`.
+//!
+//! `GrantTokens` is treated exactly as `Encrypt` treats it: a presented token is the
+//! only permission a handler here can judge, because there is no caller identity to
+//! evaluate a key policy or an IAM policy against. The effect is narrower than AWS,
+//! where a grant token is additive.
 //!
 //! ## Shape of an operation
 //!
@@ -169,6 +183,13 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The smallest and the largest data key one request can ask for: the modelled range of
+/// `NumberOfBytes` (`smithy_query(query="operation",operation="GenerateDataKeyWithoutPlaintext")`).
+/// They bound how much this handler draws and allocates for one request.
+const MIN_DATA_KEY_BYTES: usize = 1;
+/// See [`MIN_DATA_KEY_BYTES`].
+const MAX_DATA_KEY_BYTES: usize = 1024;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -245,18 +266,211 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GenerateDataKeyWithoutPlaintext` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GenerateDataKeyWithoutPlaintextErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GenerateDataKeyWithoutPlaintext"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal("the KMS state store is unavailable"));
+        };
+
+        let region = crate::state::request_region(ctx);
+        let state = state.lock();
+
+        // Permission a request draws from a grant is judged below, once the key is
+        // known and its key state has been judged.
+        let tokens = input.grant_tokens.clone().unwrap_or_default();
+
+        // This operation models no `InvalidArnException`, so a malformed ARN is
+        // reported the same way as an identifier that names nothing: the key is not
+        // found.
+        let key = match state.resolve(&region, &input.key_id) {
+            crate::state::KeyRef::Found(key) => key,
+            crate::state::KeyRef::NotFound | crate::state::KeyRef::MalformedArn => {
+                return Err(GenerateDataKeyWithoutPlaintextErrorModeled::NotFoundException(
+                    NotFoundException {
+                        message: Some(crate::state::key_not_found_message(&region, &input.key_id)),
+                    },
+                )
+                .into());
+            }
+        };
+
+        // A key that is not in the `Enabled` state cannot be used in a cryptographic
+        // operation: a disabled key answers `DisabledException`, and any other
+        // non-usable state answers `KMSInvalidStateException`, which names the state
+        // the key is actually in. Judged BEFORE the grant tokens, so a key that cannot
+        // be used at all reports why rather than reporting an authorization failure.
+        if !key.is_usable() {
+            if key.key_state == crate::state::KEY_STATE_DISABLED {
+                return Err(GenerateDataKeyWithoutPlaintextErrorModeled::DisabledException(
+                    DisabledException {
+                        message: Some(crate::state::invalid_state_message(key)),
+                    },
+                )
+                .into());
+            }
+            return Err(
+                GenerateDataKeyWithoutPlaintextErrorModeled::KMSInvalidStateException(
+                    KMSInvalidStateException {
+                        message: Some(crate::state::invalid_state_message(key)),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The permission a request draws from a grant is exactly what that grant
+        // carries: the grant is on THIS key, it permits this operation, and the
+        // request's encryption context satisfies its constraints. A token that is not
+        // one this service minted names no grant at all, so the TOKEN "is not valid".
+        // A request presenting no grant token is not asking to be authorized by a
+        // grant and is not judged here — see this file's module doc.
+        if !tokens.is_empty() {
+            let named = match state.grants_for_tokens(&region, &tokens) {
+                Ok(named) => named,
+                Err(crate::state::GrantRefusal::MalformedToken) => {
+                    return Err(
+                        GenerateDataKeyWithoutPlaintextErrorModeled::InvalidGrantTokenException(
+                            InvalidGrantTokenException {
+                                message: Some(
+                                    "The specified grant token is not valid.".to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                Err(crate::state::GrantRefusal::NotAuthorized) => Vec::new(),
+            };
+            let permitted = named.iter().any(|grant| {
+                grant.permits(&key.key_id, Self::NAME, input.encryption_context.as_ref())
+            });
+            if !permitted {
+                return Err(crate::scaffolded::Scaffolded::access_denied(
+                    crate::state::grant_access_denied_message(Self::NAME, &key.arn),
+                ));
+            }
+        }
+
+        // "For encrypting, decrypting, re-encrypting, and generating data keys, the
+        // KeyUsage must be ENCRYPT_DECRYPT"
+        // (`smithy_query(query="doc",shape="InvalidKeyUsageException")`).
+        if key.key_usage != crate::state::KEY_USAGE_ENCRYPT_DECRYPT {
+            return Err(invalid_key_usage(format!(
+                "{} has KeyUsage {}, which cannot be used to generate a data key; it must \
+                 be {}.",
+                key.arn,
+                key.key_usage,
+                crate::state::KEY_USAGE_ENCRYPT_DECRYPT
+            )));
+        }
+        // "To generate a data key, you must specify the symmetric encryption KMS key
+        // that is used to encrypt the data key. You cannot use an asymmetric KMS key or
+        // a key in a custom key store to generate a data key" (the operation doc), so
+        // an asymmetric ENCRYPT_DECRYPT key is refused by the modelled error rather
+        // than sealing a data key under material it does not have.
+        if !key.is_symmetric_encryption() {
+            return Err(invalid_key_usage(format!(
+                "{} has KeySpec {}, which is not a symmetric encryption key spec and so \
+                 cannot generate a data key.",
+                key.arn, key.key_spec
+            )));
+        }
+
+        // "You must also specify the length of the data key. Use either the KeySpec or
+        // NumberOfBytes parameters (but not both)" (the operation doc): the two members
+        // are alternative statements of ONE length, so a request stating it twice or
+        // not at all does not say how long the data key is. Neither case is modelled as
+        // an error of this operation, so both are refused as invalid requests.
+        let length = match (input.key_spec.as_deref(), input.number_of_bytes) {
+            (Some(key_spec), None) => {
+                let Some(length) = crate::state::data_key_bytes(key_spec) else {
+                    return Err(crate::scaffolded::Scaffolded::validation(format!(
+                        "KeySpec {key_spec} is not a supported data key spec; it must be one \
+                         of {}.",
+                        DATA_KEY_SPEC_VALUES.join(", ")
+                    )));
+                };
+                length
+            }
+            // `NumberOfBytesType`'s modelled range is already enforced before this
+            // handler runs, and the length is clamped to it here as well, so the number
+            // of bytes drawn below is never a raw request value however the handler is
+            // reached.
+            (None, Some(number_of_bytes)) => usize::try_from(number_of_bytes)
+                .unwrap_or(MIN_DATA_KEY_BYTES)
+                .clamp(MIN_DATA_KEY_BYTES, MAX_DATA_KEY_BYTES),
+            (Some(_), Some(_)) => {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    "KeySpec and NumberOfBytes both specify the length of the data key; \
+                     specify either one of them, but not both.",
+                ));
+            }
+            (None, None) => {
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    "The length of the data key was not specified; specify either KeySpec \
+                     or NumberOfBytes.",
+                ));
+            }
+        };
+
+        // "The request was rejected because the DryRun parameter was specified"
+        // (`smithy_query(query="doc",shape="DryRunOperationException")`): a dry run
+        // checks the request and then always fails, so it is answered AFTER every
+        // check above and BEFORE anything is generated.
+        if input.dry_run == Some(true) {
+            return Err(
+                GenerateDataKeyWithoutPlaintextErrorModeled::DryRunOperationException(
+                    DryRunOperationException {
+                        message: Some(
+                            "The request was rejected because the DryRun parameter was \
+                             specified."
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "The bytes in the key are random; they are not related to the caller or to
+        // the KMS key" (the operation doc), so the data key is drawn from the OS
+        // CSPRNG and every call yields a different one.
+        let Some(data_key) = crate::state::random_bytes(length) else {
+            return Err(internal("a data key could not be generated"));
+        };
+        // The plaintext data key leaves this handler ONLY sealed: the response has no
+        // plaintext member, and the bytes are dropped with `data_key` when `handle`
+        // returns.
+        let Some(ciphertext_blob) =
+            crate::state::seal(key, &data_key, input.encryption_context.as_ref())
+        else {
+            return Err(internal("the data key could not be encrypted"));
+        };
+
+        Ok(GenerateDataKeyWithoutPlaintextOutput {
+            ciphertext_blob: Some(ciphertext_blob),
+            // "The Amazon Resource Name (key ARN) of the KMS key that encrypted the
+            // data key" — the key ARN, not the identifier the request used.
+            key_id: Some(key.arn.clone()),
+            // "The identifier of the key material used to encrypt the data key": the
+            // version of the key's material that sealed it, which is the current one.
+            key_material_id: key.current_key_material_id.clone(),
+        })
     }
+}
+
+/// Refuse a key that cannot perform this operation.
+fn invalid_key_usage(message: impl Into<String>) -> GenerateDataKeyWithoutPlaintextError {
+    GenerateDataKeyWithoutPlaintextErrorModeled::InvalidKeyUsageException(
+        InvalidKeyUsageException {
+            message: Some(message.into()),
+        },
+    )
+    .into()
+}
+
+/// Answer a failure of this emulator itself, never a malformed request.
+fn internal(message: impl Into<String>) -> GenerateDataKeyWithoutPlaintextError {
+    GenerateDataKeyWithoutPlaintextErrorModeled::KMSInternalException(KMSInternalException {
+        message: Some(message.into()),
+    })
+    .into()
 }

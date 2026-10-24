@@ -137,13 +137,14 @@ async fn every_published_version_of_every_pattern_is_reported_from_state() {
                 "case {case:?}: a reported version must describe itself, got {}",
                 summary["description"]
             );
-            // The emulator hosts no document for a catalogue entry, so it reports no URL
-            // rather than one that resolves nowhere.
+            // The document the catalogue publishes for this pattern is reported like
+            // every other member of the record (the rule itself lives in
+            // `catalogue_published_urls.rs`).
             assert!(
-                summary
-                    .get("documentationUrl")
-                    .is_none_or(|url| url.is_null()),
-                "case {case:?}: no documentationUrl is reported, got {}",
+                summary["documentationUrl"]
+                    .as_str()
+                    .is_some_and(|url| !url.is_empty()),
+                "case {case:?}: a reported version must name its document, got {}",
                 summary["documentationUrl"]
             );
             descriptions.insert(description);

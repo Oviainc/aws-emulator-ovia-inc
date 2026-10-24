@@ -2,8 +2,9 @@
 
 //! @op AddNotificationChannel
 //! Registers an SNS topic as a notification channel: mints the channel id and stores
-//! the submitted config against it. IDEMPOTENT by topic — a topic that already backs a
-//! channel is already registered, so the add returns that channel's id and mints nothing.
+//! the submitted config against it. The topic is the channel's identity and a topic may
+//! back at most one channel, so an add whose topic already backs one is refused with
+//! `ConflictException` (HTTP 409) and stores nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -193,21 +194,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut guard = state.lock();
 
-        // IDEMPOTENT BY TARGET. The topic IS the channel: registering a topic that
-        // already backs a channel asks for the registration that is already in place, so
-        // the call reports that channel's id, mints nothing and changes nothing. That is
-        // what lets a converge loop, a retry after an ambiguous timeout, or several
-        // workers running one onboarding step all end with the same single channel and
-        // the same id. Checked BEFORE the store bound, because a call that stores nothing
-        // cannot take the store past it.
+        // CREATION CONFLICT. The topic IS the channel's identity and may back at most
+        // one channel, so the registration this call asks to create already exists: the
+        // add cannot be carried out in the state the resource is in and is refused with
+        // the `ConflictException` (HTTP 409) the model declares for exactly that, naming
+        // the channel the conflict is in. Nothing is minted and nothing is changed, so a
+        // caller that meant to create a registration learns none was created, and one
+        // probing for the conflict sees it. Freeing the topic with
+        // `RemoveNotificationChannel` makes the add succeed again. Checked BEFORE the
+        // store bound, because a call that stores nothing cannot take the store past it.
         if let Some(existing) = guard
             .notification_channels
             .values()
             .find(|channel| channel.sns_topic_arn == topic_arn)
         {
-            return Ok(AddNotificationChannelOutput {
-                id: existing.id.clone(),
-            });
+            return Err(AddNotificationChannelErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "the Amazon SNS topic {topic_arn} already backs notification channel {}",
+                        existing.id
+                    ),
+                    // The conflict is IN the channel that already registers the topic, so
+                    // `ResourceId` is that channel's `NotificationChannelId` and
+                    // `ResourceType` names the kind of resource it is.
+                    resource_id: existing.id.clone(),
+                    resource_type: crate::state::NOTIFICATION_CHANNEL_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
         }
 
         // STORE BOUND. A channel is reclaimed only by `RemoveNotificationChannel`, so

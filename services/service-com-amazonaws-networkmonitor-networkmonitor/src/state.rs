@@ -12,6 +12,12 @@
 //!   detaches. There is no second probe index: `GetMonitor`'s `probes` list is
 //!   the stored map, so a probe can never appear in one place and not the other.
 //!
+//! Those records are held PER REGION
+//! ([`ComAmazonawsNetworkmonitorNetworkmonitorState`]): the service answers on a
+//! per-region endpoint and every ARN it mints names one region, so a request
+//! reaches only the records of the region it was signed for
+//! ([`request_region`]).
+//!
 //! Every value a handler reports is read back out of these records; nothing is
 //! echoed straight from a request without being stored first.
 //!
@@ -146,7 +152,8 @@ pub const MAX_PAGE_SIZE: usize = 25;
 /// An EMULATOR-CHOSEN ceiling, not an AWS quota: the store is in memory and
 /// every request can add to it, so the service answers the modelled
 /// `ServiceQuotaExceededException` past this point rather than growing without
-/// bound. AWS enforces a per-account monitor quota of its own and answers that
+/// bound. It bounds the store as a whole, across every region it holds. AWS
+/// enforces a per-account, per-region monitor quota of its own and answers that
 /// same modelled error.
 pub const MAX_MONITORS: usize = 500;
 
@@ -200,8 +207,9 @@ pub const SUBNET_ID_PREFIX: &str = "subnet-";
 pub const EC2_ID_SUFFIX_LENGTHS: &[usize] = &[8, 17];
 
 /// The `ResourceNotFoundException` message for a monitor this service does not
-/// hold, built from the request and the caller identity: the account the request
-/// was made under, and the `monitorName` it named.
+/// hold in the region the request was signed for, built from the request and the
+/// caller identity: the account the request was made under, and the
+/// `monitorName` it named.
 pub fn monitor_not_found_message(monitor_name: &str) -> String {
     format!(
         "No existing monitor found for account {} and monitorName {monitor_name}.",
@@ -342,8 +350,8 @@ pub fn decode_page_token(token: &str) -> Option<String> {
 /// the cursor.
 ///
 /// `ordered` must be sorted by `key`, which the `monitorName`-keyed
-/// [`BTreeMap`] walk over
-/// [`ComAmazonawsNetworkmonitorNetworkmonitorState::monitors`] already is.
+/// [`BTreeMap`] walk over one region's monitors
+/// ([`ComAmazonawsNetworkmonitorNetworkmonitorState::monitors_in`]) already is.
 pub fn resume_index<T>(ordered: &[T], cursor: &str, key: impl Fn(&T) -> &str) -> usize {
     ordered.partition_point(|item| key(item) < cursor)
 }
@@ -746,10 +754,14 @@ impl Monitor {
 /// as "a monitor or probe", so an ARN resolves to one of these two.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaggedResource {
-    /// A monitor, by `monitorName`.
-    Monitor { monitor_name: String },
-    /// A probe, by the monitor that holds it and its own `probeId`.
+    /// A monitor, by the region that holds it and its `monitorName`.
+    Monitor {
+        region: String,
+        monitor_name: String,
+    },
+    /// A probe, by the region and monitor that hold it and its own `probeId`.
     Probe {
+        region: String,
         monitor_name: String,
         probe_id: String,
     },
@@ -767,20 +779,98 @@ pub struct ClientTokenRecord {
 }
 
 /// Per-service state for com-amazonaws-networkmonitor-networkmonitor. A handler reaches it through [`service_state`].
+///
+/// A monitor is a REGIONAL resource: the service has one endpoint per region
+/// (`https://networkmonitor.<region>.<dnsSuffix>`) and every ARN it mints names
+/// that region, so one `monitorName` identifies a different resource in each
+/// region, and a request reaches only the records of the region its SigV4
+/// credential scope names ([`request_region`]). The store is therefore keyed by
+/// region first, and each region's own map by `monitorName`.
 #[derive(Debug, Default)]
 pub struct ComAmazonawsNetworkmonitorNetworkmonitorState {
-    /// Monitors by `monitorName`, each holding its own probes. Bounded by
-    /// [`MAX_MONITORS`].
-    pub monitors: BTreeMap<String, Monitor>,
-    /// `clientToken` -> what it replays. Bounded by [`MAX_CLIENT_TOKENS`] and
-    /// [`CLIENT_TOKEN_TTL`].
-    pub client_tokens: BTreeMap<String, ClientTokenRecord>,
+    /// Region -> (`monitorName` -> record), each record holding its own probes.
+    /// Bounded by [`MAX_MONITORS`] across every region; a region whose last
+    /// monitor is deleted keeps no empty map behind
+    /// ([`Self::remove_monitor`]).
+    monitors: BTreeMap<String, BTreeMap<String, Monitor>>,
+    /// (region, `clientToken`) -> what it replays. A token is scoped to the
+    /// region it was sent to, like the monitor it minted. Bounded by
+    /// [`MAX_CLIENT_TOKENS`] and [`CLIENT_TOKEN_TTL`].
+    client_tokens: BTreeMap<(String, String), ClientTokenRecord>,
     /// Monotonic counter behind [`Self::next_probe_id`]; never reused within a
     /// run.
     probe_seq: u64,
 }
 
 impl ComAmazonawsNetworkmonitorNetworkmonitorState {
+    /// The monitors of `region`, in `monitorName` order; `None` when that region
+    /// holds none.
+    pub fn monitors_in(&self, region: &str) -> Option<&BTreeMap<String, Monitor>> {
+        self.monitors.get(region)
+    }
+
+    /// One region's monitor, for reporting.
+    pub fn monitor(&self, region: &str, monitor_name: &str) -> Option<&Monitor> {
+        self.monitors.get(region)?.get(monitor_name)
+    }
+
+    /// One region's monitor, for mutation. Does NOT create the region's map, so
+    /// a request naming a monitor nothing stored leaves the store as it found
+    /// it.
+    pub fn monitor_mut(&mut self, region: &str, monitor_name: &str) -> Option<&mut Monitor> {
+        self.monitors.get_mut(region)?.get_mut(monitor_name)
+    }
+
+    /// Store a monitor in `region`, opening that region's map if this is the
+    /// first record kept there. For a create path only, AFTER the request is
+    /// known to be acceptable.
+    pub fn insert_monitor(&mut self, region: &str, monitor: Monitor) {
+        self.monitors
+            .entry(region.to_string())
+            .or_default()
+            .insert(monitor.monitor_name.clone(), monitor);
+    }
+
+    /// Remove one region's monitor, with the probes it holds. A region left
+    /// holding no monitor is dropped with it, so an empty partition never
+    /// lingers.
+    pub fn remove_monitor(&mut self, region: &str, monitor_name: &str) -> Option<Monitor> {
+        let region_monitors = self.monitors.get_mut(region)?;
+        let removed = region_monitors.remove(monitor_name);
+        if region_monitors.is_empty() {
+            self.monitors.remove(region);
+        }
+        removed
+    }
+
+    /// How many monitors this store holds across every region — what
+    /// [`MAX_MONITORS`] bounds, since the ceiling exists to bound the store's
+    /// memory.
+    pub fn monitor_count(&self) -> usize {
+        self.monitors.values().map(BTreeMap::len).sum()
+    }
+
+    /// What a `clientToken` sent to `region` replays, when that region holds a
+    /// record for it.
+    pub fn client_token_record(&self, region: &str, token: &str) -> Option<&ClientTokenRecord> {
+        self.client_tokens
+            .get(&(region.to_string(), token.to_string()))
+    }
+
+    /// Record what a `clientToken` sent to `region` replays.
+    pub fn record_client_token(&mut self, region: &str, token: String, record: ClientTokenRecord) {
+        self.client_tokens
+            .insert((region.to_string(), token), record);
+    }
+
+    /// Forget every `clientToken` of `region` that named this monitor: once the
+    /// monitor is gone those records replay nothing.
+    pub fn forget_client_tokens_of_monitor(&mut self, region: &str, monitor_name: &str) {
+        self.client_tokens.retain(|(token_region, _), record| {
+            token_region != region || record.monitor_name != monitor_name
+        });
+    }
+
     /// A fresh, unique `probeId` in the form the model's `ProbeId` pattern
     /// requires: `^probe-[a-z0-9A-Z-]{21,64}$`, here 24 lowercase hex digits
     /// after the prefix.
@@ -811,8 +901,8 @@ impl ComAmazonawsNetworkmonitorNetworkmonitorState {
     /// or not anybody called, so a read settles it before reporting. Nothing
     /// else about the monitor changes, and `modified_at` is NOT touched: the
     /// caller modified nothing.
-    pub fn settle_monitor(&mut self, monitor_name: &str, now: SystemTime) {
-        let Some(monitor) = self.monitors.get_mut(monitor_name) else {
+    pub fn settle_monitor(&mut self, region: &str, monitor_name: &str, now: SystemTime) {
+        let Some(monitor) = self.monitor_mut(region, monitor_name) else {
             return;
         };
         for probe in monitor.probes.values_mut() {
@@ -829,13 +919,17 @@ impl ComAmazonawsNetworkmonitorNetworkmonitorState {
         }
     }
 
-    /// The same, for every stored monitor: what `ListMonitors` reports is the
-    /// state each monitor is in at the instant of the call, so the whole set is
-    /// settled before the page is built. Bounded by [`MAX_MONITORS`].
-    pub fn settle_all_monitors(&mut self, now: SystemTime) {
-        let names: Vec<String> = self.monitors.keys().cloned().collect();
+    /// The same, for every monitor of ONE region: what `ListMonitors` reports is
+    /// the state each monitor is in at the instant of the call, so that region's
+    /// whole set is settled before the page is built. Bounded by
+    /// [`MAX_MONITORS`].
+    pub fn settle_monitors_in(&mut self, region: &str, now: SystemTime) {
+        let names: Vec<String> = self
+            .monitors_in(region)
+            .map(|monitors| monitors.keys().cloned().collect())
+            .unwrap_or_default();
         for name in names {
-            self.settle_monitor(&name, now);
+            self.settle_monitor(region, &name, now);
         }
     }
 
@@ -844,18 +938,26 @@ impl ComAmazonawsNetworkmonitorNetworkmonitorState {
     ///
     /// The ARN is compared against the one STORED on each record — the ARN the
     /// service minted and reports — so a tagging call reaches exactly the
-    /// resource a read of that ARN reports, and an ARN for a region or an
-    /// account this store never minted resolves to nothing.
-    pub fn resolve_tagged_resource(&self, resource_arn: &str) -> Option<TaggedResource> {
-        for monitor in self.monitors.values() {
+    /// resource a read of that ARN reports, and an ARN for an account this store
+    /// never minted resolves to nothing. Only `region`'s own records are
+    /// considered, so an ARN naming another region's resource resolves to
+    /// nothing here, just as that resource is unreachable through this endpoint.
+    pub fn resolve_tagged_resource(
+        &self,
+        region: &str,
+        resource_arn: &str,
+    ) -> Option<TaggedResource> {
+        for monitor in self.monitors_in(region)?.values() {
             if monitor.monitor_arn == resource_arn {
                 return Some(TaggedResource::Monitor {
+                    region: region.to_string(),
                     monitor_name: monitor.monitor_name.clone(),
                 });
             }
             for probe in monitor.probes.values() {
                 if probe.probe_arn == resource_arn {
                     return Some(TaggedResource::Probe {
+                        region: region.to_string(),
                         monitor_name: monitor.monitor_name.clone(),
                         probe_id: probe.probe_id.clone(),
                     });
@@ -872,15 +974,18 @@ impl ComAmazonawsNetworkmonitorNetworkmonitorState {
     /// resource can never disagree.
     pub fn tags(&self, resource: &TaggedResource) -> Option<&BTreeMap<String, String>> {
         match resource {
-            TaggedResource::Monitor { monitor_name } => {
-                self.monitors.get(monitor_name).map(|monitor| &monitor.tags)
-            }
+            TaggedResource::Monitor {
+                region,
+                monitor_name,
+            } => self
+                .monitor(region, monitor_name)
+                .map(|monitor| &monitor.tags),
             TaggedResource::Probe {
+                region,
                 monitor_name,
                 probe_id,
             } => self
-                .monitors
-                .get(monitor_name)
+                .monitor(region, monitor_name)
                 .and_then(|monitor| monitor.probes.get(probe_id))
                 .map(|probe| &probe.tags),
         }
@@ -892,16 +997,18 @@ impl ComAmazonawsNetworkmonitorNetworkmonitorState {
     /// so a tagging write and a read can never disagree.
     pub fn tags_mut(&mut self, resource: &TaggedResource) -> Option<&mut BTreeMap<String, String>> {
         match resource {
-            TaggedResource::Monitor { monitor_name } => self
-                .monitors
-                .get_mut(monitor_name)
+            TaggedResource::Monitor {
+                region,
+                monitor_name,
+            } => self
+                .monitor_mut(region, monitor_name)
                 .map(|monitor| &mut monitor.tags),
             TaggedResource::Probe {
+                region,
                 monitor_name,
                 probe_id,
             } => self
-                .monitors
-                .get_mut(monitor_name)
+                .monitor_mut(region, monitor_name)
                 .and_then(|monitor| monitor.probes.get_mut(probe_id))
                 .map(|probe| &mut probe.tags),
         }
@@ -915,18 +1022,21 @@ impl ComAmazonawsNetworkmonitorNetworkmonitorState {
     /// actually changed: a tagging call that is a no-op modified nothing.
     pub fn mark_modified(&mut self, resource: &TaggedResource, now: SystemTime) {
         match resource {
-            TaggedResource::Monitor { monitor_name } => {
-                if let Some(monitor) = self.monitors.get_mut(monitor_name) {
+            TaggedResource::Monitor {
+                region,
+                monitor_name,
+            } => {
+                if let Some(monitor) = self.monitor_mut(region, monitor_name) {
                     monitor.modified_at = now;
                 }
             }
             TaggedResource::Probe {
+                region,
                 monitor_name,
                 probe_id,
             } => {
                 if let Some(probe) = self
-                    .monitors
-                    .get_mut(monitor_name)
+                    .monitor_mut(region, monitor_name)
                     .and_then(|monitor| monitor.probes.get_mut(probe_id))
                 {
                     probe.modified_at = now;
@@ -952,7 +1062,7 @@ impl ComAmazonawsNetworkmonitorNetworkmonitorState {
                 .client_tokens
                 .iter()
                 .min_by_key(|(_, record)| record.recorded_at)
-                .map(|(token, _)| token.clone());
+                .map(|(key, _)| key.clone());
             let Some(oldest) = oldest else { break };
             self.client_tokens.remove(&oldest);
         }

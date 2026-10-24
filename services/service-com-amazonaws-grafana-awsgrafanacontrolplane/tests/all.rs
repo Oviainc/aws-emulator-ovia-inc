@@ -52,3 +52,6 @@ mod workspace_grafana_api;
 
 #[path = "all/workspace_lifecycle.rs"]
 mod workspace_lifecycle;
+
+#[path = "all/workspace_native_api.rs"]
+mod workspace_native_api;

@@ -218,6 +218,54 @@ pub struct RuleGroupEntry {
     pub tags: Vec<Tag>,
 }
 
+/// An API key as stored: the encrypted key value, the token domains it carries
+/// and the bookkeeping WAFv2 reports beside them.
+///
+/// An API key is not addressed by a name and an id like the entities above — "the
+/// generated, encrypted API key" IS its identity within a scope
+/// (`DeleteAPIKey$APIKey`, `GetDecryptedAPIKey$APIKey`) — so the entry carries the
+/// key value itself and the two members `APIKeySummary` reports beside it, plus
+/// the pagination cursor this service orders and resumes a listing by (see
+/// [`api_key_cursor`]).
+#[derive(Debug, Clone)]
+pub struct ApiKeyEntry {
+    /// The scope the key was created in.
+    pub scope: String,
+    /// The encrypted key value, as the create call answered it.
+    pub api_key: String,
+    /// `APIKeySummary$TokenDomains`: "the token domains that are defined in this
+    /// API key", in the order the create call gave them.
+    pub token_domains: Vec<String>,
+    /// `APIKeySummary$CreationTimestamp` ("the date and time that the key was
+    /// created") as milliseconds since the Unix epoch, the resolution
+    /// [`date_time_millis`] compares a modelled timestamp at.
+    pub created_at_millis: i64,
+    /// `APIKeySummary$Version`: "internal value used by WAF to manage the key"
+    /// (`APIKeyVersion`, `range(min 0)`, default 0).
+    pub version: i32,
+    /// This entry's position in a listing: [`api_key_cursor`] of the creation
+    /// sequence it was minted with.
+    pub cursor: String,
+}
+
+/// The width an API-key pagination cursor is zero-padded to: the 20 digits
+/// `u64::MAX` takes, so every cursor is the same length and comparing two as
+/// strings orders them by creation.
+const API_KEY_CURSOR_WIDTH: usize = 20;
+
+/// The listing cursor of the `sequence`-th API key this service minted.
+///
+/// `ListAPIKeys`' marker is opaque to a client — the model gives `NextMarker` no
+/// form beyond `length 1..256` and `pattern \S`, and an API key is up to 2048
+/// characters long, so the key value itself cannot be one. This service mints the
+/// cursor from the key's creation sequence instead, zero-padded to
+/// [`API_KEY_CURSOR_WIDTH`] so the lexicographic comparison a resume does is the
+/// numeric one, and so a listing enumerates a scope's keys in the order they were
+/// created.
+pub fn api_key_cursor(sequence: u64) -> String {
+    format!("{sequence:0width$}", width = API_KEY_CURSOR_WIDTH)
+}
+
 /// One request a web ACL evaluated, as WAF's bot visibility recorded it: the URI
 /// path the request asked for and the bot that sent it.
 ///
@@ -310,6 +358,12 @@ pub struct ComAmazonawsWafv2Awswaf20190729State {
     /// `(Scope, Name)` to `Id`, for rule groups: duplicate-name detection and
     /// Name+Id lookup.
     pub rule_group_names: HashMap<(String, String), String>,
+    /// API keys by `(Scope, APIKey)`: the key value is the key's identity within
+    /// its scope. See [`ApiKeyEntry`].
+    pub api_keys: HashMap<(String, String), ApiKeyEntry>,
+    /// How many API keys this service has minted, over every scope: the creation
+    /// sequence [`ApiKeyEntry::cursor`] is rendered from.
+    pub api_keys_minted: u64,
     /// Every resource ARN this service minted, so a by-ARN lookup resolves from
     /// state instead of parsing the ARN back apart.
     pub arn_index: HashMap<String, ResourceRef>,
@@ -319,6 +373,73 @@ pub struct ComAmazonawsWafv2Awswaf20190729State {
 }
 
 impl ComAmazonawsWafv2Awswaf20190729State {
+    /// Store an API key under `scope`, with the next creation cursor, and answer
+    /// the entry as it was stored — or `None` when the scope already holds
+    /// [`MAX_API_KEYS_PER_SCOPE`] of them, which is the refusal a minting
+    /// operation reports as its modelled `WAFLimitsExceededException`.
+    ///
+    /// A key value is the key's identity within its scope, so storing one the
+    /// scope ALREADY holds is idempotent: the stored entry is answered unchanged,
+    /// keeping its creation instant and its place in the listing order rather than
+    /// being re-sequenced to the end.
+    ///
+    /// The cursor bookkeeping and the bound live here rather than in a handler so
+    /// that every operation that mints a key gets a position in the listing order
+    /// without a listing having to invent one, and so no caller can grow this map
+    /// without limit.
+    pub fn insert_api_key(
+        &mut self,
+        scope: &str,
+        api_key: &str,
+        token_domains: Vec<String>,
+        created_at_millis: i64,
+    ) -> Option<ApiKeyEntry> {
+        let key = (scope.to_string(), api_key.to_string());
+        if let Some(stored) = self.api_keys.get(&key) {
+            return Some(stored.clone());
+        }
+        if self.api_keys_count_in_scope(scope) >= MAX_API_KEYS_PER_SCOPE {
+            return None;
+        }
+        self.api_keys_minted = self.api_keys_minted.saturating_add(1);
+        let entry = ApiKeyEntry {
+            scope: scope.to_string(),
+            api_key: api_key.to_string(),
+            token_domains,
+            created_at_millis,
+            // `APIKeyVersion`'s own default: nothing here re-versions a stored
+            // key, so a key keeps the version it was minted with.
+            version: 0,
+            cursor: api_key_cursor(self.api_keys_minted),
+        };
+        self.api_keys.insert(key, entry.clone());
+        Some(entry)
+    }
+
+    /// How many API keys this scope already holds. See
+    /// [`MAX_API_KEYS_PER_SCOPE`].
+    pub fn api_keys_count_in_scope(&self, scope: &str) -> usize {
+        self.api_keys
+            .values()
+            .filter(|entry| entry.scope == scope)
+            .count()
+    }
+
+    /// Every API key stored under `scope`, in the order they were created.
+    ///
+    /// A scope is a namespace, so a listing of one scope never reports a key of
+    /// the other, and the order is the cursor order a marker resumes from (see
+    /// [`api_key_cursor`]).
+    pub fn api_keys_in_scope(&self, scope: &str) -> Vec<&ApiKeyEntry> {
+        let mut entries: Vec<&ApiKeyEntry> = self
+            .api_keys
+            .values()
+            .filter(|entry| entry.scope == scope)
+            .collect();
+        entries.sort_by(|left, right| left.cursor.cmp(&right.cursor));
+        entries
+    }
+
     /// The web ACL stored under `(scope, id)`, but only when it is also the one
     /// called `name`. WAFv2's Get/Update/Delete take Name, Scope AND Id together,
     /// and a triple that does not describe one stored resource names no resource
@@ -628,6 +749,20 @@ pub const MAX_RULE_GROUPS_PER_SCOPE: usize = 100;
 /// to reach it. It is per scope because a scope is a namespace, like every other
 /// bound in this module.
 pub const MAX_REGEX_PATTERN_SETS_PER_SCOPE: usize = 10;
+
+/// The most API keys this service stores per scope before a minting operation
+/// answers its modelled `WAFLimitsExceededException`
+/// ([`ComAmazonawsWafv2Awswaf20190729State::insert_api_key`] is what reports the
+/// bound being reached).
+///
+/// Like [`MAX_REGEX_PATTERN_SETS_PER_SCOPE`], and unlike the three bounds above
+/// it, no published figure is cited here, so this bound is CHOSEN, on the same
+/// reasoning: every minted key is a stored record, so the number a caller can
+/// mint has to be bounded, and the bound is well above the handful of keys a
+/// client application's CAPTCHA integration defines while staying small enough
+/// for a test to reach it. It is per scope because a scope is a namespace, like
+/// every other bound in this module.
+pub const MAX_API_KEYS_PER_SCOPE: usize = 10;
 
 /// The most addresses one IP set holds: WAF's published quota is 10,000 IP
 /// addresses or ranges per IP set. It bounds how large a single stored entry can
