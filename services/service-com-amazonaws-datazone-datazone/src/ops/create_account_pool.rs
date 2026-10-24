@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAccountPool
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAccountPool`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAccountPool::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints an account pool under a PERSISTED, available domain and stores it there, so
+//! `GetAccountPool` answers from the stored record and the pool disappears with its
+//! domain.
+//!
+//! The documented prerequisite is enforced against the store, not assumed: the domain
+//! the pool is created in must exist and be available.
+//!
+//! The model gives an account pool no status member, so a created pool is settled at
+//! once and owes the clock no transition.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +175,124 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAccountPool` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAccountPoolErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAccountPool"))
+        use crate::state::{
+            caller_principal, date_time, now_ms, validate_account_source, AccountPool,
+            DOMAIN_STATUS_AVAILABLE, MAX_ACCOUNT_POOLS_PER_DOMAIN,
+        };
+
+        // The constraints the model declares INSIDE the `AccountSource` union: the
+        // boundary validator does not walk a union's active member, so they are checked
+        // here. The refusal names the member and its constraint, never the value sent.
+        if let Err(message) = validate_account_source(&input.account_source) {
+            return Err(
+                CreateAccountPoolErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateAccountPoolErrorModeled::InternalServerException(InternalServerException {
+                message: "the DataZone store is unavailable".to_string(),
+            })
+        })?;
+        let mut store = state.lock();
+        let now = now_ms();
+        store.settle_clock(now);
+
+        // The pool is created IN a domain, so the domain is resolved from the store
+        // first: this operation models `ResourceNotFoundException`, which is what a
+        // caller naming a domain this emulator does not hold gets.
+        let (domain_status, root_domain_unit_id, pool_count) = store
+            .domains
+            .get(&input.domain_identifier)
+            .map(|domain| {
+                (
+                    domain.status.clone(),
+                    domain.root_domain_unit_id.clone(),
+                    domain.account_pools.len(),
+                )
+            })
+            .ok_or_else(|| {
+                CreateAccountPoolErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::ResourceKind::Domain.not_found_message(),
+                    },
+                )
+            })?;
+        // A domain still being created, or already being deleted, cannot take an
+        // account pool: the request conflicts with the domain's current state.
+        if domain_status != DOMAIN_STATUS_AVAILABLE {
+            return Err(CreateAccountPoolErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "Domain {} is {domain_status}, so it cannot accept an account pool",
+                    input.domain_identifier
+                ),
+            })
+            .into());
+        }
+        // The store is bounded, so a create loop cannot grow the emulator's heap
+        // without limit; the refusal is the error the operation already models.
+        if pool_count >= MAX_ACCOUNT_POOLS_PER_DOMAIN {
+            return Err(CreateAccountPoolErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this emulator stores at most {MAX_ACCOUNT_POOLS_PER_DOMAIN} account pools in one domain"
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let id = store.mint_id(now);
+        let pool = AccountPool {
+            id: id.clone(),
+            domain_id: input.domain_identifier.clone(),
+            name: input.name,
+            description: input.description,
+            resolution_strategy: input.resolution_strategy,
+            account_source: input.account_source,
+            // The request names no domain unit, so the pool belongs to the domain's
+            // ROOT unit — the unit a resource created without an explicit one hangs
+            // under.
+            domain_unit_id: root_domain_unit_id,
+            created_by: caller_principal(ctx),
+            created_at_ms: now,
+            // Nothing has updated the pool yet, so its last update IS its creation and
+            // no principal has updated it.
+            last_updated_at_ms: now,
+            updated_by: None,
+        };
+
+        let output = CreateAccountPoolOutput {
+            domain_id: Some(pool.domain_id.clone()),
+            id: Some(pool.id.clone()),
+            name: Some(pool.name.clone()),
+            description: pool.description.clone(),
+            resolution_strategy: Some(pool.resolution_strategy.clone()),
+            account_source: pool.account_source.clone(),
+            created_by: pool.created_by.clone(),
+            created_at: Some(date_time(pool.created_at_ms)),
+            last_updated_at: Some(date_time(pool.last_updated_at_ms)),
+            updated_by: pool.updated_by.clone(),
+            domain_unit_id: Some(pool.domain_unit_id.clone()),
+        };
+
+        // The domain was read under this same lock a few lines up, so it is still
+        // there; if it somehow were not, the pool would be dropped while the response
+        // said it was created, so that impossible case is answered as a server fault
+        // rather than silently.
+        let Some(stored) = store.domains.get_mut(&input.domain_identifier) else {
+            return Err(CreateAccountPoolErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: format!(
+                        "Domain {} disappeared while the account pool was being stored",
+                        input.domain_identifier
+                    ),
+                },
+            )
+            .into());
+        };
+        stored.account_pools.insert(id, pool);
+        Ok(output)
     }
 }
