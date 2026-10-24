@@ -41,7 +41,12 @@ fn past_activation() -> Duration {
 /// One emulator: the shared engine behind the one service under test, mounted in the
 /// production router.
 pub(crate) fn emulator() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    emulator_on(Arc::new(engine::InMemoryEngine::new()))
+}
+
+/// [`emulator`] on an engine the caller holds, for a suite that also reads or seeds this
+/// service's own store through `service_state(&*engine)`.
+pub(crate) fn emulator_on(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(engine));
@@ -83,7 +88,7 @@ pub(crate) fn label(value: &str) -> String {
 
 /// Call the emulator, returning the HTTP status and the parsed JSON body (`Value::Null`
 /// for an empty body).
-async fn call_in(
+pub(crate) async fn call_in(
     router: &MultiServiceRouter,
     region: &str,
     method: &str,
@@ -133,7 +138,7 @@ pub(crate) fn expected_arn(region: &str, name: &str) -> String {
 
 /// A member's value, treating "absent" and "null" alike — the JSON codec omits an absent
 /// optional member rather than writing `null`.
-fn member<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {
+pub(crate) fn member<'a>(value: &'a Value, name: &str) -> Option<&'a Value> {
     value.get(name).filter(|found| !found.is_null())
 }
 
@@ -157,7 +162,7 @@ fn resource_set(value: &Value, field: &str) -> BTreeSet<String> {
 /// timestamp this emulator writes takes the protocol default — epoch seconds for
 /// `restJson1`. Both forms are accepted here so this helper keeps working if that
 /// framework-level gap is closed.
-fn timestamp_secs(value: &Value, field: &str) -> f64 {
+pub(crate) fn timestamp_secs(value: &Value, field: &str) -> f64 {
     let found = value
         .get(field)
         .unwrap_or_else(|| panic!("{field} must be present, got {value}"));
@@ -1346,12 +1351,6 @@ async fn the_operations_outside_this_slice_still_answer_501() {
                 "EndTime": 1_792_003_600,
                 "QueryType": "MEASUREMENTS",
             })),
-        ),
-        (
-            "ListHealthEvents",
-            "GET",
-            "/v20210603/Monitors/untouched-monitor/HealthEvents".to_string(),
-            None,
         ),
         (
             "ListInternetEvents",

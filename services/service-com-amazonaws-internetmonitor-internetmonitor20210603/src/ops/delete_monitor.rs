@@ -150,6 +150,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An idempotency record that named this monitor can no longer report it, so it is
         // dropped with the monitor rather than left pointing at a gap.
         store.forget_tokens_for(&input.monitor_name);
+        // A health event belongs to its monitor, so it goes with the monitor: a monitor
+        // later created with this name is a new monitor, which has had no health events.
+        store.forget_health_events_for(&input.monitor_name);
         Ok(DeleteMonitorOutput {})
     }
 }

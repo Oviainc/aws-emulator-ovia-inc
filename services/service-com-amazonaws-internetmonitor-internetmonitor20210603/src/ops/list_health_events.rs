@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListHealthEvents
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListHealthEvents`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListHealthEvents::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the health events [`crate::state`] holds for the monitor the request names, in
+//! `EventId` order, narrowed by `EventStatus` and by the requested time window, and paged
+//! with `MaxResults` plus an opaque `NextToken`.
+//!
+//! Internet Monitor raises health events itself, from the internet-measurement pipeline it
+//! runs behind a monitor; its API has no operation that creates one. So this listing is
+//! exactly what the store holds, and a monitor nothing has recorded an event for reports
+//! an empty list — never a refusal, and never an event this emulator invented.
+//!
+//! The requested window is read as an INTERSECTION: an event is reported when its own
+//! interval (`StartedAt` to `EndedAt`, or to now while it is still ongoing) overlaps
+//! `StartTime`..`EndTime`. The model's note ("Health events that have start times during
+//! the time frame that is requested are not included") cannot be read as an exclusion of
+//! those events: it would make a window that brackets an event hide it, which contradicts
+//! the same model's `StartTime`/`EndTime` member docs ("The time when a health event
+//! started/ended") and would leave the `ACTIVE` `EventStatus` filter unusable with a
+//! window, since an ongoing event has no `EndedAt` at all.
+//!
+//! `LinkedAccountId` names an account whose monitors this monitoring account can see;
+//! this emulator serves exactly one account, so any other id names monitors that are not
+//! reachable here, which `GetMonitor` refuses the same way.
 //!
 //! ## Shape of an operation
 //!
@@ -90,6 +103,18 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The largest page `MaxResults` allows, from its modelled range 1..25 (see
+/// `smithy_query(query="operation",operation="ListHealthEvents")`). An absent `MaxResults`
+/// takes a full page.
+const MAX_PAGE_SIZE: i32 = 25;
+
+/// A stored instant as the epoch seconds the request's `StartTime` and `EndTime` are
+/// compared in: one scale for both sides of the window test, through the same wire
+/// conversion the reported timestamps go through.
+fn epoch_secs(at: ::std::time::SystemTime) -> f64 {
+    crate::state::wire_timestamp(at).as_secs_f64()
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -159,20 +184,147 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListHealthEvents` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListHealthEventsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListHealthEvents"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListHealthEventsError::Modeled(ListHealthEventsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("monitor store is unavailable".to_string()),
+                },
+            ))
+        })?;
+
+        // This emulator serves exactly one account, so the only id that can name monitors
+        // reachable here is its own.
+        if let Some(linked) = input.linked_account_id.as_deref() {
+            if linked != ::engine::emulator_account_id() {
+                return Err(ListHealthEventsErrorModeled::ValidationException(ValidationException {
+                    message: Some(format!(
+                        "LinkedAccountId {linked} is not an account linked to this monitoring account."
+                    )),
+                })
+                .into());
+            }
+        }
+
+        // `EventStatus` targets the `HealthEventStatus` enum, so the boundary validator
+        // refuses a value outside it before this handler runs; the check is kept so a
+        // value that ever reached here unvalidated is a refusal rather than a silently
+        // empty page.
+        let status_filter = input.event_status.as_deref();
+        if let Some(filter) = status_filter {
+            if !HEALTH_EVENT_STATUS_VALUES.contains(&filter) {
+                return Err(ListHealthEventsErrorModeled::ValidationException(ValidationException {
+                    message: Some(format!(
+                        "EventStatus {} is not one of: {}.",
+                        filter,
+                        HEALTH_EVENT_STATUS_VALUES.join(", ")
+                    )),
+                })
+                .into());
+            }
+        }
+
+        let window_start = input.start_time.map(|at| at.as_secs_f64());
+        let window_end = input.end_time.map(|at| at.as_secs_f64());
+        // A window that ends before it starts selects no instant at all, so it is a bad
+        // request rather than an empty page.
+        if let (Some(start), Some(end)) = (window_start, window_end) {
+            if start > end {
+                return Err(ListHealthEventsErrorModeled::ValidationException(ValidationException {
+                    message: Some("StartTime must not be after EndTime.".to_string()),
+                })
+                .into());
+            }
+        }
+
+        // The token is opaque to the caller, so one this service did not mint is a bad
+        // request rather than an empty page.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(event_id) => Some(event_id),
+                None => {
+                    return Err(ListHealthEventsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(
+                                "NextToken is not a token this service issued.".to_string(),
+                            ),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        // `MaxResults` is modelled 1..25, so the boundary validator has already refused
+        // anything outside that; an absent one takes the maximum page. The clamp keeps the
+        // page size inside the modelled range even if a request ever reached here
+        // unvalidated.
+        let page_size =
+            usize::try_from(input.max_results.unwrap_or(MAX_PAGE_SIZE).clamp(1, MAX_PAGE_SIZE))
+                .unwrap_or(1);
+
+        let now = ::std::time::SystemTime::now();
+        let store = state.lock();
+
+        // Health events are reported per monitor, so a name no monitor carries is the same
+        // refusal `GetMonitor` answers rather than an empty list.
+        if !store.monitors.contains_key(&input.monitor_name) {
+            return Err(ListHealthEventsErrorModeled::ValidationException(ValidationException {
+                message: Some(format!("The monitor {} does not exist.", input.monitor_name)),
+            })
+            .into());
+        }
+
+        // One past the page, so the presence of a further event is what decides whether
+        // there is a `NextToken` — never a token that pages to nothing.
+        let mut page: Vec<&crate::state::HealthEventRecord> = store
+            .health_events_for(&input.monitor_name)
+            .filter(|event| {
+                resume_after
+                    .as_deref()
+                    .is_none_or(|after| event.event_id.as_str() > after)
+            })
+            .filter(|event| status_filter.is_none_or(|filter| event.status() == filter))
+            .filter(|event| {
+                // The requested window and the event's own interval have to overlap: the
+                // event cannot start after the window ends, and cannot end before the
+                // window starts.
+                let started = epoch_secs(event.started_at);
+                let ended = epoch_secs(event.interval_end(now));
+                window_end.is_none_or(|end| started <= end)
+                    && window_start.is_none_or(|start| ended >= start)
+            })
+            .take(page_size.saturating_add(1))
+            .collect();
+
+        let next_token = if page.len() > page_size {
+            page.truncate(page_size);
+            page.last()
+                .map(|event| crate::state::encode_page_token(&event.event_id))
+        } else {
+            None
+        };
+
+        Ok(ListHealthEventsOutput {
+            health_events: page
+                .into_iter()
+                .map(|event| HealthEvent {
+                    event_arn: event.arn.clone(),
+                    event_id: event.event_id.clone(),
+                    started_at: crate::state::wire_timestamp(event.started_at),
+                    ended_at: event.ended_at.map(crate::state::wire_timestamp),
+                    created_at: Some(crate::state::wire_timestamp(event.created_at)),
+                    last_updated_at: crate::state::wire_timestamp(event.last_updated_at),
+                    impacted_locations: event.impacted_locations.clone(),
+                    status: event.status().to_string(),
+                    percent_of_total_traffic_impacted: event.percent_of_total_traffic_impacted,
+                    impact_type: event.impact_type.clone(),
+                    health_score_threshold: event.health_score_threshold,
+                })
+                .collect(),
+            next_token,
+        })
     }
 }
