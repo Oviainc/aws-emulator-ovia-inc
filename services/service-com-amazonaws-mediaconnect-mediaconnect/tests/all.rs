@@ -49,6 +49,8 @@ mod ops_name_bindings;
 mod remove_flow_media_stream;
 #[path = "all/remove_flow_output.rs"]
 mod remove_flow_output;
+#[path = "all/reservation_listing.rs"]
+mod reservation_listing;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/revoke_flow_entitlement.rs"]

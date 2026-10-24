@@ -35,7 +35,8 @@ use crate::ops::types::{
     MediaStreamSourceConfiguration, MediaStreamSourceConfigurationRequest,
     MergeRouterInputIndexedStreamDetails,
     MergeRouterInputStreamDetails, MonitoringConfig,
-    NdiConfig, Output, RouterContentQualityAnalysisConfiguration, RouterInput,
+    NdiConfig, Output, Reservation, ResourceSpecification,
+    RouterContentQualityAnalysisConfiguration, RouterInput,
     RouterInputConfiguration, RouterInputStreamDetails, RouterInputTransitEncryption,
     RouterInputTransitEncryptionKeyConfiguration,
     RouterNetworkInterface, RouterNetworkInterfaceConfiguration,
@@ -60,6 +61,20 @@ pub const STATUS_ACTIVE: &str = "ACTIVE";
 pub const STATUS_STOPPING: &str = "STOPPING";
 /// See [`STATUS_STANDBY`].
 pub const STATUS_DELETING: &str = "DELETING";
+
+/// The `ReservationState` enum the model declares for a reservation
+/// (`smithy_query(query="shape",shape="ReservationState")`: ACTIVE | EXPIRED | PROCESSING
+/// | CANCELED). All four are named here: a purchase is reported in the non-terminal
+/// `PROCESSING` state until the clock settles it `ACTIVE` (see
+/// [`StoredReservation::settle`]), the clock retires an active reservation into the
+/// terminal `EXPIRED` at its end instant, and `CANCELED` is the other terminal value.
+pub const RESERVATION_STATE_PROCESSING: &str = "PROCESSING";
+/// See [`RESERVATION_STATE_PROCESSING`].
+pub const RESERVATION_STATE_ACTIVE: &str = "ACTIVE";
+/// See [`RESERVATION_STATE_PROCESSING`].
+pub const RESERVATION_STATE_EXPIRED: &str = "EXPIRED";
+/// See [`RESERVATION_STATE_PROCESSING`].
+pub const RESERVATION_STATE_CANCELED: &str = "CANCELED";
 
 /// The `GatewayState` enum the model declares for a gateway
 /// (`smithy_query(query="shape",shape="GatewayState")`: CREATING | ACTIVE | UPDATING |
@@ -3137,6 +3152,128 @@ impl StoredRouterNetworkInterface {
     }
 }
 
+/// The documented wire form of `Reservation$Start` and `Reservation$End`: "Use the
+/// following format: `YYYY-MM-DDTHH:mm:SSZ`, where `T` and `Z` are literal characters"
+/// (`smithy_query(query="doc",shape="PurchaseOfferingRequest",member="Start")`).
+///
+/// Both members are modelled as plain strings rather than timestamps, so the service
+/// renders them itself. A reservation record keeps the two as instants
+/// ([`StoredReservation::start_at`], [`StoredReservation::end_at`]) because the clock
+/// decides when the reservation has expired; this is the one place they become the string
+/// a response carries, truncated to the second, which is all that form holds.
+pub fn format_reservation_instant(instant: SystemTime) -> String {
+    let epoch_seconds = match instant.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(since_epoch) => i64::try_from(since_epoch.as_secs()).unwrap_or(i64::MAX),
+        // Before the epoch: the error carries the distance back to the instant.
+        Err(before_epoch) => -i64::try_from(before_epoch.duration().as_secs()).unwrap_or(i64::MAX),
+    };
+    ::aws_smithy_types::DateTime::from_secs(epoch_seconds)
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        // An instant no RFC-3339 date can hold is reported as the empty string rather
+        // than failing the read; no instant this service stores is one.
+        .unwrap_or_default()
+}
+
+/// A reservation the account holds: "a pricing agreement for a discounted rate for a
+/// specific outbound bandwidth" (`smithy_query(query="shape",shape="Reservation")`).
+///
+/// Every term of the offering — its duration, price, description and resource
+/// specification — is COPIED onto the record when the offering is purchased, because
+/// "MediaConnect defines this value in the offering"
+/// (`smithy_query(query="shape",shape="Reservation",member="Duration")`): the reservation
+/// is the agreement that was struck, so a later change to the offering catalogue cannot
+/// rewrite a reservation already bought.
+#[derive(Debug, Clone)]
+pub struct StoredReservation {
+    /// `Reservation$ReservationArn`, the ARN this service minted for the reservation and
+    /// the identity DescribeReservation addresses it by (`@httpLabel ReservationArn`).
+    pub reservation_arn: String,
+    /// `Reservation$ReservationName`, "the name that you assigned to the reservation when
+    /// you purchased the offering".
+    pub reservation_name: String,
+    /// `Reservation$OfferingArn`, the offering this reservation was bought from.
+    pub offering_arn: String,
+    /// `Reservation$OfferingDescription`, that offering's description.
+    pub offering_description: String,
+    /// `Reservation$CurrencyCode`.
+    pub currency_code: String,
+    /// `Reservation$PricePerUnit`, which with [`Self::price_units`] "makes up the rate".
+    pub price_per_unit: String,
+    /// `Reservation$PriceUnits` — a `PriceUnits` value.
+    pub price_units: String,
+    /// `Reservation$Duration`, "the length of time that this reservation is active", in
+    /// [`Self::duration_units`].
+    pub duration: i32,
+    /// `Reservation$DurationUnits` — a `DurationUnits` value.
+    pub duration_units: String,
+    /// `Reservation$ResourceSpecification`, "a definition of the amount of outbound
+    /// bandwidth" the reservation covers.
+    pub resource_specification: ResourceSpecification,
+    /// When the reservation becomes active — `Reservation$Start`, "you set this value when
+    /// you purchase the offering". Rendered by [`format_reservation_instant`].
+    pub start_at: SystemTime,
+    /// When the reservation expires — `Reservation$End`, "calculated based on the start
+    /// date and time that you set and the offering's duration". Rendered by
+    /// [`format_reservation_instant`], and the instant from which [`Self::settle`] reports
+    /// the reservation `EXPIRED`.
+    pub end_at: SystemTime,
+    /// `Reservation$ReservationState` — one of the [`RESERVATION_STATE_PROCESSING`] values.
+    pub reservation_state: String,
+    /// The reservation-state change the clock owes, or `None` when it owes none — the
+    /// same mechanism every other record in this store uses (see [`PendingStatus`]).
+    pub pending: Option<PendingStatus>,
+}
+
+impl StoredReservation {
+    /// Materialise the reservation-state change the clock already made due, if it is due
+    /// at `now`.
+    ///
+    /// Two changes are clock-owed, and neither waits on anybody calling: the state a
+    /// purchase settles into one [`TRANSITION_SPAN`] after it was accepted, and EXPIRY —
+    /// `End` is "the day and time that this reservation expires"
+    /// (`smithy_query(query="shape",shape="Reservation",member="End")`), so from that
+    /// instant on the reservation is expired whether or not it is read. Both terminal
+    /// states stay put: an expired reservation does not come back, and a canceled one is
+    /// never expired on top.
+    pub fn settle(&mut self, now: SystemTime) {
+        if let Some(pending) = self.pending.take() {
+            if now >= pending.due_at {
+                self.reservation_state = pending.status;
+            } else {
+                self.pending = Some(pending);
+            }
+        }
+        let runs_out = self.reservation_state == RESERVATION_STATE_PROCESSING
+            || self.reservation_state == RESERVATION_STATE_ACTIVE;
+        if runs_out && now >= self.end_at {
+            self.reservation_state = RESERVATION_STATE_EXPIRED.to_string();
+            // Expiry is terminal, so a settle still owed would otherwise move the
+            // reservation back out of it.
+            self.pending = None;
+        }
+    }
+
+    /// The modelled `Reservation` for this record — the one projection every reservation
+    /// operation answers from, so no two of them can report one reservation differently.
+    pub fn to_reservation(&self) -> Reservation {
+        Reservation {
+            currency_code: self.currency_code.clone(),
+            duration: self.duration,
+            duration_units: self.duration_units.clone(),
+            end: format_reservation_instant(self.end_at),
+            offering_arn: self.offering_arn.clone(),
+            offering_description: self.offering_description.clone(),
+            price_per_unit: self.price_per_unit.clone(),
+            price_units: self.price_units.clone(),
+            reservation_arn: self.reservation_arn.clone(),
+            reservation_name: self.reservation_name.clone(),
+            reservation_state: self.reservation_state.clone(),
+            resource_specification: self.resource_specification.clone(),
+            start: format_reservation_instant(self.start_at),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-mediaconnect-mediaconnect. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsMediaconnectMediaconnectState {
@@ -3212,6 +3349,21 @@ pub struct ComAmazonawsMediaconnectMediaconnectState {
     /// not part of the ARN at all, which the modelled `RouterNetworkInterfaceArn` pattern
     /// fixes to the id alone.
     pub router_network_interfaces: BTreeMap<String, StoredRouterNetworkInterface>,
+    /// Every reservation this account holds, keyed by its ARN — the identity
+    /// DescribeReservation addresses one by (`@httpLabel ReservationArn`). Ordered, so
+    /// ListReservations pages stably.
+    ///
+    /// A reservation is never removed: ListReservations "displays a list of all
+    /// reservations that have been purchased by this account in the current Amazon Web
+    /// Services Region. This list includes all reservations in all states (such as active
+    /// and expired)" (`smithy_query(query="operation",operation="ListReservations")`), so a
+    /// reservation the clock has expired stays in this map and keeps being reported, in its
+    /// terminal state.
+    ///
+    /// There is no index by name beside it, for the same reason as [`Self::gateways`]: the
+    /// model puts no uniqueness rule on `Reservation$ReservationName`, and the reservation
+    /// id in the ARN is what keeps two same-named reservations apart.
+    pub reservations: BTreeMap<String, StoredReservation>,
     /// Monotonic counter minting the unique fragment of every flow / source / output /
     /// entitlement ARN and of the addresses and ports the service assigns.
     pub next_arn_suffix: u64,
@@ -3271,6 +3423,9 @@ impl ComAmazonawsMediaconnectMediaconnectState {
         }
         for interface in self.router_network_interfaces.values_mut() {
             interface.settle(now);
+        }
+        for reservation in self.reservations.values_mut() {
+            reservation.settle(now);
         }
         // A router input or router output whose removal the clock has made due stops
         // existing: the deletion was owed at that instant whether or not anybody called,
@@ -4000,6 +4155,52 @@ pub fn is_mintable_bridge_arn(arn: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-')
         && is_valid_bridge_name(bridge_name)
+}
+
+/// The resource fragment of a reservation ARN: `reservation:<reservation id>:<name>`.
+///
+/// Shaped like [`gateway_resource_fragment`] — the id is the ARN counter in zero-padded
+/// hex, so the fragment is unique per reservation even when two reservations share a name.
+/// The model puts no pattern on `ReservationArn`
+/// (`smithy_query(query="shape",shape="ReservationArn")`: a plain string carrying an
+/// `@arnReference` to `AWS::MediaConnect::Reservation`), so the form is this service's own,
+/// shaped like every other ARN it mints.
+pub fn reservation_resource_fragment(suffix: u64, name: &str) -> String {
+    format!("reservation:1-{suffix:08x}:{name}")
+}
+
+/// Whether `name` can be a reservation name.
+///
+/// Like [`is_valid_gateway_name`]: the model puts no pattern or length on
+/// `Reservation$ReservationName` (`smithy_query(query="shape",shape="Reservation")`:
+/// `ReservationName` targets `String`), and the name is the last segment of the
+/// `ReservationArn` the service mints, which travels as an `@httpLabel` on
+/// DescribeReservation.
+pub fn is_valid_reservation_name(name: &str) -> bool {
+    is_addressable_resource_name(name)
+}
+
+/// Whether `arn` is a reservation ARN this service could have minted: the prefix
+/// [`has_mintable_arn_prefix`] describes for the `reservation` resource type, then the
+/// reservation id [`reservation_resource_fragment`] mints and a name
+/// [`is_valid_reservation_name`] accepts.
+///
+/// ListReservations' `NextToken` is the ARN its next page resumes at, so a token the
+/// service never minted is a semantic error in the request rather than a key to page from.
+/// The reservation it names need NOT still be active: paging must survive the clock
+/// expiring a reservation between pages.
+pub fn is_mintable_reservation_arn(arn: &str) -> bool {
+    let segments: Vec<&str> = arn.split(':').collect();
+    let [.., reservation_id, reservation_name] = segments.as_slice() else {
+        return false;
+    };
+    segments.len() == 8
+        && has_mintable_arn_prefix(&segments, "reservation")
+        && !reservation_id.is_empty()
+        && reservation_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        && is_valid_reservation_name(reservation_name)
 }
 
 /// Whether `arn` is a flow ARN this service could have minted.
