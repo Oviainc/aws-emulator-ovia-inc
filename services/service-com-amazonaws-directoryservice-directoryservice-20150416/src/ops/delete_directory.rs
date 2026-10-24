@@ -167,6 +167,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .snapshots
             .retain(|_, snapshot| snapshot.directory_id != removed.directory_id);
 
+        // A trust is the Amazon Web Services side of a relationship this directory is one
+        // party to, so it does not outlive the directory either: keeping it would leave
+        // records naming an id no caller can resolve, and a store a create/delete cycle
+        // could grow without end.
+        store
+            .trusts
+            .retain(|_, trust| trust.directory_id != removed.directory_id);
+
         Ok(DeleteDirectoryOutput {
             directory_id: Some(removed.directory_id),
         })
