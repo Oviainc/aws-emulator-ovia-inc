@@ -1,15 +1,33 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetParameterHistory
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetParameterHistory`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Retrieve the history of all changes to a parameter. This is the ONLY file to touch
+//! for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetParameterHistory::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The answer is computed from the versions `PutParameter` persisted (see
+//! [`crate::state::ParameterRecord`]): every version the store still retains, oldest
+//! first, each reported with the value, type, key, description, pattern, tier, policies
+//! and labels THAT version carries. Nothing here mutates the store — a read must not
+//! change what a later caller sees.
+//!
+//! ## Paging
+//!
+//! A page carries at most `MaxResults` entries, up to the modelled maximum
+//! ([`crate::state::parameter_history_page_size`]). When versions are left over, the
+//! answer carries the version the next page starts at as its `NextToken`: a version
+//! number, so a second page resumes at the right change even if a put appended another
+//! version in between, which an offset into a list could not. A token naming a version
+//! past the newest one the parameter has could have started no page, so it is the
+//! modelled `InvalidNextToken` rather than a silently empty page.
+//!
+//! ## `WithDecryption` and `SecureString`
+//!
+//! This emulator holds no key material and encrypts nothing, so a `SecureString`'s value
+//! is reported exactly as `PutParameter` persisted it and `WithDecryption` selects
+//! nothing — the same stance `GetParameter` takes, rather than inventing a
+//! ciphertext-shaped blob nothing computed. For `String` and `StringList` the flag is
+//! ignored by the service too ("This flag is ignored for String and StringList parameter
+//! types").
 //!
 //! ## Shape of an operation
 //!
@@ -161,16 +179,124 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
         // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetParameterHistory` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetParameterHistoryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state::{
+            parameter_history_page_size, parse_parameter_query, request_region, trimmed_name,
+            INVALID_NEXT_TOKEN,
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetParameterHistoryErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the parameter store is unavailable".to_string()),
+            })
+        })?;
+
+        // This operation's own doc states the spaces rule: "The service removes any
+        // spaces specified for the beginning or end of a parameter name. If the
+        // specified name for a parameter contains spaces between characters, the request
+        // fails with a ValidationException error" — an error this operation models no
+        // variant for, so it travels on the validation channel.
+        let name = trimmed_name(&input.name).map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        let not_found = || {
+            GetParameterHistoryErrorModeled::ParameterNotFound(ParameterNotFound {
+                message: Some(format!("Parameter {name} not found")),
+            })
+        };
+
+        // A name this service could never have stored (an ARN of another service, say)
+        // names no parameter, so it is a miss rather than a refusal.
+        let Some(query) = parse_parameter_query(name) else {
+            return Err(not_found().into());
+        };
+        // The request names "the parameter for which you want to review history" and the
+        // answer is every version of it, so there is nothing for a `name:selector` to
+        // select: a `Name` naming a version or a label is refused rather than served as
+        // if the selector had not been given.
+        if let Some(selector) = query.selector {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Name '{name}' names the version or label '{selector}': a history read takes the \
+                 name of a parameter and reports every version of it"
+            )));
+        }
+        // A full ARN names the account and the Region its parameter lives in, and a
+        // parameter is reached through the endpoint it was created against: an ARN naming
+        // another account or another Region than this request was signed for names
+        // nothing reachable here. The Region therefore comes from the signed credential
+        // scope, never from the request body.
+        let region = request_region(ctx.parts());
+        if query
+            .account
+            .is_some_and(|account| account != ::engine::emulator_account_id())
+            || query.region.is_some_and(|named| named != region)
+        {
+            return Err(not_found().into());
+        }
+
+        let page_size = parameter_history_page_size(input.max_results)
+            .map_err(crate::scaffolded::Scaffolded::validation)?;
+
+        // The token is the version the next page starts at — a version number, not an
+        // offset into a list that may have grown between two pages — so a token that is
+        // not one was not issued here.
+        let resume_from = match input.next_token.as_deref() {
+            None | Some("") => None,
+            Some(token) => match token.parse::<i64>() {
+                Ok(version) if version > 0 => Some(version),
+                _ => {
+                    return Err(GetParameterHistoryErrorModeled::InvalidNextToken(
+                        InvalidNextToken {
+                            message: Some(INVALID_NEXT_TOKEN.to_string()),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        let store = state.lock();
+        let Some(record) = store.parameter(&region, query.name) else {
+            return Err(not_found().into());
+        };
+        // A token this service issued names a version that was waiting when the previous
+        // page was served, so one naming a version past the newest this parameter has
+        // could start no page of its history and was not issued here. (A version
+        // retention has since displaced is not refused: the walk below resumes at the
+        // oldest version still retained at or after the token, so paging keeps making
+        // forward progress across a put that trimmed one.)
+        if resume_from.is_some_and(|from| record.latest().is_none_or(|last| from > last.version)) {
+            return Err(GetParameterHistoryErrorModeled::InvalidNextToken(InvalidNextToken {
+                message: Some(INVALID_NEXT_TOKEN.to_string()),
+            })
+            .into());
+        }
+
+        // The retained versions, oldest first: that sequence IS the history of changes
+        // to the parameter, and a version the store no longer retains is in no page of
+        // it.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetParameterHistory"))
+        // `WithDecryption` asks for "decrypted values for secure string parameters". The
+        // store holds the value a put supplied, under the key alias that put recorded,
+        // and every parameter read in this crate reports that one stored value, so the
+        // flag changes nothing about which value this read reports.
+        let mut parameters = Vec::new();
+        let mut next_token = None;
+        for version in &record.versions {
+            if resume_from.is_some_and(|from| version.version < from) {
+                continue;
+            }
+            if parameters.len() == page_size {
+                // The page is full and a version is still waiting: hand the caller the
+                // version it resumes at, so the next request continues where this
+                // stopped.
+                next_token = Some(version.version.to_string());
+                break;
+            }
+            parameters.push(version.to_parameter_history(record));
+        }
+
+        Ok(GetParameterHistoryOutput {
+            parameters: Some(parameters),
+            next_token,
+        })
     }
 }

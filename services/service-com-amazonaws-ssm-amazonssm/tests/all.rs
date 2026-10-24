@@ -21,6 +21,8 @@ mod managed_node_filter_validation;
 mod managed_node_information;
 #[path = "all/parameter_deletion.rs"]
 mod parameter_deletion;
+#[path = "all/parameter_history.rs"]
+mod parameter_history;
 #[path = "all/parameter_store.rs"]
 mod parameter_store;
 #[path = "all/parameters_by_path.rs"]
