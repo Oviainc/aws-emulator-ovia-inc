@@ -245,22 +245,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `AvailabilityZone` "must be a valid Availability Zone for the region specified by
         // regionName, or the current region if no regionName is provided": AWS names an
         // Availability Zone by its Region followed by one lowercase letter, which
-        // `crate::state::is_zone_of_region` is this crate's one encoding of. Which zones a
-        // Region actually has is not something this emulator knows, so nothing narrower is
+        // `crate::state::resolved_availability_zone` is this crate's one resolution of —
+        // the same one the flow create resolves its zone with. Which zones a Region
+        // actually has is not something this emulator knows, so nothing narrower is
         // checked. A request that names none is given the Region's first zone, because
         // `RouterInput$AvailabilityZone` is reported for every input.
-        let availability_zone = match input.availability_zone.as_deref() {
-            Some(availability_zone) => {
-                if !crate::state::is_zone_of_region(availability_zone, &region_name) {
-                    return Err(bad_request(format!(
-                        "AvailabilityZone {availability_zone:?} is not an Availability Zone of \
-                         Region {region_name:?}."
-                    )));
-                }
-                availability_zone.to_string()
-            }
-            None => crate::state::default_availability_zone(&region_name),
-        };
+        let availability_zone = crate::state::resolved_availability_zone(
+            input.availability_zone.as_deref(),
+            &region_name,
+        )
+        .map_err(bad_request)?;
 
         // Tags are stored verbatim in a record nothing evicts, so the pairs and their count
         // are bounded before they are stored, through the same functions every other tag

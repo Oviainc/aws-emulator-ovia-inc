@@ -228,11 +228,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
-        // `ClientToken` idempotency: the same token with the same body answers with the
-        // export job the first call minted and creates nothing; with a different body it
-        // is a conflict, because that token already names another export job.
+        // `ClientToken` idempotency, for as long as the token's validity window is open
+        // (`crate::state::CLIENT_TOKEN_VALIDITY`): the same token with the same body
+        // answers with the export job the first call minted and creates nothing; with a
+        // different body it is a conflict, because that token already names another
+        // export job. Past that window the token names nothing and the call is a new
+        // request.
         if let Some(token) = input.client_token.as_deref() {
-            if let Some(job) = state.export_job_by_client_token(token) {
+            if let Some(job) = state.export_job_by_client_token(token, now) {
                 if job.request_fingerprint != fingerprint {
                     return Err(StartSearchResultExportJobErrorModeled::ConflictException(
                         ConflictException {
@@ -393,7 +396,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             export_specification,
             role_arn: input.role_arn.clone(),
             tags,
-            client_token: input.client_token.clone(),
+            // The window the token takes part in idempotency for starts when the
+            // request that used it completed, which is this call.
+            client_token: input
+                .client_token
+                .clone()
+                .map(|token| crate::state::ClientToken::minted(token, now)),
             request_fingerprint: fingerprint,
             next_status_due: Some((
                 now + crate::state::TRANSITION_DELAY,

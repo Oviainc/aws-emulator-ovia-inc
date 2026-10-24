@@ -226,21 +226,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `AvailabilityZone` "must be a valid Availability Zone for the region specified by
         // regionName, or the current region if no regionName is provided"; a request that
-        // names none gets a zone of that Region.
-        let availability_zone = match input
-            .availability_zone
-            .clone()
-            .filter(|zone| !zone.is_empty())
-        {
-            Some(zone) if !crate::state::is_zone_of_region(&zone, &region) => {
-                return Err(bad_request(format!(
-                    "AvailabilityZone {zone:?} is not an Availability Zone of Region \
-                     {region:?}."
-                )))
-            }
-            Some(zone) => zone,
-            None => crate::state::default_availability_zone(&region),
-        };
+        // names none gets a zone of that Region. Resolved through the one function in
+        // `crate::state` every create in this crate resolves the member with.
+        let availability_zone =
+            crate::state::resolved_availability_zone(input.availability_zone.as_deref(), &region)
+                .map_err(bad_request)?;
 
         // A STANDARD output's `Protocol` is implied by the variant of its
         // `ProtocolConfiguration`, so the stored configuration reports the protocol that
