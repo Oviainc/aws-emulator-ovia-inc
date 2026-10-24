@@ -204,10 +204,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
                 .ok_or_else(|| {
                     DescribeSnapshotsErrorModeled::InvalidNextTokenException(
-                        InvalidNextTokenException {
-                            message: Some(crate::state::INVALID_NEXT_TOKEN.to_string()),
-                            request_id: None,
-                        },
+                        crate::state::invalid_next_token(),
                     )
                 })?,
         };
@@ -300,19 +297,12 @@ fn cursor_filter(directory_id: Option<&str>, snapshot_ids: Option<&Vec<String>>)
 /// Refuse the request with the modelled `InvalidParameterException`, naming the member
 /// and the rule it broke so the caller can fix the request from the message alone.
 fn invalid_parameter(message: String) -> DescribeSnapshotsError {
-    DescribeSnapshotsErrorModeled::InvalidParameterException(InvalidParameterException {
-        message: Some(message),
-        request_id: None,
-    })
-    .into()
+    DescribeSnapshotsErrorModeled::InvalidParameterException(crate::state::refusal(message)).into()
 }
 
 /// Report that an id in the request names nothing this service holds — the modelled
 /// `EntityDoesNotExistException`, "The specified entity could not be found".
 fn entity_does_not_exist(message: String) -> DescribeSnapshotsError {
-    DescribeSnapshotsErrorModeled::EntityDoesNotExistException(EntityDoesNotExistException {
-        message: Some(message),
-        request_id: None,
-    })
-    .into()
+    DescribeSnapshotsErrorModeled::EntityDoesNotExistException(crate::state::refusal(message))
+        .into()
 }

@@ -149,12 +149,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.advance_clock(::std::time::SystemTime::now());
 
         let removed = store.directories.remove(&input.directory_id).ok_or_else(|| {
-            DeleteDirectoryErrorModeled::EntityDoesNotExistException(
-                EntityDoesNotExistException {
-                    message: Some(crate::state::no_such_directory(&input.directory_id)),
-                    request_id: None,
-                },
-            )
+            DeleteDirectoryErrorModeled::EntityDoesNotExistException(crate::state::refusal(
+                crate::state::no_such_directory(&input.directory_id),
+            ))
         })?;
 
         // The alias index is deliberately NOT touched: an alias "cannot be deleted or

@@ -176,7 +176,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     }
                     seq.parse::<u64>().ok()
                 })
-                .ok_or_else(|| invalid_parameter(crate::state::INVALID_NEXT_TOKEN.to_string()))?,
+                .ok_or_else(|| {
+                    // The page-token diagnostic, in the shape this operation models for
+                    // it: `ListADAssessments` declares no `InvalidNextTokenException`.
+                    ListADAssessmentsErrorModeled::InvalidParameterException(
+                        crate::state::invalid_next_token(),
+                    )
+                })?,
         };
         let page_size = crate::state::page_size(input.limit);
 
@@ -193,10 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !store.directories.contains_key(directory_id) {
                 return Err(
                     ListADAssessmentsErrorModeled::DirectoryDoesNotExistException(
-                        DirectoryDoesNotExistException {
-                            message: Some(crate::state::no_such_directory(directory_id)),
-                            request_id: None,
-                        },
+                        crate::state::refusal(crate::state::no_such_directory(directory_id)),
                     )
                     .into(),
                 );
@@ -250,13 +253,3 @@ const CURSOR_KIND: &str = "assessments";
 /// under. Not a character a `DirectoryId` can contain, so the two halves are
 /// unambiguous.
 const CURSOR_SEPARATOR: char = '|';
-
-/// Refuse the request with the modelled `InvalidParameterException`, naming the member
-/// and the rule it broke so the caller can fix the request from the message alone.
-fn invalid_parameter(message: String) -> ListADAssessmentsError {
-    ListADAssessmentsErrorModeled::InvalidParameterException(InvalidParameterException {
-        message: Some(message),
-        request_id: None,
-    })
-    .into()
-}
