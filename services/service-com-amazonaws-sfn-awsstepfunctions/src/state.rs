@@ -368,6 +368,22 @@ pub const MAX_EXECUTIONS_PER_STATE_MACHINE: usize = 1_000;
 /// number of state machines.
 pub const MAX_EXECUTIONS: usize = 10_000;
 
+/// The most versions one state machine keeps, refused with the modelled
+/// `ServiceQuotaExceededException`.
+///
+/// `PublishStateMachineVersion`'s own documentation: "You can publish up to 1000
+/// versions for each state machine. You must manually delete unused versions using
+/// the DeleteStateMachineVersion API action."
+pub const MAX_VERSIONS_PER_STATE_MACHINE: usize = 1_000;
+
+/// The `revisionId` a caller names to mean "this state machine has no revision ID
+/// assigned yet".
+///
+/// From `PublishStateMachineVersion`'s `revisionId`: "To specify an initial revision
+/// ID for a state machine with no revision ID assigned, specify the string INITIAL
+/// for the revisionId parameter."
+pub const INITIAL_REVISION_ID: &str = "INITIAL";
+
 /// The most tags one state machine may carry, refused with the modelled
 /// `TooManyTags`. The AWS-wide per-resource tag limit.
 pub const MAX_TAGS: usize = 50;
@@ -1143,6 +1159,35 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
             .map_or(0, |machine| machine.retained_bytes)
     }
 
+    /// The version of one state machine that snapshots the revision `revision_id`
+    /// names (`None` for a state machine that has never been updated), if one was
+    /// ever published from it.
+    ///
+    /// This is what makes publishing idempotent: "It doesn't create a duplicate
+    /// state machine version if it already exists for the current revision. Step
+    /// Functions bases PublishStateMachineVersion's idempotency check on the
+    /// stateMachineArn, name, and revisionId parameters" — the state machine (which
+    /// its ARN and name identify) plus the revision, and nothing else, so the
+    /// description a repeat carries does not make it a different request. The
+    /// HIGHEST-numbered match is reported, so the answer is the same whichever order
+    /// the store was filled in.
+    pub fn version_of_revision(
+        &self,
+        state_machine_arn: &str,
+        revision_id: Option<&str>,
+    ) -> Option<&StateMachineVersion> {
+        self.versions_of(state_machine_arn)
+            .into_iter()
+            .rev()
+            .find(|version| version.revision_id.as_deref() == revision_id)
+    }
+
+    /// How many versions of one state machine the store holds, which
+    /// [`MAX_VERSIONS_PER_STATE_MACHINE`] bounds.
+    pub fn version_count(&self, state_machine_arn: &str) -> usize {
+        self.versions_unordered(state_machine_arn).len()
+    }
+
     /// The published versions of one state machine, in version order.
     pub fn versions_of(&self, state_machine_arn: &str) -> Vec<&StateMachineVersion> {
         let mut versions = self.versions_unordered(state_machine_arn);
@@ -1840,6 +1885,20 @@ pub fn qualifier_version(qualifier: &str) -> Option<u32> {
         return None;
     }
     qualifier.parse().ok()
+}
+
+/// Whether the revision `requested` names is the one a state machine currently
+/// holds in `current`.
+///
+/// A caller pins the revision it wants published: "only publish the state machine
+/// version if the current state machine's revision ID matches the specified ID", and
+/// a state machine that has never been updated carries no revision ID, which the
+/// caller names with [`INITIAL_REVISION_ID`].
+pub fn revision_matches(current: Option<&str>, requested: &str) -> bool {
+    match current {
+        Some(current) => current == requested,
+        None => requested == INITIAL_REVISION_ID,
+    }
 }
 
 /// The ARN of one execution of a state machine.

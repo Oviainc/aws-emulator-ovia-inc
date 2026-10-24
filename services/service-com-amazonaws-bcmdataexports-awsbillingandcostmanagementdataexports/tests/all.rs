@@ -37,6 +37,8 @@ mod front_door_authorization;
 mod not_found_message;
 #[path = "all/not_found_wire_status.rs"]
 mod not_found_wire_status;
+#[path = "all/query_column_selection.rs"]
+mod query_column_selection;
 #[path = "all/query_statement_subset.rs"]
 mod query_statement_subset;
 #[path = "all/resource_tagging.rs"]

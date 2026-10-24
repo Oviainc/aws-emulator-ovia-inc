@@ -391,16 +391,29 @@ impl TableSpec {
         Ok(effective)
     }
 
-    /// This table's schema under `properties`: its columns in catalog order, less the
-    /// ones whose gating property does not hold the value they need.
+    /// The columns this table publishes under `properties`: its columns in catalog order,
+    /// less the ones whose gating property does not hold the value they need.
+    ///
+    /// This is the column set IN FORCE for a request carrying `properties` — what
+    /// [`Self::schema`] reports to a reader of the table, and equally what a submitted
+    /// query may name, so both answer out of this one filter rather than two copies of the
+    /// gating rule.
+    pub fn columns_in_force<'properties>(
+        &self,
+        properties: &'properties BTreeMap<String, String>,
+    ) -> impl Iterator<Item = ColumnSpec> + 'properties {
+        self.columns().filter(move |column| match column.requires {
+            None => true,
+            Some((property, value)) => {
+                properties.get(property).map(String::as_str) == Some(value)
+            }
+        })
+    }
+
+    /// This table's schema under `properties`: the columns in force, as the modelled
+    /// `Column` a reader reports.
     pub fn schema(&self, properties: &BTreeMap<String, String>) -> Vec<Column> {
-        self.columns()
-            .filter(|column| match column.requires {
-                None => true,
-                Some((property, value)) => {
-                    properties.get(property).map(String::as_str) == Some(value)
-                }
-            })
+        self.columns_in_force(properties)
             .map(|column| Column {
                 name: Some(column.name.to_string()),
                 r#type: Some(column.data_type.to_string()),

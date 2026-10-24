@@ -731,28 +731,53 @@ pub fn decode_next_token(token: &str) -> Option<u64> {
 /// `… (Service: CodeConnections; …)`.
 const FRAMEWORK_TAIL_SERVICE: &str = "CodeConnections";
 
-/// The HTTP status a refusal is answered with and the exception the framework names for
-/// it in the tail — kept PAIRED so the status the tail states can never drift from the
-/// status the response carries.
+/// The HTTP status the Git-sync component raised a refusal with and the exception the
+/// framework names for it in the tail — kept PAIRED so the two values a client parses
+/// back out of the tail cannot drift from each other.
 type FrameworkTailFacts = (u16, &'static str);
 
 /// The status this service's recorded wire answers a duplicate repository link with:
 /// HTTP 400, the awsJson1_0 client-error status, not the `@httpError 409` the
 /// `ResourceAlreadyExistsException` shape declares (the recorded
 /// `codestar-connections-repository-link-error-paths#task#3` expectation). The handler
-/// passes it to `crate::scaffolded::Scaffolded::modeled_with_status`, and the tail below
-/// states the same number, so the status the message names cannot drift from the status
-/// the response carries.
+/// passes it to `crate::scaffolded::Scaffolded::modeled_with_status`.
+///
+/// The status the TAIL states is a different number, and deliberately so: see
+/// [`with_framework_tail`].
 pub const REPOSITORY_LINK_ALREADY_EXISTS_STATUS: u16 = 400;
 
-/// A resource the request would create that is already there, paired with the status it
-/// is answered with ([`REPOSITORY_LINK_ALREADY_EXISTS_STATUS`]).
-const TAIL_RESOURCE_ALREADY_EXISTS: FrameworkTailFacts =
-    (REPOSITORY_LINK_ALREADY_EXISTS_STATUS, "ResourceAlreadyExistsException");
+/// A resource the request would create that is already there, paired with the status the
+/// Git-sync component raised it with — the `@httpError` the `ResourceAlreadyExistsException`
+/// shape declares, which is what the tail states ([`with_framework_tail`]).
+const TAIL_RESOURCE_ALREADY_EXISTS: FrameworkTailFacts = (409, "ResourceAlreadyExistsException");
+
+/// The status this service's recorded wire answers a `RepositoryLinkId` that resolves to
+/// no link with: HTTP 400, the awsJson1_0 client-error status, not the `@httpError 404`
+/// the `ResourceNotFoundException` shape declares (the recorded
+/// `codestar-connections-repository-link-error-paths#task#4` and `#teardown#7`
+/// expectations — status 400 with `__type` `ResourceNotFoundException`). The same
+/// endpoint answers every other repository-link refusal that way too (see
+/// [`REPOSITORY_LINK_ALREADY_EXISTS_STATUS`]), and `GetHost` does the same for an absent
+/// host. The handler passes this to `crate::scaffolded::Scaffolded::modeled_with_status`.
+pub const REPOSITORY_LINK_NOT_FOUND_STATUS: u16 = 400;
+
+/// A resource reference that resolves to nothing, paired with the status the Git-sync
+/// component raised it with — the `@httpError` the `ResourceNotFoundException` shape
+/// declares, which is what the tail states ([`with_framework_tail`]).
+const TAIL_RESOURCE_NOT_FOUND: FrameworkTailFacts = (404, "ResourceNotFoundException");
 
 /// `body` followed by the tail the service framework appends to the refusals its Git-sync
 /// component raises:
 /// ` (Service: CodeConnections; Status Code: <status>; Error Code: <code>; Request ID: <id>; Proxy: null)`.
+///
+/// The status the tail states is the one the Git-sync component RAISED the exception
+/// with — the `@httpError` of the modelled shape — and not the status this endpoint
+/// answers the call with: this surface is the legacy front for that component, so it
+/// reports the inner failure verbatim while answering its own client-error status
+/// ([`REPOSITORY_LINK_NOT_FOUND_STATUS`]). The recorded wire of this endpoint carries
+/// exactly that pairing: HTTP 400 with `Status Code: 404` in the tail of an absent link
+/// (`codestar-connections-repository-link-error-paths#teardown#7`) and `Status Code: 409`
+/// in the tail of a duplicate (`#task#3`).
 ///
 /// The request id is the only per-run field: it is minted per call by the service —
 /// nothing in the request carries one — from the emulator's one request-id mint
@@ -776,6 +801,29 @@ pub fn repository_link_already_exists_message(existing_repository_link_arn: &str
     with_framework_tail(
         &format!("RepoConfiguration already exists. Arn: {existing_repository_link_arn}"),
         TAIL_RESOURCE_ALREADY_EXISTS,
+    )
+}
+
+/// What the repository-link surface answers for a `RepositoryLinkId` that resolves to no
+/// link this account holds: the account the lookup was made in and the id that resolved
+/// to nothing, plus the framework tail.
+///
+/// Stated once here so every operation that addresses a link by its id words an absent
+/// link the same way, whichever call found it absent. Built from the REQUEST — it names
+/// the id that was supplied — which is the part of it that is a contract; the status
+/// (400) and the wire code (`ResourceNotFoundException`) are the rest of it. The recorded
+/// wire of this endpoint carries the sentence in TWO casings of the word uuid for the
+/// very same refusal (`…#task#4` records `UUID`, `…#teardown#7` records `uuid`), so the
+/// exact wording is an example of what the service answers rather than a rule it
+/// follows; this is the one of the two forms the sibling CodeConnections service — the
+/// same API under its current name — also words it in.
+pub fn repository_link_not_found_message(repository_link_id: &str) -> String {
+    with_framework_tail(
+        &format!(
+            "Repository not found for accountId: {} and UUID: {repository_link_id}",
+            ::engine::emulator_account_id()
+        ),
+        TAIL_RESOURCE_NOT_FOUND,
     )
 }
 
