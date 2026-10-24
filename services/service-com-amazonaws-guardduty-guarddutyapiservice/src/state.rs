@@ -893,8 +893,10 @@ const _: () = assert!(enum_carries(
 /// Does the generated enum list `values` carry `value`?
 ///
 /// A `const fn` over bytes because `==` on `str` is not usable in a const assertion;
-/// it exists only for the compile-time check above.
-const fn enum_carries(values: &[&str], value: &str) -> bool {
+/// it exists only for compile-time checks like the one above — a handler that names a
+/// modelled enum member in a constant asserts it the same way, so the BUILD fails if
+/// the model stops carrying that member.
+pub const fn enum_carries(values: &[&str], value: &str) -> bool {
     let mut index = 0;
     while index < values.len() {
         if bytes_equal(values[index].as_bytes(), value.as_bytes()) {
@@ -3847,6 +3849,27 @@ fn format_number(n: f64) -> String {
     } else {
         format!("{n}")
     }
+}
+
+/// The second segment of a finding type — the AFFECTED RESOURCE TYPE, in GuardDuty's
+/// own abbreviations: what sits between the `:` and the `/` of
+/// `ThreatPurpose:ResourceTypeAffected/ThreatFamilyName`.
+///
+/// Shared because more than one operation reads that convention: the sample-finding
+/// generator derives the `Resource.ResourceType` it stores from this segment, and the
+/// usage report derives the feature whose data source generated the finding from it.
+/// One reader, so the two can never disagree about what a finding type says.
+pub fn finding_type_affected_resource(finding_type: &str) -> &str {
+    finding_type
+        .split_once(':')
+        .map_or("", |(_, rest)| rest.split('/').next().unwrap_or(""))
+}
+
+/// The last segment of a finding type: the threat family name with its suffixes — the
+/// part that says what the finding was generated FROM (`!DNS` for DNS query data, a
+/// `…MaliciousFile` / `…SuspiciousFile` verdict for a malware scan).
+pub fn finding_type_threat_family(finding_type: &str) -> &str {
+    finding_type.rsplit('/').next().unwrap_or("")
 }
 
 /// The finding attribute paths this emulator can filter and sort on, as the

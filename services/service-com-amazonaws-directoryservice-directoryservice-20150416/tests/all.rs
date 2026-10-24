@@ -21,6 +21,8 @@ mod directory_lifecycle;
 mod directory_limits;
 #[path = "all/directory_networking_and_settings.rs"]
 mod directory_networking_and_settings;
+#[path = "all/error_envelopes.rs"]
+mod error_envelopes;
 #[path = "all/event_topics.rs"]
 mod event_topics;
 #[path = "all/harness.rs"]
