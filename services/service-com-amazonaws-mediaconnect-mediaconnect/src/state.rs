@@ -37,6 +37,7 @@ use crate::ops::types::{
     NdiConfig, Output, RouterContentQualityAnalysisConfiguration, RouterInput,
     RouterInputConfiguration, RouterInputStreamDetails, RouterInputTransitEncryption,
     RouterInputTransitEncryptionKeyConfiguration,
+    RouterNetworkInterface, RouterNetworkInterfaceConfiguration,
     RouterOutput, RouterOutputConfiguration, RouterOutputMessage,
     RouterOutputProtocolConfiguration, RouterOutputStreamDetails, SetSourceRequest, Source,
     StandardRouterInputStreamDetails,
@@ -1929,6 +1930,37 @@ pub const ROUTER_OUTPUT_TYPE_MEDIACONNECT_FLOW: &str = "MEDIACONNECT_FLOW";
 /// See [`ROUTER_OUTPUT_TYPE_STANDARD`].
 pub const ROUTER_OUTPUT_TYPE_MEDIALIVE_INPUT: &str = "MEDIALIVE_INPUT";
 
+/// The `RouterNetworkInterfaceState` enum the model declares for a router network
+/// interface (`smithy_query(query="shape",shape="RouterNetworkInterfaceState")`: CREATING |
+/// ACTIVE | UPDATING | DELETING | ERROR | RECOVERING). Only the two a network interface's
+/// creation reaches are named here; the rest belong to operations that are still
+/// scaffolded.
+pub const ROUTER_NETWORK_INTERFACE_STATE_CREATING: &str = "CREATING";
+/// See [`ROUTER_NETWORK_INTERFACE_STATE_CREATING`]. A network interface that finished being
+/// created is usable: unlike a router input or output there is no start call for one, so
+/// `ACTIVE` is where its creation settles.
+pub const ROUTER_NETWORK_INTERFACE_STATE_ACTIVE: &str = "ACTIVE";
+
+/// The `RouterNetworkInterfaceType` enum the model declares
+/// (`smithy_query(query="shape",shape="RouterNetworkInterfaceType")`: PUBLIC | VPC). Like a
+/// router input's or output's type it is not a request member: it is the variant of the
+/// interface's `RouterNetworkInterfaceConfiguration` union, reported through the one
+/// mapping [`router_network_interface_type`].
+pub const ROUTER_NETWORK_INTERFACE_TYPE_PUBLIC: &str = "PUBLIC";
+/// See [`ROUTER_NETWORK_INTERFACE_TYPE_PUBLIC`].
+pub const ROUTER_NETWORK_INTERFACE_TYPE_VPC: &str = "VPC";
+
+/// `RouterNetworkInterface$NetworkInterfaceType` for an interface configured by
+/// `configuration` — the variant of the configuration union, which is what the type is.
+pub fn router_network_interface_type(
+    configuration: &RouterNetworkInterfaceConfiguration,
+) -> &'static str {
+    match configuration {
+        RouterNetworkInterfaceConfiguration::Public(_) => ROUTER_NETWORK_INTERFACE_TYPE_PUBLIC,
+        RouterNetworkInterfaceConfiguration::Vpc(_) => ROUTER_NETWORK_INTERFACE_TYPE_VPC,
+    }
+}
+
 /// The `MaintenanceType` enum the model declares
 /// (`smithy_query(query="shape",shape="MaintenanceType")`: PREFERRED_DAY_TIME | DEFAULT).
 /// Like a router resource's type, it is not a request member: it is the variant of the
@@ -2089,6 +2121,50 @@ pub fn initial_router_input_stream_details(
     }
 }
 
+/// The ROUTER NETWORK INTERFACE ARN an input configured by `configuration` ingests on
+/// (`StandardRouterInputConfiguration$NetworkInterfaceArn` and the same member on the
+/// FAILOVER and MERGE configurations), or `None` for a configuration that takes its content
+/// from another AWS resource instead and so names no interface.
+///
+/// The crate's ONE reading of that relation on the input side: it is what
+/// `RouterNetworkInterface$AssociatedInputCount` counts
+/// ([`ComAmazonawsMediaconnectMediaconnectState::associated_router_input_count`]) and what
+/// [`router_input_has_own_address`] answers from.
+pub fn router_input_network_interface_arn(
+    configuration: &RouterInputConfiguration,
+) -> Option<&str> {
+    match configuration {
+        RouterInputConfiguration::Standard(standard) => {
+            Some(standard.network_interface_arn.as_str())
+        }
+        RouterInputConfiguration::Failover(failover) => {
+            Some(failover.network_interface_arn.as_str())
+        }
+        RouterInputConfiguration::Merge(merge) => Some(merge.network_interface_arn.as_str()),
+        RouterInputConfiguration::MediaConnectFlow(_)
+        | RouterInputConfiguration::MediaLiveChannel(_) => None,
+    }
+}
+
+/// The ROUTER NETWORK INTERFACE ARN an output configured by `configuration` egresses from
+/// (`StandardRouterOutputConfiguration$NetworkInterfaceArn`), or `None` for a configuration
+/// that delivers into another AWS resource and so names no interface.
+///
+/// The output-side counterpart of [`router_input_network_interface_arn`], and what
+/// `RouterNetworkInterface$AssociatedOutputCount` counts
+/// ([`ComAmazonawsMediaconnectMediaconnectState::associated_router_output_count`]).
+pub fn router_output_network_interface_arn(
+    configuration: &RouterOutputConfiguration,
+) -> Option<&str> {
+    match configuration {
+        RouterOutputConfiguration::Standard(standard) => {
+            Some(standard.network_interface_arn.as_str())
+        }
+        RouterOutputConfiguration::MediaConnectFlow(_)
+        | RouterOutputConfiguration::MediaLiveInput(_) => None,
+    }
+}
+
 /// Whether an input configured by `configuration` ingests on a ROUTER NETWORK INTERFACE of
 /// this account — the configurations that carry a `NetworkInterfaceArn`.
 ///
@@ -2098,12 +2174,7 @@ pub fn initial_router_input_stream_details(
 /// MediaLive channel output) has no address of its own, so the optional member stays
 /// absent for it rather than carrying an address that addresses nothing.
 pub fn router_input_has_own_address(configuration: &RouterInputConfiguration) -> bool {
-    matches!(
-        configuration,
-        RouterInputConfiguration::Standard(_)
-            | RouterInputConfiguration::Failover(_)
-            | RouterInputConfiguration::Merge(_)
-    )
+    router_input_network_interface_arn(configuration).is_some()
 }
 
 /// A router input, as the service holds it between calls. Every router input operation's
@@ -2377,6 +2448,15 @@ pub fn router_output_resource_fragment(id: &str) -> String {
     router_resource_fragment("routerOutput", id)
 }
 
+/// The resource fragment of a router network interface ARN: `routerNetworkInterface:<id>`,
+/// with the id [`router_resource_id`] mints — the form the modelled
+/// `RouterNetworkInterfaceArn` pattern fixes
+/// (`smithy_query(query="shape",shape="RouterNetworkInterfaceArn")`:
+/// `^arn:(aws[a-zA-Z-]*):mediaconnect:[a-z0-9-]+:[0-9]{12}:routerNetworkInterface:[a-z0-9]{12}$`).
+pub fn router_network_interface_resource_fragment(id: &str) -> String {
+    router_resource_fragment("routerNetworkInterface", id)
+}
+
 /// Whether `arn` is an ARN this service could have minted for the ROUTER resource
 /// `resource_type`: the prefix [`has_mintable_arn_prefix`] describes for that type, then an
 /// id of the form [`router_resource_id`] mints.
@@ -2408,6 +2488,14 @@ fn is_mintable_router_resource_arn(arn: &str, resource_type: &str) -> bool {
 /// this function.
 pub fn is_mintable_router_output_arn(arn: &str) -> bool {
     is_mintable_router_resource_arn(arn, "routerOutput")
+}
+
+/// Whether `arn` is a router network interface ARN this service could have minted — the
+/// modelled `RouterNetworkInterfaceArn` constraint, through the one encoding
+/// [`is_mintable_router_resource_arn`]. The integration test asserts minted ARNs through
+/// this function.
+pub fn is_mintable_router_network_interface_arn(arn: &str) -> bool {
+    is_mintable_router_resource_arn(arn, "routerNetworkInterface")
 }
 
 /// Whether `zone` is an Availability Zone of the Region `region`.
@@ -2607,6 +2695,103 @@ impl StoredRouterOutput {
     }
 }
 
+/// The ceiling on how many router network interfaces this store holds.
+///
+/// The same bound, for the same reason, as [`MAX_ROUTER_OUTPUTS`]: nothing evicts a network
+/// interface and a read must still answer what the create created, so the create refuses
+/// once the store is full — with the modelled
+/// `RouterNetworkInterfaceServiceQuotaExceededException` (HTTP 420), which the model
+/// declares on CreateRouterNetworkInterface alone. The number is this emulator's own bound,
+/// not a published AWS default.
+pub const MAX_ROUTER_NETWORK_INTERFACES: usize = 1_000;
+
+/// A router network interface, as the service holds it between calls — "a network interface
+/// that can be associated with one or more router inputs and outputs"
+/// (`smithy_query(query="shape",shape="RouterNetworkInterface")`). Every router network
+/// interface operation's response is computed from this record, and the two association
+/// counts from the input and output records that NAME this interface
+/// ([`ComAmazonawsMediaconnectMediaconnectState::router_network_interface_projection`]).
+#[derive(Debug, Clone)]
+pub struct StoredRouterNetworkInterface {
+    /// `RouterNetworkInterface$Arn` — the interface's identity, and the key of
+    /// [`ComAmazonawsMediaconnectMediaconnectState::router_network_interfaces`].
+    pub arn: String,
+    /// `RouterNetworkInterface$Id`: "the unique identifier of the router network interface"
+    /// — the id segment of [`Self::arn`] ([`router_resource_id`]).
+    pub id: String,
+    pub name: String,
+    /// The configuration the create stored. Its union variant is also what
+    /// [`Self::network_interface_type`] reports.
+    pub configuration: RouterNetworkInterfaceConfiguration,
+    pub region_name: String,
+    /// `RouterNetworkInterface$Tags`, as the create set them. Ordered, so the record has
+    /// one stable reading.
+    pub tags: BTreeMap<String, String>,
+    /// `RouterNetworkInterface$State` — see [`ROUTER_NETWORK_INTERFACE_STATE_CREATING`].
+    pub state: String,
+    /// The state change the clock owes this interface, if any. See [`Self::settle`].
+    pub pending: Option<PendingStatus>,
+    /// The `@idempotencyToken` of the create that minted this interface
+    /// (`CreateRouterNetworkInterfaceRequest$ClientToken`), or `None` when the request
+    /// carried none: a create replaying a token this store already holds returns THIS
+    /// record instead of minting a second one.
+    pub client_token: Option<String>,
+    pub created_at: SystemTime,
+    pub updated_at: SystemTime,
+}
+
+impl StoredRouterNetworkInterface {
+    /// Materialise the state change the clock already made due, if it is due at `now`.
+    ///
+    /// The same contract as [`StoredRouterOutput::settle`]: this is the only write a
+    /// reporting operation (BatchGetRouterNetworkInterface) performs, because the change was
+    /// owed at `due_at` whether or not anybody called.
+    pub fn settle(&mut self, now: SystemTime) {
+        if let Some(pending) = self.pending.take() {
+            if now >= pending.due_at {
+                self.state = pending.status;
+            } else {
+                self.pending = Some(pending);
+            }
+        }
+    }
+
+    /// `RouterNetworkInterface$NetworkInterfaceType`, the variant of the interface's
+    /// configuration union — through the crate's one mapping,
+    /// [`router_network_interface_type`].
+    pub fn network_interface_type(&self) -> &'static str {
+        router_network_interface_type(&self.configuration)
+    }
+
+    /// The modelled `RouterNetworkInterface` for this record, with the two association
+    /// counts resolved by the caller (they live on the input and output records, not here —
+    /// see [`ComAmazonawsMediaconnectMediaconnectState::router_network_interface_projection`]).
+    pub fn to_router_network_interface(
+        &self,
+        associated_input_count: i32,
+        associated_output_count: i32,
+    ) -> RouterNetworkInterface {
+        RouterNetworkInterface {
+            name: self.name.clone(),
+            arn: self.arn.clone(),
+            id: self.id.clone(),
+            state: self.state.clone(),
+            network_interface_type: self.network_interface_type().to_string(),
+            configuration: self.configuration.clone(),
+            associated_output_count,
+            associated_input_count,
+            region_name: self.region_name.clone(),
+            created_at: ::aws_smithy_types::DateTime::from(self.created_at),
+            updated_at: ::aws_smithy_types::DateTime::from(self.updated_at),
+            tags: self
+                .tags
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        }
+    }
+}
+
 /// Per-service state for com-amazonaws-mediaconnect-mediaconnect. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsMediaconnectMediaconnectState {
@@ -2659,6 +2844,17 @@ pub struct ComAmazonawsMediaconnectMediaconnectState {
     /// model puts no uniqueness rule on `RouterOutput$Name`, and the generated output id in
     /// the ARN is what keeps two same-named outputs apart.
     pub router_outputs: BTreeMap<String, StoredRouterOutput>,
+    /// Every router network interface, keyed by its ARN — the identity every router network
+    /// interface operation addresses one by (`@httpLabel Arn`, and the `Arns`
+    /// BatchGetRouterNetworkInterface reads them by). Ordered, so
+    /// ListRouterNetworkInterfaces can page stably.
+    ///
+    /// There is no index by name beside it, for the same reason as [`Self::gateways`]: the
+    /// model puts no uniqueness rule on `RouterNetworkInterface$Name`, and the generated
+    /// interface id in the ARN is what keeps two same-named interfaces apart — the name is
+    /// not part of the ARN at all, which the modelled `RouterNetworkInterfaceArn` pattern
+    /// fixes to the id alone.
+    pub router_network_interfaces: BTreeMap<String, StoredRouterNetworkInterface>,
     /// Monotonic counter minting the unique fragment of every flow / source / output /
     /// entitlement ARN and of the addresses and ports the service assigns.
     pub next_arn_suffix: u64,
@@ -2713,6 +2909,9 @@ impl ComAmazonawsMediaconnectMediaconnectState {
         for router_output in self.router_outputs.values_mut() {
             router_output.settle(now);
         }
+        for interface in self.router_network_interfaces.values_mut() {
+            interface.settle(now);
+        }
         // A router input or router output whose removal the clock has made due stops
         // existing: the deletion was owed at that instant whether or not anybody called,
         // and neither `RouterInputState` nor `RouterOutputState` declares a terminal state
@@ -2765,6 +2964,56 @@ impl ComAmazonawsMediaconnectMediaconnectState {
         self.router_inputs
             .get(arn)
             .map(|router_input| router_input.to_router_input(routed_outputs))
+    }
+
+    /// How many router inputs ingest on the router network interface `interface_arn` —
+    /// `RouterNetworkInterface$AssociatedInputCount`, "the number of router inputs
+    /// associated with the network interface".
+    ///
+    /// The relation lives on the input records (the `NetworkInterfaceArn` their
+    /// configuration names, see [`router_input_network_interface_arn`]), so it is counted
+    /// here rather than held a second time on the interface, where a create or delete of an
+    /// input could leave it stale.
+    pub fn associated_router_input_count(&self, interface_arn: &str) -> i32 {
+        let associated = self
+            .router_inputs
+            .values()
+            .filter(|router_input| {
+                router_input_network_interface_arn(&router_input.configuration)
+                    == Some(interface_arn)
+            })
+            .count();
+        i32::try_from(associated).unwrap_or(i32::MAX)
+    }
+
+    /// How many router outputs egress from the router network interface `interface_arn` —
+    /// `RouterNetworkInterface$AssociatedOutputCount`. Counted from the output records for
+    /// the same reason as [`Self::associated_router_input_count`].
+    pub fn associated_router_output_count(&self, interface_arn: &str) -> i32 {
+        let associated = self
+            .router_outputs
+            .values()
+            .filter(|router_output| {
+                router_output_network_interface_arn(&router_output.configuration)
+                    == Some(interface_arn)
+            })
+            .count();
+        i32::try_from(associated).unwrap_or(i32::MAX)
+    }
+
+    /// The modelled `RouterNetworkInterface` the store holds for `arn`, with both
+    /// association counts resolved — the one projection every router network interface
+    /// operation answers from, so no two of them can report one interface differently.
+    ///
+    /// Does NOT settle the clock: a caller that reports an interface settles the store once
+    /// ([`Self::settle_due_transitions`]) and then projects, so one request cannot see a
+    /// state another request would not.
+    pub fn router_network_interface_projection(&self, arn: &str) -> Option<RouterNetworkInterface> {
+        let interface = self.router_network_interfaces.get(arn)?;
+        Some(interface.to_router_network_interface(
+            self.associated_router_input_count(arn),
+            self.associated_router_output_count(arn),
+        ))
     }
 
     /// How many LIVE gateways the store holds — the count [`MAX_GATEWAYS`] bounds.

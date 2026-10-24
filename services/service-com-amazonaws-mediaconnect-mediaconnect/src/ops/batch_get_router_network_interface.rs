@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetRouterNetworkInterface
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetRouterNetworkInterface`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetRouterNetworkInterface::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the router network interfaces the store holds for the ARNs the request names,
+//! and one error entry for every named ARN the store holds no interface for. The write side
+//! is CreateRouterNetworkInterface.
 //!
 //! ## Shape of an operation
 //!
@@ -80,6 +75,16 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// The `BatchGetRouterNetworkInterfaceError$Code` for an ARN this store holds no router
+/// network interface for.
+///
+/// The per-ARN error carries the code of the failure that ARN would have been answered
+/// with on its own: GetRouterNetworkInterface models `NotFoundException` (HTTP 404) for an
+/// ARN that addresses no router network interface, so that is the code a batch read reports
+/// for it, and the message is the one envelope every not-found in this crate is worded
+/// through ([`crate::state::not_found_message`]).
+const NOT_FOUND_CODE: &str = "NotFoundException";
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -153,18 +158,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetRouterNetworkInterface` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetRouterNetworkInterfaceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetRouterNetworkInterface"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                BatchGetRouterNetworkInterfaceErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        message: "the mediaconnect router network interface store is unavailable"
+                            .to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+        // The ONLY write this reporting operation makes: a network interface state change
+        // the clock already made due (see `crate::state::TRANSITION_SPAN`) was owed at that
+        // instant whether or not anybody called, so it is materialised before reporting.
+        store.settle_due_transitions(::std::time::SystemTime::now());
+
+        // The whole request is answered: an ARN that resolves nothing is NOT a failure of
+        // the call, it is an entry in `Errors` — that is what makes this a batch read. Both
+        // lists follow the order the request named the ARNs in, and each requested resource
+        // is reported once however many times the request repeats its ARN.
+        let mut router_network_interfaces: Vec<RouterNetworkInterface> = Vec::new();
+        let mut errors: Vec<BatchGetRouterNetworkInterfaceError2> = Vec::new();
+        let mut reported: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
+        for arn in &input.arns {
+            if !reported.insert(arn.as_str()) {
+                continue;
+            }
+            // Each interface is projected the one way every router network interface
+            // operation projects one, so its association counts are counted from the router
+            // inputs and outputs that name it rather than held a second time.
+            match store.router_network_interface_projection(arn) {
+                Some(interface) => router_network_interfaces.push(interface),
+                None => errors.push(BatchGetRouterNetworkInterfaceError2 {
+                    arn: arn.clone(),
+                    code: NOT_FOUND_CODE.to_string(),
+                    message: crate::state::not_found_message(arn),
+                }),
+            }
+        }
+
+        Ok(BatchGetRouterNetworkInterfaceOutput {
+            router_network_interfaces,
+            errors,
+        })
     }
 }
