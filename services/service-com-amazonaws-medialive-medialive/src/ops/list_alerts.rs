@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAlerts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAlerts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAlerts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports one channel's alert log: "List the alerts for a channel with optional
+//! filtering based on alert state."
+//!
+//! REPORTING ONLY — it reads the alerts the channel's record holds
+//! (`crate::state::ChannelAlerts`), narrows them with the request's
+//! `StateFilter` and pages over them; it raises, clears and deletes nothing, so
+//! a later caller sees exactly the log this call saw. Nothing in this emulator
+//! ingests media and so nothing observes an alert condition: a channel whose log
+//! no `ChannelRecord::raise_alert` has written lists no alerts, which is the
+//! store's answer and not a fixed one.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +157,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAlerts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAlertsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAlerts"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListAlertsErrorModeled::InternalServerErrorException(InternalServerErrorException {
+                message: Some(crate::state::NO_STORE.to_string()),
+            })
+        })?;
+
+        // `StateFilter` "Specifies the set of alerts to return based on their
+        // state. SET - Return only alerts with SET state. CLEARED - Return only
+        // alerts with CLEARED state. ALL - Return all alerts." The member targets
+        // bare `__string`, so the request boundary admits any string and a value
+        // outside that documented set — which names no set of alerts — is refused
+        // here, naming the member and the values it accepts. An ABSENT filter
+        // narrows nothing, so it asks for them all.
+        let state_filter = input.state_filter.as_deref();
+        if let Some(filter) = state_filter {
+            if !crate::state::CHANNEL_ALERT_FILTERS.contains(&filter) {
+                return Err(bad_request(&format!(
+                    "stateFilter must be one of {}, got {filter}",
+                    crate::state::CHANNEL_ALERT_FILTERS.join(", ")
+                )));
+            }
+        }
+
+        // `MaxResults` is a page size, so a non-positive one asks for nothing and
+        // is a bad request. It is clamped to a finite ceiling, and an absent one
+        // uses that ceiling, so no single request can ask the service to project
+        // an unbounded number of alerts in one response.
+        let page_size = match input.max_results {
+            Some(max_results) if max_results < 1 => {
+                return Err(bad_request(&format!(
+                    "maxResults must be at least 1, got {max_results}"
+                )));
+            }
+            Some(max_results) => (max_results as usize).min(crate::state::MAX_LIST_PAGE_SIZE),
+            None => crate::state::MAX_LIST_PAGE_SIZE,
+        };
+
+        // The token is how many alerts of this filtered sequence the previous
+        // pages already reported. An alert's place in the log is when it was SET,
+        // not its id, so the position in that sequence is what a page resumes
+        // from; a token that is not a whole-number position at all is refused
+        // rather than read as the first page. A position past the end is NOT
+        // refused: the log is bounded ([`crate::state::MAX_CHANNEL_ALERTS`]), so
+        // a token handed out for a page the newest alerts have since pushed out
+        // resumes at the end of the log instead of failing a walk that was valid
+        // when it began. A continuation carries the same `StateFilter` as the
+        // request that was handed the token, which is what a paginator does: the
+        // position counts the alerts THAT filter reports.
+        let already_reported = match input.next_token.as_deref() {
+            Some(token) => token
+                .parse::<usize>()
+                .map_err(|_| bad_request(&format!("nextToken {token} is not an alert position")))?,
+            None => 0,
+        };
+
+        let mut state = state.lock();
+        // Reporting only: `settle` materialises what the clock already made due,
+        // so a channel whose delete has come due is reported in the state it has
+        // reached rather than the one it was left in.
+        state.settle(::std::time::SystemTime::now());
+        let state = &*state;
+
+        // A deleted channel's record is KEPT in its terminal state, so its alerts
+        // go on being reported; only an id that names no channel at all is a 404.
+        let channel = state.channels.get(&input.channel_id).ok_or_else(|| {
+            ListAlertsErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::not_found_message("Channel", &input.channel_id)),
+            })
+        })?;
+
+        let reportable = channel.alerts.in_set_order(state_filter);
+        let alerts: Vec<ChannelAlert> = reportable
+            .iter()
+            .skip(already_reported)
+            .take(page_size)
+            .map(|record| crate::state::channel_alert_output(record))
+            .collect();
+        let reported = already_reported.saturating_add(alerts.len());
+        // Absent on the last page: a token is handed out only when an alert is
+        // left over after this one.
+        let next_token = (reported < reportable.len()).then(|| reported.to_string());
+
+        Ok(ListAlertsOutput {
+            alerts: Some(alerts),
+            next_token,
+        })
     }
+}
+
+/// A request this operation cannot read, as its modelled 400.
+fn bad_request(message: &str) -> ListAlertsError {
+    ListAlertsErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }

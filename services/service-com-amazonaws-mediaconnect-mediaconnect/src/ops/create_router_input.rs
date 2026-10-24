@@ -296,6 +296,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+        // The state changes and the removals the clock already owes are materialised before
+        // anything is read, the way DeleteRouterInput and the reporting operations do it, so
+        // the idempotent replay below, the store bound and the record this call stores all
+        // answer from the store as of `now`: a replay reports the input as the clock leaves
+        // it rather than as the create first answered it, and a `ClientToken` whose input the
+        // clock has already removed mints a new one instead of answering with a record that
+        // no longer exists.
+        store.settle_due_transitions(now);
 
         // `ClientToken` is an `@idempotencyToken`, "a unique identifier for the request to
         // ensure idempotency": a create that repeats a token this store already minted an
@@ -307,12 +315,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .find(|router_input| router_input.client_token.as_deref() == Some(client_token))
                 .map(|router_input| router_input.arn.clone());
             if let Some(arn) = already_minted {
-                let routed_outputs = store.routed_output_count(&arn);
-                if let Some(router_input) = store
-                    .router_inputs
-                    .get(&arn)
-                    .map(|router_input| router_input.to_router_input(routed_outputs))
-                {
+                if let Some(router_input) = store.router_input_projection(&arn, now) {
                     return Ok(CreateRouterInputOutput { router_input });
                 }
             }

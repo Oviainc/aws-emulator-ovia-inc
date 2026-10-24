@@ -1079,6 +1079,58 @@ pub fn decode_cursor(token: &str) -> Option<String> {
     String::from_utf8(::hex::decode(token).ok()?).ok()
 }
 
+/// How many entries a list operation puts on one page, given the `MaxResults` the request
+/// carried.
+///
+/// `MaxResults` is modelled `range 0..100` on every list operation of this service that
+/// takes one, and is the `@paginated` `pageSize`. A page of zero entries with a
+/// continuation token would never advance the walk, so the only reading of 0 under which
+/// the paginated contract terminates is "unspecified" — the same as omitting the member,
+/// which gets [`DEFAULT_MAX_RESULTS`], the largest page the member admits.
+pub fn page_size(max_results: Option<i32>) -> usize {
+    max_results
+        .and_then(|max| usize::try_from(max).ok())
+        .filter(|max| *max > 0)
+        .unwrap_or(DEFAULT_MAX_RESULTS)
+}
+
+/// One page of `jobs`: the `JobListEntry` list a job-listing operation reports, together
+/// with the cursor its next page resumes at — `None` on the last page, since only a page
+/// with jobs after it carries a token.
+///
+/// `next_token` is a cursor an earlier page of the SAME listing minted, naming the job that
+/// page stopped before. A token that decodes to nothing, or to a job this listing does not
+/// hold — one the store no longer holds, or one belonging to a different listing — cannot be
+/// resumed from, which is this function's `None`: the caller answers its own operation's
+/// `InvalidNextTokenException` for it.
+#[allow(clippy::type_complexity)]
+pub fn page_of_jobs(
+    jobs: &[&StoredJob],
+    next_token: Option<&str>,
+    page_size: usize,
+) -> Option<(Vec<JobListEntry>, Option<String>)> {
+    let start = match next_token {
+        None => 0,
+        Some(token) => decode_cursor(token)
+            .and_then(|job_id| jobs.iter().position(|job| job.job_id == job_id))?,
+    };
+    let page: Vec<JobListEntry> = jobs[start..]
+        .iter()
+        .take(page_size)
+        .map(|job| job.to_job_list_entry())
+        .collect();
+    let next = jobs
+        .get(start + page.len())
+        .map(|job| encode_cursor(&job.job_id));
+    Some((page, next))
+}
+
+/// What a list operation says when the `NextToken` it was handed is not one it minted for
+/// the listing being walked, as `InvalidNextTokenException` documents the condition.
+pub const INVALID_NEXT_TOKEN_MESSAGE: &str =
+    "The NextToken string was altered unexpectedly, and the operation has stopped. Run the \
+     operation without changing the NextToken string, and try again.";
+
 /// Per-service state for com-amazonaws-snowball-awsiesnowballjobmanagementservice. A handler reaches it through [`service_state`].
 #[derive(Debug)]
 pub struct ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
@@ -1311,6 +1363,28 @@ impl ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Every job of the cluster `cluster_id` in the order the cluster's nodes were
+    /// created — the order `ListClusterJobs` pages over — or `None` when this store holds
+    /// no cluster under that id.
+    ///
+    /// A cluster's jobs are exactly the node jobs registered against it, whether
+    /// `CreateCluster` made them from `InitialClusterSize` or a later `CreateJob` named the
+    /// cluster, so the listing is read off the cluster's own record rather than by scanning
+    /// every stored job.
+    ///
+    /// Every id a cluster names resolves: nothing in this API removes a job, which is the
+    /// same invariant [`Self::job_parts`] relies on.
+    pub fn cluster_jobs_in_creation_order(&self, cluster_id: &str) -> Option<Vec<&StoredJob>> {
+        let cluster = self.clusters.get(cluster_id)?;
+        Some(
+            cluster
+                .node_job_ids
+                .iter()
+                .filter_map(|job_id| self.jobs.get(job_id))
+                .collect(),
+        )
     }
 
     /// Every stored job in creation order — the order `ListJobs` pages over.

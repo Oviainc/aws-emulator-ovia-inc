@@ -150,56 +150,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
-        // `MaxResults` is modelled `range 0..100` and is the `@paginated` `pageSize`. A
-        // page of zero entries with a continuation token would never advance the walk,
-        // so the only reading of 0 under which the paginated contract terminates is
-        // "unspecified" — the same as omitting the member, which gets the largest page
-        // the member admits.
-        let page_size = input
-            .max_results
-            .and_then(|max| usize::try_from(max).ok())
-            .filter(|max| *max > 0)
-            .unwrap_or(crate::state::DEFAULT_MAX_RESULTS);
+        // The page size, the cursor codec and the entry conversion are the ones every
+        // job-listing operation of this service shares (`state::page_size`,
+        // `state::page_of_jobs`), so `ListJobs` and `ListClusterJobs` cannot drift apart.
+        let page_size = crate::state::page_size(input.max_results);
 
         let store = state.lock();
         let jobs = store.jobs_in_creation_order();
 
-        // A `NextToken` is one this service minted on an earlier page, and it names the
-        // job that page stopped before. A token that decodes to nothing, or to a job the
-        // store no longer holds, cannot be resumed from.
-        let start = match input.next_token.as_deref() {
-            None => 0,
-            Some(token) => {
-                let resume_at = crate::state::decode_cursor(token)
-                    .and_then(|job_id| jobs.iter().position(|job| job.job_id == job_id));
-                match resume_at {
-                    Some(position) => position,
-                    None => {
-                        return Err(ListJobsErrorModeled::InvalidNextTokenException(
-                            InvalidNextTokenException {
-                                message: Some(
-                                    "The NextToken string was altered unexpectedly, and the \
-                                     operation has stopped. Run the operation without changing \
-                                     the NextToken string, and try again."
-                                        .to_string(),
-                                ),
-                            },
-                        )
-                        .into())
-                    }
-                }
-            }
+        let Some((page, next_token)) =
+            crate::state::page_of_jobs(&jobs, input.next_token.as_deref(), page_size)
+        else {
+            return Err(ListJobsErrorModeled::InvalidNextTokenException(
+                InvalidNextTokenException {
+                    message: Some(crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string()),
+                },
+            )
+            .into());
         };
-
-        let page: Vec<JobListEntry> = jobs[start..]
-            .iter()
-            .take(page_size)
-            .map(|job| job.to_job_list_entry())
-            .collect();
-        // Only a page with jobs after it carries a token; the last page carries none.
-        let next_token = jobs
-            .get(start + page.len())
-            .map(|job| crate::state::encode_cursor(&job.job_id));
 
         Ok(ListJobsOutput {
             job_list_entries: Some(page),

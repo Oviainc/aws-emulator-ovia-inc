@@ -372,13 +372,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Read the response back out of the STORE, so what the caller gets is what a
         // later GetRoute will report. The route exists (checked above), so this replaces
         // its record rather than minting a second one, and its `RouteId`, its route
-        // responses and their id seed are carried over untouched by the clone.
+        // responses and their id seed are carried over untouched by the clone. A record
+        // that is somehow not there is answered as the modelled "no such route" rather
+        // than by panicking on a lookup keyed by request input.
         api.routes.insert(input.route_id.clone(), updated);
-        let stored = api
+        let Some(stored) = api
             .routes
             .get(&input.route_id)
             .map(crate::state::Route::to_wire)
-            .expect("the route just written is in the store");
+        else {
+            return Err(UpdateRouteErrorModeled::NotFoundException(NotFoundException {
+                message: Some(format!(
+                    "Invalid Route identifier specified {}:{}",
+                    ::engine::emulator_account_id(),
+                    input.route_id
+                )),
+                resource_type: ::std::option::Option::None,
+            })
+            .into());
+        };
         Ok(UpdateRouteOutput {
             api_gateway_managed: stored.api_gateway_managed,
             api_key_required: stored.api_key_required,

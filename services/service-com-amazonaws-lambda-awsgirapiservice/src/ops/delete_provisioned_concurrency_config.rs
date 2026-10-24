@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteProvisionedConcurrencyConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteProvisionedConcurrencyConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteProvisionedConcurrencyConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes the provisioned concurrency configuration the function record
+//! [`crate::state`] holds for the qualifier the request addressed, so what
+//! `GetProvisionedConcurrencyConfig` and `ListProvisionedConcurrencyConfigs` report
+//! afterwards is the store without it.
+//!
+//! The configuration belongs to the QUALIFIER — it "is added to a function's alias or
+//! version" — so this removes the one the named alias or version holds and leaves every
+//! other qualifier's alone. The operation is `@idempotent`, and the resource it names is
+//! gone either way, so a qualifier holding no configuration is answered the same 204 as
+//! one whose configuration this call removed.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +176,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteProvisionedConcurrencyConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteProvisionedConcurrencyConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteProvisionedConcurrencyConfig"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DeleteProvisionedConcurrencyConfigErrorModeled::ServiceException(
+                    ServiceException {
+                        r#type: None,
+                        message: Some(
+                            "Lambda state is not reachable on this engine".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx);
+        let mut store = state.lock();
+
+        // A configuration "is added to a function's alias or version", and the unpublished
+        // version is neither, so `$LATEST` is not a qualifier one can be removed from
+        // either: the pair names no configuration that could ever exist.
+        if input.qualifier == crate::state::VERSION_LATEST {
+            return Err(
+                DeleteProvisionedConcurrencyConfigErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        r#type: None,
+                        message: Some(
+                            crate::state::PROVISIONED_CONCURRENCY_QUALIFIER_MESSAGE
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The name and qualifier have to name an alias or version of a stored function
+        // before anything it holds can be removed, and resolution is what brings the
+        // record up to whatever the clock already made due.
+        let (record, qualifier) = crate::state::resolve_function(
+            &mut store,
+            &input.function_name,
+            Some(&input.qualifier),
+            &region,
+            ::std::time::SystemTime::now(),
+        )
+        .map_err(|failure| match failure {
+            crate::state::ResolveFailure::Malformed(message) => {
+                DeleteProvisionedConcurrencyConfigErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        r#type: None,
+                        message: Some(message),
+                    },
+                )
+            }
+            crate::state::ResolveFailure::NotFound(message) => {
+                DeleteProvisionedConcurrencyConfigErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        r#type: None,
+                        message: Some(message),
+                    },
+                )
+            }
+        })?;
+
+        record.provisioned_concurrency_configs.remove(&qualifier);
+        Ok(DeleteProvisionedConcurrencyConfigOutput)
     }
 }

@@ -3,12 +3,18 @@
 //! @op DescribeAccountAssignmentCreationStatus
 //!
 //! Reports the STORED status record of the assignment-creation operation a `RequestId`
-//! names, within the instance the request names — a pure read: it writes nothing beyond
-//! what the clock already owes the instances themselves. A `RequestId` this instance
-//! holds no record for is the modelled `ResourceNotFoundException`, and on an ACCOUNT
-//! instance of IAM Identity Center — where account assignments do not exist at all — the
-//! whole permission-set / account-assignment surface answers the modelled
-//! `ValidationException` before anything is looked up.
+//! names, within the instance the request names — a pure read: the operation's `Status`
+//! is DERIVED from the due instant the create stored
+//! (`crate::state::AssignmentOperationRecord::status`), which is how a poller observes
+//! the move from `IN_PROGRESS` to `SUCCEEDED` without this read writing anything beyond
+//! what the clock already owes the instances themselves. This is the POLL
+//! `CreateAccountAssignment` tells a caller to make ("After a successful response, call
+//! DescribeAccountAssignmentCreationStatus to describe the status of an assignment
+//! creation request"). A `RequestId` this instance holds no record for is the modelled
+//! `ResourceNotFoundException`, and on an ACCOUNT instance of IAM Identity Center — where
+//! account assignments do not exist at all — the whole permission-set /
+//! account-assignment surface answers the modelled `ValidationException` before anything
+//! is looked up.
 //!
 //! ## Shape of an operation
 //!
@@ -162,11 +168,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         // A READ, except for what the CLOCK already owes the instances themselves, and
         // the account's ambient instance if nothing has enabled one yet (`on_request`):
-        // reporting a tracked operation's status neither advances it nor creates one.
-        store.on_request(&region, ::std::time::SystemTime::now());
+        // reporting a tracked operation's status neither advances it nor creates one, and
+        // the status itself is derived from the due instant the create stored.
+        store.on_request(&region, now);
 
         // The ACCOUNT-INSTANCE restriction, asked BEFORE any resource lookup: account
         // assignments are a feature of an organization instance, so on an account
@@ -223,9 +231,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
 
         // Answered from the STORED record, so this read cannot disagree with what the
-        // create that minted the request id reported.
+        // create that minted the request id reported, and its `Status` is the one the
+        // clock implies at this instant.
         Ok(DescribeAccountAssignmentCreationStatusOutput {
-            account_assignment_creation_status: Some(record.to_shape()),
+            account_assignment_creation_status: Some(record.to_shape(now)),
         })
     }
 }

@@ -102,6 +102,12 @@ mod list_gateways;
 #[path = "all/workspace_lifecycle.rs"]
 mod workspace_lifecycle;
 
+// Same reasoning: declared outside the sorted list, which is the stretch every
+// concurrent iotsitewise change edits. Fold it into the list once the churn
+// settles.
+#[path = "all/create_pipeline_bounds.rs"]
+mod create_pipeline_bounds;
+
 #[path = "all/asset_hierarchies.rs"]
 mod asset_hierarchies;
 #[path = "all/asset_lifecycle.rs"]

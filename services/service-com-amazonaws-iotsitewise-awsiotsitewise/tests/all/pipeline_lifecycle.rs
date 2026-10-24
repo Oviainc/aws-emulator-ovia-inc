@@ -41,18 +41,21 @@ const WORKSPACE: &str = "plant-floor";
 
 /// `POST|GET /workspaces/{workspaceName}/pipelines`, as `OPERATIONS.md` reports
 /// the route.
-fn pipelines_uri(workspace: &str) -> String {
+///
+/// `pub(crate)` because the sibling `create_pipeline_bounds` suite addresses the
+/// same route: one definition of it, so the two cannot drift.
+pub(crate) fn pipelines_uri(workspace: &str) -> String {
     format!("/workspaces/{workspace}/pipelines")
 }
 
 /// `GET|PUT /workspaces/{workspaceName}/pipelines/{pipelineName}`.
-fn pipeline_uri(workspace: &str, name: &str) -> String {
+pub(crate) fn pipeline_uri(workspace: &str, name: &str) -> String {
     format!("/workspaces/{workspace}/pipelines/{name}")
 }
 
 /// The ARN form this emulator mints for a pipeline: the workspace as well as the
 /// name, since the name is unique only within the workspace.
-fn expected_arn(workspace: &str, name: &str) -> String {
+pub(crate) fn expected_arn(workspace: &str, name: &str) -> String {
     format!(
         "arn:aws:iotsitewise:{REGION}:{}:pipeline/{workspace}/{name}",
         engine::EMULATOR_ACCOUNT_ID
@@ -80,7 +83,7 @@ fn state(body: &Value) -> &str {
 }
 
 /// `CreatePipeline` with `body`.
-async fn create(
+pub(crate) async fn create(
     router: &MultiServiceRouter,
     workspace: &str,
     body: Value,
@@ -99,7 +102,7 @@ async fn update(
 }
 
 /// `DescribePipeline`, at the latest version or at `version`.
-async fn describe(
+pub(crate) async fn describe(
     router: &MultiServiceRouter,
     workspace: &str,
     name: &str,

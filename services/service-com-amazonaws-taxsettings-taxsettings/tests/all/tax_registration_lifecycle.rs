@@ -18,8 +18,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_taxsettings_taxsettings::state::{
-    ComAmazonawsTaxsettingsTaxsettingsState, DEFAULT_PAGE_SIZE, MAX_PAGE_SIZE,
-    MAX_STORED_REGISTRATIONS, STATUS_PENDING,
+    ComAmazonawsTaxsettingsTaxsettingsState, MAX_STORED_REGISTRATIONS, STATUS_PENDING,
+    TAX_REGISTRATIONS_PAGE_BOUNDS,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -527,8 +527,10 @@ async fn seed(router: &MultiServiceRouter, count: usize) -> Vec<String> {
 /// cursor on every page but the last.
 ///
 /// The server-decided size is `maxResults` when the request names one (its
-/// modelled range is 1..=1000, so 1 and 1000 are its published bounds), and
-/// `DEFAULT_PAGE_SIZE` when it does not — never the whole store.
+/// modelled range is 1..=1000, so 1 and 1000 are its published bounds), and this
+/// operation's own documented default when it does not — never the whole store,
+/// and never more than its documented ceiling
+/// ([`TAX_REGISTRATIONS_PAGE_BOUNDS`]).
 #[tokio::test]
 async fn paging_emits_every_registration_exactly_once_in_order() {
     // (stored registrations, requested page size).
@@ -544,11 +546,11 @@ async fn paging_emits_every_registration_exactly_once_in_order() {
         (5, Some(1000)),
         (7, Some(3)),
         (7, None),
-        // More records than the default page size, so the clamp on a request
+        // More records than the default page size, so the bound on a request
         // that names none is observable: it must still page rather than return
         // everything at once.
-        (DEFAULT_PAGE_SIZE + 50, None),
-        (DEFAULT_PAGE_SIZE + 50, Some(1000)),
+        (TAX_REGISTRATIONS_PAGE_BOUNDS.default_size + 50, None),
+        (TAX_REGISTRATIONS_PAGE_BOUNDS.default_size + 50, Some(1000)),
     ];
     for (count, page_size) in shapes.iter().copied() {
         let case = format!("{count} registrations, page size {page_size:?}");
@@ -561,10 +563,8 @@ async fn paging_emits_every_registration_exactly_once_in_order() {
         // Whatever the request asks for, the page the server builds is bounded:
         // by `maxResults` when it named one, by the default otherwise, and by
         // the ceiling in both cases.
-        let bound = page_size
-            .and_then(|size| usize::try_from(size).ok())
-            .unwrap_or(DEFAULT_PAGE_SIZE)
-            .min(MAX_PAGE_SIZE);
+        let bound = TAX_REGISTRATIONS_PAGE_BOUNDS
+            .page_size(page_size.and_then(|size| i32::try_from(size).ok()));
         loop {
             let mut request = serde_json::Map::new();
             if let Some(size) = page_size {

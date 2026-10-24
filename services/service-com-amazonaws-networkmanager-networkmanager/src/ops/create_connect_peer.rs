@@ -209,7 +209,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::AttachmentDetail::Connect { options, .. } => options.protocol.clone(),
                 crate::state::AttachmentDetail::Vpc { .. }
                 | crate::state::AttachmentDetail::SiteToSiteVpn
-                | crate::state::AttachmentDetail::DirectConnectGateway { .. } => None,
+                | crate::state::AttachmentDetail::DirectConnectGateway { .. }
+                | crate::state::AttachmentDetail::TransitGatewayRouteTable { .. } => None,
             };
             (
                 attachment.core_network_id.clone(),

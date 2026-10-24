@@ -6,7 +6,10 @@
 //! loop, and both live here:
 //!
 //! * an **import file task**, minted by `StartImportFileTask` and reported by
-//!   `GetImportFileTask` one at a time and by `ListImportFileTask` a page at a time;
+//!   `GetImportFileTask` one at a time and by `ListImportFileTask` a page at a time —
+//!   including the status report object that import wrote into the report bucket the
+//!   request named, which is what its `statusReportS3Key` names
+//!   ([`import_status_report_key`]);
 //! * an **assessment**, minted by `StartAssessment`, reported by `GetAssessment` and
 //!   `GetLatestAssessmentId`, and moved to a terminal status by `StopAssessment`.
 //!
@@ -62,8 +65,8 @@ pub const IMPORT_IN_PROGRESS: &str = "ImportInProgress";
 
 /// The terminal `ImportFileTaskStatus` an import file task reaches.
 ///
-/// This emulator serves no S3 data plane, so there is no import file to read: the task
-/// completes having imported no records, and [`ImportFileTask::number_of_records_success`]
+/// The contents of the import file are not read, so the task completes having imported
+/// no records, and [`ImportFileTask::number_of_records_success`]
 /// / [`ImportFileTask::number_of_records_failed`] report exactly that — zero — rather
 /// than a count nothing produced.
 pub const IMPORT_SUCCESS: &str = "ImportSuccess";
@@ -158,10 +161,12 @@ pub struct ImportFileTask {
     /// `StartImportFileTaskRequest$groupId`: the groups this import's resources join.
     pub group_id: Vec<Group>,
     /// `StartImportFileTaskRequest$s3bucketForReportData` — the bucket the import
-    /// results would be uploaded to.
+    /// results are uploaded to.
     pub status_report_s3_bucket: Option<String>,
-    /// The key of the status report object. Unset: this emulator writes no report
-    /// object, so there is no key to name.
+    /// The key of the status report object this import wrote inside
+    /// [`Self::status_report_s3_bucket`], set by the start call once the object is
+    /// there. `None` when the request named no report bucket, or when the object could
+    /// not be written: a key is only ever held for an object a caller can read.
     pub status_report_s3_key: Option<String>,
     /// One of `ImportFileTaskStatus`'s values.
     pub status: String,
@@ -210,7 +215,12 @@ impl ImportFileTask {
             input_s3_bucket: Some(self.input_s3_bucket.clone()),
             input_s3_key: Some(self.input_s3_key.clone()),
             status_report_s3_bucket: self.status_report_s3_bucket.clone(),
-            status_report_s3_key: self.status_report_s3_key.clone(),
+            // The status report is the artifact of a FINISHED import, so its key is
+            // reported with the other completion members: a task still importing has
+            // no final report for a caller to read per-record outcomes from.
+            status_report_s3_key: complete
+                .then(|| self.status_report_s3_key.clone())
+                .flatten(),
             completion_time: self
                 .completion_time
                 .map(::aws_smithy_types::DateTime::from),
@@ -1411,10 +1421,9 @@ pub const BUCKET_NAME_PREFIX: &str = "migrationhub-strategy-";
 /// answers for a bucket it cannot reach, naming the bucket the way it reports any such
 /// bucket.
 ///
-/// The prefix is the whole of the check. This emulator serves no S3 data plane, so it
-/// cannot look a bucket up; the documented prefix is the one property of a name it can
-/// decide, and a conforming name is taken to name a bucket the service can use rather
-/// than refusing every start call and leaving the resource unreachable.
+/// The prefix is the whole of the check: it is the one property of a name this check can
+/// decide without a lookup, and a conforming name is taken to name a bucket the service
+/// can use rather than refusing every start call and leaving the resource unreachable.
 pub fn check_bucket_usable(value: Option<&str>) -> Result<(), ValidationException> {
     match value {
         Some(bucket) if !bucket.starts_with(BUCKET_NAME_PREFIX) => Err(ValidationException {
@@ -1590,6 +1599,135 @@ pub fn no_portfolio_preferences() -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(NOTHING_TO_REPORT.to_string()),
     }
+}
+
+/// The region an unsigned request (one carrying no SigV4 credential scope) is served in.
+///
+/// It is the region an in-process call this service makes into another emulated service
+/// is addressed to when the caller named none.
+pub const DEFAULT_REGION: &str = "us-east-1";
+
+/// The region the caller signed for, or [`DEFAULT_REGION`] for an unsigned request.
+///
+/// The scope is parsed by `emulator_server::sigv4_credential_scope`, the framework's
+/// single source of SigV4-scope reading; only the default lives here.
+pub fn request_region(parts: &::http::request::Parts) -> String {
+    ::emulator_server::sigv4_credential_scope(&parts.headers)
+        .map_or_else(|| DEFAULT_REGION.to_string(), |scope| scope.region)
+}
+
+/// The key prefix every import status report object is written under, inside the bucket
+/// `StartImportFileTaskRequest$s3bucketForReportData` named.
+///
+/// Neither AWS nor the model publishes the key layout, so the layout is the emulator's
+/// choice; what it has to be is DERIVED from the task it reports on (see
+/// [`import_status_report_key`]), so the `statusReportS3Key` a read reports names the one
+/// object that import wrote and two imports never write over each other.
+pub const IMPORT_STATUS_REPORT_PREFIX: &str = "import-status-reports";
+
+/// The key of the status report object the import file task `task` writes.
+///
+/// Built from the task's minted id alone, so it is stable for the life of the task and
+/// well formed for every import name the boundary validator admits.
+pub fn import_status_report_key(task: &ImportFileTask) -> String {
+    format!(
+        "{IMPORT_STATUS_REPORT_PREFIX}/{}/status-report.json",
+        task.id
+    )
+}
+
+/// A stored instant as the `date-time` string a report document carries, or `None` when
+/// the host clock is outside the representable range.
+fn rendered_timestamp(at: SystemTime) -> Option<String> {
+    ::aws_smithy_types::DateTime::from(at)
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .ok()
+}
+
+/// The status report document the import file task `task` writes to its report bucket.
+///
+/// `GetImportFileTaskResponse$statusReportS3Key` documents what the object holds — "The
+/// report contains details about whether each record imported successfully or why it did
+/// not" — so every value here comes from the task's own record: the import it belongs to,
+/// where its input file was read from, the two record counts it reports, and one entry
+/// per record outcome it holds. The serialization (JSON) is the emulator's choice; the
+/// content is computed from state and never canned.
+pub fn import_status_report_document(task: &ImportFileTask) -> String {
+    ::serde_json::json!({
+        "importTaskId": task.id,
+        "importName": task.import_name,
+        "importFileS3Bucket": task.input_s3_bucket,
+        "importFileS3Key": task.input_s3_key,
+        "startTime": rendered_timestamp(task.start_time),
+        "numberOfRecordsSuccess": task.number_of_records_success,
+        "numberOfRecordsFailed": task.number_of_records_failed,
+        // One entry per record the import brought in, each carrying that record's own
+        // outcome. The task holds no record outcomes, so there is none to list — which
+        // is exactly what the two counts above report.
+        "records": [],
+    })
+    .to_string()
+}
+
+/// An Amazon S3 client over the in-process callback into this same emulator.
+///
+/// The callback is the framework's seam for calling another emulated service: it routes
+/// in process, so no network client is configured here and this crate names no other
+/// service's crate. `region` is the request's own signing region, so the import writes
+/// its report where the caller's own S3 requests go.
+pub fn s3_client(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+) -> ::aws_sdk_s3::Client {
+    let config = ::aws_sdk_s3::Config::builder()
+        .behavior_version(::aws_sdk_s3::config::BehaviorVersion::latest())
+        .region(::aws_sdk_s3::config::Region::new(region.to_string()))
+        .endpoint_url(format!("https://s3.{region}.amazonaws.com"))
+        // The in-process transport routes on the request's own path, and a virtual-host
+        // bucket name is not a host this emulator resolves, so the bucket is addressed
+        // in the path.
+        .force_path_style(true)
+        .credentials_provider(ctx.callback().aws_credentials_provider())
+        .http_client(ctx.callback().http_client())
+        // The transport is in-process: there is nothing to retry, time out or watch for
+        // a stalled stream, and each of those would need a sleep implementation this
+        // client is not given. The same goes for caching the identity: the credentials
+        // are handed over directly.
+        .retry_config(::aws_sdk_s3::config::retry::RetryConfig::disabled())
+        .timeout_config(::aws_sdk_s3::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(::aws_sdk_s3::config::IdentityCache::no_cache())
+        .stalled_stream_protection(::aws_sdk_s3::config::StalledStreamProtectionConfig::disabled())
+        .build();
+    ::aws_sdk_s3::Client::from_conf(config)
+}
+
+/// Write `body` as the object `key` of `bucket`, through the in-process callback.
+///
+/// `Ok` only once the object is THERE, which is what lets the task record the key: a
+/// later read reports `statusReportS3Key` only for an object a caller can fetch. The
+/// `Err` carries the reason the object could not be written — no bucket of that name,
+/// say — for the caller to report rather than to name a report nothing wrote.
+pub async fn put_import_status_report(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    bucket: &str,
+    key: &str,
+    body: String,
+) -> Result<(), String> {
+    s3_client(ctx, region)
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(::aws_sdk_s3::primitives::ByteStream::from(
+            body.into_bytes(),
+        ))
+        .content_type("application/json")
+        .send()
+        .await
+        .map(|_| ())
+        .map_err(|error| {
+            ::aws_smithy_types::error::display::DisplayErrorContext(&error).to_string()
+        })
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

@@ -391,9 +391,29 @@ pub const ABAC_STATUS_CREATION_IN_PROGRESS: &str = "CREATION_IN_PROGRESS";
 /// (see [`AccessControlAttributeConfigurationRecord::status`]); nothing sleeps for it.
 pub const ABAC_ENABLE_SPAN: Duration = Duration::from_millis(500);
 
-/// `StatusValues::SUCCEEDED` — the terminal status of an assignment operation this
-/// emulator has already applied in full.
+/// `StatusValues::SUCCEEDED` — the terminal status of an assignment operation whose
+/// completion the clock has already made due.
 pub const STATUS_SUCCEEDED: &str = "SUCCEEDED";
+
+/// `StatusValues::IN_PROGRESS` — the NON-TERMINAL status an assignment operation carries
+/// from the call that starts it until the instant its completion falls due (see
+/// [`ASSIGNMENT_OPERATION_SPAN`]).
+pub const STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
+
+/// How long after the call that STARTS an account-assignment operation that operation's
+/// move from `IN_PROGRESS` to `SUCCEEDED` falls due.
+///
+/// Creating an account assignment is asynchronous — the model's `StatusValues` enum
+/// carries the non-terminal `IN_PROGRESS` and `CreateAccountAssignment`'s own
+/// documentation says "After a successful response, call
+/// DescribeAccountAssignmentCreationStatus to describe the status of an assignment
+/// creation request", which is only meaningful while the operation is still in flight —
+/// and AWS publishes no duration for it, so this span is the emulator's OWN choice, on
+/// the same footing as [`ABAC_ENABLE_SPAN`]: never zero, so a caller that polls straight
+/// after the create still observes the in-flight status, and short enough that a test can
+/// wait it out. It is held as the instant the completion falls due and the status is
+/// DERIVED from it ([`AssignmentOperationRecord::status`]); nothing sleeps for it.
+pub const ASSIGNMENT_OPERATION_SPAN: Duration = Duration::from_millis(500);
 
 /// The page size a paginated read uses when the caller sends no `MaxResults`, and the
 /// ceiling it clamps a caller's value to: the model bounds every `MaxResults` member of
@@ -1574,10 +1594,18 @@ pub struct ApplicationAssignmentRecord {
 /// The status record of one create/delete assignment operation, keyed by its
 /// `RequestId` so `DescribeAccountAssignment*Status` and
 /// `ListAccountAssignment*Status` read real history rather than a synthesised answer.
+///
+/// `Status` is DERIVED from [`succeeded_due`](Self::succeeded_due) rather than stored, so
+/// a read never has to write to move the status on: the instant the operation completes
+/// is fixed when the call that started it is accepted, and every later read computes the
+/// status the clock implies at the moment it is asked.
 #[derive(Debug, Clone)]
 pub struct AssignmentOperationRecord {
     pub request_id: String,
-    pub status: String,
+    /// The instance the operation ran under. A status record belongs to one instance,
+    /// exactly as the assignment it reports on does, so a `RequestId` minted under
+    /// another instance is as absent as one that was never minted.
+    pub instance_arn: String,
     pub failure_reason: Option<String>,
     pub target_id: String,
     pub target_type: String,
@@ -1585,13 +1613,33 @@ pub struct AssignmentOperationRecord {
     pub principal_type: String,
     pub principal_id: String,
     pub created_date: DateTime,
+    /// When this operation stops being `IN_PROGRESS` and becomes `SUCCEEDED`:
+    /// [`ASSIGNMENT_OPERATION_SPAN`] after the call that started it was accepted.
+    pub succeeded_due: SystemTime,
 }
 
 impl AssignmentOperationRecord {
-    /// This record as the modeled `AccountAssignmentOperationStatus` shape.
-    pub fn to_shape(&self) -> AccountAssignmentOperationStatus {
+    /// `StatusValues` as of `now`: the non-terminal `IN_PROGRESS` until the operation's
+    /// completion is due, `SUCCEEDED` after.
+    ///
+    /// The enum's third value, `FAILED`, is never reported: nothing here fails an
+    /// assignment operation, which is also why [`Self::failure_reason`] — "the message
+    /// that contains an error or exception in case of an operation failure" — stays
+    /// absent.
+    pub fn status(&self, now: SystemTime) -> &'static str {
+        if now < self.succeeded_due {
+            STATUS_IN_PROGRESS
+        } else {
+            STATUS_SUCCEEDED
+        }
+    }
+
+    /// This record as the modeled `AccountAssignmentOperationStatus` shape, as of `now`:
+    /// the whole status object, tracking members and the assignment the operation is
+    /// about — what a status DESCRIBE reports.
+    pub fn to_shape(&self, now: SystemTime) -> AccountAssignmentOperationStatus {
         AccountAssignmentOperationStatus {
-            status: Some(self.status.clone()),
+            status: Some(self.status(now).to_string()),
             request_id: Some(self.request_id.clone()),
             failure_reason: self.failure_reason.clone(),
             target_id: Some(self.target_id.clone()),
@@ -1600,6 +1648,29 @@ impl AssignmentOperationRecord {
             principal_type: Some(self.principal_type.clone()),
             principal_id: Some(self.principal_id.clone()),
             created_date: Some(self.created_date),
+        }
+    }
+
+    /// The TRACKING view of this record, as of `now`: the status the operation is in, the
+    /// `RequestId` — "the identifier for tracking the request operation" — to poll it by,
+    /// and the date it was accepted, and none of the assignment detail.
+    ///
+    /// Those three members are exactly the ones the model's own
+    /// `AccountAssignmentOperationStatusMetadata` carries, which is what the API reports
+    /// for an operation a caller has not described yet; it is what the call that STARTS
+    /// an operation answers with, since a caller holding the whole request already knows
+    /// the assignment it asked for and what it does not yet know is the handle to poll.
+    pub fn to_tracking_shape(&self, now: SystemTime) -> AccountAssignmentOperationStatus {
+        AccountAssignmentOperationStatus {
+            status: Some(self.status(now).to_string()),
+            request_id: Some(self.request_id.clone()),
+            created_date: Some(self.created_date),
+            failure_reason: None,
+            target_id: None,
+            target_type: None,
+            permission_set_arn: None,
+            principal_type: None,
+            principal_id: None,
         }
     }
 }
@@ -1751,12 +1822,6 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
     /// grants access to, for the same reason.
     fn remove_instance(&mut self, instance_arn: &str) {
         self.instances.remove(instance_arn);
-        let orphaned: Vec<String> = self
-            .permission_sets
-            .values()
-            .filter(|record| record.instance_arn == instance_arn)
-            .map(|record| record.permission_set_arn.clone())
-            .collect();
         self.permission_sets
             .retain(|_, record| record.instance_arn != instance_arn);
         self.account_assignments
@@ -1764,7 +1829,7 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
         self.trusted_token_issuers
             .retain(|_, record| record.instance_arn != instance_arn);
         self.assignment_operations
-            .retain(|_, record| !orphaned.contains(&record.permission_set_arn));
+            .retain(|_, record| record.instance_arn != instance_arn);
         let orphaned_applications: Vec<String> = self
             .applications
             .values()
@@ -1933,22 +1998,20 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
     /// The status record of the assignment operation `request_id` names, WITHIN
     /// `instance_arn`.
     ///
-    /// An assignment operation is performed under one instance — the permission set it
-    /// names belongs to that instance, and a permission set that goes takes its
-    /// operation records with it ([`Self::remove_instance`],
-    /// `DeletePermissionSet`) — so a `RequestId` whose record hangs off another
-    /// instance's permission set is as absent here as one nothing was ever minted for.
-    /// That is what keeps a `Describe…Status` read of one instance from reporting
-    /// another instance's history.
+    /// An assignment operation is performed under one instance, and the record carries
+    /// it, so a `RequestId` minted under another instance is as absent here as one
+    /// nothing was ever minted for — which is what keeps a `Describe…Status` read of one
+    /// instance from reporting another instance's history. A record whose permission set
+    /// has gone is absent too, because the delete removes it with the assignments it
+    /// reported on ([`Self::remove_instance`], `DeletePermissionSet`).
     pub fn assignment_operation(
         &self,
         instance_arn: &str,
         request_id: &str,
     ) -> Option<&AssignmentOperationRecord> {
-        self.assignment_operations.get(request_id).filter(|record| {
-            self.permission_set(instance_arn, &record.permission_set_arn)
-                .is_some()
-        })
+        self.assignment_operations
+            .get(request_id)
+            .filter(|record| record.instance_arn == instance_arn)
     }
 }
 

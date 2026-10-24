@@ -176,10 +176,11 @@ pub fn datastore_in_transition_message(status: DatastoreStatus, action: Datastor
 ///
 /// A typed value rather than a free-form word: the operations of this resource
 /// cannot drift into different spellings of the same sentence, and a new one has
-/// to add its variant here.
+/// to add its variant here. `UpdateFHIRDatastore` is deliberately absent: it
+/// does not classify a non-`ACTIVE` target as a transition conflict at all, and
+/// states [`DATASTORE_NOT_ACTIVE_MESSAGE`] instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DatastoreAction {
-    Update,
     Delete,
     /// Starting a FHIR export job on the data store, which reads it rather than
     /// changing it but still needs a settled, usable data store to export from.
@@ -190,12 +191,23 @@ impl DatastoreAction {
     /// The past participle the conflict sentence states this action with.
     pub fn as_participle(self) -> &'static str {
         match self {
-            Self::Update => "updated",
             Self::Delete => "deleted",
             Self::ExportFrom => "exported from",
         }
     }
 }
+
+/// The sentence `UpdateFHIRDatastore` refuses a data store with when the record
+/// exists but its `DatastoreStatus` is anything other than `ACTIVE`.
+///
+/// Fixed, like the texts above: it quotes neither the requested `DatastoreId`
+/// nor the status the record happens to be in, and it reads the same whichever
+/// non-`ACTIVE` state that is — what the refusal is about is the record not
+/// being settled and usable, not which stage of the lifecycle it sits at. It
+/// stays inside the modelled `Message` alphabet
+/// (`^([\p{L}\p{Z}\p{N}_.:/=+\-%@]*)$`), so the text is one the model would
+/// admit.
+pub const DATASTORE_NOT_ACTIVE_MESSAGE: &str = "Specified datastore is not active.";
 
 /// The sentence this service refuses a point-in-time restore with when the
 /// source data store exists but holds no enabled backup to restore from.

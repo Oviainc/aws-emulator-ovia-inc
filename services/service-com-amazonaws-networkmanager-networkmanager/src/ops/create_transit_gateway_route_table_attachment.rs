@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTransitGatewayRouteTableAttachment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTransitGatewayRouteTableAttachment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates a transit gateway route table attachment over a transit gateway PEERING of a
+//! core network: the attachment is MINTED here, its id, ARN and timestamps computed and
+//! its core network and edge location taken from the peering it is created over, and every
+//! later read of the attachment answers from that record.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTransitGatewayRouteTableAttachment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This file is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -158,18 +155,248 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTransitGatewayRouteTableAttachment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTransitGatewayRouteTableAttachmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateTransitGatewayRouteTableAttachmentErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the networkmanager store is unavailable".to_string(),
+                    retry_after_seconds: None,
+                },
+            )
+        })?;
+        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+
+        // The same tag rules `TagResource` applies hold for the tags a create carries.
+        // This operation models no `ServiceQuotaExceededException`, so the per-resource tag
+        // quota is refused through the `ValidationException` it does model.
+        if let Err(problem) = crate::state::check_requested_tags(input.tags.as_ref()) {
+            return Err(
+                CreateTransitGatewayRouteTableAttachmentErrorModeled::ValidationException(
+                    crate::state::tag_problem_rejection(problem),
+                )
+                .into(),
+            );
+        }
+
+        // This attachment is created OVER a peering ("The ID of the peer for the",
+        // `smithy_query query="doc" shape="CreateTransitGatewayRouteTableAttachmentRequest"
+        // member="PeeringId"`): the route table is reached through the transit gateway that
+        // peering peers with, so the peering is what decides the core network the
+        // attachment belongs to and the edge location it sits at. A `PeeringId` that names
+        // no stored peering is therefore a FIELD failure on that member, as every
+        // unresolvable reference of this service is.
+        let peering = store.peerings.get(&input.peering_id).ok_or_else(|| {
+            CreateTransitGatewayRouteTableAttachmentErrorModeled::ValidationException(
+                crate::state::unknown_reference(
+                    crate::state::FIELD_PEERING_ID,
+                    crate::state::PEERING_KIND,
+                ),
+            )
+        })?;
+        let core_network_id = peering.core_network_id.clone();
+        let core_network_arn = peering.core_network_arn.clone();
+        let edge_location = peering.edge_location.clone();
+
+        // `TransitGatewayRouteTableArn` carries only a length and a permissive pattern, so
+        // establishing that the string names a transit gateway route table is the
+        // handler's; and the route table belongs to the transit gateway the peering peers
+        // with, which sits in the peering's edge location, so a route table of another
+        // Region names none of that gateway's.
+        let route_table_region = crate::state::ec2_resource_region(
+            &input.transit_gateway_route_table_arn,
+            crate::state::TRANSIT_GATEWAY_ROUTE_TABLE_TYPE,
+        )
+        .ok_or_else(|| {
+            CreateTransitGatewayRouteTableAttachmentErrorModeled::ValidationException(
+                crate::state::field_rejection(
+                    crate::state::FIELD_TRANSIT_GATEWAY_ROUTE_TABLE_ARN,
+                    crate::state::REASON_FIELD_VALIDATION_FAILED,
+                    "must name a transit gateway route table and the Region it is in"
+                        .to_string(),
+                ),
+            )
+        })?;
+        if route_table_region != edge_location {
+            return Err(
+                CreateTransitGatewayRouteTableAttachmentErrorModeled::ValidationException(
+                    crate::state::field_rejection(
+                        crate::state::FIELD_TRANSIT_GATEWAY_ROUTE_TABLE_ARN,
+                        crate::state::VALIDATION_REASON_OTHER,
+                        format!(
+                            "peering {} peers a transit gateway in {edge_location}, which holds no route table in {route_table_region}",
+                            input.peering_id
+                        ),
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        // What the policy in force on the peering's core network decides about this
+        // attachment: the `attachment-policies` rule that claims it, the segment or network
+        // function group that rule puts it in, and whether the attachment request has to be
+        // ACCEPTED before the attachment is created. The decision is taken here, once, and
+        // stored on the record, so a later read reports what the policy in force at create
+        // time decided.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTransitGatewayRouteTableAttachment"))
+        // The attachment hangs off that core network, so a peering whose core network is no
+        // longer stored can carry none: an attachment minted there would hold a dangling
+        // back-reference and a policy decision no policy made. The request's own
+        // `PeeringId` is what carried that reference, so the refusal names it.
+        let core_network = store.core_networks.get(&core_network_id).ok_or_else(|| {
+            CreateTransitGatewayRouteTableAttachmentErrorModeled::ValidationException(
+                crate::state::field_rejection(
+                    crate::state::FIELD_PEERING_ID,
+                    crate::state::VALIDATION_REASON_OTHER,
+                    format!(
+                        "peering {} peers core network {core_network_id}, which is no longer stored",
+                        input.peering_id
+                    ),
+                ),
+            )
+        })?;
+        let claim = core_network
+            .topology
+            .attachment_claim(&crate::state::AttachmentCandidate {
+                attachment_type: crate::state::ATTACHMENT_TYPE_TRANSIT_GATEWAY_ROUTE_TABLE,
+                edge_location: &edge_location,
+                resource_arn: &input.transit_gateway_route_table_arn,
+                account_id: ::engine::emulator_account_id(),
+                tags: input.tags.as_deref().unwrap_or_default(),
+            });
+
+        // `ClientToken` is the operation's modelled `@idempotencyToken`, so a retry of the
+        // same request answers the record the first call minted instead of minting a second
+        // attachment; the same token asking for something else is a conflict. This is
+        // resolved BEFORE the one-attachment-per-route-table rule below, so a retry answers
+        // the attachment it created rather than colliding with it.
+        if let Some(token) = input
+            .client_token
+            .as_deref()
+            .filter(|token| !token.is_empty())
+        {
+            if let Some(existing) = store
+                .attachments
+                .values()
+                .find(|record| record.client_token.as_deref() == Some(token))
+            {
+                let same_request = existing.resource_arn
+                    == input.transit_gateway_route_table_arn
+                    && existing.routing_policy_label == input.routing_policy_label
+                    && matches!(
+                        &existing.detail,
+                        crate::state::AttachmentDetail::TransitGatewayRouteTable { peering_id }
+                            if *peering_id == input.peering_id
+                    )
+                    && crate::state::same_tags(
+                        &existing.tags,
+                        input.tags.as_deref().unwrap_or_default(),
+                    );
+                if same_request {
+                    return Ok(CreateTransitGatewayRouteTableAttachmentOutput {
+                        transit_gateway_route_table_attachment: existing
+                            .to_transit_gateway_route_table_attachment(now),
+                    });
+                }
+                return Err(
+                    CreateTransitGatewayRouteTableAttachmentErrorModeled::ConflictException(
+                        ConflictException {
+                            message: format!(
+                                "client token {token:?} already created attachment {}, with a different request",
+                                existing.id
+                            ),
+                            resource_id: existing.id.clone(),
+                            resource_type: crate::state::ATTACHMENT_KIND.to_string(),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // A transit gateway route table is attached once, so a second attachment of the
+        // same route table is the service's concurrent-state conflict and stores nothing.
+        if let Some(existing) = store
+            .attachments
+            .values()
+            .find(|record| record.resource_arn == input.transit_gateway_route_table_arn)
+        {
+            return Err(
+                CreateTransitGatewayRouteTableAttachmentErrorModeled::ConflictException(
+                    ConflictException {
+                        message: format!(
+                            "transit gateway route table {} is already attached by attachment {}",
+                            input.transit_gateway_route_table_arn, existing.id
+                        ),
+                        resource_id: existing.id.clone(),
+                        resource_type: crate::state::ATTACHMENT_KIND.to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A quota bounds how many attachments one core network can be made to hold: at the
+        // cap the create is refused and nothing is stored, so a repeated call cannot grow
+        // the store without end.
+        let held = store.attachment_count_of_core_network(&core_network_id);
+        if held >= crate::state::MAX_ATTACHMENTS_PER_CORE_NETWORK {
+            return Err(
+                CreateTransitGatewayRouteTableAttachmentErrorModeled::ValidationException(
+                    crate::state::field_rejection(
+                        crate::state::FIELD_PEERING_ID,
+                        crate::state::VALIDATION_REASON_OTHER,
+                        format!(
+                            "core network {core_network_id} already holds the maximum of {} attachments",
+                            crate::state::MAX_ATTACHMENTS_PER_CORE_NETWORK
+                        ),
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        let id = store.next_id(crate::state::ATTACHMENT_KIND);
+        let record = crate::state::AttachmentRecord {
+            arn: crate::state::ComAmazonawsNetworkmanagerNetworkmanagerState::resource_arn(
+                crate::state::ATTACHMENT_KIND,
+                &id,
+            ),
+            id: id.clone(),
+            core_network_id,
+            core_network_arn,
+            attachment_type: crate::state::ATTACHMENT_TYPE_TRANSIT_GATEWAY_ROUTE_TABLE,
+            edge_location,
+            // The resource this attachment attaches is the route table itself, which is
+            // also the `TransitGatewayRouteTableArn` the shape reports.
+            resource_arn: input.transit_gateway_route_table_arn,
+            routing_policy_label: input.routing_policy_label,
+            created_at: now,
+            // An attachment the policy asked acceptance for is not being created yet, so no
+            // transition is owed on it: `AcceptAttachment` is what starts the settle span.
+            available_at: (!claim.require_acceptance).then(|| now + crate::state::SETTLE_DELAY),
+            accepted_at: None,
+            // Nothing has changed this attachment yet; see `AttachmentRecord::changed_at`.
+            changed_at: None,
+            attachment_policy_rule_number: claim.rule_number,
+            segment_name: claim.segment_name,
+            network_function_group_name: claim.network_function_group_name,
+            client_token: input.client_token.filter(|token| !token.is_empty()),
+            tags: input.tags.unwrap_or_default(),
+            detail: crate::state::AttachmentDetail::TransitGatewayRouteTable {
+                peering_id: input.peering_id,
+            },
+        };
+        // The attachment waits for its acceptance where the policy asked for one, and is
+        // otherwise `CREATING` until the settle span the clock owes elapses, so the response
+        // reports the state the stored record is in now.
+        let transit_gateway_route_table_attachment =
+            record.to_transit_gateway_route_table_attachment(now);
+        store.attachments.insert(id, record);
+
+        Ok(CreateTransitGatewayRouteTableAttachmentOutput {
+            transit_gateway_route_table_attachment,
+        })
     }
 }

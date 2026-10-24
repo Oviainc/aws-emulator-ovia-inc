@@ -40,8 +40,9 @@ pub fn medialive() -> MultiServiceRouter {
 }
 
 /// The same router, handed back with the engine it was built on, for a suite
-/// whose rule is about state no operation writes yet (a cluster's alert log,
-/// which the real service raises from hardware this emulator does not run).
+/// whose rule is about state no operation writes yet (a cluster's or a channel's
+/// alert log, which the real service raises from hardware this emulator does not
+/// run and media it does not ingest).
 ///
 /// One construction path, so a suite that reaches the store cannot drift from
 /// how every other suite builds the service.

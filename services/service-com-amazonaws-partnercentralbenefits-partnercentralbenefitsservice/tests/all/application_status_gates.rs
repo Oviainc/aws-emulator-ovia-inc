@@ -58,7 +58,16 @@ async fn seed(harness: &Harness, case: &str, catalog: &str, token: &str) -> Stri
 /// `ACTION_REQUIRED`, `APPROVED` and `REJECTED` are set by AWS's own review workflow and
 /// no modelled operation reaches them, so those rows are placed in the store
 /// ([`Harness::place_status`]) after a real submission.
-async fn reach(harness: &Harness, case: &str, catalog: &str, id: &str, status: &str) {
+///
+/// Reused by `tests/all/disassociate_benefit_application_resource.rs`, which states its
+/// own gate over the same six statuses.
+pub(crate) async fn reach(
+    harness: &Harness,
+    case: &str,
+    catalog: &str,
+    id: &str,
+    status: &str,
+) {
     let submit = json!({ "Catalog": catalog, "Identifier": id });
     match status {
         STATUS_PENDING_SUBMISSION => {}

@@ -1159,7 +1159,8 @@ async fn pagination_token_of_another_listing_is_refused() {
 
 /// A delete of a challenge removes the record, so the next reader cannot see it; a repeat
 /// delete of the same ARN now names no record and is refused with 404. Deleting a
-/// connector is accepted (202) and takes its challenges with it once the teardown is due.
+/// connector is accepted (202), takes its challenges with it once the teardown is due, and a
+/// repeat after that names no record either, so it is refused with 404 too.
 #[tokio::test]
 async fn deletes_are_observable_and_idempotent() {
     for challenges_per_connector in [1usize, 3] {
@@ -1261,10 +1262,12 @@ async fn deletes_are_observable_and_idempotent() {
         }
         let again = delete_connector(&router, &connector).await;
         assert_eq!(
-            again.status, 202,
-            "case {challenges_per_connector} challenges: an @idempotent DeleteConnector must \
-             still succeed on a repeat, got {} / {:?}",
-            again.status, again.body
+            (again.status, again.error_type.as_str()),
+            (404, "ResourceNotFoundException"),
+            "case {challenges_per_connector} challenges: a repeated DeleteConnector names a \
+             connector that is gone, so it must answer 404, got {} / {:?}",
+            again.status,
+            again.body
         );
     }
 }
@@ -1297,6 +1300,8 @@ async fn unknown_arns_answer_resource_not_found() {
                 "GetChallengePassword",
                 get_challenge_password(&router, &challenge).await,
             ),
+            ("DeleteConnector", delete_connector(&router, connector).await),
+            ("DeleteChallenge", delete_challenge(&router, &challenge).await),
         ] {
             assert_eq!(
                 answer.status, 404,
@@ -1465,7 +1470,8 @@ async fn deleting_a_connector_mid_creation_is_accepted() {
         tearing_down.body
     );
 
-    // Once the teardown is due the record is gone, and a repeat is still accepted.
+    // Once the teardown is due the record is gone, and a delete of that ARN now names no
+    // connector, so it is refused with the modelled 404.
     release_pending(&engine, &arn);
     let gone = get_connector(&router, &arn).await;
     assert_eq!(
@@ -1475,8 +1481,11 @@ async fn deleting_a_connector_mid_creation_is_accepted() {
     );
     let answer = delete_connector(&router, &arn).await;
     assert_eq!(
-        answer.status, 202,
-        "case \"delete once gone\": an @idempotent delete must still answer 202, got {} / {:?}",
-        answer.status, answer.body
+        (answer.status, answer.error_type.as_str()),
+        (404, "ResourceNotFoundException"),
+        "case \"delete once gone\": a delete of an ARN holding no record must answer 404, got {} \
+         / {:?}",
+        answer.status,
+        answer.body
     );
 }

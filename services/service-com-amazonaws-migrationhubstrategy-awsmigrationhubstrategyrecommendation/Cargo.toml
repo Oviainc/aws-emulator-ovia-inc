@@ -27,9 +27,19 @@ hex = { workspace = true }
 # Fingerprints the selection a ListServers page was taken under, so its cursor stays
 # short and is only accepted back for the same list.
 sha2 = { workspace = true }
+# Amazon S3 client StartImportFileTask writes the import's status report object with,
+# over the in-process callback into this same emulator (no network client feature is
+# enabled: the transport is the emulator's own).
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
+
+[dev-dependencies]
+# The import status report suite mounts the S3 service beside Strategy Recommendations on
+# one engine, because StartImportFileTask writes its status report object there by calling
+# S3 in process and the suite reads that object back.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [lints]
 workspace = true
