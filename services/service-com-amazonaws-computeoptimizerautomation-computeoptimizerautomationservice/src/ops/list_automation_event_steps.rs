@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAutomationEventSteps
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAutomationEventSteps`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAutomationEventSteps::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the steps of ONE automation event, paged, out of this service's
+//! store: the event is resolved by `eventId`, and its steps — the sequence its
+//! event type performs, recorded when the event was started — are projected in
+//! that order. Nothing in the response is built from the request beyond the
+//! event the request names.
+//!
+//! The handler reaches this service's state through
+//! [`crate::state::service_state`] and reads and writes it through the guard it
+//! hands back.
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +163,125 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAutomationEventSteps` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAutomationEventStepsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAutomationEventSteps"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListAutomationEventStepsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the service is not mounted on a state-bearing engine".into()),
+                },
+            )
+            .into());
+        };
+
+        // The sequence a page is a window onto is the steps of ONE event, so the
+        // event this call asks about is what the token is bound to: a token
+        // issued for one event cannot resume a walk over another's steps.
+        let query_fingerprint = crate::state::fingerprint(&input.event_id);
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => {
+                let Some(cursor) = crate::state::decode_page_token(token) else {
+                    return Err(invalid_parameter(format!(
+                        "Value '{token}' at 'nextToken' failed to satisfy constraint: Member must \
+                         be a token returned by a previous ListAutomationEventSteps call"
+                    )));
+                };
+                if cursor.filter_fingerprint != query_fingerprint {
+                    return Err(invalid_parameter(
+                        "Value at 'nextToken' failed to satisfy constraint: Member must be a \
+                         token returned for the same eventId"
+                            .to_string(),
+                    ));
+                }
+                cursor.offset
+            }
+        };
+
+        // The model bounds `maxResults` at 1..=100, so a caller that sends none
+        // gets the largest page it could have asked for. Clamped to at least one
+        // here as well: a zero page would return nothing while still carrying a
+        // token whose offset never advances, so a walk would never terminate.
+        let page_size = usize::try_from(
+            input
+                .max_results
+                .unwrap_or(crate::state::DEFAULT_MAX_RESULTS),
+        )
+        .unwrap_or(1)
+        .max(1);
+
+        let now = ::std::time::SystemTime::now();
+        // "You can only list steps for events created within the past year": an
+        // event created before that floor is out of this operation's reach, so
+        // it is as absent as one the store never held.
+        let window_start = crate::state::effective_window_start(None, now);
+
+        let mut guard = state.lock();
+        // The service-wide enrollment gate, AHEAD of the event lookup: an
+        // account that is not opted in is refused the whole call, so it is never
+        // told "no such event" when what it has to do is enroll. See
+        // `crate::state::…::opt_in_required`.
+        if let Some(refusal) = guard.opt_in_required() {
+            return Err(
+                ListAutomationEventStepsErrorModeled::OptInRequiredException(refusal).into(),
+            );
+        }
+        let Some(event) = guard.events.get_mut(&input.event_id) else {
+            return Err(not_found());
+        };
+        if !crate::state::within_window(event.created_timestamp, Some(window_start), None) {
+            return Err(not_found());
+        }
+        // The only write a read makes: the status transition the clock already
+        // owed this event and the step it was on, which was due at the event's
+        // stored instant whether or not anybody called. Nothing here is advanced
+        // BECAUSE the steps were read, so `GetAutomationEvent` and this reader
+        // agree on what the run reached.
+        event.settle(now);
+
+        let total = event.steps.len();
+        let page: Vec<AutomationEventStep> = event
+            .steps
+            .iter()
+            .skip(offset)
+            .take(page_size)
+            .map(|step| step.to_automation_event_step(&event.event_id))
+            .collect();
+        // A token only when steps remain after this page, and it resumes exactly
+        // where this page stopped.
+        let resumed_at = offset.saturating_add(page.len());
+        let next_token = (resumed_at < total).then(|| {
+            crate::state::encode_page_token(&crate::state::PageCursor {
+                offset: resumed_at,
+                filter_fingerprint: query_fingerprint,
+            })
+        });
+
+        Ok(ListAutomationEventStepsOutput {
+            automation_event_steps: Some(page),
+            next_token,
+        })
     }
 }
+
+/// The modelled 400 (`InvalidParameterValueException`), for a `nextToken` this
+/// service did not issue for this query. The model's `NextToken` pattern cannot
+/// express "a token of mine", so the check is here rather than at the boundary.
+fn invalid_parameter(message: String) -> ListAutomationEventStepsError {
+    ListAutomationEventStepsErrorModeled::InvalidParameterValueException(
+        InvalidParameterValueException {
+            message: Some(message),
+        },
+    )
+    .into()
+}
+
+/// The modelled 404 (`ResourceNotFoundException`). The message is this service's
+/// fixed not-found text and names no resource, so the refusal discloses nothing
+/// about what the store holds.
+fn not_found() -> ListAutomationEventStepsError {
+    ListAutomationEventStepsErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.into()),
+    })
+    .into()
+}
+

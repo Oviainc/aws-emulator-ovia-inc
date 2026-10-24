@@ -174,6 +174,9 @@ fn stored_event(
         created_timestamp: DateTime::from_secs(created_secs),
         completed_timestamp: None,
         estimated_monthly_savings: None,
+        // A seeded event carries whatever steps the case gives it; the default
+        // is none, and the cases about steps build their own.
+        steps: Vec::new(),
         // A seeded event is already in the status it names, so the clock owes it
         // no transition.
         settles_at: None,

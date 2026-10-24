@@ -18,8 +18,9 @@ use sha2::{Digest, Sha256};
 use smithy_server_runtime::{Violation, ViolationKind};
 
 use crate::ops::types::{
-    AutomationEvent, AutomationEventFilter, AutomationRule, Criteria, DoubleCriteriaCondition,
-    EbsVolumeConfiguration, EstimatedMonthlySavings, Filter, IntegerCriteriaCondition,
+    AutomationEvent, AutomationEventFilter, AutomationEventStep, AutomationRule, Criteria,
+    DoubleCriteriaCondition, EbsVolumeConfiguration, EstimatedMonthlySavings, Filter,
+    IntegerCriteriaCondition,
     OptInRequiredException, OrganizationConfiguration, OrganizationScope, PreviewResult,
     RecommendedAction, RecommendedActionFilter, ResourceDetails, ResourceTagsCriteriaCondition,
     Schedule, StringCriteriaCondition, Tag, AUTOMATION_EVENT_FILTER_NAME_VALUES,
@@ -138,6 +139,35 @@ pub const EVENT_STATUS_IN_PROGRESS: &str = "InProgress";
 
 /// The modelled `EventStatus` an automation event that did not complete carries.
 pub const EVENT_STATUS_FAILED: &str = "Failed";
+
+/// The `StepStatus` of a step that has not started: it is queued behind the
+/// steps ahead of it in its event's sequence
+/// (`smithy_query(query="shape",shape="StepStatus")`).
+pub const STEP_STATUS_READY: &str = "Ready";
+
+/// The `StepStatus` of the step its event is currently on.
+pub const STEP_STATUS_IN_PROGRESS: &str = "InProgress";
+
+/// The `StepStatus` of a step that did not complete.
+pub const STEP_STATUS_FAILED: &str = "Failed";
+
+/// The `EventType` (and `RecommendedActionType`) that snapshots an unattached
+/// EBS volume and then deletes it.
+pub const EVENT_TYPE_SNAPSHOT_AND_DELETE_UNATTACHED_EBS_VOLUME: &str =
+    "SnapshotAndDeleteUnattachedEbsVolume";
+
+/// The `EventType` (and `RecommendedActionType`) that changes an EBS volume's
+/// type.
+pub const EVENT_TYPE_UPGRADE_EBS_VOLUME_TYPE: &str = "UpgradeEbsVolumeType";
+
+/// The `StepType` that takes the snapshot of a volume.
+pub const STEP_TYPE_CREATE_EBS_SNAPSHOT: &str = "CreateEbsSnapshot";
+
+/// The `StepType` that deletes a volume.
+pub const STEP_TYPE_DELETE_EBS_VOLUME: &str = "DeleteEbsVolume";
+
+/// The `StepType` that changes a volume in place (its type, for an upgrade).
+pub const STEP_TYPE_MODIFY_EBS_VOLUME: &str = "ModifyEbsVolume";
 
 /// Why an automation event this emulator started never completes.
 ///
@@ -923,6 +953,113 @@ fn ebs_volume_type(details: Option<&ResourceDetails>) -> Option<String> {
     ebs_configuration(details)?.r#type.clone()
 }
 
+/// The steps an automation event of `event_type` performs, in the order it
+/// performs them.
+///
+/// `EventType` is `SnapshotAndDeleteUnattachedEbsVolume | UpgradeEbsVolumeType`
+/// and `StepType` is `CreateEbsSnapshot | CreateEbsVolume | DeleteEbsVolume |
+/// ModifyEbsVolume` (`smithy_query(query="shape",shape="EventType,StepType")`).
+/// An event type names the work its automation does, and its steps are exactly
+/// that work in the order the name states it: a snapshot-and-delete takes the
+/// snapshot ([`STEP_TYPE_CREATE_EBS_SNAPSHOT`]) and then deletes the volume
+/// ([`STEP_TYPE_DELETE_EBS_VOLUME`]), and a volume-type upgrade modifies the
+/// volume in place ([`STEP_TYPE_MODIFY_EBS_VOLUME`]). `CreateEbsVolume` belongs
+/// to the ROLLBACK of a delete (restoring the volume from the snapshot the
+/// first step took), which no forward run performs.
+///
+/// An event type outside the modelled set has no known step sequence, so it
+/// gets none rather than a guessed one.
+pub fn step_types_for_event_type(event_type: &str) -> &'static [&'static str] {
+    match event_type {
+        EVENT_TYPE_SNAPSHOT_AND_DELETE_UNATTACHED_EBS_VOLUME => {
+            &[STEP_TYPE_CREATE_EBS_SNAPSHOT, STEP_TYPE_DELETE_EBS_VOLUME]
+        }
+        EVENT_TYPE_UPGRADE_EBS_VOLUME_TYPE => &[STEP_TYPE_MODIFY_EBS_VOLUME],
+        _ => &[],
+    }
+}
+
+/// One step of an automation event as stored, which is what
+/// `ListAutomationEventSteps` reports. A step belongs to exactly one event and
+/// is stored with it, so an evicted event takes its steps with it and no reader
+/// sees a step whose event is gone.
+#[derive(Debug, Clone)]
+pub struct StoredStep {
+    pub step_id: String,
+    pub step_type: String,
+    pub step_status: String,
+    pub resource_id: Option<String>,
+    pub start_timestamp: Option<::aws_smithy_types::DateTime>,
+    pub completed_timestamp: Option<::aws_smithy_types::DateTime>,
+    pub estimated_monthly_savings: Option<EstimatedMonthlySavings>,
+}
+
+impl StoredStep {
+    /// This step as the `AutomationEventStep` the list operation returns.
+    /// `eventId` is the owning event's, because a step is only ever reached
+    /// through it.
+    pub fn to_automation_event_step(&self, event_id: &str) -> AutomationEventStep {
+        AutomationEventStep {
+            event_id: Some(event_id.to_string()),
+            step_id: Some(self.step_id.clone()),
+            step_type: Some(self.step_type.clone()),
+            step_status: Some(self.step_status.clone()),
+            resource_id: self.resource_id.clone(),
+            start_timestamp: self.start_timestamp,
+            completed_timestamp: self.completed_timestamp,
+            estimated_monthly_savings: self.estimated_monthly_savings.clone(),
+        }
+    }
+}
+
+/// The `stepId` of step `index` of the event `event_id`: the leading characters
+/// of a digest over the pair. Derived rather than drawn from a counter so a
+/// step's id is fixed when its event is created and no read ever mints one, and
+/// it satisfies the model's `StepId` pattern `^[0-9A-Za-z]{16}$` by
+/// construction.
+fn step_id(event_id: &str, index: usize) -> String {
+    let digest = Sha256::digest(format!("{event_id}:step:{index}").as_bytes());
+    hex::encode(digest).chars().take(MINTED_ID_LEN).collect()
+}
+
+/// The steps of a freshly started event: the sequence its event type performs,
+/// with the FIRST one running — the event is [`EVENT_STATUS_IN_PROGRESS`] and
+/// that is the step it is on — and every later one queued
+/// [`STEP_STATUS_READY`]. A step that has not started carries no timestamp.
+pub fn steps_for_started_event(
+    event_id: &str,
+    event_type: &str,
+    resource_id: Option<&str>,
+    estimated_monthly_savings: Option<&EstimatedMonthlySavings>,
+    started_at: ::aws_smithy_types::DateTime,
+) -> Vec<StoredStep> {
+    let step_types = step_types_for_event_type(event_type);
+    step_types
+        .iter()
+        .enumerate()
+        .map(|(index, step_type)| StoredStep {
+            step_id: step_id(event_id, index),
+            step_type: (*step_type).to_string(),
+            step_status: if index == 0 {
+                STEP_STATUS_IN_PROGRESS.to_string()
+            } else {
+                STEP_STATUS_READY.to_string()
+            },
+            // Every step of an event acts on the resource the event automates.
+            resource_id: resource_id.map(str::to_string),
+            start_timestamp: (index == 0).then_some(started_at),
+            completed_timestamp: None,
+            // The event's estimate is realised by the step that changes what
+            // the resource costs — the LAST of the sequence, which deletes or
+            // modifies the volume — so only that step carries it and summing
+            // the steps of an event never double-counts its estimate.
+            estimated_monthly_savings: (index + 1 == step_types.len())
+                .then(|| estimated_monthly_savings.cloned())
+                .flatten(),
+        })
+        .collect()
+}
+
 /// An automation event as stored: the run of ONE recommended action, which is
 /// what `ListAutomationEvents` and the event readers report. Every response
 /// member is built from one of these, never from the request that asked for it.
@@ -943,6 +1080,10 @@ pub struct StoredEvent {
     pub created_timestamp: ::aws_smithy_types::DateTime,
     pub completed_timestamp: Option<::aws_smithy_types::DateTime>,
     pub estimated_monthly_savings: Option<EstimatedMonthlySavings>,
+    /// The steps this event's automation performs, in the order it performs
+    /// them (see [`steps_for_started_event`]). Stored WITH the event because a
+    /// step is only ever reached through its event.
+    pub steps: Vec<StoredStep>,
     /// When this event's terminal status falls due, or `None` when it owes no
     /// transition (it is already terminal). Stored as an instant rather than
     /// slept for, so no handler blocks on it.
@@ -964,6 +1105,16 @@ impl StoredEvent {
         self.event_status = EVENT_STATUS_FAILED.to_string();
         self.event_status_reason = Some(EVENT_UNPERFORMED_REASON.to_string());
         self.completed_timestamp = Some(::aws_smithy_types::DateTime::from(due));
+        // The step the event was on took the event's outcome at the same
+        // instant: it was running and never completed, so it failed. A step
+        // still queued behind it never started, so it keeps its `Ready` status
+        // and its absent timestamps rather than claiming work nothing ran.
+        for step in &mut self.steps {
+            if step.step_status == STEP_STATUS_IN_PROGRESS {
+                step.step_status = STEP_STATUS_FAILED.to_string();
+                step.completed_timestamp = Some(::aws_smithy_types::DateTime::from(due));
+            }
+        }
         self.settles_at = None;
     }
 
@@ -1052,20 +1203,31 @@ impl EventStore {
 ///
 /// The event is built from the stored recommended action — never from the
 /// request — and starts in the non-terminal [`EVENT_STATUS_IN_PROGRESS`] with
-/// its terminal status due [`EVENT_SETTLEMENT_DELAY`] later.
+/// its terminal status due [`EVENT_SETTLEMENT_DELAY`] later. Its steps are the
+/// sequence its event type performs ([`steps_for_started_event`]), stored at
+/// start so every later read reports the same steps with the same ids.
 pub fn event_for_action(
     event_id: String,
     action: &RecommendedAction,
     account_id: String,
     started_at: SystemTime,
 ) -> StoredEvent {
+    let event_type = action.recommended_action_type.clone().unwrap_or_default();
+    let created_timestamp = ::aws_smithy_types::DateTime::from(started_at);
+    let steps = steps_for_started_event(
+        &event_id,
+        &event_type,
+        action.resource_id.as_deref(),
+        action.estimated_monthly_savings.as_ref(),
+        created_timestamp,
+    );
     StoredEvent {
         event_id,
         event_description: None,
         // `EventType` and `RecommendedActionType` carry the same value set, and
         // the event automates exactly this action
         // (`smithy_query(query="shape",shape="EventType,RecommendedActionType")`).
-        event_type: action.recommended_action_type.clone().unwrap_or_default(),
+        event_type,
         event_status: EVENT_STATUS_IN_PROGRESS.to_string(),
         event_status_reason: None,
         resource_arn: action.resource_arn.clone(),
@@ -1077,9 +1239,10 @@ pub fn event_for_action(
         // `StartAutomationEvent` has none.
         rule_id: None,
         resource_type: action.resource_type.clone().unwrap_or_default(),
-        created_timestamp: ::aws_smithy_types::DateTime::from(started_at),
+        created_timestamp,
         completed_timestamp: None,
         estimated_monthly_savings: action.estimated_monthly_savings.clone(),
+        steps,
         settles_at: Some(started_at + EVENT_SETTLEMENT_DELAY),
     }
 }
