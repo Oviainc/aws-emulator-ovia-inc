@@ -22,21 +22,23 @@ use crate::email_contacts::{
 
 /// The most pairs a `TagMap` may carry, from
 /// `smithy_query(query="shape",shape="TagMap")` (`len 0..200`).
-const MAX_TAGS: usize = 200;
+pub(crate) const MAX_TAGS: usize = 200;
 /// The most characters a `TagKey` may carry, from its modelled pattern
 /// `^(?!aws:).{1,128}$` (`smithy_query(query="shape",shape="TagKey")`).
-const MAX_TAG_KEY_LEN: usize = 128;
+pub(crate) const MAX_TAG_KEY_LEN: usize = 128;
 /// The most characters a `TagValue` may carry, from
 /// `smithy_query(query="shape",shape="TagValue")` (`len 0..256`).
-const MAX_TAG_VALUE_LEN: usize = 256;
+pub(crate) const MAX_TAG_VALUE_LEN: usize = 256;
 
-async fn list_tags(em: &Emulator, arn: &str) -> (u16, Value) {
+/// `GET /tags/{arn}` — `ListTagsForResource`. `pub(crate)` so the sibling suite that
+/// owns the tag WRITES reads them back through this same reader.
+pub(crate) async fn list_tags(em: &Emulator, arn: &str) -> (u16, Value) {
     call(em, "GET", &format!("/tags/{}", label(arn)), None).await
 }
 
 /// The tag set a successful `ListTagsForResource` reported, as an ordered map so two
 /// of them compare regardless of the order the wire happened to carry.
-async fn tags_ok(em: &Emulator, arn: &str) -> BTreeMap<String, String> {
+pub(crate) async fn tags_ok(em: &Emulator, arn: &str) -> BTreeMap<String, String> {
     let (status, body) = list_tags(em, arn).await;
     assert_eq!(
         status, 200,
@@ -60,7 +62,7 @@ async fn tags_ok(em: &Emulator, arn: &str) -> BTreeMap<String, String> {
 }
 
 /// Create a contact carrying `tags` (absent when `None`) and return its ARN.
-async fn create_tagged(
+pub(crate) async fn create_tagged(
     em: &Emulator,
     name: &str,
     tags: Option<&BTreeMap<String, String>>,
@@ -90,11 +92,13 @@ async fn create_tagged(
         .to_string()
 }
 
-fn tag_map<I: IntoIterator<Item = (String, String)>>(pairs: I) -> BTreeMap<String, String> {
+pub(crate) fn tag_map<I: IntoIterator<Item = (String, String)>>(
+    pairs: I,
+) -> BTreeMap<String, String> {
     pairs.into_iter().collect()
 }
 
-fn pair(key: &str, value: &str) -> (String, String) {
+pub(crate) fn pair(key: &str, value: &str) -> (String, String) {
     (key.to_string(), value.to_string())
 }
 

@@ -23,6 +23,8 @@ mod query_error_envelope;
 mod resource_tags;
 #[path = "all/shared_endpoint_routing.rs"]
 mod shared_endpoint_routing;
+#[path = "all/ssl_policies.rs"]
+mod ssl_policies;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/trust_stores.rs"]

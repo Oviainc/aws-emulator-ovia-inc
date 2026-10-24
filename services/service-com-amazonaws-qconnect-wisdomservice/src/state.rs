@@ -845,6 +845,30 @@ impl ComAmazonawsQconnectWisdomserviceState {
         self.knowledge_bases.get(resolve_id(label))
     }
 
+    /// Forget a knowledge base and every index entry that named it, as
+    /// `DeleteKnowledgeBase` does. `None` — nothing removed — when this account holds no
+    /// knowledge base under that label, which is the caller's not-found.
+    ///
+    /// The name the record held is released by the same call, so a create may take it
+    /// again: the conflict a duplicate name is refused with is a conflict with a LIVE
+    /// knowledge base. The `clientToken` entries that created it go too — a token whose
+    /// resource is gone must not resurrect it on a replay — exactly as
+    /// [`Self::remove_assistant`] does for an assistant.
+    pub fn remove_knowledge_base(&mut self, label: &str) -> Option<KnowledgeBase> {
+        let knowledge_base = self.knowledge_bases.remove(resolve_id(label))?;
+        self.knowledge_base_name_index.remove(&knowledge_base.name);
+        let gone: Vec<String> = self
+            .idempotency
+            .iter()
+            .filter(|(_, created)| *created == &knowledge_base.knowledge_base_id)
+            .map(|(token, _)| token.clone())
+            .collect();
+        for token in gone {
+            self.idempotency.remove(&token);
+        }
+        Some(knowledge_base)
+    }
+
     /// The id of the live knowledge base already using this name, if any.
     pub fn knowledge_base_id_with_name(&self, name: &str) -> Option<&str> {
         self.knowledge_base_name_index

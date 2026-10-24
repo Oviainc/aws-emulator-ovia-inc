@@ -9,9 +9,9 @@
 //! `ListEmailContacts` walk a stable total order and name the next page's first ARN
 //! in its opaque `nextToken`.
 //!
-//! The tags a create stores live on the record, so the later
-//! `TagResource`/`UntagResource`/`ListTagsForResource` slice reads the same map
-//! rather than a second copy.
+//! The tags a create stores live on the record, so the
+//! `TagResource`/`UntagResource`/`ListTagsForResource` slice reads and writes the
+//! same map rather than a second copy.
 
 use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -62,6 +62,14 @@ pub const STATUS_ACTIVE: &str = "active";
 /// from `smithy_query(query="shape",shape="ValidationExceptionReason")`.
 pub const VALIDATION_REASON_FIELD: &str = "fieldValidationFailed";
 
+/// The most tags one email contact may carry at a time.
+///
+/// The modelled `TagMap` is `len 0..200` (`smithy_query(query="shape",shape="TagMap")`)
+/// and `ListTagsForResourceResponse$tags` reports the stored set through that very
+/// shape, so a set grown past the bound could not be reported: `TagResource` refuses a
+/// merge that would exceed it rather than persisting one.
+pub const MAX_TAGS_PER_CONTACT: usize = 200;
+
 /// The most email contacts this emulator will hold.
 ///
 /// Emulator resource guard, NOT a published AWS quota: every record is created by a
@@ -91,6 +99,8 @@ pub struct EmailContactRecord {
     pub creation_time_millis: i64,
     /// Last-update time, in milliseconds since the Unix epoch.
     pub update_time_millis: i64,
+    /// Tags attached to this contact, keyed by tag key. Bounded by
+    /// [`MAX_TAGS_PER_CONTACT`].
     pub tags: BTreeMap<String, String>,
     /// The activation code the last `SendActivationCode` stored, present only once
     /// one was issued. Kept after a successful activation so re-activating with the
