@@ -1658,11 +1658,10 @@ pub struct ComAmazonawsCloudtrailCloudtrail20131101State {
     /// characters.
     ///
     /// An entry outlives nothing: a policy belongs to the resource it is attached to,
-    /// so whoever implements an operation that DELETES one of those resources
-    /// (`DeleteDashboard`, `DeleteEventDataStore`, `DeleteChannel`, all still 501
-    /// stubs) drops that resource's entry here too — otherwise a resource later
-    /// created with the same name in the same Region would inherit a policy nobody
-    /// attached to it.
+    /// so an operation that DELETES one of those resources drops that resource's entry
+    /// here too — otherwise a resource later created with the same name in the same
+    /// Region would inherit a policy nobody attached to it. `DeleteDashboard` does;
+    /// `DeleteEventDataStore` and `DeleteChannel` own that for their registries.
     pub resource_policies: BTreeMap<String, String>,
 }
 
@@ -2051,6 +2050,22 @@ pub const DEFAULT_REFRESH_TIME_OF_DAY: &str = "00:00";
 /// and it is the text the recorded `GetDashboard` miss carries — so every dashboard
 /// operation answers a miss with the same words rather than wording its own.
 pub const DASHBOARD_NOT_FOUND_MESSAGE: &str = "No matching dashboard found.";
+
+/// The HTTP status this service answers a dashboard `ConflictException` with.
+///
+/// The model annotates the shape `@httpError(409)`
+/// (`smithy_query(query="shape", shape="ConflictException")`), but `@httpError` is an
+/// HTTP-BINDING trait and the recorded response carrying `__type: ConflictException` —
+/// a second create of a dashboard name already taken,
+/// `cloudtrail-dashboard-error-paths#task#2` — carries HTTP **400**: the status a
+/// client's retry classifier sees is the service's, not the model's, and a service
+/// renders one error shape one way. It is answered through
+/// [`crate::scaffolded::Scaffolded::modeled_with_status`], which keeps the modelled
+/// shape's body and changes only the status line — the same deviation
+/// [`TRAIL_NOT_FOUND_STATUS`] and [`IMPORT_NOT_FOUND_HTTP_STATUS`] already carry for
+/// this service. Stated here rather than in one handler so every dashboard operation
+/// that refuses with `ConflictException` answers at the same status.
+pub const DASHBOARD_CONFLICT_HTTP_STATUS: u16 = 400;
 
 /// The registry key: a dashboard name and the Region the dashboard lives in.
 ///

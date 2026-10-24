@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDashboard
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteDashboard`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteDashboard::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deletes one CloudTrail Lake dashboard out of the dashboard registry
+//! [`crate::state`] owns.
+//!
+//! A dashboard is addressed by its name or by its ARN (`DeleteDashboardRequest$DashboardId`:
+//! "The name or ARN for the dashboard"), and a dashboard ARN carries the Region the
+//! dashboard lives in — so a bare name deletes the dashboard of that name in the Region
+//! the call was made in, and an ARN the one in the Region it pins. Both readings live in
+//! [`crate::state::ComAmazonawsCloudtrailCloudtrail20131101State::resolve_dashboard_mut`],
+//! so `GetDashboard`, `UpdateDashboard` and `StartDashboardRefresh` cannot drift from
+//! this handler, and an identifier that can name no dashboard at all is the same miss as
+//! one that names none.
+//!
+//! Deleting releases the record and the resource-based policy attached to that dashboard
+//! together: a policy belongs to the resource it is attached to, so a dashboard later
+//! created with the same name in the same Region inherits nothing. Only termination
+//! protection stops a delete — "You cannot delete a dashboard that has termination
+//! protection enabled" — and `UpdateDashboard` is what turns it off.
 //!
 //! ## Shape of an operation
 //!
@@ -74,6 +83,46 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// Refuse the request because the identifier named no stored dashboard.
+///
+/// `ResourceNotFoundException` keeps the status the model annotates it with (HTTP 400,
+/// `smithy_query(query="operation", operation="DeleteDashboard")`), which is also the
+/// status the recorded refusal of this operation carries. The text is the ONE fixed
+/// sentence every dashboard operation answers a miss with
+/// ([`crate::state::DASHBOARD_NOT_FOUND_MESSAGE`]): CloudTrail reports no part of the
+/// request in it.
+fn dashboard_not_found() -> DeleteDashboardError {
+    DeleteDashboardErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::DASHBOARD_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// Refuse the delete because the dashboard it addressed is protected from deletion.
+///
+/// "You cannot delete a dashboard that has termination protection enabled" — the
+/// dashboard exists and was addressed correctly, so this is not a miss; it is the state
+/// of the resource conflicting with the request, which is what this operation's
+/// `ConflictException` covers (the only other error it models,
+/// `UnsupportedOperationException`, is about an operation the service does not support at
+/// all). The status is the one this service answers its dashboard `ConflictException`
+/// with ([`crate::state::DASHBOARD_CONFLICT_HTTP_STATUS`]), not the shape's modelled 409.
+///
+/// The text names the dashboard the request addressed and the way out, so a caller can
+/// act on it; AWS publishes no wording for this refusal, so the status and the code are
+/// what is contract here.
+fn termination_protected(dashboard_arn: &str) -> DeleteDashboardError {
+    crate::scaffolded::Scaffolded::modeled_with_status(
+        DeleteDashboardErrorModeled::ConflictException(ConflictException {
+            message: Some(format!(
+                "The dashboard {dashboard_arn} cannot be deleted while termination protection \
+                 is enabled for it: disable termination protection and try again."
+            )),
+        }),
+        crate::state::DASHBOARD_CONFLICT_HTTP_STATUS,
+    )
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -145,18 +194,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteDashboard` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteDashboardErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteDashboard"))
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteDashboardErrorModeled::UnsupportedOperationException(
+                UnsupportedOperationException {
+                    message: Some(
+                        "DeleteDashboard needs the CloudTrail dashboard registry, which this \
+                         engine does not carry"
+                            .to_string(),
+                    ),
+                },
+            )
+        })?;
+        let mut store = state.lock();
+
+        // `DashboardId` is "the name or ARN for the dashboard": a bare name addresses the
+        // caller's own Region, an ARN the Region it carries. An identifier that can name
+        // no dashboard at all is answered the same way as one that names none, through
+        // the registry's own reader — which also materialises whatever transition the
+        // clock already owed this dashboard, so the delete acts on its current state.
+        let record = store
+            .resolve_dashboard_mut(&input.dashboard_id, &region, now)
+            .ok_or_else(dashboard_not_found)?;
+
+        // "You cannot delete a dashboard that has termination protection enabled." The
+        // dashboard stays exactly as it was: the refusal releases nothing.
+        if record.termination_protection_enabled {
+            return Err(termination_protected(&record.dashboard_arn));
+        }
+
+        // The record carries the registry key it is stored under (its name and the Region
+        // it lives in) and its own ARN, which is the key a resource-based policy attached
+        // to it is stored under.
+        let key: crate::state::DashboardKey = (record.name.clone(), record.home_region.clone());
+        let dashboard_arn = record.dashboard_arn.clone();
+
+        // Deleting releases the record: the dashboard is gone from the Region the
+        // identifier addressed, every later read of it is a miss, and so is a second
+        // delete of the same dashboard. Its resource-based policy goes with it — a policy
+        // belongs to the resource it is attached to, so a dashboard later created with
+        // this name in this Region must not inherit one nobody attached to it.
+        store.dashboards.remove(&key);
+        store.resource_policies.remove(&dashboard_arn);
+
+        Ok(DeleteDashboardOutput {})
     }
 }
