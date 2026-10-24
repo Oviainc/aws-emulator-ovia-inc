@@ -296,10 +296,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            cluster_state, ClusterRecord, ClusterStatusRecord, InstanceFleetRecord,
+            cluster_state, implied_instance_group_configs, validate_instance_group_config,
+            ClusterRecord, ClusterStatusRecord, InstanceFleetRecord, InstanceGroupRecord,
             InstancesRecord, StepRecord, DEFAULT_STEP_CONCURRENCY_LEVEL,
-            MAX_INSTANCE_FLEETS_PER_CLUSTER, MAX_STEPS_PER_JOB_FLOW, MAX_STEP_CONCURRENCY_LEVEL,
-            TRANSITION_SPAN,
+            MAX_INSTANCE_FLEETS_PER_CLUSTER, MAX_INSTANCE_GROUPS_PER_CLUSTER,
+            MAX_STEPS_PER_JOB_FLOW, MAX_STEP_CONCURRENCY_LEVEL, TRANSITION_SPAN,
         };
 
         let now = ::std::time::SystemTime::now();
@@ -338,6 +339,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "Instances carries {requested_fleet_count} instance fleets; a cluster carries \
                  at most {MAX_INSTANCE_FLEETS_PER_CLUSTER}"
             )));
+        }
+
+        // One cluster carries a bounded number of instance groups, the same way it
+        // carries a bounded number of fleets. The configs are TAKEN rather than cloned —
+        // they are moved into the records below, and nothing downstream reads
+        // `Instances.InstanceGroups` again: `InstancesRecord::from_config` derives the
+        // collection type from the FLEETS, and `implied_instance_group_configs` is
+        // reached only when the request named no groups at all.
+        let requested_group_configs = input
+            .instances
+            .instance_groups
+            .take()
+            .unwrap_or_default();
+        if requested_group_configs.len() > MAX_INSTANCE_GROUPS_PER_CLUSTER {
+            return Err(crate::scaffolded::Scaffolded::validation(format!(
+                "Instances carries {} instance groups; a cluster carries at most \
+                 {MAX_INSTANCE_GROUPS_PER_CLUSTER}",
+                requested_group_configs.len()
+            )));
+        }
+        for config in &requested_group_configs {
+            if let Err(message) = validate_instance_group_config(config) {
+                return Err(crate::scaffolded::Scaffolded::validation(message));
+            }
         }
 
         // "A maximum of 256 steps are allowed in each job flow." (RunJobFlow doc.)
@@ -390,6 +415,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for config in input.instances.instance_fleets.clone().unwrap_or_default() {
             let fleet_id = store.mint_instance_fleet_id();
             requested_fleets.push(InstanceFleetRecord::from_config(fleet_id, config, now));
+        }
+
+        // One InstanceGroupRecord per group this cluster launches with: the ones the
+        // request configured, or the ones its uniform `MasterInstanceType` /
+        // `SlaveInstanceType` / `InstanceCount` form implies. `ListInstanceGroups`
+        // projects these.
+        let mut group_configs = requested_group_configs;
+        if group_configs.is_empty() {
+            group_configs = implied_instance_group_configs(&input.instances);
+        }
+        let mut groups = Vec::with_capacity(group_configs.len());
+        for config in group_configs {
+            let group_id = store.mint_instance_group_id();
+            groups.push(InstanceGroupRecord::from_config(group_id, config, now));
         }
 
         // One Step record per submitted StepConfig, in submission order.
@@ -457,6 +496,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             steps,
             // The fleets the request named, which `AddInstanceFleet` appends to.
             fleets: requested_fleets,
+            // The groups the request named or implied, which `AddInstanceGroups`
+            // appends to.
+            groups,
             // A new cluster carries no Spark Connect session: `StartSession` is what
             // starts one.
             sessions: Vec::new(),

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdatePackageGroupOriginConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdatePackageGroupOriginConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdatePackageGroupOriginConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: this operation writes a package group's own origin restriction modes and
+//! the allowed-repository list each `ALLOW_SPECIFIC_REPOSITORIES` restriction carries.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -168,23 +162,357 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UPDATE_PACKAGE_GROUP_ORIGIN_CONFIGURATION_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Set a package group's OWN origin restriction modes, and add to or remove from the
+    /// allowed-repository list of each restriction that is in
+    /// `ALLOW_SPECIFIC_REPOSITORIES` once this call's `restrictions` have been applied.
+    ///
+    /// Three rules decide the request, all of them cross-field:
+    ///
+    /// 1. A restriction named by `addAllowedRepositories` or `removeAllowedRepositories`
+    ///    must END this call in `ALLOW_SPECIFIC_REPOSITORIES` — the only mode that carries
+    ///    an allowed-repository list — whether that mode is the one the group already had
+    ///    or one this same request sets.
+    /// 2. A group with no parent cannot be set to `INHERIT`: `effectiveMode` is "the value
+    ///    of `mode` of the first parent group which does not have a value of `INHERIT`"
+    ///    (`PackageGroupOriginRestriction$effectiveMode`), and a group at the top of the
+    ///    hierarchy has no such parent.
+    /// 3. `allowedRepositoryUpdates` reports what the stored list actually gained and
+    ///    lost, so re-sending a repository the list already holds reports no change.
+    ///
+    /// The allowed-repository list SURVIVES a mode change: it is the restriction's "added
+    /// repositories list", reported only while the mode is `ALLOW_SPECIFIC_REPOSITORIES`,
+    /// and moving the mode away and back does not discard it.
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdatePackageGroupOriginConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdatePackageGroupOriginConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdatePackageGroupOriginConfiguration"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdatePackageGroupOriginConfigurationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the CodeArtifact store is unavailable".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A `packageGroup` that is not a path from the domain root is not an identifier
+        // any package group can have, so it is refused on the INPUT — as every other
+        // package-group operation refuses it — rather than resolved to a lookup that is
+        // bound to miss.
+        if let Some(refusal) = crate::state::package_group_pattern_refusal(&input.package_group) {
+            return Err(
+                UpdatePackageGroupOriginConfigurationErrorModeled::ValidationException(refusal)
+                    .into(),
+            );
+        }
+
+        let requested_modes = requested_modes(input.restrictions.as_ref())?;
+        let additions = allowed_repository_changes(
+            "addAllowedRepositories",
+            input.add_allowed_repositories.as_deref(),
+        )?;
+        let removals = allowed_repository_changes(
+            "removeAllowedRepositories",
+            input.remove_allowed_repositories.as_deref(),
+        )?;
+
+        let mut store = state.lock();
+        let Some(domain) = store.domain_mut(&input.domain, input.domain_owner.as_deref()) else {
+            return Err(
+                UpdatePackageGroupOriginConfigurationErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::domain_not_found_message(
+                            &input.domain,
+                            input.domain_owner.as_deref(),
+                        ),
+                        resource_id: Some(input.domain.clone()),
+                        resource_type: Some(crate::state::DOMAIN_RESOURCE_TYPE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        // The identity the store resolved, which is what a not-found below reports — the
+        // owner the record carries, not the (optional) one the request named.
+        let domain_name = domain.name.clone();
+        let domain_owner = domain.owner.clone();
+
+        // The modes the group carries BEFORE this call, which is what a restriction this
+        // request does not name keeps.
+        let Some(current_modes) = current_modes(domain, &input.package_group) else {
+            return Err(group_not_found(
+                &domain_name,
+                &domain_owner,
+                &input.package_group,
+            ));
+        };
+        let has_parent = domain.package_group_parent(&input.package_group).is_some();
+
+        // RULE 2.
+        if !has_parent
+            && requested_modes
+                .values()
+                .any(|mode| mode == crate::state::ORIGIN_MODE_INHERIT)
+        {
+            return Err(refusal(format!(
+                "Cannot set the origin restriction mode of package group {} to {}: it has no \
+                 parent package group to inherit from.",
+                input.package_group,
+                crate::state::ORIGIN_MODE_INHERIT
+            )));
+        }
+
+        // RULE 1, over every restriction type this request touches the allowed-repository
+        // list of, reported in the model's own enum order so one request's refusal names
+        // them in a stable order.
+        let unlisted: Vec<&str> = PACKAGE_GROUP_ORIGIN_RESTRICTION_TYPE_VALUES
+            .iter()
+            .copied()
+            .filter(|restriction_type| {
+                (additions.contains_key(*restriction_type)
+                    || removals.contains_key(*restriction_type))
+                    && resulting_mode(&requested_modes, &current_modes, restriction_type)
+                        != crate::state::ORIGIN_MODE_ALLOW_SPECIFIC_REPOSITORIES
+            })
+            .collect();
+        if !unlisted.is_empty() {
+            return Err(refusal(format!(
+                "Resulting mode is not {} for [{}]. Cannot add or remove allowed-repositories.",
+                crate::state::ORIGIN_MODE_ALLOW_SPECIFIC_REPOSITORIES,
+                unlisted.join(", ")
+            )));
+        }
+
+        // Nothing is written until every rule above has passed, so a refused request
+        // leaves the group exactly as it was.
+        let Some(group) = domain.package_groups.get_mut(&input.package_group) else {
+            return Err(group_not_found(
+                &domain_name,
+                &domain_owner,
+                &input.package_group,
+            ));
+        };
+
+        let mut updates: std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, Vec<String>>,
+        > = std::collections::HashMap::new();
+        for restriction_type in PACKAGE_GROUP_ORIGIN_RESTRICTION_TYPE_VALUES {
+            let mode = requested_modes.get(*restriction_type);
+            let added = additions.get(*restriction_type);
+            let removed = removals.get(*restriction_type);
+            if mode.is_none() && added.is_none() && removed.is_none() {
+                continue;
+            }
+
+            let restriction = group.restriction_mut(restriction_type);
+            if let Some(mode) = mode {
+                restriction.mode = mode.clone();
+            }
+
+            // Removals are applied BEFORE additions, so a repository this request both
+            // removes and adds ends up in the list the request asked it to be in.
+            // RULE 3: a name is reported only where the stored list actually moved.
+            let removed_names: Vec<String> = removed
+                .into_iter()
+                .flatten()
+                .filter(|name| restriction.allowed_repositories.remove(*name))
+                .cloned()
+                .collect();
+            let added_names: Vec<String> = added
+                .into_iter()
+                .flatten()
+                .filter(|name| restriction.allowed_repositories.insert((*name).clone()))
+                .cloned()
+                .collect();
+
+            let mut change: std::collections::HashMap<String, Vec<String>> =
+                std::collections::HashMap::new();
+            if !added_names.is_empty() {
+                change.insert(UPDATE_TYPE_ADDED.to_string(), added_names);
+            }
+            if !removed_names.is_empty() {
+                change.insert(UPDATE_TYPE_REMOVED.to_string(), removed_names);
+            }
+            if !change.is_empty() {
+                updates.insert((*restriction_type).to_string(), change);
+            }
+        }
+
+        // The answer is the projection of the record just written — parent and effective
+        // modes derived from the hierarchy as it stands — so a `DescribePackageGroup` of
+        // the same pattern cannot disagree with it.
+        let Some(package_group) = domain.package_group_description(&input.package_group) else {
+            return Err(group_not_found(
+                &domain_name,
+                &domain_owner,
+                &input.package_group,
+            ));
+        };
+
+        Ok(UpdatePackageGroupOriginConfigurationOutput {
+            package_group: Some(package_group),
+            allowed_repository_updates: Some(updates),
+        })
     }
+}
+
+/// `PackageGroupAllowedRepositoryUpdateType$ADDED` — a repository this call put into the
+/// allowed-repository list. (`PACKAGE_GROUP_ALLOWED_REPOSITORY_UPDATE_TYPE_VALUES` is the
+/// model's own value list: `ADDED`, `REMOVED`.)
+const UPDATE_TYPE_ADDED: &str = "ADDED";
+
+/// `PackageGroupAllowedRepositoryUpdateType$REMOVED` — a repository this call took out of
+/// the allowed-repository list.
+const UPDATE_TYPE_REMOVED: &str = "REMOVED";
+
+/// This operation's refusal of a request no modelled constraint covers: a 400
+/// `ValidationException`, worded by the caller.
+fn refusal(message: String) -> UpdatePackageGroupOriginConfigurationError {
+    UpdatePackageGroupOriginConfigurationErrorModeled::ValidationException(ValidationException {
+        message,
+        reason: Some(crate::state::VALIDATION_REASON_FIELD_FAILED.to_string()),
+    })
+    .into()
+}
+
+/// The not-found this operation owes for a pattern the domain does not hold.
+///
+/// `resourceType` is unset: `ResourceType` models only `domain`, `repository`, `package`,
+/// `package-version` and `asset`, so there is no enum value for a package group.
+fn group_not_found(
+    domain: &str,
+    owner: &str,
+    pattern: &str,
+) -> UpdatePackageGroupOriginConfigurationError {
+    UpdatePackageGroupOriginConfigurationErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: crate::state::package_group_not_found_message(domain, Some(owner), pattern),
+            resource_id: Some(pattern.to_string()),
+            resource_type: None,
+        },
+    )
+    .into()
+}
+
+/// The mode the group under `pattern` carries for every restriction type, or `None` when
+/// the domain holds no such group.
+///
+/// Taken as an owned snapshot so the rules below are decided on the record as it was,
+/// without holding a borrow of the store across the write that follows.
+fn current_modes(
+    domain: &crate::state::Domain,
+    pattern: &str,
+) -> Option<std::collections::BTreeMap<String, String>> {
+    let group = domain.package_groups.get(pattern)?;
+    Some(
+        PACKAGE_GROUP_ORIGIN_RESTRICTION_TYPE_VALUES
+            .iter()
+            .map(|restriction_type| {
+                (
+                    (*restriction_type).to_string(),
+                    group.restriction_mode(restriction_type).to_string(),
+                )
+            })
+            .collect(),
+    )
+}
+
+/// The mode `restriction_type` ends this call in: the one the request sets, or the one the
+/// group already carried when the request leaves it alone.
+fn resulting_mode<'modes>(
+    requested: &'modes std::collections::BTreeMap<String, String>,
+    current: &'modes std::collections::BTreeMap<String, String>,
+    restriction_type: &str,
+) -> &'modes str {
+    requested
+        .get(restriction_type)
+        .or_else(|| current.get(restriction_type))
+        .map_or(crate::state::ORIGIN_MODE_INHERIT, String::as_str)
+}
+
+/// The `restrictions` map of the request, validated against the model's enums and keyed by
+/// restriction type.
+///
+/// The map's key and value are both modelled enums, so an unmodelled member is refused in
+/// the same envelope a modelled constraint failure carries rather than stored as a mode no
+/// reader can resolve.
+fn requested_modes(
+    restrictions: Option<&std::collections::HashMap<String, String>>,
+) -> Result<std::collections::BTreeMap<String, String>, UpdatePackageGroupOriginConfigurationError>
+{
+    let mut modes = std::collections::BTreeMap::new();
+    for (restriction_type, mode) in restrictions.into_iter().flatten() {
+        if !PACKAGE_GROUP_ORIGIN_RESTRICTION_TYPE_VALUES.contains(&restriction_type.as_str()) {
+            return Err(refusal(crate::state::constraint_violation_message(
+                "restrictions",
+                restriction_type,
+                &enum_requirement(PACKAGE_GROUP_ORIGIN_RESTRICTION_TYPE_VALUES),
+            )));
+        }
+        if !PACKAGE_GROUP_ORIGIN_RESTRICTION_MODE_VALUES.contains(&mode.as_str()) {
+            return Err(refusal(crate::state::constraint_violation_message(
+                &format!("restrictions.{restriction_type}"),
+                mode,
+                &enum_requirement(PACKAGE_GROUP_ORIGIN_RESTRICTION_MODE_VALUES),
+            )));
+        }
+        modes.insert(restriction_type.clone(), mode.clone());
+    }
+    Ok(modes)
+}
+
+/// The repositories one `PackageGroupAllowedRepositoryList` names, grouped by the
+/// restriction type whose list each belongs to.
+///
+/// Both members of `PackageGroupAllowedRepository` are optional in the model, so an entry
+/// that names no repository or no restriction type is refused: there is no list for it to
+/// act on. A repository NAME is stored as given — the allowed list is a list of names, and
+/// one the domain does not hold yet simply matches nothing until it does.
+fn allowed_repository_changes(
+    member: &str,
+    entries: Option<&[PackageGroupAllowedRepository]>,
+) -> Result<
+    std::collections::BTreeMap<String, std::collections::BTreeSet<String>>,
+    UpdatePackageGroupOriginConfigurationError,
+> {
+    let mut changes: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    for entry in entries.into_iter().flatten() {
+        let Some(restriction_type) = entry.origin_restriction_type.as_deref() else {
+            return Err(refusal(crate::state::constraint_violation_message(
+                &format!("{member}.originRestrictionType"),
+                "",
+                "Member must not be null",
+            )));
+        };
+        let Some(repository) = entry.repository_name.as_deref() else {
+            return Err(refusal(crate::state::constraint_violation_message(
+                &format!("{member}.repositoryName"),
+                "",
+                "Member must not be null",
+            )));
+        };
+        if !PACKAGE_GROUP_ORIGIN_RESTRICTION_TYPE_VALUES.contains(&restriction_type) {
+            return Err(refusal(crate::state::constraint_violation_message(
+                &format!("{member}.originRestrictionType"),
+                restriction_type,
+                &enum_requirement(PACKAGE_GROUP_ORIGIN_RESTRICTION_TYPE_VALUES),
+            )));
+        }
+        changes
+            .entry(restriction_type.to_string())
+            .or_default()
+            .insert(repository.to_string());
+    }
+    Ok(changes)
+}
+
+/// The requirement an enum member that is not one of `values` failed, worded as AWS words
+/// an enum constraint violation.
+fn enum_requirement(values: &[&str]) -> String {
+    format!("Member must satisfy enum value set: [{}]", values.join(", "))
 }
