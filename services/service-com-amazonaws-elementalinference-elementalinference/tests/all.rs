@@ -25,6 +25,8 @@ mod error_message_rule;
 mod feed_association;
 #[path = "all/feed_lifecycle.rs"]
 mod feed_lifecycle;
+#[path = "all/feed_policy.rs"]
+mod feed_policy;
 #[path = "all/feed_usable_on_create.rs"]
 mod feed_usable_on_create;
 #[path = "all/fixture_catalog.rs"]

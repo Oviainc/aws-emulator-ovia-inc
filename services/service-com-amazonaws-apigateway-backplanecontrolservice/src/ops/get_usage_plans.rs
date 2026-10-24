@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetUsagePlans
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetUsagePlans`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetUsagePlans::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: lists the account's stored `UsagePlan` records in creation order, one
+//! `position`/`limit` page at a time, narrowed to the plans that meter the API key a
+//! `keyId` names. Reads only.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +142,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetUsagePlans` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetUsagePlansErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetUsagePlans"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let store = state.lock();
+        // Creation order is the stable sequence a `position` cursor walks, and `keyId`
+        // narrows that sequence BEFORE the page is cut, so paging a filtered listing
+        // walks the filtered sequence rather than cutting pages out of the whole
+        // collection and emptying them afterwards. The filter is the stored association
+        // joined against the API key it names (`usage_plan_key`), so a key no plan
+        // meters — including one that is no longer stored — matches no plan.
+        let ordered: Vec<String> = store
+            .usage_plan_ids_in_creation_order()
+            .into_iter()
+            .filter(|id| match input.key_id.as_deref() {
+                None => true,
+                Some(key_id) => store.usage_plan_key(id, key_id).is_some(),
+            })
+            .collect();
+        let page = crate::state::page_of(&ordered, input.position.as_deref(), input.limit)
+            .map_err(|message| {
+                GetUsagePlansErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(message),
+                })
+            })?;
+        let items = page
+            .ids
+            .iter()
+            .filter_map(|id| store.usage_plans.get(id))
+            .map(CreateUsagePlanOutput::from)
+            .collect();
+        Ok(GetUsagePlansOutput {
+            items: Some(items),
+            position: page.next_position,
+        })
     }
 }

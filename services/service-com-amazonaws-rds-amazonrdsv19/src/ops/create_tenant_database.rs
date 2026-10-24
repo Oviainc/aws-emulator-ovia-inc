@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateTenantDatabase
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateTenantDatabase`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates a tenant database in a DB instance this service holds. This is the ONLY file to
+//! touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateTenantDatabase::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Tenant databases exist only in a MULTI-TENANT DB instance: `MultiTenant` "only applies
+//! to RDS for Oracle container database (CDB) engines", so an instance on any other engine
+//! has no tenant databases to create one beside — a combination of a real instance and an
+//! operation its configuration does not serve, which is `InvalidParameterCombination`
+//! rather than anything missing.
 //!
 //! ## Shape of an operation
 //!
@@ -183,18 +182,158 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateTenantDatabase` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateTenantDatabaseErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateTenantDatabase"))
+        let region =
+            crate::state::request_region(ctx).map_err(CreateTenantDatabaseError::validation)?;
+        // The model constrains none of these members, so the rules their own documentation
+        // states are enforced here, and nothing caller-sized reaches the store unchecked.
+        let identifier = input.db_instance_identifier.to_ascii_lowercase();
+        let tenant_db_name = input.tenant_db_name.clone();
+        crate::state::check_identifier("TenantDBName", &tenant_db_name, 63)
+            .map_err(CreateTenantDatabaseError::invalid_parameter_value)?;
+        crate::state::check_master_username(&input.master_username)
+            .map_err(CreateTenantDatabaseError::invalid_parameter_value)?;
+        if let Some(password) = &input.master_user_password {
+            crate::state::check_master_user_password(password)
+                .map_err(CreateTenantDatabaseError::invalid_parameter_value)?;
+        }
+        for (member, value) in [
+            ("CharacterSetName", input.character_set_name.as_deref()),
+            (
+                "NcharCharacterSetName",
+                input.nchar_character_set_name.as_deref(),
+            ),
+        ] {
+            if let Some(value) = value {
+                crate::state::check_free_form(member, value)
+                    .map_err(CreateTenantDatabaseError::invalid_parameter_value)?;
+            }
+        }
+        let tags = input.tags.unwrap_or_default();
+        crate::state::check_tags(&tags)
+            .map_err(CreateTenantDatabaseError::invalid_parameter_value)?;
+        // `ManageMasterUserPassword` has RDS generate and manage the password in Amazon Web
+        // Services Secrets Manager and report the secret it created as `MasterUserSecret`;
+        // this service mints no such secret, so the request is answered naming the member
+        // rather than with a tenant database whose managed secret does not exist.
+        if input.manage_master_user_password == Some(true) {
+            return Err(crate::scaffolded::Scaffolded::NotImplemented(
+                crate::scaffolded::NotImplemented {
+                    message: "CreateTenantDatabase$ManageMasterUserPassword is not implemented \
+                              in this emulator: it has RDS generate the master user password \
+                              in Amazon Web Services Secrets Manager and report that secret \
+                              as MasterUserSecret, and this service mints no such secret. \
+                              Name MasterUserPassword instead."
+                        .to_string(),
+                },
+            ));
+        }
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated tenant database.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        store.settle_due_transitions(&region);
+
+        // RDS is regional: only the region the request was signed for is in scope.
+        let Some(instance) = store
+            .db_instances
+            .get(&(region.clone(), identifier.clone()))
+        else {
+            return Err(CreateTenantDatabaseErrorModeled::DBInstanceNotFoundFault(
+                DBInstanceNotFoundFault {
+                    message: Some(format!("DBInstance {identifier} not found.")),
+                },
+            )
+            .into());
+        };
+        if !crate::state::is_multi_tenant_engine(&instance.engine) {
+            return Err(CreateTenantDatabaseError::invalid_parameter_combination(
+                format!(
+                    "DB instance {identifier} runs engine {} and does not use the \
+                     multi-tenant configuration, so it holds no tenant databases",
+                    instance.engine
+                ),
+            ));
+        }
+        if instance.status != "available" {
+            return Err(
+                CreateTenantDatabaseErrorModeled::InvalidDBInstanceStateFault(
+                    InvalidDBInstanceStateFault {
+                        message: Some(format!(
+                            "DB instance {identifier} is in state {} and cannot take a new \
+                             tenant database",
+                            instance.status
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        let dbi_resource_id = instance.dbi_resource_id.clone();
+        let deletion_protection = instance.deletion_protection;
+
+        let key = (
+            region.clone(),
+            crate::state::tenant_database_key(&identifier, &tenant_db_name),
+        );
+        if store.tenant_databases.contains_key(&key) {
+            return Err(
+                CreateTenantDatabaseErrorModeled::TenantDatabaseAlreadyExistsFault(
+                    TenantDatabaseAlreadyExistsFault {
+                        message: Some(format!(
+                            "Tenant database {tenant_db_name} already exists in DB instance \
+                             {identifier}"
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        if store.tenant_databases_of(&region, &identifier).len()
+            >= crate::state::TENANT_DATABASE_QUOTA_PER_INSTANCE
+        {
+            return Err(
+                CreateTenantDatabaseErrorModeled::TenantDatabaseQuotaExceededFault(
+                    TenantDatabaseQuotaExceededFault {
+                        message: Some(format!(
+                            "Cannot create more than {} tenant databases in DB instance \
+                             {identifier}",
+                            crate::state::TENANT_DATABASE_QUOTA_PER_INSTANCE
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mint = store.next_mint();
+        // A new tenant database is not usable yet: it reports `creating` and reaches
+        // `available` on its own. The due instant is stored on the record — nothing sleeps.
+        let record = crate::state::TenantDatabaseRecord {
+            region: region.clone(),
+            db_instance_identifier: identifier,
+            tenant_db_name,
+            resource_id: crate::state::mint_tenant_database_resource_id(mint),
+            dbi_resource_id,
+            // `MasterUserPassword` is `@sensitive` and RDS reports no member carrying it:
+            // it is accepted and neither stored nor returned. The username is.
+            master_username: input.master_username,
+            character_set_name: input.character_set_name,
+            nchar_character_set_name: input.nchar_character_set_name,
+            status: crate::state::TENANT_DATABASE_STATUS_CREATING.to_string(),
+            pending_status: Some(crate::state::PendingStatus::in_a_moment(
+                crate::state::TENANT_DATABASE_STATUS_AVAILABLE,
+            )),
+            create_time: crate::state::now_as_wire_timestamp(),
+            tags,
+        };
+        let tenant_database = record.to_wire(deletion_protection);
+        store.tenant_databases.insert(key, record);
+        Ok(CreateTenantDatabaseOutput {
+            tenant_database: Some(tenant_database),
+        })
     }
 }

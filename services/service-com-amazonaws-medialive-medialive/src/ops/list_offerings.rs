@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListOfferings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListOfferings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListOfferings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The offerings this operation reports are the CATALOG in
+//! [`crate::state::offerings`] — an offering is not a resource a caller creates,
+//! so there is no per-account store of them — and the state this operation reads
+//! is the channel the `ChannelConfiguration` filter names.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +160,178 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListOfferings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListOfferingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListOfferings"))
+        // Every offering is reported in the region the request was signed for:
+        // `Offering$Region` is "AWS region, e.g. 'us-west-2'" and its ARN names
+        // that region too, and an offering reserves capacity in the region whose
+        // endpoint the caller addressed.
+        let region = crate::state::request_region(ctx.parts());
+
+        // `MaxResults` is a page size, so a non-positive one asks for nothing
+        // and is a bad request. It is clamped to a finite ceiling, and an absent
+        // one uses that ceiling, so no single request can ask the service to
+        // project an unbounded number of offerings in one response — the same
+        // rule, and the same ceiling, every other listing of this service
+        // applies.
+        let page_size = match input.max_results {
+            Some(max_results) if max_results < 1 => {
+                return Err(bad_request(format!(
+                    "maxResults must be at least 1, got {max_results}"
+                )));
+            }
+            Some(max_results) => (max_results as usize).min(crate::state::MAX_LIST_PAGE_SIZE),
+            None => crate::state::MAX_LIST_PAGE_SIZE,
+        };
+
+        // Each of these filters names one member of
+        // `ReservationResourceSpecification`, whose target shape is an ENUM, but
+        // the request member itself targets the free-form `__string` — so the
+        // request boundary refuses no value and a value outside the member's
+        // modelled set, which names no offering, is refused here, naming the
+        // member and the values it accepts.
+        for (member, filter, values) in [
+            ("channelClass", input.channel_class.as_deref(), CHANNEL_CLASS_VALUES),
+            ("codec", input.codec.as_deref(), RESERVATION_CODEC_VALUES),
+            (
+                "maximumBitrate",
+                input.maximum_bitrate.as_deref(),
+                RESERVATION_MAXIMUM_BITRATE_VALUES,
+            ),
+            (
+                "maximumFramerate",
+                input.maximum_framerate.as_deref(),
+                RESERVATION_MAXIMUM_FRAMERATE_VALUES,
+            ),
+            (
+                "resolution",
+                input.resolution.as_deref(),
+                RESERVATION_RESOLUTION_VALUES,
+            ),
+            (
+                "resourceType",
+                input.resource_type.as_deref(),
+                RESERVATION_RESOURCE_TYPE_VALUES,
+            ),
+            (
+                "specialFeature",
+                input.special_feature.as_deref(),
+                RESERVATION_SPECIAL_FEATURE_VALUES,
+            ),
+            (
+                "videoQuality",
+                input.video_quality.as_deref(),
+                RESERVATION_VIDEO_QUALITY_VALUES,
+            ),
+        ] {
+            if let Some(value) = filter {
+                if !values.contains(&value) {
+                    return Err(bad_request(format!(
+                        "{member} must be one of {}, got {value:?}",
+                        values.join(", ")
+                    )));
+                }
+            }
+        }
+
+        // `Duration` is "Filter by offering duration, e.g. '12'" — a count of
+        // the units an offering's duration is measured in, carried as a string —
+        // so a value that is not a positive count of them is a bad request,
+        // while a well-formed count no offering is leased for simply admits
+        // none.
+        let duration = match input.duration.as_deref() {
+            None => None,
+            Some(duration) => Some(duration.parse::<i32>().ok().filter(|months| *months > 0).ok_or_else(
+                || {
+                    bad_request(format!(
+                        "duration must be a positive number of {}, got {duration:?}",
+                        crate::state::OFFERING_DURATION_UNITS
+                    ))
+                },
+            )?),
+        };
+
+        // `NextToken` is the `OfferingId` the next page starts at, which is the
+        // form this operation hands a token out as, so a value that is not one
+        // of this catalog's offering ids cannot be one of its tokens and is a
+        // bad request rather than an empty page.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(next_token) => crate::state::offering_index(next_token).ok_or_else(|| {
+                bad_request(format!(
+                    "nextToken must be the offeringId this operation hands a page's token out \
+                     as, got {next_token:?}"
+                ))
+            })?,
+        };
+
+        // `ChannelConfiguration` is "Filter to offerings that match the
+        // configuration of an existing channel, e.g. '2345678' (a channel ID)",
+        // so it is resolved against the channel store: the channel has to be
+        // one the account HAS, and a value naming no channel has no
+        // configuration to match and is refused. This operation models no 404,
+        // so the refusal is its `BadRequestException`.
+        let channel_configuration = match input.channel_configuration.as_deref() {
+            None => None,
+            Some(channel_id) => {
+                let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+                let mut state = state.lock();
+                // Reporting only: `settle` materialises the transitions the
+                // clock had already made due, which were owed at this instant
+                // whether or not anybody listed.
+                state.settle(::std::time::SystemTime::now());
+                Some(
+                    state
+                        .channel_offering_configuration(channel_id)
+                        .ok_or_else(|| {
+                            bad_request(format!(
+                                "channelConfiguration must be the id of a channel in this \
+                                 account, got {channel_id:?}"
+                            ))
+                        })?,
+                )
+            }
+        };
+
+        let filters = crate::state::OfferingFilters {
+            channel_class: input.channel_class.as_deref(),
+            codec: input.codec.as_deref(),
+            duration,
+            maximum_bitrate: input.maximum_bitrate.as_deref(),
+            maximum_framerate: input.maximum_framerate.as_deref(),
+            resolution: input.resolution.as_deref(),
+            resource_type: input.resource_type.as_deref(),
+            special_feature: input.special_feature.as_deref(),
+            video_quality: input.video_quality.as_deref(),
+            channel_configuration,
+        };
+
+        let (offerings, next_token) =
+            crate::state::offering_page(&filters, &region, start, page_size);
+
+        Ok(ListOfferingsOutput {
+            offerings: Some(offerings),
+            next_token,
+        })
     }
+}
+
+/// A request this operation cannot serve as asked, as the 400
+/// `BadRequestException` it models. The message names the member, the rule and
+/// the value the request carried, so a caller can fix the request from that text
+/// alone.
+fn bad_request(message: String) -> ListOfferingsError {
+    ListOfferingsErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no channel store to resolve a `ChannelConfiguration` filter
+/// against. A modelled server error, never a fresh engine (which would answer
+/// from an empty store nobody ever wrote to).
+fn unavailable() -> ListOfferingsError {
+    ListOfferingsErrorModeled::InternalServerErrorException(InternalServerErrorException {
+        message: Some(crate::state::NO_STORE.to_string()),
+    })
+    .into()
 }
