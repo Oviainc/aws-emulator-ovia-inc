@@ -10,8 +10,8 @@
 //! # Every store here is bounded
 //!
 //! This process is a developer's emulator that authenticates nobody, so a caller that
-//! can reach it must not be able to grow its memory without limit. Each of the three
-//! maps below has an explicit ceiling and a stated release path, and every insert goes
+//! can reach it must not be able to grow its memory without limit. Each of the stores
+//! below has an explicit ceiling and a stated release path, and every insert goes
 //! through the method that enforces it:
 //!
 //! | store | ceiling | release |
@@ -19,6 +19,7 @@
 //! | [`ComAmazonawsArcregionswitchArcregionswitchState::plans`] | [`MAX_PLANS`] | `DeletePlan`, or the request is refused |
 //! | [`ComAmazonawsArcregionswitchArcregionswitchState::executions`] | [`MAX_EXECUTIONS_PER_PLAN`] per plan | the oldest terminal execution is evicted; deleting the plan drops them all |
 //! | [`ComAmazonawsArcregionswitchArcregionswitchState::client_tokens`] | [`MAX_CLIENT_TOKENS`] | the oldest record is evicted (FIFO) |
+//! | [`StoredPlan::tags`] | [`MAX_TAGS_PER_PLAN`] | `UntagResource`, or the request is refused |
 //!
 //! Per-request cost is independent of how much is stored, too: [`settle`] walks only the
 //! transitions whose deadline has passed, through the
@@ -172,6 +173,57 @@ pub const MAX_PLANS: usize = 500;
 /// is refused. (One plan can hold only one non-terminal execution at a time, so this
 /// ceiling is what bounds the history that accumulates behind it.)
 pub const MAX_EXECUTIONS_PER_PLAN: usize = 50;
+
+/// The most tags one plan carries.
+///
+/// AWS documents this one: `TagResourceRequest$tags` reads "Tags that you add to a
+/// resource. You can add a maximum of 50 tags in Region switch."
+/// (`smithy_query(query="doc", shape="TagResourceRequest", member="tags", model_path="services/service-com-amazonaws-arcregionswitch-arcregionswitch/smithy-model/com-amazonaws-arcregionswitch-arcregionswitch.json")`),
+/// so it is the service's own limit rather than an emulator choice. The `Tags` map's
+/// `@length(0..200)` bounds ONE request; this bounds what a plan accumulates over many,
+/// and it also bounds the store, since tags are the one part of a plan record a caller
+/// can keep growing after the plan exists.
+pub const MAX_TAGS_PER_PLAN: usize = 50;
+
+/// `TagKey`'s modelled minimum length (`@length(min: 1, max: 128)`), from
+/// `smithy_query(query="shape", shape="TagKey", model_path="services/service-com-amazonaws-arcregionswitch-arcregionswitch/smithy-model/com-amazonaws-arcregionswitch-arcregionswitch.json")`.
+pub const TAG_KEY_MIN_LENGTH: usize = 1;
+
+/// `TagKey`'s modelled maximum length, from the same shape.
+pub const TAG_KEY_MAX_LENGTH: usize = 128;
+
+/// `TagValue`'s modelled maximum length (`@length(min: 0, max: 256)`), from
+/// `smithy_query(query="shape", shape="TagValue", model_path="services/service-com-amazonaws-arcregionswitch-arcregionswitch/smithy-model/com-amazonaws-arcregionswitch-arcregionswitch.json")`.
+///
+/// Nothing here enforces it: the boundary validator reaches a map's VALUE target, so a
+/// tag value past this length is refused before any handler runs. It is stated for the
+/// tests that pin that bound.
+pub const TAG_VALUE_MAX_LENGTH: usize = 256;
+
+/// Why `key` is not an acceptable tag key, naming the member and the constraint it
+/// breaks, or `None` when it is acceptable.
+///
+/// The boundary validator reaches a map's VALUE target but not its KEY target, so a
+/// request carrying a tag key outside `TagKey`'s `@length` reaches the handler. This is
+/// where that constraint is enforced, for every operation that takes tag keys.
+pub fn tag_key_rejection(member: &str, key: &str) -> Option<String> {
+    let length = key.chars().count();
+    (!(TAG_KEY_MIN_LENGTH..=TAG_KEY_MAX_LENGTH).contains(&length)).then(|| {
+        format!(
+            "{member}: a tag key is {TAG_KEY_MIN_LENGTH} to {TAG_KEY_MAX_LENGTH} characters \
+             long; {key:?} is {length}"
+        )
+    })
+}
+
+/// Why this set of tag keys is not acceptable, or `None` when every one of them is.
+pub fn tag_keys_rejection<'a>(
+    member: &str,
+    keys: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
+    keys.into_iter()
+        .find_map(|key| tag_key_rejection(member, key))
+}
 
 /// The most `clientToken` records this emulator keeps. Reaching it evicts the oldest
 /// recorded token, so the idempotency cache cannot accumulate without bound; a caller
