@@ -19,17 +19,20 @@
 //! case — a `MaxResults` outside the modelled range — is one row of
 //! [`max_results_outside_the_modelled_range_is_refused`].
 //!
-//! Nothing in this emulator CREATES an execution (see `execution_lookup.rs` and
-//! `crate::state::StoredExecution`), so the executions below are written into the store the
-//! handler reads, exactly as a delivery would record them — which is what makes every
-//! assertion below about a value this test put in the store rather than one the handler
-//! invented. The router, the signing, the error-code helper, the store seeding and the
-//! minimal export request all come from the other suites of this same test target.
+//! The executions below are the ones this suite WROTE into the store the handler reads,
+//! which is what makes every assertion about a value this test put in the store rather than
+//! one the handler invented. The service records deliveries of its own — one per definition
+//! it persists, on the clock (see `delivery_executions.rs`) — so each export created here
+//! has that delivery HELD out of the way: this suite is about how the listing pages over a
+//! given store, and the accrual itself has its own suite. The router, the signing, the
+//! error-code helper, the store seeding and the minimal export request all come from the
+//! other suites of this same test target.
 
 use serde_json::{json, Map, Value};
 
 use service_com_amazonaws_bcmdataexports_awsbillingandcostmanagementdataexports::ops::types::EXECUTION_STATUS_CODE_VALUES;
 
+use crate::delivery_executions::hold_delivery;
 use crate::execution_lookup::{client_and_engine, record_execution};
 use crate::export_lifecycle::{error_code, Client};
 use crate::table_listing::minimal_export_request;
@@ -168,6 +171,9 @@ async fn seeded() -> (Client, Vec<(String, Vec<String>)>) {
             .as_str()
             .unwrap_or_else(|| panic!("case {name:?}: CreateExport returns an ExportArn"))
             .to_string();
+        // The delivery the service owes this export is held, so the executions this row
+        // pages over are exactly the ones it records below.
+        hold_delivery(&engine, &arn);
         for (offset, id) in ids.iter().enumerate() {
             // Each execution gets a different published status code, so the reported
             // status is the recorded one rather than a constant.

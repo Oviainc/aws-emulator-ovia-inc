@@ -184,7 +184,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map_err(ListTagsForResourceErrorModeled::ValidationException)?;
 
         let tags: Vec<(String, ResourceTag)> = {
-            let store = state.lock();
+            let mut store = state.lock();
+            // Tags do not depend on an export's deliveries, but every handler of this
+            // service applies what the clock already owes before it answers, so a delivery
+            // falls due at its stored instant whichever operation a caller happens to use.
+            store.materialize_due(::std::time::SystemTime::now());
             let stored = store.exports.get(&input.resource_arn).ok_or_else(|| {
                 crate::state::tagged_resource_not_found_error(
                     &input.resource_arn,

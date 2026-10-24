@@ -43,3 +43,5 @@ mod state_roundtrip;
 mod static_catalog;
 #[path = "all/storage_summary.rs"]
 mod storage_summary;
+#[path = "all/usage_limits.rs"]
+mod usage_limits;

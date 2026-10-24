@@ -26,7 +26,7 @@ use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
 use service_com_amazonaws_mwaaserverless_amazonmwaaserverless::state::{
-    TaskInstance, UnresolvedEntity, LOOKUP_MISS_STATUS, RUN_STATUS_QUEUED,
+    TaskInstance, UnresolvedEntity, LOOKUP_MISS_STATUS, RUN_STATUS_STARTING,
     TASK_INSTANCE_STATUS_NONE,
 };
 use service_com_amazonaws_mwaaserverless_amazonmwaaserverless::ComAmazonawsMwaaserverlessAmazonmwaaserverlessState;
@@ -65,7 +65,10 @@ fn expected_seconds(offset_millis: u64) -> f64 {
 
 /// A timestamp member as epoch seconds, whichever wire form the protocol rendered:
 /// a number, or the ISO 8601 string the member's `timestampFormat: date-time` names.
-fn epoch_seconds(value: &serde_json::Value) -> Option<f64> {
+///
+/// `pub(crate)` so `run_lifecycle_progression` reads a timestamp the same way rather
+/// than writing a second decoder.
+pub(crate) fn epoch_seconds(value: &serde_json::Value) -> Option<f64> {
     if let Some(number) = value.as_f64() {
         return Some(number);
     }
@@ -79,7 +82,9 @@ fn epoch_seconds(value: &serde_json::Value) -> Option<f64> {
 
 /// A task-instance record with every optional member empty: the state of an instance
 /// that has not started.
-fn instance(id: &str, status: &str) -> TaskInstance {
+///
+/// `pub(crate)` so `run_lifecycle_progression` seeds the same record shape.
+pub(crate) fn instance(id: &str, status: &str) -> TaskInstance {
     TaskInstance {
         task_instance_id: id.to_string(),
         task_id: None,
@@ -243,7 +248,9 @@ async fn stored_run(harness: &Harness, name: &str) -> (String, String, String) {
 /// Put `task` into the run's store. Nothing in this service's API creates a task
 /// instance (no Apache Airflow engine executes a definition here), so seeding the
 /// store is the only way to exercise the read this operation owns.
-fn seed(harness: &Harness, workflow_arn: &str, run_id: &str, task: TaskInstance) {
+///
+/// `pub(crate)` so `run_lifecycle_progression` seeds through the same path.
+pub(crate) fn seed(harness: &Harness, workflow_arn: &str, run_id: &str, task: TaskInstance) {
     harness
         .engine()
         .state::<ComAmazonawsMwaaserverlessAmazonmwaaserverlessState>()
@@ -652,8 +659,8 @@ async fn reading_a_task_instance_changes_nothing_a_later_caller_sees() {
          then {second:?}"
     );
 
-    // The read moved no run status and consumed nothing: the run is still the `QUEUED`
-    // its start left it in, and it still holds exactly the seeded instances.
+    // The read moved no run status and consumed nothing: the run is still the
+    // `STARTING` its start left it in, and it still holds exactly the seeded instances.
     let (run_state, error_message, stored_ids) = {
         let state = harness
             .engine()
@@ -671,7 +678,7 @@ async fn reading_a_task_instance_changes_nothing_a_later_caller_sees() {
         )
     };
     assert_eq!(
-        run_state, RUN_STATUS_QUEUED,
+        run_state, RUN_STATUS_STARTING,
         "case reporting read: GetTaskInstance must not move the run's status, got \
          {run_state:?}"
     );

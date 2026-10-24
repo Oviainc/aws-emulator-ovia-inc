@@ -155,6 +155,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let mut store = state.lock();
+        // Every handler of this service applies what the clock already owes before it
+        // answers, so a delivery owed to ANOTHER export is recorded at the instant it fell
+        // due rather than waiting for a reader of it. The deliveries of the export this
+        // call removes go with it below.
+        store.materialize_due(::std::time::SystemTime::now());
         // Removing the export frees its name: the ARN a later CreateExport mints for that
         // name in that region is this key, and it is no longer taken.
         store.exports.remove(&input.export_arn).ok_or_else(|| {

@@ -19,12 +19,13 @@
 //! stable order, paged — and answers 200 with an EMPTY list for an ARN that names no
 //! export, which is recorded AWS behaviour for this one listing.
 //!
-//! Nothing in this emulator CREATES an execution — an execution records a data-plane
-//! delivery (a query run and a file written to the caller's bucket), which this emulator
-//! does not perform — so the executions below are written into the store the handler reads
-//! (`crate::state`), exactly as a delivery would record them. That is also what makes the
-//! assertions about the reported values meaningful: each one is a value this test put in
-//! the store, not a value the handler invented.
+//! The executions below are the ones these suites WROTE into the store the handler reads
+//! (`crate::state`), so every assertion is about a value this test put there rather than
+//! one the handler invented. The service records deliveries of its own — one per definition
+//! it persists, on the clock (see `delivery_executions.rs`) — so each export created here
+//! has that delivery HELD out of the way with
+//! [`crate::delivery_executions::hold_delivery`]: this suite is about what the two readers
+//! report for a given store, and the accrual itself has its own suite.
 //!
 //! It is asserted over a TABLE that differs along what the rule generalises over: several
 //! executions of several exports, each with a different `ExecutionStatusCode` (walked from
@@ -43,6 +44,7 @@ use service_com_amazonaws_bcmdataexports_awsbillingandcostmanagementdataexports:
 };
 use service_com_amazonaws_bcmdataexports_awsbillingandcostmanagementdataexports::ComAmazonawsBcmdataexportsAwsbillingandcostmanagementdataexportsState as State;
 
+use crate::delivery_executions::hold_delivery;
 use crate::export_lifecycle::{cases, error_code, Client, NOT_FOUND_STATUS};
 
 /// The ids a bogus-execution lookup is tried with: the recorded shape (a UUID), and the
@@ -68,14 +70,17 @@ pub(crate) fn client_and_engine() -> (Client, Arc<engine::InMemoryEngine>) {
     (Client::with_engine(Arc::clone(&engine)), engine)
 }
 
-/// Create the export named by case `index` and return its ARN.
-async fn create_export(client: &Client, index: usize) -> String {
+/// Create the export named by case `index` and return its ARN, with the delivery the
+/// service owes it held out of the way (see this module's header).
+async fn create_export(client: &Client, engine: &Arc<engine::InMemoryEngine>, index: usize) -> String {
     let case = cases().remove(index);
     let created = client.ok("CreateExport", &case.create_request()).await;
-    created["ExportArn"]
+    let arn = created["ExportArn"]
         .as_str()
         .expect("CreateExport returns an ExportArn")
-        .to_string()
+        .to_string();
+    hold_delivery(engine, &arn);
+    arn
 }
 
 /// Record one execution of `export_arn` in the store, with the status code
@@ -113,6 +118,10 @@ pub(crate) fn record_execution(
         export_arn: export_arn.to_string(),
         status: recorded.clone(),
         export,
+        initiated_at: ::std::time::SystemTime::now(),
+        // This execution is recorded in a terminal-looking state by the test rather than
+        // by the service, so it owes no later transition.
+        completion_due_at: None,
     });
     recorded
 }
@@ -124,10 +133,10 @@ fn reported_status(body: &Value) -> &Value {
 
 #[tokio::test]
 async fn an_execution_id_that_names_nothing_is_a_modelled_not_found() {
-    let (client, _engine) = client_and_engine();
+    let (client, engine) = client_and_engine();
 
     // The recorded precondition: a valid export, so the refusal is about the execution.
-    let arn = create_export(&client, 0).await;
+    let arn = create_export(&client, &engine, 0).await;
 
     for id in bogus_execution_ids() {
         let label = format!("bogus execution id {id:?}");
@@ -190,8 +199,8 @@ async fn an_execution_id_that_names_nothing_is_a_modelled_not_found() {
 async fn a_recorded_execution_is_reported_from_the_store() {
     let (client, engine) = client_and_engine();
 
-    let first = create_export(&client, 0).await;
-    let second = create_export(&client, 1).await;
+    let first = create_export(&client, &engine, 0).await;
+    let second = create_export(&client, &engine, 1).await;
     let first_definition = client
         .ok("GetExport", &json!({ "ExportArn": first }))
         .await["Export"]
@@ -326,11 +335,11 @@ async fn a_recorded_execution_is_reported_from_the_store() {
 async fn list_executions_reports_the_executions_of_its_own_export() {
     let (client, engine) = client_and_engine();
 
-    let first = create_export(&client, 0).await;
-    let second = create_export(&client, 1).await;
+    let first = create_export(&client, &engine, 0).await;
+    let second = create_export(&client, &engine, 1).await;
 
-    // An export that has recorded none lists none: nothing in this emulator creates an
-    // execution, so this is the ordinary answer.
+    // An export that has recorded none lists none: the delivery the service owes these
+    // exports is held, so neither has an execution yet.
     for (label, arn) in [("first", &first), ("second", &second)] {
         let body = client
             .ok("ListExecutions", &json!({ "ExportArn": arn }))
@@ -414,7 +423,7 @@ async fn list_executions_reports_the_executions_of_its_own_export() {
 #[tokio::test]
 async fn list_executions_pages_over_every_recorded_execution() {
     let (client, engine) = client_and_engine();
-    let arn = create_export(&client, 0).await;
+    let arn = create_export(&client, &engine, 0).await;
 
     let total = EXECUTION_STATUS_CODE_VALUES.len();
     let mut expected: Vec<String> = Vec::new();
@@ -494,11 +503,11 @@ async fn list_executions_pages_over_every_recorded_execution() {
 #[tokio::test]
 async fn list_executions_on_an_absent_export_lists_none() {
     let (client, engine) = client_and_engine();
-    let live = create_export(&client, 0).await;
+    let live = create_export(&client, &engine, 0).await;
     // A recorded execution of a LIVE export, so an empty answer below is about the ARN
     // asked for and not about an empty store.
     record_execution(&engine, &live, "live-0000-0000-0000-000000000000", 0);
-    let other = create_export(&client, 1).await;
+    let other = create_export(&client, &engine, 1).await;
     client
         .ok("DeleteExport", &json!({ "ExportArn": other }))
         .await;

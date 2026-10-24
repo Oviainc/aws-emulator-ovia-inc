@@ -649,7 +649,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `CacheNodeIdsToRemove`, `CacheNodeType`, `EngineVersion`,
         // `AuthTokenStatus` and `LogDeliveryConfigurations` (the shape also
         // carries the in-transit encryption members, which only
-        // `ModifyReplicationGroup`, a scaffolded 501, can set). Those are the
+        // `ModifyReplicationGroup` can set, and which it reports under the
+        // GROUP's own pending values). Those are the
         // changes ElastiCache works through asynchronously, so an immediate one
         // leaves the cluster transient; a request confined to the members that
         // shape does NOT carry is a settings change applied synchronously.

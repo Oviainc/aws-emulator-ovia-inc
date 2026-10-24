@@ -12,6 +12,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use service_com_amazonaws_mwaaserverless_amazonmwaaserverless::state::{
+    RUN_ADMITTED_AFTER, RUN_SETTLE_AFTER,
+};
 use service_com_amazonaws_mwaaserverless_amazonmwaaserverless::{
     ComAmazonawsMwaaserverlessAmazonmwaaserverlessState, EmulatedService,
 };
@@ -688,9 +691,9 @@ async fn a_started_run_is_persisted_and_read_back_with_its_override_parameters()
             "case {case:?}: expected a RunId matching the modelled pattern, got {run_id:?}"
         );
         assert_eq!(
-            started["Status"], "QUEUED",
-            "case {case:?}: a just-started run is still in its initial non-terminal status, \
-             got {:?}",
+            started["Status"], "STARTING",
+            "case {case:?}: a just-started run carries the status the model documents a \
+             newly created run with, got {:?}",
             started["Status"]
         );
         assert!(
@@ -732,16 +735,24 @@ async fn a_started_run_is_persisted_and_read_back_with_its_override_parameters()
             "case {case:?}: a run started through StartWorkflowRun is ON_DEMAND, got {:?}",
             run["RunType"]
         );
-        let expected_parameters = if parameters.is_null() {
-            serde_json::json!({})
+        // An optional member the run holds no value for is OMITTED, not reported as
+        // an empty collection: a run started with no overrides (and one started with
+        // an empty map, which is the same absence of overrides) carries none.
+        if parameters.as_object().is_none_or(serde_json::Map::is_empty) {
+            assert!(
+                run["OverrideParameters"].is_null(),
+                "case {case:?}: expected OverrideParameters absent for a run that holds \
+                 none, got {:?}",
+                run["OverrideParameters"]
+            );
         } else {
-            parameters.clone()
-        };
-        assert_eq!(
-            run["OverrideParameters"], expected_parameters,
-            "case {case:?}: OverrideParameters must come back exactly as supplied, got {:?}",
-            run["OverrideParameters"]
-        );
+            assert_eq!(
+                run["OverrideParameters"], parameters,
+                "case {case:?}: OverrideParameters must come back exactly as supplied, \
+                 got {:?}",
+                run["OverrideParameters"]
+            );
+        }
         let detail = &run["RunDetail"];
         assert_eq!(
             detail["RunId"], started["RunId"],
@@ -754,7 +765,7 @@ async fn a_started_run_is_persisted_and_read_back_with_its_override_parameters()
             detail["RunType"]
         );
         assert_eq!(
-            detail["RunState"], "QUEUED",
+            detail["RunState"], "STARTING",
             "case {case:?}: RunDetail's RunState must match the run's status, got {:?}",
             detail["RunState"]
         );
@@ -762,10 +773,11 @@ async fn a_started_run_is_persisted_and_read_back_with_its_override_parameters()
             detail["CreatedAt"].is_number() && detail["StartedOn"].is_number(),
             "case {case:?}: RunDetail must carry CreatedAt and StartedOn, got {detail:?}"
         );
-        for member in ["CompletedOn", "Duration", "ErrorMessage"] {
+        for member in ["CompletedOn", "Duration", "ErrorMessage", "TaskInstances"] {
             assert!(
                 detail[member].is_null(),
-                "case {case:?}: {member} is null while the run is not complete, got {:?}",
+                "case {case:?}: {member} is null while the run is not complete and holds \
+                 no task instance, got {:?}",
                 detail[member]
             );
         }
@@ -812,21 +824,22 @@ async fn a_run_leaves_its_non_terminal_status_when_the_clock_makes_the_change_du
         .expect("a started run has an id")
         .to_string();
 
-    // Before the change falls due the caller still observes the initial status.
-    let (_, queued) = harness
+    // Before the first change falls due the caller still observes the initial status.
+    let (_, starting) = harness
         .call(
             "GetWorkflowRun",
             serde_json::json!({"WorkflowArn": arn, "RunId": run_id}),
         )
         .await;
     assert_eq!(
-        queued["RunDetail"]["RunState"], "QUEUED",
-        "a run read back immediately is still QUEUED, got {:?}",
-        queued["RunDetail"]["RunState"]
+        starting["RunDetail"]["RunState"], "STARTING",
+        "a run read back immediately is still STARTING, got {:?}",
+        starting["RunDetail"]["RunState"]
     );
 
-    // The transition is owed by the clock, so it lands without anybody polling for it.
-    tokio::time::sleep(Duration::from_millis(900)).await;
+    // Each transition is owed by the clock, so it lands without anybody polling for
+    // it. The whole schedule is covered row by row in `run_lifecycle_progression`.
+    tokio::time::sleep(RUN_ADMITTED_AFTER + RUN_SETTLE_AFTER + Duration::from_millis(300)).await;
 
     let (status, settled) = harness
         .call(
