@@ -437,6 +437,15 @@ pub const PAYMENT_REQUEST_STATUS_PENDING_APPROVAL: &str = "PENDING_APPROVAL";
 /// present for approved payment requests").
 pub const PAYMENT_REQUEST_STATUS_APPROVED: &str = "APPROVED";
 
+/// The `PaymentRequestStatus` a cancelled payment request carries: "Once
+/// cancelled, the payment request transitions to CANCELLED status and can no
+/// longer be accepted or rejected by the buyer"
+/// (`CancelAgreementPaymentRequest`).
+///
+/// Terminal: nothing moves a request out of it, so a second decision on the
+/// same request is a conflict rather than a second transition.
+pub const PAYMENT_REQUEST_STATUS_CANCELLED: &str = "CANCELLED";
+
 /// Every value a `partyType` admits. `PartyType` is modelled a plain string
 /// (`@length(1, 32)`, `^[A-Za-z]+$`), not an enum, so the boundary validator
 /// cannot refuse a party type that is neither of these — the handler does, with
@@ -1126,6 +1135,32 @@ impl PaymentRequest {
             && self.description == input.description
     }
 
+    /// Whether a decision on this payment request is still open — the one
+    /// precondition every operation that moves it shares.
+    ///
+    /// A request is decidable only in [`PAYMENT_REQUEST_STATUS_PENDING_APPROVAL`]:
+    /// "Only payment requests in PENDING_APPROVAL status can be cancelled"
+    /// (`CancelAgreementPaymentRequest`), and the buyer's accept and reject state
+    /// the same bound. Every other `PaymentRequestStatus` value is one a decision
+    /// has already moved it to, or one the validation of the send left it in, so
+    /// deciding now would move it a second time.
+    pub fn is_pending_approval(&self) -> bool {
+        self.status == PAYMENT_REQUEST_STATUS_PENDING_APPROVAL
+    }
+
+    /// Cancel this payment request at `now`: the one transition to
+    /// [`PAYMENT_REQUEST_STATUS_CANCELLED`], so the status and the `updated_at`
+    /// that goes with it have exactly one writer.
+    ///
+    /// `updatedAt` is "the date and time when the payment request was
+    /// cancelled", so it becomes this instant while `created_at` keeps the one
+    /// the send recorded. Callers check [`PaymentRequest::is_pending_approval`]
+    /// first and refuse anything else as a conflict.
+    pub fn cancel(&mut self, now: SystemTime) {
+        self.status = PAYMENT_REQUEST_STATUS_CANCELLED.to_string();
+        self.updated_at = now;
+    }
+
     /// The `ListAgreementPaymentRequests` projection of this payment request.
     pub fn to_summary(&self) -> PaymentRequestSummary {
         PaymentRequestSummary {
@@ -1159,13 +1194,13 @@ impl PaymentRequest {
             status: Some(self.status.clone()),
             // `statusMessage` is "an optional message providing additional
             // context about the payment request status, such as a rejection
-            // reason or validation failure details", which only the calls that
-            // supply one give a value to: the buyer's `rejectionReason`
-            // (`RejectAgreementPaymentRequest`) and the seller's
-            // `cancellationReason` (`CancelAgreementPaymentRequest`). Both are
-            // still scaffolds with issues of their own, so no stored request
-            // carries a message and the member is reported absent rather than
-            // invented.
+            // reason or validation failure details", which only a call that
+            // supplies one gives a value to: the buyer's `rejectionReason`
+            // (`RejectAgreementPaymentRequest`), still a scaffold with an issue
+            // of its own. The seller's own `CancelAgreementPaymentRequest`
+            // models no reason member at all, so a cancelled request has no
+            // message to report either, and the member is reported absent
+            // rather than invented.
             status_message: None,
             name: Some(self.name.clone()),
             description: self.description.clone(),
