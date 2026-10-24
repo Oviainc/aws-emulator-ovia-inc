@@ -26,8 +26,8 @@
 //! customer list seeded alike.
 //!
 //! Managed lists are seeded through the store because no API creates one (they
-//! are AWS's own), and applications lists are seeded through the store because
-//! `PutAppsList` is still a 501 stub tracked by its own issue. A seeded list is
+//! are AWS's own), and the customer applications list is seeded the same way so
+//! the two are arranged alike. A seeded list is
 //! then observed only through the WIRE: its tags through `ListTagsForResource`,
 //! and the list itself through `GetAppsList` / `GetProtocolsList` in each
 //! namespace.
