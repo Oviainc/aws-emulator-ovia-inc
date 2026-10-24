@@ -283,11 +283,15 @@ fn lens_review_summary(
         risk_counts: Some(crate::state::risk_counts_to_map(
             &workload.lens_risk_counts(lens),
         )),
-        // A review carries profiles, and risk counts restricted to the questions they
-        // prioritise, only once a profile is associated with the workload;
-        // `AssociateProfiles` is still a stub with its own issue, so there is nothing to
-        // project.
-        profiles: None,
+        // "The profiles associated with the workload" — the same list the workload itself
+        // and a read of this review report, projected from the one place
+        // (`WorkloadRecord::profiles_projection`), so a listed review cannot disagree with
+        // either about which profile the workload is reviewed against. The risk counts
+        // restricted to the questions a profile prioritises are NOT projected: which
+        // questions those are is decided by the profile template this emulator does not
+        // carry (`GetProfileTemplate` is a stub with its own issue), so no question of any
+        // workload is prioritized.
+        profiles: workload.profiles_projection(),
         prioritized_risk_counts: None,
     }
 }

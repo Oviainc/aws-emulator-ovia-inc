@@ -296,23 +296,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // A profile named here has to be ASSOCIATED with the workload, and no profile
-        // can be associated in this emulator yet: associating one prioritises the lens
-        // questions the profile's selected choices map to, and that mapping is published
-        // by the profile template this emulator does not carry (`GetProfileTemplate` is a
-        // stub with its own issue, as is `AssociateProfiles`). So no profile ARN a caller
-        // passes resolves to an association. A review template ARN is resolved against
-        // the store below, once the lock is held.
-        if let Some(arn) = input.profile_arns.unwrap_or_default().first() {
-            return Err(CreateWorkloadErrorModeled::ResourceNotFoundException(
-                crate::state::resource_not_found(
-                    crate::state::PROFILE_RESOURCE_TYPE,
-                    arn.clone(),
-                    &format!("profile with ARN {arn}"),
-                ),
-            )
-            .into());
-        }
+        // "The list of profile ARNs associated with the workload"
+        // (`CreateWorkloadInput$ProfileArns`): a profile named here is ASSOCIATED with the
+        // created workload, exactly as `AssociateProfiles` associates one with a stored
+        // workload, so the ARN has to name a stored profile — resolved against the store
+        // below, once the lock is held, as a review template ARN is.
+        let profile_arns = input.profile_arns.unwrap_or_default();
         let review_template_arns = input.review_template_arns.unwrap_or_default();
 
         let tags: std::collections::BTreeMap<String, String> =
@@ -340,6 +329,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             "NonAwsRegions": &non_aws_regions,
             "Notes": &input.notes,
             "PillarPriorities": &pillar_priorities,
+            // The profiles the workload is created associated with are part of what a
+            // request asks for, for the reason the review templates below are.
+            "ProfileArns": &profile_arns,
             "ReviewOwner": &review_owner,
             // The review templates applied to the workload are part of what a request
             // asks for — their lenses and notes land in the stored workload below — so
@@ -475,6 +467,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The profiles the created workload is reviewed against: `ProfileArns` is
+        // `@length(max: 1)` here, so the boundary validator has already held the list at
+        // [`crate::state::MAX_PROFILES_PER_WORKLOAD`], and each ARN has to name a stored
+        // profile — resolved before the workload is minted, so the store never holds an
+        // association no profile backs. The version each association is pinned at is the
+        // one the profile is at now, as `AssociateProfiles` pins it.
+        let mut profiles = Vec::with_capacity(profile_arns.len());
+        for arn in &profile_arns {
+            let profile = store.profiles.get(arn).ok_or_else(|| {
+                CreateWorkloadErrorModeled::ResourceNotFoundException(
+                    crate::state::profile_not_found(arn),
+                )
+            })?;
+            profiles.push(crate::state::WorkloadProfileRecord {
+                profile_arn: arn.clone(),
+                profile_version: profile.profile_version.clone(),
+            });
+        }
+
         let workload_id = store.mint_workload_id();
         let record = crate::state::WorkloadRecord {
             workload_arn: ::engine::emulator_arn(
@@ -514,11 +525,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A new workload's lens reviews carry no answers yet: every question of
             // every attached lens is UNANSWERED until one is recorded.
             answers: std::collections::BTreeMap::new(),
-            // No profile is associated with the workload: a `ProfileArn` the request
-            // named is refused above, because associating one would have to prioritise
-            // the lens questions the profile's choices map to and this emulator carries
-            // no profile template to map them through.
-            profiles: Vec::new(),
+            // The profiles the workload is reviewed against: the associations the
+            // request's `ProfileArns` resolved to above, each pinned at the version its
+            // profile is at. Which lens questions a profile PRIORITISES is decided by the
+            // profile template this emulator does not carry
+            // (`crate::state::DEFAULT_QUESTION_TYPE`), so an association changes what the
+            // workload reports under `Profiles` and not its question types.
+            profiles,
         };
         let workload_arn = record.workload_arn.clone();
 
