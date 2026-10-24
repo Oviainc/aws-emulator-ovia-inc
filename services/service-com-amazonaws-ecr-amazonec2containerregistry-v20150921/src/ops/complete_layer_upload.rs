@@ -296,14 +296,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "layer digest does not match the assembled layer",
                 &caller_akid,
                 CompleteLayerUploadErrorModeled::InvalidLayerException(InvalidLayerException {
-                    message: Some(format!(
-                        "The layer digests '{}' in the request do not match the digest \
-                         '{digest}' that Amazon ECR calculated for the {} bytes received by \
-                         upload '{}'",
-                        input.layer_digests.join(", "),
-                        layer_size,
-                        input.upload_id
-                    )),
+                    // ECR states the verdict and nothing else: not one of the digests the
+                    // request offered is the digest it calculated. It echoes neither the
+                    // offered digests, nor the digest it calculated, nor the byte count —
+                    // a client learns only that its claim did not hold.
+                    message: Some(
+                        "None of the provided layer digests match the calculated layer \
+                         digest"
+                            .to_string(),
+                    ),
                 }),
             )
             .into());

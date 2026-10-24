@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteOutpost
-//! IMPLEMENTED: removes the stored Outpost the `OutpostId` names, so every later call
+//! IMPLEMENTED: removes the stored Outpost the `OutpostId` names, and with it the
+//! capacity tasks that exist only as tasks of that Outpost, so every later call
 //! observes it gone. Absent id -> `NotFoundException` (404).
 //!
 //! ## Shape of an operation
@@ -163,6 +164,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         }
+        // A capacity task exists only as a task OF an Outpost, so the Outpost going
+        // away takes its tasks with it: nothing can name them any more (every
+        // capacity-task route resolves the Outpost first), and leaving the records
+        // behind would let a later Outpost's calls trip over them.
+        store
+            .capacity_tasks
+            .retain(|_, task| task.outpost_id != outpost_id);
 
         Ok(DeleteOutpostOutput {})
     }
