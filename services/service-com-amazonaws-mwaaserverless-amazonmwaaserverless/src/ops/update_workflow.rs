@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateWorkflow
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateWorkflow`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateWorkflow::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: appends a new immutable workflow version holding the configuration this
+//! request supplies, makes it the only latest (scheduled) version of the workflow, and
+//! persists all of it in this service's store (`crate::state`). Every value in the
+//! response is read back out of that record, so `GetWorkflow` reports exactly what was
+//! stored, and every earlier version still answers with the configuration it froze.
 //!
 //! ## Shape of an operation
 //!
@@ -126,6 +122,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -202,31 +199,164 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (ctx, &self.engine);
+        // `ctx` carries only request metadata; the workflow this call updates is the one
+        // its `WorkflowArn` names, and the ARN the response reports is the stored one.
+        let _ = ctx;
 
         // A member value that fails the constraint its model declares is refused
         // first, with the modelled `ValidationException` — `Message`,
         // `Reason: fieldValidationFailed` and a `FieldList` entry naming each
-        // offending member. A well-formed request still reaches the 501 below:
-        // the operation itself is not implemented yet.
+        // offending member.
         validate_input(&input).map_err(|refusal| {
             UpdateWorkflowError::from(UpdateWorkflowErrorModeled::ValidationException(refusal))
         })?;
 
-        // Implement `UpdateWorkflow` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateWorkflowErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". The members listed in `skip_validation` on
-        // `UpdateWorkflowInput` are checked by `validate_input` below; every other
-        // modeled constraint is refused BEFORE this handler runs.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateWorkflow"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+        let now = SystemTime::now();
+        let fingerprint = request_fingerprint(&input);
+        let mut store = state.lock();
+
+        // A reference that resolves to nothing is a lookup miss, and the entity THIS
+        // operation resolves is the workflow itself.
+        let (arn, version_count, encryption_configuration) = {
+            let workflow = store.workflows.get(&input.workflow_arn).ok_or_else(|| {
+                crate::state::lookup_miss(UpdateWorkflowErrorModeled::ResourceNotFoundException(
+                    crate::state::unresolved(
+                        crate::state::UnresolvedEntity::Workflow,
+                        &input.workflow_arn,
+                    ),
+                ))
+            })?;
+            (
+                workflow.arn.clone(),
+                workflow.versions.len(),
+                // `UpdateWorkflowRequest` carries no `EncryptionConfiguration`
+                // (`smithy_query(query="operation", operation="UpdateWorkflow")`), so an
+                // update cannot change how the workflow's data is encrypted: the new
+                // version freezes the configuration already in force.
+                workflow
+                    .current_snapshot()
+                    .and_then(|snapshot| snapshot.encryption_configuration.clone()),
+            )
+        };
+
+        // The emulator's own ceiling on this workflow's version history, refused with the
+        // error the model already declares for exceeding a workflow quota.
+        if version_count >= crate::state::MAX_VERSIONS_PER_WORKFLOW {
+            return Err(UpdateWorkflowErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "This emulator holds at most {} versions for one workflow",
+                        crate::state::MAX_VERSIONS_PER_WORKFLOW
+                    ),
+                    resource_id: arn.clone(),
+                    resource_type: "workflow-version".to_string(),
+                    service_code: crate::state::ARN_NAMESPACE.to_string(),
+                    quota_code: "VersionsPerWorkflow".to_string(),
+                },
+            )
+            .into());
+        }
+
+        let nonce = store.next_nonce(now);
+        let version = crate::state::mint_workflow_version(&arn, &fingerprint, &nonce);
+        let revision_id = crate::state::mint_revision_id(&arn, &version);
+
+        // The configuration the new version freezes: what this request supplies, plus the
+        // encryption configuration an update cannot express. The code is copied "at the
+        // time of the request", so the snapshot is taken now.
+        let snapshot = crate::state::WorkflowSnapshot {
+            definition_s3_location: input.definition_s3_location.clone(),
+            code: input.code.clone(),
+            role_arn: input.role_arn.clone(),
+            description: input.description.clone(),
+            encryption_configuration,
+            logging_configuration: input.logging_configuration.clone(),
+            engine_version: input.engine_version,
+            network_configuration: input.network_configuration.clone(),
+            trigger_mode: input.trigger_mode.clone(),
+        };
+
+        let workflow = store.workflows.get_mut(&arn).ok_or_else(unavailable)?;
+        // "Creates a new version with the updated configuration and disables scheduling on
+        // all previous versions to ensure only one version is actively scheduled at a
+        // time": the appended version becomes the workflow's only latest one, and every
+        // earlier version keeps the configuration it froze.
+        for record in &mut workflow.versions {
+            record.is_latest = false;
+        }
+        workflow.versions.push(crate::state::WorkflowVersionRecord {
+            version: version.clone(),
+            created_at: now,
+            is_latest: true,
+            snapshot,
+        });
+        workflow.current_version = version;
+        workflow.revision_id = revision_id;
+        workflow.modified_at = now;
+        workflow.code_snapshotted_at = now;
+
+        // Answer from the stored record, so the response can only ever be what was
+        // persisted.
+        let stored = store.workflows.get(&arn).ok_or_else(unavailable)?;
+        Ok(UpdateWorkflowOutput {
+            workflow_arn: stored.arn.clone(),
+            modified_at: Some(crate::state::timestamp(stored.modified_at)),
+            workflow_version: Some(stored.current_version.clone()),
+            // `Warnings` reports what the service noticed while updating; this emulator
+            // refuses every request it cannot carry out, so it has none to report.
+            warnings: None,
+        })
     }
+}
+
+/// The modelled server error for a store this handler could not reach.
+fn unavailable() -> UpdateWorkflowError {
+    UpdateWorkflowErrorModeled::InternalServerException(InternalServerException {
+        message: "the com.amazonaws.mwaaserverless workflow store is unavailable".to_string(),
+        retry_after_seconds: None,
+    })
+    .into()
+}
+
+/// A stable digest of the configuration this request asks for, so the minted
+/// `WorkflowVersion` is derived from what the version freezes and two different
+/// configurations never share a version identifier.
+fn request_fingerprint(input: &UpdateWorkflowInput) -> String {
+    let mut fields: Vec<String> = vec![
+        input.workflow_arn.clone(),
+        input.role_arn.clone(),
+        input.description.clone().unwrap_or_default(),
+        input.trigger_mode.clone().unwrap_or_default(),
+        input
+            .engine_version
+            .map(|version| version.to_string())
+            .unwrap_or_default(),
+        input.definition_s3_location.bucket.clone(),
+        input.definition_s3_location.object_key.clone(),
+        input
+            .definition_s3_location
+            .version_id
+            .clone()
+            .unwrap_or_default(),
+    ];
+    match input.code.as_ref() {
+        Some(Code::S3Location(location)) => {
+            fields.push(location.bucket.clone());
+            fields.push(location.object_key.clone());
+            fields.push(location.version_id.clone().unwrap_or_default());
+        }
+        None => fields.push(String::new()),
+    }
+    if let Some(logging) = input.logging_configuration.as_ref() {
+        fields.push(logging.log_group_name.clone());
+    }
+    if let Some(network) = input.network_configuration.as_ref() {
+        fields.extend(network.security_group_ids.clone().unwrap_or_default());
+        fields.extend(network.subnet_ids.clone().unwrap_or_default());
+    }
+    let borrowed: Vec<&str> = fields.iter().map(String::as_str).collect();
+    crate::state::digest(&borrowed)
 }
 
 /// Check every `UpdateWorkflow` input member whose modelled constraint this

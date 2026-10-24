@@ -21,3 +21,5 @@ mod state_roundtrip;
 mod validation_errors;
 #[path = "all/workflow_lifecycle.rs"]
 mod workflow_lifecycle;
+#[path = "all/workflow_update_versions.rs"]
+mod workflow_update_versions;

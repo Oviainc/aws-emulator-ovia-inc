@@ -958,14 +958,6 @@ async fn a_well_formed_request_keeps_the_answer_it_had() {
                 "TaskInstanceId": "task-01",
             }),
         ),
-        (
-            "UpdateWorkflow",
-            serde_json::json!({
-                "WorkflowArn": arn.clone(),
-                "DefinitionS3Location": good_definition(),
-                "RoleArn": role_arn(),
-            }),
-        ),
     ];
     for (operation, body) in stub_cases {
         let (status, answered) = harness.call(operation, body).await;
