@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAccounts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAccounts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAccounts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. Reports one `AccountInfo` per account the enrollment store holds
+//! a configuration for — the accounts this organization's management account has
+//! seen — each projected from what is PERSISTED for it (its enrollment status,
+//! the reason that explains it, its organization rule mode and the instant it
+//! was last updated), never from anything the request carried.
+//!
+//! The store is a map, so the sequence a page is a window onto is ordered by
+//! account id (see `crate::state`'s `accounts_in_order`), and the page is cut by
+//! `maxResults`, with an opaque `nextToken` resuming exactly where the previous
+//! page stopped.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +162,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAccounts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAccountsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListAccountsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the service is not mounted on a state-bearing engine".into()),
+                },
+            )
+            .into());
+        };
+
+        // This operation carries no filters, so the only thing a page token is
+        // bound to is the walk it was issued for: a token one of this service's
+        // other paginated operations minted cannot resume this listing.
+        let query_fingerprint = crate::state::fingerprint(&Self::NAME);
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => match crate::state::decode_page_token(token) {
+                // A token this listing never issued, whether it decodes to no
+                // cursor at all or to one taken for another walk: one refusal,
+                // worded once.
+                Some(cursor) if cursor.filter_fingerprint == query_fingerprint => cursor.offset,
+                _ => return Err(foreign_token()),
+            },
+        };
+
+        // The model bounds this operation's `maxResults` at 1..=1000, so a
+        // caller that sends none gets `crate::state::DEFAULT_MAX_RESULTS`.
+        // Clamped to at least one here as well: a zero page would return nothing
+        // while still carrying a token whose offset never advances, so a walk
+        // would never terminate.
+        let page_size = usize::try_from(
+            input
+                .max_results
+                .unwrap_or(crate::state::DEFAULT_MAX_RESULTS),
+        )
+        .unwrap_or(1)
+        .max(1);
+
+        let at = crate::state::now();
+        let guard = state.lock();
+        // The service-wide enrollment gate, AHEAD of reading the store: an
+        // account that is not opted in is refused the whole call rather than
+        // handed a listing tooling would then build on. See
+        // `crate::state::…::opt_in_required`.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAccounts"))
+        // `NotManagementAccountException` is the refusal for a caller that is
+        // neither the management account nor a delegated administrator ("Only
+        // the management account or a delegated administrator can perform this
+        // action"). This emulator serves exactly one account
+        // (`state::caller_account_id`), which is the organization's management
+        // account, so no request can reach that refusal.
+        if let Some(refusal) = guard.opt_in_required() {
+            return Err(ListAccountsErrorModeled::OptInRequiredException(refusal).into());
+        }
+        let accounts = guard.accounts_in_order(at);
+        let total = accounts.len();
+        let page: Vec<AccountInfo> = accounts.into_iter().skip(offset).take(page_size).collect();
+
+        // A token only while accounts remain after this page, and it resumes
+        // exactly where this page stopped.
+        let resumed_at = offset.saturating_add(page.len());
+        let next_token = (resumed_at < total).then(|| {
+            crate::state::encode_page_token(&crate::state::PageCursor {
+                offset: resumed_at,
+                filter_fingerprint: query_fingerprint,
+            })
+        });
+
+        Ok(ListAccountsOutput {
+            accounts: page,
+            next_token,
+        })
     }
+}
+
+/// The modelled 400 (`InvalidParameterValueException`), for a `nextToken` this
+/// operation did not issue. The model's `NextToken` pattern cannot express "a
+/// token of mine", so the check is in the handler rather than at the boundary.
+fn foreign_token() -> ListAccountsError {
+    ListAccountsErrorModeled::InvalidParameterValueException(InvalidParameterValueException {
+        message: Some(crate::state::constraint_report(
+            "nextToken",
+            "Member must be a token returned by a previous ListAccounts call",
+        )),
+    })
+    .into()
 }
