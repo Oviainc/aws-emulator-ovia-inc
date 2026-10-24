@@ -19,6 +19,8 @@ mod investigation_group_policy_delete;
 mod investigation_group_singleton;
 #[path = "all/investigation_groups.rs"]
 mod investigation_groups;
+#[path = "all/regional_identifier_resolution.rs"]
+mod regional_identifier_resolution;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]

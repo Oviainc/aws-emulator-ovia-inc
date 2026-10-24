@@ -784,8 +784,9 @@ async fn a_policy_round_trips_byte_for_byte() {
             "case {case}: expected ResourceNotFoundException, got {body:?}"
         );
 
-        let (status, put) = call(
+        let (status, put) = call_in(
             &router,
+            &region,
             "POST",
             &format!("/investigationGroups/{}/policy", label(&arn)),
             Some(&json!({ "policy": document })),
@@ -804,8 +805,9 @@ async fn a_policy_round_trips_byte_for_byte() {
         // Read it back twice through the ARN: the bytes are the ones stored, and a
         // read does not consume them.
         for via in [arn.clone(), arn.clone()] {
-            let (status, got) = call(
+            let (status, got) = call_in(
                 &router,
+                &region,
                 "GET",
                 &format!("/investigationGroups/{}/policy", label(&via)),
                 None,
@@ -829,15 +831,17 @@ async fn a_policy_round_trips_byte_for_byte() {
 
         // A second put replaces the document rather than appending to it.
         let replacement = format!("{{\"Sid\":\"replaced-{index}\"}}");
-        call(
+        call_in(
             &router,
+            &region,
             "POST",
             &format!("/investigationGroups/{}/policy", label(&arn)),
             Some(&json!({ "policy": replacement })),
         )
         .await;
-        let (_, got) = call(
+        let (_, got) = call_in(
             &router,
+            &region,
             "GET",
             &format!("/investigationGroups/{}/policy", label(&arn)),
             None,

@@ -151,13 +151,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let principal = crate::state::caller_principal(ctx.parts());
         let modified_at = crate::state::now_epoch_seconds();
+        // This service is regional: the endpoint this request reached holds only the
+        // groups of the Region it was signed for, so another Region's group is absent
+        // here and its policy cannot be deleted through it.
+        let region = crate::state::request_region(ctx.parts());
 
         let mut store = state.lock();
         // Which resource is missing decides which 404 this answers, the same way
         // `GetInvestigationGroupPolicy` reports it: an absent GROUP is reported as the
         // absent group, and a group that exists while carrying no policy is reported
         // as the absent policy, so a client can tell the two conditions apart.
-        let group = store.group_mut(&input.identifier).ok_or_else(|| {
+        let group = store.group_mut(&input.identifier, &region).ok_or_else(|| {
             DeleteInvestigationGroupPolicyErrorModeled::ResourceNotFoundException(
                 crate::state::investigation_group_not_found(),
             )

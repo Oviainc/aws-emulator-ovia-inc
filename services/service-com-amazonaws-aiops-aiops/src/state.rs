@@ -15,6 +15,13 @@
 //! [`MAX_INVESTIGATION_GROUPS_PER_REGION`] of them there — so the store is keyed by
 //! id and read per region through
 //! [`ComAmazonawsAiopsAiopsState::groups_in_region`].
+//!
+//! This service is REGIONAL — its endpoints are `aiops.<region>.<dns-suffix>`
+//! (`smithy_query(query="service_info")`) — so every regional endpoint serves only the
+//! resources of its own Region. Identifier resolution is therefore scoped to the Region
+//! the request was signed for ([`request_region`]): resolving, reading, mutating and
+//! removing a group all take that Region and answer as if the group did not exist when
+//! it belongs to another one.
 
 use std::collections::{BTreeMap, HashMap};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -196,28 +203,40 @@ impl ComAmazonawsAiopsAiopsState {
     /// An ARN must match the stored ARN in EVERY field, so an ARN naming another
     /// partition, region or account resolves to nothing rather than to the group that
     /// happens to share its id segment.
-    pub fn resolve_group_id(&self, identifier: &str) -> Option<String> {
+    ///
+    /// Resolution is also scoped to `request_region`, the Region the request was signed
+    /// for: this service is reached through per-Region endpoints, so an endpoint holds
+    /// only its own Region's groups and resolves nothing for a group that belongs to
+    /// another one — whatever ARN the request carried. That keeps a single reader,
+    /// writer and remover consistent with the regional `ListInvestigationGroups` and
+    /// with the per-region create quota.
+    pub fn resolve_group_id(&self, identifier: &str, request_region: &str) -> Option<String> {
         let id = group_id_from_arn(identifier)?;
         self.investigation_groups
             .get(id)
-            .filter(|group| group.arn == identifier)
+            .filter(|group| group.arn == identifier && group.region == request_region)
             .map(|group| group.id.clone())
     }
 
-    /// The group `identifier` names, for a reporting operation.
-    pub fn group(&self, identifier: &str) -> Option<&InvestigationGroup> {
-        let id = self.resolve_group_id(identifier)?;
+    /// The group `identifier` names in `request_region`, for a reporting operation.
+    pub fn group(&self, identifier: &str, request_region: &str) -> Option<&InvestigationGroup> {
+        let id = self.resolve_group_id(identifier, request_region)?;
         self.investigation_groups.get(&id)
     }
 
-    /// The group `identifier` names, for an operation the spec says mutates it.
+    /// The group `identifier` names in `request_region`, for an operation the spec says
+    /// mutates it.
     ///
     /// `id` is part of this record's identity — the store is keyed on it — so it may
     /// not be reassigned through this handle. No operation needs to; the model binds
     /// no `name` member on `UpdateInvestigationGroup` either, so a group keeps the
     /// name it was created with.
-    pub fn group_mut(&mut self, identifier: &str) -> Option<&mut InvestigationGroup> {
-        let id = self.resolve_group_id(identifier)?;
+    pub fn group_mut(
+        &mut self,
+        identifier: &str,
+        request_region: &str,
+    ) -> Option<&mut InvestigationGroup> {
+        let id = self.resolve_group_id(identifier, request_region)?;
         self.investigation_groups.get_mut(&id)
     }
 
@@ -245,10 +264,15 @@ impl ComAmazonawsAiopsAiopsState {
         self.investigation_groups.insert(group.id.clone(), group);
     }
 
-    /// Remove the group `identifier` names, with its policy and tags. `None` when
-    /// nothing matched.
-    pub fn remove_group(&mut self, identifier: &str) -> Option<InvestigationGroup> {
-        let id = self.resolve_group_id(identifier)?;
+    /// Remove the group `identifier` names in `request_region`, with its policy and
+    /// tags. `None` when nothing matched — including a group that exists in another
+    /// Region, which this Region's endpoint may not reach, let alone delete.
+    pub fn remove_group(
+        &mut self,
+        identifier: &str,
+        request_region: &str,
+    ) -> Option<InvestigationGroup> {
+        let id = self.resolve_group_id(identifier, request_region)?;
         self.investigation_groups.remove(&id)
     }
 

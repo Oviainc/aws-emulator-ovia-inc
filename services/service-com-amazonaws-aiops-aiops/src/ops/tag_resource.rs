@@ -151,18 +151,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // centralized walk has already refused anything outside of. The `Tags` map
         // carries NO modelled length, so the published per-resource maximum is applied
         // here \u2014 to the set the resource ENDS UP with, which is what the rule bounds.
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             TagResourceErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the investigation group store is unavailable".to_string()),
             })
         })?;
 
+        // This service is regional: the endpoint this request reached holds only the
+        // groups of the Region it was signed for, so another Region's group is absent
+        // here and cannot be tagged through it.
+        let region = crate::state::request_region(ctx.parts());
+
         let mut store = state.lock();
         // `resourceArn` is the `InvestigationGroup` resource's `identifier` (this
         // operation's modelled `@references` trait), so it resolves exactly the way
         // every other identifier of this service does.
-        let group = store.group_mut(&input.resource_arn).ok_or_else(|| {
+        let group = store.group_mut(&input.resource_arn, &region).ok_or_else(|| {
             // A tagging call is served by the tagging frontend, whose absent-resource
             // answer is 404 `NotFoundException` rather than this service's own
             // modelled `ResourceNotFoundException`; see

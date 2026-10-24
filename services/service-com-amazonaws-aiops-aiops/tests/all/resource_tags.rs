@@ -131,8 +131,7 @@ async fn call_in(
     (status, parsed)
 }
 
-/// [`call_in`] in [`REGION`]: every operation below but the create resolves its
-/// resource through an ARN, which names its own Region.
+/// [`call_in`] in [`REGION`], for a call that addresses no single resource.
 async fn call(
     router: &MultiServiceRouter,
     method: &str,
@@ -140,6 +139,20 @@ async fn call(
     body: Option<&Value>,
 ) -> (u16, Value) {
     call_in(router, REGION, method, uri, body).await
+}
+
+/// The Region a call addressing `identifier` is signed for.
+///
+/// This service is regional (`aiops.<region>.<dns-suffix>`), so an endpoint serves only
+/// its own Region's groups and a caller reaches a group through the Region its ARN
+/// names. An identifier that is not a group ARN names no Region, so those rows sign for
+/// [`REGION`] — and still resolve nothing, which is what they assert.
+fn region_of(identifier: &str) -> String {
+    identifier
+        .strip_prefix("arn:")
+        .map(|rest| rest.split(':').collect::<Vec<_>>())
+        .filter(|fields| fields.len() > 3 && fields[1] == "aiops")
+        .map_or_else(|| REGION.to_string(), |fields| fields[2].to_string())
 }
 
 /// The modelled error shape a failed call reported.
@@ -183,12 +196,20 @@ async fn create_ok(router: &MultiServiceRouter, region: &str, body: &Value) -> S
 }
 
 async fn list_tags(router: &MultiServiceRouter, identifier: &str) -> (u16, Value) {
-    call(router, "GET", &format!("/tags/{}", encode(identifier)), None).await
+    call_in(
+        router,
+        &region_of(identifier),
+        "GET",
+        &format!("/tags/{}", encode(identifier)),
+        None,
+    )
+    .await
 }
 
 async fn tag(router: &MultiServiceRouter, identifier: &str, tags: &Value) -> (u16, Value) {
-    call(
+    call_in(
         router,
+        &region_of(identifier),
         "POST",
         &format!("/tags/{}", encode(identifier)),
         Some(&json!({ "tags": tags })),
@@ -201,8 +222,9 @@ async fn untag(router: &MultiServiceRouter, identifier: &str, keys: &[&str]) -> 
         .iter()
         .map(|key| format!("tagKeys={}", encode(key)))
         .collect();
-    call(
+    call_in(
         router,
+        &region_of(identifier),
         "DELETE",
         &format!("/tags/{}?{}", encode(identifier), query.join("&")),
         None,
@@ -705,8 +727,9 @@ async fn an_unknown_resource_is_a_tagging_frontend_404() {
     );
 
     // The tag set belongs to the resource, so deleting the resource takes it away.
-    let (status, body) = call(
+    let (status, body) = call_in(
         &router,
+        &region_of(&arn),
         "DELETE",
         &format!("/investigationGroups/{}", encode(&arn)),
         None,

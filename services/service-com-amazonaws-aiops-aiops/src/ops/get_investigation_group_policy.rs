@@ -150,7 +150,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetInvestigationGroupPolicyErrorModeled::InternalServerException(
                 InternalServerException {
@@ -159,13 +158,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
 
+        // This service is regional: the endpoint this request reached holds only the
+        // groups of the Region it was signed for, so another Region's group is absent
+        // here however well-formed the ARN that named it.
+        let region = crate::state::request_region(ctx.parts());
+
         let store = state.lock();
         // Which resource is missing decides which 404 this answers: an absent GROUP is
         // reported as the absent group — the policy operations report the group they
         // could not find, not a policy on a group that does not exist — and a group
         // that exists with no policy attached is reported as the absent policy, so a
         // client can tell the two conditions apart.
-        let group = store.group(&input.identifier).ok_or_else(|| {
+        let group = store.group(&input.identifier, &region).ok_or_else(|| {
             GetInvestigationGroupPolicyErrorModeled::ResourceNotFoundException(
                 crate::state::investigation_group_not_found(),
             )
