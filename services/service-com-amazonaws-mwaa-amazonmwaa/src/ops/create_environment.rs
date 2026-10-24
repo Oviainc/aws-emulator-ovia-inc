@@ -287,6 +287,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // Every member MWAA assigns a value for is RESOLVED here, before the record is
+        // stored: the request's value when it carried one, the service's default when it
+        // did not. A member the service always reports is therefore stored (and read back)
+        // as a value, never as "the caller said nothing".
+        let environment_class = input
+            .environment_class
+            .clone()
+            .unwrap_or_else(|| crate::state::DEFAULT_ENVIRONMENT_CLASS.to_string());
+
         let spec = crate::state::EnvironmentSpec {
             execution_role_arn: input.execution_role_arn.clone(),
             source_bucket_arn: input.source_bucket_arn.clone(),
@@ -307,30 +316,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .unwrap_or_default()
                 .into_iter()
                 .collect(),
-            environment_class: input.environment_class.clone(),
             // "If no value is specified, it defaults to the latest version" — the
             // `AirflowVersion` doc.
             airflow_version: input
                 .airflow_version
                 .clone()
                 .unwrap_or_else(|| crate::state::LATEST_AIRFLOW_VERSION.to_string()),
+            // An environment encrypted with an Amazon Web Services owned CMK names no
+            // customer key, so a create that asked for none stores none.
             kms_key: input.kms_key.clone(),
-            max_workers: input.max_workers,
-            min_workers: input.min_workers,
+            max_workers: input.max_workers.unwrap_or(crate::state::DEFAULT_MAX_WORKERS),
+            min_workers: input.min_workers.unwrap_or(crate::state::DEFAULT_MIN_WORKERS),
             // `Schedulers`, `MinWebservers` and `MaxWebservers` all document the same
-            // default: 2 for every environment size except mw1.micro, which gets 1.
-            schedulers: input.schedulers.unwrap_or_else(|| {
-                crate::state::default_unit_count(input.environment_class.as_deref())
-            }),
-            min_webservers: input.min_webservers.unwrap_or_else(|| {
-                crate::state::default_unit_count(input.environment_class.as_deref())
-            }),
-            max_webservers: input.max_webservers.unwrap_or_else(|| {
-                crate::state::default_unit_count(input.environment_class.as_deref())
-            }),
-            webserver_access_mode: input.webserver_access_mode.clone(),
-            weekly_maintenance_window_start: input.weekly_maintenance_window_start.clone(),
-            endpoint_management: input.endpoint_management.clone(),
+            // default: 2 for every environment size except mw1.micro, which gets 1 — of
+            // the class the environment ends up on, defaulted or not.
+            schedulers: input
+                .schedulers
+                .unwrap_or_else(|| crate::state::default_unit_count(&environment_class)),
+            min_webservers: input
+                .min_webservers
+                .unwrap_or_else(|| crate::state::default_unit_count(&environment_class)),
+            max_webservers: input
+                .max_webservers
+                .unwrap_or_else(|| crate::state::default_unit_count(&environment_class)),
+            webserver_access_mode: input
+                .webserver_access_mode
+                .clone()
+                .unwrap_or_else(|| crate::state::DEFAULT_WEBSERVER_ACCESS_MODE.to_string()),
+            // MWAA schedules weekly maintenance for every environment, so a create that
+            // named no window gets the one the service assigns it.
+            weekly_maintenance_window_start: input
+                .weekly_maintenance_window_start
+                .clone()
+                .unwrap_or_else(|| {
+                    crate::state::default_weekly_maintenance_window_start(&input.name)
+                }),
+            endpoint_management: input
+                .endpoint_management
+                .clone()
+                .unwrap_or_else(|| crate::state::DEFAULT_ENDPOINT_MANAGEMENT.to_string()),
+            // All five Apache Airflow log types, each at the settings the request named
+            // for it or the service's default (off, at the default level) for the ones it
+            // did not.
             logging_configuration: {
                 let mut logging = crate::state::LoggingConfigurationRecord::default();
                 if let Some(requested) = input.logging_configuration.as_ref() {
@@ -338,6 +365,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 logging
             },
+            environment_class,
         };
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;

@@ -149,15 +149,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // Reporting only: nothing here writes, so the page a caller sees is exactly
-        // what the publishing seam has registered.
+        // Reporting only: nothing here decides what a later caller sees. The one
+        // write is `materialize_due_expiries`, which finishes what the clock already
+        // made due at this instant whether or not anybody called — a stream past the
+        // documented 24 hours of its disable is deleted, so the page lists what
+        // exists now rather than what the registry once held.
         let _ = ctx;
+        let now = std::time::SystemTime::now();
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListStreamsErrorModeled::InternalServerError(InternalServerError {
                 message: Some("the DynamoDB Streams store is unavailable".to_string()),
             })
         })?;
-        let guard = state.lock();
+        let mut guard = state.lock();
+        guard.materialize_due_expiries(now);
 
         // `Limit`'s declared range (1..) is enforced at the boundary; the documented
         // ceiling of 100 is not modelled, so it is applied here.

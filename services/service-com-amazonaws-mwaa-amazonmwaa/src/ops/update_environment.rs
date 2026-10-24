@@ -284,7 +284,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             spec.dag_s3_path = value;
         }
         if let Some(value) = input.environment_class {
-            spec.environment_class = Some(value);
+            spec.environment_class = value;
         }
         if let Some(value) = input.logging_configuration.as_ref() {
             // Per-log-type merge, for the same reason: a log type the request omits keeps
@@ -292,10 +292,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             spec.logging_configuration.merge(value);
         }
         if let Some(value) = input.max_workers {
-            spec.max_workers = Some(value);
+            spec.max_workers = value;
         }
         if let Some(value) = input.min_workers {
-            spec.min_workers = Some(value);
+            spec.min_workers = value;
         }
         if let Some(value) = input.max_webservers {
             spec.max_webservers = value;
@@ -334,10 +334,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             spec.startup_script_s3_object_version = Some(value);
         }
         if let Some(value) = input.webserver_access_mode {
-            spec.webserver_access_mode = Some(value);
+            spec.webserver_access_mode = value;
         }
         if let Some(value) = input.weekly_maintenance_window_start {
-            spec.weekly_maintenance_window_start = Some(value);
+            spec.weekly_maintenance_window_start = value;
         }
 
         stored.begin_update(

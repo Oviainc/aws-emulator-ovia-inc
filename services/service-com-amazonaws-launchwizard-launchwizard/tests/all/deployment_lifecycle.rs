@@ -31,12 +31,22 @@ pub(crate) const ACCOUNT: &str = "000000000000";
 const SETTLE: Duration = Duration::from_millis(1_400);
 
 /// A `CreateDeployment` request body.
+///
+/// `specifications` carries the two fields EVERY seeded pattern publishes as
+/// `required: "Yes"` (`KeyPairName`, `VpcId`, from the schema
+/// `GetWorkloadDeploymentPattern` reports) and nothing the pattern does not publish:
+/// a create is judged against that schema, so a body that is meant to succeed fills
+/// it in. See `tests/all/create_deployment_validation.rs` for the suite that drives
+/// the judgement itself.
 pub(crate) fn create_body(workload: &str, pattern: &str, name: &str, dry_run: bool) -> Value {
     json!({
         "workloadName": workload,
         "deploymentPatternName": pattern,
         "name": name,
-        "specifications": {"KeyName": format!("key-for-{name}"), "VpcId": "vpc-0123456789abcdef0"},
+        "specifications": {
+            "KeyPairName": format!("key-for-{name}"),
+            "VpcId": "vpc-0123456789abcdef0",
+        },
         "tags": {"Owner": "emulator-tests", "Workload": workload},
         "dryRun": dry_run,
     })

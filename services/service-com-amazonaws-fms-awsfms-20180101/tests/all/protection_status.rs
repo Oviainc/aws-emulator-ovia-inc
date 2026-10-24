@@ -176,12 +176,33 @@ const CHRONOLOGICAL: &[&str] = &[
 /// appear in the first policy's page, whatever the query.
 const DECOY_ATTACK_ID: &str = "decoy-of-the-other-policy";
 
+/// A resource type the model lists as valid for a policy of `service_type`, from
+/// the `Policy$ResourceType` documentation's "valid resource types for each
+/// Firewall Manager policy type" — so the document below is one `PutPolicy`
+/// accepts for every type the model declares, not only for Shield Advanced.
+fn resource_type_for(service_type: &str) -> &'static str {
+    match service_type {
+        // WAF Classic (`WAF`), WAF (`WAFV2`) and Shield Advanced all list the
+        // v2 load balancer.
+        "WAF" | "WAFV2" | "SHIELD_ADVANCED" => "AWS::ElasticLoadBalancingV2::LoadBalancer",
+        // "Network ACL"
+        "NETWORK_ACL_COMMON" => "AWS::EC2::Subnet",
+        // The security-group policies ("usage audit", "content audit", and the
+        // common policy the doc's list does not constrain).
+        "SECURITY_GROUPS_USAGE_AUDIT" | "SECURITY_GROUPS_CONTENT_AUDIT"
+        | "SECURITY_GROUPS_COMMON" => "AWS::EC2::SecurityGroup",
+        // "DNS Firewall, Network Firewall, and third-party firewall", and the
+        // Network Firewall import variant the doc's list does not constrain.
+        _ => "AWS::EC2::VPC",
+    }
+}
+
 /// A policy document `PutPolicy` accepts, of the given `SecurityServiceType`.
 fn policy_of_type(name: &str, service_type: &str) -> Value {
     json!({
         "PolicyName": name,
         "SecurityServicePolicyData": { "Type": service_type },
-        "ResourceType": "AWS::ElasticLoadBalancingV2::LoadBalancer",
+        "ResourceType": resource_type_for(service_type),
         "IncludeMap": { "ACCOUNT": ["111111111111", "222222222222", "333333333333"] },
         "ExcludeResourceTags": false,
         "RemediationEnabled": false

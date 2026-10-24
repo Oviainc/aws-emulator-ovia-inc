@@ -36,6 +36,25 @@ pub fn emulator_and_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>
     (router, engine)
 }
 
+/// One emulator holding this service AND DynamoDB Streams, over ONE shared engine.
+///
+/// A stream is created by a DynamoDB call and read by a streams call, so a suite
+/// about streams needs both services mounted on the same engine — which is also how
+/// the router mounts them. They share the `dynamodb` signing name and are told apart
+/// by `X-Amz-Target`, which is what [`call_streams`] sets.
+pub fn emulator_with_streams() -> MultiServiceRouter {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    router.set_request_authentication(false);
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    router.register_service(
+        service_com_amazonaws_dynamodbstreams_dynamodbstreams_20120810::EmulatedService::new(
+            engine,
+        ),
+    );
+    router
+}
+
 /// Send one operation in `region` and return its HTTP status and parsed body.
 pub async fn call_in(
     router: &MultiServiceRouter,
@@ -43,11 +62,43 @@ pub async fn call_in(
     operation: &str,
     body: Value,
 ) -> (u16, Value) {
+    dispatch(
+        router,
+        region,
+        &format!("DynamoDB_20120810.{operation}"),
+        body,
+    )
+    .await
+}
+
+/// Send one DynamoDB STREAMS operation in [`REGION`]. Both services sign as
+/// `dynamodb`, so the `X-Amz-Target` prefix is the whole discriminator.
+pub async fn call_streams(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: Value,
+) -> (u16, Value) {
+    dispatch(
+        router,
+        REGION,
+        &format!("DynamoDBStreams_20120810.{operation}"),
+        body,
+    )
+    .await
+}
+
+/// Send one request to `target` (the whole `X-Amz-Target` value) in `region`.
+async fn dispatch(
+    router: &MultiServiceRouter,
+    region: &str,
+    target: &str,
+    body: Value,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
         .header("content-type", "application/x-amz-json-1.0")
-        .header("x-amz-target", format!("DynamoDB_20120810.{operation}"))
+        .header("x-amz-target", target)
         .header(
             "authorization",
             format!(
