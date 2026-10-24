@@ -143,10 +143,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if !store.directories.contains_key(&input.directory_id) {
             return Err(GetSnapshotLimitsErrorModeled::EntityDoesNotExistException(
-                EntityDoesNotExistException {
-                    message: Some(crate::state::no_such_directory(&input.directory_id)),
-                    request_id: None,
-                },
+                crate::state::refusal(crate::state::no_such_directory(&input.directory_id)),
             )
             .into());
         }

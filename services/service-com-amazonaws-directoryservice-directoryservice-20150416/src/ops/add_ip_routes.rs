@@ -220,10 +220,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .directories
             .get_mut(&input.directory_id)
             .ok_or_else(|| {
-                AddIpRoutesErrorModeled::EntityDoesNotExistException(EntityDoesNotExistException {
-                    message: Some(crate::state::no_such_directory(&input.directory_id)),
-                    request_id: None,
-                })
+                AddIpRoutesErrorModeled::EntityDoesNotExistException(crate::state::refusal(
+                    crate::state::no_such_directory(&input.directory_id),
+                ))
             })?;
 
         // Routing an address block changes the directory's own networking, so it needs
@@ -231,17 +230,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // create owes is unavailable, which is the modelled refusal for exactly that.
         if directory.stage != crate::state::STAGE_ACTIVE {
             return Err(
-                AddIpRoutesErrorModeled::DirectoryUnavailableException(
-                    DirectoryUnavailableException {
-                        message: Some(format!(
-                            "Directory {id} is in stage {stage} and is not available for \
-                             IP route changes",
-                            id = directory.directory_id,
-                            stage = directory.stage
-                        )),
-                        request_id: None,
-                    },
-                )
+                AddIpRoutesErrorModeled::DirectoryUnavailableException(crate::state::refusal(
+                    format!(
+                        "Directory {id} is in stage {stage} and is not available for \
+                         IP route changes",
+                        id = directory.directory_id,
+                        stage = directory.stage
+                    ),
+                ))
                 .into(),
             );
         }
@@ -255,13 +251,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let block = record.block().to_string();
             if merged.contains_key(&block) {
                 return Err(AddIpRoutesErrorModeled::EntityAlreadyExistsException(
-                    EntityAlreadyExistsException {
-                        message: Some(format!(
-                            "Directory {id} already routes the address block {block}",
-                            id = directory.directory_id
-                        )),
-                        request_id: None,
-                    },
+                    crate::state::refusal(format!(
+                        "Directory {id} already routes the address block {block}",
+                        id = directory.directory_id
+                    )),
                 )
                 .into());
             }
@@ -283,23 +276,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// Refuse the request with the modelled `InvalidParameterException`, naming the member
 /// and the rule it broke so the caller can fix the request from the message alone.
 fn invalid_parameter(message: String) -> AddIpRoutesError {
-    AddIpRoutesErrorModeled::InvalidParameterException(InvalidParameterException {
-        message: Some(message),
-        request_id: None,
-    })
-    .into()
+    AddIpRoutesErrorModeled::InvalidParameterException(crate::state::refusal(message)).into()
 }
 
 /// Refuse the request with the modelled `IpRouteLimitExceededException`, naming the
 /// bound and the count that broke it.
 fn route_limit_exceeded(count: usize) -> AddIpRoutesError {
-    AddIpRoutesErrorModeled::IpRouteLimitExceededException(IpRouteLimitExceededException {
-        message: Some(format!(
-            "A directory may route at most {max} IP address blocks; the request would \
-             leave {count}",
-            max = crate::state::MAX_IP_ROUTES
-        )),
-        request_id: None,
-    })
+    AddIpRoutesErrorModeled::IpRouteLimitExceededException(crate::state::refusal(format!(
+        "A directory may route at most {max} IP address blocks; the request would \
+         leave {count}",
+        max = crate::state::MAX_IP_ROUTES
+    )))
     .into()
 }

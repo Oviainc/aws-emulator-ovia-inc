@@ -144,14 +144,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // parameter it is.
         if input.tag_keys.len() > crate::state::MAX_TAGS {
             return Err(RemoveTagsFromResourceErrorModeled::InvalidParameterException(
-                InvalidParameterException {
-                    message: Some(format!(
-                        "TagKeys may name at most {max} keys, got {got}",
-                        max = crate::state::MAX_TAGS,
-                        got = input.tag_keys.len()
-                    )),
-                    request_id: None,
-                },
+                crate::state::refusal(format!(
+                    "TagKeys may name at most {max} keys, got {got}",
+                    max = crate::state::MAX_TAGS,
+                    got = input.tag_keys.len()
+                )),
             )
             .into());
         }
@@ -163,11 +160,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .directories
             .get_mut(&input.resource_id)
             .ok_or_else(|| {
+                // The tag family's own diagnostic: a `ResourceId` that names no taggable
+                // resource (see [`crate::state::invalid_resource_id`]).
                 RemoveTagsFromResourceErrorModeled::EntityDoesNotExistException(
-                    EntityDoesNotExistException {
-                        message: Some(crate::state::no_such_directory(&input.resource_id)),
-                        request_id: None,
-                    },
+                    crate::state::invalid_resource_id(),
                 )
             })?;
 

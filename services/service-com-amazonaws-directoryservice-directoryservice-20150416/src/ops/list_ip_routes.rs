@@ -173,10 +173,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     })
                     .ok_or_else(|| {
                         ListIpRoutesErrorModeled::InvalidNextTokenException(
-                            InvalidNextTokenException {
-                                message: Some(crate::state::INVALID_NEXT_TOKEN.to_string()),
-                                request_id: None,
-                            },
+                            crate::state::invalid_next_token(),
                         )
                     })?,
             ),
@@ -187,10 +184,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.advance_clock(::std::time::SystemTime::now());
 
         let directory = store.directories.get(&input.directory_id).ok_or_else(|| {
-            ListIpRoutesErrorModeled::EntityDoesNotExistException(EntityDoesNotExistException {
-                message: Some(crate::state::no_such_directory(&input.directory_id)),
-                request_id: None,
-            })
+            ListIpRoutesErrorModeled::EntityDoesNotExistException(crate::state::refusal(
+                crate::state::no_such_directory(&input.directory_id),
+            ))
         })?;
 
         // The page is built from the store's own keys, in key order, so the boundary a

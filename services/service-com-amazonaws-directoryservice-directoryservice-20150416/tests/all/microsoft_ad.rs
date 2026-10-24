@@ -14,8 +14,9 @@
 //! description, network type, subnet count and tag count; the default `ShortName` over a
 //! table of DNS names differing in label count, separator and case; the admitted
 //! editions over the WHOLE modelled `DirectoryEdition` catalog; the admitted network
-//! types over the whole modelled `NetworkType` catalog; and the Region directory quota
-//! at the bound and one past it.
+//! types over the whole modelled `NetworkType` catalog; and the Managed Microsoft AD
+//! Region quota — its own allowance, not one shared with Simple AD — at the bound and one
+//! past it.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -24,7 +25,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::directory_lifecycle::{
     assert_directory_id, create_directory, describe_one, descriptions, minimal_create, ok, refused,
-    service, string, tag_map, DIRECTORY_QUOTA, PASSWORD, PAST_ONE_SPAN, STAGE_ACTIVE,
+    service, string, tag_map, MICROSOFT_AD_QUOTA, PASSWORD, PAST_ONE_SPAN, STAGE_ACTIVE,
     STAGE_REQUESTED, TAG_QUOTA,
 };
 
@@ -466,25 +467,33 @@ async fn a_created_microsoft_ad_directory_leaves_the_requested_stage_on_the_cloc
 }
 
 #[tokio::test]
-async fn the_region_directory_quota_counts_microsoft_ad_directories() {
-    let case = "directory quota";
+async fn the_managed_microsoft_ad_quota_is_its_own_allowance() {
+    let case = "Managed Microsoft AD quota";
     let router = service();
 
-    // Both creates draw on one Region-wide allowance, so the quota is reached by a mix
-    // of the two directory types rather than by either one alone.
-    let microsoft_ad_share = DIRECTORY_QUOTA / 2;
-    for index in 0..DIRECTORY_QUOTA {
-        let name = format!("quota{index}.example.com");
-        if index < microsoft_ad_share {
-            create_microsoft_ad(&router, minimal_microsoft_ad(&name), case).await;
-        } else {
-            create_directory(&router, minimal_create(&name), case).await;
-        }
+    // Managed Microsoft AD carries its OWN published Region quota, so this create is
+    // bounded by that allowance alone and not by the Simple AD one: filling the Simple
+    // AD quota first must leave the Managed Microsoft AD allowance untouched.
+    for index in 0..crate::directory_lifecycle::CLOUD_ONLY_QUOTA {
+        create_directory(
+            &router,
+            minimal_create(&format!("simple{index}.example.com")),
+            case,
+        )
+        .await;
+    }
+    for index in 0..MICROSOFT_AD_QUOTA {
+        create_microsoft_ad(
+            &router,
+            minimal_microsoft_ad(&format!("managed{index}.example.com")),
+            case,
+        )
+        .await;
     }
     assert_eq!(
         stored_count(&router, case).await,
-        DIRECTORY_QUOTA,
-        "case {case:?}: expected the store to hold the whole allowance"
+        crate::directory_lifecycle::CLOUD_ONLY_QUOTA + MICROSOFT_AD_QUOTA,
+        "case {case:?}: expected both allowances to be fillable at once"
     );
 
     refused(
@@ -492,12 +501,12 @@ async fn the_region_directory_quota_counts_microsoft_ad_directories() {
         "CreateMicrosoftAD",
         minimal_microsoft_ad("overflow.example.com"),
         "DirectoryLimitExceededException",
-        "one past the directory quota",
+        "one past the Managed Microsoft AD quota",
     )
     .await;
     assert_eq!(
         stored_count(&router, case).await,
-        DIRECTORY_QUOTA,
+        crate::directory_lifecycle::CLOUD_ONLY_QUOTA + MICROSOFT_AD_QUOTA,
         "case {case:?}: expected the refused create to persist nothing"
     );
 }
