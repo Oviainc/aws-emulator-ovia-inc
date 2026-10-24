@@ -514,6 +514,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A new workload's lens reviews carry no answers yet: every question of
             // every attached lens is UNANSWERED until one is recorded.
             answers: std::collections::BTreeMap::new(),
+            // No profile is associated with the workload: a `ProfileArn` the request
+            // named is refused above, because associating one would have to prioritise
+            // the lens questions the profile's choices map to and this emulator carries
+            // no profile template to map them through.
+            profiles: Vec::new(),
         };
         let workload_arn = record.workload_arn.clone();
 

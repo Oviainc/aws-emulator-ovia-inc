@@ -1240,6 +1240,29 @@ impl<Token> TokenLedger<Token> {
 /// 50 is the most a stored resource can hold too.
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
+/// One profile associated with a workload: "The profile associated with a workload"
+/// (`smithy_query(query="shape", shape="WorkloadProfile")`).
+///
+/// A workload is reviewed against ONE VERSION of the profile — `WorkloadProfile` carries
+/// `ProfileVersion` beside `ProfileArn`, and `UpgradeProfileVersion` is what moves a
+/// workload to a later one — so the association records the version it is pinned at
+/// rather than resolving the profile's current one on every read.
+#[derive(Debug, Clone)]
+pub struct WorkloadProfileRecord {
+    pub profile_arn: String,
+    pub profile_version: String,
+}
+
+impl WorkloadProfileRecord {
+    /// The `WorkloadProfile` projection a workload read reports this association by.
+    pub fn to_workload_profile(&self) -> crate::ops::types::WorkloadProfile {
+        crate::ops::types::WorkloadProfile {
+            profile_arn: Some(self.profile_arn.clone()),
+            profile_version: Some(self.profile_version.clone()),
+        }
+    }
+}
+
 /// Every resource type of this service a TAG operation can name, as
 /// `(ARN resource prefix, modelled `ResourceType`, the words a message calls it by)`.
 ///
@@ -1304,6 +1327,20 @@ pub struct WorkloadRecord {
     /// own because a milestone records the workload BY VALUE: freezing the workload
     /// freezes the answers it had, which is what a milestone read reports.
     pub answers: BTreeMap<String, BTreeMap<String, AnswerRecord>>,
+    /// The profiles associated with this workload, in association order.
+    ///
+    /// The association lives on the WORKLOAD rather than in a map of its own for the
+    /// reason the answers above do: a milestone records the workload by value, so
+    /// freezing the workload freezes the profiles it was reviewed against. A `Vec`
+    /// rather than a map because the list is at most one entry long
+    /// (`WorkloadProfiles` is `@length(max: 1)`, as is
+    /// `CreateWorkloadInput$ProfileArns`) and its order is the order the response
+    /// reports.
+    ///
+    /// `DisassociateProfiles` is what removes an entry here, and `AssociateProfiles` —
+    /// still a stub with its own issue, which is why no HTTP path adds one yet — is what
+    /// will add one.
+    pub profiles: Vec<WorkloadProfileRecord>,
 }
 
 impl WorkloadRecord {
@@ -1324,6 +1361,45 @@ impl WorkloadRecord {
         self.lenses
             .iter()
             .any(|attached| lens_alias(attached) == lens_alias(lens))
+    }
+
+    /// Whether a profile ARN names a profile associated with this workload.
+    ///
+    /// The ARN identifies the profile on its own, so the comparison is exact: an ARN
+    /// agreeing on the resource part and disagreeing on the account or the Region names a
+    /// DIFFERENT profile and is not associated here.
+    pub fn associates_profile(&self, profile_arn: &str) -> bool {
+        self.profiles
+            .iter()
+            .any(|associated| associated.profile_arn == profile_arn)
+    }
+
+    /// Drop the association of one profile from this workload.
+    ///
+    /// Idempotent in the ARN: a workload holds a profile at most once, so this removes at
+    /// most one entry and leaves the order of the rest alone. It answers nothing, because
+    /// whether the workload held the profile is what [`Self::associates_profile`] is for —
+    /// an operation that has to refuse an unheld profile resolves it BEFORE removing any.
+    pub fn disassociate_profile(&mut self, profile_arn: &str) {
+        self.profiles
+            .retain(|associated| associated.profile_arn != profile_arn);
+    }
+
+    /// The `WorkloadProfiles` projection of this workload's associations, or `None` when
+    /// no profile is associated: the member describes "the profile associated with a
+    /// workload", and a workload with none has no profile to report rather than an empty
+    /// list of them.
+    ///
+    /// Public because a LENS REVIEW of the workload reports the same list — "the profiles
+    /// associated with the workload" (`smithy_query(query="doc", shape="LensReview",
+    /// member="Profiles")`) — so both reads project it from the one place.
+    pub fn profiles_projection(&self) -> Option<Vec<crate::ops::types::WorkloadProfile>> {
+        (!self.profiles.is_empty()).then(|| {
+            self.profiles
+                .iter()
+                .map(WorkloadProfileRecord::to_workload_profile)
+                .collect()
+        })
     }
 
     /// The lens reviews this workload has: every attached lens's [`lens_alias`] — the
@@ -1465,10 +1541,14 @@ impl WorkloadRecord {
             tags: Some(self.tags.clone().into_iter().collect()),
             discovery_config: Some(self.effective_discovery_config()),
             applications: Some(self.applications.clone()),
-            // A workload's profiles, and the risk counts restricted to the questions a
-            // profile prioritises, exist only once a profile is associated; profiles
-            // are still a stub, so there is nothing to project.
-            profiles: None,
+            // The profiles this workload is reviewed against, and the risk counts
+            // restricted to the questions a profile prioritises. The associations are
+            // projected from the record; the prioritised roll-up is NOT, because which
+            // questions a profile prioritises is read off that profile's own answered
+            // profile questions and this emulator holds no profile question catalog to
+            // read them against (see [`DEFAULT_QUESTION_TYPE`]) — so no question of any
+            // workload is prioritized and there is no prioritised roll-up to report.
+            profiles: self.profiles_projection(),
             prioritized_risk_counts: None,
             jira_configuration: self.jira_configuration.as_ref().map(|input| {
                 WorkloadJiraConfigurationOutput {
@@ -1492,7 +1572,9 @@ impl WorkloadRecord {
             lenses: Some(self.lenses.clone()),
             risk_counts: Some(risk_counts_to_map(&self.risk_counts())),
             improvement_status: Some(self.improvement_status.clone()),
-            profiles: None,
+            // As in [`Self::to_workload`]: the associations are projected from the
+            // record, the prioritised roll-up has nothing to compute it from.
+            profiles: self.profiles_projection(),
             prioritized_risk_counts: None,
         }
     }
@@ -4882,6 +4964,25 @@ pub fn workload_share_not_found(workload_id: &str, share_id: &str) -> ResourceNo
         WORKLOAD_SHARE_RESOURCE_TYPE,
         share_id.to_string(),
         &format!("share with ID {share_id} of a workload with ID {workload_id}"),
+    )
+}
+
+/// [`resource_not_found`] for a `ProfileArn` that names no profile associated with the
+/// workload — none is, or the one the workload holds is a different profile.
+///
+/// A `ProfileArn` identifies the profile on its own, so — as for a workload `ShareId` —
+/// the `ResourceId` is that ARN AS SENT, and the message names the workload the profile
+/// was looked for in, so a caller can tell a profile of another workload from one that
+/// was already disassociated. Shared by every operation that resolves a profile OF a
+/// workload, so they cannot word it differently.
+pub fn workload_profile_not_found(
+    workload_id: &str,
+    profile_arn: &str,
+) -> ResourceNotFoundException {
+    resource_not_found(
+        PROFILE_RESOURCE_TYPE,
+        profile_arn.to_string(),
+        &format!("profile with ARN {profile_arn} associated with a workload with ID {workload_id}"),
     )
 }
 
