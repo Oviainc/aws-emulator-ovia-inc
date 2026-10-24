@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetTargetResourceType
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetTargetResourceType`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetTargetResourceType::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the target resource type the request names, from the service's own catalog
+//! ([`crate::state::TARGET_RESOURCE_TYPE_CATALOG`]) — the same table
+//! `ListTargetResourceTypes` pages over, so the two cannot disagree. A resource type is
+//! service-owned data (no API creates, updates or deletes one), so this is a REPORTING
+//! operation that writes nothing: two reads at any two instants report the same type, and
+//! an id the catalog does not hold answers `ResourceNotFoundException` rather than a
+//! fabricated type.
 //!
 //! ## Shape of an operation
 //!
@@ -138,18 +137,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetTargetResourceType` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetTargetResourceTypeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetTargetResourceType"))
+        // The catalog is the SERVICE's own constant data, so this handler needs no store:
+        // the engine is bound here only to keep the constructor seam honest. A resource
+        // type belongs to no account or region either, so nothing here reads the request's
+        // credential scope.
+        let _ = (ctx, &self.engine);
+
+        // Reporting only: nothing here writes, so two reads at any two instants report the
+        // same resource type and a later caller sees exactly what this one saw. The id is
+        // matched exactly, so a differently cased or suffixed id names no resource type.
+        let Some(entry) = crate::state::target_resource_type_catalog_entry(&input.resource_type)
+        else {
+            return Err(GetTargetResourceTypeErrorModeled::ResourceNotFoundException(
+                crate::state::target_resource_type_not_found(&input.resource_type),
+            )
+            .into());
+        };
+
+        Ok(GetTargetResourceTypeOutput {
+            target_resource_type: Some(entry.to_target_resource_type()),
+        })
     }
 }
