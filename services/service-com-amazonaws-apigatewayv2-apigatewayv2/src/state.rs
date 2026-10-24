@@ -277,10 +277,47 @@ pub const DEFAULT_CONNECTION_TYPE: &str = "INTERNET";
 /// for an HTTP api.
 pub const WEBSOCKET_ONLY_INTEGRATION_TYPES: &[&str] = &["AWS", "HTTP", "MOCK"];
 
+/// The `IntegrationType` of a proxy integration to a Lambda function or another AWS
+/// service action, from `INTEGRATION_TYPE_VALUES`: "AWS_PROXY: for integrating the route
+/// or method request with a Lambda function or other AWS service action. This
+/// integration is also referred to as a Lambda proxy integration"
+/// (`CreateIntegration$IntegrationType`).
+pub const AWS_PROXY_INTEGRATION_TYPE: &str = "AWS_PROXY";
+
+/// The `IntegrationType` of a proxy integration to an HTTP endpoint, from
+/// `INTEGRATION_TYPE_VALUES` ("HTTP_PROXY: for integrating the route or method request
+/// with an HTTP endpoint … also referred to as the HTTP proxy integration").
+pub const HTTP_PROXY_INTEGRATION_TYPE: &str = "HTTP_PROXY";
+
+/// The one `PayloadFormatVersion` every integration supports: "For all other
+/// integrations, 1.0 is the only supported value"
+/// (`Integration$PayloadFormatVersion`).
+pub const ONLY_PAYLOAD_FORMAT_VERSION: &str = "1.0";
+
+/// The later `PayloadFormatVersion` a Lambda proxy integration supports: "Supported
+/// values for Lambda proxy integrations are 1.0 and 2.0"
+/// (`Integration$PayloadFormatVersion`).
+pub const LAMBDA_PROXY_PAYLOAD_FORMAT_VERSION: &str = "2.0";
+
+/// Every `PayloadFormatVersion` a Lambda proxy integration supports, from the same
+/// sentence ("Supported values for Lambda proxy integrations are 1.0 and 2.0").
+pub const LAMBDA_PROXY_PAYLOAD_FORMAT_VERSIONS: &[&str] =
+    &[ONLY_PAYLOAD_FORMAT_VERSION, LAMBDA_PROXY_PAYLOAD_FORMAT_VERSION];
+
 /// The `TimeoutInMillis` an integration of an HTTP API gets when the request names
 /// none: "The default timeout is … 30 seconds for HTTP APIs"
 /// (`CreateIntegration$TimeoutInMillis`).
 pub const DEFAULT_HTTP_TIMEOUT_MILLIS: i32 = 30_000;
+
+/// The `TimeoutInMillis` window an integration's timeout has to fall in, from the shape
+/// `CreateIntegration$TimeoutInMillis` targets: `IntegerWithLengthBetween50And30000`,
+/// `range` 50..30000 (`smithy_query(query="shape",
+/// shape="IntegerWithLengthBetween50And30000")`). The boundary validator is what refuses
+/// a value outside it; these name the window the refusal states.
+pub const MIN_INTEGRATION_TIMEOUT_MILLIS: i32 = 50;
+
+/// The upper end of that window (see [`MIN_INTEGRATION_TIMEOUT_MILLIS`]).
+pub const MAX_INTEGRATION_TIMEOUT_MILLIS: i32 = 30_000;
 
 /// The `TimeoutInMillis` an integration of a WebSocket API gets when the request names
 /// none: "The default timeout is 29 seconds for WebSocket APIs"
@@ -556,6 +593,40 @@ impl Api {
             .collect()
     }
 
+    /// The refusal message for a reference of this route that this api cannot resolve,
+    /// or `None` when every reference names a child resource this api holds.
+    ///
+    /// A route references two resources of its OWN api: the integration its `Target`
+    /// addresses (`integrations/{IntegrationId}`) and the authorizer its `AuthorizerId`
+    /// names. Neither may be stored unresolved — a route wired to nothing could never be
+    /// invoked, and the api it belongs to could not be reproduced on AWS — so every
+    /// writer of a route resolves them here before persisting anything. The reference is
+    /// part of the REQUEST, so a request naming one that does not resolve is "not valid,
+    /// for example, the input is incomplete or incorrect": the message is the
+    /// operation's `BadRequestException`'s.
+    pub fn unresolved_route_reference(
+        &self,
+        target: Option<&str>,
+        authorizer_id: Option<&str>,
+    ) -> Option<String> {
+        if let Some(integration_id) = target.and_then(target_integration_id) {
+            if !self.integrations.contains_key(integration_id) {
+                // The message names the kind of target the key addresses and the id it
+                // carried, both read out of the request's own `Target`.
+                return Some(format!(
+                    "Unable to find route target of type {} with ID {integration_id}",
+                    INTEGRATION_TARGET_PREFIX.trim_end_matches('/')
+                ));
+            }
+        }
+        if let Some(authorizer_id) = authorizer_id.filter(|id| !id.is_empty()) {
+            if !self.authorizers.contains_key(authorizer_id) {
+                return Some(UNRESOLVED_AUTHORIZER_MESSAGE.to_string());
+            }
+        }
+        None
+    }
+
     /// Project the record onto the modelled `Api` shape.
     pub fn to_wire(&self) -> wire::Api {
         wire::Api {
@@ -619,9 +690,7 @@ impl Route {
     /// route with no target at all, and for a target of any other form — a target
     /// this service does not resolve to an integration references none of them.
     pub fn target_integration_id(&self) -> Option<&str> {
-        self.target
-            .as_deref()?
-            .strip_prefix(INTEGRATION_TARGET_PREFIX)
+        self.target.as_deref().and_then(target_integration_id)
     }
 
     /// Mint a fresh `RouteResponseId` for this route: ten lowercase alphanumerics,
@@ -957,6 +1026,283 @@ pub fn validate_route_authorization(
         ));
     }
     Ok(())
+}
+
+/// The entry a CORS list carries to stand for "every value": the wildcard.
+pub const CORS_WILDCARD: &str = "*";
+
+/// `Ok(())`, or why this CORS configuration cannot hold together — the message for the
+/// operation's `BadRequestException`.
+///
+/// One rule: a configuration that allows CREDENTIALED cross-origin requests cannot
+/// answer them with the wildcard. A browser rejects a credentialed response whose
+/// `Access-Control-Allow-Origin` (or `-Methods`, or `-Headers`) is `*`, so the pair
+/// describes a policy no client could ever use and the service refuses it instead of
+/// storing a document that would never work.
+///
+/// Shared by every writer of an api's CORS document, so the requirement cannot differ
+/// between the create and a later update; an update checks the MERGED configuration,
+/// which is the one the api would carry.
+pub fn validate_cors_configuration(cors: &wire::Cors) -> Result<(), String> {
+    if cors.allow_credentials != Some(true) {
+        return Ok(());
+    }
+    // The message names the response header the wildcard would go into, which is what
+    // the browser rule it states is about: `access-control-allow-origin: *` cannot
+    // answer a credentialed request, and neither can the method or header forms.
+    for (header, values) in [
+        ("allow-origin", cors.allow_origins.as_ref()),
+        ("allow-methods", cors.allow_methods.as_ref()),
+        ("allow-headers", cors.allow_headers.as_ref()),
+    ] {
+        if values.is_some_and(|values| values.iter().any(|value| value == CORS_WILDCARD)) {
+            return Err(format!(
+                "allow-credentials is not supported if '{header}' is {CORS_WILDCARD}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The variable namespaces a selection expression may read, lowercased for comparison.
+///
+/// A selection expression selects a stored key by evaluating request DATA — the
+/// documented defaults name exactly these namespaces (`$request.header.x-api-key` for
+/// `Api$ApiKeySelectionExpression`, `$request.method $request.path` for an HTTP api's
+/// `RouteSelectionExpression`, `$context.*` for context variables) — so a `$`-token
+/// naming anything else names no variable at all.
+pub const SELECTION_EXPRESSION_VARIABLES: &[&str] = &["request", "context", "stagevariables"];
+
+/// `Ok(())`, or why this selection expression cannot be stored — the message for the
+/// operation's `BadRequestException`.
+///
+/// One rule: in a selection expression an unescaped `$` begins a VARIABLE reference, so
+/// every `$`-token has to name one of the variable namespaces the service evaluates
+/// ([`SELECTION_EXPRESSION_VARIABLES`]). A selection KEY that itself begins with `$` —
+/// `$default` is the one the service mints — is a literal, and a literal is written
+/// escaped (`\$default`); unescaped it reads as a variable the service does not define.
+pub fn validate_selection_expression(expression: &str) -> Result<(), String> {
+    let characters: Vec<char> = expression.chars().collect();
+    let mut index = 0;
+    while index < characters.len() {
+        match characters[index] {
+            // An escaped character is a literal: this is how a selection key beginning
+            // with `$` is written.
+            '\\' => index += 2,
+            '$' => {
+                let name: String = characters[index + 1..]
+                    .iter()
+                    .skip_while(|c| **c == '{')
+                    .take_while(|c| c.is_ascii_alphanumeric() || **c == '_')
+                    .collect();
+                if !SELECTION_EXPRESSION_VARIABLES.contains(&name.to_ascii_lowercase().as_str()) {
+                    return Err(format!(
+                        "Unexpected variable in selection expression: ${name}"
+                    ));
+                }
+                index += 1;
+            }
+            _ => index += 1,
+        }
+    }
+    Ok(())
+}
+
+/// `Ok(())`, or why this integration's payload format version cannot be stored — the
+/// message for the operation's `BadRequestException`.
+///
+/// One rule, straight from `Integration$PayloadFormatVersion`: "Supported values for
+/// Lambda proxy integrations are 1.0 and 2.0. For all other integrations, 1.0 is the
+/// only supported value." A Lambda proxy integration is the `AWS_PROXY` type invoking a
+/// function, so an `AWS_PROXY` integration that names an AWS service action through an
+/// `IntegrationSubtype` instead is one of the "all other integrations".
+pub fn validate_payload_format_version(
+    integration_type: &str,
+    integration_subtype: Option<&str>,
+    payload_format_version: Option<&str>,
+) -> Result<(), String> {
+    let Some(version) = payload_format_version else {
+        return Ok(());
+    };
+    let is_lambda_proxy =
+        integration_type == AWS_PROXY_INTEGRATION_TYPE && integration_subtype.is_none();
+    let supported = if is_lambda_proxy {
+        LAMBDA_PROXY_PAYLOAD_FORMAT_VERSIONS
+    } else {
+        &[ONLY_PAYLOAD_FORMAT_VERSION]
+    };
+    if !supported.contains(&version) {
+        return Err(format!(
+            "PayloadFormatVersion {version} is not supported for an integration of type \
+             {integration_type}; supported values are {}",
+            supported.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+/// The one `IntegrationType` that names no endpoint, from `INTEGRATION_TYPE_VALUES`:
+/// "MOCK: for integrating the route or method request with API Gateway as a 'loopback'
+/// endpoint without invoking any backend."
+pub const MOCK_INTEGRATION_TYPE: &str = "MOCK";
+
+/// The `ConnectionType` of a private integration, from `CONNECTION_TYPE_VALUES`: the
+/// one that connects through a VPC link and so needs the link's id.
+pub const VPC_LINK_CONNECTION_TYPE: &str = "VPC_LINK";
+
+/// `Ok(())`, or why this integration's configuration cannot hold together — the message
+/// for the operation's `BadRequestException`.
+///
+/// The rules an integration RECORD has to satisfy, whatever wrote it, so a create and a
+/// later update cannot disagree about them; an update checks the MERGED record, which is
+/// the one the api would carry:
+///
+/// * an `IntegrationSubtype` names the AWS service action an AWS_PROXY integration
+///   invokes ("Supported only for HTTP API AWS_PROXY integrations. Specifies the AWS
+///   service action to invoke", `CreateIntegration$IntegrationSubtype` — the protocol
+///   half of that clause is the protocol gate's, this is the type half);
+/// * an `IntegrationUri` is needed only when the URI is what names what the integration
+///   invokes: `MOCK` invokes nothing and a subtype names the action itself;
+/// * the payload format version is the one the type supports (see
+///   [`validate_payload_format_version`]);
+/// * "The ID of the VPC link for a private integration" is what a `VPC_LINK` connection
+///   connects through, and it means nothing without one;
+/// * a template selection expression names only variables the service evaluates (see
+///   [`validate_selection_expression`]).
+pub fn validate_integration(
+    integration_type: &str,
+    integration_subtype: Option<&str>,
+    integration_uri: Option<&str>,
+    payload_format_version: Option<&str>,
+    connection_type: &str,
+    connection_id: Option<&str>,
+    template_selection_expression: Option<&str>,
+) -> Result<(), String> {
+    if integration_subtype.is_some() && integration_type != AWS_PROXY_INTEGRATION_TYPE {
+        return Err(format!(
+            "IntegrationSubtype is supported only for integrations of type \
+             {AWS_PROXY_INTEGRATION_TYPE}, and this integration's IntegrationType is \
+             {integration_type}"
+        ));
+    }
+    if integration_uri.is_none_or(str::is_empty)
+        && integration_type != MOCK_INTEGRATION_TYPE
+        && integration_subtype.is_none()
+    {
+        return Err(format!(
+            "IntegrationUri is required for an integration of type {integration_type}."
+        ));
+    }
+    validate_payload_format_version(
+        integration_type,
+        integration_subtype,
+        payload_format_version,
+    )?;
+    if connection_type == VPC_LINK_CONNECTION_TYPE && connection_id.is_none_or(str::is_empty) {
+        return Err(format!(
+            "ConnectionId is required for a connection of type {VPC_LINK_CONNECTION_TYPE}."
+        ));
+    }
+    if let Some(expression) = template_selection_expression {
+        validate_selection_expression(expression)?;
+    }
+    Ok(())
+}
+
+/// The name of the path variable a route-key path segment declares, or `None` for a
+/// literal segment. `{id}` names `id` and the greedy `{proxy+}` names `proxy+`.
+fn route_key_path_variable(segment: &str) -> Option<&str> {
+    segment.strip_prefix('{')?.strip_suffix('}')
+}
+
+/// The method and the path segments of a route key of the `METHOD /path` form, or `None`
+/// for a key of any other form — a WebSocket key (`$connect`, `$default`,
+/// `sendmessage`) names no path, so it declares no path variables at all.
+fn route_key_parts(route_key: &str) -> Option<(&str, Vec<&str>)> {
+    let (method, path) = route_key.split_once(' ')?;
+    let path = path.strip_prefix('/')?;
+    Some((method, path.split('/').collect()))
+}
+
+/// `Ok(())`, or why this route key cannot live beside the api's existing ones — the
+/// message for the operation's `BadRequestException`.
+///
+/// One rule: within a method's path space a position that is a path VARIABLE has ONE
+/// name. Two route keys of the same method that agree on every earlier segment therefore
+/// cannot declare differently named variables at the same position, because a request
+/// matching both would have to bind two different path parameters at once. A literal
+/// beside a variable is not a conflict (the more specific key simply wins), and the two
+/// keys part company there, so nothing deeper can conflict either.
+///
+/// Shared by every writer of a route key, so the requirement cannot differ between the
+/// create and a later update. A duplicate key is a different refusal, `ConflictException`.
+pub fn validate_route_key_variables<'a>(
+    route_key: &str,
+    existing_keys: impl Iterator<Item = &'a str>,
+) -> Result<(), String> {
+    let Some((method, segments)) = route_key_parts(route_key) else {
+        return Ok(());
+    };
+    for existing in existing_keys {
+        let Some((other_method, other_segments)) = route_key_parts(existing) else {
+            continue;
+        };
+        // One method's path space at a time: two methods are routed separately, so each
+        // binds its own path parameters.
+        if method != other_method {
+            continue;
+        }
+        for (segment, other) in segments.iter().zip(other_segments.iter()) {
+            match (
+                route_key_path_variable(segment),
+                route_key_path_variable(other),
+            ) {
+                (Some(name), Some(other_name)) if name != other_name => {
+                    // The message is built from the request: the key it asked for and
+                    // the key already on the api whose variable sits at that level.
+                    return Err(format!(
+                        "The provided route key \"{route_key}\" has a conflicting variable \
+                         on the same hierarchical level as \"{existing}\""
+                    ));
+                }
+                // The same variable at the same position, or the same literal: the keys
+                // still share a path space, so keep comparing.
+                (Some(_), Some(_)) => continue,
+                _ if segment == other => continue,
+                // A literal beside a variable, or two different literals: the keys part
+                // company here.
+                _ => break,
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The sentence this service refuses a route whose `AuthorizerId` names no authorizer of
+/// its api with.
+///
+/// The refusal is about the ASSOCIATION, not about the id — an id a route may not name is
+/// one no authorizer of that api carries — so the sentence states the requirement rather
+/// than echoing the id back.
+pub const UNRESOLVED_AUTHORIZER_MESSAGE: &str = "Invalid authorizer ID specified. Setting \
+    the authorization type to CUSTOM or COGNITO_USER_POOLS requires a valid authorizer.";
+
+/// The message this service answers `NotFoundException` with for a request naming a
+/// resource no record holds: the sentence API Gateway answers an unknown identifier
+/// with, for the resource named ("Invalid API identifier specified
+/// {account}:{identifier}").
+pub fn invalid_identifier_message(resource: &str, id: &str) -> String {
+    format!(
+        "Invalid {resource} identifier specified {}:{id}",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// The `IntegrationId` a route target names, when it addresses an integration of the
+/// same api (`integrations/{IntegrationId}`). `None` for a target of any other form — a
+/// target this service does not resolve to an integration references none of them.
+pub fn target_integration_id(target: &str) -> Option<&str> {
+    target.strip_prefix(INTEGRATION_TARGET_PREFIX)
 }
 
 /// One request member the model restricts to APIs of a single `ProtocolType`.

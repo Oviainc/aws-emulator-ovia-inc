@@ -159,8 +159,10 @@
 use super::types::*;
 
 /// `protocolType`'s modelled default: `GatewayProtocolType` has the single value `MCP`
-/// and the member carries `default: "MCP"` (`smithy_query operation=CreateGateway`).
-const DEFAULT_PROTOCOL_TYPE: &str = "MCP";
+/// and the member carries `default: "MCP"` (`smithy_query operation=CreateGateway`). It
+/// is [`crate::state::PROTOCOL_TYPE_MCP`], the same value the gateway's own MCP endpoint
+/// is served for, so the two cannot drift.
+const DEFAULT_PROTOCOL_TYPE: &str = crate::state::PROTOCOL_TYPE_MCP;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the

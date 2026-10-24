@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSites
-//! IMPLEMENTED: reports every persisted site that satisfies the caller's operating-address
-//! filters, in creation order, cut into pages of at most `MaxResults` with the modelled
-//! `NextToken` the next page resumes from. A read: it never changes what a later caller
-//! sees.
+//! IMPLEMENTED: reports every site of the region the request is addressed to that
+//! satisfies the caller's operating-address filters, in creation order, cut into pages
+//! of at most `MaxResults` with the modelled `NextToken` the next page resumes from. A
+//! read: it never changes what a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -145,12 +145,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListSitesErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the Outposts store is unavailable".to_string()),
             })
         })?;
+        // This service is regional, so the list is the inventory of the region the
+        // request is addressed to — a region nothing was created in lists nothing.
+        let region = crate::state::request_region(ctx.parts());
 
         // The resume point the caller's token names. A token this service did not
         // issue for THIS list is a bad request, not an empty page.
@@ -172,8 +174,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let (sites, next_token) = crate::state::page(
             crate::state::SITE_PAGE,
             store
-                .sites
-                .values()
+                .sites_in(&region)
                 .filter(|record| matches_filters(&record.site, &input))
                 .map(|record| (record.sequence, record.site.clone())),
             after,

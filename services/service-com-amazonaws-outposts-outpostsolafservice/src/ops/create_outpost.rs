@@ -196,10 +196,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         // An Outpost belongs to a site, so a site that does not exist cannot take
-        // one: the service answers the not-found error it models for this call.
+        // one: the service answers the not-found error it models for this call. The
+        // site is resolved in the region this request is addressed to — a site of
+        // another region is not part of this region's inventory, so it cannot be
+        // named here at all.
         let site_arn = store
-            .sites
-            .get(&site_id)
+            .site(&region, &site_id)
             .and_then(|record| record.site.site_arn.clone())
             .ok_or_else(|| {
                 CreateOutpostErrorModeled::NotFoundException(NotFoundException {
@@ -276,6 +278,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             outpost_id,
             crate::state::OutpostRecord {
                 sequence,
+                // The Outpost belongs to the region this request was addressed to:
+                // the one its ARN names, and the only one it is reachable through.
+                region,
                 outpost: outpost.clone(),
                 // Private connectivity is configured by its own call
                 // (`CreatePrivateConnectivityConfig`), so a just-created Outpost

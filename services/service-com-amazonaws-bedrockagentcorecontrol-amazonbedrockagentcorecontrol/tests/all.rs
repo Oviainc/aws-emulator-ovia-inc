@@ -17,6 +17,8 @@ mod agent_runtime_lifecycle;
 mod gateway_lifecycle;
 #[path = "all/gateway_listings.rs"]
 mod gateway_listings;
+#[path = "all/gateway_mcp_endpoint.rs"]
+mod gateway_mcp_endpoint;
 #[path = "all/gateway_mutation.rs"]
 mod gateway_mutation;
 #[path = "all/gateway_target_listing.rs"]

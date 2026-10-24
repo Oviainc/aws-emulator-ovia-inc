@@ -199,11 +199,18 @@ fn rows() -> Vec<Row> {
         Row {
             case: "CreateIntegration$IntegrationSubtype, supported only for HTTP APIs",
             collection: "integrations",
-            request: with(
-                proxy_integration(),
-                "integrationSubtype",
-                json!("SQS-SendMessage"),
-            ),
+            // The base is an `AWS_PROXY` integration, not the shared `HTTP_PROXY` one:
+            // "Supported only for HTTP API AWS_PROXY integrations"
+            // (`CreateIntegration$IntegrationSubtype`), so a subtype on any other
+            // integration type is refused whatever the protocol, and the only thing
+            // left for this row to isolate is the PROTOCOL half of that clause.
+            // `AWS_PROXY` itself carries no protocol restriction.
+            request: json!({
+                "integrationType": "AWS_PROXY",
+                "integrationUri": "arn:aws:lambda:eu-west-1:000000000000:function:handler",
+                "payloadFormatVersion": "1.0",
+                "integrationSubtype": "SQS-SendMessage"
+            }),
             supported_by: HTTP_PROTOCOL_TYPE,
             read_back: ReadBack::Collection,
         },

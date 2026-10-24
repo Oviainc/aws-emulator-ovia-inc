@@ -348,8 +348,6 @@ type RefusedZone = (
 #[tokio::test]
 async fn create_outpost_refuses_an_availability_zone_of_another_region() {
     let outposts = Outposts::new();
-    let site = outposts.create_site(&json!({ "Name": "zone site" })).await;
-    let site_id = text(&site, "SiteId");
 
     // (case, region, AvailabilityZone, AvailabilityZoneId). A row naming BOTH names
     // one zone with them, since the two identities of one zone is what a pair means
@@ -384,6 +382,11 @@ async fn create_outpost_refuses_an_availability_zone_of_another_region() {
         ("no zone named at all", "ca-central-1", None, None),
     ];
     for (case, region, zone, zone_id) in accepted {
+        // An Outpost is placed on a site of its OWN region, so each row's site is
+        // created in the region that row is addressed to.
+        let site_id = outposts
+            .site_id_in(region, &format!("zone site {region}"))
+            .await;
         let mut request = json!({ "Name": format!("zoned-{case}"), "SiteId": site_id });
         if let Some(zone) = zone {
             request["AvailabilityZone"] = json!(zone);

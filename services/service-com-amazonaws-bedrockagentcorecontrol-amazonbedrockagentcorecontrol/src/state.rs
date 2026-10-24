@@ -43,6 +43,7 @@ use crate::ops::types::{
     McpTargetConfiguration, Memory, MemoryStrategy, MetadataConfiguration, NamespaceKeyEntry,
     NetworkConfiguration, PrivateEndpoint, ProtocolConfiguration, RequestHeaderConfiguration,
     RuntimeMetadataConfiguration, StreamDeliveryResources, TargetConfiguration, TargetSummary,
+    ToolDefinition, ToolSchema,
     UpdateGatewayOutput, ValidationException, ValidationExceptionField, WafConfiguration,
     WorkloadIdentityDetails,
 };
@@ -86,6 +87,21 @@ pub const CREDENTIAL_PROVIDER_GATEWAY_IAM_ROLE: &str = "GATEWAY_IAM_ROLE";
 /// mandatory: "If you specify CUSTOM_JWT as the authorizerType, you must provide
 /// an authorizerConfiguration" (`smithy_query doc shape=CreateGateway`).
 pub const AUTHORIZER_TYPE_CUSTOM_JWT: &str = "CUSTOM_JWT";
+
+/// The `authorizerType` that admits an inbound request on the caller's IAM
+/// credentials: "AWS_IAM - Authorize with your Amazon Web Services IAM
+/// credentials" (`smithy_query shape=AuthorizerType`). The enum's full value
+/// list is [`crate::ops::types::AUTHORIZER_TYPE_VALUES`].
+pub const AUTHORIZER_TYPE_AWS_IAM: &str = "AWS_IAM";
+
+/// The `authorizerType` that admits every inbound request: "NONE - No
+/// authorization" (`smithy_query shape=AuthorizerType`).
+pub const AUTHORIZER_TYPE_NONE: &str = "NONE";
+
+/// `GatewayProtocolType`'s single value, which `protocolType` also carries as its
+/// modelled default (`smithy_query shape=GatewayProtocolType`): the protocol a
+/// gateway's own endpoint speaks.
+pub const PROTOCOL_TYPE_MCP: &str = "MCP";
 
 /// `ValidationExceptionReason` for a member of the request that failed
 /// validation. The enum's full value list is `CannotParse |
@@ -1200,6 +1216,23 @@ impl ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState {
             .retain(|token| live.contains_key(token));
     }
 
+    /// The gateway whose PUBLISHED endpoint host is the one a data-plane request
+    /// addressed: the gateway `gateway_id` names, and only while the URL it
+    /// published is the one on `region`'s gateway host.
+    ///
+    /// The Region is part of the address, so a gateway created in one Region is
+    /// not reachable through another Region's host — the gateway store is keyed
+    /// by id alone, and the published URL is what ties a record to a host
+    /// ([`gateway_url`]).
+    pub fn gateway_on_endpoint_host(
+        &self,
+        region: &str,
+        gateway_id: &str,
+    ) -> Option<&GatewayRecord> {
+        let record = self.gateways.get(gateway_id)?;
+        (record.gateway_url == gateway_url(region, gateway_id)).then_some(record)
+    }
+
     /// Remove every gateway whose deletion the clock has already made due, with
     /// the name it reserved, the targets on it and the idempotency records naming
     /// it.
@@ -1551,7 +1584,93 @@ pub fn memory_arn(region: &str, memory_id: &str) -> String {
 /// one gateway twice sees one URL. `GatewayUrl` is only constrained in length
 /// (1..1024), which this form satisfies for every id the pattern admits.
 pub fn gateway_url(region: &str, gateway_id: &str) -> String {
-    format!("https://{gateway_id}.gateway.{ARN_SERVICE}.{region}.amazonaws.com")
+    format!("https://{}", gateway_endpoint_host(region, gateway_id))
+}
+
+/// The label a gateway endpoint host carries between the gateway's own id and
+/// this service's name, in the host [`gateway_url`] publishes.
+const GATEWAY_HOST_LABEL: &str = "gateway";
+
+/// The DNS suffix of the endpoint hosts this emulator publishes.
+const ENDPOINT_DNS_SUFFIX: &str = "amazonaws.com";
+
+/// The host half of [`gateway_url`]:
+/// `{gatewayId}.gateway.bedrock-agentcore.{region}.amazonaws.com`.
+pub fn gateway_endpoint_host(region: &str, gateway_id: &str) -> String {
+    format!("{gateway_id}.{GATEWAY_HOST_LABEL}.{ARN_SERVICE}.{region}.{ENDPOINT_DNS_SUFFIX}")
+}
+
+/// The `(gatewayId, region)` a gateway endpoint host names, or `None` for any
+/// other host.
+///
+/// The inverse of [`gateway_endpoint_host`], so the host this service PUBLISHES
+/// is exactly the host its data plane answers on: a published URL resolves back
+/// to the record behind it. Any port the client dialled is not part of the
+/// address.
+pub fn gateway_endpoint_identity(host: &str) -> Option<(&str, &str)> {
+    let host = host.split(':').next().unwrap_or(host);
+    let (gateway_id, rest) = host.split_once('.')?;
+    let region = rest
+        .strip_prefix(&format!("{GATEWAY_HOST_LABEL}.{ARN_SERVICE}."))?
+        .strip_suffix(&format!(".{ENDPOINT_DNS_SUFFIX}"))?;
+    // Both labels are minted by this service — a `GatewayId`
+    // (`^([0-9a-z][-]?){1,100}-[0-9a-z]{10}$`) and the Region of the request
+    // that created the gateway — so a label outside that grammar addresses no
+    // gateway of this emulator.
+    let label = |value: &str| {
+        !value.is_empty()
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    };
+    (label(gateway_id) && label(region)).then_some((gateway_id, region))
+}
+
+/// The fixed sub-path a gateway's MCP JSON-RPC surface is reached at, under the
+/// bare host [`gateway_url`] publishes.
+///
+/// Recorded behaviour only: the MCP wire surface is not in this service's model,
+/// and the blessed recording drives `<gatewayUrl>/mcp`.
+pub const GATEWAY_MCP_PATH: &str = "/mcp";
+
+/// The separator a gateway qualifies an aggregated tool name with:
+/// `<targetName>___<toolName>`, as the recorded `tools/list` reports them.
+///
+/// A `TargetName` is `^([0-9a-zA-Z][-]?){1,100}$` (`smithy_query
+/// shape=TargetName`), so it carries no underscore and the FIRST occurrence of
+/// the separator is always the one between the two names.
+pub const TOOL_NAME_SEPARATOR: &str = "___";
+
+/// `<target_name>___<tool_name>`: the name one of `target_name`'s tools is
+/// aggregated under on the gateway's MCP surface.
+pub fn qualified_tool_name(target_name: &str, tool_name: &str) -> String {
+    format!("{target_name}{TOOL_NAME_SEPARATOR}{tool_name}")
+}
+
+/// The `(targetName, toolName)` a qualified tool name carries, or `None` when it
+/// is not qualified at all. The inverse of [`qualified_tool_name`].
+pub fn split_qualified_tool_name(qualified: &str) -> Option<(&str, &str)> {
+    let (target_name, tool_name) = qualified.split_once(TOOL_NAME_SEPARATOR)?;
+    (!target_name.is_empty() && !tool_name.is_empty()).then_some((target_name, tool_name))
+}
+
+/// The tool definitions a target declares INLINE, for the one target shape that
+/// declares any: an MCP target whose tool handler is a Lambda function carrying
+/// `toolSchema.inlinePayload`.
+///
+/// `None` for a target whose schema lives in S3 and for every other target
+/// shape: nothing is known about the tools behind it without reading that
+/// schema, and a tool list invented for it would name tools no target declares.
+pub fn inline_tool_definitions(configuration: &TargetConfiguration) -> Option<&[ToolDefinition]> {
+    match configuration {
+        TargetConfiguration::Mcp(McpTargetConfiguration::Lambda(lambda)) => {
+            match &lambda.tool_schema {
+                ToolSchema::inlinePayload(tools) => Some(tools),
+                ToolSchema::S3(_) => None,
+            }
+        }
+        _ => None,
+    }
 }
 
 /// How long a freshly created gateway or gateway target stays in its transient
@@ -1653,33 +1772,8 @@ pub async fn lambda_function_is_absent(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     lambda_arn: &str,
 ) -> bool {
-    // The function is asked for in ITS OWN Region — the ARN's — which is not
-    // necessarily the one this request was signed for. The label is read through
-    // `service_common`'s one ARN parse, which reports it only for an ARN OF LAMBDA
-    // whose Region field is a Region label: it lands in the authority of the
-    // endpoint URL below, so a caller-supplied value outside that grammar must not
-    // reach it. Anything else falls back to this emulator's default Region.
-    let region = ::service_common::arn::region_of(lambda_arn, LAMBDA_VENDOR)
-        .unwrap_or(DEFAULT_REGION);
-    let config = ::aws_sdk_lambda::Config::builder()
-        .behavior_version(::aws_sdk_lambda::config::BehaviorVersion::latest())
-        .http_client(ctx.callback().http_client())
-        .credentials_provider(ctx.callback().aws_credentials_provider())
-        .region(::aws_sdk_lambda::config::Region::new(region.to_string()))
-        .endpoint_url(format!("https://lambda.{region}.amazonaws.com"))
-        // The transport is in-process: there is nothing to retry, time out or
-        // watch for a stalled stream, and each of those would need a sleep
-        // implementation this client is not given. The same goes for caching the
-        // identity: the credentials are handed over directly.
-        .retry_config(::aws_sdk_lambda::config::retry::RetryConfig::disabled())
-        .timeout_config(::aws_sdk_lambda::config::timeout::TimeoutConfig::disabled())
-        .identity_cache(::aws_sdk_lambda::config::IdentityCache::no_cache())
-        .stalled_stream_protection(
-            ::aws_sdk_lambda::config::StalledStreamProtectionConfig::disabled(),
-        )
-        .build();
     // `FunctionName` takes the full ARN, which is what the target carries.
-    let answer = ::aws_sdk_lambda::Client::from_conf(config)
+    let answer = lambda_client(ctx, lambda_arn)
         .get_function()
         .function_name(lambda_arn)
         .send()
@@ -1701,6 +1795,95 @@ pub async fn lambda_function_is_absent(
                 "the gateway target's Lambda function could not be verified against Lambda"
             );
             false
+        }
+    }
+}
+
+/// The Lambda client this service reaches a function through: the in-process
+/// callback into this same emulator, at the endpoint of the function's OWN
+/// Region.
+///
+/// The Region comes off the ARN — not off the request — because that is the
+/// endpoint the function lives behind, and it is read through `service_common`'s
+/// one ARN parse, which reports it only for an ARN OF LAMBDA whose Region field
+/// is a Region label: the value lands in the authority of the endpoint URL, so a
+/// caller-supplied value outside that grammar must not reach it. Anything else
+/// falls back to this emulator's default Region.
+fn lambda_client(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    lambda_arn: &str,
+) -> ::aws_sdk_lambda::Client {
+    let region = ::service_common::arn::region_of(lambda_arn, LAMBDA_VENDOR)
+        .unwrap_or(DEFAULT_REGION);
+    let config = ::aws_sdk_lambda::Config::builder()
+        .behavior_version(::aws_sdk_lambda::config::BehaviorVersion::latest())
+        .http_client(ctx.callback().http_client())
+        .credentials_provider(ctx.callback().aws_credentials_provider())
+        .region(::aws_sdk_lambda::config::Region::new(region.to_string()))
+        .endpoint_url(format!("https://lambda.{region}.amazonaws.com"))
+        // The transport is in-process: there is nothing to retry, time out or
+        // watch for a stalled stream, and each of those would need a sleep
+        // implementation this client is not given. The same goes for caching the
+        // identity: the credentials are handed over directly.
+        .retry_config(::aws_sdk_lambda::config::retry::RetryConfig::disabled())
+        .timeout_config(::aws_sdk_lambda::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(::aws_sdk_lambda::config::IdentityCache::no_cache())
+        .stalled_stream_protection(
+            ::aws_sdk_lambda::config::StalledStreamProtectionConfig::disabled(),
+        )
+        .build();
+    ::aws_sdk_lambda::Client::from_conf(config)
+}
+
+/// What the function behind a gateway tool answered.
+#[derive(Debug)]
+pub struct LambdaInvocation {
+    /// The bytes the function returned, which the gateway hands back to the MCP
+    /// caller as the tool's result.
+    pub payload: Vec<u8>,
+    /// `FunctionError` — present only when the function itself failed, which is
+    /// what makes the tool call an error rather than a result.
+    pub function_error: Option<String>,
+}
+
+/// Invoke the function behind a gateway tool and report what Lambda answered.
+///
+/// `Err` carries the code and rendering of Lambda's own refusal: the tool call
+/// did not run, and what is reported to the MCP caller is that answer rather
+/// than a result nothing produced.
+pub async fn invoke_lambda_tool(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    lambda_arn: &str,
+    payload: Vec<u8>,
+    client_context: Option<String>,
+) -> Result<LambdaInvocation, String> {
+    let mut request = lambda_client(ctx, lambda_arn)
+        .invoke()
+        .function_name(lambda_arn)
+        // The tool call is synchronous: its result is the function's response
+        // payload, so the invocation has to be the one that returns it.
+        .invocation_type(::aws_sdk_lambda::types::InvocationType::RequestResponse)
+        .payload(::aws_sdk_lambda::primitives::Blob::new(payload));
+    if let Some(context) = client_context {
+        request = request.client_context(context);
+    }
+    match request.send().await {
+        Ok(answer) => Ok(LambdaInvocation {
+            payload: answer
+                .payload
+                .map(::aws_sdk_lambda::primitives::Blob::into_inner)
+                .unwrap_or_default(),
+            function_error: answer.function_error,
+        }),
+        Err(error) => {
+            use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
+            let rendered = ::aws_smithy_types::error::display::DisplayErrorContext(&error);
+            Err(match error.code() {
+                Some(code) => format!("{code}: {rendered}"),
+                // No code at all: the call did not reach Lambda, which is this
+                // emulator failing to ask rather than the function failing.
+                None => rendered.to_string(),
+            })
         }
     }
 }

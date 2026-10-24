@@ -46,8 +46,9 @@ use crate::ops::types::{
     Failure, KeyValuePair, LoadBalancer, ManagedInstancesProvider, NetworkConfiguration,
     PlacementConstraint, PlacementStrategy, PlatformDevice, PortMapping, ProxyConfiguration,
     Resource, RuntimePlatform, Service, ServiceConnectConfiguration,
-    ServiceCurrentRevisionSummary, ServiceEvent, ServiceRegistry, ServiceVolumeConfiguration,
-    Setting, Tag, Task, TaskDefinition, TaskDefinitionPlacementConstraint, TaskOverride,
+    ServiceCurrentRevisionSummary, ServiceDeploymentBrief, ServiceEvent, ServiceRegistry,
+    ServiceVolumeConfiguration, Setting, Tag, Task, TaskDefinition,
+    TaskDefinitionPlacementConstraint, TaskOverride,
     ThresholdConfiguration, VersionInfo, Volume, VpcLatticeConfiguration,
     CLUSTER_SETTING_NAME_VALUES,
 };
@@ -645,6 +646,34 @@ pub const ROLLOUT_IN_PROGRESS: &str = "IN_PROGRESS";
 /// "When the service reaches a steady state, the deployment transitions to a
 /// `COMPLETED` state."
 pub const ROLLOUT_COMPLETED: &str = "COMPLETED";
+
+/// `ServiceDeploymentBrief$status` while the rollout this deployment records is still
+/// under way — one of `ServiceDeploymentStatus`
+/// (`smithy_query(query="shape", shape="ServiceDeploymentStatus")`), and the
+/// service-deployment counterpart of the [`ROLLOUT_IN_PROGRESS`] the SAME rollout reports
+/// on the service's own `Deployment`.
+pub const SERVICE_DEPLOYMENT_IN_PROGRESS: &str = "IN_PROGRESS";
+/// See [`SERVICE_DEPLOYMENT_IN_PROGRESS`]: the status of a deployment whose service
+/// reached the steady state it was rolling out — the counterpart of
+/// [`ROLLOUT_COMPLETED`].
+pub const SERVICE_DEPLOYMENT_SUCCESSFUL: &str = "SUCCESSFUL";
+/// See [`SERVICE_DEPLOYMENT_IN_PROGRESS`]: the status of a deployment that stopped
+/// WITHOUT reaching that steady state, because a newer deployment replaced it or the
+/// service it was rolling out was deleted. Those two are the only ways a rollout ends
+/// early here: nothing else interrupts one, so no deployment is left open forever.
+pub const SERVICE_DEPLOYMENT_STOPPED: &str = "STOPPED";
+
+/// `ListServiceDeployments`'s page size when the caller gives no `maxResults`, from that
+/// member's own doc: "This value can be between 1 and 100. If this parameter isn't used,
+/// then ListServiceDeployments returns up to 20 results and a nextToken value if
+/// applicable." The upper bound is the shared [`MAX_LIST_PAGE_SIZE`].
+pub const DEFAULT_LIST_SERVICE_DEPLOYMENTS_PAGE_SIZE: usize = 20;
+
+/// How many service deployments this emulator keeps for ONE service. EMULATOR-CHOSEN, for
+/// the same reason as [`MAX_SERVICE_EVENTS`]: every `UpdateService` that forces a new
+/// deployment appends one, so without a bound a caller could grow the in-memory store
+/// without limit. The newest are the ones kept.
+pub const MAX_SERVICE_DEPLOYMENTS_PER_SERVICE: usize = 100;
 
 /// `deploymentConfiguration.strategy` a service takes when the request names none. The
 /// `CreateService` doc: "When you create a service which uses the ECS deployment
@@ -1725,6 +1754,80 @@ impl ServiceRecord {
     }
 }
 
+/// One SERVICE DEPLOYMENT: the rollout of ONE service revision, as the call that started
+/// it wrote it and the clock (or a later deployment) left it.
+///
+/// `ListServiceDeployments`: "A service deployment happens when you release a software
+/// update for the service. You route traffic from the running service revisions to the new
+/// service revison" — so a record is written by the call that STARTS a rollout
+/// (`CreateService`, and an `UpdateService` that forces a new deployment or moves the
+/// service onto another task definition), and never by a read. Scaling a service places
+/// or stops tasks without changing the revision it runs, so it starts no deployment.
+///
+/// The record is the service's own `PRIMARY` deployment seen as a resource of its own:
+/// [`Self::deployment_id`] is the `Deployment$id` the service reports, so the status this
+/// record carries and the `rolloutState` the service's `Deployment` carries are two views
+/// of one rollout and settle on the same instant (see
+/// [`ComAmazonawsEcsAmazonec2containerservicev20141113State::settle_services`]).
+#[derive(Debug, Clone)]
+pub struct ServiceDeploymentRecord {
+    /// `arn:aws:ecs:<region>:<account>:service-deployment/<cluster>/<service>/<id>`.
+    pub arn: String,
+    /// The `Deployment$id` (`ecs-svc/...`) of the service deployment this records.
+    pub deployment_id: String,
+    pub service_arn: String,
+    pub service_name: String,
+    pub cluster_name: String,
+    pub cluster_arn: String,
+    /// When the call that started the rollout created it. The rollout begins with that
+    /// same call — the ECS scheduler starts replacing tasks as soon as it is given the
+    /// new revision — so it is also the `startedAt` the brief reports.
+    pub created_at: DateTime,
+    /// `ServiceDeploymentBrief$finishedAt`: "The time that the service deployment
+    /// completed", and so `None` for exactly the deployments still under way.
+    pub finished_at: Option<DateTime>,
+    /// `ServiceDeploymentBrief$targetServiceRevisionArn`: "The ARN of the service revision
+    /// being deplyed" — the revision minted with this deployment.
+    pub target_service_revision_arn: String,
+    /// One of `ServiceDeploymentStatus`; see [`SERVICE_DEPLOYMENT_IN_PROGRESS`].
+    pub status: String,
+    /// `ServiceDeploymentBrief$statusReason`: "Information about why the service deployment
+    /// is in the current status."
+    pub status_reason: String,
+}
+
+impl ServiceDeploymentRecord {
+    /// Whether this rollout has ended — which is exactly when it carries a `finishedAt`,
+    /// so a reported status and a reported finish time can never disagree.
+    pub fn is_finished(&self) -> bool {
+        self.finished_at.is_some()
+    }
+
+    /// The key a listing orders deployments by: the `createdAt` the brief reports, with
+    /// the ARN breaking a tie between two deployments created in the same instant (its
+    /// last segment is minted from a monotonic fixed-width counter, so the later
+    /// deployment always sorts after the earlier one).
+    pub fn order_key(&self) -> ((i64, u32), &str) {
+        (timestamp_key(self.created_at), self.arn.as_str())
+    }
+
+    /// The `ServiceDeploymentBrief` `ListServiceDeployments` reports for this deployment,
+    /// built from what is stored.
+    pub fn brief(&self) -> ServiceDeploymentBrief {
+        ServiceDeploymentBrief {
+            service_deployment_arn: Some(self.arn.clone()),
+            service_arn: Some(self.service_arn.clone()),
+            cluster_arn: Some(self.cluster_arn.clone()),
+            started_at: Some(self.created_at),
+            created_at: Some(self.created_at),
+            finished_at: self.finished_at,
+            target_service_revision_arn: Some(self.target_service_revision_arn.clone()),
+            status: Some(self.status.clone()),
+            status_reason: Some(self.status_reason.clone()),
+        }
+    }
+}
+
 /// Which optional service fields a response carries, as `DescribeServices$include`
 /// (the `ServiceField` enum: `TAGS`) selects them.
 #[derive(Debug, Clone, Copy, Default)]
@@ -1792,6 +1895,11 @@ pub struct ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// cluster ("Service names must be unique within a cluster, but you can have
     /// similarly named services in multiple clusters"), which is exactly this key.
     pub services: HashMap<(String, String), ServiceRecord>,
+    /// `serviceDeploymentArn` -> the service deployment. A service's rollouts are its
+    /// HISTORY, so a record outlives the rollout it names (`ListServiceDeployments` lists
+    /// finished deployments as well as the one under way) and the key is the ARN the
+    /// listing reports.
+    pub service_deployments: HashMap<String, ServiceDeploymentRecord>,
     /// `(principalArn, settingName)` -> the account setting value stored for that ONE
     /// principal by `PutAccountSetting`. An entry here shadows the account-wide default
     /// for that principal alone (`ListAccountSettings$effectiveSettings`: "the account
@@ -1812,6 +1920,9 @@ pub struct ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// Monotonic source of service-deployment ids, so every deployment of every service
     /// is distinct.
     next_deployment_seq: u64,
+    /// Monotonic source of service-deployment ids, so every service deployment of every
+    /// service is distinct.
+    next_service_deployment_seq: u64,
     /// Monotonic source of service-revision ids, so every revision of every service is
     /// distinct.
     next_service_revision_seq: u64,
@@ -1868,8 +1979,10 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     }
 
     /// Materialise the SERVICE-level transitions the clock owes, as of `now`: the steady
-    /// state a started rollout settles into, and the `INACTIVE` a drained service
-    /// reaches once the tasks it was still cleaning up have stopped.
+    /// state a started rollout settles into — which is also where the SERVICE DEPLOYMENT
+    /// that rollout is recorded as becomes [`SERVICE_DEPLOYMENT_SUCCESSFUL`] — and the
+    /// `INACTIVE` a drained service reaches once the tasks it was still cleaning up have
+    /// stopped.
     ///
     /// Both were owed at this instant whether or not anybody called, so a reporting
     /// operation may run them — and each happens at most once, because the instant it
@@ -1895,6 +2008,12 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             // STOPPED status, the service status moves from DRAINING to INACTIVE."
             let drained = service.status == SERVICE_DRAINING
                 && !self.service_has_active_tasks(&key.0, &key.1);
+            // The SAME rollout, as the service-deployment resource: it finishes with the
+            // steady state the service reaches, not a moment before or after.
+            let settled_deployment = settled.and_then(|_| {
+                self.current_service_deployment(service)
+                    .map(|deployment| deployment.arn.clone())
+            });
 
             let events = match settled {
                 // The two events the scheduler writes when a rollout reaches its steady
@@ -1936,6 +2055,20 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             }
             if drained {
                 service.status = SERVICE_INACTIVE.to_string();
+            }
+            // The rollout's own record ends where the rollout did. Guarded on an OPEN
+            // deployment, so a rollout the clock already finished is not re-finished when
+            // a later scale-out puts the service back through a steady state of the same
+            // deployment.
+            if let (Some(due), Some(arn)) = (settled, settled_deployment) {
+                if let Some(deployment) = self.service_deployments.get_mut(&arn) {
+                    if !deployment.is_finished() {
+                        deployment.status = SERVICE_DEPLOYMENT_SUCCESSFUL.to_string();
+                        deployment.status_reason =
+                            rollout_state_reason(&deployment.deployment_id, true);
+                        deployment.finished_at = Some(DateTime::from(due));
+                    }
+                }
             }
         }
     }
@@ -2014,6 +2147,137 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             service_name,
             &format!("{:019}", self.next_service_revision_seq),
         )
+    }
+
+    /// Mint the ARN of the SERVICE DEPLOYMENT that records one rollout. The counter is
+    /// what makes every deployment of every service distinct, and it is fixed-width, so
+    /// sorting two of these ARNs orders the deployments they name oldest first.
+    pub fn next_service_deployment_arn(
+        &mut self,
+        region: &str,
+        cluster_name: &str,
+        service_name: &str,
+    ) -> String {
+        self.next_service_deployment_seq += 1;
+        service_deployment_arn(
+            region,
+            cluster_name,
+            service_name,
+            &format!("{:019}", self.next_service_deployment_seq),
+        )
+    }
+
+    /// Record the SERVICE DEPLOYMENT of the rollout the CALLER just started for `key`,
+    /// and answer its ARN.
+    ///
+    /// Called by `CreateService` and by an `UpdateService` that starts a new deployment,
+    /// AFTER the service record carries the deployment id and the service revision that
+    /// rollout belongs to — those two are what the record is built from, so the
+    /// deployment a listing reports and the one the service reports cannot drift.
+    ///
+    /// Only the ECS scheduler's own rollout is a service deployment: the other deployment
+    /// controllers' tasks come from a task set ([`ServiceRecord::places_tasks`]), so there
+    /// is no rollout of a service revision to record and this answers `None`.
+    pub fn start_service_deployment(
+        &mut self,
+        key: &(String, String),
+        region: &str,
+        at: DateTime,
+    ) -> Option<String> {
+        let service = self.services.get(key)?;
+        if !service.places_tasks() {
+            return None;
+        }
+        let deployment_id = service.deployment_id.clone();
+        let service_arn = service.arn.clone();
+        let service_name = service.name.clone();
+        let cluster_name = service.cluster_name.clone();
+        let cluster_arn = service.cluster_arn.clone();
+        let target_service_revision_arn = service.service_revision_arn.clone();
+        // A rollout this one replaces never reaches the steady state it was rolling out:
+        // its tasks are the ones `scale_service` stops as superseded, so it ends here
+        // rather than staying open for a steady state that can no longer arrive.
+        self.finish_open_deployments(
+            &service_arn,
+            at,
+            SERVICE_DEPLOYMENT_STOPPED,
+            &format!("ECS deployment {deployment_id} replaced this deployment."),
+        );
+        let arn = self.next_service_deployment_arn(region, &cluster_name, &service_name);
+        self.service_deployments.insert(
+            arn.clone(),
+            ServiceDeploymentRecord {
+                arn: arn.clone(),
+                status_reason: rollout_state_reason(&deployment_id, false),
+                deployment_id,
+                service_arn: service_arn.clone(),
+                service_name,
+                cluster_name,
+                cluster_arn,
+                created_at: at,
+                finished_at: None,
+                target_service_revision_arn,
+                status: SERVICE_DEPLOYMENT_IN_PROGRESS.to_string(),
+            },
+        );
+        self.prune_service_deployments(&service_arn);
+        Some(arn)
+    }
+
+    /// End every rollout of `service_arn` that has not finished yet, at `at`.
+    ///
+    /// The two things that end one early are a deployment that REPLACES it and the DELETE
+    /// of the service it was rolling out; both are calls, so neither is a transition the
+    /// clock owes.
+    fn finish_open_deployments(
+        &mut self,
+        service_arn: &str,
+        at: DateTime,
+        status: &str,
+        reason: &str,
+    ) {
+        for deployment in self.service_deployments.values_mut() {
+            if deployment.service_arn == service_arn && !deployment.is_finished() {
+                deployment.status = status.to_string();
+                deployment.status_reason = reason.to_string();
+                deployment.finished_at = Some(at);
+            }
+        }
+    }
+
+    /// Drop the oldest of `service_arn`'s deployments down to
+    /// [`MAX_SERVICE_DEPLOYMENTS_PER_SERVICE`], the way a service's event stream keeps
+    /// only its latest entries.
+    fn prune_service_deployments(&mut self, service_arn: &str) {
+        let mut arns: Vec<String> = self
+            .service_deployments
+            .values()
+            .filter(|deployment| deployment.service_arn == service_arn)
+            .map(|deployment| deployment.arn.clone())
+            .collect();
+        if arns.len() <= MAX_SERVICE_DEPLOYMENTS_PER_SERVICE {
+            return;
+        }
+        // The ARN ends with a fixed-width monotonic id, so sorting orders them oldest
+        // first and the ones to drop are the leading entries.
+        arns.sort();
+        let first_kept = arns.len() - MAX_SERVICE_DEPLOYMENTS_PER_SERVICE;
+        for arn in &arns[..first_kept] {
+            self.service_deployments.remove(arn);
+        }
+    }
+
+    /// The stored SERVICE DEPLOYMENT of `service`'s current (`PRIMARY`) deployment, if
+    /// this service has one — `Service$currentServiceDeployment` names it, and the
+    /// rollout it records is the one the service's `Deployment` reports.
+    pub fn current_service_deployment(
+        &self,
+        service: &ServiceRecord,
+    ) -> Option<&ServiceDeploymentRecord> {
+        self.service_deployments.values().find(|deployment| {
+            deployment.service_arn == service.arn
+                && deployment.deployment_id == service.deployment_id
+        })
     }
 
     /// Mint the container records of ONE task of `definition`, each with its own ARN and
@@ -2204,11 +2468,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                 }
                 .to_string(),
             ),
-            rollout_state_reason: Some(if settled {
-                format!("ECS deployment {} completed.", service.deployment_id)
-            } else {
-                format!("ECS deployment {} in progress.", service.deployment_id)
-            }),
+            rollout_state_reason: Some(rollout_state_reason(&service.deployment_id, settled)),
             service_connect_configuration: service.service_connect_configuration.clone(),
             // A Service Connect resource is registered in Cloud Map, which this
             // emulator does not provision, so a deployment has none.
@@ -2260,11 +2520,13 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
                     .collect(),
             ),
             created_at: Some(service.created_at),
-            // The service DEPLOYMENT resource (`ListServiceDeployments` /
-            // `DescribeServiceDeployments`) is not part of this slice, so there is no
-            // deployment ARN to name; the service REVISION the current deployment rolls
-            // out is minted with it.
-            current_service_deployment: None,
+            // "The ARN of the service deployment" the service is on now: the record the
+            // call that started this rollout wrote, which is the same deployment the
+            // `deployments` list above reports and the one `ListServiceDeployments`
+            // answers with.
+            current_service_deployment: self
+                .current_service_deployment(service)
+                .map(|deployment| deployment.arn.clone()),
             current_service_revisions: if scheduler_owned {
                 Some(vec![ServiceCurrentRevisionSummary {
                     arn: Some(service.service_revision_arn.clone()),
@@ -2355,6 +2617,7 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             .collect();
         task_arns.sort();
         let name = service.name.clone();
+        let service_arn = service.arn.clone();
         for arn in &task_arns {
             self.stop_service_task(arn, now, &format!("Service {name} was deleted"));
         }
@@ -2371,6 +2634,15 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
         .to_string();
         // A deleted service has no rollout left to settle.
         service.deployment_steady_due_at = None;
+        // And the rollout that was still under way ends here with it, rather than being
+        // left open for a steady state the deleted service will never reach. The history
+        // itself is KEPT, exactly as the service record is.
+        self.finish_open_deployments(
+            &service_arn,
+            DateTime::from(now),
+            SERVICE_DEPLOYMENT_STOPPED,
+            &format!("Service {name} was deleted"),
+        );
     }
 
     /// Place or stop tasks so the service holds exactly the `desiredCount` tasks it
@@ -3621,6 +3893,35 @@ pub fn service_revision_arn(
     )
 }
 
+/// The ARN of a service deployment:
+/// `arn:aws:ecs:<region>:<account>:service-deployment/<cluster>/<service>/<id>`.
+pub fn service_deployment_arn(
+    region: &str,
+    cluster_name: &str,
+    service_name: &str,
+    deployment_id: &str,
+) -> String {
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("service-deployment/{cluster_name}/{service_name}/{deployment_id}"),
+    )
+}
+
+/// Why a rollout is in the state it is in, for the deployment that rolls it out.
+///
+/// `Deployment$rolloutStateReason` is "A description of the rollout state of a
+/// deployment"; the service deployment that records the SAME rollout reports it as its own
+/// `statusReason` ("Information about why the service deployment is in the current
+/// status"), so both read it from here and cannot drift.
+pub fn rollout_state_reason(deployment_id: &str, settled: bool) -> String {
+    if settled {
+        format!("ECS deployment {deployment_id} completed.")
+    } else {
+        format!("ECS deployment {deployment_id} in progress.")
+    }
+}
+
 /// The ARN of a service: `arn:aws:ecs:<region>:<account>:service/<cluster>/<name>`.
 pub fn service_arn(region: &str, cluster_name: &str, service_name: &str) -> String {
     ::engine::emulator_arn(
@@ -4146,6 +4447,13 @@ pub fn request_region(ctx: &smithy_server_runtime::OperationContext<'_>) -> Stri
 /// Now, as the wire timestamp type every modelled timestamp member uses.
 pub fn now() -> DateTime {
     DateTime::from(SystemTime::now())
+}
+
+/// A wire timestamp as a key that ORDERS and COMPARES: whole seconds and the nanoseconds
+/// within them. [`DateTime`] is not itself ordered, and comparing two of them through
+/// floating-point seconds would make two instants a few nanoseconds apart compare equal.
+pub fn timestamp_key(at: DateTime) -> (i64, u32) {
+    (at.secs(), at.subsec_nanos())
 }
 
 /// The `TargetType` a target group must carry to receive the tasks of a revision whose

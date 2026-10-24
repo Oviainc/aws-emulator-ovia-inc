@@ -189,13 +189,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refused a malformed one with a 400 `ValidationException` before this body runs.
         let region = crate::state::request_region(ctx);
         let page_size = crate::state::page_size(input.max_results);
-        let resume_from = match input.next_token.as_deref() {
-            Some(token) => Some(
-                crate::state::decode_page_token(token, crate::state::BENEFIT_ID_PREFIX)
-                    .ok_or_else(invalid_next_token)?,
-            ),
-            None => None,
-        };
 
         let store = state.lock();
         let Some(catalog) = store.catalogs.get(&input.catalog) else {
@@ -209,6 +202,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // A `NextToken` only resumes this listing when it is a cursor this service issued
+        // for THIS catalog's benefits and the benefit it names is still stored — see
+        // [`crate::state::resume_from`]; anything else is a client-fabricated or stale
+        // cursor, which is a validation failure rather than a position in the collection.
+        let resume_from = crate::state::resume_from(
+            input.next_token.as_deref(),
+            crate::state::BENEFIT_ID_PREFIX,
+            &input.catalog,
+            &catalog.benefits,
+        )
+        .map_err(|_| invalid_next_token())?;
 
         // The benefits are keyed by id in a `BTreeMap`, so this walk is in one stable
         // order and the token is simply the id to resume at — the range starts directly
@@ -234,7 +239,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let next_token = page
             .get(page_size)
-            .map(|benefit| crate::state::encode_page_token(&benefit.id));
+            .map(|benefit| crate::state::encode_page_token(&input.catalog, &benefit.id));
         page.truncate(page_size);
 
         Ok(ListBenefitsOutput {

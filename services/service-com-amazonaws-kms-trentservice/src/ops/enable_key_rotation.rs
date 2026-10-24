@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op EnableKeyRotation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `EnableKeyRotation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`EnableKeyRotation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -220,18 +211,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `EnableKeyRotation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(EnableKeyRotationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(EnableKeyRotationErrorModeled::KMSInternalException(
+                KMSInternalException {
+                    message: Some("the KMS state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx);
+        let mut state = state.lock();
+        let key = match state.resolve_mut(&region, &input.key_id) {
+            crate::state::KeyRefMut::Found(key) => key,
+            crate::state::KeyRefMut::MalformedArn => {
+                return Err(EnableKeyRotationErrorModeled::InvalidArnException(
+                    InvalidArnException {
+                        message: Some(crate::state::invalid_arn_message(&input.key_id)),
+                    },
+                )
+                .into());
+            }
+            crate::state::KeyRefMut::NotFound => {
+                return Err(EnableKeyRotationErrorModeled::NotFoundException(
+                    NotFoundException {
+                        message: Some(crate::state::key_not_found_message(&region, &input.key_id)),
+                    },
+                )
+                .into());
+            }
+        };
+
+        // Every gate below is shared with `DisableKeyRotation`, which configures the
+        // same schedule from the other end: the two operations accept exactly the set
+        // of keys whose automatic rotation is configurable, so a key one of them
+        // refuses the other refuses the same way.
+        crate::state::check_rotation_configurable(key).map_err(refuse)?;
+
+        // "KMS rotates the key material of the KMS key one year (approximately 365
+        // days) from the enable date and every year thereafter. You can use the
+        // optional RotationPeriodInDays parameter to specify a custom rotation period
+        // ... or ... to modify the rotation period of a key that you previously
+        // enabled automatic key rotation on": the schedule is the period plus the
+        // instant this call configured it, and the next rotation date a reader
+        // reports is derived from the two rather than echoed from the request.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("EnableKeyRotation"))
+        // The period itself is already within its modelled 90..2560 bound by the time
+        // this handler runs, so there is nothing further to validate here.
+        key.schedule_rotation(input.rotation_period_in_days);
+
+        Ok(EnableKeyRotationOutput)
     }
+}
+
+/// Lift the shared refusal of a key whose automatic rotation cannot be configured
+/// into this operation's modelled error channel. Which error reports which refusal
+/// is the same for `EnableKeyRotation` and `DisableKeyRotation`, because the two
+/// model the same set.
+fn refuse(refusal: crate::state::RotationConfigRefusal) -> EnableKeyRotationError {
+    match refusal {
+        crate::state::RotationConfigRefusal::Unsupported => {
+            EnableKeyRotationErrorModeled::UnsupportedOperationException(
+                UnsupportedOperationException {
+                    message: crate::state::unsupported_rotation_message(),
+                },
+            )
+        }
+        crate::state::RotationConfigRefusal::Disabled(message) => {
+            EnableKeyRotationErrorModeled::DisabledException(DisabledException {
+                message: Some(message),
+            })
+        }
+        crate::state::RotationConfigRefusal::InvalidState(message) => {
+            EnableKeyRotationErrorModeled::KMSInvalidStateException(KMSInvalidStateException {
+                message: Some(message),
+            })
+        }
+    }
+    .into()
 }

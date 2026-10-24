@@ -66,7 +66,19 @@
 //! request's own lists, and [`validation`] turns them into the sentence. `override_refusal`
 //! words a refusal that reaches the centralized walk anyway through that same module, so
 //! the wording lives in ONE place.
+//!
+//! ## This service's other edited seam: the endpoint a gateway publishes
+//!
+//! A gateway's `gatewayUrl` is a host of its OWN
+//! (`<gatewayId>.gateway.bedrock-agentcore.<region>.amazonaws.com`), not this service's
+//! control-plane endpoint, and what a client drives on it is the Model Context Protocol
+//! rather than a modelled operation. `can_handle` therefore also claims that host — no
+//! routing key can name it, so without the claim the router answers `404 UnknownService`
+//! for a URL this service handed out — and `override_operation` names [`mcp`]'s surface
+//! for it, so the emulator verifies the credential the request carries before anything is
+//! served. [`mcp`] documents what answers there.
 
+pub mod mcp;
 mod validation;
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
@@ -96,6 +108,12 @@ const ENDPOINT_PREFIX: &str = "bedrock-agentcore-control";
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// Serves the MCP wire surface a gateway publishes — the endpoint `CreateGateway`
+    /// hands back in `gatewayUrl`. Held on the service because
+    /// [`Service::override_operation`] hands the router a BORROW of one of its own
+    /// operations, and it owns the shared engine so every answer is computed from the
+    /// same store the control-plane handlers write.
+    gateway_mcp: mcp::GatewayMcpSurface<Eng>,
     /// The same modelled operations the generated table holds, each wrapped in
     /// [`StatedPerOperation`] so a refused request is worded the way the backend serving
     /// that operation words it. Keyed by the routing key the protocol resolves — the key
@@ -313,6 +331,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             update_workload_identity::UpdateWorkloadIdentity,
         );
         Self {
+            gateway_mcp: mcp::GatewayMcpSurface::new(Arc::clone(&engine)),
             entry: crate::ServiceDefinition::new(engine),
             stated,
         }
@@ -438,11 +457,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // route for, by the one rule `service-common` states for every service under a
         // shared signing name. The two models bind no identical method + URI pattern, so
         // exactly one of them claims every AgentCore request.
-        service_common::claims_modeled_route(
+        if service_common::claims_modeled_route(
             parts,
             &[self.entry.identity().signing_name(), ENDPOINT_PREFIX],
             self.definition(),
-        )
+        ) {
+            return true;
+        }
+        // And a request addressed to a GATEWAY endpoint host — the host this service
+        // PUBLISHES in every gateway's `gatewayUrl`, whose first label is the gateway's
+        // own id and which no route key can therefore name. See [`mcp`]: without this the
+        // router answers `404 UnknownService` for a URL this service handed out.
+        mcp::addresses_gateway_endpoint_parts(parts)
     }
 
     fn override_operation(
@@ -455,6 +481,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // in the words the backend serving THAT operation uses. A key the model does not
         // name resolves to `None` here exactly as it does in the generated table, so the
         // router's routing-error path is unchanged.
+        //
+        // Ahead of that: a request to a published gateway endpoint host is named as an
+        // operation, so the router verifies the credential it carries before anything is
+        // served — the router authenticates only what it names an operation for. Nothing
+        // in the generated table can name it, because the MCP wire carries no
+        // `X-Amz-Target` and this service's model binds no route for its path.
+        if mcp::addresses_gateway_endpoint(req) {
+            return Some(&self.gateway_mcp);
+        }
         let key = self.entry.protocol().routing_key(req).ok()?;
         self.stated.get(key)
     }
