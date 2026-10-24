@@ -123,6 +123,33 @@ pub const MAX_PACKAGING_CONFIGURATIONS_PER_GROUP: usize = 100;
 /// [`MAX_PACKAGING_GROUPS`].
 pub const MAX_ASSETS: usize = 10_000;
 
+/// The most tags one resource may carry, from AWS's universal resource-tagging
+/// restrictions ("Maximum number of tags per resource - 50").
+///
+/// NOT a modelled constraint: `Tags` is a plain `map<__string,__string>` on every
+/// request that carries one
+/// (`smithy_query(query="shape",shape="CreatePackagingGroupRequest",model_path="services/service-com-amazonaws-mediapackagevod-mediapackagevod/smithy-model/com-amazonaws-mediapackagevod-mediapackagevod.json")`),
+/// so the boundary validator admits any map at all and the SERVICE decides this.
+pub const MAX_TAGS: usize = 50;
+
+/// The longest tag key AWS accepts, from the same restrictions ("Maximum key length
+/// - 128 Unicode characters in UTF-8"), counted in characters rather than bytes.
+pub const MAX_TAG_KEY_CHARS: usize = 128;
+
+/// The longest tag value AWS accepts, from the same restrictions ("Maximum value
+/// length - 256 Unicode characters in UTF-8").
+pub const MAX_TAG_VALUE_CHARS: usize = 256;
+
+/// The tag-key prefix AWS reserves for its own tags: "Do not use `aws:` ... as a
+/// prefix for keys, as it is reserved for AWS use. You cannot edit or delete tag keys
+/// with this prefix." A caller may therefore neither name such a key on a create, nor
+/// remove one.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// How many characters of a refused tag key the refusal quotes, so a message is bounded
+/// by this service rather than by the length of the key the caller sent.
+const TAG_KEY_LABEL_CHARS: usize = 32;
+
 /// Length of the checksum prefix a pagination cursor carries, so a cursor this
 /// service did not issue is detectable rather than merely malformed.
 const PAGE_TOKEN_CHECK_LEN: usize = 8;
@@ -407,6 +434,10 @@ impl ComAmazonawsMediapackagevodMediapackagevodState {
 
     /// Replace the tags stored for `arn`. An absent `Tags` member and an empty map
     /// are the same request: the resource carries no tags.
+    ///
+    /// Stores what it is given: the caller-supplied map is judged against AWS's
+    /// tagging restrictions by [`check_tags`] before a handler reaches this, so a map
+    /// that breaks them never gets here.
     pub fn set_tags(&mut self, arn: &str, tags: Option<&HashMap<String, String>>) {
         let stored: BTreeMap<String, String> = tags
             .into_iter()
@@ -920,6 +951,119 @@ pub fn check_arn_members(
         .filter(|(_, value, requirement)| !requirement.admits(value))
         .map(|(member, _, requirement)| ((*member).to_string(), requirement.phrase()))
         .collect();
+    match crate::scaffolded::UnprocessableEntity::members(violations) {
+        Some(refusal) => Err(refusal),
+        None => Ok(()),
+    }
+}
+
+/// A tag key as a refusal quotes it: quoted, and clipped to [`TAG_KEY_LABEL_CHARS`]
+/// characters so the refusal names the key the caller sent without echoing a key of
+/// any length back at them.
+fn tag_key_label(key: &str) -> String {
+    let clipped: String = key.chars().take(TAG_KEY_LABEL_CHARS).collect();
+    if clipped.chars().count() < key.chars().count() {
+        format!("{clipped:?}…")
+    } else {
+        format!("{clipped:?}")
+    }
+}
+
+/// Every way the tag key `key` breaks AWS's tagging restrictions, as the phrases a
+/// refusal attributes to the member the key arrived on.
+///
+/// Only the rules that hold for a key WHATEVER the caller does with it: its length, and
+/// the reserved [`RESERVED_TAG_KEY_PREFIX`] AWS owns — which is why the same check
+/// covers naming a key on a create and naming one to remove.
+fn tag_key_violations(key: &str) -> Vec<String> {
+    let mut phrases = Vec::new();
+    let length = key.chars().count();
+    if length > MAX_TAG_KEY_CHARS {
+        phrases.push(format!(
+            "key {} must be at most {MAX_TAG_KEY_CHARS} characters, not {length}",
+            tag_key_label(key)
+        ));
+    }
+    if key.starts_with(RESERVED_TAG_KEY_PREFIX) {
+        phrases.push(format!(
+            "key {} must not use the reserved `{RESERVED_TAG_KEY_PREFIX}` prefix, which \
+             only Amazon Web Services may set",
+            tag_key_label(key)
+        ));
+    }
+    phrases
+}
+
+/// Refuse a list of tag keys a caller may not name — the `TagKeys` of `UntagResource`.
+///
+/// A reserved key is refused on NAMING it, not on writing it: a caller may no more
+/// DELETE an `aws:` tag than create one, so the removal is refused rather than reported
+/// as done. A well-formed key the resource does not carry is NOT refused here —
+/// removing it is simply idempotent.
+pub fn check_tag_keys(
+    member: &str,
+    keys: &[String],
+) -> Result<(), crate::scaffolded::UnprocessableEntity> {
+    let violations: Vec<(String, String)> = keys
+        .iter()
+        .flat_map(|key| {
+            tag_key_violations(key)
+                .into_iter()
+                .map(|phrase| (member.to_string(), phrase))
+        })
+        .collect();
+    match crate::scaffolded::UnprocessableEntity::members(violations) {
+        Some(refusal) => Err(refusal),
+        None => Ok(()),
+    }
+}
+
+/// Refuse a caller-supplied `Tags` map that breaks AWS's universal resource-tagging
+/// restrictions: more than [`MAX_TAGS`] entries, a key longer than
+/// [`MAX_TAG_KEY_CHARS`], a value longer than [`MAX_TAG_VALUE_CHARS`], or a key
+/// carrying the reserved [`RESERVED_TAG_KEY_PREFIX`].
+///
+/// This is the ONE place the rules are decided, so every operation that accepts a tag
+/// map judges one the same way, and it is called BEFORE anything is stored — a refused
+/// request creates no resource and leaves no tag behind. An absent map carries no tag
+/// and so violates nothing. Entries are judged in key order, so the refusal does not
+/// depend on how the request's map happened to be hashed.
+pub fn check_tags(
+    tags: Option<&HashMap<String, String>>,
+) -> Result<(), crate::scaffolded::UnprocessableEntity> {
+    const MEMBER: &str = "tags";
+    let Some(tags) = tags else { return Ok(()) };
+    if tags.len() > MAX_TAGS {
+        return Err(crate::scaffolded::UnprocessableEntity::member(
+            MEMBER,
+            format!(
+                "must carry at most {MAX_TAGS} tags, not {}",
+                tags.len()
+            ),
+        ));
+    }
+    let mut entries: Vec<(&str, &str)> = tags
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    entries.sort_unstable();
+    let mut violations: Vec<(String, String)> = Vec::new();
+    for (key, value) in entries {
+        for phrase in tag_key_violations(key) {
+            violations.push((MEMBER.to_string(), phrase));
+        }
+        let length = value.chars().count();
+        if length > MAX_TAG_VALUE_CHARS {
+            violations.push((
+                MEMBER.to_string(),
+                format!(
+                    "the value of key {} must be at most {MAX_TAG_VALUE_CHARS} characters, \
+                     not {length}",
+                    tag_key_label(key)
+                ),
+            ));
+        }
+    }
     match crate::scaffolded::UnprocessableEntity::members(violations) {
         Some(refusal) => Err(refusal),
         None => Ok(()),
