@@ -4,6 +4,8 @@
 //! Comprehend Medical (start, describe, list, stop), plus the refusals this service
 //! words itself and the 501 the synchronous `DetectEntitiesV2` inference still answers.
 //!
+//! `InferICD10CM` is implemented and has its own suite (`tests/all/icd10_cm_inference.rs`).
+//!
 //! Every request goes over the wire the service actually speaks (awsJson1_1, `POST /`
 //! with `X-Amz-Target: ComprehendMedical_20181030.<Operation>`) through the same
 //! `MultiServiceRouter` the emulator's front doors use, so these tests exercise
@@ -105,14 +107,15 @@ async fn describe_job(router: &MultiServiceRouter, job_id: &str) -> Value {
     answer["ComprehendMedicalAsyncJobProperties"].clone()
 }
 
-/// The synchronous detection calls are machine-learning inference over clinical text,
-/// which this emulator performs with no model, so each one answers the scaffold's 501
-/// `NotImplemented` — never an empty or synthesised 200 a client could not tell from a
-/// real detection.
+/// The synchronous detection calls that are machine-learning inference over clinical
+/// text with no ontology to link against are performed by nothing in this emulator, so
+/// each one answers the scaffold's 501 `NotImplemented` — never an empty or synthesised
+/// 200 a client could not tell from a real detection.
 ///
-/// The rows span the whole family of text-inference operations and both ends of the
-/// accepted text length, so an operation that starts answering 200 without a real
-/// inference component behind it fails here.
+/// The rows span the text-inference operations that are still scaffolds and both ends of
+/// the accepted text length, so an operation that starts answering 200 without a real
+/// inference component behind it fails here. `InferICD10CM` is implemented and is
+/// asserted in its own suite.
 #[tokio::test]
 async fn the_text_inference_operations_answer_not_implemented() {
     let router = router();
@@ -124,7 +127,6 @@ async fn the_text_inference_operations_answer_not_implemented() {
         ("DetectEntitiesV2", json!({"Text": "a"})),
         ("DetectEntities", json!({"Text": "Reports fever."})),
         ("DetectPHI", json!({"Text": "John Doe, 44, reports fever."})),
-        ("InferICD10CM", json!({"Text": "Reports fever."})),
         ("InferRxNorm", json!({"Text": "Takes 50 mg of ibuprofen."})),
         ("InferSNOMEDCT", json!({"Text": "A chest x-ray was ordered."})),
     ];
