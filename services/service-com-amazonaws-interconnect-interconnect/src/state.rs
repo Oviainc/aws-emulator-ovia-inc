@@ -429,6 +429,52 @@ pub fn connection_absent_message(identifier: &str) -> String {
     format!("{REFUSAL_ENVELOPE}Connection does not exist for {identifier}")
 }
 
+/// The resource-type segment every `AmazonResourceName` of this service carries:
+/// the model's pattern is `^arn:aws[a-z-]*:interconnect:[^:]+:[0-9]{12}:connection/…$`,
+/// so a connection is the only resource kind an ARN here can name (which is what the
+/// tagging operations mean by "currently this supports Connection resources").
+pub const ARN_RESOURCE_TYPE: &str = "connection";
+
+/// How many digits an ARN's account-id field has (`[0-9]{12}` in that pattern).
+const ARN_ACCOUNT_ID_DIGITS: usize = 12;
+
+/// The `ConnectionId` an `AmazonResourceName` names, for the operations that
+/// identify a connection by its ARN (`TagResource`, `UntagResource`,
+/// `ListTagsForResource`) rather than by its id.
+///
+/// Parsed from the ARN's six colon-separated fields — `arn`, a partition the
+/// pattern writes `aws[a-z-]*`, this service's [`ARN_NAMESPACE`], a region, a
+/// twelve-digit account and `connection/<id>` — so anything that is not an
+/// Interconnect connection ARN resolves to `None` rather than to some other
+/// service's resource. The id itself is NOT re-checked against
+/// `^(mcc|lmcc)-[a-z0-9]{8}$` here: an id outside it simply matches no stored
+/// connection.
+pub fn connection_id_from_arn(arn: &str) -> Option<&str> {
+    let (qualifier, id) = arn.rsplit_once('/')?;
+    let mut fields = qualifier.split(':');
+    let well_formed = fields.next() == Some("arn")
+        && fields.next().is_some_and(|partition| {
+            partition.starts_with("aws")
+                && partition[3..]
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c == '-')
+        })
+        && fields.next() == Some(ARN_NAMESPACE)
+        && fields.next().is_some_and(|region| !region.is_empty())
+        && fields.next().is_some_and(|account| {
+            account.len() == ARN_ACCOUNT_ID_DIGITS && account.chars().all(|c| c.is_ascii_digit())
+        })
+        && fields.next() == Some(ARN_RESOURCE_TYPE)
+        && fields.next().is_none();
+    well_formed.then_some(id).filter(|id| !id.is_empty())
+}
+
+/// How the service words an `arn` that is not an Interconnect connection ARN at
+/// all, which is a fault in the request rather than a missing resource.
+pub fn not_a_connection_arn_message(arn: &str) -> String {
+    format!("{REFUSAL_ENVELOPE}{arn} is not the ARN of an Interconnect {ARN_RESOURCE_TYPE}")
+}
+
 /// The `ConnectionState` values an `UpdateConnection` is permitted FROM.
 ///
 /// The service states the rule in its own refusal ("only connections in 'requested'
