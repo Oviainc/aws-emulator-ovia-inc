@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListInvalidationsForDistributionTenant
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListInvalidationsForDistributionTenant`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListInvalidationsForDistributionTenant::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the invalidations persisted under ONE distribution tenant, one page at a
+//! time: the page is cut at `MaxItems` (bounded by this emulator's own ceiling), the order
+//! is the documented one — most recent first — and `Marker` names the invalidation the
+//! previous page ended at, so walking the pages enumerates every invalidation of that
+//! tenant exactly once. A tenant's invalidations are addressed under the tenant, so this
+//! list serves the records held on that tenant and reaches no other tenant's.
+//!
+//! A reporting operation: it reads the stored records and writes nothing but the batch
+//! completion the clock already owes (`settle`).
 //!
 //! ## Shape of an operation
 //!
@@ -77,6 +78,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::time::SystemTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -148,18 +151,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListInvalidationsForDistributionTenant` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListInvalidationsForDistributionTenantErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+
+        // "MaxItems: the maximum number of invalidations to return for the distribution
+        // tenant" — a page holds at least one item, so a non-positive size names no page
+        // at all, and the size served is bounded above by this emulator's own page
+        // ceiling. The refusal is the one sentence this service states the constraint in,
+        // wherever the unusable value was read.
+        let max_items = input.max_items.unwrap_or(crate::state::MAX_ITEMS);
+        let Some(page_size) = crate::state::page_size(input.max_items) else {
+            return Err(
+                ListInvalidationsForDistributionTenantErrorModeled::InvalidArgument(
+                    crate::state::invalid_max_items(),
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+        // Materialise the batch completions the clock already owes, so every summary
+        // reports the status its invalidation has at this instant.
+        store.settle(SystemTime::now());
+
+        let Some(tenant) = store.distribution_tenant(&input.id) else {
+            return Err(
+                ListInvalidationsForDistributionTenantErrorModeled::EntityNotFound(
+                    crate::state::distribution_tenant_not_found(&input.id),
+                )
+                .into(),
+            );
+        };
+
+        // The page contract — the documented order, the cut at `MaxItems`, the marker that
+        // resumes after the invalidation it names, `NextMarker`/`IsTruncated`/`Quantity` —
+        // is the one every invalidation listing serves, so it is read from the stored
+        // records by `crate::state::invalidation_page`.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListInvalidationsForDistributionTenant"))
+        // A `Marker` is a resume point this service handed out: the id of one of THIS
+        // tenant's invalidations, after which the page starts. A value naming none of them
+        // was never such a resume point, and resuming at no position at all would silently
+        // serve the first page again.
+        let Some(invalidation_list) = crate::state::invalidation_page(
+            &tenant.invalidations,
+            input.marker.as_deref(),
+            max_items,
+            page_size,
+        ) else {
+            return Err(
+                ListInvalidationsForDistributionTenantErrorModeled::InvalidArgument(
+                    InvalidArgument {
+                        message: Some(format!(
+                            "Marker {} is not the id of an invalidation of distribution \
+                             tenant {}",
+                            input.marker.unwrap_or_default(),
+                            input.id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(ListInvalidationsForDistributionTenantOutput {
+            invalidation_list: Some(invalidation_list),
+        })
     }
 }

@@ -12,7 +12,8 @@
 //! each catalog, CONNECTION definitions (`CreateConnection` / `GetConnection`). A job is
 //! named per account ("The name you assign to this job definition. It must be unique in
 //! your account" — `CreateJobRequest$Name`) and a connection per catalog, which is where
-//! each lives here.
+//! each lives here. A job definition also holds the RUNS `StartJobRun` started of it
+//! ([`JobRunEntry`]), because every operation that addresses a run names its job too.
 //!
 //! Crawlers sit BESIDE that tree too, in one per-account namespace keyed by crawler name:
 //! every operation that addresses a crawler does so by name alone, so a crawler's
@@ -27,16 +28,16 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     CodeGenConfigurationNode, Column, Connection, ConnectionInput, ConnectionsList, Crawler,
     CrawlerTargets, CreateCrawlerInput, CreateJobInput, DataLakePrincipal, Database,
     DatabaseIdentifier, DatabaseInput, ErrorDetail, ExecutionProperty, FederatedDatabase,
-    FederatedTable, Job, JobCommand, LakeFormationConfiguration, LineageConfiguration,
+    FederatedTable, Job, JobCommand, JobRun, LakeFormationConfiguration, LineageConfiguration,
     NotificationProperty, PrincipalPermissions, RLSProperties, RecrawlPolicy, Schedule,
-    SchemaChangePolicy, SourceControlDetails, StorageDescriptor, Table, TableIdentifier,
-    TableInput,
+    SchemaChangePolicy, SourceControlDetails, StartJobRunInput, StorageDescriptor, Table,
+    TableIdentifier, TableInput,
 };
 
 /// Ceiling on the databases one catalog may hold.
@@ -862,11 +863,11 @@ pub fn default_timeout_minutes(glue_version: &str) -> i32 {
     }
 }
 
-/// A stored job definition.
+/// A stored job definition, plus the runs `StartJobRun` has started of it.
 ///
 /// Every member of the modelled `Job` shape a create can fill is held here, so a later
-/// `GetJob` reports what the create stored and nothing else. The members only a RUN
-/// produces are not part of this shape at all, and `ProfileName` is not a
+/// `GetJob` reports what the create stored and nothing else — the members only a RUN
+/// produces live on [`JobRunEntry`], in [`JobEntry::runs`], and `ProfileName` is not a
 /// `CreateJob` member, so a created job carries none.
 #[derive(Debug, Clone)]
 pub struct JobEntry {
@@ -911,6 +912,12 @@ pub struct JobEntry {
     /// The request's `Tags`, which are not part of the `Job` shape — they are read back
     /// through the tagging operations.
     pub tags: HashMap<String, String>,
+    /// The runs of this job definition, oldest first, as `StartJobRun` appended them.
+    ///
+    /// They live on the job rather than in a store-wide map because every operation that
+    /// addresses a run names its job as well (`GetJobRun`/`GetJobRuns`/`BatchStopJobRun`
+    /// all take `JobName`), so a run is reclaimed with the definition it belongs to.
+    pub runs: Vec<JobRunEntry>,
 }
 
 impl JobEntry {
@@ -963,6 +970,51 @@ impl JobEntry {
             created_on: now,
             last_modified_on: now,
             tags: input.tags.clone().unwrap_or_default(),
+            // A job definition has no runs until `StartJobRun` starts one.
+            runs: Vec::new(),
+        }
+    }
+
+    /// The maximum number of this job's runs that may be in flight at once:
+    /// `ExecutionProperty$MaxConcurrentRuns`, held at the documented minimum of one
+    /// ([`DEFAULT_MAX_CONCURRENT_RUNS`]) so a stored zero cannot make the job unrunnable.
+    pub fn max_concurrent_runs(&self) -> i32 {
+        self.execution_property
+            .max_concurrent_runs
+            .max(DEFAULT_MAX_CONCURRENT_RUNS)
+    }
+
+    /// Give every run of this job the state the CLOCK already owed it at `now`.
+    ///
+    /// This is the one write a reporting operation performs: a run's next state was due
+    /// at [`JobRunEntry::settles_at`] whether or not anybody called, so materialising it
+    /// on read reports the state the clock had already reached. It never moves a run
+    /// because something was read.
+    pub fn settle_due_runs(&mut self, now: SystemTime) {
+        for run in &mut self.runs {
+            run.settle_if_due(now);
+        }
+    }
+
+    /// The stored run with this `Id`, or `None` when this job has no such run.
+    pub fn run(&self, run_id: &str) -> Option<&JobRunEntry> {
+        self.runs.iter().find(|run| run.id == run_id)
+    }
+
+    /// How many of this job's runs have not finished.
+    ///
+    /// Call [`JobEntry::settle_due_runs`] first, or a run the clock has already finished
+    /// still counts as in flight.
+    pub fn runs_in_flight(&self) -> usize {
+        self.runs.iter().filter(|run| !run.is_terminal()).count()
+    }
+
+    /// Append a run, keeping at most [`MAX_RUNS_PER_JOB`] of them.
+    pub fn record_run(&mut self, run: JobRunEntry) {
+        self.runs.push(run);
+        if self.runs.len() > MAX_RUNS_PER_JOB {
+            let overflow = self.runs.len() - MAX_RUNS_PER_JOB;
+            self.runs.drain(..overflow);
         }
     }
 
@@ -1005,22 +1057,360 @@ impl JobEntry {
     }
 }
 
-/// The capacity, in DPUs, a `CreateJob` request asks for: `MaxCapacity` when it names
-/// one, else the deprecated `AllocatedCapacity` ("This parameter is deprecated. Use
-/// MaxCapacity instead", so the two are one quantity), else what the worker
-/// configuration maps to — `NumberOfWorkers` workers of `WorkerType`, at the DPUs per
-/// worker [`dpu_per_worker`] quotes from the model. `None` when the request names no
-/// capacity and no worker configuration the model gives a DPU figure for.
+/// The capacity, in DPUs, a `CreateJob` request asks for: see [`capacity_from`].
 fn capacity_of(input: &CreateJobInput) -> Option<f64> {
-    if let Some(max_capacity) = input.max_capacity {
+    capacity_from(
+        input.max_capacity,
+        input.allocated_capacity,
+        input.worker_type.as_deref(),
+        input.number_of_workers,
+    )
+}
+
+/// The capacity, in DPUs, a request asks for: `MaxCapacity` when it names one, else the
+/// deprecated `AllocatedCapacity` ("This parameter is deprecated. Use MaxCapacity
+/// instead", so the two are one quantity), else what the worker configuration maps to —
+/// `NumberOfWorkers` workers of `WorkerType`, at the DPUs per worker [`dpu_per_worker`]
+/// quotes from the model. `None` when nothing names a capacity and no worker
+/// configuration the model gives a DPU figure for is named.
+///
+/// `CreateJob` and `StartJobRun` carry the same four members and the same documentation
+/// for each, so both resolve capacity here.
+fn capacity_from(
+    max_capacity: Option<f64>,
+    allocated_capacity: i32,
+    worker_type: Option<&str>,
+    number_of_workers: Option<i32>,
+) -> Option<f64> {
+    if let Some(max_capacity) = max_capacity {
         return Some(max_capacity);
     }
-    if input.allocated_capacity > 0 {
-        return Some(f64::from(input.allocated_capacity));
+    if allocated_capacity > 0 {
+        return Some(f64::from(allocated_capacity));
     }
-    let workers = input.number_of_workers.filter(|count| *count > 0)?;
-    let per_worker = dpu_per_worker(input.worker_type.as_deref()?)?;
+    let workers = number_of_workers.filter(|count| *count > 0)?;
+    let per_worker = dpu_per_worker(worker_type?)?;
     Some(per_worker * f64::from(workers))
+}
+
+/// The `JobRunState` a run is in the instant `StartJobRun` returns, and the one the
+/// clock then owes it. Both are values of the modelled `JobRunState` enum (`STARTING`,
+/// `RUNNING`, `STOPPING`, `STOPPED`, `SUCCEEDED`, `FAILED`, `TIMEOUT`, `ERROR`,
+/// `WAITING`, `EXPIRED`).
+pub const JOB_RUN_STATE_STARTING: &str = "STARTING";
+/// See [`JOB_RUN_STATE_STARTING`].
+pub const JOB_RUN_STATE_FAILED: &str = "FAILED";
+
+/// The `JobRunState` values a run never moves out of again: of the modelled enum quoted
+/// on [`JOB_RUN_STATE_STARTING`], the ones that name a finished run. The other four
+/// (`STARTING`, `RUNNING`, `STOPPING`, `WAITING`) each still owe a further state.
+pub const TERMINAL_JOB_RUN_STATES: [&str; 6] = [
+    "STOPPED",
+    "SUCCEEDED",
+    "FAILED",
+    "TIMEOUT",
+    "ERROR",
+    "EXPIRED",
+];
+
+/// How long a run stays in [`JOB_RUN_STATE_STARTING`] before the clock owes it its
+/// terminal state.
+///
+/// CHOSEN, not documented: Glue publishes no duration for starting a job run, so this is
+/// the emulator's own span — deliberately not zero, so a caller that polls `GetJobRun`
+/// straight after `StartJobRun` still observes the run in flight, and the concurrency
+/// limit that goes with it. The due instant is stored on the run and materialised by
+/// whichever later call reads it; nothing sleeps.
+pub const JOB_RUN_SETTLES_AFTER: Duration = Duration::from_millis(500);
+
+/// `JobRun$ErrorMessage` for the terminal state the clock owes every run.
+///
+/// This emulator is the Glue control plane: it records a run faithfully, but it runs no
+/// job script, so a run can never reach `SUCCEEDED` — it ends in the modelled failure
+/// state carrying a reason that says exactly that, rather than reporting a result nothing
+/// computed.
+pub const JOB_RUN_NOT_EXECUTED_MESSAGE: &str =
+    "This emulator records job runs but executes no job script, so the job run ended \
+     without running.";
+
+/// `JobRun$Attempt` of a run that is not a retry of an earlier one: "The number of the
+/// attempt to run this job", which for a first attempt is the model's own default of 0.
+pub const FIRST_JOB_RUN_ATTEMPT: i32 = 0;
+
+/// The prefix a Glue job run id carries, which is what makes an `IdString` recognisable
+/// as a job run id rather than any other id the service mints.
+pub const JOB_RUN_ID_PREFIX: &str = "jr_";
+
+/// How many runs one job definition keeps.
+///
+/// CHOSEN: Glue publishes no retention for job-run records, so this is the emulator's own
+/// window. It bounds [`JobEntry::runs`], and with it every per-job walk, so a job that
+/// has been started many times still costs a bounded amount of work and memory. The
+/// OLDEST record is dropped first, so the runs a caller is most likely to read are kept.
+pub const MAX_RUNS_PER_JOB: usize = 100;
+
+/// How many job run ids this process has minted. A nonce source for
+/// [`new_job_run_id`], exactly as [`MINTED_DATABASE_IDS`] is for a database id.
+static MINTED_JOB_RUN_IDS: AtomicU64 = AtomicU64::new(0);
+
+/// A fresh `JobRunId`: the id the service assigns a job run when it starts.
+///
+/// [`JOB_RUN_ID_PREFIX`] followed by 64 lowercase hexadecimal characters, i.e. 256 bits,
+/// which is the shape a Glue job run id has on the wire and is inside `IdString`'s
+/// `length 1..255`. The bits are minted the way [`new_database_id`] mints a database id,
+/// so two runs started in the same nanosecond cannot be given the same id. It is stored
+/// on the run, so every later read of that run reports the same id.
+///
+/// This names a RESOURCE, not a credential: a credential would come from the credential
+/// store, never from here.
+pub fn new_job_run_id() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::BuildHasher;
+
+    let sequence = MINTED_JOB_RUN_IDS.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_nanos());
+    let words = [
+        RandomState::new().hash_one((sequence, nanos)),
+        RandomState::new().hash_one((nanos, sequence)),
+        RandomState::new().hash_one((sequence, sequence, nanos)),
+        RandomState::new().hash_one((nanos, nanos, sequence)),
+    ];
+    let mut id = String::from(JOB_RUN_ID_PREFIX);
+    for word in words {
+        id.push_str(&format!("{word:016x}"));
+    }
+    id
+}
+
+/// One run of a job definition, as `StartJobRun` recorded it.
+///
+/// A run carries the job's own configuration with the members the `StartJobRun` request
+/// overrode applied on top — "This value overrides the timeout value set in the parent
+/// job" (`StartJobRun$Timeout`) is the rule for each of them — plus the members only a
+/// run has: its id, its attempt, its state and the instants it moved between them.
+#[derive(Debug, Clone)]
+pub struct JobRunEntry {
+    /// `JobRun$Id`, minted by [`new_job_run_id`].
+    pub id: String,
+    /// The name of the job definition this is a run of.
+    pub job_name: String,
+    /// `JobRun$Attempt`; one past the retried run's attempt when this run retries one.
+    pub attempt: i32,
+    /// `JobRun$PreviousRunId`: "the `JobRunId` specified in the `StartJobRun` action",
+    /// i.e. the run this one retries, when the request named one.
+    pub previous_run_id: Option<String>,
+    pub job_mode: String,
+    pub job_run_queuing_enabled: Option<bool>,
+    /// Server-set: the instant `StartJobRun` recorded this run.
+    pub started_on: SystemTime,
+    /// Server-set: moves with every state change of this run.
+    pub last_modified_on: SystemTime,
+    /// Server-set when the run reaches a terminal state, and absent until then.
+    pub completed_on: Option<SystemTime>,
+    /// One of the modelled `JobRunState` values.
+    pub state: String,
+    /// The instant the clock owes this run its next state; `None` once it has settled.
+    pub settles_at: Option<SystemTime>,
+    /// The job's `DefaultArguments` with this run's `Arguments` applied over them, then
+    /// the job's `NonOverridableArguments`: "For this job run, they replace the default
+    /// arguments set in the job definition itself" (`StartJobRun$Arguments`), except for
+    /// the "arguments for this job that are not overridden when providing job arguments
+    /// in a job run" (`CreateJob$NonOverridableArguments`).
+    pub arguments: HashMap<String, String>,
+    pub error_message: Option<String>,
+    pub max_capacity: Option<f64>,
+    pub timeout: i32,
+    pub worker_type: Option<String>,
+    pub number_of_workers: Option<i32>,
+    pub security_configuration: Option<String>,
+    pub notification_property: Option<NotificationProperty>,
+    pub glue_version: String,
+    pub execution_class: Option<String>,
+    pub maintenance_window: Option<String>,
+    pub execution_role_session_policy: Option<String>,
+}
+
+impl JobRunEntry {
+    /// Record a run of `job` as the `StartJobRun` request asks for it, in
+    /// [`JOB_RUN_STATE_STARTING`] with its next state due [`JOB_RUN_SETTLES_AFTER`] out.
+    ///
+    /// `retries` is the `(id, attempt)` of the run this one retries, when the request's
+    /// `JobRunId` ("The ID of a previous JobRun to retry") named one.
+    pub fn start(
+        job: &JobEntry,
+        input: &StartJobRunInput,
+        id: String,
+        now: SystemTime,
+        retries: Option<(String, i32)>,
+    ) -> Self {
+        let (previous_run_id, attempt) = match retries {
+            Some((previous_id, previous_attempt)) => {
+                (Some(previous_id), previous_attempt.saturating_add(1))
+            }
+            None => (None, FIRST_JOB_RUN_ATTEMPT),
+        };
+        // Each capacity member of the run is the one the request named, else the job's,
+        // and the DPU figure is then derived from that pair exactly as a job's is.
+        let worker_type = input.worker_type.clone().or_else(|| job.worker_type.clone());
+        let number_of_workers = input.number_of_workers.or(job.number_of_workers);
+        let max_capacity = capacity_from(
+            input.max_capacity,
+            input.allocated_capacity,
+            worker_type.as_deref(),
+            number_of_workers,
+        )
+        .or(job.max_capacity);
+
+        let mut arguments = job.default_arguments.clone().unwrap_or_default();
+        if let Some(requested) = input.arguments.as_ref() {
+            arguments.extend(
+                requested
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone())),
+            );
+        }
+        if let Some(locked) = job.non_overridable_arguments.as_ref() {
+            arguments.extend(
+                locked
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone())),
+            );
+        }
+
+        Self {
+            id,
+            job_name: job.name.clone(),
+            attempt,
+            previous_run_id,
+            job_mode: job.job_mode.clone(),
+            // "If this field does not match the value set in the job run, then the value
+            // from the job run field will be used."
+            job_run_queuing_enabled: input.job_run_queuing_enabled.or(job.job_run_queuing_enabled),
+            started_on: now,
+            last_modified_on: now,
+            completed_on: None,
+            state: JOB_RUN_STATE_STARTING.to_string(),
+            settles_at: Some(now.checked_add(JOB_RUN_SETTLES_AFTER).unwrap_or(now)),
+            arguments,
+            // Nothing has failed yet: a run carries an error message only once it has.
+            error_message: None,
+            max_capacity,
+            timeout: input.timeout.unwrap_or(job.timeout),
+            worker_type,
+            number_of_workers,
+            security_configuration: input
+                .security_configuration
+                .clone()
+                .or_else(|| job.security_configuration.clone()),
+            notification_property: input
+                .notification_property
+                .clone()
+                .or_else(|| job.notification_property.clone()),
+            // `GlueVersion` is not a `StartJobRun` member: a run uses its job's.
+            glue_version: job.glue_version.clone(),
+            execution_class: input
+                .execution_class
+                .clone()
+                .or_else(|| job.execution_class.clone()),
+            // Nor is `MaintenanceWindow`.
+            maintenance_window: job.maintenance_window.clone(),
+            execution_role_session_policy: input.execution_role_session_policy.clone(),
+        }
+    }
+
+    /// Whether this run has finished, by [`TERMINAL_JOB_RUN_STATES`].
+    pub fn is_terminal(&self) -> bool {
+        TERMINAL_JOB_RUN_STATES.contains(&self.state.as_str())
+    }
+
+    /// Move this run into the state the clock owed it at `now`, if it owed one.
+    ///
+    /// The run was due to leave [`JOB_RUN_STATE_STARTING`] at [`JobRunEntry::settles_at`]
+    /// whether or not anybody called, and the instants recorded are that DUE instant, not
+    /// the instant somebody read it — so two reads of a settled run report the same run.
+    pub fn settle_if_due(&mut self, now: SystemTime) {
+        let Some(due) = self.settles_at else {
+            return;
+        };
+        if due > now {
+            return;
+        }
+        self.settles_at = None;
+        self.state = JOB_RUN_STATE_FAILED.to_string();
+        self.error_message = Some(JOB_RUN_NOT_EXECUTED_MESSAGE.to_string());
+        self.completed_on = Some(due);
+        self.last_modified_on = due;
+    }
+
+    /// `JobRun$ExecutionTime`: "The amount of time (in seconds) that the job run consumed
+    /// resources" — the whole seconds between the run starting and finishing, and the
+    /// model's own default of 0 while it has not finished.
+    fn execution_time_seconds(&self) -> i32 {
+        let Some(completed_on) = self.completed_on else {
+            return 0;
+        };
+        let elapsed = completed_on
+            .duration_since(self.started_on)
+            .unwrap_or_default();
+        i32::try_from(elapsed.as_secs()).unwrap_or(i32::MAX)
+    }
+
+    /// Rebuild the modelled `JobRun` output shape from what is stored.
+    pub fn to_job_run(&self) -> JobRun {
+        JobRun {
+            id: Some(self.id.clone()),
+            attempt: self.attempt,
+            previous_run_id: self.previous_run_id.clone(),
+            // "The name of the trigger that started this job run": this run was started
+            // through `StartJobRun`, so no trigger started it.
+            trigger_name: None,
+            job_name: Some(self.job_name.clone()),
+            job_mode: Some(self.job_mode.clone()),
+            job_run_queuing_enabled: self.job_run_queuing_enabled,
+            started_on: Some(to_date_time(self.started_on)),
+            last_modified_on: Some(to_date_time(self.last_modified_on)),
+            completed_on: self.completed_on.map(to_date_time),
+            job_run_state: Some(self.state.clone()),
+            arguments: Some(self.arguments.clone()),
+            error_message: self.error_message.clone(),
+            // "A job run that was used in the predicate of a conditional trigger that
+            // triggered this job run" (`Predecessor`): a run started through
+            // `StartJobRun` has none, and a run this one retries is not one of them —
+            // that is `PreviousRunId`.
+            predecessor_runs: None,
+            // `AllocatedCapacity` is the same quantity as `MaxCapacity` — "This field is
+            // deprecated. Use MaxCapacity instead" — so it reports the same number of
+            // whole DPUs, and the model's own default of 0 for a run with no capacity.
+            allocated_capacity: self.max_capacity.map_or(0, |capacity| capacity as i32),
+            execution_time: self.execution_time_seconds(),
+            timeout: Some(self.timeout),
+            max_capacity: self.max_capacity,
+            worker_type: self.worker_type.clone(),
+            number_of_workers: self.number_of_workers,
+            security_configuration: self.security_configuration.clone(),
+            // "The name of the log group for secure logging": no job script runs here, so
+            // nothing writes this run's output anywhere and there is no log group holding
+            // it to name.
+            log_group_name: None,
+            notification_property: self.notification_property.clone(),
+            glue_version: Some(self.glue_version.clone()),
+            // "The total time each executor ran during the lifecycle of a job run in
+            // seconds, multiplied by a DPU factor": no executor ran.
+            dpu_seconds: None,
+            execution_class: self.execution_class.clone(),
+            maintenance_window: self.maintenance_window.clone(),
+            // `ProfileName` names a usage profile, which neither `CreateJob` nor
+            // `StartJobRun` can set.
+            profile_name: None,
+            // "For example, when a job run is in a WAITING state as a result of job run
+            // queuing, the field has the reason why": this run was never queued, and the
+            // reason it failed is its `ErrorMessage`.
+            state_detail: None,
+            execution_role_session_policy: self.execution_role_session_policy.clone(),
+        }
+    }
 }
 
 /// Whether `targets` names at least one data store to crawl, across every target list

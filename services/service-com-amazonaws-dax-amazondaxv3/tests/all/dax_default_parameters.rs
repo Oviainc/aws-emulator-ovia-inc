@@ -181,8 +181,14 @@ async fn every_defined_parameter_is_reported_from_the_catalog() {
         );
         assert_eq!(
             parameter["Source"],
-            json!(state::PARAMETER_SOURCE_SYSTEM),
-            "case {case}: a default is system-defined, got {parameter:?}"
+            json!(definition.source),
+            "case {case}: expected the Source its catalog entry publishes, got {parameter:?}"
+        );
+        assert!(
+            state::PARAMETER_SOURCES.contains(&definition.source),
+            "case {case}: expected a Source from {:?}, got {:?}",
+            state::PARAMETER_SOURCES,
+            definition.source
         );
         assert_eq!(
             parameter["ParameterType"],
@@ -193,6 +199,67 @@ async fn every_defined_parameter_is_reported_from_the_catalog() {
             parameter["NodeTypeSpecificValues"],
             json!([]),
             "case {case}: expected no node-type-specific values, got {parameter:?}"
+        );
+    }
+}
+
+/// Rule: a reported `Parameter`'s `Description` and `Source` are properties of the
+/// CATALOG ENTRY it is rendered from — carried through verbatim — not values chosen
+/// where the parameter is projected. Rows span both `Source` values the member's
+/// documentation names and descriptions of different shapes, so a projection that
+/// substituted a constant for either would fail on at least one row.
+///
+/// Source: `Parameter$Source` ("How the parameter is defined. For example, system
+/// denotes a system-defined parameter.") and `Parameter$Description`, via
+/// `state::ParameterDefinition::default_view` — the one projection every parameter view
+/// in this service goes through.
+#[test]
+fn a_parameter_is_projected_with_its_own_catalog_description_and_source() {
+    let rows = [
+        ("system-defined", state::PARAMETER_SOURCE_SYSTEM, "Set by the service"),
+        ("user-defined", state::PARAMETER_SOURCE_USER, "Set by the parameter group"),
+        (
+            "a description with punctuation",
+            state::PARAMETER_SOURCE_USER,
+            "Duration in milliseconds (Default: 0 = infinite)",
+        ),
+    ];
+
+    for (case, source, description) in rows {
+        let definition = state::ParameterDefinition {
+            name: "a-parameter",
+            default_value: "1",
+            description,
+            source,
+            data_type: state::DATA_TYPE_INTEGER,
+            allowed_values: "0-",
+            is_modifiable: state::IS_MODIFIABLE_TRUE,
+            change_type: state::CHANGE_TYPE_IMMEDIATE,
+        };
+        let view = definition.default_view();
+        assert_eq!(
+            view.source.as_deref(),
+            Some(source),
+            "case {case}: expected the entry's own Source {source:?}, got {:?}",
+            view.source
+        );
+        assert_eq!(
+            view.description.as_deref(),
+            Some(description),
+            "case {case}: expected the entry's own Description {description:?}, got {:?}",
+            view.description
+        );
+    }
+
+    // And every entry of the real catalog publishes a `Source` from the documented
+    // vocabulary, so none is rendered with a value outside it.
+    for definition in state::DEFAULT_PARAMETERS {
+        assert!(
+            state::PARAMETER_SOURCES.contains(&definition.source),
+            "case {}: expected a Source from {:?}, got {:?}",
+            definition.name,
+            state::PARAMETER_SOURCES,
+            definition.source
         );
     }
 }
@@ -251,6 +318,12 @@ async fn every_reported_parameter_satisfies_the_modelled_value_sets() {
             CHANGE_TYPE_VALUES.contains(&change_type),
             "case {case}: expected a ChangeType from {CHANGE_TYPE_VALUES:?}, \
              got {change_type:?}"
+        );
+        let source = parameter["Source"].as_str().unwrap_or_default();
+        assert!(
+            state::PARAMETER_SOURCES.contains(&source),
+            "case {case}: expected a Source from {:?}, got {source:?}",
+            state::PARAMETER_SOURCES
         );
 
         // A value is reported in its own data type and inside its own allowed range: an

@@ -110,9 +110,9 @@ impl Client {
     }
 
     /// Record an answer to one question of one lens review straight through the shared
-    /// state, so a test has a stored answer for the reads to report. `UpdateAnswer` —
-    /// the operation that answers a question over the wire — is still a stub with its
-    /// own issue; the READ under test still crosses the HTTP boundary.
+    /// state, so a test has a stored answer for the reads to report. The answers
+    /// `UpdateAnswer` records over the wire are exercised by `super::answer_updates`;
+    /// this seeds one for the suites that are about a DIFFERENT read.
     pub(crate) fn record_answer(
         &self,
         workload_id: &str,
@@ -580,8 +580,8 @@ pub(crate) async fn review_template(client: &Client, name: &str, lenses: &[&str]
 /// An `AnswerRecord` that records `selected` as the best practices in place, `choices` as
 /// the status of each choice it speaks about, whether the question applies and the reason
 /// it does not — the one answer builder the suites in this crate share. The answer's own
-/// notes and each choice's notes are what `UpdateReviewTemplateAnswer` writes over the
-/// wire, so a seeded answer carries none.
+/// notes and each choice's notes are what `UpdateAnswer` / `UpdateReviewTemplateAnswer`
+/// write over the wire, so a seeded answer carries none.
 pub(crate) fn answered(
     selected: &[&str],
     choices: &[(&str, &str)],

@@ -38,7 +38,7 @@ use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
     AliasListEntry, GrantConstraints, GrantListEntry, KeyMetadata, MultiRegionConfiguration,
-    MultiRegionKey, CUSTOMER_MASTER_KEY_SPEC_VALUES,
+    MultiRegionKey, Tag, CUSTOMER_MASTER_KEY_SPEC_VALUES,
 };
 
 /// `KeyState` values, from `smithy_query(shape="KeyState")`.
@@ -1001,6 +1001,40 @@ impl Cmk {
                 .is_some_and(|profile| matches!(profile.material, MaterialKind::Aes256))
     }
 
+    /// Add or edit this key's tags: "To add a tag, specify a new tag key and a tag
+    /// value. To edit a tag, specify an existing tag key and a new tag value"
+    /// (`smithy_query(query="doc",shape="TagResource")`). A tag key the key already
+    /// carries takes the value this request gives it — so the last write of a tag key
+    /// is the value the key holds — and every tag the request does not name stays as
+    /// it was.
+    pub fn apply_tags(&mut self, tags: BTreeMap<String, String>) {
+        self.tags.extend(tags);
+    }
+
+    /// Remove the tags `tag_keys` names. "If the specified tag key isn't found on the
+    /// KMS key, it doesn't throw an exception"
+    /// (`smithy_query(query="doc",shape="UntagResource")`), so a key this key does not
+    /// carry removes nothing instead of refusing.
+    pub fn remove_tags(&mut self, tag_keys: &[String]) {
+        for tag_key in tag_keys {
+            self.tags.remove(tag_key);
+        }
+    }
+
+    /// This key's tags as the `TagList` a reader reports, in tag-key order.
+    ///
+    /// The order is the stored map's, so it is the same on every call and a tag added
+    /// later never reshuffles the tags a previous page of `ListResourceTags` returned.
+    pub fn tag_list(&self) -> Vec<Tag> {
+        self.tags
+            .iter()
+            .map(|(tag_key, tag_value)| Tag {
+                tag_key: tag_key.clone(),
+                tag_value: tag_value.clone(),
+            })
+            .collect()
+    }
+
     /// This key's `KeyMetadata`, computed from the record — the one place the
     /// metadata is built, so `CreateKey` and `DescribeKey` cannot disagree.
     pub fn metadata(&self) -> KeyMetadata {
@@ -1720,6 +1754,71 @@ pub const MAX_KEYS: usize = 500;
 /// KMS key" is KMS's own per-key tag quota, and it also bounds what one request can
 /// make the store retain.
 pub const MAX_TAGS_PER_KEY: usize = 50;
+
+/// The tag-key prefix AWS reserves for its own tags: "Do not use the `aws:` prefix
+/// in your tag names or values because it is reserved for Amazon Web Services use.
+/// You can't edit or delete tag names or values with this prefix" (Tagging Amazon
+/// Web Services resources in the General Reference, which `TagResource`'s own
+/// documentation points at for "the format and syntax" of a tag). A caller's tag
+/// cannot fall under it, so a request that carries one is refused and nothing is
+/// stored.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Whether `tag_key` falls under [`RESERVED_TAG_KEY_PREFIX`].
+///
+/// The prefix is matched without regard to case: the reservation is on the prefix,
+/// not on one spelling of it, so no capitalisation of it is a caller's to set.
+pub fn is_reserved_tag_key(tag_key: &str) -> bool {
+    let prefix = RESERVED_TAG_KEY_PREFIX.as_bytes();
+    tag_key
+        .as_bytes()
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
+/// The tags a request's `TagList` asks a key to carry, keyed by tag key, or why the
+/// list is not one KMS stores — the sentence a `TagException` ("one or more tags are
+/// not valid") carries.
+///
+/// ONE function for every operation that accepts tags, so no two of them judge the
+/// same list differently:
+///
+/// * "You cannot have more than one tag on a KMS key with the same tag key"
+///   (`smithy_query(query="doc",shape="TagResourceRequest",member="Tags")`), so a
+///   list naming one tag key twice is refused rather than silently collapsed to
+///   whichever entry came last;
+/// * a tag key under [`RESERVED_TAG_KEY_PREFIX`] is not a caller's to set.
+///
+/// Every other property of a tag — that both members are present, and their lengths
+/// — is modelled, so the boundary validator has already refused a list that breaks
+/// one before any handler runs. In particular a tag VALUE may be the empty string
+/// (`TagValueType` is `@length(0..256)`), which is why nothing here treats an empty
+/// value as absent.
+///
+/// The sentences are this emulator's wording; what this function pins is WHICH tag
+/// lists are refused.
+pub fn requested_tags(tags: &[Tag]) -> Result<BTreeMap<String, String>, String> {
+    let mut requested = BTreeMap::new();
+    for tag in tags {
+        if is_reserved_tag_key(&tag.tag_key) {
+            // KMS words this refusal by naming the reserved prefix and nothing else,
+            // so the sentence carries no value from the request.
+            return Err(format!(
+                "Tags beginning with {RESERVED_TAG_KEY_PREFIX} are reserved"
+            ));
+        }
+        if requested
+            .insert(tag.tag_key.clone(), tag.tag_value.clone())
+            .is_some()
+        {
+            return Err(format!(
+                "One or more tags are not valid: the tag key {} appears more than once.",
+                tag.tag_key
+            ));
+        }
+    }
+    Ok(requested)
+}
 
 /// AWS's default key policy, which "gives the Amazon Web Services account that owns
 /// the KMS key permission to use it in all cryptographic operations"
@@ -2693,6 +2792,9 @@ const MARKER_PREFIX: &str = "keys/1/";
 /// an item of the wrong kind instead of answering `InvalidMarkerException`.
 const ALIAS_MARKER_PREFIX: &str = "aliases/1/";
 
+/// [`MARKER_PREFIX`], for one key's tag list.
+const RESOURCE_TAG_MARKER_PREFIX: &str = "resource-tags/1/";
+
 /// [`MARKER_PREFIX`], for the grant list.
 const GRANT_MARKER_PREFIX: &str = "grants/1/";
 
@@ -2723,6 +2825,17 @@ pub fn encode_alias_marker(alias_arn: &str) -> String {
 /// [`decode_marker`], for the alias list.
 pub fn decode_alias_marker(marker: &str) -> Option<String> {
     decode_marker_for(ALIAS_MARKER_PREFIX, marker)
+}
+
+/// [`encode_marker`], for one key's tag list: the token resumes after the tag whose
+/// key is `tag_key`, since the tag key is what identifies a tag on a key.
+pub fn encode_resource_tag_marker(tag_key: &str) -> String {
+    encode_marker_for(RESOURCE_TAG_MARKER_PREFIX, tag_key)
+}
+
+/// [`decode_marker`], for one key's tag list.
+pub fn decode_resource_tag_marker(marker: &str) -> Option<String> {
+    decode_marker_for(RESOURCE_TAG_MARKER_PREFIX, marker)
 }
 
 /// [`encode_marker`], for the grant list: the token resumes after the grant whose
