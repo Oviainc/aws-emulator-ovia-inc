@@ -61,6 +61,9 @@ mod table_items;
 #[path = "all/table_scan.rs"]
 mod table_scan;
 
+#[path = "all/table_streams.rs"]
+mod table_streams;
+
 #[path = "all/table_throughput_mode_and_warm_capacity.rs"]
 mod table_throughput_mode_and_warm_capacity;
 

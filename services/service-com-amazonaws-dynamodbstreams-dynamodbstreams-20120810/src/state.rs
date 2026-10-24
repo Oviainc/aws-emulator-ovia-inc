@@ -7,7 +7,7 @@
 //! `StreamSpecification`, and records are published by `PutItem`/`UpdateItem`/
 //! `DeleteItem`. All four modelled operations are therefore pure consumers, so this
 //! module owns both the consumer-visible store and the publishing seam the DynamoDB
-//! service calls into once it is implemented: `register_stream`, `append_record` and
+//! service calls into: `register_stream`, `disable_stream`, `append_record` and
 //! `roll_shard` on the state struct below.
 //!
 //! Positions inside a shard are ABSOLUTE record ordinals (`trimmed + offset`), not
@@ -15,7 +15,7 @@
 //! retention limit never silently moves a shard iterator that a client is still
 //! holding.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
@@ -47,6 +47,16 @@ pub const RECORD_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 /// observes the transient status.
 pub const STREAM_ENABLE_DELAY: Duration = Duration::from_millis(500);
 
+/// How long after a disable request a stream reports `DISABLED` instead of
+/// `DISABLING`.
+///
+/// The mirror of [`STREAM_ENABLE_DELAY`], for the same reason and over the same
+/// CHOSEN span: the model documents `StreamStatus` `DISABLING` ("Streams is
+/// currently being disabled on the DynamoDB table") beside `DISABLED`, so a
+/// caller that describes the stream straight after the call still observes the
+/// transient status.
+pub const STREAM_DISABLE_DELAY: Duration = STREAM_ENABLE_DELAY;
+
 /// The most records one `GetRecords` call may return.
 ///
 /// From the model's `GetRecords` documentation: "GetRecords can retrieve a maximum
@@ -57,6 +67,66 @@ pub const MAX_GET_RECORDS_LIMIT: i32 = 1000;
 /// documented sentence ("a maximum of 1 MB of data or 1000 stream records,
 /// whichever comes first"). Measured over the records' own `SizeBytes`.
 pub const MAX_GET_RECORDS_BYTES: i64 = 1024 * 1024;
+
+/// How long a stream stays registered after it is DISABLED, before the clock
+/// reclaims it.
+///
+/// From the model's `DeleteTable` documentation: "If you have DynamoDB Streams
+/// enabled on the table, then the corresponding stream on that table goes into
+/// the DISABLED state, and the stream is automatically deleted after 24 hours."
+/// That deletion is what bounds the registry over time: a stream a caller turned
+/// off is drainable for the documented window and then gone.
+pub const DISABLED_STREAM_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// How many streams this registry holds for ONE table.
+///
+/// A table has at most one stream ON; the rest are disabled predecessors, which a
+/// caller produces by turning a stream off and on again and which
+/// [`DISABLED_STREAM_RETENTION`] reclaims. AWS publishes no quota for that count,
+/// so this is a CHOSEN bound, and it is what keeps the registry's size a function
+/// of the tables that exist rather than of how often a caller toggles one: past it
+/// a registration is refused and the control plane answers its own
+/// `LimitExceededException`.
+///
+/// This bound is the emulator's, NOT a modelled AWS quota: real DynamoDB would
+/// accept a 33rd enable within the retention window. It is the alternative to
+/// keeping every disabled stream a caller can ask for, and it is deliberately
+/// generous enough that no ordinary enable/disable sequence meets it.
+///
+/// It is counted over the streams whose ARN carries this table's NAME, so the
+/// streams of a table that has been deleted still count against a new table
+/// created with the same name until [`DISABLED_STREAM_RETENTION`] reclaims them.
+/// That is the same resource the name owns, which is why the count is read off the
+/// name rather than off a table identity this service does not hold.
+pub const MAX_STREAMS_PER_TABLE: usize = 32;
+
+/// How many streams this registry holds in total — the second half of the same
+/// bound, so the registry is capped even if the control plane's own table quotas
+/// change. Also a CHOSEN figure.
+pub const MAX_STREAMS: usize = 10_000;
+
+/// How many LIVE shard iterators this service holds.
+///
+/// An iterator is reclaimed by its own 15 minute lifetime
+/// ([`SHARD_ITERATOR_TTL`]), but that alone bounds the table only by how fast a
+/// client asks for iterators, so the count has a ceiling of its own: a mint past
+/// it RETIRES the oldest live iterator instead of growing the store. Retiring
+/// rather than dropping is what keeps the answer honest — a client that comes back
+/// with an evicted token is told its iterator expired, which is what happened to
+/// it. Also a CHOSEN figure, and generous: no consumer loop needs this many
+/// iterators alive at once.
+pub const MAX_LIVE_ITERATORS: usize = 10_000;
+
+/// How many RETIRED shard-iterator tokens this service remembers.
+///
+/// A retired token is the only record that this service ever minted it, which is
+/// what tells an iterator past its lifetime (`ExpiredIteratorException`) from a
+/// token that is not one of this service's iterators at all (a request this
+/// service refuses as invalid). The set is capped so a client cannot grow the
+/// store without limit by asking for iterators, and the OLDEST retirement is
+/// dropped first: a token retired that long ago is no longer attributable, so it
+/// reads as not-an-iterator again.
+pub const MAX_RETIRED_ITERATORS: usize = 10_000;
 
 /// The most entries one page of `ListStreams` or `DescribeStream` may return.
 ///
@@ -86,6 +156,12 @@ pub const EVENT_VERSION: &str = "1.1";
 /// numeric characters only"), so the monotonic counter is offset into the 21-digit
 /// range: every generated sequence number is exactly 21 digits.
 const SEQUENCE_NUMBER_BASE: u128 = 100_000_000_000_000_000_000;
+
+/// The format version a shard-iterator token carries between its stream ARN and its
+/// opaque blob, as a DynamoDB Streams iterator does. It is the token FORMAT's
+/// version, not a position: a token of an older format could be recognised and
+/// refused rather than misread.
+const ITERATOR_TOKEN_VERSION: u32 = 1;
 
 /// The format of the records a stream captures (the modelled `StreamViewType`
 /// enum; wire values from `STREAM_VIEW_TYPE_VALUES`).
@@ -234,6 +310,40 @@ impl std::fmt::Display for AppendRejected {
     }
 }
 
+/// Why [`ComAmazonawsDynamodbstreamsDynamodbstreams20120810State::register_stream`]
+/// refused to register a stream, so the publisher can word its own failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegistrationRejected {
+    /// The table already holds [`MAX_STREAMS_PER_TABLE`] streams.
+    TooManyStreamsForTable { table_name: String, limit: usize },
+    /// The registry already holds [`MAX_STREAMS`] streams.
+    TooManyStreams { limit: usize },
+    /// No free stream label within the bounded probe — see `register_stream`.
+    NoFreeLabel { table_name: String, probes: usize },
+}
+
+impl std::fmt::Display for RegistrationRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooManyStreamsForTable { table_name, limit } => write!(
+                f,
+                "table {table_name} already holds the maximum of {limit} streams"
+            ),
+            Self::TooManyStreams { limit } => write!(
+                f,
+                "this account already holds the maximum of {limit} streams"
+            ),
+            Self::NoFreeLabel {
+                table_name,
+                probes,
+            } => write!(
+                f,
+                "no free stream label for table {table_name} in {probes} attempts"
+            ),
+        }
+    }
+}
+
 /// A stream record as it is persisted.
 #[derive(Debug, Clone)]
 pub struct StoredRecord {
@@ -310,6 +420,11 @@ pub struct StoredStream {
     pub creation_request_date_time: SystemTime,
     /// When the asynchronous enable this registration started becomes due.
     pub enabled_at: SystemTime,
+    /// When the asynchronous disable a `StreamSpecification` that turns the
+    /// stream OFF started becomes due, or `None` while the stream is on. The
+    /// stream stays REGISTERED once disabled — AWS deletes it only after 24
+    /// hours — so a consumer still discovers it and reads its status.
+    pub disabled_at: Option<SystemTime>,
     pub aws_region: String,
     pub key_schema: Vec<KeySchemaElement>,
     /// Shards in creation order: a child shard always follows its parent.
@@ -318,13 +433,15 @@ pub struct StoredStream {
 
 impl StoredStream {
     /// The status the clock owes at `now`: a registration starts the stream
-    /// `ENABLING` and it becomes `ENABLED` once the enable is due.
+    /// `ENABLING` and it becomes `ENABLED` once the enable is due; a disable
+    /// starts it `DISABLING` and it becomes `DISABLED` once that is due.
     #[must_use]
     pub fn status_at(&self, now: SystemTime) -> StreamStatus {
-        if now < self.enabled_at {
-            StreamStatus::Enabling
-        } else {
-            StreamStatus::Enabled
+        match self.disabled_at {
+            Some(due) if now >= due => StreamStatus::Disabled,
+            Some(_) => StreamStatus::Disabling,
+            None if now < self.enabled_at => StreamStatus::Enabling,
+            None => StreamStatus::Enabled,
         }
     }
 
@@ -333,6 +450,23 @@ impl StoredStream {
     pub fn shard(&self, shard_id: &str) -> Option<&StoredShard> {
         self.shards.iter().find(|shard| shard.shard_id == shard_id)
     }
+}
+
+/// What a `ShardIterator` token a client presented resolves to.
+///
+/// The token is a digest, so it carries no position and cannot be decoded: the
+/// only thing that makes a token an iterator is that this service minted it and
+/// still remembers doing so. That is what separates the two refusals
+/// `GetRecords` can answer — an iterator whose lifetime has passed, and a value
+/// that is not an iterator.
+#[derive(Debug, Clone, Copy)]
+pub enum IteratorLookup<'a> {
+    /// A live iterator, standing at the position it carries.
+    Live(&'a IteratorState),
+    /// A token this service minted whose 15 minute lifetime has since passed.
+    Retired,
+    /// A token this service has no record of minting, so it names no position.
+    Unknown,
 }
 
 /// Where a shard iterator token points, and when it was handed out.
@@ -353,6 +487,20 @@ pub struct ComAmazonawsDynamodbstreamsDynamodbstreams20120810State {
     streams: BTreeMap<String, StoredStream>,
     /// Live shard iterators, keyed by the opaque token handed to the client.
     iterators: HashMap<String, IteratorState>,
+    /// The live tokens in MINT order (oldest first), so the
+    /// [`MAX_LIVE_ITERATORS`] cap can retire the oldest. It may also hold tokens
+    /// the clock has already retired; those are skipped when they come up, and its
+    /// own length is what the cap is enforced on, so `iterators` can never be
+    /// larger than the cap.
+    live_iterators: VecDeque<String>,
+    /// Tokens this service minted whose lifetime has passed, in retirement order
+    /// (oldest first) so the cap drops the oldest. Paired with
+    /// `retired_iterator_tokens`, which answers membership in one hash.
+    retired_iterators: VecDeque<String>,
+    /// Membership index over `retired_iterators`; the two always hold the same
+    /// tokens, because [`ComAmazonawsDynamodbstreamsDynamodbstreams20120810State::retire_iterator`]
+    /// is the only thing that writes either.
+    retired_iterator_tokens: HashSet<String>,
     /// Backs sequence-number generation; monotonic for the life of the emulator.
     next_sequence_number: u64,
     /// Backs shard-id generation, so two shards created in the same millisecond
@@ -376,16 +524,41 @@ impl ComAmazonawsDynamodbstreamsDynamodbstreams20120810State {
         self.streams.get(stream_arn)
     }
 
-    /// Where a shard-iterator token points, if it is still live.
+    /// How many iterators are LIVE — the figure [`MAX_LIVE_ITERATORS`] caps.
     #[must_use]
-    pub fn iterator(&self, token: &str) -> Option<&IteratorState> {
-        self.iterators.get(token)
+    pub fn live_iterator_count(&self) -> usize {
+        self.iterators.len()
+    }
+
+    /// What a client-presented `ShardIterator` token resolves to: a live
+    /// iterator, one this service minted and has since retired, or a value it
+    /// never minted at all.
+    #[must_use]
+    pub fn resolve_iterator(&self, token: &str) -> IteratorLookup<'_> {
+        if let Some(iterator) = self.iterators.get(token) {
+            return IteratorLookup::Live(iterator);
+        }
+        if self.retired_iterator_tokens.contains(token) {
+            return IteratorLookup::Retired;
+        }
+        IteratorLookup::Unknown
     }
 
     /// Materialise everything the CLOCK already owes at `now`, whether or not
-    /// anybody called: records past the 24 hour retention limit are trimmed, and
-    /// shard iterators past their 15 minute lifetime are retired.
+    /// anybody called: a stream disabled longer than
+    /// [`DISABLED_STREAM_RETENTION`] is deleted, records past the 24 hour
+    /// retention limit are trimmed, and shard iterators past their 15 minute
+    /// lifetime are retired.
     pub fn materialize_due_expiries(&mut self, now: SystemTime) {
+        // "The stream is automatically deleted after 24 hours" (the `DeleteTable`
+        // doc): a stream whose disable fell due that long ago is gone, which is what
+        // reclaims the registry rather than letting a disabled stream sit in it for
+        // the life of the process.
+        self.streams.retain(|_, stream| {
+            stream
+                .disabled_at
+                .is_none_or(|due| !older_than(due, now, DISABLED_STREAM_RETENTION))
+        });
         for stream in self.streams.values_mut() {
             for shard in &mut stream.shards {
                 while shard
@@ -398,49 +571,149 @@ impl ComAmazonawsDynamodbstreamsDynamodbstreams20120810State {
                 }
             }
         }
-        self.iterators
-            .retain(|_, iterator| !older_than(iterator.issued_at, now, SHARD_ITERATOR_TTL));
+        // An iterator past its lifetime stops standing at a position, but the fact
+        // that this service minted it is kept: that is what makes it an EXPIRED
+        // iterator rather than a value that was never one. An iterator of a stream
+        // the clock has deleted is left alone and reclaimed by this same lifetime,
+        // so `GetRecords` can still answer the modelled `ResourceNotFoundException`
+        // for the stream that is gone rather than reporting the iterator as the
+        // problem.
+        let expired: Vec<String> = self
+            .iterators
+            .iter()
+            .filter(|(_, iterator)| older_than(iterator.issued_at, now, SHARD_ITERATOR_TTL))
+            .map(|(token, _)| token.clone())
+            .collect();
+        for token in expired {
+            self.iterators.remove(&token);
+            self.retire_iterator(token);
+        }
     }
 
     /// Register a stream for a table — the publishing seam DynamoDB's
     /// `CreateTable`/`UpdateTable` calls when a `StreamSpecification` enables one.
     ///
-    /// Returns the stream ARN. Idempotent: registering the same table at the same
-    /// instant yields the same ARN and leaves the existing stream untouched, so a
-    /// repeated `UpdateTable` does not fork a second stream.
+    /// Returns the stream ARN. Idempotent while the stream is ON: registering the
+    /// same table at the same instant yields the same ARN and leaves the existing
+    /// stream untouched, so a repeated registration does not fork a second stream.
+    ///
+    /// A stream's ARN carries its label, and a label identifies at most ONE stream
+    /// of a table — "the combination of ... Amazon Web Services customer ID, table
+    /// name, StreamLabel is guaranteed to be unique"
+    /// (`TableDescription$LatestStreamLabel`) — so a registration landing on the
+    /// label of a stream that has since been DISABLED takes the next free
+    /// millisecond instead of resurrecting it: that stream keeps the records it
+    /// captured until it is deleted, and a re-enabled stream is a new one.
+    /// REFUSED past [`MAX_STREAMS_PER_TABLE`] or [`MAX_STREAMS`], which is what
+    /// keeps the registry bounded by the resources that exist rather than by how
+    /// often a caller turns a stream off and on again; the control plane answers
+    /// the refusal with its own `LimitExceededException`. The work this does is
+    /// bounded too: one prefix range over the table's own streams, then at most
+    /// `MAX_STREAMS_PER_TABLE` label probes, which is enough because a table under
+    /// the cap can occupy at most that many labels (see the loop below).
     pub fn register_stream(
         &mut self,
         registration: &StreamRegistration,
         at: SystemTime,
-    ) -> String {
-        let stream_label = iso8601_label(at);
-        let stream_arn = ::engine::emulator_arn(
-            "dynamodb",
-            &registration.region,
-            &format!(
-                "table/{}/stream/{}",
-                registration.table_name, stream_label
-            ),
-        );
-        if self.streams.contains_key(&stream_arn) {
-            return stream_arn;
+    ) -> Result<String, RegistrationRejected> {
+        let first = stream_arn_at(registration, at);
+        // The same table's stream, registered at the same instant and still on:
+        // nothing to register, and nothing to count against a quota either.
+        if self
+            .streams
+            .get(&first)
+            .is_some_and(|existing| existing.disabled_at.is_none())
+        {
+            return Ok(first);
         }
-        let shard = self.new_shard(&stream_arn, None, at);
-        self.streams.insert(
-            stream_arn.clone(),
-            StoredStream {
-                stream_arn: stream_arn.clone(),
+
+        // How many streams this table already holds. A stream's ARN starts with its
+        // table's own `table/<name>/stream/` prefix, so this is a RANGE over that
+        // prefix in the ARN-ordered map rather than a scan of the registry.
+        let prefix = stream_arn_prefix(&registration.region, &registration.table_name);
+        let held = self
+            .streams
+            .range::<str, _>((
+                std::ops::Bound::Included(prefix.as_str()),
+                std::ops::Bound::Unbounded,
+            ))
+            .take_while(|(stream_arn, _)| stream_arn.starts_with(&prefix))
+            .count();
+        if held >= MAX_STREAMS_PER_TABLE {
+            return Err(RegistrationRejected::TooManyStreamsForTable {
                 table_name: registration.table_name.clone(),
-                stream_label,
-                stream_view_type: registration.stream_view_type,
-                creation_request_date_time: at,
-                enabled_at: at + STREAM_ENABLE_DELAY,
-                aws_region: registration.region.clone(),
-                key_schema: registration.key_schema.clone(),
-                shards: vec![shard],
-            },
-        );
-        stream_arn
+                limit: MAX_STREAMS_PER_TABLE,
+            });
+        }
+        if self.streams.len() >= MAX_STREAMS {
+            return Err(RegistrationRejected::TooManyStreams {
+                limit: MAX_STREAMS,
+            });
+        }
+
+        // The table holds `held` streams, so at most `held` of its labels are taken
+        // and a free one is reached within `held + 1` passes: a BOUNDED probe rather
+        // than a search over whatever state a caller has built.
+        let mut at = at;
+        for _ in 0..=held {
+            let stream_arn = stream_arn_at(registration, at);
+            if self.streams.contains_key(&stream_arn) {
+                at += Duration::from_millis(1);
+                continue;
+            }
+            let shard = self.new_shard(&stream_arn, None, at);
+            self.streams.insert(
+                stream_arn.clone(),
+                StoredStream {
+                    stream_arn: stream_arn.clone(),
+                    table_name: registration.table_name.clone(),
+                    stream_label: iso8601_label(at),
+                    stream_view_type: registration.stream_view_type,
+                    creation_request_date_time: at,
+                    enabled_at: at + STREAM_ENABLE_DELAY,
+                    disabled_at: None,
+                    aws_region: registration.region.clone(),
+                    key_schema: registration.key_schema.clone(),
+                    shards: vec![shard],
+                },
+            );
+            return Ok(stream_arn);
+        }
+        // Unreachable while the count above is the truth about this table's streams;
+        // if it ever is not, this is a refusal rather than an unbounded search.
+        Err(RegistrationRejected::NoFreeLabel {
+            table_name: registration.table_name.clone(),
+            probes: held + 1,
+        })
+    }
+
+    /// Turn a registered stream OFF — the other half of the publishing seam, which
+    /// DynamoDB's `UpdateTable` calls when a `StreamSpecification` disables the
+    /// stream.
+    ///
+    /// The stream reports `DISABLING` until [`STREAM_DISABLE_DELAY`] has elapsed and
+    /// `DISABLED` after that, and its open shard is CLOSED, so nothing more can be
+    /// published to it while the records it already carries stay readable. It is not
+    /// removed: AWS deletes a disabled stream only after 24 hours, so a consumer can
+    /// still discover it and drain it. Idempotent, and `false` when no stream with
+    /// that ARN is registered.
+    pub fn disable_stream(&mut self, stream_arn: &str, at: SystemTime) -> bool {
+        let Some(stream) = self.streams.get_mut(stream_arn) else {
+            return false;
+        };
+        if stream.disabled_at.is_none() {
+            stream.disabled_at = Some(at + STREAM_DISABLE_DELAY);
+        }
+        if let Some(open) = stream.shards.iter_mut().rfind(|shard| shard.is_open()) {
+            // A shard that never took a record still needs an ending sequence number
+            // of 21..40 digits, so it closes on its own starting number — the same
+            // rule `roll_shard` closes a shard by.
+            open.ending_sequence_number = Some(open.records.back().map_or_else(
+                || open.starting_sequence_number.clone(),
+                |record| record.sequence_number.clone(),
+            ));
+        }
+        true
     }
 
     /// Publish one item-level change onto the stream's open shard — the seam
@@ -549,6 +822,11 @@ impl ComAmazonawsDynamodbstreamsDynamodbstreams20120810State {
     /// Record a shard iterator against the position it names and return the
     /// opaque token the client gets. The token carries no position itself: it is
     /// resolved here, so a client cannot forge or decode one.
+    ///
+    /// The live table is capped at [`MAX_LIVE_ITERATORS`]: a mint past it retires
+    /// the OLDEST live iterator, so a client asking for iterators cannot grow the
+    /// store without limit and the token it evicted still answers as the expired
+    /// iterator it now is.
     pub fn mint_iterator(
         &mut self,
         stream_arn: &str,
@@ -568,7 +846,31 @@ impl ComAmazonawsDynamodbstreamsDynamodbstreams20120810State {
                 issued_at: at,
             },
         );
+        self.live_iterators.push_back(token.clone());
+        while self.live_iterators.len() > MAX_LIVE_ITERATORS {
+            let Some(oldest) = self.live_iterators.pop_front() else {
+                break;
+            };
+            // A token the clock already retired is simply dropped from the order;
+            // one that is still live is retired now.
+            if self.iterators.remove(&oldest).is_some() {
+                self.retire_iterator(oldest);
+            }
+        }
         token
+    }
+
+    /// Remember that `token` was an iterator of this service's, now past its
+    /// lifetime, bounded by [`MAX_RETIRED_ITERATORS`].
+    fn retire_iterator(&mut self, token: String) {
+        if self.retired_iterator_tokens.insert(token.clone()) {
+            self.retired_iterators.push_back(token);
+        }
+        while self.retired_iterators.len() > MAX_RETIRED_ITERATORS {
+            if let Some(dropped) = self.retired_iterators.pop_front() {
+                self.retired_iterator_tokens.remove(&dropped);
+            }
+        }
     }
 
     fn new_shard(
@@ -602,6 +904,24 @@ pub fn epoch_millis(at: SystemTime) -> i64 {
         .ok()
         .and_then(|since| i64::try_from(since.as_millis()).ok())
         .unwrap_or_default()
+}
+
+/// Every stream ARN of one table starts with this prefix — `.../table/<name>/
+/// stream/` — which is what makes the table's own streams a RANGE of the
+/// ARN-ordered registry rather than a scan of it. The trailing `/stream/` is part
+/// of the prefix, so one table's streams can never be read as another's.
+#[must_use]
+pub fn stream_arn_prefix(region: &str, table_name: &str) -> String {
+    ::engine::emulator_arn("dynamodb", region, &format!("table/{table_name}/stream/"))
+}
+
+/// The ARN a stream of this table registered at `at` carries.
+fn stream_arn_at(registration: &StreamRegistration, at: SystemTime) -> String {
+    format!(
+        "{}{}",
+        stream_arn_prefix(&registration.region, &registration.table_name),
+        iso8601_label(at)
+    )
 }
 
 /// A stream label: "A timestamp, in ISO 8601 format, for this stream"
@@ -675,20 +995,29 @@ fn event_id(stream_arn: &str, shard_id: &str, sequence_number: &str) -> String {
         .to_string()
 }
 
-/// An opaque shard-iterator token, 64 hex characters (inside the modelled
-/// `ShardIterator` 1..2048 bound). It is a digest, not an encoding: the position
-/// it names lives only in the iterator table, so the token cannot be decoded or
-/// forged into a different position.
+/// An opaque shard-iterator token, of the form a DynamoDB Streams iterator takes:
+/// `<stream ARN>|<format version>|<opaque blob>`. The leading ARN is what lets a
+/// client that holds only an iterator tell which stream it belongs to — the
+/// DynamoDB Streams Kinesis adapter reads it straight off the token — and the blob
+/// is a DIGEST of the position, not an encoding of it: the position itself lives in
+/// the iterator table, so a client can neither decode a token nor forge one for a
+/// different position. The whole token stays well inside the modelled
+/// `ShardIterator` 1..2048 bound.
 fn opaque_token(stream_arn: &str, shard_id: &str, next_position: u64, ordinal: u64) -> String {
-    digest_hex(&[
+    let blob = ::aws_smithy_types::base64::encode(digest_bytes(&[
         stream_arn.as_bytes(),
         shard_id.as_bytes(),
         &next_position.to_be_bytes(),
         &ordinal.to_be_bytes(),
-    ])
+    ]));
+    format!("{stream_arn}|{ITERATOR_TOKEN_VERSION}|{blob}")
 }
 
 fn digest_hex(parts: &[&[u8]]) -> String {
+    hex::encode(digest_bytes(parts))
+}
+
+fn digest_bytes(parts: &[&[u8]]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     for part in parts {
         // Length-prefixed, so concatenating two different field splits cannot
@@ -696,7 +1025,7 @@ fn digest_hex(parts: &[&[u8]]) -> String {
         hasher.update((part.len() as u64).to_be_bytes());
         hasher.update(part);
     }
-    hex::encode(hasher.finalize())
+    hasher.finalize().into()
 }
 
 /// `StreamRecord.SizeBytes`: "The size of the stream record, in bytes."

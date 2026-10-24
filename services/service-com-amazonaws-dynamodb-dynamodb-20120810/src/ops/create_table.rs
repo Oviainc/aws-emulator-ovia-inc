@@ -15,8 +15,11 @@
 //! `WarmThroughput`, which defaults to the documented pair when the request names none;
 //! a `ResourcePolicy` is parsed and attached to the stored table, so the data plane
 //! enforces it from the table's first request ("the policy application is strongly
-//! consistent"); vector indexes, streams, SSE and the other members this slice does not
-//! store are refused with the scaffold's 501 and filed as their own gap issues.
+//! consistent"); a `StreamSpecification` that enables a stream registers one in the
+//! DynamoDB Streams store, and the table reports its
+//! `LatestStreamArn`/`LatestStreamLabel`; vector indexes, SSE and the other members
+//! this slice does not store are refused with the scaffold's 501 and filed as their
+//! own gap issues.
 //!
 //! The table is stored under the REGION the request's endpoint names
 //! ([`crate::state::request_region`], which reads it from the credential scope or from
@@ -308,6 +311,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let key_schema = validated_key_schema(&input).map_err(lift)?;
+        // The stream the table publishes to, when the request enables one: its view
+        // type is resolved before anything is stored, so a specification that cannot
+        // hold together refuses the whole create.
+        let stream_view_type = match input.stream_specification.as_ref() {
+            Some(specification) => crate::state::stream_view_type(specification)
+                .map_err(lift)?
+                .map(str::to_string),
+            None => None,
+        };
         let (billing_mode, provisioned_throughput) = validated_throughput(&input).map_err(lift)?;
         // The warm throughput the table starts life with: the request's values where it
         // named them, otherwise the pair the table's own capacity keeps warm, in force
@@ -380,6 +392,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // table becomes ACTIVE at — this response still reports the table CREATING and
         // therefore carries no timestamp yet.
         let pay_per_request_at = (billing_mode == "PAY_PER_REQUEST").then_some(active_at);
+        // A stream the request enables is registered in the DYNAMODB STREAMS store
+        // (`crate::state::register_table_stream`), because the stream, its shards and
+        // its records are that service's resources; this table keeps only the latest
+        // stream's identity, which the description below reports. Registration
+        // happens after every refusal above, so a create that fails registers
+        // nothing.
+        let stream = match stream_view_type.as_deref() {
+            Some(view_type) => Some(
+                crate::state::register_table_stream(
+                    &*self.engine,
+                    &name,
+                    &region,
+                    &key_schema,
+                    view_type,
+                    now,
+                )
+                .map_err(stream_not_registered)?,
+            ),
+            None => None,
+        };
         let table = crate::state::Table {
             arn: crate::state::table_arn(&region, &name),
             name: name.clone(),
@@ -409,6 +441,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             pay_per_request_at,
             removed_at: None,
             resource_policy,
+            stream,
             items: ::std::collections::BTreeMap::new(),
             stored_bytes: 0,
             // A new table has been metered once, at zero: `ItemCount`/`TableSizeBytes` are
@@ -417,7 +450,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let description = table.describe(now);
         store.insert_table(table);
-
         // The audit record for a state-changing call: who asked, what was created and that
         // it succeeded. Never a credential — only the access key id the caller presented.
         ::tracing::info!(
@@ -453,6 +485,34 @@ fn store_unavailable() -> CreateTableError {
         message: Some("the DynamoDB table store is unavailable".to_string()),
     })
     .into()
+}
+
+/// The modelled refusal for a create that enables a stream the streams registry did
+/// not take: its own quota is the control plane's `LimitExceededException`, and a
+/// store this process cannot reach at all is a server fault. Refusing either way is
+/// the only honest answer — a table reported with a stream nothing registered would
+/// be invisible to every streams consumer.
+fn stream_not_registered(fault: crate::state::StreamFault) -> CreateTableError {
+    match fault {
+        crate::state::StreamFault::Rejected(reason) => {
+            CreateTableErrorModeled::LimitExceededException(LimitExceededException {
+                message: Some(format!("Subscriber limit exceeded: {reason}")),
+            })
+            .into()
+        }
+        crate::state::StreamFault::StoreUnavailable => {
+            CreateTableErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the DynamoDB Streams store is unavailable".to_string()),
+            })
+            .into()
+        }
+        crate::state::StreamFault::Internal(detail) => {
+            CreateTableErrorModeled::InternalServerError(InternalServerError {
+                message: Some(detail.to_string()),
+            })
+            .into()
+        }
+    }
 }
 
 /// Lift a store refusal into this operation's error channel. `CreateTable` looks no
@@ -502,15 +562,6 @@ fn unsupported_member(input: &CreateTableInput) -> Option<&'static str> {
         .is_some_and(|indexes| !indexes.is_empty())
     {
         return Some("VectorIndexes");
-    }
-    // A specification that turns the feature OFF asks for what this emulator already
-    // does, so only an enabling one is refused.
-    if input
-        .stream_specification
-        .as_ref()
-        .is_some_and(|specification| specification.stream_enabled)
-    {
-        return Some("StreamSpecification");
     }
     if input
         .sse_specification

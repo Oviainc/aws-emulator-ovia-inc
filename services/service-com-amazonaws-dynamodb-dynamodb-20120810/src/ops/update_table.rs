@@ -23,7 +23,14 @@
 //! A request that names NO updatable member at all is refused as a `ValidationException`
 //! before any of that: it is permanently invalid rather than a transient conflict.
 //!
-//! Members this slice does not store (streams, SSE, replicas, witnesses, on-demand
+//! A `StreamSpecification` enables or disables the table's DynamoDB Streams stream,
+//! which lives in the streams service's own store: enabling registers a stream and
+//! the table starts reporting its `LatestStreamArn`/`LatestStreamLabel`, disabling
+//! closes it. Both contradictions the model names ("you try to enable a stream on a
+//! table that already has a stream, or ... disable a stream on a table that doesn't
+//! have a stream") are `ResourceInUseException`.
+//!
+//! Members this slice does not store (SSE, replicas, witnesses, on-demand
 //! throughput, a PER-INDEX warm throughput, multi-region consistency and vector
 //! indexes) are refused with the scaffold's 501 and are their own gap issues.
 //!
@@ -289,6 +296,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
         let index_updates = validated_index_updates(&input).map_err(lift)?;
+        // What the request's `StreamSpecification` asks for, resolved before the
+        // store lock is taken: a specification that cannot hold together refuses the
+        // whole update.
+        let stream_request = requested_stream_change(&input).map_err(lift)?;
         // Every other caller-sized list is clamped here too, BEFORE the store lock is
         // taken, so no loop whose length the request chooses runs inside the critical
         // section.
@@ -376,6 +387,52 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request declares for no key at all is refused the way CreateTable refuses it.
         let definitions =
             retained_definitions(declared, table, &indexes, &declared_definitions).map_err(lift)?;
+        // What this request asks of the table's stream, decided against the STORED
+        // stream: "You receive a ResourceInUseException if you try to enable a stream
+        // on a table that already has a stream, or if you try to disable a stream on
+        // a table that doesn't have a stream" (`UpdateTable$StreamSpecification`), so
+        // both contradictions are refused here — the last step that can fail, which
+        // is what lets the writes below apply whole.
+        let stream = match (&stream_request, table.stream.clone()) {
+            (StreamRequest::Unchanged, stored) => stored,
+            (StreamRequest::Enable(_), Some(stored)) if stored.enabled => {
+                return Err(stream_in_use(&name, "already has a stream"))
+            }
+            // A table with no stream, or one whose stream was disabled, gets a NEW
+            // stream: a stream's identity is its ARN and label, and the disabled one
+            // keeps the records it captured, so re-enabling cannot reuse it.
+            (StreamRequest::Enable(view_type), _) => Some(
+                crate::state::register_table_stream(
+                    &*self.engine,
+                    &name,
+                    &region,
+                    &table.key_schema,
+                    view_type,
+                    now,
+                )
+                .map_err(stream_not_registered)?,
+            ),
+            (StreamRequest::Disable, Some(stored)) if stored.enabled => {
+                // The table's enabled stream is always in the registry (the clock
+                // reclaims a stream only 24 hours after it is DISABLED), so a
+                // registry that does not hold it is a broken invariant rather than a
+                // state the caller can reach — reported as such.
+                if !crate::state::disable_table_stream(&*self.engine, &stored.arn, now) {
+                    return Err(stream_not_registered(crate::state::StreamFault::Internal(
+                        "the table's enabled stream is not in the DynamoDB Streams registry",
+                    )));
+                }
+                // The table keeps reporting the ARN and label: they name its LATEST
+                // stream, which outlives the disable.
+                Some(crate::state::TableStream {
+                    enabled: false,
+                    ..stored
+                })
+            }
+            (StreamRequest::Disable, _) => {
+                return Err(stream_in_use(&name, "does not have a stream"))
+            }
+        };
 
         // Nothing above wrote to the table, so from here on the update applies whole.
         //
@@ -422,6 +479,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         table.warm_throughput = warm_throughput;
         table.attribute_definitions = definitions;
         table.global_secondary_indexes = indexes;
+        table.stream = stream;
         if let Some(table_class) = input.table_class.clone() {
             table.table_class = Some(table_class);
         }
@@ -456,6 +514,75 @@ fn lift(error: crate::state::RequestError) -> UpdateTableError {
             crate::scaffolded::Scaffolded::validation(message)
         }
     }
+}
+
+/// The modelled refusal for an update whose stream change the streams registry did
+/// not take: its own quota is the control plane's `LimitExceededException`, and a
+/// store this process cannot reach at all is a server fault. Refusing either way is
+/// the only honest answer — a table reported with a stream nothing registered would
+/// be invisible to every streams consumer.
+fn stream_not_registered(fault: crate::state::StreamFault) -> UpdateTableError {
+    match fault {
+        crate::state::StreamFault::Rejected(reason) => {
+            UpdateTableErrorModeled::LimitExceededException(LimitExceededException {
+                message: Some(format!("Subscriber limit exceeded: {reason}")),
+            })
+            .into()
+        }
+        crate::state::StreamFault::StoreUnavailable => {
+            UpdateTableErrorModeled::InternalServerError(InternalServerError {
+                message: Some("the DynamoDB Streams store is unavailable".to_string()),
+            })
+            .into()
+        }
+        crate::state::StreamFault::Internal(detail) => {
+            UpdateTableErrorModeled::InternalServerError(InternalServerError {
+                message: Some(detail.to_string()),
+            })
+            .into()
+        }
+    }
+}
+
+/// The modelled refusal for a `StreamSpecification` that contradicts the table's
+/// stored stream, which the model declares for exactly these two cases: "You receive
+/// a ResourceInUseException if you try to enable a stream on a table that already
+/// has a stream, or if you try to disable a stream on a table that doesn't have a
+/// stream" (`UpdateTable$StreamSpecification`).
+fn stream_in_use(name: &str, state: &str) -> UpdateTableError {
+    UpdateTableErrorModeled::ResourceInUseException(ResourceInUseException {
+        message: Some(format!(
+            "Attempt to change a resource which is still in use: Table {name} {state}"
+        )),
+    })
+    .into()
+}
+
+/// What a request's `StreamSpecification` asks of the table's stream.
+#[derive(Debug)]
+enum StreamRequest {
+    /// The request names no `StreamSpecification`, so the table's stream — whether it
+    /// has one or not — is left exactly as it is.
+    Unchanged,
+    /// Turn a stream ON, capturing records in this `StreamViewType`.
+    Enable(String),
+    /// Turn the table's stream OFF.
+    Disable,
+}
+
+/// Read the request's `StreamSpecification` as one of the three things it can ask
+/// for, refusing a specification that cannot hold together
+/// ([`crate::state::stream_view_type`]).
+fn requested_stream_change(
+    input: &UpdateTableInput,
+) -> Result<StreamRequest, crate::state::RequestError> {
+    let Some(specification) = input.stream_specification.as_ref() else {
+        return Ok(StreamRequest::Unchanged);
+    };
+    Ok(match crate::state::stream_view_type(specification)? {
+        Some(view_type) => StreamRequest::Enable(view_type.to_string()),
+        None => StreamRequest::Disable,
+    })
 }
 
 /// One input member that can ASK FOR A CHANGE: its name, and the test for whether this
@@ -557,15 +684,6 @@ fn asks_to_move_capacity(input: &UpdateTableInput) -> bool {
 
 /// The first input member present that this slice does not store, if any.
 fn unsupported_member(input: &UpdateTableInput) -> Option<&'static str> {
-    // A specification that turns a feature OFF asks for what this emulator already
-    // does, so only an enabling one is refused.
-    if input
-        .stream_specification
-        .as_ref()
-        .is_some_and(|specification| specification.stream_enabled)
-    {
-        return Some("StreamSpecification");
-    }
     if input
         .sse_specification
         .as_ref()

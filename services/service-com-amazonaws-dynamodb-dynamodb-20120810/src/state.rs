@@ -21,8 +21,9 @@ use crate::ops::types::{
     ConsumedCapacity, ExpectedAttributeValue, GlobalSecondaryIndexDescription,
     GlobalSecondaryIndexWarmThroughputDescription,
     ItemCollectionMetrics, KeySchemaElement, LocalSecondaryIndexDescription, Projection,
-    ProvisionedThroughput, ProvisionedThroughputDescription, Tag, TableClassSummary,
-    TableDescription, TableThroughputModeSummary, TableWarmThroughputDescription, WarmThroughput,
+    ProvisionedThroughput, ProvisionedThroughputDescription, StreamSpecification, Tag,
+    TableClassSummary, TableDescription, TableThroughputModeSummary,
+    TableWarmThroughputDescription, WarmThroughput,
 };
 
 /// A DynamoDB item: the attribute-name -> attribute-value map a client put.
@@ -1188,6 +1189,28 @@ fn utc_day(instant: SystemTime) -> i64 {
         })
 }
 
+/// The DynamoDB Streams stream a table publishes its item-level changes to.
+///
+/// A stream is a resource of the STREAMS service, which owns the registry its own
+/// consumers read ([`register_table_stream`]); what the table keeps is the identity
+/// of its latest stream — "the ARN that uniquely identifies the latest stream for
+/// this table" (`TableDescription$LatestStreamArn`) — and the specification that
+/// stream was created from, which is what every `TableDescription` reports.
+#[derive(Debug, Clone)]
+pub struct TableStream {
+    /// `TableDescription$LatestStreamArn`, as the streams service minted it.
+    pub arn: String,
+    /// `TableDescription$LatestStreamLabel`: "a timestamp, in ISO 8601 format, for
+    /// this stream".
+    pub label: String,
+    /// The wire `StreamViewType` the stream captures records in.
+    pub view_type: String,
+    /// Whether the stream is still ON. A disabled stream keeps its ARN and label:
+    /// AWS reports the LATEST stream of the table, and the stream itself outlives
+    /// the disable (it is deleted 24 hours later).
+    pub enabled: bool,
+}
+
 /// The METERED figures a table or index description reports as `ItemCount` and
 /// `TableSizeBytes`/`IndexSizeBytes`.
 ///
@@ -1603,6 +1626,11 @@ pub struct Table {
     /// evaluates before it reads or writes an item, and what `GetResourcePolicy`
     /// reports.
     pub resource_policy: Option<AttachedPolicy>,
+    /// The stream this table publishes to, or `None` for a table that has never had
+    /// one. A table whose stream was disabled keeps it here, disabled, because
+    /// `LatestStreamArn`/`LatestStreamLabel` report the table's latest stream
+    /// whether or not it is currently on.
+    pub stream: Option<TableStream>,
     pub items: BTreeMap<ItemKey, Item>,
     /// The metered figures `ItemCount` and `TableSizeBytes` report — refreshed on the
     /// documented schedule by [`Table::refresh_due_counters`], never on the write path.
@@ -2213,6 +2241,16 @@ impl Table {
                 status: Some(self.warm_throughput.status(now).as_str().to_string()),
             }),
             deletion_protection_enabled: Some(self.deletion_protection_enabled),
+            // "The current DynamoDB Streams configuration for the table": reported
+            // only for a table that has a stream, which is what DescribeTable does
+            // for a table that never enabled one. A disabled stream reports the flag
+            // alone, since no view type is in force.
+            stream_specification: self.stream.as_ref().map(|stream| StreamSpecification {
+                stream_enabled: stream.enabled,
+                stream_view_type: stream.enabled.then(|| stream.view_type.clone()),
+            }),
+            latest_stream_arn: self.stream.as_ref().map(|stream| stream.arn.clone()),
+            latest_stream_label: self.stream.as_ref().map(|stream| stream.label.clone()),
             ..TableDescription::default()
         }
     }
@@ -2759,6 +2797,17 @@ pub fn index_arn(region: &str, table: &str, index: &str) -> String {
         &format!("table/{table}/index/{index}"),
     )
 }
+
+// =============================================================================
+// The DynamoDB Streams seam lives in `state/streams_seam.rs`: enabling a stream
+// on a table registers it in the STREAMS service's own registry, and this store
+// keeps only the table's latest stream identity.
+// =============================================================================
+pub mod streams_seam;
+
+pub use streams_seam::{
+    disable_table_stream, register_table_stream, stream_view_type, StreamFault,
+};
 
 /// The form a table name must take: 3..=255 characters of
 /// `[a-zA-Z0-9_.-]` (the `CreateTable$TableName` doc's own length and pattern —
