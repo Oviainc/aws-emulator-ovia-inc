@@ -547,15 +547,114 @@ pub fn co_required_setting_error(
     qualifier_set: bool,
 ) -> Option<String> {
     match (enabled, qualifier_set) {
-        (true, false) => Some(format!(
-            "Settings.{qualifier} is required when Settings.{toggle} is set. Correct \
-             your request and try again."
+        (true, false) => Some(missing_companion_message(
+            &format!("Settings.{toggle}"),
+            &format!("Settings.{qualifier}"),
         )),
-        (false, true) => Some(format!(
-            "Settings.{toggle} must be set when Settings.{qualifier} is specified. \
-             Correct your request and try again."
+        (false, true) => Some(missing_companion_message(
+            &format!("Settings.{qualifier}"),
+            &format!("Settings.{toggle}"),
         )),
         _ => None,
+    }
+}
+
+/// How this service words "the member you included needs one you left out", for
+/// `member` present in a request whose companion `companion` is absent.
+///
+/// The one template for every co-requirement of this service, so a refusal reads the
+/// same whichever member pair it is about: the BOTH-ways settings pairs that
+/// [`co_required_setting_error`] decides and the ONE-way requirements a request member
+/// documents on itself ("If you include X in your request, you must also include Y").
+/// Both member names are spelled by the CALLER, fully qualified
+/// (`Settings.VocabularyFilterMethod`, `JobExecutionSettings.DataAccessRoleArn`), so
+/// the text names the member path the caller sent and carries no other request value.
+pub fn missing_companion_message(member: &str, companion: &str) -> String {
+    format!(
+        "{companion} is required when {member} is specified. Correct your request and \
+         try again."
+    )
+}
+
+/// The refusal for a ONE-way co-requirement: `Some(message)` when `member` is in the
+/// request and the `companion` it documents as co-required is not, `None` otherwise.
+///
+/// Several members of this service's start requests document the same rule on the
+/// member itself — "Note that if you include `VocabularyFilterName` in your request,
+/// you must also include `VocabularyFilterMethod`", "If you include
+/// `JobExecutionSettings` in your request, you must also include the sub-parameters:
+/// `AllowDeferredExecution` and `DataAccessRoleArn`", "If you include `ModelSettings`
+/// in your request, you must include the `LanguageModelName` sub-parameter", "If you
+/// include `LanguageOptions` in your request, you must also include
+/// `IdentifyLanguage`", "Use in combination with `OutputBucketName`"
+/// (`smithy_query(query="operation", operation="StartTranscriptionJob")` and
+/// `smithy_query(query="shape", shape="Settings,ModelSettings,JobExecutionSettings")`).
+/// Unlike [`co_required_setting_error`] the rule holds in ONE direction only: the
+/// companion alone is a whole request.
+pub fn missing_companion_error(
+    member: &str,
+    present: bool,
+    companion: &str,
+    companion_present: bool,
+) -> Option<String> {
+    (present && !companion_present).then(|| missing_companion_message(member, companion))
+}
+
+/// The references a request's settings name, as
+/// [`ComAmazonawsTranscribeTranscribeState::unheld_reference_error`] reads them: the
+/// custom vocabulary, custom vocabulary filter and custom language model a settings
+/// shape of this service can name, each paired with the family its name belongs to.
+///
+/// Every settings shape that can name custom resources names these same three
+/// families, so which family each member reads is decided here once rather than in
+/// each operation that accepts one.
+pub fn custom_resource_references<'a>(
+    vocabulary: Option<&'a str>,
+    vocabulary_filter: Option<&'a str>,
+    language_model: Option<&'a str>,
+) -> Vec<(ResourceFamily, Option<&'a str>)> {
+    vec![
+        (ResourceFamily::Vocabulary, vocabulary),
+        (ResourceFamily::VocabularyFilter, vocabulary_filter),
+        (ResourceFamily::LanguageModel, language_model),
+    ]
+}
+
+/// Append every custom resource the per-language `LanguageIdSettings` of a request
+/// name to `references`, in the form
+/// [`ComAmazonawsTranscribeTranscribeState::unheld_reference_error`] reads.
+///
+/// `LanguageIdSettings` names resources of the very same three families a request's
+/// top-level settings do (`VocabularyName`, `VocabularyFilterName`,
+/// `LanguageModelName` — `smithy_query(query="shape", shape="LanguageIdSettings")`),
+/// so the expansion is single-homed here: the operations that accept the map cannot
+/// end up checking different members of it. The entries are walked in language-code
+/// order rather than the map's own, so which dangling name a refusal reports is the
+/// same on every run.
+pub fn extend_language_id_references<'a>(
+    references: &mut Vec<(ResourceFamily, Option<&'a str>)>,
+    per_language: Option<&'a std::collections::HashMap<String, LanguageIdSettings>>,
+) {
+    let Some(per_language) = per_language else {
+        return;
+    };
+    let mut entries: Vec<(&String, &LanguageIdSettings)> = per_language.iter().collect();
+    entries.sort_by_key(|(language, _)| *language);
+    for (_, settings) in entries {
+        references.extend([
+            (
+                ResourceFamily::Vocabulary,
+                settings.vocabulary_name.as_deref(),
+            ),
+            (
+                ResourceFamily::VocabularyFilter,
+                settings.vocabulary_filter_name.as_deref(),
+            ),
+            (
+                ResourceFamily::LanguageModel,
+                settings.language_model_name.as_deref(),
+            ),
+        ]);
     }
 }
 
@@ -797,6 +896,37 @@ impl ComAmazonawsTranscribeTranscribeState {
         Some(record)
     }
 
+    /// Whether this account holds a resource of `family` named `name`.
+    ///
+    /// Reads the same per-family lookup [`Self::tags`] does, so "this account holds
+    /// it" cannot mean one thing to a tagging call and another to a job start. Borrows
+    /// the name rather than building a [`ResourceRef`], so a start checking several
+    /// references allocates nothing.
+    pub fn holds(&self, family: ResourceFamily, name: &str) -> bool {
+        self.tags_of(family, name).is_some()
+    }
+
+    /// The refusal for the first resource `references` names that this account does
+    /// not hold, or `None` when every named one is held.
+    ///
+    /// A job's settings may NAME a custom vocabulary, custom vocabulary filter or
+    /// custom language model, and a name no create of that family ever recorded names
+    /// nothing this emulator could apply — so a start that carries one is refused with
+    /// the family's own not-found text ([`not_found_message`]) rather than stored on a
+    /// job that would report the dangling name back. Each reference is the family the
+    /// member's target resource belongs to and the name the request put there, or
+    /// `None` where the request left the member out; the families are distinct stores,
+    /// so a resource of one family never stands in for another's.
+    pub fn unheld_reference_error(
+        &self,
+        references: &[(ResourceFamily, Option<&str>)],
+    ) -> Option<String> {
+        references.iter().find_map(|(family, name)| {
+            let name = (*name)?;
+            (!self.holds(*family, name)).then(|| not_found_message(family.kind()))
+        })
+    }
+
     /// The tag set of the resource `resource` names, or `None` when this account holds
     /// no such resource.
     ///
@@ -805,39 +935,43 @@ impl ComAmazonawsTranscribeTranscribeState {
     /// about which ARN names which stored record, so both match on the same resource
     /// types.
     pub fn tags(&self, resource: &ResourceRef) -> Option<&Vec<Tag>> {
-        match ResourceFamily::from_resource_type(&resource.resource_type)? {
-            ResourceFamily::TranscriptionJob => self
-                .transcription_jobs
-                .get(&resource.name)
-                .map(|record| &record.tags),
+        let family = ResourceFamily::from_resource_type(&resource.resource_type)?;
+        self.tags_of(family, &resource.name)
+    }
+
+    /// The tag set of the resource `family` names `name`, or `None` when this account
+    /// holds no such resource.
+    ///
+    /// The lookup [`Self::tags`] and [`Self::holds`] both read, by family and borrowed
+    /// name: one place decides which family's store answers for which resource.
+    pub fn tags_of(&self, family: ResourceFamily, name: &str) -> Option<&Vec<Tag>> {
+        match family {
+            ResourceFamily::TranscriptionJob => {
+                self.transcription_jobs.get(name).map(|record| &record.tags)
+            }
             ResourceFamily::MedicalTranscriptionJob => self
                 .medical_transcription_jobs
-                .get(&resource.name)
+                .get(name)
                 .map(|record| &record.tags),
-            ResourceFamily::Vocabulary => self
-                .vocabularies
-                .get(&resource.name)
-                .map(|record| &record.tags),
+            ResourceFamily::Vocabulary => self.vocabularies.get(name).map(|record| &record.tags),
             ResourceFamily::MedicalVocabulary => self
                 .medical_vocabularies
-                .get(&resource.name)
+                .get(name)
                 .map(|record| &record.tags),
             ResourceFamily::VocabularyFilter => self
                 .vocabulary_filters
-                .get(&resource.name)
+                .get(name)
                 .map(|record| &record.tags),
-            ResourceFamily::LanguageModel => self
-                .language_models
-                .get(&resource.name)
-                .map(|record| &record.tags),
+            ResourceFamily::LanguageModel => {
+                self.language_models.get(name).map(|record| &record.tags)
+            }
             ResourceFamily::CallAnalyticsCategory => self
                 .call_analytics_categories
-                .get(&resource.name)
+                .get(name)
                 .map(|record| &record.tags),
-            ResourceFamily::MedicalScribeJob => self
-                .medical_scribe_jobs
-                .get(&resource.name)
-                .map(|record| &record.tags),
+            ResourceFamily::MedicalScribeJob => {
+                self.medical_scribe_jobs.get(name).map(|record| &record.tags)
+            }
         }
     }
 

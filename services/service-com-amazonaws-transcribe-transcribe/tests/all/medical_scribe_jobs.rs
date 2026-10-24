@@ -182,9 +182,43 @@ async fn delete(transcribe: &Transcribe, name: &str) -> crate::transcription_job
         .await
 }
 
+/// Create the custom resources the rows of [`start_requests`] NAME, so each row
+/// applies a custom vocabulary and vocabulary filter this account holds.
+///
+/// A start may only name custom resources that exist — "The name of the custom
+/// vocabulary you want to include in your Medical Scribe request", and the same
+/// sentence for the filter (`smithy_query(query="shape",
+/// shape="MedicalScribeSettings")`) — so a suite that starts a job naming them creates
+/// them first.
+async fn create_named_resources(transcribe: &Transcribe) {
+    transcribe
+        .call(
+            "CreateVocabulary",
+            json!({
+                "VocabularyName": "clinic-terms",
+                "LanguageCode": "en-US",
+                "Phrases": ["Aardvark", "Transcribe"]
+            }),
+        )
+        .await
+        .ok("CreateVocabulary clinic-terms");
+    transcribe
+        .call(
+            "CreateVocabularyFilter",
+            json!({
+                "VocabularyFilterName": "blocked-terms",
+                "LanguageCode": "en-US",
+                "Words": ["crud"]
+            }),
+        )
+        .await
+        .ok("CreateVocabularyFilter blocked-terms");
+}
+
 #[tokio::test]
 async fn a_started_medical_scribe_job_reads_back_exactly_as_it_was_started() {
     let transcribe = Transcribe::new();
+    create_named_resources(&transcribe).await;
 
     for (case, request) in start_requests() {
         let started = transcribe
@@ -266,6 +300,7 @@ async fn a_started_medical_scribe_job_reads_back_exactly_as_it_was_started() {
 #[tokio::test]
 async fn a_medical_scribe_job_completes_once_its_processing_span_has_elapsed() {
     let transcribe = Transcribe::new();
+    create_named_resources(&transcribe).await;
 
     for (case, request) in start_requests() {
         transcribe
@@ -324,6 +359,7 @@ async fn a_medical_scribe_job_completes_once_its_processing_span_has_elapsed() {
 #[tokio::test]
 async fn a_terminal_medical_scribe_job_is_deletable_exactly_once() {
     let transcribe = Transcribe::new();
+    create_named_resources(&transcribe).await;
 
     for (case, request) in start_requests() {
         transcribe
@@ -365,6 +401,7 @@ async fn a_terminal_medical_scribe_job_is_deletable_exactly_once() {
 #[tokio::test]
 async fn a_medical_scribe_job_the_service_is_still_working_on_is_not_deletable() {
     let transcribe = Transcribe::new();
+    create_named_resources(&transcribe).await;
 
     for (case, request) in start_requests() {
         let name = job_name(&request);
@@ -593,6 +630,7 @@ async fn a_start_whose_members_cannot_hold_together_is_refused() {
 #[tokio::test]
 async fn a_second_start_under_a_live_job_name_is_a_conflict() {
     let transcribe = Transcribe::new();
+    create_named_resources(&transcribe).await;
 
     for (case, request) in start_requests() {
         transcribe

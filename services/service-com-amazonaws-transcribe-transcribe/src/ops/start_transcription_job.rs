@@ -360,9 +360,99 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The ONE-way co-requirements this request's members document on themselves —
+        // "if you include VocabularyFilterName in your request, you must also include
+        // VocabularyFilterMethod", "If you include JobExecutionSettings in your
+        // request, you must also include the sub-parameters: AllowDeferredExecution
+        // and DataAccessRoleArn", "If you include ModelSettings in your request, you
+        // must include the LanguageModelName sub-parameter", "Use in combination with
+        // OutputBucketName to specify the output location of your transcript" and "If
+        // you include LanguageOptions in your request, you must also include
+        // IdentifyLanguage" (the automatic language identification that restricts it,
+        // which `IdentifyMultipleLanguages` also documents taking `LanguageOptions`).
+        // Language options restrict identification, so what satisfies that last one is
+        // identification actually ASKED FOR: the member present and true, never present
+        // and false.
+        // A request that names only one side is refused rather than stored, so no
+        // stored job reports a vocabulary filter with no method, queueing with no role
+        // to read the media with, a language model setting naming no model, an output
+        // key with no bucket to write it under, or language options with no language
+        // identification to restrict. [`crate::state::missing_companion_error`] words
+        // every one of them.
+        let settings = input.settings.as_ref();
+        let job_execution = input.job_execution_settings.as_ref();
+        let model_settings = input.model_settings.as_ref();
+        for (member, present, companion, companion_present) in [
+            (
+                "Settings.VocabularyFilterName",
+                settings.is_some_and(|settings| settings.vocabulary_filter_name.is_some()),
+                "Settings.VocabularyFilterMethod",
+                settings.is_some_and(|settings| settings.vocabulary_filter_method.is_some()),
+            ),
+            (
+                "JobExecutionSettings",
+                job_execution.is_some(),
+                "JobExecutionSettings.AllowDeferredExecution",
+                job_execution.is_some_and(|settings| settings.allow_deferred_execution.is_some()),
+            ),
+            (
+                "JobExecutionSettings",
+                job_execution.is_some(),
+                "JobExecutionSettings.DataAccessRoleArn",
+                job_execution.is_some_and(|settings| settings.data_access_role_arn.is_some()),
+            ),
+            (
+                "ModelSettings",
+                model_settings.is_some(),
+                "ModelSettings.LanguageModelName",
+                model_settings.is_some_and(|settings| settings.language_model_name.is_some()),
+            ),
+            (
+                "OutputKey",
+                input.output_key.is_some(),
+                "OutputBucketName",
+                input.output_bucket_name.is_some(),
+            ),
+            (
+                "LanguageOptions",
+                input.language_options.is_some(),
+                "IdentifyLanguage or IdentifyMultipleLanguages",
+                input.identify_language == Some(true)
+                    || input.identify_multiple_languages == Some(true),
+            ),
+        ] {
+            if let Some(message) =
+                crate::state::missing_companion_error(member, present, companion, companion_present)
+            {
+                return Err(bad_request(&message));
+            }
+        }
+
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
+
+        // A job may only apply a custom vocabulary, custom vocabulary filter or custom
+        // language model this account HOLDS: each of those members names a resource of
+        // its own family ("The name of the custom vocabulary you want to use in your
+        // transcription job request", and the same sentence for the filter and the
+        // model), so a name no create of that family recorded is refused here rather
+        // than stored on a job that would report it back. The per-language
+        // `LanguageIdSettings` name resources of the very same families, so every
+        // entry of it is checked too — see
+        // [`crate::state::unheld_reference_error`].
+        let mut references = crate::state::custom_resource_references(
+            settings.and_then(|settings| settings.vocabulary_name.as_deref()),
+            settings.and_then(|settings| settings.vocabulary_filter_name.as_deref()),
+            model_settings.and_then(|settings| settings.language_model_name.as_deref()),
+        );
+        crate::state::extend_language_id_references(
+            &mut references,
+            input.language_id_settings.as_ref(),
+        );
+        if let Some(message) = store.unheld_reference_error(&references) {
+            return Err(bad_request(&message));
+        }
 
         if store
             .transcription_jobs
