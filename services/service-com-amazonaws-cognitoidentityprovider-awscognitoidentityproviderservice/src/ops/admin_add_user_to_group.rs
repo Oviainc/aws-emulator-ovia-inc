@@ -195,7 +195,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reported first is not something AWS documents; each is reported on its
         // own.
         if !pool.groups.contains_key(&input.group_name) {
-            return Err(group_not_found(&input.group_name));
+            return Err(group_not_found());
         }
 
         // `Username` "can be any of their alias attributes" or "the sub of a
@@ -221,10 +221,12 @@ fn user_pool_not_found(user_pool_id: &str) -> AdminAddUserToGroupError {
     .into()
 }
 
-/// This operation's `ResourceNotFoundException` for a group the pool does not hold.
-fn group_not_found(group_name: &str) -> AdminAddUserToGroupError {
+/// This operation's `ResourceNotFoundException` for a group the pool does not
+/// hold. Carries the fixed message of
+/// [`crate::state::GROUP_NOT_FOUND_MESSAGE`], which names no group.
+fn group_not_found() -> AdminAddUserToGroupError {
     AdminAddUserToGroupErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("Group not found: {group_name}")),
+        message: Some(crate::state::GROUP_NOT_FOUND_MESSAGE.to_string()),
     })
     .into()
 }

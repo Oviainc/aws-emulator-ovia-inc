@@ -166,7 +166,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let group = pool
             .groups
             .get(&input.group_name)
-            .ok_or_else(|| group_not_found(&input.group_name))?;
+            .ok_or_else(group_not_found)?;
 
         // Rendered from the STORED group: this read changes nothing.
         Ok(GetGroupOutput {
@@ -183,10 +183,12 @@ fn user_pool_not_found(user_pool_id: &str) -> GetGroupError {
     .into()
 }
 
-/// This operation's `ResourceNotFoundException` for a group the pool does not hold.
-fn group_not_found(group_name: &str) -> GetGroupError {
+/// This operation's `ResourceNotFoundException` for a group the pool does not
+/// hold. Carries the fixed message of
+/// [`crate::state::GROUP_NOT_FOUND_MESSAGE`], which names no group.
+fn group_not_found() -> GetGroupError {
     GetGroupErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(format!("Group not found: {group_name}")),
+        message: Some(crate::state::GROUP_NOT_FOUND_MESSAGE.to_string()),
     })
     .into()
 }
