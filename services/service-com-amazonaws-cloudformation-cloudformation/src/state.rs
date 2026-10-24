@@ -5,7 +5,7 @@
 //! One store holds every stack this emulator has ever created, in creation order, so
 //! `CreateStack` / `UpdateStack` / `DeleteStack` write exactly the rows
 //! `DescribeStacks` / `ListStacks` / `GetTemplate` / `DescribeStackEvents` /
-//! `DescribeStackResources` read back.
+//! `DescribeStackResources` / `ListStackResources` read back.
 //! A deleted stack is NOT dropped: CloudFormation keeps a deleted stack's summary,
 //! template, events and resources addressable by its stack id (`ListStacks`: "Summary
 //! information for stacks that have been deleted is kept for 90 days"; `GetTemplate`:

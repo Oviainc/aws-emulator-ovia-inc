@@ -40,7 +40,7 @@ pub(crate) struct WireResource {
     pub(crate) logical_id: Option<String>,
     pub(crate) physical_id: Option<String>,
     pub(crate) resource_type: Option<String>,
-    status: Option<String>,
+    pub(crate) status: Option<String>,
     status_reason: Option<String>,
     timestamp: Option<String>,
     drift_status: Option<String>,
