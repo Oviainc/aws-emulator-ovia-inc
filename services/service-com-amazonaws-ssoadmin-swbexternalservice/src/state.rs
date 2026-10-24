@@ -197,6 +197,16 @@ pub fn instance_not_found_message(instance_arn: &str) -> String {
     format!("No IAM Identity Center instance {instance_arn} exists in this account")
 }
 
+/// The refusal a `Scope` an application does not carry earns, as the message of the
+/// modelled `ResourceNotFoundException`.
+///
+/// Built from the request: it names both the scope and the application it was looked for
+/// on, because an unknown scope on a known application is a different failure from an
+/// unknown application.
+pub fn access_scope_not_found_message(application_arn: &str, scope: &str) -> String {
+    format!("Could not find access scope {scope} for application {application_arn}.")
+}
+
 /// The refusal a `TrustedTokenIssuerArn` nothing holds earns, as the message of the
 /// modelled `ResourceNotFoundException`.
 ///
@@ -345,6 +355,29 @@ pub fn quota_exceeded_message(store: &str) -> String {
     format!(
         "The principal has crossed the permitted number of resources that can be \
          created: this emulator holds at most {MAX_RECORDS_PER_STORE} {store}"
+    )
+}
+
+/// The maximum number of ACCESS SCOPES this emulator keeps on any ONE application
+/// ([`ApplicationRecord::access_scopes`]).
+///
+/// This is NOT an AWS quota — IAM Identity Center publishes none for it. It is the
+/// emulator's own MEMORY CEILING, the per-application counterpart of
+/// [`MAX_RECORDS_PER_STORE`]: `PutApplicationAccessScope` inserts one entry per distinct
+/// `Scope` name, the model's `Scope` pattern admits unboundedly many of them, and a
+/// stored scope lives until a caller deletes it — so without a ceiling a caller could
+/// grow the process until the host runs out of memory. A put that would add a scope
+/// beyond it is refused.
+pub const MAX_SCOPES_PER_APPLICATION: usize = 100;
+
+/// The message a put refuses a new access scope with once an application already holds
+/// [`MAX_SCOPES_PER_APPLICATION`] of them; built from the request, which names the
+/// application the ceiling was reached on.
+pub fn access_scope_ceiling_message(application_arn: &str) -> String {
+    format!(
+        "Cannot add another access scope: this emulator holds at most \
+         {MAX_SCOPES_PER_APPLICATION} access scopes per application, and \
+         {application_arn} already holds that many"
     )
 }
 
@@ -923,6 +956,19 @@ pub struct ApplicationRecord {
     /// [`application_fingerprint`] of that create, so a retry carrying the SAME token
     /// can be told from the same token carrying a DIFFERENT request.
     pub request_fingerprint: String,
+    /// The ACCESS SCOPES of this application, by `Scope` name, as
+    /// `PutApplicationAccessScope` stored them.
+    ///
+    /// They live ON the application record rather than in a second map, so an
+    /// application that no longer exists holds no scopes and the scope operations
+    /// resolve the same application every other read resolves. The value is the scope's
+    /// `AuthorizedTargets`: `None` for a scope stored with no authorized targets, which
+    /// is a different statement from an empty list the model's `ScopeTargets`
+    /// (`length 1..10`) cannot even express. A `BTreeMap` so an enumeration walks one
+    /// stable order and can page by scope name. Holds at most
+    /// [`MAX_SCOPES_PER_APPLICATION`] scopes; a put that would add one beyond that
+    /// ceiling is refused rather than grown into.
+    pub access_scopes: BTreeMap<String, Option<Vec<String>>>,
 }
 
 /// A direct assignment of one principal to one application.
@@ -991,9 +1037,9 @@ pub struct ComAmazonawsSsoadminSwbexternalserviceState {
     /// enumeration walks one stable order and can page by key. Holds at most
     /// [`MAX_RECORDS_PER_STORE`] records.
     pub trusted_token_issuers: BTreeMap<String, TrustedTokenIssuerRecord>,
-    /// Applications by `ApplicationArn`. A `BTreeMap` so an enumeration walks one
-    /// stable order and can page by key. Holds at most [`MAX_RECORDS_PER_STORE`]
-    /// records.
+    /// Applications by `ApplicationArn`, each carrying its own access scopes. A
+    /// `BTreeMap` so an enumeration walks one stable order and can page by key. Holds at
+    /// most [`MAX_RECORDS_PER_STORE`] records.
     pub applications: BTreeMap<String, ApplicationRecord>,
     /// Direct application assignments. At most one row per (application, principal type,
     /// principal id) tuple, and at most [`MAX_RECORDS_PER_STORE`] rows in all.
@@ -1248,6 +1294,12 @@ impl ComAmazonawsSsoadminSwbexternalserviceState {
     /// exists — never created, or created under an instance that has since gone.
     pub fn application(&self, application_arn: &str) -> Option<&ApplicationRecord> {
         self.applications.get(application_arn)
+    }
+
+    /// The application `application_arn` names, for a handler that updates it (a
+    /// `PutApplicationAccessScope` writing one of its access scopes, say).
+    pub fn application_mut(&mut self, application_arn: &str) -> Option<&mut ApplicationRecord> {
+        self.applications.get_mut(application_arn)
     }
 
     /// The application a previous `CreateApplication` minted under `client_token`, if

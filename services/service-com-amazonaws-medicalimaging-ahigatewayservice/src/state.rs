@@ -187,6 +187,20 @@ pub const IMAGE_SET_NOT_ACTIVE_MESSAGE: &str =
 /// with no identifier from the request in it.
 pub const IMAGE_FRAME_NOT_FOUND_MESSAGE: &str = "ImageFrame resource is not found.";
 
+/// The text this service refuses a call that would act on a data store, or on the
+/// contents of one, that has not settled into `ACTIVE` with — one still `CREATING` or
+/// already `DELETING`. Constant, and stated by rule rather than by which store it was,
+/// exactly like [`IMAGE_SET_NOT_ACTIVE_MESSAGE`] one resource kind down.
+pub const DATASTORE_NOT_ACTIVE_MESSAGE: &str =
+    "The data store is not in the ACTIVE state, so it cannot serve this request.";
+
+/// The text this service refuses the DELETE of a data store whose creation is still in
+/// flight with. A separate sentence from [`DATASTORE_NOT_ACTIVE_MESSAGE`] because the
+/// delete is the one call a `DELETING` store still answers (idempotently), so the only
+/// status it refuses is `CREATING`.
+pub const DATASTORE_STILL_CREATING_MESSAGE: &str =
+    "The data store is still being created, so it cannot be deleted yet.";
+
 /// The storage tier every image set this emulator holds reports.
 ///
 /// `StorageTier`'s other value, `ARCHIVE_INSTANT_ACCESS`, is reached by archiving, and
@@ -1031,6 +1045,35 @@ impl Datastore {
         self.datastore_name
             .clone()
             .unwrap_or_else(|| self.datastore_id.clone())
+    }
+
+    /// Whether this data store has settled into the one status that serves work on it or
+    /// on its contents: `ACTIVE`.
+    ///
+    /// A status change the clock still owes — `CREATING` on the way to `ACTIVE`,
+    /// `DELETING` on the way to gone — is exactly what the modelled `ConflictException`
+    /// (HTTP 409, "Updating or deleting a resource can cause an inconsistent state")
+    /// reports: acting on a store mid-transition would leave the transition and the call
+    /// disagreeing about the resource. The model states the same precondition in prose
+    /// for `StartDICOMImportJob`: "Start importing bulk data into an ACTIVE data store"
+    /// (`smithy_query(query="operation",operation="StartDICOMImportJob")`).
+    ///
+    /// A terminal status is NOT in flight: a `CREATE_FAILED` store never becomes usable,
+    /// but it is still deletable — see [`Datastore::creation_in_flight`].
+    pub fn is_active(&self) -> bool {
+        self.datastore_status == DatastoreStatus::Active
+    }
+
+    /// Whether this data store's CREATION is still in flight (`CREATING`), i.e. the
+    /// clock owes it the move to `ACTIVE`.
+    ///
+    /// What `DeleteDatastore` refuses: a delete admitted here would cancel a creation the
+    /// service has already promised, so it is answered with `ConflictException`. Every
+    /// other status is deletable — `ACTIVE` because it has settled, `CREATE_FAILED`
+    /// because a failed creation is terminal and has to be cleanable, and `DELETING`
+    /// because a repeat delete is idempotent.
+    pub fn creation_in_flight(&self) -> bool {
+        self.datastore_status == DatastoreStatus::Creating
     }
 
     /// Materialise every change the clock owed this data store by `now`.

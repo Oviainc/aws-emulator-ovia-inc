@@ -25,6 +25,8 @@ mod engagement_lifecycle;
 mod onboarding;
 #[path = "all/replication_set_precondition.rs"]
 mod replication_set_precondition;
+#[path = "all/rotation_deletes.rs"]
+mod rotation_deletes;
 #[path = "all/rotation_reads.rs"]
 mod rotation_reads;
 #[path = "all/start_engagement.rs"]

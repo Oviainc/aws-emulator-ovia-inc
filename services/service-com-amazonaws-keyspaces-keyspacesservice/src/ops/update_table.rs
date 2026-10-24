@@ -412,61 +412,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
-        if let Some(added) = input.add_columns {
-            // Every table reachable here carries the schema its `CreateTable` stored: the
-            // only schema-less tables are the service-managed ones, refused above.
-            let schema = match table.schema_definition.as_mut() {
-                Some(schema) => schema,
-                None => {
+        // What `addColumns` would do to the stored schema, checked BEFORE anything is
+        // written: a refused update leaves the table, and its revision history, exactly as
+        // they were.
+        let added_columns = match input.add_columns {
+            None => None,
+            Some(added) => {
+                // Every table reachable here carries the schema its `CreateTable` stored:
+                // the only schema-less tables are the service-managed ones, refused above.
+                let Some(schema) = table.schema_definition.as_ref() else {
                     return Err(invalid(crate::state::service_managed_rejection(
                         &input.keyspace_name,
-                    )))
+                    )));
+                };
+                // The schema is the one part of a stored table that GROWS, and it never
+                // shrinks: `addColumns` is modelled `len 1..` with no maximum, and every
+                // accepted update appends again. So the column count is capped the way this
+                // crate caps its other two caller-driven growth dimensions, refused past the
+                // cap with the quota error this operation models — checked BEFORE anything is
+                // stored, so neither one oversized list nor a run of updates can grow the
+                // schema without bound, and the scan below stays bounded too.
+                if schema.all_columns.len() + added.len() > crate::state::MAX_COLUMNS_PER_TABLE {
+                    return Err(UpdateTableErrorModeled::ServiceQuotaExceededException(
+                        ServiceQuotaExceededException {
+                            message: Some(format!(
+                                "adding {} column(s) to table '{}.{}' would exceed the limit of {} \
+                                 columns per table, which it already has {} of",
+                                added.len(),
+                                input.keyspace_name,
+                                input.table_name,
+                                crate::state::MAX_COLUMNS_PER_TABLE,
+                                schema.all_columns.len()
+                            )),
+                        },
+                    )
+                    .into());
                 }
-            };
-            // The schema is the one part of a stored table that GROWS, and it never
-            // shrinks: `addColumns` is modelled `len 1..` with no maximum, and every
-            // accepted update appends again. So the column count is capped the way this
-            // crate caps its other two caller-driven growth dimensions, refused past the
-            // cap with the quota error this operation models — checked BEFORE anything is
-            // stored, so neither one oversized list nor a run of updates can grow the
-            // schema without bound, and the scan below stays bounded too.
-            if schema.all_columns.len() + added.len() > crate::state::MAX_COLUMNS_PER_TABLE {
-                return Err(UpdateTableErrorModeled::ServiceQuotaExceededException(
-                    ServiceQuotaExceededException {
+                // A column holds one name: `allColumns` declares each of "the columns of the
+                // table" once (`SchemaDefinition`), which is the same rule
+                // `crate::state::validate_schema` enforces on a create. A name the table
+                // already has, or one this request repeats, is refused naming the member the
+                // caller has to fix — the alternative would be a schema with two columns of
+                // one name.
+                let mut declared: ::std::collections::BTreeSet<&str> = schema
+                    .all_columns
+                    .iter()
+                    .map(|column| column.name.as_str())
+                    .collect();
+                for column in &added {
+                    if !declared.insert(column.name.as_str()) {
+                        return Err(invalid(format!(
+                            "addColumns names column '{}', which the table's schema already declares",
+                            column.name
+                        )));
+                    }
+                }
+                Some(added)
+            }
+        };
+
+        // The schema and the TTL settings are what a point-in-time restore reproduces
+        // "based on the selected timestamp", so an update that CHANGES one of them closes
+        // the revision that was in effect until now before the new values go in. An update
+        // that re-sets a value the table already holds changed no restorable setting, so it
+        // records no revision — otherwise a run of such updates would consume the retained
+        // history and shrink the restorable window without anything having changed. Called
+        // after every refusal above, so only an accepted update records a revision.
+        let changes_restorable_settings = added_columns.is_some()
+            || input.ttl.as_ref().is_some_and(|supplied| {
+                table.ttl.as_ref().map(|held| held.status.as_str()) != Some(supplied.status.as_str())
+            })
+            || input
+                .default_time_to_live
+                .is_some_and(|supplied| table.default_time_to_live != Some(supplied))
+            || input.client_side_timestamps.as_ref().is_some_and(|supplied| {
+                table
+                    .client_side_timestamps
+                    .as_ref()
+                    .map(|held| held.status.as_str())
+                    != Some(supplied.status.as_str())
+            });
+        if changes_restorable_settings {
+            table.supersede_restorable_settings(now);
+        }
+
+        if let Some(added) = added_columns {
+            // The added columns are regular columns of the table, so they join
+            // `allColumns` and take no key or static role. The schema is there: the only
+            // schema-less tables are the service-managed ones, refused above, and the
+            // validation step read this very schema under this same lock — so an absent
+            // schema here is this service failing to serve its own state, which it reports
+            // as the modelled server error rather than by unwinding the request.
+            let Some(schema) = table.schema_definition.as_mut() else {
+                return Err(UpdateTableErrorModeled::InternalServerException(
+                    InternalServerException {
                         message: Some(format!(
-                            "adding {} column(s) to table '{}.{}' would exceed the limit of {} \
-                             columns per table, which it already has {} of",
-                            added.len(),
-                            input.keyspace_name,
-                            input.table_name,
-                            crate::state::MAX_COLUMNS_PER_TABLE,
-                            schema.all_columns.len()
+                            "Amazon Keyspaces could not read the schema of table '{}.{}' it \
+                             had just validated this update against.",
+                            input.keyspace_name, input.table_name
                         )),
                     },
                 )
                 .into());
-            }
-            // A column holds one name: `allColumns` declares each of "the columns of the
-            // table" once (`SchemaDefinition`), which is the same rule
-            // `crate::state::validate_schema` enforces on a create. A name the table
-            // already has, or one this request repeats, is refused naming the member the
-            // caller has to fix — the alternative would be a schema with two columns of
-            // one name.
-            let mut declared: ::std::collections::BTreeSet<&str> = schema
-                .all_columns
-                .iter()
-                .map(|column| column.name.as_str())
-                .collect();
-            for column in &added {
-                if !declared.insert(column.name.as_str()) {
-                    return Err(invalid(format!(
-                        "addColumns names column '{}', which the table's schema already declares",
-                        column.name
-                    )));
-                }
-            }
-            // The added columns are regular columns of the table, so they join
-            // `allColumns` and take no key or static role.
+            };
             schema.all_columns.extend(added);
         }
         if let Some(capacity) = capacity_specification {

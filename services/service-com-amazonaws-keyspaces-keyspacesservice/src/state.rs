@@ -137,6 +137,35 @@ pub const MAX_TARGET_VALUE: f64 = 90.0;
 /// `PointInTimeRecoveryStatus` = `ENABLED`.
 pub const POINT_IN_TIME_RECOVERY_ENABLED: &str = "ENABLED";
 
+/// How far back point-in-time recovery reaches: the restorable window `RestoreTable`
+/// restores "within the `earliest_restorable_timestamp` and the current time", which
+/// the Amazon Keyspaces "Time window for PITR continuous backups" that operation
+/// points at publishes as the preceding 35 days.
+///
+/// So an instant older than this is outside every table's restorable window, whatever
+/// the store still holds for it.
+pub const POINT_IN_TIME_RECOVERY_WINDOW: Duration = Duration::from_secs(35 * 24 * 60 * 60);
+
+/// How many restores may run in this account at once: "Any number of users can execute
+/// up to 4 concurrent restores (any type of restore) in a given account"
+/// (`RestoreTable`). A restore is running while the table it is creating is still
+/// `CREATING`; see
+/// [`restores_in_progress`][ComAmazonawsKeyspacesKeyspacesserviceState::restores_in_progress].
+pub const MAX_CONCURRENT_RESTORES: usize = 4;
+
+/// How many superseded revisions of a table's point-in-time-restorable settings
+/// ([`TableRevision`]) are kept.
+///
+/// CHOSEN, not documented: every accepted update that changes one of those settings
+/// appends a revision, and only the window it falls out of removes one, so the list is
+/// capped to keep a long-lived store bounded — the same ground every other `MAX_` here
+/// stands on. Once the cap has dropped a revision, the oldest retained one's boundary
+/// is the earliest instant whose settings are still known, and
+/// [`Table::earliest_restorable_timestamp`] reports exactly that, so a restore the
+/// store can no longer reproduce is refused rather than answered from the wrong
+/// instant.
+pub const MAX_RETAINED_TABLE_REVISIONS: usize = 64;
+
 /// `WarmThroughputStatus` = `AVAILABLE`: "the current status of the warm throughput
 /// configuration. Valid values are `AVAILABLE` when the configuration is active, and
 /// `UPDATING` when changes are being applied"
@@ -712,6 +741,145 @@ pub struct Table {
     /// This table's tags: what `CreateTable` attached, plus what `TagResource` added and
     /// `UntagResource` removed since.
     pub tags: TagSet,
+    /// The superseded revisions of the settings a point-in-time restore reproduces "based
+    /// on the selected timestamp" — the schema and the TTL settings — newest last. Empty
+    /// for a table whose schema and TTL settings have never changed since it was created,
+    /// which is every table no `UpdateTable` has touched.
+    pub superseded: Vec<TableRevision>,
+    /// Where this table came from, for a table a `RestoreTable` created, and `None` for
+    /// one a `CreateTable` did.
+    pub restored_from: Option<RestoreOrigin>,
+    /// The earliest instant whose restorable settings are still known, once the revision
+    /// cap ([`MAX_RETAINED_TABLE_REVISIONS`]) has dropped a revision this table held, and
+    /// `None` while nothing has been dropped — which is every table whose revisions all
+    /// still fit.
+    pub earliest_known_settings: Option<SystemTime>,
+}
+
+/// One superseded revision of the table settings a point-in-time restore reproduces
+/// "based on the selected timestamp" (`RestoreTable`): the schema and the TTL settings,
+/// with the instant they stopped being in effect.
+///
+/// A revision was in effect from the PREVIOUS revision's `superseded_at` — or from the
+/// table's creation, for the oldest — until its own. So the settings in effect at an
+/// instant are the first revision superseded after it, and the table's current settings
+/// when no revision was: see [`Table::restorable_settings_at`].
+#[derive(Debug, Clone)]
+pub struct TableRevision {
+    /// When these settings stopped being in effect.
+    pub superseded_at: SystemTime,
+    /// The schema as of this revision.
+    pub schema_definition: Option<SchemaDefinition>,
+    /// The custom TTL setting as of this revision.
+    pub ttl: Option<TimeToLive>,
+    /// The default TTL in seconds as of this revision.
+    pub default_time_to_live: Option<i32>,
+    /// The client-side-timestamps setting as of this revision.
+    pub client_side_timestamps: Option<ClientSideTimestamps>,
+}
+
+/// Where a table a `RestoreTable` created came from: the source table, and the point in
+/// time whose settings it reproduces.
+#[derive(Debug, Clone)]
+pub struct RestoreOrigin {
+    /// `sourceKeyspaceName` of the restore that created this table.
+    pub source_keyspace_name: String,
+    /// `sourceTableName` of that restore.
+    pub source_table_name: String,
+    /// The point in time the restore reproduced — `restoreTimestamp`, or the instant the
+    /// call ran when the request named none.
+    pub restore_timestamp: SystemTime,
+}
+
+impl Table {
+    /// The settings a point-in-time restore of this table reproduces for `at`: the
+    /// revision in effect then, or the current settings when nothing has superseded them
+    /// since.
+    ///
+    /// The revisions are appended in time order, so the first one superseded after `at`
+    /// is the one that was in effect at `at`.
+    pub fn restorable_settings_at(&self, at: SystemTime) -> TableRevision {
+        if let Some(revision) = self
+            .superseded
+            .iter()
+            .find(|revision| revision.superseded_at > at)
+        {
+            return revision.clone();
+        }
+        TableRevision {
+            superseded_at: at,
+            schema_definition: self.schema_definition.clone(),
+            ttl: self.ttl.clone(),
+            default_time_to_live: self.default_time_to_live,
+            client_side_timestamps: self.client_side_timestamps.clone(),
+        }
+    }
+
+    /// Record that this table's restorable settings change at `now`, keeping the outgoing
+    /// values as the revision in effect until then.
+    ///
+    /// Every operation that changes one of them calls this BEFORE it does — `UpdateTable`
+    /// for a schema or TTL change, `UpdateKeyspace` where it enables client-side
+    /// timestamps — so a restore to an earlier instant reproduces what the table held at
+    /// that instant rather than what it holds now.
+    pub fn supersede_restorable_settings(&mut self, now: SystemTime) {
+        self.superseded.push(TableRevision {
+            superseded_at: now,
+            schema_definition: self.schema_definition.clone(),
+            ttl: self.ttl.clone(),
+            default_time_to_live: self.default_time_to_live,
+            client_side_timestamps: self.client_side_timestamps.clone(),
+        });
+        // A revision superseded before the restorable window opened can never be the one a
+        // restore targets, so it is dropped instead of kept forever.
+        if let Some(window_start) = now.checked_sub(POINT_IN_TIME_RECOVERY_WINDOW) {
+            self.superseded
+                .retain(|revision| revision.superseded_at > window_start);
+        }
+        // And the newest [`MAX_RETAINED_TABLE_REVISIONS`] are all that is kept, so one
+        // table's history stays bounded however many updates it takes inside one window.
+        // The newest revision dropped is the boundary below which this table's settings are
+        // no longer known, because the oldest revision kept describes only the span from
+        // that boundary on.
+        let excess = self
+            .superseded
+            .len()
+            .saturating_sub(MAX_RETAINED_TABLE_REVISIONS);
+        if excess > 0 {
+            self.earliest_known_settings = self
+                .superseded
+                .get(excess - 1)
+                .map(|dropped| dropped.superseded_at);
+            self.superseded.drain(..excess);
+        }
+    }
+
+    /// The earliest instant a restore of this table may target —
+    /// `PointInTimeRecoverySummary$earliestRestorableTimestamp` — or `None` when the table
+    /// has no restorable window at all, which is every table point-in-time recovery is not
+    /// `ENABLED` on and every table the service itself owns.
+    ///
+    /// Continuous backups begin when the table is created, reach back at most
+    /// [`POINT_IN_TIME_RECOVERY_WINDOW`], and can only reproduce settings the store still
+    /// holds a revision for ([`MAX_RETAINED_TABLE_REVISIONS`]), so the earliest restorable
+    /// instant is the latest of those three.
+    pub fn earliest_restorable_timestamp(&self, now: SystemTime) -> Option<SystemTime> {
+        if self
+            .point_in_time_recovery
+            .as_ref()
+            .is_none_or(|recovery| recovery.status != POINT_IN_TIME_RECOVERY_ENABLED)
+        {
+            return None;
+        }
+        let mut earliest = self.creation_timestamp?;
+        if let Some(window_start) = now.checked_sub(POINT_IN_TIME_RECOVERY_WINDOW) {
+            earliest = earliest.max(window_start);
+        }
+        if let Some(known_from) = self.earliest_known_settings {
+            earliest = earliest.max(known_from);
+        }
+        Some(earliest)
+    }
 }
 
 /// A table's warm throughput configuration: "Pre-warming a table by specifying warm
@@ -1130,6 +1298,9 @@ impl ComAmazonawsKeyspacesKeyspacesserviceState {
                             replica_specifications: BTreeMap::new(),
                             warm_throughput_specification: None,
                             tags: TagSet::new(),
+                            superseded: Vec::new(),
+                            restored_from: None,
+                            earliest_known_settings: None,
                         },
                     )
                 })
@@ -1275,6 +1446,22 @@ impl ComAmazonawsKeyspacesKeyspacesserviceState {
                 (table.resource_arn == resource_arn).then_some(&table.tags)
             }
         }
+    }
+
+    /// How many restores are running in this account: "Any number of users can execute up
+    /// to 4 concurrent restores (any type of restore) in a given account"
+    /// ([`MAX_CONCURRENT_RESTORES`]), and a restore is running exactly while the table it
+    /// is creating is still `CREATING` — which [`Self::settle`] materialises out of that
+    /// status when the clock owes it, so a finished restore stops counting without anybody
+    /// having to clear a flag.
+    pub fn restores_in_progress(&self) -> usize {
+        self.keyspaces
+            .values()
+            .flat_map(|keyspace| keyspace.tables.values())
+            .filter(|table| {
+                table.restored_from.is_some() && table.status == TABLE_STATUS_CREATING
+            })
+            .count()
     }
 
     /// The same lookup, for a tagging operation that writes.

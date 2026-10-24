@@ -16,6 +16,9 @@
 //! nothing, while the same token carrying DIFFERENT parameters is refused with the
 //! modelled `ConflictException`.
 //!
+//! A fresh application carries no ACCESS SCOPES; `PutApplicationAccessScope` is what adds
+//! them to the record this create writes.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -369,6 +372,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags,
             client_token: input.client_token,
             request_fingerprint: fingerprint,
+            // A fresh application carries no access scopes; `PutApplicationAccessScope`
+            // is what adds them.
+            access_scopes: ::std::collections::BTreeMap::new(),
         };
         // The response is built from the record that is about to be stored, so it cannot
         // differ from what the next `DescribeApplication` reads: both report these

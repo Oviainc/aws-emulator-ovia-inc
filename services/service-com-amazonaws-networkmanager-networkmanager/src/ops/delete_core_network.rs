@@ -147,10 +147,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Deletes a core network along with all core network policies. This can only be
         // done if there are no attachments on a core network." The policies live on the
         // record itself (`state::CoreNetworkRecord::policy_document`), so removing the
-        // record removes them with it; attachments are held nowhere yet (every attachment
-        // create is still a scaffold stub), so none can block this delete — when that
-        // slice lands, its refusal belongs in `state::dependents_block_delete` beside the
-        // other dependency refusals of this service.
+        // record removes them with it; the attachments it holds block the delete until the
+        // caller removes them, reported like every other dependency refusal of this service
+        // through `state::dependents_block_delete`.
+        //
+        // The dependency refusal is computed only for a core network that IS stored, so the
+        // one not-found answer below stays the single path for an id that names nothing.
+        if store.core_networks.contains_key(&input.core_network_id) {
+            let attachments = store.attachment_count_of_core_network(&input.core_network_id);
+            if let Some(refusal) = crate::state::dependents_block_delete(
+                crate::state::CORE_NETWORK_KIND,
+                &[(crate::state::ATTACHMENT_KIND, attachments)],
+            ) {
+                return Err(DeleteCoreNetworkErrorModeled::ValidationException(refusal).into());
+            }
+        }
+
         let removed = store
             .core_networks
             .remove(&input.core_network_id)
