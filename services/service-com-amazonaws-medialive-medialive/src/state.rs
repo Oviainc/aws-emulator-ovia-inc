@@ -11,10 +11,13 @@
 //! own token map. So do signal maps: one [`SignalMapRecord`] per created signal
 //! map, carrying the media-resource graph discovery found by walking the
 //! channels this store already holds, and the latest monitor deployment
-//! `StartMonitorDeployment` started for it ([`MonitorDeploymentRecord`]) beside
-//! the latest one that succeeded, which is how both the signal map's
-//! `MonitorDeployment` and its summary's `MonitorDeploymentStatus` are reported
-//! out of state.
+//! ([`MonitorDeploymentRecord`]) beside the latest one that succeeded, which is
+//! how both the signal map's `MonitorDeployment` and its summary's
+//! `MonitorDeploymentStatus` are reported out of state. A deployment is of one
+//! of the three kinds its [`MonitorDeploymentKind`] names: the real deployment
+//! and the dry run `StartMonitorDeployment` starts, and the deletion of the
+//! monitor `StartDeleteMonitorDeployment` starts — one record either way, so a
+//! signal map has exactly one latest monitor deployment whatever started it.
 //!
 //! The MediaLive Anywhere network lives here too: one [`NetworkRecord`] per
 //! created network, its own id counter and its own token map. A network's
@@ -408,16 +411,21 @@ pub mod signal_map_status {
 /// and the clock settles that into the matching COMPLETE status
 /// ([`MonitorDeploymentRecord`]).
 ///
+/// The `DELETE_*` pair belongs to `StartDeleteMonitorDeployment`, which
+/// "initiates a deployment to delete the monitor of the specified signal map":
+/// that deployment runs in `DELETE_IN_PROGRESS` and the clock settles it into
+/// `DELETE_COMPLETE`, on the same terms as the deploying kinds above it.
+///
 /// The `*_FAILED` statuses are deliberately absent: nothing in this emulator
-/// makes a deployment fail, so no code may report one as failed. So are the
-/// `DELETE_*` ones, which belong to `StartDeleteMonitorDeployment` — still a
-/// scaffold, and its own issue.
+/// makes a deployment fail, so no code may report one as failed.
 pub mod signal_map_monitor_deployment_status {
     pub const NOT_DEPLOYED: &str = "NOT_DEPLOYED";
     pub const DEPLOYMENT_IN_PROGRESS: &str = "DEPLOYMENT_IN_PROGRESS";
     pub const DEPLOYMENT_COMPLETE: &str = "DEPLOYMENT_COMPLETE";
     pub const DRY_RUN_DEPLOYMENT_IN_PROGRESS: &str = "DRY_RUN_DEPLOYMENT_IN_PROGRESS";
     pub const DRY_RUN_DEPLOYMENT_COMPLETE: &str = "DRY_RUN_DEPLOYMENT_COMPLETE";
+    pub const DELETE_IN_PROGRESS: &str = "DELETE_IN_PROGRESS";
+    pub const DELETE_COMPLETE: &str = "DELETE_COMPLETE";
 }
 
 /// The `InputSecurityGroupState` enum values, spelled exactly as the model
@@ -3268,7 +3276,61 @@ enum TaggedResource {
     ChannelPlacementGroup(String),
 }
 
-/// One monitor deployment of one signal map, as `StartMonitorDeployment`
+/// What a monitor deployment of a signal map DOES, which is what decides the
+/// pair of statuses it moves through and what completing it leaves behind.
+///
+/// `StartMonitorDeployment` "initiates a deployment to deploy the latest monitor
+/// of the specified signal map" — a real one, or the dry run its `DryRun` member
+/// asks for — and `StartDeleteMonitorDeployment` "initiates a deployment to
+/// delete the monitor of the specified signal map". All three are the same
+/// asynchronous deployment of one signal map's monitor, differing only in what
+/// they leave behind, so one record models them and this is the kind of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MonitorDeploymentKind {
+    /// Deploy the signal map's latest monitor.
+    Deploy,
+    /// Run the deployment without deploying anything.
+    DryRun,
+    /// Delete the signal map's monitor.
+    Delete,
+}
+
+impl MonitorDeploymentKind {
+    /// The `SignalMapMonitorDeploymentStatus` a deployment of this kind runs in.
+    fn in_progress_status(self) -> &'static str {
+        match self {
+            Self::Deploy => signal_map_monitor_deployment_status::DEPLOYMENT_IN_PROGRESS,
+            Self::DryRun => signal_map_monitor_deployment_status::DRY_RUN_DEPLOYMENT_IN_PROGRESS,
+            Self::Delete => signal_map_monitor_deployment_status::DELETE_IN_PROGRESS,
+        }
+    }
+
+    /// The status a deployment of this kind completes in.
+    fn complete_status(self) -> &'static str {
+        match self {
+            Self::Deploy => signal_map_monitor_deployment_status::DEPLOYMENT_COMPLETE,
+            Self::DryRun => signal_map_monitor_deployment_status::DRY_RUN_DEPLOYMENT_COMPLETE,
+            Self::Delete => signal_map_monitor_deployment_status::DELETE_COMPLETE,
+        }
+    }
+}
+
+/// What completing a monitor deployment does to the signal map's
+/// `LastSuccessfulMonitorDeployment`, "the latest successful monitor deployment
+/// of a signal map".
+enum LatestSuccessfulDeployment {
+    /// A deployment that deployed the monitor IS that latest successful
+    /// deployment.
+    Deployed(SuccessfulMonitorDeployment),
+    /// A dry run deploys nothing, so it neither becomes the latest successful
+    /// deployment nor undoes the one before it.
+    Unchanged,
+    /// A completed deletion leaves the signal map with no deployed monitor, so
+    /// there is no successful deployment of one left to report.
+    Gone,
+}
+
+/// One monitor deployment of one signal map, as the operation that started it
 /// started it.
 ///
 /// A deployment is ASYNCHRONOUS — the operation answers 202 and the caller polls
@@ -3277,10 +3339,9 @@ enum TaggedResource {
 /// STORED and never slept on.
 #[derive(Debug, Clone)]
 pub struct MonitorDeploymentRecord {
-    /// Whether the request asked for a dry run, which is what decides both the
-    /// pair of statuses this deployment moves through and whether completing it
-    /// leaves a successful deployment behind.
-    dry_run: bool,
+    /// What this deployment does, which is what decides both the pair of
+    /// statuses it moves through and what completing it leaves behind.
+    kind: MonitorDeploymentKind,
     /// The `SignalMapMonitorDeploymentStatus` this deployment is in.
     status: String,
     /// `MonitorDeployment$DetailsUri`, built once when the deployment started
@@ -3292,21 +3353,10 @@ pub struct MonitorDeploymentRecord {
 }
 
 impl MonitorDeploymentRecord {
-    /// Whether this deployment is still running, in either of the two
-    /// IN_PROGRESS statuses a deployment can be running in.
+    /// Whether this deployment is still running, in the IN_PROGRESS status of
+    /// its own kind.
     fn in_progress(&self) -> bool {
-        self.status == signal_map_monitor_deployment_status::DEPLOYMENT_IN_PROGRESS
-            || self.status == signal_map_monitor_deployment_status::DRY_RUN_DEPLOYMENT_IN_PROGRESS
-    }
-
-    /// The status this deployment completes in: a dry run reports the dry-run
-    /// outcome, a real deployment the deployed one.
-    fn complete_status(&self) -> &'static str {
-        if self.dry_run {
-            signal_map_monitor_deployment_status::DRY_RUN_DEPLOYMENT_COMPLETE
-        } else {
-            signal_map_monitor_deployment_status::DEPLOYMENT_COMPLETE
-        }
+        self.status == self.kind.in_progress_status()
     }
 
     /// This deployment as the modelled `MonitorDeployment`, "the latest monitor
@@ -3377,24 +3427,36 @@ impl SignalMapRecord {
             self.modified_at = self.discovery_due;
         }
         // Completed on THIS call: the due instant to stamp as the signal map's
-        // `ModifiedAt`, and the successful deployment to record when the
-        // deployment was a real one. Read out of the deployment before the
-        // signal map's own fields are written, so the record is borrowed once.
+        // `ModifiedAt`, and what that completion does to the latest successful
+        // deployment. Read out of the deployment before the signal map's own
+        // fields are written, so the record is borrowed once.
         let settled = self.monitor_deployment.as_mut().and_then(|deployment| {
             if !deployment.in_progress() || now < deployment.due {
                 return None;
             }
-            deployment.status = deployment.complete_status().to_string();
-            let successful = (!deployment.dry_run).then(|| SuccessfulMonitorDeployment {
-                details_uri: deployment.details_uri.clone(),
-                status: deployment.status.clone(),
-            });
-            Some((deployment.due, successful))
+            deployment.status = deployment.kind.complete_status().to_string();
+            let latest = match deployment.kind {
+                MonitorDeploymentKind::Deploy => {
+                    LatestSuccessfulDeployment::Deployed(SuccessfulMonitorDeployment {
+                        details_uri: deployment.details_uri.clone(),
+                        status: deployment.status.clone(),
+                    })
+                }
+                MonitorDeploymentKind::DryRun => LatestSuccessfulDeployment::Unchanged,
+                MonitorDeploymentKind::Delete => LatestSuccessfulDeployment::Gone,
+            };
+            Some((deployment.due, latest))
         });
-        if let Some((due, successful)) = settled {
+        if let Some((due, latest)) = settled {
             self.modified_at = due;
-            if let Some(successful) = successful {
-                self.last_successful_monitor_deployment = Some(successful);
+            match latest {
+                LatestSuccessfulDeployment::Deployed(successful) => {
+                    self.last_successful_monitor_deployment = Some(successful);
+                }
+                LatestSuccessfulDeployment::Unchanged => {}
+                LatestSuccessfulDeployment::Gone => {
+                    self.last_successful_monitor_deployment = None;
+                }
             }
         }
     }
@@ -3413,7 +3475,7 @@ impl SignalMapRecord {
     }
 
     /// Whether a monitor deployment of this signal map is already running, so a
-    /// second one cannot be started on top of it.
+    /// second one — of any kind — cannot be started on top of it.
     pub fn monitor_deployment_in_progress(&self) -> bool {
         self.monitor_deployment
             .as_ref()
@@ -3442,14 +3504,31 @@ impl SignalMapRecord {
     /// `LastSuccessfulMonitorDeployment` is the latest SUCCESSFUL deployment,
     /// which a redeployment does not undo.
     pub fn begin_monitor_deployment(&mut self, dry_run: bool, now: SystemTime) {
-        let status = if dry_run {
-            signal_map_monitor_deployment_status::DRY_RUN_DEPLOYMENT_IN_PROGRESS
+        let kind = if dry_run {
+            MonitorDeploymentKind::DryRun
         } else {
-            signal_map_monitor_deployment_status::DEPLOYMENT_IN_PROGRESS
+            MonitorDeploymentKind::Deploy
         };
+        self.begin_deployment(kind, now);
+    }
+
+    /// Start a deployment to DELETE this signal map's monitor, replacing the
+    /// latest deployment on the same terms as [`Self::begin_monitor_deployment`]
+    /// replaces it: `StartDeleteMonitorDeployment` "initiates a deployment to
+    /// delete the monitor of the specified signal map", which is the same
+    /// asynchronous deployment of that monitor, so it runs in the deletion's own
+    /// IN_PROGRESS status and comes due [`TRANSIENT_STATE_SPAN`] later.
+    pub fn begin_delete_monitor_deployment(&mut self, now: SystemTime) {
+        self.begin_deployment(MonitorDeploymentKind::Delete, now);
+    }
+
+    /// Record `kind` as this signal map's latest monitor deployment, running and
+    /// due [`TRANSIENT_STATE_SPAN`] from `now`. One writer for every kind, so no
+    /// two of them can disagree about how a deployment starts.
+    fn begin_deployment(&mut self, kind: MonitorDeploymentKind, now: SystemTime) {
         self.monitor_deployment = Some(MonitorDeploymentRecord {
-            dry_run,
-            status: status.to_string(),
+            kind,
+            status: kind.in_progress_status().to_string(),
             details_uri: monitor_deployment_details_uri(&self.arn, &self.id),
             due: now + TRANSIENT_STATE_SPAN,
         });

@@ -9,6 +9,10 @@
 //! The suites are tables: one recorded call is ONE row of each. The wire harness
 //! (`medialive`, `call`, `error_code`, `error_message`) is the crate's shared one
 //! in `wire`, and the clock wait is the channel suite's — reused, not copied.
+//!
+//! The helpers that reach a signal map ready to deploy are `pub(crate)`: the
+//! deletion half of this lifecycle (`monitor_deployment_deletion`) drives the
+//! same resources, so it reuses them instead of copying them.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -22,29 +26,31 @@ use crate::wire::{call, error_code, error_message, medialive, DEFAULT_REGION};
 /// GET /prod/signal-maps/{Identifier}, GET /prod/signal-maps).
 const SIGNAL_MAPS: &str = "/prod/signal-maps";
 
+/// The path of one signal map's monitor deployment, which
+/// `StartMonitorDeployment` POSTs to and `StartDeleteMonitorDeployment` DELETEs
+/// (`smithy_query(query="operation",
+/// operation="StartMonitorDeployment,StartDeleteMonitorDeployment")`).
+pub(crate) fn monitor_deployment_uri(identifier: &str) -> String {
+    format!("{SIGNAL_MAPS}/{identifier}/monitor-deployment")
+}
+
 /// `StartMonitorDeployment` for `identifier`, with `body` sent verbatim (the
 /// only member in the payload is `DryRun`; `Identifier` is an `@httpLabel`).
-async fn start_monitor_deployment(
+pub(crate) async fn start_monitor_deployment(
     router: &MultiServiceRouter,
     identifier: &str,
     body: Option<Value>,
 ) -> (u16, Value) {
-    call(
-        router,
-        "POST",
-        &format!("{SIGNAL_MAPS}/{identifier}/monitor-deployment"),
-        body,
-    )
-    .await
+    call(router, "POST", &monitor_deployment_uri(identifier), body).await
 }
 
 /// `GetSignalMap` for `identifier`.
-async fn get_signal_map(router: &MultiServiceRouter, identifier: &str) -> (u16, Value) {
+pub(crate) async fn get_signal_map(router: &MultiServiceRouter, identifier: &str) -> (u16, Value) {
     call(router, "GET", &format!("{SIGNAL_MAPS}/{identifier}"), None).await
 }
 
 /// The `SignalMapSummary` `ListSignalMaps` reports for `id`.
-async fn listed_summary(router: &MultiServiceRouter, case: &str, id: &str) -> Value {
+pub(crate) async fn listed_summary(router: &MultiServiceRouter, case: &str, id: &str) -> Value {
     let (status, body) = call(router, "GET", SIGNAL_MAPS, None).await;
     assert_eq!(
         status, 200,
@@ -62,7 +68,7 @@ async fn listed_summary(router: &MultiServiceRouter, case: &str, id: &str) -> Va
 /// Create a channel to enter discovery from, create the signal map `name` on it
 /// and let the clock settle its discovery, so the map has a monitor to deploy.
 /// Answers the signal map's id.
-async fn signal_map_ready_to_deploy(
+pub(crate) async fn signal_map_ready_to_deploy(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,
@@ -85,7 +91,7 @@ async fn signal_map_ready_to_deploy(
 
 /// Create a channel and a signal map discovered from it, WITHOUT waiting for the
 /// clock: the signal map is still `CREATE_IN_PROGRESS` when this returns.
-async fn signal_map_discovering(
+pub(crate) async fn signal_map_discovering(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,
@@ -128,7 +134,12 @@ async fn signal_map_discovering(
 
 /// Assert `deployment` is the modelled `MonitorDeployment` of `id` in `status`,
 /// and answer its `DetailsUri`.
-fn deployment_details_uri(case: &str, id: &str, status_name: &str, deployment: &Value) -> String {
+pub(crate) fn deployment_details_uri(
+    case: &str,
+    id: &str,
+    status_name: &str,
+    deployment: &Value,
+) -> String {
     assert_eq!(
         deployment["status"],
         json!(status_name),

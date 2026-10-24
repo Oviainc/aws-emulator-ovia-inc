@@ -107,6 +107,9 @@ mod input_update;
 #[path = "all/monitor_deployment.rs"]
 mod monitor_deployment;
 
+#[path = "all/monitor_deployment_deletion.rs"]
+mod monitor_deployment_deletion;
+
 #[path = "all/multiplex_alerts.rs"]
 mod multiplex_alerts;
 
