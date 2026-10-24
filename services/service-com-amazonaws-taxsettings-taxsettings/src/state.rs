@@ -109,6 +109,27 @@ pub const MANAGEMENT_ACCOUNT_ONLY: &str =
 /// [`check_country_requirements`] applies.
 pub const TYPES_WITH_DERIVED_LEGAL_ADDRESS: &[(&str, &str)] = &[("PAN", "India")];
 
+/// The jurisdictions this emulator stores a SUPPLEMENTAL TRN for.
+///
+/// `PutSupplementalTaxRegistration` accepts an entry only for a country in this
+/// set and refuses every other one with the modelled `ValidationException`,
+/// because the real service does: it supports supplemental registration in a
+/// bounded set of jurisdictions and answers a 400 for the rest.
+///
+/// WHERE THIS LIST COMES FROM: not the model. The model constrains
+/// `SupplementalTaxRegistrationEntry$address$countryCode` to any two letters and
+/// the operation's whole documentation is "Stores supplemental tax registration
+/// for a single account", so the model names no jurisdiction; `VAT` is the one
+/// `SupplementalTaxRegistrationType` value. The boundary is therefore the
+/// emulator's own, and it holds the jurisdiction observed to clear country
+/// validation (Switzerland — a Swiss VAT/MWST number is held with the Swiss
+/// authority alongside the account's primary TRN). The alternative — accepting
+/// every country — would report a supplemental registration AWS refuses, which
+/// is the worse answer of the two: a refusal is a modelled outcome a client
+/// handles, a fabricated success is not. A later fixer whose recording shows
+/// another jurisdiction accepted adds its row here, and nothing else changes.
+pub const SUPPLEMENTAL_TRN_COUNTRIES: &[(&str, &str)] = &[("CH", "Switzerland")];
+
 /// `ValidationException.errorCode` values, from the model's
 /// `ValidationExceptionErrorCode` enum
 /// (`MalformedToken | ExpiredToken | InvalidToken | FieldValidationFailed |
@@ -218,6 +239,40 @@ impl ComAmazonawsTaxsettingsTaxsettingsState {
         for stored in self.supplemental_registrations.values_mut() {
             stored.settle(now);
         }
+    }
+
+    /// Store `entry` as `account_id`'s tax registration, answering the status it
+    /// was stored with.
+    ///
+    /// The one place a `TaxRegistrationEntry` becomes a stored record, so
+    /// `PutTaxRegistration` and the per-account loop of
+    /// `BatchPutTaxRegistration` cannot write one entry two different ways: the
+    /// write replaces the account's record and bumps its revision, which the
+    /// document access tokens carry, and `accountId` is caller-supplied, so a
+    /// write that would ADD a record is refused once the store holds as many as
+    /// this emulator keeps resident ([`MAX_STORED_REGISTRATIONS`]) while
+    /// rewriting an account that already has one adds nothing and is always
+    /// allowed. Each caller renders the refusal on its own channel — a
+    /// `ConflictException` response, or a per-account row of the batch's `errors`
+    /// list.
+    pub fn store_registration(
+        &mut self,
+        account_id: &str,
+        entry: &TaxRegistrationEntry,
+        written_at: Instant,
+    ) -> Result<String, ConflictException> {
+        let previous_revision = self
+            .registrations
+            .get(account_id)
+            .map(|stored| stored.revision);
+        if previous_revision.is_none() && self.registrations.len() >= MAX_STORED_REGISTRATIONS {
+            return Err(registration_store_full());
+        }
+        let revision = previous_revision.map_or(1, |revision| revision.saturating_add(1));
+        let stored = StoredTaxRegistration::from_entry(entry, account_id, revision, written_at);
+        let status = stored.status.clone();
+        self.registrations.insert(account_id.to_string(), stored);
+        Ok(status)
     }
 
     /// The `authorityId` of the stored supplemental TRN with this type and
@@ -1271,6 +1326,99 @@ pub fn check_country_requirements(
         return Err(validation(rule.error_code, rule.member_path, rule.message));
     }
     Ok(())
+}
+
+/// Refuse a `TaxRegistrationEntry` no write of this service may store.
+///
+/// The one place both writers — `PutTaxRegistration` and the per-account loop of
+/// `BatchPutTaxRegistration` — decide whether an entry is storable, so the two
+/// operations cannot disagree about one entry: the structural refusals (a legal
+/// address submitted for a type AWS derives it from, a missing legal name or
+/// address, a blank value the boundary validator's regex engine could not refuse)
+/// and then the per-country business rules [`COUNTRY_RULES`] carries. Why each is
+/// not left to the boundary validator is spelled out on the helpers this calls
+/// and in `ops/put_tax_registration.rs`.
+pub fn check_tax_registration_entry(
+    entry: &TaxRegistrationEntry,
+) -> Result<(), ValidationException> {
+    // A registration type whose legal address AWS derives from the tax number
+    // itself does not take one from the request.
+    check_registration_type_members(entry)?;
+
+    // Both shapes that report a registration (`TaxRegistration`,
+    // `TaxRegistrationWithJurisdiction`) mark `legalName` and `legalAddress`
+    // `@required`, so a record missing either could never be read back: refuse
+    // the write rather than store one.
+    let Some(legal_name) = entry.legal_name.as_deref() else {
+        return Err(validation(
+            ERROR_CODE_MISSING_INPUT,
+            "taxRegistrationEntry.legalName",
+            "legalName is required to store a tax registration.",
+        ));
+    };
+    let Some(legal_address) = entry.legal_address.as_ref() else {
+        return Err(validation(
+            ERROR_CODE_MISSING_INPUT,
+            "taxRegistrationEntry.legalAddress",
+            "legalAddress is required to store a tax registration.",
+        ));
+    };
+
+    check_not_blank(
+        "taxRegistrationEntry.registrationId",
+        &entry.registration_id,
+    )?;
+    check_not_blank("taxRegistrationEntry.legalName", legal_name)?;
+    check_address("taxRegistrationEntry.legalAddress", legal_address)?;
+
+    // The per-country business rules the model documents for a
+    // `TaxRegistrationEntry`, keyed off `legalAddress.countryCode`. They run last
+    // because they are about an entry that is otherwise storable.
+    check_country_requirements(entry)
+}
+
+/// Whether this emulator stores a supplemental TRN for `country_code`, with the
+/// country's name — see [`SUPPLEMENTAL_TRN_COUNTRIES`].
+pub fn supplemental_country(country_code: &str) -> Option<&'static str> {
+    SUPPLEMENTAL_TRN_COUNTRIES
+        .iter()
+        .find(|(code, _)| code.eq_ignore_ascii_case(country_code))
+        .map(|(_, country)| *country)
+}
+
+/// Refuse a `SupplementalTaxRegistrationEntry` for a jurisdiction this service
+/// does not store a supplemental TRN for ([`SUPPLEMENTAL_TRN_COUNTRIES`]).
+///
+/// The members the boundary validator's regex engine could not refuse (the
+/// non-blank pattern on `registrationId`, `legalName` and the address lines) are
+/// checked by the handler through [`check_not_blank`] / [`check_address`]; this
+/// is the jurisdiction boundary alone.
+pub fn check_supplemental_jurisdiction(
+    entry: &SupplementalTaxRegistrationEntry,
+) -> Result<(), ValidationException> {
+    if supplemental_country(&entry.address.country_code).is_some() {
+        return Ok(());
+    }
+    Err(validation(
+        ERROR_CODE_FIELD_VALIDATION_FAILED,
+        "taxRegistrationEntry.address.countryCode",
+        "Tax registration for country is not supported.",
+    ))
+}
+
+/// This service's modelled `ValidationException` for an `authorityId` that names
+/// no live supplemental registration of the caller's account.
+///
+/// `DeleteSupplementalTaxRegistration` also models `ResourceNotFoundException`,
+/// but the real service answers an unknown `authorityId` — a junk string and a
+/// well-formed UUID alike — with the 400 class, so this is the refusal both get:
+/// an `authorityId` is valid only while it names a registration.
+pub fn invalid_authority_id() -> ValidationException {
+    validation(
+        ERROR_CODE_FIELD_VALIDATION_FAILED,
+        "authorityId",
+        "Provided authorityId is not valid.",
+    )
 }
 
 /// This service's modelled `ResourceNotFoundException` (HTTP 404) for an account

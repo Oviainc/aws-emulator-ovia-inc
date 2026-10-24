@@ -13,12 +13,16 @@
 //!   `authorityId` keyed on the TRN it names (its `registrationType` and
 //!   `registrationId`), so writing the same TRN again updates that one record
 //!   and a TRN the account does not hold yet gets its own id.
+//! * only a jurisdiction this service supports supplemental registration in may
+//!   hold one, and an `authorityId` that names no live registration cannot be
+//!   deleted — the two rules this suite gained with the supplemental-TRN
+//!   write-path issue.
 //!
 //! Every table below spans the class its rule generalises over rather than one
 //! recorded request: several address shapes and country codes, the published
 //! bounds of the constrained members plus one past them, several store sizes
-//! against several page sizes, and each form of a `nextToken` the service did
-//! not issue.
+//! against several page sizes, each form of a `nextToken` the service did not
+//! issue, and several shapes of `authorityId`.
 //!
 //! The harness (`emulator`, `emulator_with_engine`, `call`) lives in
 //! `tax_registration_lifecycle.rs`; nothing here builds a second one.
@@ -31,7 +35,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_taxsettings_taxsettings::state::{
     ComAmazonawsTaxsettingsTaxsettingsState, DEFAULT_PAGE_SIZE, ERROR_CODE_FIELD_VALIDATION_FAILED,
     ERROR_CODE_INVALID_TOKEN, ERROR_CODE_MALFORMED_TOKEN, MAX_PAGE_SIZE,
-    SETTLED_REGISTRATION_STATUS, STATUS_PENDING,
+    SETTLED_REGISTRATION_STATUS, STATUS_PENDING, SUPPLEMENTAL_TRN_COUNTRIES,
 };
 
 use crate::tax_registration_lifecycle::{call, emulator, emulator_with_engine, Answer};
@@ -55,6 +59,23 @@ fn make_supplemental_validations_due(engine: &Arc<engine::InMemoryEngine>) {
     for stored in store.supplemental_registrations.values_mut() {
         stored.validation_due_at = Some(Instant::now());
     }
+}
+
+/// A supplemental entry for `country_code` registering `registration_id`.
+/// Everything else satisfies every constraint on
+/// `SupplementalTaxRegistrationEntry`.
+fn entry_for(country_code: &str, registration_id: &str, legal_name: &str) -> Value {
+    json!({
+        "registrationId": registration_id,
+        "registrationType": "VAT",
+        "legalName": legal_name,
+        "address": {
+            "addressLine1": "1 Example Street",
+            "city": "Example City",
+            "postalCode": "8001",
+            "countryCode": country_code,
+        },
+    })
 }
 
 /// One `SupplementalTaxRegistrationEntry` to store.
@@ -152,6 +173,83 @@ async fn put(router: &smithy_server_runtime::MultiServiceRouter, entry: &Value) 
         &json!({ "taxRegistrationEntry": entry }),
     )
     .await
+}
+
+/// RULE: a supplemental TRN is stored only for a jurisdiction this service
+/// supports supplemental registration in; an entry for any other country is
+/// refused with the modelled `ValidationException` (HTTP 400) and creates
+/// nothing.
+#[tokio::test]
+async fn only_a_supported_jurisdiction_can_hold_a_supplemental_registration() {
+    assert!(
+        !SUPPLEMENTAL_TRN_COUNTRIES.is_empty(),
+        "the supported set must name at least one jurisdiction"
+    );
+
+    // The supported side: every row of the catalog, in both cases the model's
+    // `CountryCode` pattern (`^[a-zA-Z]+$`) admits.
+    for (country_code, country) in SUPPLEMENTAL_TRN_COUNTRIES {
+        for spelling in [country_code.to_uppercase(), country_code.to_lowercase()] {
+            let case = format!("{country} as {spelling:?}");
+            let (router, _engine) = emulator_with_engine();
+            let answer = put(&router, &entry_for(&spelling, "CHE123456789", "Acme AG")).await;
+            assert_eq!(
+                answer.status, 200,
+                "case {case:?}: a supported jurisdiction must store, got {answer:?}"
+            );
+            assert!(
+                answer
+                    .get("authorityId")
+                    .as_str()
+                    .is_some_and(|id| !id.is_empty() && id.chars().count() <= 200),
+                "case {case:?}: the write must report the authority it filed, got {:?}",
+                answer.body
+            );
+            assert_eq!(
+                answer.get("status").as_str(),
+                Some(STATUS_PENDING),
+                "case {case:?}: the write reports the status it stored, got {:?}",
+                answer.body
+            );
+            assert_eq!(
+                list_all(&router, None).await.len(),
+                1,
+                "case {case:?}: the registration must be readable back"
+            );
+        }
+    }
+
+    // The unsupported side: the countries the recorded case cites (FR, GB) and
+    // several it does not.
+    for country_code in ["FR", "GB", "DE", "US", "IN", "JP", "BR", "ZA", "au"] {
+        if SUPPLEMENTAL_TRN_COUNTRIES
+            .iter()
+            .any(|(code, _)| code.eq_ignore_ascii_case(country_code))
+        {
+            continue;
+        }
+        let (router, _engine) = emulator_with_engine();
+        let answer = put(
+            &router,
+            &entry_for(country_code, "XX12345678901", "Acme Overseas"),
+        )
+        .await;
+        assert_eq!(
+            (answer.status, answer.error_code.as_str()),
+            (400, "ValidationException"),
+            "case {country_code:?}: an unsupported jurisdiction must be refused, got {answer:?}"
+        );
+        assert_eq!(
+            answer.get("errorCode").as_str(),
+            Some(ERROR_CODE_FIELD_VALIDATION_FAILED),
+            "case {country_code:?}: the refusal carries the field-validation code, got {:?}",
+            answer.body
+        );
+        assert!(
+            list_all(&router, None).await.is_empty(),
+            "case {country_code:?}: a refused write must create nothing"
+        );
+    }
 }
 
 /// Every supplemental TRN the listing reports, following its cursor to the end.
@@ -759,6 +857,154 @@ async fn requests_outside_the_model_are_refused() {
             );
         }
     }
+}
+
+/// RULE: deleting a supplemental registration removes it, and an `authorityId`
+/// that names no live registration is refused with the modelled
+/// `ValidationException` (HTTP 400) — whatever its shape, and however many
+/// callers ask at once.
+#[tokio::test]
+async fn deleting_by_an_authority_that_names_nothing_is_refused() {
+    let supported = SUPPLEMENTAL_TRN_COUNTRIES[0].0;
+
+    // Rows span the shapes an authority id can take: junk, a well-formed UUID,
+    // one character, the longest string the model admits, and punctuation the
+    // member's `^[\s\S]*$` pattern allows.
+    let unknown: Vec<(&str, String)> = vec![
+        ("a junk string", "no-such-authority-7f3".to_string()),
+        (
+            "a well-formed UUID",
+            "123e4567-e89b-12d3-a456-426614174000".to_string(),
+        ),
+        ("one character", "x".to_string()),
+        ("the longest id the model admits", "a".repeat(200)),
+        ("punctuation", "../../etc/passwd".to_string()),
+    ];
+    for (case, authority_id) in &unknown {
+        let (router, _engine) = emulator_with_engine();
+        // An account holding a registration still refuses an authority that is
+        // not that registration's.
+        let stored = put(&router, &entry_for(supported, "CHE400000001", "Acme AG")).await;
+        assert_eq!(
+            stored.status, 200,
+            "case {case:?}: setup write failed: {stored:?}"
+        );
+        let answer = call(
+            &router,
+            "DeleteSupplementalTaxRegistration",
+            &json!({ "authorityId": authority_id }),
+        )
+        .await;
+        assert_eq!(
+            (answer.status, answer.error_code.as_str()),
+            (400, "ValidationException"),
+            "case {case:?}: an unknown authority must be refused, got {answer:?}"
+        );
+        assert_eq!(
+            answer.get("errorCode").as_str(),
+            Some(ERROR_CODE_FIELD_VALIDATION_FAILED),
+            "case {case:?}: the refusal carries the field-validation code, got {:?}",
+            answer.body
+        );
+        assert_eq!(
+            list_all(&router, None).await.len(),
+            1,
+            "case {case:?}: a refused delete must remove nothing"
+        );
+    }
+
+    // The live authority deletes, and deleting it again is refused the same way.
+    let (router, _engine) = emulator_with_engine();
+    let stored = put(&router, &entry_for(supported, "CHE400000002", "Acme AG")).await;
+    let authority_id = stored
+        .get("authorityId")
+        .as_str()
+        .expect("an authority")
+        .to_string();
+    let deleted = call(
+        &router,
+        "DeleteSupplementalTaxRegistration",
+        &json!({ "authorityId": authority_id }),
+    )
+    .await;
+    assert_eq!(
+        deleted.status, 200,
+        "a live authority must delete, got {deleted:?}"
+    );
+    assert!(
+        list_all(&router, None).await.is_empty(),
+        "the deleted registration must be gone"
+    );
+    let again = call(
+        &router,
+        "DeleteSupplementalTaxRegistration",
+        &json!({ "authorityId": authority_id }),
+    )
+    .await;
+    assert_eq!(
+        (again.status, again.error_code.as_str()),
+        (400, "ValidationException"),
+        "a second delete of one authority must be refused, got {again:?}"
+    );
+}
+
+/// RULE: concurrent callers see ONE consistent outcome — eight identical deletes
+/// of an authority that names nothing all get the 400, and eight of a live one
+/// delete it exactly once.
+#[tokio::test]
+async fn concurrent_deletes_of_one_authority_agree() {
+    let supported = SUPPLEMENTAL_TRN_COUNTRIES[0].0;
+
+    // An authority that names nothing: every caller is refused.
+    let (router, _engine) = emulator_with_engine();
+    let body = json!({ "authorityId": "no-such-authority-concurrent" });
+    let mut codes = Vec::new();
+    for answer in eight_deletes(&router, &body).await {
+        codes.push((answer.status, answer.error_code.clone()));
+    }
+    assert!(
+        codes
+            .iter()
+            .all(|(status, code)| *status == 400 && code == "ValidationException"),
+        "case \"unknown authority\": every caller must see the same refusal, got {codes:?}"
+    );
+
+    // A live authority: exactly one caller deletes it, the rest are refused, and
+    // the registration is gone.
+    let (router, _engine) = emulator_with_engine();
+    let stored = put(&router, &entry_for(supported, "CHE500000001", "Acme AG")).await;
+    let authority_id = stored
+        .get("authorityId")
+        .as_str()
+        .expect("an authority")
+        .to_string();
+    let body = json!({ "authorityId": authority_id });
+    let answers = eight_deletes(&router, &body).await;
+    let deleted = answers.iter().filter(|answer| answer.status == 200).count();
+    let refused = answers
+        .iter()
+        .filter(|answer| answer.status == 400 && answer.error_code == "ValidationException")
+        .count();
+    assert_eq!(
+        (deleted, refused),
+        (1, 7),
+        "case \"live authority\": exactly one delete succeeds, got {answers:?}"
+    );
+    assert!(
+        list_all(&router, None).await.is_empty(),
+        "case \"live authority\": the registration must be gone"
+    );
+}
+
+/// Eight `DeleteSupplementalTaxRegistration` calls in flight at once.
+async fn eight_deletes(
+    router: &smithy_server_runtime::MultiServiceRouter,
+    body: &Value,
+) -> Vec<Answer> {
+    let one = || call(router, "DeleteSupplementalTaxRegistration", body);
+    let (a, b, c, d, e, f, g, h) =
+        tokio::join!(one(), one(), one(), one(), one(), one(), one(), one());
+    vec![a, b, c, d, e, f, g, h]
 }
 
 /// RULE: a required member the request omits is refused, not stored.
