@@ -4,8 +4,9 @@
 //!
 //! One store per emulator, holding the provisioned-cluster control plane: the
 //! clusters, the snapshots taken of them, the cluster parameter groups and
-//! cluster subnet groups they are configured from, and the usage limits set on
-//! their features. Every collection keeps
+//! cluster subnet groups they are configured from, the usage limits set on
+//! their features, and the Query Editor (QEV2) IAM Identity Center
+//! applications the account registered. Every collection keeps
 //! INSERTION ORDER, so the `Marker`
 //! cursor the paginated `Describe*` operations hand out is a stable, resumable
 //! offset into the same sequence a later page walks.
@@ -27,8 +28,8 @@ use crate::ops::types::{
     AccountWithRestoreAccess, AquaConfiguration, AvailabilityZone, Cluster, ClusterNode,
     ClusterParameterGroup, ClusterParameterGroupStatus, ClusterParameterStatus, ClusterSubnetGroup,
     ClusterVersion, CreateUsageLimitOutput, MaintenanceTrack, NetworkInterface, Parameter,
-    PendingModifiedValues, Snapshot, Subnet, SupportedOperation, SupportedPlatform, UpdateTarget,
-    VpcEndpoint, VpcSecurityGroupMembership,
+    PendingModifiedValues, Qev2IdcApplication, Snapshot, Subnet, SupportedOperation,
+    SupportedPlatform, UpdateTarget, VpcEndpoint, VpcSecurityGroupMembership,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -1133,6 +1134,19 @@ pub const MAX_SORTING_ENTITIES: usize = 3;
 /// released by `DeleteUsageLimit`.
 pub const USAGE_LIMIT_QUOTA: usize = 10_000;
 
+/// How many Query Editor (QEV2) IAM Identity Center applications the store
+/// holds before `CreateQev2IdcApplication` refuses with the modelled
+/// `LimitExceededFault`.
+///
+/// The same reasoning as [`USAGE_LIMIT_QUOTA`]: the emulator's own bound on
+/// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::qev2_idc_applications`],
+/// not a claim about an account's published limit. An application's identity is
+/// its name, and names are unlimited in number, so this bound is what stops the
+/// collection growing without end; it is set far above any workflow an emulator
+/// serves, and every record it holds is released by
+/// `DeleteQev2IdcApplication`.
+pub const QEV2_IDC_APPLICATION_QUOTA: usize = 10_000;
+
 /// How many tags one resource may carry before a create that would exceed it
 /// refuses with the modelled `TagLimitExceededFault`.
 ///
@@ -1196,6 +1210,113 @@ pub fn usage_limit_type_of_feature(feature_type: &str) -> Option<&'static str> {
 /// dependency is needed.
 pub fn new_usage_limit_id() -> String {
     crate::service::query_error_envelope::new_request_id()
+}
+
+/// The `IdcOnboardStatus` of a registered Query Editor (QEV2) IAM Identity
+/// Center application.
+///
+/// The model publishes no value list for the member (`smithy_query(query="doc",
+/// shape="Qev2IdcApplication", member="IdcOnboardStatus")` — "The onboarding
+/// status for the Amazon Redshift Query Editor (QEV2) IAM Identity Center
+/// application"), so the single status this emulator reports is its own choice:
+/// the application is registered by the time `CreateQev2IdcApplication`
+/// returns — the call itself mints the managed application — so the status it
+/// reports is terminal and no transition is owed on it.
+pub const QEV2_IDC_ONBOARD_STATUS: &str = "Completed";
+
+/// The ARN of a Query Editor (QEV2) IAM Identity Center application:
+/// `arn:aws:redshift:<region>:<account>:qev2idcapplication:<uuid>`.
+///
+/// Derived from the application's own name and Region, so the value is stable
+/// across every read of the same application and is not a per-run value; it is
+/// computed ONCE, by the create, and then persisted on the stored application.
+///
+/// An application deleted and registered again under the same name therefore
+/// gets the same ARN, which is intentional: the ARN is content-addressed from
+/// the resource's own identity, exactly as [`cluster_arn`] and
+/// [`subnet_group_arn`] are, and a name is all an application's identity is.
+pub fn qev2_idc_application_arn(application_name: &str, region: &str) -> String {
+    let hexed = short_digest(
+        &format!("qev2idcapplication/{application_name}/{region}"),
+        32,
+    );
+    let uuid = format!(
+        "{}-{}-{}-{}-{}",
+        &hexed[0..8],
+        &hexed[8..12],
+        &hexed[12..16],
+        &hexed[16..20],
+        &hexed[20..32]
+    );
+    engine::emulator_arn("redshift", region, &format!("qev2idcapplication:{uuid}"))
+}
+
+/// The ARN of the IAM Identity Center MANAGED application a registered Query
+/// Editor (QEV2) application is backed by:
+/// `arn:aws:sso::<account>:application/<instance id>/apl-<token>`.
+///
+/// IAM Identity Center is a global service, so the ARN carries no Region. The
+/// instance segment is the instance the request named (the last path segment of
+/// its ARN, which is where an IAM Identity Center instance ARN carries its
+/// `ssoins-…` id) and the application segment is derived from that instance and
+/// the application's name, so the value is stable across reads rather than
+/// per-run.
+pub fn idc_managed_application_arn(idc_instance_arn: &str, application_name: &str) -> String {
+    let instance = idc_instance_arn
+        .split('/')
+        .next_back()
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            format!(
+                "ssoins-{}",
+                short_digest(&format!("idc-instance/{idc_instance_arn}"), 16)
+            )
+        });
+    let token = short_digest(
+        &format!("idc-managed-application/{idc_instance_arn}/{application_name}"),
+        16,
+    );
+    engine::emulator_arn(
+        "sso",
+        "",
+        &format!("application/{instance}/apl-{token}"),
+    )
+}
+
+/// The longest an ARN this service STORES may be.
+///
+/// An ARN-valued member the model constrains only by length (`IdcInstanceArn`
+/// is modelled `len 0..2147483647`) would otherwise let one request store a
+/// two-gigabyte string, so a value longer than an AWS ARN can be is refused
+/// rather than persisted. 2048 is the published maximum length of an AWS ARN
+/// (the limit AWS documents for an ARN-valued field, e.g. an IAM role ARN), so
+/// no ARN the real service accepts is refused by this bound.
+pub const MAX_ARN_LENGTH: usize = 2048;
+
+/// Whether a value is an AWS ARN at all: `arn:`, a non-empty partition and
+/// service, and a non-empty resource portion, within [`MAX_ARN_LENGTH`].
+///
+/// A general check on the FORM of an ARN, not on which resource it names: it
+/// says nothing about the partition, Region, account or service a particular
+/// member requires. It exists because a member the model constrains only by
+/// length can still be documented as an ARN (`smithy_query(query="doc",
+/// shape="CreateQev2IdcApplicationMessage", member="IdcInstanceArn")` — "The
+/// Amazon Resource Name (ARN) of the IAM Identity Center instance"), so a value
+/// that is no ARN names no resource and is refused before anything is stored.
+pub fn is_arn(value: &str) -> bool {
+    if value.len() > MAX_ARN_LENGTH {
+        return false;
+    }
+    let mut segments = value.split(':');
+    segments.next() == Some("arn")
+        && segments.next().is_some_and(|partition| !partition.is_empty())
+        && segments.next().is_some_and(|service| !service.is_empty())
+        // region, account and the resource portion: an ARN has at least six
+        // colon-separated segments, and the resource portion is never empty.
+        && segments.next().is_some()
+        && segments.next().is_some()
+        && segments.next().is_some_and(|resource| !resource.is_empty())
 }
 
 /// What a handler answers when the shared store cannot be reached: the service's
@@ -1324,6 +1445,15 @@ pub struct ComAmazonawsRedshiftRedshiftserviceversion20121201State {
     /// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::subnet_groups`],
     /// this collection needs no `Stored*` wrapper.
     pub usage_limits: Vec<CreateUsageLimitOutput>,
+    /// Every Query Editor (QEV2) IAM Identity Center application the account
+    /// registered, keyed by `Qev2IdcApplicationArn`, in creation order.
+    ///
+    /// The modelled `Qev2IdcApplication` shape IS the whole record — the
+    /// application carries no status the clock moves (see
+    /// [`QEV2_IDC_ONBOARD_STATUS`]) and nothing the shape has no member for —
+    /// so, like [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::usage_limits`],
+    /// this collection needs no `Stored*` wrapper.
+    pub qev2_idc_applications: Vec<Qev2IdcApplication>,
     /// The engine versions this service offers, in catalog order. Unlike the
     /// collections above this one is SEEDED when the store is created — the
     /// versions exist before any cluster does, which is why
@@ -1369,6 +1499,7 @@ impl Default for ComAmazonawsRedshiftRedshiftserviceversion20121201State {
             snapshots: Vec::new(),
             parameter_groups: default_parameter_groups(),
             usage_limits: Vec::new(),
+            qev2_idc_applications: Vec::new(),
             cluster_versions: published_cluster_versions(),
             maintenance_tracks: published_maintenance_tracks(),
         }
@@ -1463,6 +1594,30 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
         self.usage_limits
             .iter()
             .position(|limit| limit.usage_limit_id.as_deref() == Some(usage_limit_id))
+    }
+
+    /// The position of the registered QEV2 IAM Identity Center application with
+    /// this `Qev2IdcApplicationArn`, if any.
+    ///
+    /// A position rather than a reference, because every caller of it — the
+    /// modify and the delete — needs to write the record it finds; the read path
+    /// selects by reference while it walks the collection for a page.
+    pub fn qev2_idc_application_position(&self, application_arn: &str) -> Option<usize> {
+        self.qev2_idc_applications
+            .iter()
+            .position(|application| {
+                application.qev2_idc_application_arn.as_deref() == Some(application_arn)
+            })
+    }
+
+    /// The registered QEV2 IAM Identity Center application with this
+    /// `Qev2IdcApplicationName`, if any — the name uniqueness is decided on,
+    /// since the modelled fault tells a caller to "use a different application
+    /// name".
+    pub fn qev2_idc_application_named(&self, name: &str) -> Option<&Qev2IdcApplication> {
+        self.qev2_idc_applications
+            .iter()
+            .find(|application| application.qev2_idc_application_name.as_deref() == Some(name))
     }
 
     /// The position of the cluster with this identifier, if any.
