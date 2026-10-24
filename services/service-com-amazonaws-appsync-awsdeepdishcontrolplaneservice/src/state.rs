@@ -51,6 +51,9 @@ pub struct GraphqlApiRecord {
     /// members can never disagree about where the API is served.
     pub dns: BTreeMap<String, String>,
     pub tags: BTreeMap<String, String>,
+    /// The API's environmental variables, the whole list the last write left
+    /// behind: a write REPLACES this map rather than merging into it.
+    pub environment_variables: BTreeMap<String, String>,
     pub created_at: SystemTime,
     /// The API keys created under this API, keyed by key id.
     pub api_keys: BTreeMap<String, ApiKeyRecord>,
@@ -308,6 +311,46 @@ pub fn is_api_id(candidate: &str) -> bool {
 /// rejected id, so the caller can see which value was refused.
 pub fn invalid_api_id_message(api_id: &str) -> String {
     format!("Invalid API ID {api_id}")
+}
+
+/// The modelled bounds and alphabet of an `EnvironmentVariableKey`, and whether
+/// `candidate` satisfies them.
+///
+/// Source: the `EnvironmentVariableKey` shape — `@length` 2..64 and `@pattern`
+/// `^[A-Za-z]+\w*$` — which `PutGraphqlApiEnvironmentVariables` also states in prose:
+/// "Keys must begin with a letter. Keys must be at least two characters long. Keys can
+/// only contain letters, numbers, and the underscore character (_)." A map KEY is not
+/// checked by the request boundary (only map values and the entry count are), so the
+/// service enforces it.
+pub const ENVIRONMENT_VARIABLE_KEY_MIN_LEN: usize = 2;
+
+/// The maximum length of an `EnvironmentVariableKey` ([`ENVIRONMENT_VARIABLE_KEY_MIN_LEN`]).
+pub const ENVIRONMENT_VARIABLE_KEY_MAX_LEN: usize = 64;
+
+/// Whether `candidate` is a well-formed `EnvironmentVariableKey`: between
+/// [`ENVIRONMENT_VARIABLE_KEY_MIN_LEN`] and [`ENVIRONMENT_VARIABLE_KEY_MAX_LEN`]
+/// characters, beginning with a letter and otherwise holding only letters, digits and
+/// the underscore.
+pub fn is_environment_variable_key(candidate: &str) -> bool {
+    let length = candidate.chars().count();
+    if !(ENVIRONMENT_VARIABLE_KEY_MIN_LEN..=ENVIRONMENT_VARIABLE_KEY_MAX_LEN).contains(&length) {
+        return false;
+    }
+    let mut characters = candidate.chars();
+    characters.next().is_some_and(|first| first.is_ascii_alphabetic())
+        && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
+/// AppSync's refusal text for an `environmentVariables` key that is not an
+/// `EnvironmentVariableKey` ([`is_environment_variable_key`]): the rejected key and the
+/// constraint it broke, so the caller can fix the request from the message alone.
+pub fn invalid_environment_variable_key_message(key: &str) -> String {
+    format!(
+        "Invalid environment variable key {key}: a key must be between \
+         {ENVIRONMENT_VARIABLE_KEY_MIN_LEN} and {ENVIRONMENT_VARIABLE_KEY_MAX_LEN} characters \
+         long, must begin with a letter, and can only contain letters, numbers, and the \
+         underscore character (_)."
+    )
 }
 
 /// AppSync's fixed, request-independent text for an API that is absent, carried by

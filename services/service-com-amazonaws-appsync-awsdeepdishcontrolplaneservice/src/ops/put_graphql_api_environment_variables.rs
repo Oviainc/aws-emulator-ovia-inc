@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutGraphqlApiEnvironmentVariables
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutGraphqlApiEnvironmentVariables`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutGraphqlApiEnvironmentVariables::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: REPLACES the environmental variable list stored for the API named by
+//! `apiId` in [`crate::state`] with the submitted one, and answers with the list the
+//! API now holds. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +170,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutGraphqlApiEnvironmentVariables` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutGraphqlApiEnvironmentVariablesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutGraphqlApiEnvironmentVariables"))
+        // Where the list is written depends only on the `apiId` in the request, so
+        // nothing here reads the request's metadata.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                PutGraphqlApiEnvironmentVariablesErrorModeled::InternalFailureException(
+                    InternalFailureException {
+                        message: Some(
+                            "the appsync store is unavailable on this engine".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // An `apiId` that is not an API id at all is a malformed request, not a
+        // missing resource (see `crate::state::is_api_id`).
+        if !crate::state::is_api_id(&input.api_id) {
+            return Err(PutGraphqlApiEnvironmentVariablesErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::invalid_api_id_message(&input.api_id)),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        // The entry COUNT and every VALUE are refused by the request boundary against
+        // the modelled `@length` bounds before this handler runs; a map KEY is not
+        // covered there, so a key's own bounds and alphabet are enforced here. Checked
+        // before anything is written, so a refused call leaves the stored list exactly
+        // as it was.
+        for key in input.environment_variables.keys() {
+            if !crate::state::is_environment_variable_key(key) {
+                return Err(PutGraphqlApiEnvironmentVariablesErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: Some(crate::state::invalid_environment_variable_key_message(key)),
+                        ..Default::default()
+                    },
+                )
+                .into());
+            }
+        }
+
+        let mut guard = state.lock();
+        let Some(record) = guard.graphql_apis.get_mut(&input.api_id) else {
+            return Err(PutGraphqlApiEnvironmentVariablesErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // "Each call of the PutGraphqlApiEnvironmentVariables action will result in the
+        // overwriting of the existing environmental variable list of that API" — the
+        // submitted list REPLACES the stored one, so a key the request omits is gone.
+        record.environment_variables = input.environment_variables.into_iter().collect();
+
+        // Answer from the STORED list, so this body is the one
+        // `GetGraphqlApiEnvironmentVariables` answers with afterwards.
+        Ok(PutGraphqlApiEnvironmentVariablesOutput {
+            environment_variables: Some(crate::state::map_out(&record.environment_variables)),
+        })
     }
 }

@@ -374,6 +374,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .unwrap_or_default(),
             enhanced_metrics_config: input.enhanced_metrics_config,
             tags: input.tags.unwrap_or_default().into_iter().collect(),
+            // The create call carries no environmental variables: they are written by
+            // `PutGraphqlApiEnvironmentVariables`, so a fresh API holds none.
+            environment_variables: std::collections::BTreeMap::new(),
             created_at: std::time::SystemTime::now(),
             api_keys: std::collections::BTreeMap::new(),
         };
