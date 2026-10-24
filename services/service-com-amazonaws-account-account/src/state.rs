@@ -8,11 +8,12 @@
 //! report it, and `DeleteAlternateContact` removes one of its contacts. The
 //! record below is the one copy every one of those handlers reads and writes.
 //! It also carries the account's most recent primary email update, which
-//! `StartPrimaryEmailUpdate` records and `GetPrimaryEmailUpdateStatus` reports,
-//! and the phone-number verification of its primary contact, which
-//! `SendPhoneNumberVerification` starts, `VerifyPhoneNumber` completes and
-//! `GetContactInformation` reports as `VerificationStatus`
-//! ([`PhoneNumberVerification`]).
+//! `StartPrimaryEmailUpdate` records, `AcceptPrimaryEmailUpdate` confirms and
+//! `GetPrimaryEmailUpdateStatus` reports, the primary email address a confirmed
+//! update put on the account once it completed, and the phone-number
+//! verification of its primary contact, which `SendPhoneNumberVerification`
+//! starts, `VerifyPhoneNumber` completes and `GetContactInformation` reports as
+//! `VerificationStatus` ([`PhoneNumberVerification`]).
 //!
 //! Account Management operations all take an OPTIONAL `AccountId`: absent, the
 //! call lands on "the Amazon Web Services account of the identity used to call
@@ -148,10 +149,34 @@ pub const MAX_ACCOUNTS: usize = 1_000;
 ///
 /// `PENDING` is not a status the CLOCK moves on: Account Management sends a
 /// one-time passcode to the proposed address and the update advances only when a
-/// caller presents that passcode through `AcceptPrimaryEmailUpdate` (still
-/// scaffolded, with its own stub issue). So no due instant is stored for it —
-/// waiting changes nothing, and an update nobody accepts stays `PENDING`.
+/// caller presents that passcode through `AcceptPrimaryEmailUpdate`. So no due
+/// instant is stored for it — waiting changes nothing, and an update nobody
+/// accepts stays `PENDING`.
 pub const PENDING_PRIMARY_EMAIL_UPDATE_STATUS: &str = "PENDING";
+
+/// The `PrimaryEmailUpdateStatus` an update carries from the moment
+/// `AcceptPrimaryEmailUpdate` confirms it: `ACCEPTED`, another of that enum's
+/// four values.
+///
+/// `ACCEPTED` is NOT terminal — the request has been accepted and the address
+/// change still has to be applied — so the clock owes the update its
+/// [`COMPLETED_PRIMARY_EMAIL_UPDATE_STATUS`] after
+/// [`PRIMARY_EMAIL_UPDATE_COMPLETION`].
+pub const ACCEPTED_PRIMARY_EMAIL_UPDATE_STATUS: &str = "ACCEPTED";
+
+/// The TERMINAL `PrimaryEmailUpdateStatus` of an accepted update: `COMPLETED`,
+/// the status an update carries once the address it was started for is the
+/// account's primary email.
+pub const COMPLETED_PRIMARY_EMAIL_UPDATE_STATUS: &str = "COMPLETED";
+
+/// How long this emulator takes to carry an accepted primary email update from
+/// `ACCEPTED` to `COMPLETED`.
+///
+/// AWS publishes no duration for it, so this span is the emulator's OWN choice.
+/// It is deliberately non-zero: a caller that reads the status straight after
+/// accepting still observes `ACCEPTED`, and the state errors that go with it,
+/// exactly as it would against AWS.
+pub const PRIMARY_EMAIL_UPDATE_COMPLETION: Duration = Duration::from_millis(500);
 
 /// The `RegionOptStatus` a Region that Amazon Web Services turns on for every
 /// account carries: `ENABLED_BY_DEFAULT`, one of `RegionOptStatus`'s five values
@@ -403,6 +428,16 @@ pub struct PrimaryEmailUpdate {
     /// When this status was last set — what `GetPrimaryEmailUpdateStatus`
     /// reports as `UpdatedAt`.
     pub updated_at: SystemTime,
+    /// The instant this update's `COMPLETED` status is DUE, set when
+    /// `AcceptPrimaryEmailUpdate` moves it to `ACCEPTED`, and `None` for a
+    /// status the clock does not move on (`PENDING`, and `COMPLETED` once it
+    /// has been materialised).
+    ///
+    /// Held so the transition is owed by the CLOCK rather than by whoever
+    /// happens to call next: [`settled_status`](Self::settled_status) reports
+    /// the terminal status from that instant on, whether or not anybody read or
+    /// wrote in between.
+    pub completes_at: Option<SystemTime>,
 }
 
 impl PrimaryEmailUpdate {
@@ -413,7 +448,70 @@ impl PrimaryEmailUpdate {
             requested_email,
             status: PENDING_PRIMARY_EMAIL_UPDATE_STATUS.to_string(),
             updated_at: now,
+            completes_at: None,
         }
+    }
+
+    /// Whether this update is still waiting for the one-time passcode, which is
+    /// the one status `AcceptPrimaryEmailUpdate` can act on.
+    pub fn is_pending(&self) -> bool {
+        self.status == PENDING_PRIMARY_EMAIL_UPDATE_STATUS
+    }
+
+    /// Whether this update has been confirmed and its completion is owed: the
+    /// address it names is on its way to being an account's primary email, so
+    /// it already counts as in use.
+    pub fn is_accepted(&self) -> bool {
+        self.status == ACCEPTED_PRIMARY_EMAIL_UPDATE_STATUS
+    }
+
+    /// Confirm this update at `now`: it becomes `ACCEPTED`, and its `COMPLETED`
+    /// status comes due [`PRIMARY_EMAIL_UPDATE_COMPLETION`] later.
+    pub fn accept(&mut self, now: SystemTime) {
+        self.status = ACCEPTED_PRIMARY_EMAIL_UPDATE_STATUS.to_string();
+        self.updated_at = now;
+        self.completes_at = Some(now + PRIMARY_EMAIL_UPDATE_COMPLETION);
+    }
+
+    /// This update's status as of `now`: an accepted update whose due instant
+    /// has passed IS `COMPLETED` from that instant on, and every other status
+    /// is the stored one. A pure function of the record and the clock, so a
+    /// reader reports the settled status without writing anything.
+    pub fn settled_status(&self, now: SystemTime) -> &str {
+        if self.completes_at.is_some_and(|due| now >= due) {
+            COMPLETED_PRIMARY_EMAIL_UPDATE_STATUS
+        } else {
+            &self.status
+        }
+    }
+
+    /// When the status [`settled_status`](Self::settled_status) reports was set:
+    /// the due instant for a completion the clock already owes, else the instant
+    /// the stored status was written.
+    pub fn settled_updated_at(&self, now: SystemTime) -> SystemTime {
+        match self.completes_at {
+            Some(due) if now >= due => due,
+            _ => self.updated_at,
+        }
+    }
+
+    /// Materialise the completion the clock already owes: an `ACCEPTED` update
+    /// whose due instant is at or before `now` becomes `COMPLETED` in the
+    /// store, and the address it was started for is answered back as the one
+    /// the account's primary email becomes.
+    ///
+    /// Owed by the CLOCK, so this changes nothing a reader could not already
+    /// see ([`settled_status`](Self::settled_status) reports the same status
+    /// from the same instant without writing), and it is idempotent.
+    pub fn settle(&mut self, now: SystemTime) -> Option<String> {
+        let due = self.completes_at?;
+        if now < due {
+            return None;
+        }
+        self.status = COMPLETED_PRIMARY_EMAIL_UPDATE_STATUS.to_string();
+        self.updated_at = due;
+        self.completes_at = None;
+        Some(self.requested_email.clone())
     }
 }
 
@@ -520,6 +618,17 @@ pub struct Account {
     /// none has ever been started — which is what makes a status read of an
     /// account with no update a refusal rather than a reported status.
     pub primary_email_update: Option<PrimaryEmailUpdate>,
+    /// The account's primary email address (the root user email address), and
+    /// `None` until an update has COMPLETED on this record: this emulator
+    /// learns an account's primary email only by being told it through the
+    /// `StartPrimaryEmailUpdate` / `AcceptPrimaryEmailUpdate` flow, and never
+    /// invents one.
+    ///
+    /// Written by [`settle_primary_email_update`](Self::settle_primary_email_update)
+    /// when the accepted update completes, and read to decide whether an
+    /// address is already in use — which is the conflict Account Management
+    /// documents for a root user email change.
+    pub primary_email: Option<String>,
     /// The MOST RECENT phone-number verification of this account, or `None`
     /// while no `SendPhoneNumberVerification` has ever sent a passcode. The
     /// record names the number the passcode went to, so it stops applying when
@@ -539,7 +648,27 @@ impl Account {
             contact_information: None,
             region_opt_status: BTreeMap::new(),
             primary_email_update: None,
+            primary_email: None,
             phone_verification: None,
+        }
+    }
+
+    /// Materialise the primary email update completion the clock already owes:
+    /// an `ACCEPTED` update whose due instant is at or before `now` becomes
+    /// `COMPLETED`, and the address it was started for becomes this account's
+    /// [`primary_email`](Self::primary_email).
+    ///
+    /// Owed by the CLOCK and idempotent, exactly like
+    /// [`settle_region_opts`](Self::settle_region_opts). The mutating
+    /// primary-email operations call it before deciding, so the record they
+    /// write over is the settled one.
+    pub fn settle_primary_email_update(&mut self, now: SystemTime) {
+        let completed = self
+            .primary_email_update
+            .as_mut()
+            .and_then(|update| update.settle(now));
+        if let Some(address) = completed {
+            self.primary_email = Some(address);
         }
     }
 
@@ -704,6 +833,34 @@ impl ComAmazonawsAccountAccountState {
         )
     }
 
+    /// Materialise every primary email update completion the clock already owes,
+    /// across every account — see
+    /// [`Account::settle_primary_email_update`].
+    pub fn settle_primary_email_updates(&mut self, now: SystemTime) {
+        for account in self.accounts.values_mut() {
+            account.settle_primary_email_update(now);
+        }
+    }
+
+    /// Whether `address` is already in use as an account's primary email
+    /// address: either an account holds it, or another account's update is
+    /// ACCEPTED for it, so its completion is already owed.
+    ///
+    /// Settle first ([`settle_primary_email_updates`](Self::settle_primary_email_updates)):
+    /// an address a completed update put on an account is in use from the
+    /// instant that completion came due. An address a PENDING update merely
+    /// asked for is NOT in use — nothing has been changed for it yet, and the
+    /// passcode it waits for may never arrive.
+    pub fn primary_email_in_use(&self, address: &str) -> bool {
+        self.accounts.values().any(|account| {
+            account.primary_email.as_deref() == Some(address)
+                || account
+                    .primary_email_update
+                    .as_ref()
+                    .is_some_and(|update| update.is_accepted() && update.requested_email == address)
+        })
+    }
+
     /// The account `account_id` names, for a mutating operation that must NOT
     /// bring a record into existence: `None` when this emulator holds no record
     /// of that account, and nothing is written.
@@ -779,13 +936,15 @@ pub fn alternate_contact_not_found() -> ResourceNotFoundException {
     }
 }
 
-/// The `ValidationException` payload for a primary-email status read of an
-/// account that has never had an update started.
+/// The `ValidationException` payload for a primary-email call on an account that
+/// has never had an update started: there is no update to report or to accept.
 ///
 /// `GetPrimaryEmailUpdateStatus` reports "the status of the MOST RECENT primary
 /// email update" and models `Status` as REQUIRED, so an account with no update
 /// has no status to report and the call is refused rather than answered with an
-/// invented status. The modelled refusal is the 400 `ValidationException`; the
+/// invented status; `AcceptPrimaryEmailUpdate` accepts "the request that
+/// originated from StartPrimaryEmailUpdate", so with no such request there is
+/// nothing it can accept. The modelled refusal is the 400 `ValidationException`; the
 /// `reason` member is left absent because neither
 /// `ValidationExceptionReason` value (`fieldValidationFailed |
 /// invalidRegionOptTarget`) describes it — no input member was invalid.
@@ -797,8 +956,64 @@ pub fn no_primary_email_update() -> ValidationException {
     }
 }
 
-/// The `AccessDeniedException` payload for a `StartPrimaryEmailUpdate` whose
-/// `AccountId` is the caller's own account.
+/// The `ConflictException` payload for an `AcceptPrimaryEmailUpdate` whose
+/// update is not waiting for its one-time passcode: only a `PENDING` update can
+/// be accepted, and "the request could not be processed because of a conflict in
+/// the current status of the resource".
+///
+/// The message names the status the update IS in, which is what a caller needs
+/// to tell "already accepted" from "nothing in flight"; it names no address,
+/// because `PrimaryEmailAddress` is `@sensitive`.
+pub fn primary_email_update_not_pending(status: &str) -> ConflictException {
+    ConflictException {
+        message: format!(
+            "The primary email update is in status {status}; only a \
+             {PENDING_PRIMARY_EMAIL_UPDATE_STATUS} update can be accepted"
+        ),
+        error_type: None,
+    }
+}
+
+/// The `ValidationException` payload for an `AcceptPrimaryEmailUpdate` whose
+/// `PrimaryEmail` is not the address the update was started for.
+///
+/// The rule is the model's own `PrimaryEmail` documentation: "This must match
+/// the PrimaryEmail from the StartPrimaryEmailUpdate API call." `reason` is
+/// `fieldValidationFailed` and `fieldList` names the member, so a caller can see
+/// which input was refused — and neither the presented nor the requested address
+/// is echoed, because `PrimaryEmailAddress` is `@sensitive`.
+pub fn primary_email_does_not_match_request() -> ValidationException {
+    const RULE: &str =
+        "PrimaryEmail must match the PrimaryEmail from the StartPrimaryEmailUpdate API call";
+    ValidationException {
+        message: RULE.to_string(),
+        reason: Some(FIELD_VALIDATION_FAILED.to_string()),
+        field_list: Some(vec![ValidationExceptionField {
+            name: "PrimaryEmail".to_string(),
+            message: RULE.to_string(),
+        }]),
+    }
+}
+
+/// The `ConflictException` payload for a primary email change to an address that
+/// is already in use — the conflict this service's own `ConflictException`
+/// documentation gives as its example: "you try to change an account's root user
+/// email to an email address which is already in use".
+///
+/// It names no address: `PrimaryEmailAddress` is `@sensitive`, and the address
+/// in use belongs to whichever account already holds it.
+pub fn primary_email_already_in_use() -> ConflictException {
+    ConflictException {
+        message: "The request could not be processed because the email address is already in \
+                  use as the primary email address of an account"
+            .to_string(),
+        error_type: None,
+    }
+}
+
+/// The `AccessDeniedException` payload for a primary email update operation
+/// (`StartPrimaryEmailUpdate`, `AcceptPrimaryEmailUpdate`) whose `AccountId` is
+/// the caller's own account.
 ///
 /// The model's own `AccountId` documentation states the rule: the operation "can
 /// only be called from the management account or the delegated administrator

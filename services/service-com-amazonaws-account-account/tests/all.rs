@@ -25,6 +25,8 @@ mod pattern_validation_messages;
 mod phone_number_verification;
 #[path = "all/primary_email_update.rs"]
 mod primary_email_update;
+#[path = "all/primary_email_update_acceptance.rs"]
+mod primary_email_update_acceptance;
 #[path = "all/region_opt_in.rs"]
 mod region_opt_in;
 #[path = "all/region_opt_in_listing.rs"]
