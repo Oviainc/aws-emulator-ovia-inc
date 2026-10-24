@@ -81,6 +81,12 @@ mod task_lifecycle;
 // Same reasoning: declared outside the sorted list, which is the stretch every
 // concurrent iotsitewise change edits. Fold it into the list once the churn
 // settles.
+#[path = "all/list_gateways.rs"]
+mod list_gateways;
+
+// Same reasoning: declared outside the sorted list, which is the stretch every
+// concurrent iotsitewise change edits. Fold it into the list once the churn
+// settles.
 #[path = "all/workspace_lifecycle.rs"]
 mod workspace_lifecycle;
 
