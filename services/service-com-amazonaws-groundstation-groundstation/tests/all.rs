@@ -15,6 +15,8 @@
 mod agent_configuration_reads;
 #[path = "all/agent_lifecycle.rs"]
 mod agent_lifecycle;
+#[path = "all/antenna_inventory.rs"]
+mod antenna_inventory;
 #[path = "all/config_defaults_and_references.rs"]
 mod config_defaults_and_references;
 #[path = "all/config_listing.rs"]

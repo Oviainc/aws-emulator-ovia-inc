@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAntennas
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAntennas`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the antennas at one ground station this account is served by, a page at a
+//! time: one `AntennaListItem` per antenna at it, carrying that ground station's name,
+//! the antenna's own name and the Region the request addressed.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAntennas::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Neither a ground station nor an antenna is created through this API (the model
+//! declares no operation that builds one), so the inventory this reads is the one written
+//! when this service's store was created — see [`crate::state::GROUND_STATIONS_ENV`] —
+//! and a `groundStationId` naming no ground station this account knows is refused as the
+//! bad parameter it is.
 //!
 //! ## Shape of an operation
 //!
@@ -73,6 +73,15 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+/// What this operation answers when a `groundStationId` names no ground station this
+/// account is served by.
+///
+/// Built from the request: the refusal names the id it was given, so a caller can tell
+/// which of its parameters is the one that resolves to nothing.
+fn ground_station_not_found_message(ground_station_id: &str) -> String {
+    format!("No ground station found with id {ground_station_id}")
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -138,23 +147,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::LIST_ANTENNAS_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// Report the antennas at the ground station `groundStationId` names, a page at a
+    /// time.
+    ///
+    /// `@readonly`: the answer is computed from
+    /// [`crate::state::ComAmazonawsGroundstationGroundstationState::ground_stations`] and
+    /// nothing is written, so a listing changes nothing a later caller sees. An antenna is
+    /// not created through this API — AWS builds and operates it outside this API — so the
+    /// store holds exactly the inventory [`crate::state::GROUND_STATIONS_ENV`] describes,
+    /// and a ground station with no antenna recorded for it lists none.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAntennas` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAntennasErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAntennas"))
+        /// Names this listing inside its pagination tokens, so a token another listing
+        /// issued is not accepted here.
+        const LISTING: &str = "antennas";
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListAntennasErrorModeled::DependencyException(DependencyException {
+                message: Some("this service's state store is unavailable".to_string()),
+                parameter_name: None,
+            })
+        })?;
+
+        // An offset counts within the antennas of ONE ground station, so the ground
+        // station is part of the scope its token is issued under: a token issued for
+        // another station is refused rather than resumed at an offset into a different
+        // sequence (skipping or repeating antennas).
+        let scope =
+            crate::state::page_scope(LISTING, ::std::slice::from_ref(&input.ground_station_id));
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => crate::state::decode_page_token(&scope, token).ok_or_else(|| {
+                ListAntennasErrorModeled::InvalidParameterException(InvalidParameterException {
+                    message: Some(
+                        "nextToken was not issued by a previous ListAntennas call for this ground \
+                         station"
+                            .to_string(),
+                    ),
+                    parameter_name: Some("nextToken".to_string()),
+                })
+            })?,
+        };
+
+        // An antenna's Region is the Region the request addressed: these are the ground
+        // stations serving THIS account, reached through the regional endpoint the caller
+        // signed for — the same region every ARN this service mints carries.
+        let region = crate::state::request_region(ctx.parts());
+
+        let guard = state.lock();
+
+        // A `groundStationId` naming no ground station this account knows references
+        // nothing, so the request is answered as the bad parameter it carries rather than
+        // with the empty page the lookup would otherwise select — which a caller could not
+        // tell from "this ground station has no antenna".
+        if !guard.knows_ground_station(&input.ground_station_id) {
+            return Err(ListAntennasErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(ground_station_not_found_message(&input.ground_station_id)),
+                    parameter_name: Some("groundStationId".to_string()),
+                },
+            )
+            .into());
+        }
+
+        let items: Vec<AntennaListItem> = guard
+            .antennas_at(&input.ground_station_id)
+            .into_iter()
+            .map(|antenna_name| AntennaListItem {
+                ground_station_name: input.ground_station_id.clone(),
+                antenna_name,
+                region: region.clone(),
+            })
+            .collect();
+
+        let (page, next_token) = crate::state::paginate(&scope, &items, input.max_results, offset);
+
+        Ok(ListAntennasOutput {
+            // Present and empty when the ground station has no antenna recorded for it:
+            // the member is modelled required over a list of length 0..100, so a client's
+            // pagination loop reads the same member on every page.
+            antenna_list: page,
+            next_token,
+        })
     }
 }
