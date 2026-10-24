@@ -91,3 +91,5 @@ mod configuration_recorder_refusal_messages;
 mod list_stored_queries;
 #[path = "all/delete_stored_query.rs"]
 mod delete_stored_query;
+#[path = "all/delete_pending_aggregation_request.rs"]
+mod delete_pending_aggregation_request;

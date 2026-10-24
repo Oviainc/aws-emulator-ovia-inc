@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeletePendingAggregationRequest
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeletePendingAggregationRequest`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Removes the pending authorization request the (requester account, requester Region)
+//! pair names from [`crate::state`], so `DescribePendingAggregationRequests` no longer
+//! reports it and every other pending request stays reported.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeletePendingAggregationRequest::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The pair is what identifies ONE pending request (see
+//! [`crate::state::PendingAggregationRequestEntry`]), and the operation models no
+//! not-found error, so deleting a pair that holds no pending request succeeds and
+//! leaves state as it was.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +153,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeletePendingAggregationRequest` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeletePendingAggregationRequestErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeletePendingAggregationRequest"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        // `RequesterAccountId`'s `^\d{12}$` pattern and `RequesterAwsRegion`'s 1..64
+        // length are modelled, so a request that reaches here already satisfies them.
+        // The requesting pair is the key one pending request is held under, so it names
+        // exactly the one to remove and no other.
+        let key = crate::state::PendingAggregationRequestEntry::new(
+            &input.requester_account_id,
+            &input.requester_aws_region,
+        )
+        .key();
+
+        // The model declares no not-found error for this operation, so a pair holding
+        // no pending request is not a failure: the request is absent either way, and
+        // nothing else about state changes.
+        state.lock().pending_aggregation_requests.remove(&key);
+
+        Ok(DeletePendingAggregationRequestOutput)
     }
 }
