@@ -2,7 +2,9 @@
 
 //! @op DescribeJob
 //!
-//! Rebuilds the `JobMetadata` of the requested job from what `CreateJob` persisted.
+//! Rebuilds the `JobMetadata` of the requested job from what `CreateJob` persisted, and
+//! the `JobMetadata` of each of its job parts in `SubJobMetadata` when the job is the
+//! main job of an export order.
 //!
 //! ## Shape of an operation
 //!
@@ -158,12 +160,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // "Information about a specific job part (in the case of an export job)"
+        // (`DescribeJobResult$SubJobMetadata`): the parts of the main job an export
+        // request minted, in the order they were created. A job with no parts — a plain
+        // job, or a job part itself — reports no member rather than an empty list.
+        let parts = store.job_parts(&input.job_id);
+        let sub_job_metadata: Option<Vec<JobMetadata>> = (!parts.is_empty())
+            .then(|| parts.iter().map(|part| part.to_job_metadata()).collect());
+
         Ok(DescribeJobOutput {
             job_metadata: Some(job.to_job_metadata()),
-            // `SubJobMetadata` describes the job parts of a cluster or export main job.
-            // A job this service mints has none, so it reports no member rather than an
-            // empty list.
-            sub_job_metadata: None,
+            sub_job_metadata,
         })
     }
 }
