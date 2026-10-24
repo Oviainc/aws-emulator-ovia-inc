@@ -150,8 +150,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata.
-        let _ = ctx;
+        // request metadata — here the Region this request was signed for.
+        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetFeedPolicyErrorModeled::InternalServerErrorException(
                 InternalServerErrorException {
@@ -172,7 +172,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // 404). The message is this service's one fixed not-found sentence, so the
         // refusal reports neither the id that was probed nor which of the two reasons
         // it was — a caller cannot use it to learn whether another caller's feed exists.
-        let Some(policy) = state.feeds.get(&input.id).and_then(|feed| feed.policy.clone()) else {
+        // The feed is resolved WITHIN the request's Region, as `GetFeed` resolves it:
+        // a feed of another Region is no feed of this endpoint, so its policy is not
+        // this endpoint's to report either.
+        let Some(policy) = state
+            .feed(&region, &input.id)
+            .and_then(|feed| feed.policy.clone())
+        else {
             return Err(GetFeedPolicyErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
                     message: crate::state::NOT_FOUND_MESSAGE.to_string(),

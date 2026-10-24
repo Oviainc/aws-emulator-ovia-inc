@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetBucketPolicyStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetBucketPolicyStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED. Reports whether the bucket's POLICY grants access to the public, computed
+//! from the document `PutBucketPolicy` stored on the bucket
+//! ([`crate::state::policy_grants_public_access`]). A bucket carrying no policy grants the
+//! public nothing, so it is reported not public; a bucket this emulator does not hold is
+//! `NoSuchBucket` (404), and a request naming another account as the expected bucket owner
+//! is `AccessDenied` (403).
+//!
+//! Block Public Access does NOT enter this answer: the switches `PutPublicAccessBlock`
+//! sets govern what S3 lets a public policy DO, while this operation reports the policy's
+//! own status — "The policy status for this bucket" (`PolicyStatus$IsPublic`).
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetBucketPolicyStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! broken".
 //!
 //! ## Shape of an operation
 //!
@@ -142,18 +146,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetBucketPolicyStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetBucketPolicyStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetBucketPolicyStatus"))
+        // A read needs nothing from the request beyond its deserialized input.
+        let _ = ctx;
+
+        // "If the account ID that you provide does not match the actual owner of the
+        // bucket, the request fails with the HTTP status code 403 Forbidden (access
+        // denied)" — `GetBucketPolicyStatusRequest$ExpectedBucketOwner`. This emulator
+        // serves one account, so that account owns every bucket it holds.
+        if input
+            .expected_bucket_owner
+            .as_deref()
+            .is_some_and(|expected| expected != ::engine::emulator_account_id())
+        {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                "AccessDenied",
+                ACCESS_DENIED_STATUS,
+                "Access Denied",
+            ));
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                "InternalError",
+                500,
+                "the S3 store is unavailable",
+            ));
+        };
+
+        // Read-only: the guard is taken, the stored policy is read, and nothing is
+        // written — a later caller sees exactly what this one saw.
+        let store = state.lock();
+        let Some(bucket) = store.bucket(&input.bucket) else {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::NO_SUCH_BUCKET_CODE,
+                404,
+                crate::state::NO_SUCH_BUCKET_MESSAGE,
+            ));
+        };
+
+        // A bucket with no policy grants the public nothing through one, so it is not
+        // public: unlike the other policy readers, this operation has an answer for that
+        // state and so does not refuse it.
+        let is_public = bucket
+            .policy
+            .as_deref()
+            .is_some_and(crate::state::policy_grants_public_access);
+
+        Ok(GetBucketPolicyStatusOutput {
+            policy_status: Some(PolicyStatus {
+                is_public: Some(is_public),
+            }),
+        })
     }
 }
+
+/// The HTTP status AWS answers a bucket-owner mismatch with: 403, as
+/// `GetBucketPolicyStatusRequest$ExpectedBucketOwner` documents.
+const ACCESS_DENIED_STATUS: u16 = 403;

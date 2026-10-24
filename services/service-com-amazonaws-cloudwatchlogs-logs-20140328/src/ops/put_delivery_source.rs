@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutDeliverySource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutDeliverySource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutDeliverySource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates the named delivery source in this account's state, or UPDATES the one already
+//! stored under that name ("If you use this operation to update an existing delivery source,
+//! all the current delivery source parameters are overwritten with the new parameter values
+//! that you specify"), and reports the stored record.
+//!
+//! A source is identified by the pairing of its name with the resource it represents, so a
+//! put that keeps the name and names a DIFFERENT resource is refused with the
+//! `ConflictException` this operation models rather than re-pointing the stored source.
 //!
 //! ## Shape of an operation
 //!
@@ -190,18 +190,111 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutDeliverySource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutDeliverySourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutDeliverySource"))
+        // The ARN of the logical object this call creates names the Region the request was
+        // signed for, so it is read off the request's credential scope.
+        let region = crate::state::request_region(ctx.parts());
+
+        // "The ARN of the Amazon Web Services resource that is generating and sending logs":
+        // the source's `service` member is read off it, so a value that is not an ARN at all
+        // names no resource and is refused here. Whether that resource EXISTS is a question
+        // this service cannot answer for another service's resource, and the operation
+        // documents no existence requirement, so it is not asked.
+        if let Some(message) =
+            crate::state::unparsable_arn_message("resourceArn", &input.resource_arn)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            PutDeliverySourceError::from(
+                PutDeliverySourceErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let mut store = state.lock();
+
+        // A delivery source is the pairing of its name with the resource it represents: the
+        // name "must be unique for all delivery sources in your account", and
+        // `DeliverySource$resourceArns` holds "the ARN of the Amazon Web Services resource
+        // that sends logs and is represented by this delivery source". A put that keeps the
+        // name and names another resource would make every delivery already paired with that
+        // source — each of which names it by this name — deliver a different resource's logs,
+        // so it is refused as the conflict it is ("This operation attempted to create a
+        // resource that already exists") rather than applied.
+        if let Some(stored) = store.delivery_sources.get(&input.name) {
+            if !stored.resource_arns.contains(&input.resource_arn) {
+                return Err(PutDeliverySourceErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(format!(
+                            "A delivery source named {} already exists and represents {}",
+                            input.name,
+                            stored.resource_arns.join(", ")
+                        )),
+                    },
+                )
+                .into());
+            }
+        } else if store.delivery_sources.len() >= crate::state::MAX_DELIVERY_SOURCES {
+            // A put under a name already stored UPDATES that source, so only a put that would
+            // ADD one can exceed the number this emulator holds.
+            return Err(PutDeliverySourceErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "an account can have up to {} delivery sources",
+                        crate::state::MAX_DELIVERY_SOURCES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "all the current delivery source parameters are overwritten with the new parameter
+        // values that you specify": the record is REBUILT from this request, so a parameter an
+        // earlier put named and this one omits is absent afterwards rather than inherited.
+        let mut record = crate::state::DeliverySourceRecord::new(
+            &region,
+            &input.name,
+            &input.resource_arn,
+            &input.log_type,
+        );
+        record.source_configuration = input
+            .delivery_source_configuration
+            .as_ref()
+            .map(|configuration| {
+                configuration
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        // The tag set is the RESOURCE's, not one of the delivery parameters the sentence above
+        // overwrites: `tags` is "An optional list of key-value pairs to associate with the
+        // resource", so a put that names tags assigns exactly those, and a put that names none
+        // leaves the source's tags as they were.
+        record.tags = match input.tags.as_ref() {
+            Some(tags) => tags
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+            None => store
+                .delivery_sources
+                .get(&input.name)
+                .map(|stored| stored.tags.clone())
+                .unwrap_or_default(),
+        };
+        store.delivery_sources.insert(input.name.clone(), record);
+
+        Ok(PutDeliverySourceOutput {
+            // "A structure containing information about the delivery source that was just
+            // created or updated" — read back out of the store, so what this call reports is
+            // what `GetDeliverySource` reports afterwards.
+            delivery_source: store
+                .delivery_sources
+                .get(&input.name)
+                .map(crate::state::DeliverySourceRecord::reported),
+        })
     }
 }

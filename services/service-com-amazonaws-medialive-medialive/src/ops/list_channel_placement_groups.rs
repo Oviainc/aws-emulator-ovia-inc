@@ -1,15 +1,34 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListChannelPlacementGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListChannelPlacementGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListChannelPlacementGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Retrieve the list of ChannelPlacementGroups in the specified Cluster." Reports
+//! the groups this service's store holds for the `ClusterId` the path names, each
+//! exactly once, in the order their ids were minted, cut into pages of at most
+//! `MaxResults` (bounded by [`crate::state::MAX_LIST_PAGE_SIZE`]) whose `NextToken`
+//! is the id the next page resumes at and is absent on the last page — the same
+//! page walk every other collection listing in this crate performs (see
+//! `list_clusters`, `list_multiplex_programs`).
+//!
+//! Every reported group comes from the ONE projection
+//! `CreateChannelPlacementGroup`, `DescribeChannelPlacementGroup` and
+//! `UpdateChannelPlacementGroup` answer from
+//! ([`crate::state::ComAmazonawsMedialiveMedialiveState::channel_placement_group_description`]),
+//! moved onto the model's own `DescribeChannelPlacementGroupSummary` — so a listed
+//! summary cannot drift from the described group.
+//!
+//! A group belongs to the cluster it was created in and is never visible through
+//! another cluster's id (`crate::state::channel_placement_groups`), so the listing
+//! is scoped to that one cluster. A `ClusterId` this store holds no cluster for
+//! names no collection at all; this operation models no `NotFoundException`, so
+//! such a request is refused with the 400 `BadRequestException` it does model
+//! rather than reported as an empty collection.
+//!
+//! REPORTING only: the single write this handler's read performs is
+//! [`crate::state::ComAmazonawsMedialiveMedialiveState::settle`], which
+//! materialises the transitions the clock had already made due (a group's
+//! `ASSIGNING` -> `ASSIGNED` step among them) and were owed whether or not this
+//! listing ran.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +170,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListChannelPlacementGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListChannelPlacementGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListChannelPlacementGroups"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+
+        // `MaxResults` is a page size, so a non-positive one asks for nothing and
+        // is a bad request. It is clamped to a finite ceiling, and an absent one
+        // uses that ceiling, so no single request can ask the service to project
+        // an unbounded number of groups in one response. The page size is judged
+        // before the cluster is resolved, so a request the real service refuses is
+        // refused whatever cluster it names.
+        let page_size = match input.max_results {
+            Some(max_results) if max_results < 1 => {
+                return Err(bad_request(&format!(
+                    "maxResults must be at least 1, got {max_results}"
+                )));
+            }
+            Some(max_results) => (max_results as usize).min(crate::state::MAX_LIST_PAGE_SIZE),
+            None => crate::state::MAX_LIST_PAGE_SIZE,
+        };
+
+        let mut state = state.lock();
+        // Reporting only: `settle` materialises the transitions the clock had
+        // already made due — a group's `ASSIGNING` -> `ASSIGNED` step among them —
+        // which were owed whether or not this listing ran, so a listed group
+        // reports the same `State` a describe of it does.
+        state.settle(::std::time::SystemTime::now());
+        let state = &*state;
+
+        // A group lives inside ONE cluster, so a `ClusterId` this store holds no
+        // cluster for names no collection to page through. This operation models
+        // no 404, so the request itself is what cannot be read: the modelled 400.
+        if !state.clusters.contains_key(&input.cluster_id) {
+            return Err(bad_request(&crate::state::not_found_message(
+                "Cluster",
+                &input.cluster_id,
+            )));
+        }
+
+        // `NextToken` is the id the next page starts at, and ids sort in mint
+        // order in the `BTreeMap`, so resuming is a range scan from that id,
+        // keeping only the groups of the cluster the path names. A token naming a
+        // group gone since the previous page simply resumes at the next surviving
+        // id instead of failing.
+        let first = match input.next_token.as_deref() {
+            Some(token) => ::std::ops::Bound::Included(token),
+            None => ::std::ops::Bound::Unbounded,
+        };
+        let mut remaining = state
+            .channel_placement_groups
+            .range::<str, _>((first, ::std::ops::Bound::Unbounded))
+            .filter(|(_, group)| group.cluster_id == input.cluster_id);
+
+        // Every group is reported through the ONE projection
+        // `DescribeChannelPlacementGroup` answers from, so a summary cannot drift
+        // from the described group. The projection is resolved BEFORE the page
+        // budget is spent, so the page carries `page_size` groups whenever that
+        // many are left.
+        let channel_placement_groups: Vec<DescribeChannelPlacementGroupSummary> = remaining
+            .by_ref()
+            .filter_map(|(id, _)| state.channel_placement_group_description(&input.cluster_id, id))
+            .take(page_size)
+            .map(|group| {
+                crate::state::channel_placement_group_output!(
+                    DescribeChannelPlacementGroupSummary,
+                    group
+                )
+            })
+            .collect();
+        // Absent on the last page: a token is handed out only when a group of this
+        // cluster is left over after this one.
+        let next_token = remaining.next().map(|(id, _)| id.clone());
+
+        Ok(ListChannelPlacementGroupsOutput {
+            channel_placement_groups: Some(channel_placement_groups),
+            next_token,
+        })
     }
+}
+
+/// A request this operation cannot read, as its modelled 400.
+fn bad_request(message: &str) -> ListChannelPlacementGroupsError {
+    ListChannelPlacementGroupsErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no store to list the cluster's groups from. A modelled server
+/// error, never a fresh engine (which would answer from an empty private store).
+fn unavailable() -> ListChannelPlacementGroupsError {
+    ListChannelPlacementGroupsErrorModeled::InternalServerErrorException(
+        InternalServerErrorException {
+            message: Some(crate::state::NO_STORE.to_string()),
+        },
+    )
+    .into()
 }

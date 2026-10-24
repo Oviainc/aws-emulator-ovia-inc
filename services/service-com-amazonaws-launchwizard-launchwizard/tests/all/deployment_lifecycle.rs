@@ -13,13 +13,14 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use service_com_amazonaws_launchwizard_launchwizard::ops::types::{
     DEPLOYMENT_FILTER_KEY_VALUES, DEPLOYMENT_STATUS_VALUES, EVENT_STATUS_VALUES,
 };
 
 // The HTTP harness, the signing region and the pagination walker are shared with the
 // other suites in this crate rather than copied — see `tests/all/harness.rs`.
+use crate::deployment_update::conforming_specifications;
 use crate::harness::{catalogue, walk_pages, Harness, REGION};
 
 /// The canonical emulator account id every ARN carries.
@@ -30,23 +31,53 @@ pub(crate) const ACCOUNT: &str = "000000000000";
 /// test waiting for the clock.
 const SETTLE: Duration = Duration::from_millis(1_400);
 
-/// A `CreateDeployment` request body.
+/// The settings a `CreateDeployment` for `pattern` has to carry: every field THAT
+/// pattern's published schema marks `required`, filled with one of the values it allows
+/// wherever it publishes any.
 ///
-/// `specifications` carries the two fields EVERY seeded pattern publishes as
-/// `required: "Yes"` (`KeyPairName`, `VpcId`, from the schema
-/// `GetWorkloadDeploymentPattern` reports) and nothing the pattern does not publish:
-/// a create is judged against that schema, so a body that is meant to succeed fills
-/// it in. See `tests/all/create_deployment_validation.rs` for the suite that drives
-/// the judgement itself.
-pub(crate) fn create_body(workload: &str, pattern: &str, name: &str, dry_run: bool) -> Value {
+/// Read off `GetWorkloadDeploymentPattern` rather than written by hand, because the
+/// schema is the PATTERN's own: two patterns of one workload require different settings,
+/// so a map written out here would be a map for one of them. When the catalogue
+/// publishes no such pattern (the not-found rows below), there is no schema to fill in
+/// and a well-formed `DeploymentSpecifications` map is enough — the request is refused
+/// for the pattern it names, before any schema is consulted.
+pub(crate) async fn required_specifications(
+    harness: &Harness,
+    workload: &str,
+    pattern: &str,
+) -> Map<String, Value> {
+    let case = format!("{workload}/{pattern} schema");
+    let reply = harness
+        .call(
+            "/getWorkloadDeploymentPattern",
+            &json!({"workloadName": workload, "deploymentPatternName": pattern}),
+        )
+        .await;
+    if reply.status != 200 {
+        return [("KeyPairName".to_string(), json!("key-for-no-such-pattern"))]
+            .into_iter()
+            .collect();
+    }
+    conforming_specifications(&case, &reply.body["workloadDeploymentPattern"], false)
+}
+
+/// A `CreateDeployment` request body whose `specifications` the named pattern's own
+/// published schema accepts — see [`required_specifications`]. A create is judged
+/// against that schema, so a body that is meant to succeed fills it in; see
+/// `tests/all/create_deployment_validation.rs` for the suite that drives the judgement
+/// itself.
+pub(crate) async fn create_body(
+    harness: &Harness,
+    workload: &str,
+    pattern: &str,
+    name: &str,
+    dry_run: bool,
+) -> Value {
     json!({
         "workloadName": workload,
         "deploymentPatternName": pattern,
         "name": name,
-        "specifications": {
-            "KeyPairName": format!("key-for-{name}"),
-            "VpcId": "vpc-0123456789abcdef0",
-        },
+        "specifications": Value::Object(required_specifications(harness, workload, pattern).await),
         "tags": {"Owner": "emulator-tests", "Workload": workload},
         "dryRun": dry_run,
     })
@@ -64,7 +95,7 @@ pub(crate) async fn create(
         .ok(
             case,
             "/createDeployment",
-            create_body(workload, pattern, name, false),
+            create_body(harness, workload, pattern, name, false).await,
         )
         .await;
     let id = body["deploymentId"]
@@ -167,7 +198,7 @@ async fn the_seeded_workload_catalogue_is_reported_and_paged() {
 async fn a_created_deployment_is_read_back_from_state_and_advances_on_the_clock() {
     let harness = Harness::new();
     let case = "SAP/SapHanaSingle/demo-deployment";
-    let request = create_body("SAP", "SapHanaSingle", "demo-deployment", false);
+    let request = create_body(&harness, "SAP", "SapHanaSingle", "demo-deployment", false).await;
     let created = harness.ok(case, "/createDeployment", request.clone()).await;
     let id = created["deploymentId"]
         .as_str()
@@ -334,7 +365,7 @@ async fn create_resolves_the_workload_and_pattern_against_the_catalogue() {
             .refused(
                 &case,
                 "/createDeployment",
-                create_body(&workload, &pattern, "should-not-exist", false),
+                create_body(&harness, &workload, &pattern, "should-not-exist", false).await,
                 404,
                 "ResourceNotFoundException",
             )
@@ -382,7 +413,7 @@ async fn a_deployment_name_is_held_only_while_a_deployment_holds_it() {
             .refused(
                 &case,
                 "/createDeployment",
-                create_body(workload, pattern, name, false),
+                create_body(&harness, workload, pattern, name, false).await,
                 400,
                 "ValidationException",
             )
@@ -437,7 +468,7 @@ async fn a_dry_run_validates_and_stores_nothing() {
             .ok(
                 &case,
                 "/createDeployment",
-                create_body(workload, pattern, name, true),
+                create_body(&harness, workload, pattern, name, true).await,
             )
             .await;
         assert!(
@@ -452,7 +483,7 @@ async fn a_dry_run_validates_and_stores_nothing() {
         .refused(
             "dry run of an unknown workload",
             "/createDeployment",
-            create_body("NoSuchWorkload", "SapHanaSingle", "dry-four", true),
+            create_body(&harness, "NoSuchWorkload", "SapHanaSingle", "dry-four", true).await,
             404,
             "ResourceNotFoundException",
         )
@@ -881,7 +912,7 @@ async fn the_store_and_every_page_are_bounded() {
         .refused(
             "one deployment past the store bound",
             "/createDeployment",
-            create_body("SAP", "SapHanaSingle", "one-too-many", false),
+            create_body(&harness, "SAP", "SapHanaSingle", "one-too-many", false).await,
             400,
             "ResourceLimitException",
         )
