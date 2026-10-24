@@ -116,7 +116,7 @@ pub(crate) async fn get_profile(client: &Client, profile_arn: &str) -> Answer {
         .await
 }
 
-async fn create_goal(client: &Client, profile_arn: &str, body: Value) -> Answer {
+pub(crate) async fn create_goal(client: &Client, profile_arn: &str, body: Value) -> Answer {
     client
         .send(
             "POST",

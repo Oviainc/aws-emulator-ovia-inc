@@ -23,6 +23,9 @@ mod agent_profile_lifecycle;
 #[path = "all/agent_profile_listing.rs"]
 mod agent_profile_listing;
 
+#[path = "all/agent_recommendation_generations.rs"]
+mod agent_recommendation_generations;
+
 #[path = "all/custom_lens_import.rs"]
 mod custom_lens_import;
 

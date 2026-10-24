@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartAgentRecommendationGeneration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartAgentRecommendationGeneration`'s real behaviour. Implement it here — this is
+//! Initiates a recommendation generation for an agent profile and records it, so
+//! `GetAgentRecommendationGeneration` can report its status, progress and scope.
+//! IMPLEMENTED here — this is
 //! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartAgentRecommendationGeneration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The generation is recorded with the instants the clock owes its transitions at
+//! ([`crate::state::AgentGenerationRecord`]), so `GetAgentRecommendationGeneration` can
+//! report the job's status and progress without anything sleeping. The operation carries
+//! `@idempotent`, so a repeat of a start whose generation is still in flight answers that
+//! generation rather than starting a second analysis.
 //!
 //! ## Shape of an operation
 //!
@@ -174,20 +175,308 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartAgentRecommendationGeneration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartAgentRecommendationGenerationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartAgentRecommendationGeneration"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartAgentRecommendationGenerationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Well-Architected Tool agent profile store is unavailable"
+                        .to_string(),
+                },
+            )
+        })?;
+
+        // Defence in depth for a caller that builds the input directly: `RecommendationType`
+        // and `Pillar` are enums, so the boundary walk in `crate::service` already refuses a
+        // value outside their published sets with this same 400 before the handler runs. It
+        // is kept so a generation is never STORED naming a value the enums do not publish.
+        if let Some(exception) = unpublished_enum_exception(&input) {
+            return Err(
+                StartAgentRecommendationGenerationErrorModeled::ValidationException(exception)
+                    .into(),
+            );
+        }
+
+        // `additionalContext` is an untyped `Document`, so its nesting is CALLER-chosen and
+        // every walk of one costs a level of stack. A document deeper than the ceiling this
+        // service holds documents to is refused here, before anything walks it, naming the
+        // member that carried it.
+        if crate::state::document_depth_exceeded(input.additional_context.as_ref()) {
+            return Err(
+                StartAgentRecommendationGenerationErrorModeled::ValidationException(
+                    crate::state::member_constraint_exception(
+                        ADDITIONAL_CONTEXT_MEMBER,
+                        &format!(
+                            "Member must not nest more than {} levels deep",
+                            crate::state::MAX_DOCUMENT_DEPTH
+                        ),
+                    ),
+                )
+                .into(),
+            );
+        }
+
+        let fingerprint = crate::state::parameter_fingerprint(&serde_json::json!({
+            "additionalContext": crate::state::document_fingerprint(
+                input.additional_context.as_ref(),
+            ),
+            "name": &input.name,
+            "profileArn": &input.profile_arn,
+            "scope": scope_fingerprint(&input.scope),
+            "types": &input.types,
+        }));
+        let now = std::time::SystemTime::now();
+
+        let mut store = state.lock();
+
+        // "Initiates a new recommendation generation process for the specified optimization
+        // profile": that profile is resolved by this lookup. The operation models NO
+        // `ResourceNotFoundException` (`AccessDenied`, `Conflict`, `InternalServer`,
+        // `ServiceQuotaExceeded`, `Throttling`, `Validation`), so a well-formed ARN that
+        // names no stored profile is refused as a field validation naming the member that
+        // carried it, and nothing is recorded.
+        let Some(profile) = store.agent_profiles.get(&input.profile_arn) else {
+            return Err(
+                StartAgentRecommendationGenerationErrorModeled::ValidationException(
+                    crate::state::member_constraint_exception(
+                        PROFILE_ARN_MEMBER,
+                        &format!(
+                            "Member must name an agent profile of account {}, got {}",
+                            ::engine::emulator_account_id(),
+                            input.profile_arn
+                        ),
+                    ),
+                )
+                .into(),
+            );
+        };
+
+        // A generation "analyzes your Amazon Web Services resources" over the scope the
+        // PROFILE names, and a profile that names none is eligible for neither kind of
+        // generation — the same derived answer `GetAgentProfile` reports in
+        // `eligibleForArchitectureGeneration` / `eligibleForScheduledGeneration` and
+        // explains in `fieldErrors`. There is nothing to analyse, so the start is refused
+        // with that same sentence rather than recording a job that cannot run.
+        if !profile.eligible_for_generation() {
+            return Err(
+                StartAgentRecommendationGenerationErrorModeled::ValidationException(
+                    crate::state::unclassified_exception(format!(
+                        "The agent profile with ARN {} is not eligible for recommendation \
+                         generation. {}",
+                        input.profile_arn,
+                        crate::state::NO_AGGREGATION_CONFIGURATION_MESSAGE
+                    )),
+                )
+                .into(),
+            );
+        }
+
+        // `Scope$goalIds` names "specific goal IDs to focus on during recommendation
+        // generation", and a goal is reached only through the profile that holds it: an id
+        // that names no goal OF THIS PROFILE scopes the generation to nothing, so it is
+        // refused naming the member that carried it.
+        if let Some(goal_ids) = input.scope.goal_ids.as_ref() {
+            if let Some(goal_id) = goal_ids
+                .iter()
+                .find(|goal_id| store.agent_goal(&input.profile_arn, goal_id).is_none())
+            {
+                return Err(
+                    StartAgentRecommendationGenerationErrorModeled::ValidationException(
+                        crate::state::member_constraint_exception(
+                            SCOPE_GOAL_IDS_MEMBER,
+                            &format!(
+                                "Member must name a goal of the agent profile with ARN {}, got {}",
+                                input.profile_arn, goal_id
+                            ),
+                        ),
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // `@idempotent`: repeating a start request must not leave a second analysis of the
+        // same scope running, so the repeat answers the generation already in flight. Once
+        // that one is terminal the same request starts a fresh analysis, which is what
+        // asking again then means.
+        if let Some(existing) =
+            store.in_flight_agent_generation(&input.profile_arn, &fingerprint, now)
+        {
+            return Ok(generation_output(existing, now));
+        }
+
+        // Generations are metered per profile, and this operation models
+        // `ServiceQuotaExceededException` for the case. Refusing here is also what keeps the
+        // store bounded: nothing deletes a generation.
+        if store.agent_generation_count(&input.profile_arn)
+            >= crate::state::MAX_GENERATIONS_PER_AGENT_PROFILE
+        {
+            return Err(
+                StartAgentRecommendationGenerationErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "The agent profile with ARN {} already holds the maximum of {} \
+                             recommendation generations",
+                            input.profile_arn,
+                            crate::state::MAX_GENERATIONS_PER_AGENT_PROFILE
+                        ),
+                        resource_id: Some(input.profile_arn.clone()),
+                        resource_type: Some(
+                            crate::state::AGENT_GENERATION_RESOURCE_TYPE.to_string(),
+                        ),
+                        // `QuotaCode` and `ServiceCode` are modelled `@required`. The
+                        // service code is this service's own signing name; the model
+                        // publishes no numeric Service Quotas code for this quota, so the
+                        // quota is named by what it meters.
+                        quota_code: "RecommendationGenerationsPerAgentProfile".to_string(),
+                        service_code: crate::state::ARN_NAMESPACE.to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let id = store.mint_agent_generation_id();
+        // The job is asynchronous — "use GetAgentRecommendationGeneration to check status" —
+        // so the instants its transitions come due at are recorded here and NOTHING sleeps
+        // for them: a read compares them with the clock.
+        let starts_at = now + crate::state::GENERATION_QUEUE_DURATION;
+        let record = crate::state::AgentGenerationRecord {
+            id: id.clone(),
+            profile_arn: input.profile_arn.clone(),
+            name: input.name,
+            types: input.types,
+            scope: input.scope,
+            additional_context: input.additional_context,
+            // "The identifier of the user or system that started this generation": every
+            // request this emulator serves is attributed to its one account, so that is the
+            // identity the start is recorded under — never a value read off the request.
+            created_by: ::engine::emulator_account_id().to_string(),
+            created_at: now,
+            starts_at,
+            ends_at: starts_at + crate::state::GENERATION_RUN_DURATION,
+            fingerprint,
+        };
+        let output = generation_output(&record, now);
+        store
+            .agent_generations
+            .entry(input.profile_arn)
+            .or_default()
+            .insert(id, record);
+
+        Ok(output)
+    }
+}
+
+/// The modelled input member a profile-resolution finding names
+/// (`StartAgentRecommendationGenerationRequest$profileArn`), as
+/// `ValidationExceptionField$Name` reports it.
+const PROFILE_ARN_MEMBER: &str = "profileArn";
+
+/// The member a recommendation-type finding names
+/// (`StartAgentRecommendationGenerationRequest$types`).
+const TYPES_MEMBER: &str = "types";
+
+/// The member an over-nested document finding names
+/// (`StartAgentRecommendationGenerationRequest$additionalContext`).
+const ADDITIONAL_CONTEXT_MEMBER: &str = "additionalContext";
+
+/// The member a pillar finding of the request's scope names (`Scope$pillars`, reached
+/// through `…Request$scope`), as the path `ValidationExceptionField$Name` reports for a
+/// member inside a structure.
+const SCOPE_PILLARS_MEMBER: &str = "scope.pillars";
+
+/// The member a per-pillar item finding of the request's scope names
+/// (`PillarItem$pillar`, reached through `Scope$items`). See [`SCOPE_PILLARS_MEMBER`].
+const SCOPE_ITEMS_PILLAR_MEMBER: &str = "scope.items.pillar";
+
+/// The member a goal finding of the request's scope names (`Scope$goalIds`). See
+/// [`SCOPE_PILLARS_MEMBER`].
+const SCOPE_GOAL_IDS_MEMBER: &str = "scope.goalIds";
+
+/// The refusal for a request whose enum-typed members carry a value their enum does not
+/// publish, or `None` when every one of them does — one finding per offending member.
+fn unpublished_enum_exception(
+    input: &StartAgentRecommendationGenerationInput,
+) -> Option<ValidationException> {
+    let scope_pillars = input
+        .scope
+        .pillars
+        .iter()
+        .map(|pillar| (SCOPE_PILLARS_MEMBER, pillar, PILLAR_VALUES));
+    let item_pillars = input
+        .scope
+        .items
+        .iter()
+        .flatten()
+        .map(|item| (SCOPE_ITEMS_PILLAR_MEMBER, &item.pillar, PILLAR_VALUES));
+    let findings: Vec<(String, String)> = input
+        .types
+        .iter()
+        .map(|recommendation_type| {
+            (
+                TYPES_MEMBER,
+                recommendation_type,
+                RECOMMENDATION_TYPE_VALUES,
+            )
+        })
+        .chain(scope_pillars)
+        .chain(item_pillars)
+        .filter(|(_, value, values)| !values.contains(&value.as_str()))
+        .map(|(member, value, values)| {
+            (
+                member.to_string(),
+                crate::state::constraint_sentence(
+                    member,
+                    &format!(
+                        "Member must satisfy enum value set: [{}], got {value}",
+                        values.join(", ")
+                    ),
+                ),
+            )
+        })
+        .collect();
+    (!findings.is_empty()).then(|| crate::state::field_validation_exception(&findings))
+}
+
+/// The request's `Scope` as a JSON value, for `parameter_fingerprint`: every member in one
+/// fixed order, so two start requests fingerprint alike exactly when they scope the same
+/// analysis.
+fn scope_fingerprint(scope: &Scope) -> serde_json::Value {
+    serde_json::json!({
+        "goalIds": &scope.goal_ids,
+        "items": scope.items.as_ref().map(|items| {
+            items
+                .iter()
+                .map(|item| serde_json::json!({ "ids": &item.ids, "pillar": &item.pillar }))
+                .collect::<Vec<serde_json::Value>>()
+        }),
+        "pillars": &scope.pillars,
+    })
+}
+
+/// The stored generation as THIS operation answers it, as of `now`.
+///
+/// `GetAgentRecommendationGeneration` answers the same record through its own output shape
+/// — the model declares the two responses as separate structures, so the projections are
+/// separate Rust types over one stored record; the derived members (`status`,
+/// `lastModified…`) come from the record, so the two cannot disagree about it.
+fn generation_output(
+    record: &crate::state::AgentGenerationRecord,
+    now: std::time::SystemTime,
+) -> StartAgentRecommendationGenerationOutput {
+    let last_modified = record.last_modified(now);
+    StartAgentRecommendationGenerationOutput {
+        id: record.id.clone(),
+        profile_arn: record.profile_arn.clone(),
+        name: record.name.clone(),
+        status: record.status(now).to_string(),
+        // "The estimated time for the generation to complete": the instant the clock owes
+        // this job's completion at, which is what the record holds.
+        estimated_completion_time: Some(::aws_smithy_types::DateTime::from(record.ends_at)),
+        created_by: record.created_by.clone(),
+        created_at: ::aws_smithy_types::DateTime::from(record.created_at),
+        last_modified_by: last_modified.as_ref().map(|(identity, _)| identity.clone()),
+        last_modified_at: last_modified.map(|(_, at)| ::aws_smithy_types::DateTime::from(at)),
     }
 }

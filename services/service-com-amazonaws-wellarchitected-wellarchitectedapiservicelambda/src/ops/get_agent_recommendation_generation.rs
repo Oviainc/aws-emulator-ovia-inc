@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAgentRecommendationGeneration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAgentRecommendationGeneration`'s real behaviour. Implement it here — this is
+//! Reports a recommendation generation `StartAgentRecommendationGeneration` recorded —
+//! its status, progress, scope and timestamps. This is
 //! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAgentRecommendationGeneration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Recommendation generation is asynchronous: poll this operation until status reaches a
+//! terminal value" — so this is a REPORT, never a mutation: `status`, `progress`,
+//! `startedAt`, `endedAt` and the `lastModified…` pair are derived from the instants the
+//! start call recorded ([`crate::state::AgentGenerationRecord`]) and compared with the
+//! clock on every read, so polling moves nothing and nothing sleeps.
 //!
 //! ## Shape of an operation
 //!
@@ -177,20 +177,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAgentRecommendationGeneration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAgentRecommendationGenerationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAgentRecommendationGeneration"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetAgentRecommendationGenerationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the Well-Architected Tool agent profile store is unavailable"
+                        .to_string(),
+                },
+            )
+        })?;
+
+        // "Retrieves information about a recommendation generation process": a pure
+        // REPORT. The status, the progress and the transition timestamps below are
+        // DERIVED from the instants the start call recorded, so polling this operation
+        // changes nothing a later caller sees — the clock alone moves the job.
+        let now = std::time::SystemTime::now();
+        let store = state.lock();
+        // A generation is reached only THROUGH its profile, so the pair is resolved in one
+        // lookup: an id that belongs to another profile is as absent here as one that
+        // belongs to none, and a `profileArn` that names no stored profile resolves
+        // nothing either.
+        let record = store
+            .agent_generation(&input.profile_arn, &input.generation_id)
+            .ok_or_else(|| {
+                GetAgentRecommendationGenerationErrorModeled::ResourceNotFoundException(
+                    crate::state::agent_generation_not_found(
+                        &input.profile_arn,
+                        &input.generation_id,
+                    ),
+                )
+            })?;
+
+        let last_modified = record.last_modified(now);
+        Ok(GetAgentRecommendationGenerationOutput {
+            id: record.id.clone(),
+            profile_arn: record.profile_arn.clone(),
+            name: record.name.clone(),
+            status: record.status(now).to_string(),
+            // "The estimated time for the generation to complete": the instant the clock
+            // owes this job's completion at, which is what the record holds.
+            estimated_completion_time: Some(::aws_smithy_types::DateTime::from(record.ends_at)),
+            created_by: record.created_by.clone(),
+            created_at: ::aws_smithy_types::DateTime::from(record.created_at),
+            last_modified_by: last_modified.as_ref().map(|(identity, _)| identity.clone()),
+            last_modified_at: last_modified.map(|(_, at)| ::aws_smithy_types::DateTime::from(at)),
+            additional_context: record.additional_context.clone(),
+            scope: Some(record.scope.clone()),
+            started_at: record
+                .started_at(now)
+                .map(::aws_smithy_types::DateTime::from),
+            ended_at: record.ended_at(now).map(::aws_smithy_types::DateTime::from),
+            progress: Some(record.progress(now)),
+            // "Details about the error if the generation status is ERROR": no generation
+            // this emulator records reaches `ERROR` — a start it cannot serve is refused at
+            // `StartAgentRecommendationGeneration` instead — so there are no details to
+            // report, and the member is absent rather than carrying an invented failure.
+            error_details: None,
+        })
     }
 }

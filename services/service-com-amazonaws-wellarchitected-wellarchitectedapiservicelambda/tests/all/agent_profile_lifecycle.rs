@@ -109,7 +109,7 @@ async fn get_profile(client: &Client, profile_arn: &str) -> Answer {
         .await
 }
 
-async fn delete_profile(client: &Client, profile_arn: &str) -> Answer {
+pub(crate) async fn delete_profile(client: &Client, profile_arn: &str) -> Answer {
     client
         .send(
             "DELETE",

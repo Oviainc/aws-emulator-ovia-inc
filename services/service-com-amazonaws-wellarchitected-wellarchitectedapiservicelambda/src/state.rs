@@ -23,7 +23,12 @@
 //! backed the same way,
 //! each goal keyed under the profile it belongs to. The contexts recorded against a
 //! profile (`CreateAgentContext`, `GetAgentContext`, `ListAgentContexts`) are held
-//! exactly like the goals, keyed under the profile they belong to. The record types and
+//! exactly like the goals, keyed under the profile they belong to. The recommendation
+//! generations of a profile (`StartAgentRecommendationGeneration`,
+//! `GetAgentRecommendationGeneration`) are held the same way; a generation is a JOB, so
+//! its status, progress and transition timestamps are DERIVED from the instants the
+//! clock owes its transitions at ([`AgentGenerationRecord`]) rather than stored, and no
+//! read has to write. The record types and
 //! their projections live here rather than in a handler because several operations reach
 //! them.
 //!
@@ -61,10 +66,10 @@ use crate::ops::types::{
     ContextSummary,
     GoalSummary, LensSummary, Milestone,
     MilestoneSummary,
-    Profile, ProfileQuestion,
+    Profile, ProfileQuestion, Progress,
     ResourceNotFoundException,
     ReviewTemplate, ReviewTemplateLensReview, ReviewTemplatePillarReviewSummary,
-    ReviewTemplateSummary,
+    ReviewTemplateSummary, Scope,
     ShareInvitation, ShareInvitationSummary, Tag, Workload, WorkloadDiscoveryConfig,
     WorkloadJiraConfigurationInput, WorkloadJiraConfigurationOutput, WorkloadShare,
     WorkloadShareSummary, WorkloadSummary, APPLICATION_TYPE_VALUES, CONTEXT_TYPE_VALUES,
@@ -3276,6 +3281,173 @@ impl AgentContextRecord {
     }
 }
 
+/// `ResourceNotFoundException$ResourceType` for a recommendation generation of an agent
+/// profile — the job `StartAgentRecommendationGeneration` accepts and
+/// `GetAgentRecommendationGeneration` reports. `ExceptionResourceType` is a free-form
+/// string, so it names the kind of resource that was missing: a generation.
+pub const AGENT_GENERATION_RESOURCE_TYPE: &str = "GENERATION";
+
+/// The most recommendation generations one agent profile holds here.
+/// `StartAgentRecommendationGeneration` models `ServiceQuotaExceededException` (HTTP 402)
+/// for the case; the ceiling is this emulator's own, for the reasons
+/// [`MAX_AGENT_PROFILES`] gives, and it is what bounds
+/// [`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::agent_generations`]
+/// — nothing deletes a generation, so the map needs a bound of its own.
+pub const MAX_GENERATIONS_PER_AGENT_PROFILE: usize = 100;
+
+/// `GenerationStatus$QUEUED`: a generation this service has accepted and not started
+/// working on yet (`smithy_query(query="shape", shape="GenerationStatus")`).
+pub const GENERATION_QUEUED: &str = "QUEUED";
+
+/// `GenerationStatus$IN_PROGRESS`: a generation whose analysis has started and has not
+/// finished.
+pub const GENERATION_IN_PROGRESS: &str = "IN_PROGRESS";
+
+/// `GenerationStatus$COMPLETED`: the terminal status of a generation that finished —
+/// "poll this operation until status reaches a terminal value of COMPLETED (results are
+/// ready) or ERROR" (`GetAgentRecommendationGeneration` doc).
+///
+/// The enum's fourth member, `ERROR`, is the terminal status of a generation that FAILED,
+/// whose `errorDetails` says why. No generation this emulator accepts reaches it — a
+/// start it cannot serve is refused by `StartAgentRecommendationGeneration` instead — so
+/// it is not named as a constant here; `GENERATION_STATUS_VALUES` carries the whole
+/// published catalog.
+pub const GENERATION_COMPLETED: &str = "COMPLETED";
+
+/// How long after `StartAgentRecommendationGeneration` accepts a generation its analysis
+/// STARTS — the span the generation spends `QUEUED`.
+///
+/// AWS publishes no duration for either span, so both are this emulator's own: non-zero
+/// on purpose, so a caller polling straight after the start call still observes `QUEUED`,
+/// and short enough not to hold a workflow up. Nothing sleeps for it —
+/// [`AgentGenerationRecord::status`] compares the stored instants with the clock on every
+/// read.
+pub const GENERATION_QUEUE_DURATION: Duration = Duration::from_millis(250);
+
+/// How long a generation's analysis takes once it has started — the span the generation
+/// spends `IN_PROGRESS` before it reaches `COMPLETED`. This emulator's own span, for the
+/// reasons [`GENERATION_QUEUE_DURATION`] gives.
+pub const GENERATION_RUN_DURATION: Duration = Duration::from_millis(500);
+
+/// One accepted recommendation generation: the asynchronous job
+/// `StartAgentRecommendationGeneration` records and `GetAgentRecommendationGeneration`
+/// reports the status and progress of.
+///
+/// The record holds what the request carried plus what the SERVICE owns — the id it
+/// minted, the identity and instant it attributed the start to, and the two instants the
+/// clock owes the job's transitions at. Status, progress and the transition timestamps
+/// are DERIVED from those instants rather than stored, so they cannot drift from the
+/// clock and no read has to write.
+#[derive(Debug, Clone)]
+pub struct AgentGenerationRecord {
+    pub id: String,
+    pub profile_arn: String,
+    pub name: Option<String>,
+    /// `StartAgentRecommendationGenerationRequest$types` — the kinds of recommendation
+    /// this generation was started for. Stored because it is what a listing's
+    /// `recommendationType` filter selects on and what the recommendations a generation
+    /// produces are of; neither response shape projects it
+    /// (`smithy_query(query="operation", operation="StartAgentRecommendationGeneration")`),
+    /// and `ListAgentRecommendationGenerations` — the operation that filters on it — is
+    /// still a stub with its own issue.
+    pub types: Vec<String>,
+    pub scope: Scope,
+    pub additional_context: Option<::aws_smithy_types::Document>,
+    pub created_by: String,
+    pub created_at: SystemTime,
+    /// When the analysis starts: `created_at` plus [`GENERATION_QUEUE_DURATION`].
+    pub starts_at: SystemTime,
+    /// When the analysis finishes: `starts_at` plus [`GENERATION_RUN_DURATION`].
+    pub ends_at: SystemTime,
+    /// The fingerprint of the request that started it, so a repeat of that request —
+    /// `StartAgentRecommendationGeneration` carries `@idempotent` — resolves to this
+    /// generation instead of starting a second one.
+    pub fingerprint: String,
+}
+
+impl AgentGenerationRecord {
+    /// The `GenerationStatus` of this generation as of `now`: `QUEUED` until its analysis
+    /// starts, `IN_PROGRESS` until it finishes, then the terminal `COMPLETED`.
+    pub fn status(&self, now: SystemTime) -> &'static str {
+        if now < self.starts_at {
+            GENERATION_QUEUED
+        } else if now < self.ends_at {
+            GENERATION_IN_PROGRESS
+        } else {
+            GENERATION_COMPLETED
+        }
+    }
+
+    /// Whether this generation has reached a terminal status as of `now` — what decides
+    /// whether a repeat of the request that started it resolves to it.
+    pub fn is_terminal(&self, now: SystemTime) -> bool {
+        self.status(now) == GENERATION_COMPLETED
+    }
+
+    /// `startedAt` — "the timestamp when the recommendation generation process started",
+    /// absent while the generation is still `QUEUED`: nothing has started yet.
+    pub fn started_at(&self, now: SystemTime) -> Option<SystemTime> {
+        (self.starts_at <= now).then_some(self.starts_at)
+    }
+
+    /// `endedAt` — "the timestamp when the recommendation generation process completed",
+    /// absent until it has.
+    pub fn ended_at(&self, now: SystemTime) -> Option<SystemTime> {
+        (self.ends_at <= now).then_some(self.ends_at)
+    }
+
+    /// `lastModifiedAt` / `lastModifiedBy`: the instant of the most recent transition the
+    /// clock has made due, and the identity that made it.
+    ///
+    /// A generation's stored state is changed by the SERVICE moving its status, so the
+    /// most recent change is the latest transition that has happened; while the generation
+    /// is still `QUEUED` nothing has changed since the start call, so both members are
+    /// absent rather than echoing it — the convention every create in this service
+    /// follows.
+    pub fn last_modified(&self, now: SystemTime) -> Option<(String, SystemTime)> {
+        self.ended_at(now)
+            .or_else(|| self.started_at(now))
+            .map(|at| (::engine::emulator_account_id().to_string(), at))
+    }
+
+    /// `progress` — "current progress information including steps completed and completion
+    /// percentage", as of `now`.
+    ///
+    /// A generation analyses the pillars its `scope` names ("the Well-Architected Tool
+    /// Framework pillars to include in the generation scope" —
+    /// `smithy_query(query="shape", shape="Scope")`), so one scoped pillar is one step of
+    /// the process and `totalSteps` is how many the scope names. `stepsCompleted` is how
+    /// many of them the elapsed share of [`GENERATION_RUN_DURATION`] has got through, and
+    /// `completionPercentage` is that same share of the steps as a percentage, so the two
+    /// members always agree.
+    pub fn progress(&self, now: SystemTime) -> Progress {
+        let total = i32::try_from(self.scope.pillars.len()).unwrap_or(i32::MAX);
+        let completed = if now >= self.ends_at {
+            total
+        } else if now <= self.starts_at || total <= 0 {
+            0
+        } else {
+            let elapsed = now
+                .duration_since(self.starts_at)
+                .unwrap_or_default()
+                .as_secs_f64();
+            let share = (elapsed / GENERATION_RUN_DURATION.as_secs_f64()).clamp(0.0, 1.0);
+            // `share < 1.0` here, so the floor is at most `total - 1`: a generation that
+            // has not ended never reports every step done.
+            (share * f64::from(total)) as i32
+        };
+        Progress {
+            steps_completed: completed,
+            total_steps: total,
+            completion_percentage: if total <= 0 {
+                0.0
+            } else {
+                f64::from(completed) * 100.0 / f64::from(total)
+            },
+        }
+    }
+}
+
 /// What a `CreateAgentProfile` idempotency token resolves to: the profile the original
 /// request created, plus that request's parameter fingerprint.
 #[derive(Debug, Clone)]
@@ -3387,6 +3559,11 @@ pub struct ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// `CreateAgentContext`'s `clientToken` -> what the original request created. Caller
     /// input keys it, so it is a BOUNDED [`TokenLedger`].
     pub create_agent_context_tokens: TokenLedger<CreateAgentContextToken>,
+    /// Every recommendation generation `StartAgentRecommendationGeneration` has accepted,
+    /// keyed by the agent profile's ARN then by the generation's `UUID`. A `BTreeMap`
+    /// because generation-id order is the stable order a listing pages over, exactly as
+    /// the goals and contexts above are held.
+    pub agent_generations: HashMap<String, BTreeMap<String, AgentGenerationRecord>>,
     /// Monotonic input to [`Self::next_hex_id`]; never returned to a caller.
     id_counter: u64,
 }
@@ -3618,6 +3795,62 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
             .map_or(0, BTreeMap::len)
     }
 
+    /// A fresh recommendation generation id, in the five dashed groups the modelled
+    /// `UUID` pattern requires
+    /// (`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`), and unused by
+    /// any generation this store holds.
+    ///
+    /// Uniqueness is checked across EVERY profile's generations, for the reason
+    /// [`Self::mint_agent_goal_id`] gives: the id identifies the generation, so two
+    /// profiles handing out the same one would make it ambiguous.
+    pub fn mint_agent_generation_id(&mut self) -> String {
+        loop {
+            let id = self.next_uuid();
+            if !self
+                .agent_generations
+                .values()
+                .any(|generations| generations.contains_key(&id))
+            {
+                return id;
+            }
+        }
+    }
+
+    /// The recommendation generation `id` of the agent profile `profile_arn` names, if
+    /// that profile holds one. A generation is reached only THROUGH its profile, so the
+    /// pair resolves in one lookup.
+    pub fn agent_generation(&self, profile_arn: &str, id: &str) -> Option<&AgentGenerationRecord> {
+        self.agent_generations.get(profile_arn)?.get(id)
+    }
+
+    /// How many recommendation generations the agent profile `profile_arn` names holds —
+    /// what [`MAX_GENERATIONS_PER_AGENT_PROFILE`] bounds.
+    pub fn agent_generation_count(&self, profile_arn: &str) -> usize {
+        self.agent_generations
+            .get(profile_arn)
+            .map_or(0, BTreeMap::len)
+    }
+
+    /// The generation of `profile_arn` that the request fingerprinted `fingerprint`
+    /// started and that has not reached a terminal status as of `now`, if there is one.
+    ///
+    /// `StartAgentRecommendationGeneration` is modelled `@idempotent`
+    /// (`smithy_query(query="operation",
+    /// operation="StartAgentRecommendationGeneration")`), so repeating a start request
+    /// must not leave a second job running: the repeat resolves to the job already in
+    /// flight. Once that job is terminal the same request starts a fresh analysis, which
+    /// is what asking again then means.
+    pub fn in_flight_agent_generation(
+        &self,
+        profile_arn: &str,
+        fingerprint: &str,
+        now: SystemTime,
+    ) -> Option<&AgentGenerationRecord> {
+        self.agent_generations.get(profile_arn)?.values().find(|record| {
+            record.fingerprint == fingerprint && !record.is_terminal(now)
+        })
+    }
+
     /// The tags recorded on the resource an ARN names, or `None` when it names no
     /// resource this store holds.
     ///
@@ -3711,14 +3944,20 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     }
 
     /// Drop an agent profile and everything keyed to it: every create token that
-    /// resolved to it, and the goals and contexts recorded against it with the create
-    /// tokens that resolved to those, so nothing outlives the profile it belongs to and
-    /// the next request carrying one of those tokens acts afresh.
+    /// resolved to it, the goals and contexts recorded against it with the create
+    /// tokens that resolved to those, and the recommendation generations started against
+    /// it, so nothing outlives the profile it belongs to and the next request carrying
+    /// one of those tokens acts afresh.
     ///
     /// `DeleteAgentProfile` "deletes an optimization profile and its associated
     /// configuration": the profile's own configuration — its pillars, aggregation
-    /// configuration and tags — lives on the record, and a goal or a context is reached
-    /// only through the profile it belongs to, so none of them can be left behind.
+    /// configuration and tags — lives on the record, and a goal, a context or a
+    /// generation is reached only through the profile it belongs to, so none of them can
+    /// be left behind. Dropping the generations is also what keeps
+    /// [`MAX_GENERATIONS_PER_AGENT_PROFILE`] a real bound on
+    /// [`Self::agent_generations`]: that ceiling counts the generations of a LIVE
+    /// profile, and an ARN is never minted twice, so a generation left under a deleted
+    /// profile's ARN could never be reclaimed.
     pub fn remove_agent_profile(&mut self, profile_arn: &str) -> Option<AgentProfileRecord> {
         let record = self.agent_profiles.remove(profile_arn)?;
         self.create_agent_profile_tokens
@@ -3729,6 +3968,7 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
         self.agent_contexts.remove(profile_arn);
         self.create_agent_context_tokens
             .retain(|token| token.profile_arn != profile_arn);
+        self.agent_generations.remove(profile_arn);
         Some(record)
     }
 
@@ -4088,6 +4328,111 @@ pub fn parameter_fingerprint(parameters: &::serde_json::Value) -> String {
     let mut hasher = Sha256::new();
     hasher.update(parameters.to_string().as_bytes());
     hex::encode(hasher.finalize())
+}
+
+/// The deepest an untyped `Document` member may nest before this service refuses it.
+///
+/// A `Document` carries whatever JSON the request sent, so its nesting is CALLER-chosen,
+/// and every walk of one (fingerprinting it, projecting it) costs one level of nesting:
+/// an unbounded document would cost stack depth a caller picks, and stack exhaustion
+/// aborts the process rather than failing the call. The ceiling is this emulator's own —
+/// far above any realistic `additionalContext` and far below what the stack allows — and
+/// a document past it is refused with a modelled 400 by
+/// [`document_depth_exceeded`]'s callers.
+pub const MAX_DOCUMENT_DEPTH: usize = 32;
+
+/// Whether `document` nests deeper than [`MAX_DOCUMENT_DEPTH`] — the check an operation
+/// that stores or fingerprints a caller-supplied `Document` runs BEFORE walking it.
+///
+/// Iterative, over an explicit worklist, so the check itself costs heap rather than stack
+/// however deep the document is.
+pub fn document_depth_exceeded(document: Option<&::aws_smithy_types::Document>) -> bool {
+    let Some(document) = document else {
+        return false;
+    };
+    let mut pending: Vec<(&::aws_smithy_types::Document, usize)> = vec![(document, 1)];
+    while let Some((node, depth)) = pending.pop() {
+        if depth > MAX_DOCUMENT_DEPTH {
+            return true;
+        }
+        match node {
+            ::aws_smithy_types::Document::Array(items) => {
+                pending.extend(items.iter().map(|item| (item, depth + 1)));
+            }
+            ::aws_smithy_types::Document::Object(members) => {
+                pending.extend(members.values().map(|value| (value, depth + 1)));
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// An untyped `Document` member as a JSON value, for [`parameter_fingerprint`]: `null`
+/// for a request that carried none, so two requests fingerprint alike exactly when they
+/// carry the same document.
+///
+/// Object members are emitted in SORTED key order, so a document's fingerprint depends
+/// neither on the order the wire carried its keys in nor on a `HashMap`'s iteration order
+/// (see [`document_json`]).
+///
+/// The walk is DEPTH-BOUNDED at [`MAX_DOCUMENT_DEPTH`]: nesting is caller-chosen, so the
+/// recursion is capped here as well as refused by the handler ahead of it
+/// ([`document_depth_exceeded`]), and a node past the cap contributes `null` instead of
+/// another frame.
+pub fn document_fingerprint(
+    document: Option<&::aws_smithy_types::Document>,
+) -> ::serde_json::Value {
+    document.map_or(::serde_json::Value::Null, |document| {
+        document_json(document, 1)
+    })
+}
+
+/// [`document_fingerprint`]'s walk, carrying the depth of the node it is at.
+fn document_json(document: &::aws_smithy_types::Document, depth: usize) -> ::serde_json::Value {
+    if depth > MAX_DOCUMENT_DEPTH {
+        // Unreachable for a request that got past `document_depth_exceeded`; the cap is
+        // restated here so the recursion is bounded by this function alone.
+        return ::serde_json::Value::Null;
+    }
+    match document {
+        ::aws_smithy_types::Document::Null => ::serde_json::Value::Null,
+        ::aws_smithy_types::Document::Bool(value) => ::serde_json::Value::Bool(*value),
+        ::aws_smithy_types::Document::String(value) => {
+            ::serde_json::Value::String(value.clone())
+        }
+        ::aws_smithy_types::Document::Number(number) => match number {
+            ::aws_smithy_types::Number::PosInt(value) => ::serde_json::Value::from(*value),
+            ::aws_smithy_types::Number::NegInt(value) => ::serde_json::Value::from(*value),
+            ::aws_smithy_types::Number::Float(value) => {
+                ::serde_json::Number::from_f64(*value).map_or(::serde_json::Value::Null, ::serde_json::Value::Number)
+            }
+        },
+        ::aws_smithy_types::Document::Array(items) => ::serde_json::Value::Array(
+            items
+                .iter()
+                .map(|item| document_json(item, depth + 1))
+                .collect(),
+        ),
+        // Members are emitted in SORTED key order. `Document::Object` is a `HashMap`,
+        // whose iteration order differs between two instances holding the same keys, and
+        // `serde_json::Map` preserves INSERTION order whenever anything in the workspace
+        // enables `serde_json/preserve_order`. Without the sort two renderings of the
+        // same document can differ, which would make [`parameter_fingerprint`]
+        // non-deterministic and turn an idempotent repeat into a second generation. The
+        // same guard the `bedrockruntime` service's `document_to_json` carries.
+        ::aws_smithy_types::Document::Object(members) => {
+            let mut pairs: Vec<(&String, &::aws_smithy_types::Document)> =
+                members.iter().collect();
+            pairs.sort_unstable_by_key(|(name, _)| *name);
+            ::serde_json::Value::Object(
+                pairs
+                    .into_iter()
+                    .map(|(name, member)| (name.clone(), document_json(member, depth + 1)))
+                    .collect(),
+            )
+        }
+    }
 }
 
 /// A context's typed content as a JSON value, for [`parameter_fingerprint`]: every
@@ -4624,6 +4969,14 @@ pub fn agent_goal_not_found(profile_arn: &str, id: &str) -> ResourceNotFoundExce
 /// How a goal of an agent profile is named in an exception's `ResourceId`: the profile
 /// it belongs to and its own id, which together identify it.
 pub fn agent_goal_resource_id(profile_arn: &str, id: &str) -> String {
+    profile_scoped_resource_id(profile_arn, id)
+}
+
+/// How a resource that belongs to an agent profile is named in an exception's
+/// `ResourceId`: the profile it hangs off and its own id, which together identify it.
+/// Goals, contexts and recommendation generations are all reached through their profile,
+/// so the composite is spelled ONCE here and the three builders above call it.
+fn profile_scoped_resource_id(profile_arn: &str, id: &str) -> String {
     format!("{profile_arn}.{id}")
 }
 
@@ -4639,10 +4992,30 @@ pub fn agent_context_not_found(profile_arn: &str, id: &str) -> ResourceNotFoundE
     )
 }
 
-/// How a context of an agent profile is named in an exception's `ResourceId`: the profile
-/// it belongs to and its own id, which together identify it.
+/// How a context of an agent profile is named in an exception's `ResourceId`: see
+/// [`profile_scoped_resource_id`].
 pub fn agent_context_resource_id(profile_arn: &str, id: &str) -> String {
-    format!("{profile_arn}.{id}")
+    profile_scoped_resource_id(profile_arn, id)
+}
+
+/// [`resource_not_found`] for a generation id that names no recommendation generation of
+/// the agent profile `profile_arn`. Worded exactly as [`agent_goal_not_found`], because a
+/// generation is reached through its profile the same way: an id that belongs to ANOTHER
+/// profile is as absent here as one that belongs to none.
+pub fn agent_generation_not_found(profile_arn: &str, id: &str) -> ResourceNotFoundException {
+    resource_not_found(
+        AGENT_GENERATION_RESOURCE_TYPE,
+        agent_generation_resource_id(profile_arn, id),
+        &format!(
+            "recommendation generation with ID {id} in an agent profile with ARN {profile_arn}"
+        ),
+    )
+}
+
+/// How a recommendation generation of an agent profile is named in an exception's
+/// `ResourceId`: see [`profile_scoped_resource_id`].
+pub fn agent_generation_resource_id(profile_arn: &str, id: &str) -> String {
+    profile_scoped_resource_id(profile_arn, id)
 }
 
 /// [`resource_not_found`] for a milestone number that names no recorded milestone of
