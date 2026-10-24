@@ -287,7 +287,6 @@ async fn create_persists_every_member_and_describe_reports_it_back() {
         // that was not supplied is absent rather than invented.
         for member in [
             "DatastoreName",
-            "SseConfiguration",
             "PreloadDataConfig",
             "IdentityProviderConfiguration",
             "AnalyticsConfiguration",
@@ -304,6 +303,20 @@ async fn create_persists_every_member_and_describe_reports_it_back() {
                 ),
             }
         }
+
+        // `SseConfiguration` is the one optional member with a DEFAULT: the
+        // modelled `KmsEncryptionConfig` is documented "If a customer-owned key is
+        // not specified, an Amazon Web Services-owned key is used for encryption",
+        // so a create that named no key still reports the key that encrypts the
+        // data store. The rule over a set of inputs is pinned in
+        // `tests/all/datastore_encryption_and_preload.rs`.
+        let expected_sse = request.get("SseConfiguration").cloned().unwrap_or_else(
+            || json!({ "KmsEncryptionConfig": { "CmkType": "AWS_OWNED_KMS_KEY" } }),
+        );
+        assert_eq!(
+            properties["SseConfiguration"], expected_sse,
+            "case {case:?}: Describe must report the key that encrypts the data store, got {properties}"
+        );
 
         // The tags supplied at create are the tags the resource carries.
         let expected_tags = request["Tags"].as_array().cloned().unwrap_or_default();

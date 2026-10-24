@@ -17,6 +17,8 @@ mod control_plane_error_semantics;
 mod data_transformation_job;
 #[path = "all/data_transformation_profile.rs"]
 mod data_transformation_profile;
+#[path = "all/datastore_encryption_and_preload.rs"]
+mod datastore_encryption_and_preload;
 #[path = "all/datastore_state_conflict.rs"]
 mod datastore_state_conflict;
 #[path = "all/error_envelopes.rs"]

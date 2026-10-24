@@ -568,7 +568,11 @@ fn submitted_resource(body: &[u8], resource_type: &str) -> Result<::serde_json::
 /// written to the id the resource is stored under — the one the server assigned on a
 /// `create`, the one the URL named on an `update`. The REST of `meta` (a profile claim,
 /// a security label, a tag) is the caller's and is kept.
-fn stored_content(
+///
+/// `pub(crate)` because it is the ONE builder of a stored resource's bytes: the
+/// Synthea preload ([`super::synthea`]) writes its records through it too, so a
+/// preloaded resource and a created one are stored, and read back, identically.
+pub(crate) fn stored_content(
     submitted: ::serde_json::Value,
     id: &str,
     version: u64,

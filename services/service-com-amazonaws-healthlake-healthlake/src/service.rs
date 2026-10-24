@@ -81,6 +81,7 @@
 
 pub mod fhir_rest;
 pub mod non_rpc;
+pub mod synthea;
 pub mod validate_source;
 
 use std::collections::HashMap;

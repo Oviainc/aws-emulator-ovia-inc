@@ -406,7 +406,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // resources, so it speaks the same release version.
             type_version: snapshot.type_version,
             created_at: restored_at,
-            sse_configuration: input.sse_configuration.or(snapshot.sse_configuration),
+            sse_configuration: input
+                .sse_configuration
+                .unwrap_or(snapshot.sse_configuration),
             preload_data_config: snapshot.preload_data_config,
             identity_provider_configuration: input
                 .identity_provider_configuration
@@ -448,7 +450,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 struct SourceSnapshot {
     type_version: String,
     name: Option<String>,
-    sse_configuration: Option<SseConfiguration>,
+    /// How the source data store's contents are encrypted, which the restored one
+    /// inherits unless this request names a key of its own. Not an `Option`: a
+    /// data store is always encrypted (see [`crate::state::Datastore`]).
+    sse_configuration: SseConfiguration,
     preload_data_config: Option<PreloadDataConfig>,
     identity_provider_configuration: Option<IdentityProviderConfiguration>,
     analytics_configuration: Option<AnalyticsConfiguration>,

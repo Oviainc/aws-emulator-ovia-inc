@@ -48,6 +48,15 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
 /// control plane and a data store's FHIR REST endpoint).
 pub(crate) struct HealthLake {
     router: MultiServiceRouter,
+    /// The SINGLE shared engine the service was built from — the same store every
+    /// handler and the FHIR data plane read and write.
+    ///
+    /// `pub(crate)` so a suite can read back a record no modelled operation
+    /// REPORTS: `tests/all/datastore_encryption_and_preload.rs` reads the FHIR
+    /// resources a preload delivered, because the FHIR `search` interaction that
+    /// would enumerate them is still unimplemented (its own gap), and then reads
+    /// each one over the endpoint.
+    pub(crate) engine: Arc<engine::InMemoryEngine>,
 }
 
 impl HealthLake {
@@ -55,9 +64,9 @@ impl HealthLake {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.register_service(
-            service_com_amazonaws_healthlake_healthlake::EmulatedService::new(engine),
+            service_com_amazonaws_healthlake_healthlake::EmulatedService::new(Arc::clone(&engine)),
         );
-        Self { router }
+        Self { router, engine }
     }
 
     /// Dispatch one awsJson1_0 control-plane call.

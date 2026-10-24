@@ -35,10 +35,10 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
     AnalyticsConfiguration, BackupConfiguration, DatastoreBackupStatus, DatastoreProperties,
-    ErrorCause, ExportJobProperties, IdentityProviderConfiguration, NlpConfiguration,
-    OutputDataConfig, PreloadDataConfig, ProfileConfiguration, SseConfiguration, Tag,
-    TransformationInputDataConfig, TransformationJobProgressReport, TransformationJobProperties,
-    TransformationOutputDataConfig,
+    ErrorCause, ExportJobProperties, IdentityProviderConfiguration, KmsEncryptionConfig,
+    NlpConfiguration, OutputDataConfig, PreloadDataConfig, ProfileConfiguration, SseConfiguration,
+    Tag, TransformationInputDataConfig, TransformationJobProgressReport,
+    TransformationJobProperties, TransformationOutputDataConfig,
 };
 
 /// How long after the call that starts it a data store's pending lifecycle
@@ -300,6 +300,15 @@ const DATASTORE_ARN_RESOURCE_PREFIX: &str = "datastore/fhir/";
 /// (`BACKUP_STATUS_VALUES` = `["DISABLED", "ENABLED"]`).
 const BACKUP_ENABLED: &str = "ENABLED";
 
+/// The service-owned-key value of the modelled `CmkType` enum
+/// (`CMK_TYPE_VALUES` = `["AWS_OWNED_KMS_KEY", "CUSTOMER_MANAGED_KMS_KEY"]`).
+///
+/// `KmsEncryptionConfig` is documented as "The customer-managed-key (CMK) used when
+/// creating a data store. If a customer-owned key is not specified, an Amazon Web
+/// Services-owned key is used for encryption", and this is the value that case is
+/// modelled by: it is what [`aws_owned_sse_configuration`] reports.
+const AWS_OWNED_KMS_KEY: &str = "AWS_OWNED_KMS_KEY";
+
 /// The `dataTransformationProfile` resource prefix of a HealthLake data
 /// transformation profile ARN, as the same modelled `AmazonResourceName`
 /// pattern spells it, and as the `DataTransformationProfile` resource's
@@ -419,7 +428,13 @@ pub struct Datastore {
     pub type_version: String,
     pub endpoint: String,
     pub created_at: ::aws_smithy_types::DateTime,
-    pub sse_configuration: Option<SseConfiguration>,
+    /// How this data store's contents are encrypted at rest. NOT an `Option`: a
+    /// data store is always encrypted, with the customer-managed key its create
+    /// named or else with the service-owned key
+    /// ([`aws_owned_sse_configuration`]), so every operation that mints a record
+    /// has to settle which — and `DatastoreProperties.SseConfiguration` reports
+    /// it on every read.
+    pub sse_configuration: SseConfiguration,
     pub preload_data_config: Option<PreloadDataConfig>,
     pub identity_provider_configuration: Option<IdentityProviderConfiguration>,
     pub analytics_configuration: Option<AnalyticsConfiguration>,
@@ -485,7 +500,10 @@ impl Datastore {
             created_at: Some(self.created_at),
             datastore_type_version: self.type_version.clone(),
             datastore_endpoint: self.endpoint.clone(),
-            sse_configuration: self.sse_configuration.clone(),
+            // Always reported: this data store IS encrypted, so a client reading
+            // its encryption posture is told which key encrypts it rather than
+            // finding the member absent.
+            sse_configuration: Some(self.sse_configuration.clone()),
             preload_data_config: self.preload_data_config.clone(),
             identity_provider_configuration: self.identity_provider_configuration.clone(),
             error_cause: self.error_cause.clone(),
@@ -644,6 +662,29 @@ impl Datastore {
     /// The stored tags as the modelled `TagList`, ordered by key.
     pub fn tag_list(&self) -> Vec<Tag> {
         tag_list(&self.tags)
+    }
+}
+
+/// The server-side encryption configuration of a data store whose create named no
+/// customer-provided key.
+///
+/// `KmsEncryptionConfig` is documented as "The customer-managed-key (CMK) used when
+/// creating a data store. If a customer-owned key is not specified, an Amazon Web
+/// Services-owned key is used for encryption", and the modelled `CmkType` enum
+/// carries [`AWS_OWNED_KMS_KEY`] for exactly that case. So an absent
+/// `SseConfiguration` does not mean an unencrypted data store, and it is not a value
+/// to be kept absent: it SELECTS the service-owned key, which every operation that
+/// mints a data store materialises here and every read reports.
+///
+/// No `KmsKeyId`: the member is "The Key Management Service (KMS) encryption key
+/// id/alias used to encrypt the data store contents at rest", and a service-owned key
+/// is not one a caller names or can name.
+pub fn aws_owned_sse_configuration() -> SseConfiguration {
+    SseConfiguration {
+        kms_encryption_config: KmsEncryptionConfig {
+            cmk_type: AWS_OWNED_KMS_KEY.to_string(),
+            kms_key_id: None,
+        },
     }
 }
 

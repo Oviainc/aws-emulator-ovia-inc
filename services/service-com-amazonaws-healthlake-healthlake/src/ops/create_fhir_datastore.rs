@@ -101,6 +101,11 @@ use super::types::*;
 /// modelled name).
 const DATASTORE_TYPE_VERSION_PATH: &str = "datastoreTypeVersion";
 
+/// The validation path of this operation's `PreloadDataConfig$PreloadDataType`
+/// member, spelled the way the envelope spells a nested member (lowerCamel, dotted
+/// from the operation's input).
+const PRELOAD_DATA_TYPE_PATH: &str = "preloadDataConfig.preloadDataType";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -202,6 +207,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle_lifecycle();
 
+        // `PreloadDataType` models exactly one value too ("Only Synthea preloaded
+        // data is supported"), and it selects a DATASET this service has to
+        // deliver, so a type outside the modelled set is refused rather than
+        // stored on a data store nothing could be preloaded into. Same words as
+        // the validator, member and permitted set, no echo of the value.
+        if let Some(configuration) = &input.preload_data_config {
+            if !PRELOAD_DATA_TYPE_VALUES.contains(&configuration.preload_data_type.as_str()) {
+                return Err(CreateFHIRDatastoreErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(crate::service::enum_violation_message(
+                            PRELOAD_DATA_TYPE_PATH,
+                            PRELOAD_DATA_TYPE_VALUES,
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
         // A tag set larger than one data store carries is refused rather than
         // stored: the modelled `TagList` bound caps the request, this caps the
         // resource. Keyed, so two requests that differ only in the order their
@@ -286,6 +310,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let created_at = ::aws_smithy_types::DateTime::from(now);
         let id = store.next_datastore_id(now);
+        // `PreloadDataConfig` is "an optional parameter to preload (import) open
+        // source Synthea FHIR data upon creation of the data store", so a data
+        // store that asked for it comes up HOLDING that data: the records are
+        // written onto the record here, at the creation instant, and its FHIR
+        // endpoint serves them as soon as the data store is ACTIVE. A create that
+        // asked for none holds nothing, as before.
+        let (fhir_resources, fhir_resource_bytes) = if input.preload_data_config.is_some() {
+            let Some(preloaded) = crate::service::synthea::preloaded_resources(&mut store, now)
+            else {
+                return Err(CreateFHIRDatastoreErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the preloaded Synthea data set could not be prepared for the data \
+                             store"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into());
+            };
+            preloaded
+        } else {
+            (::std::collections::BTreeMap::new(), 0)
+        };
+        // A preload RETAINS bytes, so it charges the ceiling every data store's
+        // resources are held to together, exactly as a FHIR write and a restore
+        // do. The data set itself is bounded by construction
+        // (`synthea::PRELOADED_RESOURCE_COUNT` resources), so only a service
+        // already close to the ceiling is refused.
+        if store
+            .fhir_resource_bytes_total()
+            .saturating_add(fhir_resource_bytes)
+            > crate::state::MAX_FHIR_RESOURCE_BYTES_TOTAL
+        {
+            return Err(CreateFHIRDatastoreErrorModeled::ThrottlingException(
+                ThrottlingException {
+                    message: Some(format!(
+                        "The preloaded data store would push the FHIR resources this service \
+                         retains past its {} byte ceiling",
+                        crate::state::MAX_FHIR_RESOURCE_BYTES_TOTAL
+                    )),
+                },
+            )
+            .into());
+        }
         let mut datastore = crate::state::Datastore {
             arn: crate::state::datastore_arn(&region, &id),
             endpoint: crate::state::datastore_endpoint(&region, &id),
@@ -302,7 +371,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             reap_at: None,
             type_version: input.datastore_type_version,
             created_at,
-            sse_configuration: input.sse_configuration,
+            // A data store is always encrypted: with the customer-managed key
+            // this request named, or else with the service-owned key the
+            // modelled `CmkType` carries for that case. The default is
+            // MATERIALISED here rather than left absent, so every later read
+            // reports which key encrypts the data store.
+            sse_configuration: input
+                .sse_configuration
+                .unwrap_or_else(crate::state::aws_owned_sse_configuration),
             preload_data_config: input.preload_data_config,
             identity_provider_configuration: input.identity_provider_configuration,
             analytics_configuration: input.analytics_configuration,
@@ -312,10 +388,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             backup_enabled_at: None,
             error_cause: None,
             tags,
-            // A new data store holds no FHIR resources; its REST endpoint fills
-            // this in as resources are written to it.
-            fhir_resources: ::std::collections::BTreeMap::new(),
-            fhir_resource_bytes: 0,
+            // Whatever the preload above delivered: the Synthea data set for a
+            // data store that asked for it, and nothing for one that did not —
+            // its REST endpoint then fills this in as resources are written.
+            fhir_resources,
+            fhir_resource_bytes,
         };
         // Written through the record's own setter, so the reported
         // `BackupEnabledAt` is the instant backup became enabled rather than a
