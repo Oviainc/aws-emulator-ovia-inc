@@ -2,7 +2,12 @@
 
 //! @op TagResource
 //! Merges the request's tags into the stored environment the ARN names: tags already
-//! on the resource that the request does not mention are left alone. A resource with
+//! on the resource that the request does not mention are left alone. A tag key in
+//! AWS's reserved `aws:` namespace ([`crate::state::RESERVED_TAG_KEY_PREFIX`], matched
+//! however it is cased) is refused with this operation's own tag-policy refusal and
+//! writes nothing — a rule about the REQUEST, so it is judged before the ARN is
+//! resolved: a request that is both unservable and addressed to no resource draws the
+//! tag-policy refusal. A resource with
 //! more than 200 tags is refused; an ARN this service holds no environment for is a
 //! `ResourceNotFoundException` — the tagging surface's own, answered with HTTP 400 and
 //! carrying the request's `resourceArn` (see `crate::scaffolded`).
@@ -178,6 +183,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let mut state = state.lock();
         state.materialise_due_transitions();
+
+        // A tag key in AWS's reserved namespace is not the caller's to write: the
+        // `aws:` prefix marks a tag Amazon Web Services applies itself, and the
+        // modelled `TagKey` pattern admits a colon, so the refusal is this handler's.
+        // It is the operation's own tag-policy refusal (HTTP 400), and nothing is
+        // stored — the request is judged before any tag is merged.
+        if let Some(refusal) = crate::state::reserved_tag_key_refusal(
+            "tags",
+            input.tags.keys().map(String::as_str),
+        ) {
+            return Err(
+                TagResourceErrorModeled::TagPolicyException(TagPolicyException {
+                    message: refusal,
+                })
+                .into(),
+            );
+        }
 
         let environment = state
             .environment_by_arn_mut(&input.resource_arn)
