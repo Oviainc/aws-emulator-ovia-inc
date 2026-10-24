@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeSavingsPlansOfferingRates
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeSavingsPlansOfferingRates`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeSavingsPlansOfferingRates::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Searches the rates the seeded offering catalog in [`crate::state`] prices:
+//! the catalog prices one usage line item per product, region and usage
+//! dimension, and every offering that sells that usage prices it at the
+//! product's on-demand price less the discount the offering's plan type, term
+//! and payment option earn. Every supplied filter narrows that set and
+//! `maxResults`/`nextToken` page it.
+//!
+//! The walk is BY LINE ITEM, and within a line item by the offerings that price
+//! it, so consecutive rows quote the same usage under different offerings — what
+//! a client comparing offerings for the usage it runs reads down.
+//!
+//! The paging is the resumable cursor the sibling offerings search uses: a
+//! search answers with one page — the caller's `maxResults`, or the service's
+//! own page when the caller names none — and hands back the cursor to resume
+//! at. Only a RESUMED answer with no more results to return carries a null
+//! `nextToken`.
 //!
 //! ## Shape of an operation
 //!
@@ -152,20 +160,194 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeSavingsPlansOfferingRates` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeSavingsPlansOfferingRatesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeSavingsPlansOfferingRates"))
+        /// Which paginator minted a token: see [`crate::state::encode_page_token`].
+        const PAGE_KIND: &str = "offeringRates";
+
+        let offset = match input.next_token.as_deref() {
+            Some(token) => crate::state::decode_page_token(PAGE_KIND, token).ok_or_else(|| {
+                validation("nextToken is not a token this operation issued".to_string())
+            })?,
+            None => 0,
+        };
+        // `maxResults` is `@required` with `@default: 0`, and 0 is "no page size
+        // asked for": the service picks its own, so a search of a catalog the
+        // service owns answers with one page of it rather than all of it.
+        let page_size = usize::try_from(input.max_results)
+            .ok()
+            .filter(|asked| *asked > 0)
+            .unwrap_or(crate::state::DEFAULT_OFFERINGS_PAGE_SIZE);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeSavingsPlansOfferingRatesErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the savingsplans store is unavailable".to_string(),
+                },
+            )
+        })?;
+
+        let (page, next) = {
+            let store = state.lock();
+            // The rate catalog is the priced line items crossed with the
+            // offerings that sell them, so it is walked LAZILY: a page is one
+            // window of that walk, and a pairing past the page is never looked
+            // at. One pairing past the page is taken to learn whether the walk
+            // has more to return, and dropped without being priced.
+            let offerings: Vec<&crate::state::Offering> = store
+                .offerings()
+                .iter()
+                .filter(|offering| offering_admits(&input, offering))
+                .collect();
+            let mut window: Vec<(&crate::state::Offering, &crate::state::RateLineItem)> =
+                crate::state::rate_line_items()
+                    .iter()
+                    .filter(|item| item_admits(&input, item))
+                    .flat_map(|item| {
+                        offerings
+                            .iter()
+                            .filter(move |offering| crate::state::offering_prices(offering, item))
+                            .map(move |offering| (*offering, item))
+                    })
+                    .skip(offset)
+                    .take(page_size.saturating_add(1))
+                    .collect();
+            let more_remain = window.len() > page_size;
+            window.truncate(page_size);
+            // The FIRST answer of a search always carries the cursor to resume
+            // at, even when its page already held every rate the filters
+            // admitted: this search reports where its walk of the catalog got
+            // to, not whether another match exists. A caller learns the walk is
+            // over by resuming it: a RESUMED answer carries a cursor only while
+            // results remain past its page, so the walk ends on the first
+            // resumed page with nothing more to return, which is what
+            // `nextToken` being "null when there are no more results to return"
+            // means here. One extra call at most, and never a loop.
+            let reached = offset.saturating_add(window.len());
+            let next = if more_remain {
+                Some(reached)
+            } else {
+                input.next_token.is_none().then_some(reached)
+            };
+            let page: Vec<SavingsPlanOfferingRate> = window
+                .into_iter()
+                .map(|(offering, item)| project(offering, item))
+                .collect();
+            (page, next)
+        };
+
+        Ok(DescribeSavingsPlansOfferingRatesOutput {
+            search_results: Some(page),
+            next_token: next.map(|offset| crate::state::encode_page_token(PAGE_KIND, offset)),
+        })
     }
 }
+
+/// A 400 `ValidationException`, the error this operation models for a request
+/// whose values the model's own constraints cannot refuse.
+fn validation(message: String) -> DescribeSavingsPlansOfferingRatesError {
+    DescribeSavingsPlansOfferingRatesErrorModeled::ValidationException(ValidationException {
+        message,
+    })
+    .into()
+}
+
+/// Whether the filters that narrow the PARENT offering admit `offering`.
+///
+/// `products` is a filter on the rate, not on the offering, but an offering that
+/// covers none of the named products prices no rate that could match one, so it
+/// is skipped here rather than priced and discarded.
+fn offering_admits(
+    input: &DescribeSavingsPlansOfferingRatesInput,
+    offering: &crate::state::Offering,
+) -> bool {
+    use crate::state::filter_admits;
+
+    if !filter_admits(
+        input.savings_plan_offering_ids.as_ref(),
+        &offering.offering_id,
+    ) || !filter_admits(
+        input.savings_plan_payment_options.as_ref(),
+        &offering.payment_option,
+    ) || !filter_admits(input.savings_plan_types.as_ref(), &offering.plan_type)
+    {
+        return false;
+    }
+    match input.products.as_ref().filter(|products| !products.is_empty()) {
+        Some(products) => offering
+            .product_types
+            .iter()
+            .any(|covered| products.contains(covered)),
+        None => true,
+    }
+}
+
+/// Whether every filter on the RATE itself admits `item`.
+///
+/// Each list-shaped filter admits the values it names and, when absent or empty,
+/// constrains nothing; `filters` match the line item's own dimensions, so a line
+/// item that is not priced along the property a filter names cannot satisfy it.
+fn item_admits(
+    input: &DescribeSavingsPlansOfferingRatesInput,
+    item: &crate::state::RateLineItem,
+) -> bool {
+    use crate::state::filter_admits;
+
+    if !filter_admits(input.products.as_ref(), &item.product_type)
+        || !filter_admits(input.service_codes.as_ref(), &item.service_code)
+        || !filter_admits(input.usage_types.as_ref(), &item.usage_type)
+        || !filter_admits(input.operations.as_ref(), &item.operation)
+    {
+        return false;
+    }
+    for filter in input.filters.iter().flatten() {
+        let Some(name) = filter.name.as_deref() else {
+            continue;
+        };
+        let admitted = match item.property(name) {
+            Some(value) => filter_admits(filter.values.as_ref(), value),
+            // A line item that is not priced along the property cannot satisfy a
+            // filter on it, unless that filter names no value at all.
+            None => filter.values.as_ref().is_none_or(Vec::is_empty),
+        };
+        if !admitted {
+            return false;
+        }
+    }
+    true
+}
+
+/// Project a priced line item, and the offering pricing it, onto the wire shape.
+fn project(
+    offering: &crate::state::Offering,
+    item: &crate::state::RateLineItem,
+) -> SavingsPlanOfferingRate {
+    SavingsPlanOfferingRate {
+        savings_plan_offering: Some(ParentSavingsPlanOffering {
+            offering_id: Some(offering.offering_id.clone()),
+            payment_option: Some(offering.payment_option.clone()),
+            plan_type: Some(offering.plan_type.clone()),
+            duration_seconds: offering.duration_seconds,
+            currency: Some(offering.currency.clone()),
+            plan_description: Some(offering.description.clone()),
+        }),
+        rate: Some(crate::state::format_amount(
+            crate::state::discounted_rate_units(offering, item.on_demand_units),
+        )),
+        unit: Some(item.unit.clone()),
+        product_type: Some(item.product_type.clone()),
+        service_code: Some(item.service_code.clone()),
+        usage_type: Some(item.usage_type.clone()),
+        operation: Some(item.operation.clone()),
+        properties: Some(
+            item.properties
+                .iter()
+                .map(|(name, value)| SavingsPlanOfferingRateProperty {
+                    name: Some(name.clone()),
+                    value: Some(value.clone()),
+                })
+                .collect(),
+        ),
+    }
+}
+

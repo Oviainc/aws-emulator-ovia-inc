@@ -13,6 +13,7 @@
 //!   the first call created instead of creating a second one.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use sha2::{Digest, Sha256};
@@ -404,12 +405,14 @@ pub fn paginate<T: Clone>(
     (page, next)
 }
 
-/// The page the offerings search serves when the caller names no size.
+/// The page the offering and offering-rate searches serve when the caller names
+/// no size.
 ///
-/// `DescribeSavingsPlansOfferings$maxResults` is `@required` with `@default: 0`
-/// and a `PageSize` range of 0..1000, so 0 is "no size asked for" and the
-/// service picks one: a search of a catalog the service owns comes back as one
-/// page of it, resumable through `nextToken`, never as the whole catalog.
+/// `DescribeSavingsPlansOfferings$maxResults` and
+/// `DescribeSavingsPlansOfferingRates$maxResults` are `@required` with
+/// `@default: 0` and a `PageSize` range of 0..1000, so 0 is "no size asked for"
+/// and the service picks one: a search of a catalog the service owns comes back
+/// as one page of it, resumable through `nextToken`, never as the whole catalog.
 ///
 /// A chosen bound, not a documented one: AWS publishes no default page size for
 /// this search. What the recorded answers show is only that a search WAS
@@ -712,9 +715,32 @@ const REGIONS: [(&str, &str); 22] = [
 /// (`SavingsPlanOffering$properties` -> `instanceFamily`): the general purpose,
 /// compute, memory and storage optimised families of several generations, so a
 /// search by instance family finds the family a client is actually running.
-const EC2_INSTANCE_FAMILIES: [&str; 18] = [
-    "m5", "m6a", "m6i", "m7g", "c5", "c6a", "c6i", "c7g", "r5", "r6a", "r6i", "r7g", "t3",
-    "t3a", "t4g", "i3", "i4i", "x2idn",
+///
+/// Each family carries the on-demand price of ONE vCPU-hour in it, in
+/// [`AMOUNT_SCALE`] units — AWS's published on-demand Linux price for a family,
+/// divided by the vCPUs it is for (`m5.large` at $0.096 an hour is two vCPUs at
+/// $0.048) — which is what [`discounted_rate_units`] discounts into a Savings
+/// Plan rate. One list, so a family the offering catalog sells is a family the
+/// rate catalog prices.
+const EC2_INSTANCE_FAMILIES: [(&str, i128); 18] = [
+    ("m5", 4_800_000),
+    ("m6a", 4_320_000),
+    ("m6i", 4_800_000),
+    ("m7g", 4_080_000),
+    ("c5", 4_250_000),
+    ("c6a", 3_825_000),
+    ("c6i", 4_250_000),
+    ("c7g", 3_625_000),
+    ("r5", 6_300_000),
+    ("r6a", 5_670_000),
+    ("r6i", 6_300_000),
+    ("r7g", 5_355_000),
+    ("t3", 4_160_000),
+    ("t3a", 3_760_000),
+    ("t4g", 3_360_000),
+    ("i3", 7_800_000),
+    ("i4i", 8_600_000),
+    ("x2idn", 10_420_000),
 ];
 
 /// The product types a **Compute** Savings Plan covers
@@ -804,7 +830,7 @@ fn seed_offerings(id_seed: u128) -> Vec<Offering> {
     for (duration_seconds, term_label, term_token) in TERMS {
         for payment_option in PAYMENT_OPTIONS {
             for (region, currency) in REGIONS {
-                for family in EC2_INSTANCE_FAMILIES {
+                for (family, _) in EC2_INSTANCE_FAMILIES {
                     offerings.push(offering(
                         "EC2Instance",
                         &EC2_INSTANCE_PRODUCT_TYPES,
@@ -946,6 +972,454 @@ fn offering(
         usage_type: usage_type.to_string(),
         operation: operation.to_string(),
         properties,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The offering-rate catalog
+// ---------------------------------------------------------------------------
+
+/// `SavingsPlanRatePropertyKey` members a RATE is dimensioned by, beyond the two
+/// an offering itself carries ([`PROPERTY_INSTANCE_FAMILY`] and
+/// [`PROPERTY_REGION`]). The full value set is
+/// [`crate::ops::types::SAVINGS_PLAN_RATE_PROPERTY_KEY_VALUES`].
+pub const RATE_PROPERTY_INSTANCE_TYPE: &str = "instanceType";
+/// See [`RATE_PROPERTY_INSTANCE_TYPE`].
+pub const RATE_PROPERTY_PRODUCT_DESCRIPTION: &str = "productDescription";
+/// See [`RATE_PROPERTY_INSTANCE_TYPE`].
+pub const RATE_PROPERTY_TENANCY: &str = "tenancy";
+
+/// The EC2 product description every priced EC2 line item carries.
+///
+/// A rate is priced for ONE product description and tenancy per instance type,
+/// so both dimensions are reported and filterable without the catalog carrying a
+/// row per operating system and tenancy.
+pub const PRODUCT_DESCRIPTION_LINUX: &str = "Linux/UNIX";
+/// See [`PRODUCT_DESCRIPTION_LINUX`].
+pub const TENANCY_SHARED: &str = "shared";
+
+/// Seconds in a 365-day year: the unit a Savings Plans term is sold in, so the
+/// terms the catalog sells ([`TERMS`]) are one and three of these.
+const SECONDS_PER_YEAR: i64 = 31_536_000;
+
+/// Basis points in a whole, so a discount is applied in integer arithmetic and
+/// no price is ever computed in floating point.
+const BASIS_POINTS: i128 = 10_000;
+
+/// The largest discount any Savings Plan earns: AWS publishes Savings Plans
+/// savings of "up to 72 percent" over on-demand, so no row of this catalog is
+/// priced below 28 percent of its on-demand price however the ladder below
+/// compounds.
+const MAX_DISCOUNT_BASIS_POINTS: i128 = 7_200;
+
+/// The discount, in basis points, a ONE-year No Upfront plan of each
+/// `SavingsPlanType` earns.
+///
+/// A chosen ladder, not a documented one: what AWS publishes is the ORDERING and
+/// the ceiling ([`MAX_DISCOUNT_BASIS_POINTS`]), not a discount per plan type, so
+/// these magnitudes are the catalog's own and only the relations between them are
+/// the service's. The ordering is the documented one: an EC2 Instance Savings
+/// Plan, which commits to one instance family in one region, earns the deepest
+/// discount; a Compute Savings Plan, which commits to nothing but an hourly
+/// spend, earns less; the plan types scoped to one service sit between a Compute
+/// plan and nothing.
+fn plan_type_discount_basis_points(plan_type: &str) -> i128 {
+    match plan_type {
+        "EC2Instance" => 4_000,
+        "Compute" => 2_700,
+        "SageMaker" => 2_400,
+        // Every other `SavingsPlanType` the model declares (Database today)
+        // commits to one family of services, which earns the shallowest of the
+        // published discounts.
+        _ => 2_000,
+    }
+}
+
+/// How much of the base discount a payment option earns, in percent: paying
+/// more of the commitment up front earns a deeper discount, which is why AWS
+/// prices All Upfront below Partial Upfront below No Upfront. Chosen magnitudes,
+/// as in [`plan_type_discount_basis_points`]; the ordering is the service's.
+fn payment_option_discount_percent(payment_option: &str) -> i128 {
+    match payment_option {
+        PAYMENT_ALL_UPFRONT => 112,
+        PAYMENT_PARTIAL_UPFRONT => 108,
+        // No Upfront pays nothing in advance and earns the base discount.
+        _ => 100,
+    }
+}
+
+/// The discount `offering` earns, in basis points: its plan type's base
+/// discount, deepened by 30 percent of itself for each year of term past the
+/// first and by the payment option's share, and capped at
+/// [`MAX_DISCOUNT_BASIS_POINTS`].
+///
+/// Strictly increasing in the term and in how much is paid up front, so two
+/// offerings of one plan type never price the same usage at the same rate unless
+/// they sell the same term and payment option.
+pub fn offering_discount_basis_points(offering: &Offering) -> i128 {
+    let years = i128::from(offering.duration_seconds / SECONDS_PER_YEAR).max(1);
+    let term_percent = 100 + 30 * (years - 1);
+    let base = plan_type_discount_basis_points(&offering.plan_type);
+    let laddered = base * term_percent / 100 * payment_option_discount_percent(&offering.payment_option)
+        / 100;
+    laddered.min(MAX_DISCOUNT_BASIS_POINTS)
+}
+
+/// What `offering` charges for usage whose on-demand price is
+/// `on_demand_units`: the on-demand price less the discount the offering earns.
+///
+/// Never zero — a discounted price is still a price — so a unit billed at a
+/// fraction of the service's scale is reported at the smallest amount the scale
+/// can spell rather than as free.
+pub fn discounted_rate_units(offering: &Offering, on_demand_units: i128) -> i128 {
+    let retained = BASIS_POINTS - offering_discount_basis_points(offering);
+    divide_rounded(on_demand_units.saturating_mul(retained), BASIS_POINTS).max(1)
+}
+
+/// The instance sizes the catalog prices in every EC2 family, with the vCPUs of
+/// that size.
+///
+/// EC2 doubles the vCPUs — and the on-demand price — at each step up the size
+/// ladder, so the hourly price of a size is its vCPU count times the family's
+/// per-vCPU price (see [`EC2_INSTANCE_FAMILIES`]).
+const EC2_SIZES: [(&str, i128); 3] = [("large", 2), ("xlarge", 4), ("2xlarge", 8)];
+
+/// The SageMaker ML instance types the catalog prices, with the on-demand hourly
+/// price of one instance in [`AMOUNT_SCALE`] units (AWS's published SageMaker
+/// real-time inference prices: $0.23, $0.204 and $0.7364 an hour).
+const SAGEMAKER_INSTANCE_TYPES: [(&str, i128); 3] = [
+    ("ml.m5.xlarge", 23_000_000),
+    ("ml.c5.xlarge", 20_400_000),
+    ("ml.g4dn.xlarge", 73_640_000),
+];
+
+/// A product a Savings Plan covers, and the billing line item the catalog prices
+/// it by.
+///
+/// `service_codes` are the `SavingsPlanRateServiceCode`s that bill the product,
+/// `unit` the `SavingsPlanRateUnit` it is billed in, `usage_token` the
+/// usage-type token of its line item (the region it is billed in is prefixed to
+/// it), `operation` the billing operation, and `on_demand_units` the on-demand
+/// price of ONE `unit` in [`AMOUNT_SCALE`] units.
+struct PricedProduct {
+    product_type: &'static str,
+    service_codes: &'static [&'static str],
+    unit: &'static str,
+    usage_token: &'static str,
+    operation: &'static str,
+    on_demand_units: i128,
+}
+
+/// The `SavingsPlanProductType`s the catalog prices by a single line item each,
+/// one row per service code that bills them.
+///
+/// Every product type is mapped onto the `SavingsPlanRateServiceCode` of the
+/// service that bills it (Keyspaces bills under `AmazonMCS`, OpenSearch under
+/// `AmazonES`, and Fargate under both `AmazonECS` and `AmazonEKS`, the two
+/// services that run Fargate tasks) and onto the `SavingsPlanRateUnit` that
+/// service bills it in — both model enums, so a product type the model gains is
+/// a product type this table is missing and a `cargo test` row below says so.
+///
+/// The two product types priced along an instance-type dimension (EC2 and
+/// SageMaker) are not here: they are priced per instance type from
+/// [`EC2_INSTANCE_FAMILIES`] and [`SAGEMAKER_INSTANCE_TYPES`].
+const PRICED_PRODUCTS: [PricedProduct; 12] = [
+    PricedProduct {
+        product_type: "Fargate",
+        service_codes: &["AmazonECS", "AmazonEKS"],
+        unit: "Hrs",
+        usage_token: "Fargate-vCPU-Hours:perCPU",
+        operation: "FargateTask",
+        // $0.04048 a vCPU-hour.
+        on_demand_units: 4_048_000,
+    },
+    PricedProduct {
+        product_type: "Lambda",
+        service_codes: &["AWSLambda"],
+        unit: "Lambda-GB-Second",
+        usage_token: "Lambda-GB-Second",
+        operation: "",
+        // $0.00001667 a GB-second, at this service's scale.
+        on_demand_units: 1_667,
+    },
+    PricedProduct {
+        product_type: "RDS",
+        service_codes: &["AmazonRDS"],
+        unit: "Hrs",
+        usage_token: "InstanceUsage:db.m5.large",
+        operation: "CreateDBInstance",
+        // $0.178 an instance-hour.
+        on_demand_units: 17_800_000,
+    },
+    PricedProduct {
+        product_type: "DSQL",
+        service_codes: &["AuroraDSQL"],
+        unit: "DPU",
+        usage_token: "DPU",
+        operation: "",
+        // $0.000008 a distributed processing unit.
+        on_demand_units: 800,
+    },
+    PricedProduct {
+        product_type: "DynamoDB",
+        service_codes: &["AmazonDynamoDB"],
+        unit: "ReadCapacityUnit-Hrs",
+        usage_token: "ReadCapacityUnit-Hrs",
+        operation: "",
+        // $0.00013 a read-capacity-unit-hour.
+        on_demand_units: 13_000,
+    },
+    PricedProduct {
+        product_type: "ElastiCache",
+        service_codes: &["AmazonElastiCache"],
+        unit: "Hrs",
+        usage_token: "NodeUsage:cache.m5.large",
+        operation: "CreateCacheCluster",
+        // $0.156 a node-hour.
+        on_demand_units: 15_600_000,
+    },
+    PricedProduct {
+        product_type: "DocDB",
+        service_codes: &["AmazonDocDB"],
+        unit: "Hrs",
+        usage_token: "InstanceUsage:db.r5.large",
+        operation: "CreateDBInstance",
+        // $0.277 an instance-hour.
+        on_demand_units: 27_700_000,
+    },
+    PricedProduct {
+        product_type: "Neptune",
+        service_codes: &["AmazonNeptune"],
+        unit: "Hrs",
+        usage_token: "InstanceUsage:db.r5.large",
+        operation: "CreateDBInstance",
+        // $0.348 an instance-hour.
+        on_demand_units: 34_800_000,
+    },
+    PricedProduct {
+        product_type: "Timestream",
+        service_codes: &["AmazonTimestream"],
+        unit: "Hrs",
+        usage_token: "ComputeUsage:TCU",
+        operation: "",
+        // $0.052 a compute-unit-hour.
+        on_demand_units: 5_200_000,
+    },
+    PricedProduct {
+        product_type: "Keyspaces",
+        service_codes: &["AmazonMCS"],
+        unit: "ReadRequestUnits",
+        usage_token: "ReadRequestUnits",
+        operation: "",
+        // $0.283 a million read request units, at this service's scale.
+        on_demand_units: 28,
+    },
+    PricedProduct {
+        product_type: "DMS",
+        service_codes: &["AWSDatabaseMigrationSvc"],
+        unit: "Hrs",
+        usage_token: "InstanceUsage:dms.c5.large",
+        operation: "CreateReplicationInstance",
+        // $0.154 an instance-hour.
+        on_demand_units: 15_400_000,
+    },
+    PricedProduct {
+        product_type: "OpenSearch",
+        service_codes: &["AmazonES"],
+        unit: "OCU-hours",
+        usage_token: "OCU-Hours",
+        operation: "",
+        // $0.24 an OpenSearch compute-unit-hour.
+        on_demand_units: 24_000_000,
+    },
+];
+
+/// One usage line item the catalog prices, WITHOUT the offering that prices it:
+/// the billed product, the service that bills it, its usage type, operation and
+/// unit, its on-demand price, and the dimensions it is priced along.
+///
+/// A line item is priced by every offering that sells it
+/// ([`offering_prices`]), and each pairing of the two is one
+/// `SavingsPlanOfferingRate` on the wire.
+#[derive(Debug, Clone)]
+pub struct RateLineItem {
+    pub product_type: String,
+    pub service_code: String,
+    pub usage_type: String,
+    pub operation: String,
+    /// The `SavingsPlanRateUnit` the line item is billed in.
+    pub unit: String,
+    /// The undiscounted price of one `unit`, in [`AMOUNT_SCALE`] units.
+    pub on_demand_units: i128,
+    /// `(name, value)` pairs, where `name` is a `SavingsPlanRatePropertyKey`.
+    ///
+    /// `productId` is a `SavingsPlanRateFilterAttribute` the model's
+    /// property-key enum does NOT carry, so no line item is dimensioned by it
+    /// and nothing in this catalog claims a price-list SKU it does not publish.
+    pub properties: Vec<(String, String)>,
+}
+
+impl RateLineItem {
+    /// The value of the named property, or `None` when this line item is not
+    /// dimensioned by it (a Lambda line item is scoped to no instance type).
+    pub fn property(&self, name: &str) -> Option<&str> {
+        self.properties
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.as_str())
+    }
+
+    /// The region this line item is billed in. Every line item is billed in one.
+    pub fn region(&self) -> Option<&str> {
+        self.property(PROPERTY_REGION)
+    }
+
+    /// The instance family this line item is priced for, when it is priced per
+    /// instance.
+    pub fn instance_family(&self) -> Option<&str> {
+        self.property(PROPERTY_INSTANCE_FAMILY)
+    }
+}
+
+/// Every usage line item the catalog prices, in a stable order.
+///
+/// One exists for each product type the model declares, in each region the
+/// catalog sells in, and for each dimension that product is priced along: an
+/// instance type for EC2 and SageMaker, a single line item for every other
+/// product. The outer order is the model's own `SavingsPlanProductType` value
+/// set ([`crate::ops::types::SAVINGS_PLAN_PRODUCT_TYPE_VALUES`]), then region,
+/// then the dimension, so page N of a search is the same rows on every call.
+///
+/// Derived from the model's value set rather than written out by hand, so a
+/// product type the model gains is a product type the catalog is asked to price.
+///
+/// Built ONCE: it is a pure function of the tables above, so every request reads
+/// the same slice instead of rebuilding it.
+pub fn rate_line_items() -> &'static [RateLineItem] {
+    static LINE_ITEMS: OnceLock<Vec<RateLineItem>> = OnceLock::new();
+    LINE_ITEMS.get_or_init(build_rate_line_items)
+}
+
+/// Build the line items [`rate_line_items`] hands out.
+fn build_rate_line_items() -> Vec<RateLineItem> {
+    let mut items = Vec::new();
+    for product_type in crate::ops::types::SAVINGS_PLAN_PRODUCT_TYPE_VALUES {
+        for (region, _) in REGIONS {
+            match *product_type {
+                "EC2" => {
+                    for (family, vcpu_units) in EC2_INSTANCE_FAMILIES {
+                        for (size, vcpus) in EC2_SIZES {
+                            let instance_type = format!("{family}.{size}");
+                            items.push(line_item(
+                                product_type,
+                                "AmazonEC2",
+                                format!("{region}-BoxUsage:{instance_type}"),
+                                "RunInstances",
+                                "Hrs",
+                                vcpu_units.saturating_mul(vcpus),
+                                vec![
+                                    (PROPERTY_INSTANCE_FAMILY, family),
+                                    (RATE_PROPERTY_INSTANCE_TYPE, &instance_type),
+                                    (RATE_PROPERTY_PRODUCT_DESCRIPTION, PRODUCT_DESCRIPTION_LINUX),
+                                    (PROPERTY_REGION, region),
+                                    (RATE_PROPERTY_TENANCY, TENANCY_SHARED),
+                                ],
+                            ));
+                        }
+                    }
+                }
+                "SageMaker" => {
+                    for (instance_type, hourly_units) in SAGEMAKER_INSTANCE_TYPES {
+                        // An ML instance type's family is the type without its
+                        // size (`ml.m5.xlarge` is an `ml.m5`).
+                        let family = instance_type
+                            .rsplit_once('.')
+                            .map_or(instance_type, |(family, _)| family);
+                        items.push(line_item(
+                            product_type,
+                            "AmazonSageMaker",
+                            format!("{region}-Hosting:{instance_type}"),
+                            "RunInstance",
+                            "Hrs",
+                            hourly_units,
+                            vec![
+                                (PROPERTY_INSTANCE_FAMILY, family),
+                                (RATE_PROPERTY_INSTANCE_TYPE, instance_type),
+                                (PROPERTY_REGION, region),
+                            ],
+                        ));
+                    }
+                }
+                other => {
+                    let Some(priced) = PRICED_PRODUCTS
+                        .iter()
+                        .find(|priced| priced.product_type == other)
+                    else {
+                        continue;
+                    };
+                    for service_code in priced.service_codes {
+                        items.push(line_item(
+                            product_type,
+                            service_code,
+                            format!("{region}-{}", priced.usage_token),
+                            priced.operation,
+                            priced.unit,
+                            priced.on_demand_units,
+                            vec![(PROPERTY_REGION, region)],
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    items
+}
+
+/// Whether `offering` prices `item`: it covers the item's product, and the scope
+/// it is sold for admits the item's region and instance family.
+///
+/// An offering scoped to neither (a Compute Savings Plan) prices the product
+/// wherever it is billed; one scoped to a region prices it in that region; one
+/// scoped to an instance family as well prices only that family. So a client
+/// comparing what each offering charges for the usage it runs sees every
+/// offering that would cover that usage.
+pub fn offering_prices(offering: &Offering, item: &RateLineItem) -> bool {
+    offering
+        .product_types
+        .iter()
+        .any(|covered| covered.as_str() == item.product_type)
+        && offering
+            .property(PROPERTY_REGION)
+            .is_none_or(|region| Some(region) == item.region())
+        && offering
+            .property(PROPERTY_INSTANCE_FAMILY)
+            .is_none_or(|family| Some(family) == item.instance_family())
+}
+
+/// One line item of the rate catalog.
+///
+/// `properties` are given in `SavingsPlanRatePropertyKey` order, so two line
+/// items of one product report their dimensions in the same order.
+fn line_item(
+    product_type: &str,
+    service_code: &str,
+    usage_type: String,
+    operation: &str,
+    unit: &str,
+    on_demand_units: i128,
+    properties: Vec<(&str, &str)>,
+) -> RateLineItem {
+    RateLineItem {
+        product_type: product_type.to_string(),
+        service_code: service_code.to_string(),
+        usage_type,
+        operation: operation.to_string(),
+        unit: unit.to_string(),
+        on_demand_units,
+        properties: properties
+            .into_iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect(),
     }
 }
 
