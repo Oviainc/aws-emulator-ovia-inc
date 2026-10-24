@@ -131,6 +131,57 @@ fn cannot_create(message: impl Into<String>) -> CreateFlowError {
     .into()
 }
 
+/// What in the flow this request describes uses NDI®, worded for the refusal, or `None`
+/// when nothing in it does.
+///
+/// A flow includes NDI when its `NdiConfig` turns it on ("this value must be set as
+/// ENABLED for your flow to support NDI sources or outputs", `NdiConfig$NdiState`), or when
+/// one of the sources or outputs it is created with uses the NDI transport — the three
+/// markers `crate::state` resolves, so the create side reads them exactly as the add and
+/// update sides do. `sources` is the request's resolved source list (`Sources`, or the
+/// single `Source`), whose entries may be unnamed, so an unnamed one is named by the
+/// position the request put it in.
+fn requested_ndi_feature(input: &CreateFlowInput, sources: &[SetSourceRequest]) -> Option<String> {
+    if crate::state::ndi_is_enabled(input.ndi_config.as_ref()) {
+        return Some(format!(
+            "NdiConfig.NdiState {}",
+            crate::state::STATE_ENABLED
+        ));
+    }
+    if let Some((index, source)) = sources
+        .iter()
+        .enumerate()
+        .find(|(_, source)| crate::state::source_request_uses_ndi(source))
+    {
+        return Some(match source.name.as_deref() {
+            Some(name) => format!("The NDI source {name:?}"),
+            // An unnamed source is named by the member and the position the request put it
+            // in, which is `Source` when that single member is where it came from.
+            None if input
+                .sources
+                .as_ref()
+                .is_some_and(|sources| !sources.is_empty()) =>
+            {
+                format!("The NDI source at Sources[{index}]")
+            }
+            None => "The NDI source at Source".to_string(),
+        });
+    }
+    if let Some((index, output)) = input
+        .outputs
+        .iter()
+        .flatten()
+        .enumerate()
+        .find(|(_, output)| crate::state::output_request_uses_ndi(output))
+    {
+        return Some(match output.name.as_deref() {
+            Some(name) => format!("The NDI output {name:?}"),
+            None => format!("The NDI output at Outputs[{index}]"),
+        });
+    }
+    None
+}
+
 /// Materialise one `VpcInterfaceRequest` into the VPC interface the flow carries.
 fn materialise_vpc_interface(request: &VpcInterfaceRequest, suffix: u64) -> VpcInterface {
     VpcInterface {
@@ -291,6 +342,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for (key, value) in input.flow_tags.iter().flatten() {
             if let Some(reason) = crate::state::tag_pair_rejection(key, value) {
                 return Err(bad_request(reason));
+            }
+        }
+
+        // NDI needs the larger flow: "set this optional parameter to LARGE if you want to
+        // enable NDI sources or outputs on the flow" (`CreateFlowRequest$FlowSize`), and
+        // "this value must be set as ENABLED for your flow to support NDI sources or
+        // outputs" (`NdiConfig$NdiState`). A request that would store a flow including NDI
+        // at a size that does not carry it describes a flow the service will not create, so
+        // it is refused and NOTHING is stored — the same rule, read from the same place,
+        // that UpdateFlow refuses an NDI-enabling update with.
+        if let Some(feature) = requested_ndi_feature(&input, &requested_sources) {
+            if let Some(rejection) =
+                crate::state::ndi_flow_size_rejection(&feature, input.flow_size.as_deref())
+            {
+                return Err(bad_request(rejection));
             }
         }
 

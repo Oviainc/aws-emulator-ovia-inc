@@ -25,6 +25,8 @@ mod flow_identity_and_description;
 mod flow_lifecycle;
 #[path = "all/flow_media_streams.rs"]
 mod flow_media_streams;
+#[path = "all/flow_ndi_sizing.rs"]
+mod flow_ndi_sizing;
 #[path = "all/flow_outputs.rs"]
 mod flow_outputs;
 #[path = "all/flow_projection.rs"]
