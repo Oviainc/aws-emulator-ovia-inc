@@ -344,6 +344,73 @@ pub fn tag_bounds_rejection(tags: &HashMap<String, String>) -> Option<Validation
     None
 }
 
+/// The tag-key prefix AWS reserves for its own system tags.
+///
+/// AWS's tagging rules, applied uniformly by every taggable service: "Do not use the
+/// `aws:` prefix in your tag names or values because it is reserved for AWS use. You
+/// can't edit or delete tag names or values with this prefix." A caller may therefore
+/// neither CREATE, REPLACE nor DELETE a tag whose key is in this namespace — the service
+/// owns it — so every request that names such a key is refused before anything is
+/// written. The model expresses nothing about it (`TagKey` is a bare string with no
+/// `@pattern`), so the handlers enforce it.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Whether `key` is in the reserved [`RESERVED_TAG_KEY_PREFIX`] namespace.
+///
+/// Compared WITHOUT regard to ASCII case: the namespace belongs to the service, and a
+/// key spelled `AWS:` or `Aws:` names the same system namespace as `aws:`, so admitting
+/// one spelling would leave the rule bypassable. A key shorter than the prefix, or one
+/// whose first bytes are not a character boundary, is not in the namespace.
+pub fn is_reserved_tag_key(key: &str) -> bool {
+    key.get(..RESERVED_TAG_KEY_PREFIX.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(RESERVED_TAG_KEY_PREFIX))
+}
+
+/// The requirement a reserved-key refusal states, worded as this service words every
+/// other member requirement ([`constraint_detail`]): the rule, then the sentence telling
+/// the caller to check what it sent.
+///
+/// It states the RULE and names no key from the request: the refusal is about the
+/// namespace, not about which key happened to land in it, and a tag map carries no
+/// ordering a message could pick a representative key from.
+pub fn reserved_tag_key_requirement() -> String {
+    format!(
+        "Member must not contain a tag key beginning with {RESERVED_TAG_KEY_PREFIX}, a \
+         prefix reserved for Amazon Web Services use. {CHECK_THE_VALUE}"
+    )
+}
+
+/// Refuse a request whose tag keys reach into the reserved
+/// [`RESERVED_TAG_KEY_PREFIX`] namespace, reporting the modelled rejection.
+///
+/// `keys` are the keys the REQUEST named — the keys it would create, replace or delete —
+/// rather than the keys the resource ends up holding: a stored map can never hold a
+/// reserved key (this gate is what keeps it out), and it is the request that is refused.
+/// `member_path` is the wire name of the member they arrived in, which differs per
+/// operation (`tags` on `TagResource`, `CreateChannelGroup` and `CreateChannel` through
+/// `@jsonName`, `Tags` on `CreateOriginEndpoint` and `CreateHarvestJob`, `tagKeys` on
+/// `UntagResource`), so the sentence points the caller at the member it sent.
+///
+/// Called before anything is written, so a refused request leaves the resource exactly
+/// as it was. The discriminator is `MEMBER_INVALID`: `ValidationExceptionType` names no
+/// reserved-tag reason, and `MEMBER_INVALID` is the value the enum carries for a member
+/// that is wrong in a way none of its other values names.
+pub fn reserved_tag_key_rejection<'a, I>(
+    member_path: &str,
+    keys: I,
+) -> Option<ValidationException>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    keys.into_iter().any(is_reserved_tag_key).then(|| {
+        validation_failed(
+            member_path,
+            &reserved_tag_key_requirement(),
+            "MEMBER_INVALID",
+        )
+    })
+}
+
 /// The tag map a resource holding `current` would be left with after `submitted` is
 /// merged into it, which is what [`tag_bounds_rejection`] has to judge.
 ///

@@ -23,6 +23,8 @@ mod pattern_violation_messages;
 mod register_application_conditional_requirements;
 #[path = "all/region_scoping.rs"]
 mod region_scoping;
+#[path = "all/resource_permissions.rs"]
+mod resource_permissions;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/validation_message_rendering.rs"]

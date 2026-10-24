@@ -29,7 +29,7 @@
 //! its own — and so does a *sync job* (`SyncJob::settles_at`), which
 //! `CreateSyncJob` accepts in the non-terminal `CREATING` state.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, SystemTime};
 
 /// The `ParentEntityId` sentinel the service uses for an entity with no parent.
@@ -612,6 +612,65 @@ impl Workspace {
         references
     }
 
+    /// Whether a declared reference to the component type `component_type_id`
+    /// RESOLVES in this workspace — whether the service holds the component
+    /// type the reference names.
+    ///
+    /// A reference resolves when this workspace stores a component type under
+    /// the id (a component type is addressed inside its workspace, so a
+    /// reference never reaches across one), or when the id is one of the
+    /// service's own built-in types — see
+    /// [`BUILT_IN_COMPONENT_TYPE_ID_PREFIX`], of which this emulator holds no
+    /// registry.
+    pub fn resolves_component_type(&self, component_type_id: &str) -> bool {
+        self.component_types.contains_key(component_type_id)
+            || built_in_component_type_id(component_type_id)
+    }
+
+    /// Every component type `extends_from` reaches — the ids it names plus,
+    /// transitively, the ids those stored component types themselves extend —
+    /// and whether any of them is NOT stored in this workspace, i.e. is one of
+    /// the service's built-in types, whose own definitions this emulator does
+    /// not hold.
+    ///
+    /// TERMINATION is structural, the same way [`subtree_of`](Self::subtree_of)
+    /// gets it: an id is expanded only the first time it is seen and the ids
+    /// come from this workspace's own component-type map, so the walk visits at
+    /// most one id per stored component type plus the declared parents however
+    /// the stored `extendsFrom` values point — a self-extending component type
+    /// or an already-stored cycle cannot make it loop.
+    pub fn ancestor_component_type_ids(&self, extends_from: &[String]) -> (BTreeSet<String>, bool) {
+        let mut reached: BTreeSet<String> = BTreeSet::new();
+        let mut queue: VecDeque<String> = extends_from.iter().cloned().collect();
+        let mut holds_unstored = false;
+        while let Some(ancestor) = queue.pop_front() {
+            if !reached.insert(ancestor.clone()) {
+                continue;
+            }
+            match self.component_types.get(&ancestor) {
+                Some(stored) => queue.extend(stored.extends_from.iter().cloned()),
+                None => holds_unstored = true,
+            }
+        }
+        (reached, holds_unstored)
+    }
+
+    /// The property names a component type extending `extends_from` INHERITS —
+    /// the own definitions of every component type the inheritance chain
+    /// reaches — and whether some ancestor's definitions are unknown to this
+    /// emulator (a built-in type), in which case a name the set does not carry
+    /// cannot be called undefined.
+    pub fn inherited_property_names(&self, extends_from: &[String]) -> (BTreeSet<String>, bool) {
+        let (ancestors, holds_unstored) = self.ancestor_component_type_ids(extends_from);
+        let mut names: BTreeSet<String> = BTreeSet::new();
+        for ancestor in &ancestors {
+            if let Some(stored) = self.component_types.get(ancestor) {
+                names.extend(stored.property_definitions.keys().cloned());
+            }
+        }
+        (names, holds_unstored)
+    }
+
     /// Every id that some stored entity names as its parent, in ONE pass.
     ///
     /// A listing needs `hasChildEntities` for each entity it reports; asking
@@ -1113,6 +1172,131 @@ pub fn property_definition_needs_data_type(
     definition: &crate::ops::types::PropertyDefinitionRequest,
 ) -> bool {
     extends_from.is_empty() && definition.data_type.is_none()
+}
+
+/// The id prefix the service's own BUILT-IN component types carry.
+///
+/// IoT TwinMaker publishes the component types it ships under the reserved
+/// `com.amazon.` namespace — `com.amazon.iottwinmaker.alarm.basic`,
+/// `com.amazon.iotsitewise.connector` and the rest of the user guide's
+/// "built-in component types" — while a caller's own ids live outside it. This
+/// emulator holds no registry of those types (nothing creates them and
+/// `ListComponentTypes` does not report them), so an id inside the namespace is
+/// treated as RESOLVING to a built-in instead of being refused: refusing it
+/// would reject inheritance the real service accepts, which is the opposite
+/// error from the dangling reference this rule exists to catch.
+pub const BUILT_IN_COMPONENT_TYPE_ID_PREFIX: &str = "com.amazon.";
+
+/// Whether `component_type_id` names one of the service's built-in component
+/// types. See [`BUILT_IN_COMPONENT_TYPE_ID_PREFIX`].
+pub fn built_in_component_type_id(component_type_id: &str) -> bool {
+    component_type_id.starts_with(BUILT_IN_COMPONENT_TYPE_ID_PREFIX)
+}
+
+/// Why `extends_from` cannot be stored as the inheritance of
+/// `component_type_id`, as the message a `ValidationException` carries — `None`
+/// when it can.
+///
+/// A component type's declared inheritance has to be DESCRIBABLE: a read
+/// reports each property definition's required `dataType` and `isInherited`,
+/// which is only answerable when the service holds every component type the
+/// chain names, and an id that reaches back to the component type itself is an
+/// inheritance cycle no chain can be walked up. Shared by every writer of a
+/// component type's `extendsFrom`, so one declaration meets one rule wherever
+/// it is written.
+pub fn extends_from_violation(
+    workspace: &Workspace,
+    component_type_id: &str,
+    extends_from: &[String],
+) -> Option<String> {
+    for parent in extends_from {
+        // The self-reference check comes FIRST, and so gets its own message
+        // whether or not the id is stored: a writer that mints the component
+        // type (a create) has not stored it yet, so resolving first would tell
+        // such a caller its parent "does not exist" rather than that a
+        // component type cannot extend itself.
+        if parent == component_type_id {
+            return Some(format!(
+                "extendsFrom names component type {component_type_id} itself; a component type \
+                 cannot extend itself"
+            ));
+        }
+        if !workspace.resolves_component_type(parent) {
+            return Some(format!(
+                "extendsFrom names component type {parent}, which does not exist in workspace {}",
+                workspace.workspace_id
+            ));
+        }
+    }
+    let (ancestors, _) = workspace.ancestor_component_type_ids(extends_from);
+    if ancestors.contains(component_type_id) {
+        return Some(format!(
+            "extendsFrom names a component type that already extends \
+             {component_type_id}; inheritance cannot form a cycle"
+        ));
+    }
+    None
+}
+
+/// Why these `compositeComponentTypes` cannot be stored, as the message a
+/// `ValidationException` carries — `None` when they can.
+///
+/// A composite component type IS the component type its `componentTypeId`
+/// refers to, so the service has to hold that one for the composition to mean
+/// anything; an entry that names none declares no reference to resolve.
+/// Shared by every writer of a component type's `compositeComponentTypes`.
+pub fn composite_component_types_violation(
+    workspace: &Workspace,
+    composite_component_types: &BTreeMap<String, crate::ops::types::CompositeComponentTypeRequest>,
+) -> Option<String> {
+    for (composite_name, composite) in composite_component_types {
+        let Some(referenced) = composite.component_type_id.as_deref() else {
+            continue;
+        };
+        if !workspace.resolves_component_type(referenced) {
+            return Some(format!(
+                "compositeComponentTypes.{composite_name}.componentTypeId names component type \
+                 {referenced}, which does not exist in workspace {}",
+                workspace.workspace_id
+            ));
+        }
+    }
+    None
+}
+
+/// Why `record`'s `propertyGroups` cannot be stored, as the message a
+/// `ValidationException` carries — `None` when they can.
+///
+/// A property group GROUPS properties of the component type, so each name it
+/// carries has to be one the component type defines: one of its own
+/// definitions, or one it inherits from the component types it extends. The
+/// groups and the names are both read off `record` as the write leaves it, so a
+/// group may name a property the same request defines and no caller can check
+/// one component type's groups against another's definitions. Where the chain
+/// reaches a built-in type, this emulator does not hold its definitions, so a
+/// name it does not otherwise account for cannot be called undefined and the
+/// group stands. Shared by every writer of a component type's `propertyGroups`.
+pub fn property_groups_violation(workspace: &Workspace, record: &ComponentType) -> Option<String> {
+    let (inherited, inherits_unknown_definitions) =
+        workspace.inherited_property_names(&record.extends_from);
+    if inherits_unknown_definitions {
+        return None;
+    }
+    for (group_name, group) in &record.property_groups {
+        for property_name in &group.property_names {
+            if record.property_definitions.contains_key(property_name)
+                || inherited.contains(property_name)
+            {
+                continue;
+            }
+            return Some(format!(
+                "propertyGroups.{group_name}.propertyNames names property {property_name}, which \
+                 component type {} does not define",
+                record.component_type_id
+            ));
+        }
+    }
+    None
 }
 
 /// One stored `PropertyDefinitionRequest` as the modelled

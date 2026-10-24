@@ -13,8 +13,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    Address, DeviceConfiguration, JobListEntry, JobMetadata, JobResource, Notification,
-    OnDeviceServiceConfiguration, PickupDetails, ServiceVersion, ShippingDetails, TaxDocuments,
+    Address, ClusterMetadata, DeviceConfiguration, JobListEntry, JobMetadata, JobResource,
+    Notification, OnDeviceServiceConfiguration, PickupDetails, ServiceVersion, ShippingDetails,
+    TaxDocuments,
 };
 
 /// What a handler says when the engine it was constructed with does not carry this
@@ -88,6 +89,60 @@ pub const MAX_STORED_ADDRESSES: usize = 1_000;
 /// not remove it, so the ceiling is what keeps repeated job creation from growing the
 /// process without limit.
 pub const MAX_STORED_JOBS: usize = 1_000;
+
+/// The most clusters this store holds.
+///
+/// Bounds the same way [`MAX_STORED_ADDRESSES`] does for addresses: a cluster carries a
+/// handful of strings and the structures a job carries, and nothing in this API deletes a
+/// cluster, so the ceiling is what keeps repeated `CreateCluster` calls from growing the
+/// process without limit.
+pub const MAX_STORED_CLUSTERS: usize = 1_000;
+
+/// How many node jobs a cluster holds once it has the quorum it ships with.
+///
+/// `CreateCluster`: "Each cluster supports five nodes. You use the CreateJob action
+/// separately to create the jobs for each of these nodes. The cluster does not ship until
+/// these five node jobs have been created", and `ClusterLimitExceededException`:
+/// "Currently, clusters support five nodes … create jobs until your cluster has exactly
+/// five nodes."
+pub const CLUSTER_NODE_QUORUM: usize = 5;
+
+/// The lifecycle states a cluster can be in: the whole `ClusterState` enum
+/// (`shared_types::CLUSTER_STATE_VALUES`), so the update rule below is expressed over the
+/// modelled set rather than over the two states this slice can reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClusterState {
+    AwaitingQuorum,
+    Pending,
+    InUse,
+    Complete,
+    Cancelled,
+}
+
+impl ClusterState {
+    /// This state's wire value, exactly as `ClusterState` spells it.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::AwaitingQuorum => "AwaitingQuorum",
+            Self::Pending => "Pending",
+            Self::InUse => "InUse",
+            Self::Complete => "Complete",
+            Self::Cancelled => "Cancelled",
+        }
+    }
+
+    /// Whether `UpdateCluster` is permitted in this state.
+    ///
+    /// The model documents the window on `UpdateCluster`: "While a cluster's ClusterState
+    /// value is in the AwaitingQuorum state, you can update some of the information
+    /// associated with a cluster. Once the cluster changes to a different job state …
+    /// this action is no longer available." So `AwaitingQuorum` — the state a cluster is
+    /// created in, and the one it stays in until its node jobs are all created — is the
+    /// only one a cluster's information can still be updated from.
+    pub fn is_updatable(self) -> bool {
+        matches!(self, Self::AwaitingQuorum)
+    }
+}
 
 /// How long the update file a `GetSoftwareUpdates` call answers with stays available.
 ///
@@ -262,10 +317,9 @@ pub struct StoredJob {
     pub resources: Option<JobResource>,
     pub notification: Option<Notification>,
     pub on_device_service_configuration: Option<OnDeviceServiceConfiguration>,
-    /// The cluster this job is a node of. Always `None` for now: `CreateCluster` is
-    /// still a 501 stub, so no cluster exists for a job to join and `CreateJob` refuses
-    /// every `ClusterId` it is given. The field is where that id will live once the
-    /// cluster operations are implemented.
+    /// The cluster this job is a node of, and `None` for a job that is not a cluster
+    /// node: a node job is created either by `CreateCluster`'s `InitialClusterSize` or by
+    /// a `CreateJob` that names the cluster.
     pub cluster_id: Option<String>,
     pub long_term_pricing_id: Option<String>,
     pub tax_documents: Option<TaxDocuments>,
@@ -350,6 +404,110 @@ impl StoredJob {
             snowball_type: self.snowball_type.clone(),
             creation_date: Some(::aws_smithy_types::DateTime::from(self.creation_date)),
             description: self.description.clone(),
+        }
+    }
+}
+
+/// One stored cluster: the id and state the service minted for it plus every
+/// `CreateCluster` input a cluster keeps, so `DescribeCluster` reports what was persisted
+/// and a node job created for the cluster inherits it.
+///
+/// The members `CreateClusterRequest` makes required are held as plain values, since a
+/// stored cluster always has them; the rest are held exactly as supplied.
+/// `SnowballCapacityPreference`, `RemoteManagement` and `LongTermPricingIds` are kept even
+/// though `ClusterMetadata` models none of them, because a node job does model them and
+/// inherits them from the cluster.
+#[derive(Debug, Clone)]
+pub struct StoredCluster {
+    pub cluster_id: String,
+    pub cluster_state: ClusterState,
+    pub job_type: String,
+    pub snowball_type: String,
+    pub shipping_option: String,
+    pub address_id: String,
+    pub creation_date: SystemTime,
+    pub snowball_capacity_preference: Option<String>,
+    pub description: Option<String>,
+    pub forwarding_address_id: Option<String>,
+    pub role_arn: Option<String>,
+    pub kms_key_arn: Option<String>,
+    pub resources: Option<JobResource>,
+    pub notification: Option<Notification>,
+    pub on_device_service_configuration: Option<OnDeviceServiceConfiguration>,
+    pub tax_documents: Option<TaxDocuments>,
+    pub remote_management: Option<String>,
+    /// The long-term pricing ids the cluster's automatically created jobs are associated
+    /// with, in the order they were supplied (`CreateClusterRequest$LongTermPricingIds`).
+    pub long_term_pricing_ids: Vec<String>,
+    /// This cluster's node jobs, in the order they were created.
+    pub node_job_ids: Vec<String>,
+}
+
+impl StoredCluster {
+    /// Whether this cluster holds the [`CLUSTER_NODE_QUORUM`] node jobs it ships with.
+    pub fn has_quorum(&self) -> bool {
+        self.node_job_ids.len() >= CLUSTER_NODE_QUORUM
+    }
+
+    /// This record as the modelled `ClusterMetadata` `DescribeCluster` reports.
+    pub fn to_cluster_metadata(&self) -> ClusterMetadata {
+        ClusterMetadata {
+            cluster_id: Some(self.cluster_id.clone()),
+            description: self.description.clone(),
+            kms_key_arn: self.kms_key_arn.clone(),
+            role_arn: self.role_arn.clone(),
+            cluster_state: Some(self.cluster_state.as_wire().to_string()),
+            job_type: Some(self.job_type.clone()),
+            snowball_type: Some(self.snowball_type.clone()),
+            creation_date: Some(::aws_smithy_types::DateTime::from(self.creation_date)),
+            resources: self.resources.clone(),
+            address_id: Some(self.address_id.clone()),
+            shipping_option: Some(self.shipping_option.clone()),
+            notification: self.notification.clone(),
+            forwarding_address_id: self.forwarding_address_id.clone(),
+            tax_documents: self.tax_documents.clone(),
+            on_device_service_configuration: self.on_device_service_configuration.clone(),
+        }
+    }
+
+    /// A node job of this cluster under the id `job_id`, created at `created`.
+    ///
+    /// "If you're creating a job for a node in a cluster, you only need to provide the
+    /// clusterId value; the other job attributes are inherited from the cluster"
+    /// (`CreateJobRequest$ClusterId`), so every member the cluster carries is this job's
+    /// too. The members only a job models — its device configuration, its impact level,
+    /// its pickup details, the long-term pricing it is associated with — are left for the
+    /// caller of this helper to fill in, since the cluster holds nothing to inherit them
+    /// from.
+    pub fn node_job(&self, job_id: String, created: SystemTime) -> StoredJob {
+        StoredJob {
+            job_id,
+            // A node job AWS has accepted but prepared no device for is `New`, exactly as
+            // a job created on its own is.
+            job_state: JobState::New,
+            job_type: Some(self.job_type.clone()),
+            snowball_type: Some(self.snowball_type.clone()),
+            snowball_capacity_preference: self.snowball_capacity_preference.clone(),
+            shipping_option: Some(self.shipping_option.clone()),
+            creation_date: created,
+            description: self.description.clone(),
+            address_id: Some(self.address_id.clone()),
+            forwarding_address_id: self.forwarding_address_id.clone(),
+            role_arn: self.role_arn.clone(),
+            kms_key_arn: self.kms_key_arn.clone(),
+            resources: self.resources.clone(),
+            notification: self.notification.clone(),
+            on_device_service_configuration: self.on_device_service_configuration.clone(),
+            cluster_id: Some(self.cluster_id.clone()),
+            long_term_pricing_id: None,
+            tax_documents: self.tax_documents.clone(),
+            device_configuration: None,
+            remote_management: self.remote_management.clone(),
+            impact_level: None,
+            pickup_details: None,
+            // A cluster's node is a job of its own, never an export order's main job, so
+            // it holds no job parts.
+            job_part_ids: Vec::new(),
         }
     }
 }
@@ -582,6 +740,8 @@ pub struct ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
     pub addresses: HashMap<String, StoredAddress>,
     /// Every job `CreateJob` stored, keyed by the `JobId` it minted.
     pub jobs: HashMap<String, StoredJob>,
+    /// Every cluster `CreateCluster` stored, keyed by the `ClusterId` it minted.
+    pub clusters: HashMap<String, StoredCluster>,
     /// The ids in `jobs` in creation order, so `ListJobs` pages deterministically.
     pub job_order: Vec<String>,
     /// The versions of each Snow on-device service this emulator supports, keyed by the
@@ -598,6 +758,7 @@ pub struct ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
     /// per-store sequence [`mint_id`] hashes, so two records never share an id.
     next_address_seq: u64,
     next_job_seq: u64,
+    next_cluster_seq: u64,
     /// How many software-update grants this store has ever issued: the per-store sequence
     /// [`mint_update_token`] hashes, so two grants never share a token.
     next_software_update_seq: u64,
@@ -610,11 +771,13 @@ impl Default for ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
         Self {
             addresses: HashMap::new(),
             jobs: HashMap::new(),
+            clusters: HashMap::new(),
             job_order: Vec::new(),
             service_versions: seed_service_versions(),
             software_update_grants: Vec::new(),
             next_address_seq: 0,
             next_job_seq: 0,
+            next_cluster_seq: 0,
             next_software_update_seq: 0,
         }
     }
@@ -657,6 +820,19 @@ impl ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
         mint_id("JID", self.next_job_seq, SystemTime::now())
     }
 
+    /// Whether this store can hold another cluster, i.e. is below
+    /// [`MAX_STORED_CLUSTERS`].
+    pub fn can_store_another_cluster(&self) -> bool {
+        self.clusters.len() < MAX_STORED_CLUSTERS
+    }
+
+    /// Mint the next `ClusterId`: the 39-character form the modelled pattern
+    /// `^CID[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$` admits.
+    pub fn mint_cluster_id(&mut self) -> String {
+        self.next_cluster_seq += 1;
+        mint_id("CID", self.next_cluster_seq, SystemTime::now())
+    }
+
     /// Mint the next main job's `JobId`: the same 39-character form in the `MID` variant
     /// the modelled pattern's `M` alternative is for — the id of the main job an export
     /// order's job parts hang off, which is associated with no device.
@@ -692,6 +868,48 @@ impl ComAmazonawsSnowballAwsiesnowballjobmanagementserviceState {
         for job in jobs {
             self.job_order.push(job.job_id.clone());
             self.jobs.insert(job.job_id.clone(), job);
+        }
+        true
+    }
+
+    /// Store `cluster` under its minted id, or answer `false` when this store is at
+    /// [`MAX_STORED_CLUSTERS`].
+    ///
+    /// The ceiling is enforced HERE, at the insertion point, so a handler cannot exceed it
+    /// by forgetting to ask [`Self::can_store_another_cluster`] first.
+    pub fn insert_cluster(&mut self, cluster: StoredCluster) -> bool {
+        if !self.can_store_another_cluster() {
+            return false;
+        }
+        self.clusters.insert(cluster.cluster_id.clone(), cluster);
+        true
+    }
+
+    /// Store `nodes` as the newest jobs and register them as node jobs of `cluster_id`,
+    /// or answer `false`, storing nothing, when no such cluster is held or this store
+    /// cannot hold all of them without passing [`MAX_STORED_JOBS`].
+    ///
+    /// Registering a node is what can give the cluster its quorum, so the state move that
+    /// follows from holding [`CLUSTER_NODE_QUORUM`] nodes is made HERE rather than in a
+    /// handler: a cluster whose node jobs have all been created is no longer awaiting
+    /// them, so it leaves `AwaitingQuorum` for `Pending` — it now has every node it needs
+    /// and waits to be prepared and shipped (`CreateCluster`: "The cluster does not ship
+    /// until these five node jobs have been created"). A cluster in any other state keeps
+    /// it, so this can never move a cluster backwards.
+    pub fn add_cluster_node_jobs(&mut self, cluster_id: &str, nodes: Vec<StoredJob>) -> bool {
+        if !self.clusters.contains_key(cluster_id) || !self.can_store_jobs(nodes.len()) {
+            return false;
+        }
+        let node_ids: Vec<String> = nodes.iter().map(|node| node.job_id.clone()).collect();
+        if !self.insert_job_order(nodes) {
+            return false;
+        }
+        let Some(cluster) = self.clusters.get_mut(cluster_id) else {
+            return false;
+        };
+        cluster.node_job_ids.extend(node_ids);
+        if cluster.cluster_state == ClusterState::AwaitingQuorum && cluster.has_quorum() {
+            cluster.cluster_state = ClusterState::Pending;
         }
         true
     }

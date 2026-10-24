@@ -237,6 +237,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The snapshotted disk is the database bundle's own storage — the size
             // `GetRelationalDatabase` reports as its hardware disk size.
             let size_in_gb = database.bundle.disk_size_in_gb;
+            // A snapshot is a copy of the DATABASE, so the database name and the
+            // master credentials it was created with are captured here too: a
+            // later `CreateRelationalDatabaseFromSnapshot` restores a database
+            // reached with them, and it must still do so after the source has
+            // been deleted. No member of `RelationalDatabaseSnapshot` reports
+            // them, exactly as no member of `RelationalDatabase` reports a
+            // password.
+            let master_database_name = database.master_database_name.clone();
+            let master_username = database.master_username.clone();
+            let master_user_password = database.master_user_password.clone();
             let from_relational_database_name = database.name.clone();
             let from_relational_database_arn = database.arn.clone();
             let from_relational_database_bundle_id = database.bundle.bundle_id.to_string();
@@ -263,6 +273,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     engine,
                     engine_version,
                     size_in_gb,
+                    master_database_name,
+                    master_username,
+                    master_user_password,
                     state: crate::state::RELATIONAL_DATABASE_SNAPSHOT_STATE_CREATING,
                     due: Some(due),
                     from_relational_database_name,

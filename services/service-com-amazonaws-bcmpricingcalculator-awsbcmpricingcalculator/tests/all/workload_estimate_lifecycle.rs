@@ -69,11 +69,13 @@ pub(crate) async fn create_estimate(emulator: &Emulator, name: &str) -> String {
 }
 
 /// RULE: a create mints one fresh workload estimate and answers from what it persisted —
-/// a `ResourceId` nothing else carries, the name and rate type the request asked for,
-/// the create instant as both `createdAt` and the `rateTimestamp` the rates were read
-/// at, one retention window later as `expiresAt`, the non-terminal status it starts in,
-/// and the cost of the usage it holds (none yet) in the one modelled currency — and the
-/// reader reports exactly that stored estimate.
+/// a `ResourceId` nothing else carries, the name the request asked for, the EFFECTIVE
+/// rate basis it is priced on (the one the request named, or the service's default when
+/// it named none), the create instant as both `createdAt` and the `rateTimestamp` the
+/// rates were read at, one retention window later as `expiresAt`, the terminal status an
+/// estimate whose cost is resolved carries, and the cost of the usage it holds (none
+/// yet) in the one modelled currency — and the reader reports exactly that stored
+/// estimate.
 ///
 /// The table spans the name shape (`WorkloadEstimateName` is `len ..64`, pattern
 /// `^[a-zA-Z0-9-]+$`), every `WorkloadEstimateRateType` and its absence, and the tag
@@ -153,17 +155,23 @@ async fn a_created_estimate_is_what_the_reader_reports() {
             "case {label}: expected the name back, got {:?}",
             created["name"]
         );
+        // A request that named no rate type is priced on the service's default basis,
+        // and the response reports which basis that is rather than leaving the caller to
+        // assume one.
+        let expected_rate_type = case
+            .rate_type
+            .unwrap_or(state::DEFAULT_WORKLOAD_ESTIMATE_RATE_TYPE);
         assert_eq!(
             created["rateType"].as_str(),
-            case.rate_type,
-            "case {label}: expected rateType {:?}, got {:?}",
-            case.rate_type,
+            Some(expected_rate_type),
+            "case {label}: expected rateType {expected_rate_type:?}, got {:?}",
             created["rateType"]
         );
         assert_eq!(
             created["status"].as_str(),
-            Some(state::WORKLOAD_ESTIMATE_STATUS_UPDATING),
-            "case {label}: expected the non-terminal status a create starts in, got {:?}",
+            Some(state::WORKLOAD_ESTIMATE_STATUS_VALID),
+            "case {label}: expected the terminal status of an estimate whose cost is \
+             resolved, got {:?}",
             created["status"]
         );
         assert_eq!(
@@ -263,33 +271,23 @@ async fn a_created_estimate_is_what_the_reader_reports() {
     }
 }
 
-/// RULE: a resource a create reports in a non-terminal status is owed its terminal one
-/// by the CLOCK, over a span that is never zero — so a caller reading straight after the
-/// create still sees the transient status — and once settled it stays settled, with
-/// every other member of the estimate untouched.
+/// RULE: an estimate the service reports as complete is complete when the create
+/// answers: its cost is computed from the usage it holds and the rates it is priced at,
+/// both in hand by then, so the status the create reports is already the terminal one and
+/// no reader — however long it waits, however often it asks — sees it move, or sees any
+/// other member of the estimate move either.
 ///
-/// The table spans how long the caller waits before reading, on each side of the window.
+/// The table spans how long the caller waits before reading: a caller that does not wait
+/// at all must see the same settled estimate as one that waits.
 #[tokio::test]
-async fn the_clock_alone_settles_the_transient_status() {
-    let window = u64::try_from(state::WORKLOAD_ESTIMATE_UPDATING_MILLIS)
-        .expect("the window is a positive number of milliseconds");
-    assert!(
-        window > 0,
-        "expected a non-zero window so a caller can observe the transient status, got {window}"
-    );
+async fn a_created_estimate_is_already_settled_and_stays_settled() {
+    let waits: [u64; 3] = [0, 150, 650];
 
-    let cases: [(u64, &str); 4] = [
-        (0, state::WORKLOAD_ESTIMATE_STATUS_UPDATING),
-        (0, state::WORKLOAD_ESTIMATE_STATUS_UPDATING),
-        (window + 150, state::WORKLOAD_ESTIMATE_STATUS_VALID),
-        (window * 2 + 150, state::WORKLOAD_ESTIMATE_STATUS_VALID),
-    ];
-
-    for (waited_millis, expected_status) in cases {
+    for waited_millis in waits {
         let case = format!("waited={waited_millis}ms");
         let emulator = Emulator::new();
         let (status, created) = emulator
-            .call("CreateWorkloadEstimate", json!({ "name": "settling" }))
+            .call("CreateWorkloadEstimate", json!({ "name": "settled" }))
             .await;
         assert_eq!(
             status, 200,
@@ -298,18 +296,23 @@ async fn the_clock_alone_settles_the_transient_status() {
         let id = created["id"].as_str().unwrap_or_default().to_string();
         assert_eq!(
             created["status"].as_str(),
-            Some(state::WORKLOAD_ESTIMATE_STATUS_UPDATING),
-            "case {case}: expected the create to report the transient status, got {:?}",
+            Some(state::WORKLOAD_ESTIMATE_STATUS_VALID),
+            "case {case}: expected the create to report the terminal status, got {:?}",
             created["status"]
         );
+        assert_eq!(
+            created["failureMessage"],
+            Value::Null,
+            "case {case}: expected no failureMessage on an estimate with nothing wrong, \
+             got {:?}",
+            created["failureMessage"]
+        );
 
-        // The clock is the only thing that moves the status: nothing here touches the
-        // store, and no read before the window closes advances it.
         if waited_millis > 0 {
             std::thread::sleep(std::time::Duration::from_millis(waited_millis));
         }
 
-        // Read twice: a settled status is stable, and a read is not what settles it.
+        // Read twice: the status is stable, and reading is not what sets it.
         for attempt in 0..2 {
             let (status, fetched) = emulator
                 .call("GetWorkloadEstimate", json!({ "identifier": id }))
@@ -318,16 +321,20 @@ async fn the_clock_alone_settles_the_transient_status() {
                 status, 200,
                 "case {case} attempt={attempt}: expected 200, got {status} with {fetched}"
             );
-            assert_eq!(
-                fetched["status"].as_str(),
-                Some(expected_status),
-                "case {case} attempt={attempt}: expected status {expected_status}, got {:?}",
-                fetched["status"]
-            );
-            for field in ["id", "name", "createdAt", "expiresAt", "totalCost"] {
+            for field in [
+                "id",
+                "name",
+                "status",
+                "createdAt",
+                "expiresAt",
+                "rateType",
+                "rateTimestamp",
+                "totalCost",
+                "costCurrency",
+            ] {
                 assert_eq!(
                     fetched[field], created[field],
-                    "case {case} attempt={attempt}: expected the settling estimate to keep its {field} {:?}, got {:?}",
+                    "case {case} attempt={attempt}: expected the estimate to keep its {field} {:?}, got {:?}",
                     created[field], fetched[field]
                 );
             }

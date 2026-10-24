@@ -18,8 +18,9 @@ use smithy_server_runtime::{Violation, ViolationKind};
 
 use crate::ops::types::{
     AccountSetting, Check, ConnectivityInfo, Connector, ConnectorCheck, EipAssociation, Environment,
-    EnvironmentSummary, Host, LicenseInfo, NetworkInterface, ResourceNotFoundException,
-    ServiceAccessSecurityGroups, ValidationException, VcfHostnames, Vlan, VmEntitlement,
+    EnvironmentSummary, Host, InstanceTypeEsxVersionsInfo, LicenseInfo, NetworkInterface,
+    ResourceNotFoundException, ServiceAccessSecurityGroups, ValidationException, VcfHostnames,
+    VcfVersionInfo, Vlan, VmEntitlement, INSTANCE_TYPE_VALUES, VCF_VERSION_VALUES,
 };
 
 /// Whether IAM lets a request to this service perform the action it asks for — the
@@ -664,12 +665,13 @@ pub struct StoredHost {
     pub placement_group_id: Option<String>,
     /// The EC2 Dedicated Host the host was placed on, when the request named one.
     pub dedicated_host_id: Option<String>,
-    /// The ESX version the request asked for, when it named one.
+    /// The ESX version the host RUNS: the one the request named, or the default
+    /// [`default_esx_version`] gives the environment's VCF version when it named none —
+    /// "Amazon EVS automatically uses the default ESX version for your environment's VCF
+    /// version" (`CreateEnvironmentHost` doc). `None` only for an environment whose VCF
+    /// version the catalogue knows no Bill Of Materials for.
     ///
-    /// Kept as supplied so caller input is not discarded, and reported by nothing: the
-    /// modelled `Host` shape carries no ESX version member, and the catalogue that
-    /// would resolve the default version for an environment's VCF version is
-    /// `GetVersions`, which still answers 501.
+    /// Reported by nothing: the modelled `Host` shape carries no ESX version member.
     pub esx_version: Option<String>,
     /// The `HostState` the host is in.
     pub state: String,
@@ -1493,6 +1495,124 @@ pub fn account_setting_failures(
         }
     }
     failures
+}
+
+/// The `VcfVersionInfo$status` values, from that member's own documentation
+/// (`smithy_query(query="shape", shape="VcfVersionInfo")`): "The status for this VCF
+/// version. Valid values are: `AVAILABLE` - This VCF version is available to you.
+/// `RESTRICTED` - This VCF version has limited availability."
+pub const VERSION_STATUS_AVAILABLE: &str = "AVAILABLE";
+/// See [`VERSION_STATUS_AVAILABLE`]. Reported for no version by this service: a version
+/// is `RESTRICTED` when the account's own availability of it is limited, which is a fact
+/// about an agreement with Broadcom that nothing in this emulator holds — and reporting
+/// it would contradict `CreateEnvironment`, which accepts every version of the catalog
+/// below from every caller.
+pub const VERSION_STATUS_RESTRICTED: &str = "RESTRICTED";
+
+/// The one `VcfVersion` value that names NO version Amazon EVS provides: "`SELF_DEPLOYED`:
+/// You install VCF yourself" (`smithy_query(query="doc", shape="CreateEnvironmentRequest",
+/// member="vcfVersion")`).
+///
+/// `GetVersions` "returns information about VCF versions … provided by Amazon EVS. For
+/// each VCF version, the response also includes the default ESX version and provided EC2
+/// instance types", so the value that means "the caller installs VCF itself" is not one of
+/// them: Amazon EVS neither provides nor installs it, and there is no default ESX version
+/// of its own to report for it.
+pub const VCF_VERSION_SELF_DEPLOYED: &str = "SELF_DEPLOYED";
+
+/// One VCF release line Amazon EVS installs, and the ESX version Broadcom's Bill Of
+/// Materials pairs that line with — the source `VcfVersionInfo$defaultEsxVersion` names:
+/// "The default ESX version for this VCF version. It is based on Broadcom's Bill Of
+/// Materials (BOM)."
+#[derive(Debug, Clone, Copy)]
+pub struct VcfReleaseLine {
+    /// The prefix every `VcfVersion` value of this release line starts with.
+    pub prefix: &'static str,
+    /// The ESX version the line's BOM names, as ESXi itself reports its version
+    /// (`<major>.<minor>.<update>`).
+    pub esx_version: &'static str,
+}
+
+/// The VCF release lines this service knows a Bill Of Materials for.
+///
+/// Every `VcfVersion` the model declares besides [`VCF_VERSION_SELF_DEPLOYED`] is in the
+/// VCF 5.2 line (`smithy_query(query="shape", shape="VcfVersion")` reports `VCF-5.2.1`
+/// and `VCF-5.2.2`), and Broadcom's VCF 5.2 BOM is built on VMware ESXi 8.0 Update 3 —
+/// version `8.0.3` in the form ESXi reports its own version in. The BOM pins a BUILD
+/// within that update per VCF patch; a build number is published by Broadcom and is not
+/// derivable here, so the ESX version is reported at the granularity the version string
+/// itself has, which is inside `EsxVersion`'s modelled `@length(max: 128)`.
+///
+/// Add a line here when the model declares a `VcfVersion` of another release line;
+/// a version matching no line is reported by nothing rather than paired with a BOM that
+/// was never published for it.
+pub const VCF_RELEASE_LINES: &[VcfReleaseLine] = &[VcfReleaseLine {
+    prefix: "VCF-5.2.",
+    esx_version: "8.0.3",
+}];
+
+/// The ESX version `vcf_version`'s Bill Of Materials names, or `None` for a version no
+/// line in [`VCF_RELEASE_LINES`] covers.
+pub fn default_esx_version(vcf_version: &str) -> Option<&'static str> {
+    VCF_RELEASE_LINES
+        .iter()
+        .find(|line| vcf_version.starts_with(line.prefix))
+        .map(|line| line.esx_version)
+}
+
+/// Every VCF version Amazon EVS PROVIDES, with the status, default ESX version and EC2
+/// instance types of each — what `GetVersions` reports as `vcfVersions`.
+///
+/// The set is the `VcfVersion` enum the model declares, less
+/// [`VCF_VERSION_SELF_DEPLOYED`] and less any version no [`VCF_RELEASE_LINES`] entry
+/// covers, in the order the enum declares them (ascending version). The instance types
+/// are every `InstanceType` the model declares: nothing in the model narrows the types
+/// per VCF version, and this service's `CreateEnvironmentHost` accepts each of them on an
+/// environment of any version, so reporting fewer here would state a restriction the
+/// service does not apply.
+pub fn provided_vcf_versions() -> Vec<VcfVersionInfo> {
+    VCF_VERSION_VALUES
+        .iter()
+        .filter(|version| **version != VCF_VERSION_SELF_DEPLOYED)
+        .filter_map(|version| {
+            default_esx_version(version).map(|esx_version| VcfVersionInfo {
+                vcf_version: (*version).to_string(),
+                status: VERSION_STATUS_AVAILABLE.to_string(),
+                default_esx_version: esx_version.to_string(),
+                instance_types: INSTANCE_TYPE_VALUES
+                    .iter()
+                    .map(|instance_type| (*instance_type).to_string())
+                    .collect(),
+            })
+        })
+        .collect()
+}
+
+/// The ESX versions offered for each EC2 instance type — what `GetVersions` reports as
+/// `instanceTypeEsxVersions`.
+///
+/// Computed as the TRANSPOSE of [`provided_vcf_versions`]: an instance type is offered an
+/// ESX version exactly when some provided VCF version offers that instance type and
+/// defaults to that ESX version. So the two lists of one response cannot disagree about
+/// which types Amazon EVS provides or which ESX versions it installs. Both levels are
+/// deduplicated and in a stable order.
+pub fn instance_type_esx_versions() -> Vec<InstanceTypeEsxVersionsInfo> {
+    let mut by_instance_type: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for version in provided_vcf_versions() {
+        for instance_type in version.instance_types {
+            by_instance_type
+                .entry(instance_type)
+                .or_default()
+                .insert(version.default_esx_version.clone());
+        }
+    }
+    by_instance_type
+        .into_iter()
+        .map(|(instance_type, esx_versions)| InstanceTypeEsxVersionsInfo {
+            instance_type,
+            esx_versions: esx_versions.into_iter().collect(),
+        })
+        .collect()
 }
 
 /// Per-service state for com-amazonaws-evs-amazonelasticvmwareservice. A handler reaches it through [`service_state`].

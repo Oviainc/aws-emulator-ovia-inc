@@ -139,27 +139,11 @@ fn selected(line: &crate::state::WorkloadEstimateUsage, filters: Option<&[ListUs
         })
 }
 
-/// This operation's item for one stored usage line.
+/// This operation's item for one stored usage line: the projection `crate::state` holds
+/// for the modelled shape, so this reader and `BatchUpdateWorkloadEstimateUsage` cannot
+/// report one line two ways.
 fn item_for(line: &crate::state::WorkloadEstimateUsage) -> WorkloadEstimateUsageItem {
-    WorkloadEstimateUsageItem {
-        id: Some(line.id.clone()),
-        service_code: line.service_code.clone(),
-        usage_type: line.usage_type.clone(),
-        operation: line.operation.clone(),
-        location: line.location.clone(),
-        group: line.group.clone(),
-        usage_account_id: Some(line.usage_account_id.clone()),
-        quantity: Some(line.quantity()),
-        cost: line.cost,
-        // `currency` says which currency a reported `cost` is in, and `status` (a
-        // `WorkloadEstimateCostStatus`) qualifies that same cost, so both are reported
-        // exactly when a cost is. Both come from `crate::state`, which is the rule
-        // `BatchCreateWorkloadEstimateUsage` reports a freshly stored line by too, so the
-        // two readers of one line cannot be told apart.
-        currency: line.cost_currency(),
-        status: line.cost_status(),
-        historical_usage: line.historical_usage.clone(),
-    }
+    line.usage_item()
 }
 
 /// The `ListWorkloadEstimateUsage` operation.
@@ -210,8 +194,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut state = store.lock();
         // Materialise what the clock has already made due, so an estimate past its
-        // `expiresAt` reads as gone rather than lingering for the life of the process,
-        // and no reader reports a status the clock has already moved on from.
+        // `expiresAt` reads as gone rather than lingering for the life of the process.
         state.settle(crate::state::now_millis());
 
         let Some(estimate) = state.workload_estimate(&input.workload_estimate_id) else {

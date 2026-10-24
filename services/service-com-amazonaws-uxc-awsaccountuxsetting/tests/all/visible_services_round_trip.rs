@@ -14,8 +14,9 @@
 //!    the model (`smithy_query(query="operation",
 //!    operation="UpdateAccountCustomizations")`) states a refusal for one the
 //!    catalog omits.
-//! 2. ROUND TRIP — a list setting's value is the caller's document. The update
-//!    stores and answers with the exact sequence the request supplied, a later
+//! 2. ROUND TRIP — the members of a list setting are the caller's, their ORDER is
+//!    the service's. The update stores and answers with those members in the one
+//!    canonical sequence (ascending — `crate::support::reported`), a later
 //!    `GetAccountCustomizations` reports that same sequence, and an update that
 //!    omits the setting leaves it alone ("Omitted settings remain unchanged").
 //!
@@ -29,6 +30,7 @@
 //! cover. The generators are deterministic (no seed, nothing random), so a
 //! failing case names itself.
 
+use crate::support::{reported, reported_owned};
 use crate::wire::{
     build_router, generated_service_id, get_customizations, is_legal_region, is_legal_service,
     legal_region, legal_service, strings, update_customizations, whole_catalog,
@@ -103,9 +105,9 @@ fn round_trip_rows() -> Vec<Row> {
 }
 
 /// The rule over the generated table: any list the modelled constraints admit is
-/// accepted with HTTP 200, answered back as the EXACT sequence supplied, reported
-/// again by `GetAccountCustomizations`, and preserved across an update that names
-/// only the colour.
+/// accepted with HTTP 200, answered back with exactly its members in the canonical
+/// sequence, reported again by `GetAccountCustomizations`, and preserved across an
+/// update that names only the colour.
 #[tokio::test]
 async fn a_supplied_list_setting_round_trips_whatever_its_members() {
     for row in round_trip_rows() {
@@ -125,8 +127,8 @@ async fn a_supplied_list_setting_round_trips_whatever_its_members() {
         }
 
         let router = build_router();
-        let expected_services = json!(row.services);
-        let expected_regions = json!(row.regions);
+        let expected_services = reported_owned(&row.services);
+        let expected_regions = reported_owned(&row.regions);
 
         let (status, error_type, updated) = update_customizations(
             &router,
@@ -169,7 +171,7 @@ async fn a_supplied_list_setting_round_trips_whatever_its_members() {
         );
 
         // "Omitted settings remain unchanged": a colour-only update keeps both
-        // lists, sequence included.
+        // lists, canonical sequence included.
         let (_, _, partial) =
             update_customizations(&router, json!({"accountColor": "orange"})).await;
         assert_eq!(
@@ -185,21 +187,22 @@ async fn a_supplied_list_setting_round_trips_whatever_its_members() {
     }
 }
 
-/// Order is carried, not derived: for every row of at least two members,
-/// supplying it and then supplying it reversed yields two different documents,
-/// each answered as sent, and the record ends on the second one.
+/// Order is the service's, not the request's: for every row of at least two
+/// members, supplying it and then supplying it reversed names the SAME setting —
+/// both answers, and the record afterwards, are the one canonical sequence.
 #[tokio::test]
-async fn supplying_a_list_reversed_is_answered_reversed() {
+async fn supplying_a_list_reversed_is_answered_with_the_same_canonical_sequence() {
     for row in round_trip_rows().into_iter().filter(|row| row.services.len() > 1) {
         let reversed: Vec<String> = row.services.iter().rev().cloned().collect();
+        let expected = reported_owned(&row.services);
         let router = build_router();
 
         let (_, _, forward) =
             update_customizations(&router, json!({"visibleServices": row.services.clone()})).await;
         assert_eq!(
             forward.get("visibleServices"),
-            Some(&json!(row.services)),
-            "case {:?}: the forward sequence must be answered as sent, got {forward:?}",
+            Some(&expected),
+            "case {:?}: expected the canonical {expected}, got {forward:?}",
             row.name
         );
 
@@ -207,16 +210,16 @@ async fn supplying_a_list_reversed_is_answered_reversed() {
             update_customizations(&router, json!({"visibleServices": reversed.clone()})).await;
         assert_eq!(
             backward.get("visibleServices"),
-            Some(&json!(reversed)),
-            "case {:?}: the reversed sequence must be answered as sent, got {backward:?}",
+            Some(&expected),
+            "case {:?} reversed: expected the same canonical {expected}, got {backward:?}",
             row.name
         );
 
         let (_, _, fetched) = get_customizations(&router).await;
         assert_eq!(
             fetched.get("visibleServices"),
-            Some(&json!(reversed)),
-            "case {:?}: Get must report the last document written, got {fetched:?}",
+            Some(&expected),
+            "case {:?}: Get must report the canonical {expected}, got {fetched:?}",
             row.name
         );
     }
@@ -272,7 +275,7 @@ async fn an_identifier_the_catalog_omits_is_accepted_and_read_back() {
 
     for (case, row) in rows {
         let router = build_router();
-        let expected = strings(&row);
+        let expected = reported(&row);
 
         let (status, error_type, updated) =
             update_customizations(&router, json!({"visibleServices": strings(&row)})).await;
@@ -307,7 +310,9 @@ async fn neither_a_catalog_entry_nor_a_near_miss_of_one_is_refused() {
         "the catalog must hold entries for this test to say anything"
     );
 
-    // The whole catalog in one request, in the sequence it was reported.
+    // The whole catalog in one request. `ListServices` already reports it in the
+    // same ascending order a list setting is canonicalized into, so here the two
+    // coincide.
     let (status, _, body) =
         update_customizations(&router, json!({"visibleServices": catalog.clone()})).await;
     assert_eq!(
@@ -316,8 +321,8 @@ async fn neither_a_catalog_entry_nor_a_near_miss_of_one_is_refused() {
     );
     assert_eq!(
         body.get("visibleServices"),
-        Some(&json!(catalog.clone())),
-        "the whole catalog must be read back in the sequence it was sent, got {body:?}"
+        Some(&reported_owned(&catalog)),
+        "the whole catalog must be read back canonically, got {body:?}"
     );
 
     // Every near miss in ONE request, then each on its own: the first says the
@@ -331,8 +336,8 @@ async fn neither_a_catalog_entry_nor_a_near_miss_of_one_is_refused() {
     );
     assert_eq!(
         body.get("visibleServices"),
-        Some(&json!(near_misses.clone())),
-        "the near-miss identifiers must be read back as sent, got {body:?}"
+        Some(&reported_owned(&near_misses)),
+        "the near-miss identifiers must be read back canonically, got {body:?}"
     );
 
     for near_miss in &near_misses {
@@ -353,15 +358,17 @@ async fn neither_a_catalog_entry_nor_a_near_miss_of_one_is_refused() {
 
 /// The configure workflow end to end, in the shape a console client performs it:
 /// set the two settings, read them back, change ONE of them, and read again — the
-/// setting the second request omitted is still there, in the sequence it was
-/// written.
+/// setting the second request omitted is still there, in the canonical sequence it
+/// was stored in.
 #[tokio::test]
 async fn a_configure_then_partial_update_workflow_preserves_the_omitted_setting() {
     let router = build_router();
 
-    // Step 1: configure both lists, each in a non-sorted sequence.
+    // Step 1: configure both lists, the Regions in a non-canonical sequence.
     let services = ["account-access", "acm"];
     let regions = ["us-west-2", "eu-west-1"];
+    let expected_services = reported(&services);
+    let expected_regions = reported(&regions);
     let (status, _, configured) = update_customizations(
         &router,
         json!({"visibleServices": services, "visibleRegions": regions}),
@@ -375,8 +382,8 @@ async fn a_configure_then_partial_update_workflow_preserves_the_omitted_setting(
         configured,
         json!({
             "accountColor": "none",
-            "visibleServices": services,
-            "visibleRegions": regions,
+            "visibleServices": expected_services,
+            "visibleRegions": expected_regions,
         }),
         "the update must answer the record it stored, got {configured:?}"
     );
@@ -403,8 +410,8 @@ async fn a_configure_then_partial_update_workflow_preserves_the_omitted_setting(
         partial,
         json!({
             "accountColor": "teal",
-            "visibleServices": narrowed,
-            "visibleRegions": regions,
+            "visibleServices": reported(&narrowed),
+            "visibleRegions": expected_regions,
         }),
         "the omitted visibleRegions must survive the partial update, got {partial:?}"
     );
@@ -417,8 +424,8 @@ async fn a_configure_then_partial_update_workflow_preserves_the_omitted_setting(
     );
     assert_eq!(
         after.get("visibleRegions"),
-        Some(&json!(regions)),
-        "the preserved list must keep its sequence, got {after:?}"
+        Some(&expected_regions),
+        "the preserved list must keep its canonical sequence, got {after:?}"
     );
     assert!(
         after.get("visibleServices").and_then(Value::as_array).is_some(),

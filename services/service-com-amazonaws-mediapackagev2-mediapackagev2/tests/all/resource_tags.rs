@@ -293,7 +293,9 @@ const TAG_MAP_CASES: &[TagMapCase] = &[
         tags: &[
             ("cost center", "video / prod"),
             ("owner@example.com", "a+b=c"),
-            ("aws:like:colons", "path/to:thing-1.0_x"),
+            // Colons are permitted INSIDE a key; only the reserved `aws:` prefix at the
+            // START of a key is refused, which `reserved_tag_keys` owns.
+            ("team:like:colons", "path/to:thing-1.0_x"),
         ],
     },
     TagMapCase {

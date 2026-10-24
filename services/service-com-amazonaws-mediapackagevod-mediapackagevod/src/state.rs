@@ -137,6 +137,37 @@ pub const LISTING_PACKAGING_CONFIGURATIONS: &str = "packaging-configurations";
 /// The listing name [`encode_page_token`] binds a `ListPackagingGroups` cursor to.
 pub const LISTING_PACKAGING_GROUPS: &str = "packaging-groups";
 
+/// The resource-type segment an Asset's ARN carries — the `assets` of
+/// `arn:aws:mediapackage-vod:<region>:<account>:assets/<Id>`, which is the form
+/// `CreateAsset` mints and every read reports.
+pub const ARN_KIND_ASSETS: &str = "assets";
+
+/// The resource-type segment a PackagingConfiguration's ARN carries; see
+/// [`ARN_KIND_ASSETS`].
+pub const ARN_KIND_PACKAGING_CONFIGURATIONS: &str = "packaging-configurations";
+
+/// The resource-type segment a PackagingGroup's ARN carries; see
+/// [`ARN_KIND_ASSETS`].
+pub const ARN_KIND_PACKAGING_GROUPS: &str = "packaging-groups";
+
+/// Every resource type of this service an ARN can name, as `(the resource-type
+/// segment of that resource's ARN, the label a message about that resource names it
+/// by)`.
+///
+/// The segments are the ones the creates mint an ARN with ([`resource_arn`]), and
+/// the labels the ones this service's own not-found messages already use — `Asset`,
+/// `PackagingGroup` and [`crate::scaffolded::PACKAGING_CONFIGURATION_LABEL`] — so an
+/// operation that resolves a caller-supplied ARN words its refusal exactly as the
+/// operation that resolves the same resource by `Id` does.
+pub const ARN_RESOURCE_KINDS: [(&str, &str); 3] = [
+    (ARN_KIND_ASSETS, "Asset"),
+    (
+        ARN_KIND_PACKAGING_CONFIGURATIONS,
+        crate::scaffolded::PACKAGING_CONFIGURATION_LABEL,
+    ),
+    (ARN_KIND_PACKAGING_GROUPS, "PackagingGroup"),
+];
+
 /// The smallest page a listing returns: the minimum of the `MaxResults` `range`
 /// trait every paginated operation in this model shares (`min: 1, max: 1000`).
 pub const MIN_PAGE_SIZE: usize = 1;
@@ -403,6 +434,38 @@ impl ComAmazonawsMediapackagevodMediapackagevodState {
             .unwrap_or_default()
     }
 
+    /// Whether this service holds, IN `region`, the resource the caller-supplied ARN
+    /// `arn` names — the resource whose tags are stored under that very ARN.
+    ///
+    /// An ARN resolves here only when it is EXACTLY the ARN this service issued for a
+    /// resource it still holds in `region`: the comparison is against
+    /// [`resource_arn`], so an ARN differing in partition, account, Region or id, one
+    /// naming a resource type this service has none of, and a value that is not an ARN
+    /// at all all resolve to nothing. That is what makes a tag read Region-scoped like
+    /// every other read of this regional control plane.
+    ///
+    /// The equality is also what fixes the resource form: [`arn_resource`] reads both
+    /// ARN forms AWS writes (`<type>/<id>` and `<type>:<id>`), while this service
+    /// issues only the slash form, so a colon-form value names no resource it ever
+    /// minted and resolves to nothing here \u2014 deliberately, since the `ResourceArn`
+    /// documentation is "You can get this from the response to any request to the
+    /// resource".
+    pub fn holds_arn_resource(&self, region: &str, arn: &str) -> bool {
+        let Some((kind, _, id)) = arn_resource(arn) else {
+            return false;
+        };
+        if arn != resource_arn(kind, region, id) {
+            return false;
+        }
+        match kind {
+            ARN_KIND_ASSETS => self.has_asset(region, id),
+            ARN_KIND_PACKAGING_CONFIGURATIONS => self.has_packaging_configuration(region, id),
+            ARN_KIND_PACKAGING_GROUPS => self.has_packaging_group(region, id),
+            // `arn_resource` reports only the three kinds above.
+            _ => false,
+        }
+    }
+
     /// How many assets are currently stored in `group_id` IN `region` —
     /// `ApproximateAssetCount`, counted rather than stored. An asset of the same
     /// group `Id` in another Region belongs to another group, so it is not counted.
@@ -654,6 +717,39 @@ fn digest_hex(input: &str, len: usize) -> String {
 /// The ARN of a resource of `kind` (the ARN's resource-type segment) named `id`.
 pub fn resource_arn(kind: &str, region: &str, id: &str) -> String {
     engine::emulator_arn(ARN_NAMESPACE, region, &format!("{kind}/{id}"))
+}
+
+/// What a caller-supplied ARN of this service names: the [`ARN_RESOURCE_KINDS`] row
+/// its resource-type segment matches — that segment and the label a message about
+/// that resource type names it by — and the non-empty id after it.
+///
+/// `None` for a value that is not a well-formed resource ARN of this service
+/// ([`::service_common::arn::parse_of`], this repository's one caller-supplied-ARN
+/// parse), one naming a resource type this service has none of, and one carrying no
+/// id — none of which names a resource whose tags could be stored.
+pub fn arn_resource(arn: &str) -> Option<(&'static str, &'static str, &str)> {
+    let parsed = ::service_common::arn::parse_of(arn, ARN_NAMESPACE)?;
+    let (kind, label) = ARN_RESOURCE_KINDS
+        .into_iter()
+        .find(|(kind, _)| *kind == parsed.resource_type())?;
+    let id = ::service_common::arn::resource_id_of_type(arn, kind)?;
+    (!id.is_empty()).then_some((kind, label, id))
+}
+
+/// The message a `NotFoundException` about a caller-supplied `ResourceArn` carries
+/// when this service holds no such resource.
+///
+/// An ARN that names one of this service's resource types is reported in the very
+/// form [`crate::scaffolded::not_found_message`] words every other missing resource
+/// of that type in — the resource label and the id the ARN asked for — so a client
+/// parses one form whether it addressed the resource by `Id` or by ARN. One that
+/// names no resource type of this service has no id to report, so it is named by the
+/// ARN the request sent.
+pub fn arn_resource_not_found_message(arn: &str) -> String {
+    match arn_resource(arn) {
+        Some((_, label, id)) => crate::scaffolded::not_found_message(label, id),
+        None => format!("Resource with arn={arn} not found"),
+    }
 }
 
 /// The region this request is served in: the SigV4 credential scope's region, or

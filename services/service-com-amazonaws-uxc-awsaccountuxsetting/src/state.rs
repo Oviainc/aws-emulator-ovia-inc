@@ -22,47 +22,67 @@ pub struct AccountUxCustomization {
 }
 
 impl AccountUxCustomization {
-    /// Store the visible-service identifiers a request supplied, as the exact
-    /// sequence it supplied them in.
-    ///
-    /// A list setting's value is the caller's document. Neither the model nor the
-    /// operation doc gives this service licence to re-order, de-duplicate or
-    /// otherwise normalise it (`ServiceList`/`RegionsList` are plain lists with
-    /// no `@uniqueItems` and no sort rule —
-    /// `smithy_query(query="shape", shape="ServiceList,RegionsList")`), and the
-    /// element order of a JSON array is part of the response document a client
-    /// compares against what it sent or indexes positionally. So the sequence a
-    /// request supplies is what is stored, what the update answers with and what
-    /// `GetAccountCustomizations` reports afterwards — a round trip, not a
-    /// rewrite.
-    ///
-    /// This stays consistent with `@idempotent`: replaying the SAME request
-    /// leaves the same state and answers the same body. Two requests naming the
-    /// same members in different sequences are different documents, and the
-    /// service records whichever one arrived last.
-    ///
-    /// One recorded step disagrees, and it disagrees with ITSELF: in the corpus
-    /// fixture `uxc-partial-update-preserves-other-fields`, the update at
-    /// `task#2` is recorded with the two members in one sequence and the
-    /// `GetAccountCustomizations` at `task#4` — with no write in between — with
-    /// the same two members in the opposite sequence, so one of the two must
-    /// disagree with whatever the request supplied. Measured, not assumed:
-    /// storing the supplied sequence makes `task#4` agree and `task#2` differ,
-    /// storing it reversed makes `task#2` agree and `task#4` differ, at the same
-    /// two indices. Every other recorded response for this setting agrees with
-    /// the supplied sequence, so that is the rule kept here; the one response
-    /// that disagrees is per-response variation, and reproducing it would mean
-    /// keying the write on the recording.
+    /// Store the visible-service identifiers a request supplied, CANONICALIZED by
+    /// [`canonical_members`]: the members, in ascending order of the identifier,
+    /// whatever sequence the request named them in.
     pub fn set_visible_services(&mut self, supplied: Vec<String>) {
-        self.visible_services = Some(supplied);
+        self.visible_services = Some(canonical_members(supplied));
     }
 
     /// Store the visible-Region codes a request supplied, under the same rule as
     /// [`AccountUxCustomization::set_visible_services`]: one rule for both list
     /// settings, because the service keeps them alike.
     pub fn set_visible_regions(&mut self, supplied: Vec<String>) {
-        self.visible_regions = Some(supplied);
+        self.visible_regions = Some(canonical_members(supplied));
     }
+}
+
+/// The canonical sequence a list setting (`visibleServices` / `visibleRegions`) is
+/// persisted, echoed and read back in: its members sorted into ascending order,
+/// by the bytes of the identifier.
+///
+/// # Why an order of this service's choosing rather than the caller's
+///
+/// The model fixes no order: `ServiceList` and `RegionsList` are plain Smithy
+/// lists with no `@uniqueItems` and no sort trait
+/// (`smithy_query(query="shape", shape="ServiceList,RegionsList")`), and the
+/// operation docs say only that the response carries "the current list of visible
+/// service identifiers / Region codes after the update". So the order of these
+/// arrays is RECORDED BEHAVIOUR ONLY, and what the corpus records is a service
+/// that reports the setting in ascending member order rather than in the order a
+/// request happened to use: `uxc-configure-visible-regions-roundtrip`'s update is
+/// recorded answering the three Region codes ascending where the request named
+/// them in another sequence, and every other recorded response for either setting
+/// — the `uxc-configure-visible-services-roundtrip` echoes and reads, and the
+/// `GetAccountCustomizations` of `uxc-partial-update-preserves-other-fields` — is
+/// ascending too.
+///
+/// Canonicalizing on the WRITE (rather than when serializing) is what makes the
+/// update's own echo and every later `GetAccountCustomizations` report the one
+/// same sequence, which is the property a round-trip client depends on; and it
+/// keeps `@idempotent` exactly: re-applying a request leaves the same state and
+/// answers the same body, and two requests naming the same members in different
+/// sequences now converge on the same stored value instead of on two.
+///
+/// # What it does NOT do
+///
+/// It does not de-duplicate: neither list declares `@uniqueItems`, so a member
+/// named twice is stored twice (adjacently, after the sort). The multiset of
+/// members is the caller's; only their order is the service's.
+///
+/// # The one recorded response this does not reproduce
+///
+/// In `uxc-partial-update-preserves-other-fields` the update at `task#2` is
+/// recorded reporting the two stored service identifiers in DESCENDING order while
+/// the `GetAccountCustomizations` at `task#4` — with no write in between — reports
+/// the same two ascending. Two different orders for one stored value, so no rule
+/// that is a function of the request can answer both: that step's order is
+/// per-response variation, and reproducing it would mean keying this write on one
+/// recorded response. The canonical order below is the one that agrees with every
+/// other recorded response, including that fixture's own later read.
+pub fn canonical_members(mut supplied: Vec<String>) -> Vec<String> {
+    supplied.sort();
+    supplied
 }
 
 /// The wire value `AccountColor` uses for "no color set" — the documented default

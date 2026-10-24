@@ -232,7 +232,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let arn = crate::state::resource_arn("assets", &region, &input.id);
+        let arn = crate::state::resource_arn(crate::state::ARN_KIND_ASSETS, &region, &input.id);
         let record = crate::state::AssetRecord {
             id: input.id.clone(),
             region: region.clone(),

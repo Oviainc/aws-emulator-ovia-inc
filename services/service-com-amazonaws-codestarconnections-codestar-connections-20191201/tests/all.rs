@@ -19,6 +19,8 @@ mod host_arn_rules;
 mod host_deletion;
 #[path = "all/host_lifecycle.rs"]
 mod host_lifecycle;
+#[path = "all/host_listing.rs"]
+mod host_listing;
 #[path = "all/repository_link_lifecycle.rs"]
 mod repository_link_lifecycle;
 #[path = "all/sdk_target_dispatch.rs"]

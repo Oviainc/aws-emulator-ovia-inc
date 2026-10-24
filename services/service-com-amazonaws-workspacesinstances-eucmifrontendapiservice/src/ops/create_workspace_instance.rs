@@ -153,6 +153,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
+        // A key in the reserved `aws:` namespace names a tag AWS generates, not one a
+        // caller may set. The request is refused before the store is reached, so it
+        // neither replays an idempotency token nor creates an instance.
+        crate::state::reject_reserved_tag_keys(
+            "Tags",
+            input
+                .tags
+                .iter()
+                .flatten()
+                .filter_map(|tag| tag.key.as_deref()),
+        )
+        .map_err(CreateWorkspaceInstanceErrorModeled::ValidationException)?;
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateWorkspaceInstanceErrorModeled::InternalServerException(
                 InternalServerException {

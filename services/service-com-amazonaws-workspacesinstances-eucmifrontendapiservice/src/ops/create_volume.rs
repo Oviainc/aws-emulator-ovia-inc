@@ -136,7 +136,10 @@ impl From<CreateVolumeErrorModeled> for CreateVolumeError {
 ///   per [`crate::state::VOLUME_TYPE_SPECS`], whose doc carries the published ranges
 ///   and the sentences they come from;
 /// * "If KmsKeyId is specified, the encrypted state must be true" (Amazon EBS
-///   `CreateVolume$KmsKeyId`).
+///   `CreateVolume$KmsKeyId`);
+/// * no tag key a `TagSpecification` carries may be in the namespace AWS reserves for
+///   its own tags ([`crate::state::reject_reserved_tag_keys`]), which the modelled
+///   `TagKey` pattern admits.
 ///
 /// Returns the modelled `ValidationException` naming the ONE member the request is
 /// refused for; the member is named in `FieldList` as well as the wording, and no
@@ -146,9 +149,21 @@ fn validate_configuration(
     region: &str,
 ) -> Result<(), ValidationException> {
     use crate::state::{
-        availability_zones_in_region, field_validation_failed, volume_type_spec,
-        DEFAULT_VOLUME_TYPE,
+        availability_zones_in_region, field_validation_failed, reject_reserved_tag_keys,
+        volume_type_spec, DEFAULT_VOLUME_TYPE,
     };
+
+    // A tag key in the reserved `aws:` namespace names a tag AWS generates, not one a
+    // caller may set, whichever resource type the specification names.
+    reject_reserved_tag_keys(
+        "TagSpecifications",
+        input
+            .tag_specifications
+            .iter()
+            .flatten()
+            .flat_map(|specification| specification.tags.iter().flatten())
+            .filter_map(|tag| tag.key.as_deref()),
+    )?;
 
     if !availability_zones_in_region(region)
         .iter()
