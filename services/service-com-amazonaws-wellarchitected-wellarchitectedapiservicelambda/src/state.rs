@@ -36,8 +36,8 @@ use crate::ops::types::{
     AggregationConfiguration, Choice, ConflictException, GoalSummary, LensSummary, Milestone,
     MilestoneSummary,
     ResourceNotFoundException,
-    ReviewTemplate, ShareInvitation, ShareInvitationSummary, Tag, Workload,
-    WorkloadDiscoveryConfig,
+    ReviewTemplate, ReviewTemplateLensReview, ReviewTemplatePillarReviewSummary,
+    ShareInvitation, ShareInvitationSummary, Tag, Workload, WorkloadDiscoveryConfig,
     WorkloadJiraConfigurationInput, WorkloadJiraConfigurationOutput, WorkloadShare,
     WorkloadShareSummary, WorkloadSummary, QUESTION_VALUES, RISK_VALUES,
 };
@@ -1415,6 +1415,17 @@ fn empty_risk_counts() -> BTreeMap<String, i32> {
         .collect()
 }
 
+/// A question roll-up with one entry for every `Question` the enum publishes, all zero:
+/// what every `QuestionCounts` roll-up here starts from, so a caller that reads a bucket
+/// to report review progress always finds it — including for a lens this emulator holds
+/// no question set for, whose every bucket stays 0.
+fn empty_question_counts() -> BTreeMap<String, i32> {
+    QUESTION_VALUES
+        .iter()
+        .map(|bucket| ((*bucket).to_string(), 0))
+        .collect()
+}
+
 /// A risk roll-up as the modelled `RiskCounts` map a response carries.
 pub fn risk_counts_to_map(counts: &BTreeMap<String, i32>) -> HashMap<String, i32> {
     counts.iter().map(|(k, v)| (k.clone(), *v)).collect()
@@ -1457,6 +1468,30 @@ impl MilestoneRecord {
     }
 }
 
+/// The notes one lens review of a review template carries: "the notes that will be
+/// associated with the workload when the template is applied"
+/// (`UpdateReviewTemplateLensReviewInput$LensNotes` / `$PillarNotes` docs).
+///
+/// A lens review of a template is not a resource of its own — it exists exactly while
+/// the lens is applied to the template ([`ReviewTemplateRecord::applies_lens`]) — so
+/// what this record holds is only what a caller has WRITTEN to it: the review's own
+/// notes, the notes of each pillar of that lens, and when either was last written
+/// (`ReviewTemplateLensReview$UpdatedAt`, "the date and time when the review template
+/// lens review was last updated"). Everything else a lens review reports — the lens's
+/// name, version and status, its pillars and its question roll-up — is DERIVED from the
+/// lens content and the template's stored answers by
+/// [`ReviewTemplateRecord::to_lens_review`].
+#[derive(Debug, Clone)]
+pub struct ReviewTemplateLensNotes {
+    /// `ReviewTemplateLensReview$Notes`, absent until a caller writes it.
+    pub notes: Option<String>,
+    /// `ReviewTemplatePillarReviewSummary$Notes` per `PillarId`, holding only the
+    /// pillars a caller has written notes for.
+    pub pillar_notes: BTreeMap<String, String>,
+    /// `ReviewTemplateLensReview$UpdatedAt`.
+    pub updated_at: SystemTime,
+}
+
 /// One stored review template: "A review template" (`ReviewTemplate` shape doc).
 ///
 /// Every member of the modelled `ReviewTemplate` a request can set is persisted here;
@@ -1479,6 +1514,10 @@ pub struct ReviewTemplateRecord {
     /// ([`WorkloadRecord::answers`]) — a review template is reviewed against the same
     /// lens question set, so the two cannot disagree about what an answer records.
     pub answers: BTreeMap<String, BTreeMap<String, AnswerRecord>>,
+    /// The notes recorded against this template's lens reviews, by lens ALIAS (as
+    /// [`lens_alias`] resolves it, so one entry however the request named the lens).
+    /// A lens whose review nothing has been written to carries no entry.
+    pub lens_reviews: BTreeMap<String, ReviewTemplateLensNotes>,
 }
 
 impl ReviewTemplateRecord {
@@ -1508,26 +1547,179 @@ impl ReviewTemplateRecord {
     /// answers on every read and never stored, so it moves when either does — exactly
     /// as a workload's risk roll-up does ([`WorkloadRecord::risk_counts`]).
     pub fn question_counts(&self) -> BTreeMap<String, i32> {
-        let mut counts: BTreeMap<String, i32> = QUESTION_VALUES
-            .iter()
-            .map(|bucket| ((*bucket).to_string(), 0))
-            .collect();
+        let mut counts = empty_question_counts();
         let applied: std::collections::BTreeSet<&str> =
             self.lenses.iter().map(|lens| lens_alias(lens)).collect();
         for lens in applied {
-            for question in lens_questions(lens) {
-                let bucket = if self.answer(lens, question.question_id).is_some() {
-                    QUESTION_ANSWERED
-                } else {
-                    QUESTION_UNANSWERED
-                };
+            for (bucket, count) in self.lens_question_counts(lens) {
                 counts
-                    .entry(bucket.to_string())
-                    .and_modify(|count| *count = count.saturating_add(1))
-                    .or_insert(1);
+                    .entry(bucket)
+                    .and_modify(|total| *total = total.saturating_add(count))
+                    .or_insert(count);
             }
         }
         counts
+    }
+
+    /// The question roll-up of ONE lens review of this template: the same buckets as
+    /// [`Self::question_counts`], counted over the questions that ONE lens asks rather
+    /// than over every applied lens's — which is what a lens review reports.
+    ///
+    /// `lens` is a lens as a request names it (an alias or an ARN). A lens this emulator
+    /// holds no question set for asks nothing ([`lens_questions`]), so every bucket is 0.
+    pub fn lens_question_counts(&self, lens: &str) -> BTreeMap<String, i32> {
+        self.question_counts_over(lens, lens_questions(lens).iter())
+    }
+
+    /// [`Self::lens_question_counts`] narrowed to the questions ONE pillar of that lens
+    /// asks, which is what a pillar review summary of a lens review reports.
+    pub fn pillar_question_counts(&self, lens: &str, pillar_id: &str) -> BTreeMap<String, i32> {
+        self.question_counts_over(
+            lens,
+            lens_questions(lens)
+                .iter()
+                .filter(|question| question.pillar_id == pillar_id),
+        )
+    }
+
+    /// The question roll-up over an arbitrary set of ONE lens's questions — the one
+    /// place a template question is bucketed, so the template's roll-up, a lens
+    /// review's and a pillar's cannot disagree about what a question counts as.
+    fn question_counts_over<'question>(
+        &self,
+        lens: &str,
+        questions: impl Iterator<Item = &'question FrameworkQuestion>,
+    ) -> BTreeMap<String, i32> {
+        let mut counts = empty_question_counts();
+        for question in questions {
+            let bucket = if self.answer(lens, question.question_id).is_some() {
+                QUESTION_ANSWERED
+            } else {
+                QUESTION_UNANSWERED
+            };
+            counts
+                .entry(bucket.to_string())
+                .and_modify(|count| *count = count.saturating_add(1))
+                .or_insert(1);
+        }
+        counts
+    }
+
+    /// The notes written to ONE of this template's lens reviews, if any have been.
+    ///
+    /// `lens` is a lens as a request names it, so the same notes are found by either
+    /// spelling ([`lens_alias`]).
+    pub fn lens_review_notes(&self, lens: &str) -> Option<&ReviewTemplateLensNotes> {
+        self.lens_reviews.get(lens_alias(lens))
+    }
+
+    /// [`Self::lens_review_notes`] for a caller about to WRITE them, created empty at
+    /// `now` on the first write: the lens review itself exists as soon as the lens is
+    /// applied, and this record is only how the store remembers what was written to it.
+    pub fn lens_review_notes_mut(
+        &mut self,
+        lens: &str,
+        now: SystemTime,
+    ) -> &mut ReviewTemplateLensNotes {
+        self.lens_reviews
+            .entry(lens_alias(lens).to_string())
+            .or_insert_with(|| ReviewTemplateLensNotes {
+                notes: None,
+                pillar_notes: BTreeMap::new(),
+                updated_at: now,
+            })
+    }
+
+    /// The pillars ONE lens review of this template reports a summary for, each with the
+    /// `PillarName` the lens content gives it where this emulator holds that content.
+    ///
+    /// The pillars the lens is organized into come first, in the lens's own order
+    /// ([`lens_pillars`]); then any pillar this template records notes for that the lens
+    /// content does not name, in `PillarId` order and with no `PillarName`, so notes a
+    /// caller wrote are always readable back. For a lens this emulator holds content for
+    /// the second group is empty — `UpdateReviewTemplateLensReview` refuses a
+    /// `PillarNotes` key that lens does not define — and for a lens it holds none for the
+    /// first group is, because such a lens is organized into no pillars HERE while the
+    /// real lens is.
+    pub fn lens_review_pillars(&self, lens: &str) -> Vec<(String, Option<&'static str>)> {
+        let defined = lens_pillars(lens);
+        let mut pillars: Vec<(String, Option<&'static str>)> = defined
+            .iter()
+            .map(|(pillar_id, pillar_name, _)| ((*pillar_id).to_string(), Some(*pillar_name)))
+            .collect();
+        if let Some(written) = self.lens_review_notes(lens) {
+            // `pillar_notes` is a `BTreeMap`, so the extra pillars come out in
+            // `PillarId` order.
+            pillars.extend(
+                written
+                    .pillar_notes
+                    .keys()
+                    .filter(|pillar_id| {
+                        !defined
+                            .iter()
+                            .any(|(defined_id, _, _)| defined_id == pillar_id)
+                    })
+                    .map(|pillar_id| (pillar_id.clone(), None)),
+            );
+        }
+        pillars
+    }
+
+    /// The `ReviewTemplateLensReview` shape `GetReviewTemplateLensReview` and
+    /// `UpdateReviewTemplateLensReview` return for ONE lens applied to this template.
+    ///
+    /// `lens` is the lens AS THE REQUEST NAMED IT — `LensAlias` is "either the lens
+    /// alias … or the lens ARN" (`LensAlias` doc) and this shape models no member to
+    /// resolve one spelling into the other — and `lens_arn` is the ARN that lens is
+    /// reported by ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::lens_arn_of`]).
+    ///
+    /// Everything but the notes is DERIVED on every read: the lens's own name, version
+    /// and status from the lens content this emulator holds ([`lens_metadata`], absent
+    /// for a lens it holds none for), one pillar summary per pillar of the lens
+    /// ([`Self::lens_review_pillars`]) and the answered/unanswered roll-ups from the
+    /// template's stored answers.
+    pub fn to_lens_review(&self, lens: &str, lens_arn: String) -> ReviewTemplateLensReview {
+        let metadata = lens_metadata(lens);
+        let written = self.lens_review_notes(lens);
+        ReviewTemplateLensReview {
+            lens_alias: Some(lens.to_string()),
+            lens_arn: Some(lens_arn),
+            lens_version: metadata.map(|metadata| metadata.version.to_string()),
+            lens_name: metadata.map(|metadata| metadata.name.to_string()),
+            lens_status: metadata.map(|metadata| metadata.status.to_string()),
+            pillar_review_summaries: Some(
+                self.lens_review_pillars(lens)
+                    .into_iter()
+                    .map(|(pillar_id, pillar_name)| ReviewTemplatePillarReviewSummary {
+                        notes: written
+                            .and_then(|written| written.pillar_notes.get(&pillar_id).cloned()),
+                        question_counts: Some(
+                            self.pillar_question_counts(lens, &pillar_id)
+                                .into_iter()
+                                .collect::<HashMap<String, i32>>(),
+                        ),
+                        pillar_id: Some(pillar_id),
+                        pillar_name: pillar_name.map(str::to_string),
+                    })
+                    .collect(),
+            ),
+            // "The date and time when the review template lens review was last updated":
+            // the notes record carries that instant, and a lens review nothing has been
+            // written to was last changed when the template carrying it was.
+            updated_at: Some(::aws_smithy_types::DateTime::from(
+                written.map_or(self.updated_at, |written| written.updated_at),
+            )),
+            notes: written.and_then(|written| written.notes.clone()),
+            question_counts: Some(
+                self.lens_question_counts(lens)
+                    .into_iter()
+                    .collect::<HashMap<String, i32>>(),
+            ),
+            // `ReviewTemplateLensReview$NextToken` continues a paged read, and neither
+            // operation that returns this shape models a paging member to continue, so
+            // there is nothing to hand back.
+            next_token: None,
+        }
     }
 
     /// The `ReviewTemplate` shape `GetReviewTemplate` returns.

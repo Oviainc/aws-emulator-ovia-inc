@@ -285,6 +285,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A new template's lens reviews carry no answers yet: every question of
             // every applied lens is `UNANSWERED` until one is recorded.
             answers: std::collections::BTreeMap::new(),
+            // …and nothing has been written to those lens reviews either, so each
+            // reports the template's own `UpdatedAt` until
+            // `UpdateReviewTemplateLensReview` writes notes to it.
+            lens_reviews: std::collections::BTreeMap::new(),
         };
 
         store.review_templates.insert(template_arn.clone(), record);

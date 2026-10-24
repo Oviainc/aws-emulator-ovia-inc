@@ -44,6 +44,9 @@ mod question_choice_catalog;
 #[path = "all/review_template_answers.rs"]
 mod review_template_answers;
 
+#[path = "all/review_template_lens_review.rs"]
+mod review_template_lens_review;
+
 #[path = "all/review_template_lifecycle.rs"]
 mod review_template_lifecycle;
 
