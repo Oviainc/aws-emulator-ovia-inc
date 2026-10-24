@@ -9,13 +9,16 @@
 //! nothing, or that combines framing parameters the model's own documentation
 //! says cannot be combined, is a `ValidationException`.
 //!
-//! NOT RENDERED YET: `PoliticalView`, `Language` and `CropLabels` are accepted
-//! and change no pixel, because this slice draws no label text and no boundary
-//! layer for them to act on. The gap — and what a fix needs — is recorded in
-//! `issues/things-that-do-not-work/20261022T013000Z-getstaticmap-ignores-politicalview-language-and-croplabels-geomaps.md`.
+//! `PoliticalView` selects between the boundary lines a disputed territory has
+//! under the views the model documents (`crate::state::boundaries`), `Language`
+//! selects the language the image's place labels are written in and
+//! `CropLabels` decides whether a label that does not fit inside the frame is
+//! left off the image (`crate::state::labels`).
+//!
 //! `CompactOverlay` is the one deferred knob that asks for geometry to be
-//! DRAWN, so it is refused with the modeled `ValidationException` rather than
-//! answered with an image that silently omits it.
+//! DRAWN in a syntax this emulator does not parse, so it is refused with the
+//! modeled `ValidationException` rather than answered with an image that
+//! silently omits it.
 //!
 //! ## Shape of an operation
 //!
@@ -484,7 +487,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Read the catalog, then release it: the render is the expensive part
         // and nothing in it reads state, so it must not hold this service's one
         // shared lock.
-        let (palette, content_type, cache_control, pricing_bucket) = {
+        let (palette, content_type, cache_control, pricing_bucket, label_font, label_language) = {
             let catalog = state.lock();
             let Some(style_record) = catalog.styles.get(&(style, scheme)) else {
                 return Err(refuse(FieldFault::new(
@@ -497,11 +500,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ),
                 )));
             };
+            // The labels are measured with the metrics of the style's own font
+            // stack — a fallback list, so the first name the catalog has
+            // metrics for is the one measured with, exactly as `GetGlyphs`
+            // picks the stack it serves a glyph range from.
+            let label_font = style_record
+                .font_stack
+                .iter()
+                .find_map(|name| catalog.fonts.get(name))
+                .unwrap_or(&catalog.fallback_font)
+                .clone();
             (
                 style_record.palette.clone(),
                 catalog.static_maps.content_type.clone(),
                 catalog.static_maps.cache_control.clone(),
                 catalog.pricing_bucket(catalog.static_maps.pricing_bucket.as_ref()),
+                label_font,
+                // `Language` names a language the catalog may or may not have
+                // label data for; the catalog decides which language the image
+                // is actually labelled in.
+                catalog.label_language(input.language.as_deref()),
             )
         };
 
@@ -529,6 +547,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some("Miles" | "MilesKilometers")
             ),
             overlay,
+            label_language,
+            label_font,
+            // `CropLabels` "prevents the labels that are on the edge of the
+            // image from being cut or obscured". The model declares no
+            // default, so a request that does not set it gets the plain
+            // rendering, in which a label at the edge is drawn and clipped.
+            crop_labels: input.crop_labels.unwrap_or(false),
+            // `PoliticalView` is a `CountryCode`, whose modeled pattern the
+            // request walk has already enforced; which views have a claim to
+            // apply is the boundary catalog's business, not this handler's.
+            political_view: input.political_view.clone(),
         };
         // Rendering a full-size image is millions of pixel writes with no
         // await point in it, so it runs on the blocking pool rather than
