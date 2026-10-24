@@ -242,7 +242,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ::std::time::SystemTime::now(),
             tags,
         );
-        let stored = pipeline.declaration.clone();
+        // Reported through the one declaration projection `GetPipeline` reports from,
+        // so the create answers with the same structure a later read does.
+        let stored = crate::state::reported_declaration(&pipeline.declaration);
         // Reported from the stored set, so the create answers with the same tags a
         // later `ListTagsForResource` call does.
         let stored_tags = pipeline.tag_list();

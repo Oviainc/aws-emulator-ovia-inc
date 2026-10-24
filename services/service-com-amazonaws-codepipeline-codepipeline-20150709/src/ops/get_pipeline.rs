@@ -176,7 +176,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(GetPipelineOutput {
-            pipeline: Some(declaration.clone()),
+            // Reported through the one declaration projection every operation that
+            // answers with a pipeline structure uses, so what a caller reads back is
+            // the same structure the create or update that stored it reported.
+            pipeline: Some(crate::state::reported_declaration(declaration)),
             metadata: Some(pipeline.metadata()),
         })
     }

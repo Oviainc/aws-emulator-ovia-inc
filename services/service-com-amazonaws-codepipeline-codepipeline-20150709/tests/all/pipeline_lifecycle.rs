@@ -190,6 +190,27 @@ pub(crate) fn build_stage(name: &str, action_count: usize) -> Value {
     json!({"name": name, "actions": actions})
 }
 
+/// The `stages` a declaration is REPORTED with: the ones the request declares, with
+/// each action's artifact-list members made present — empty for an action that
+/// declares no artifact, which is how every reported action declaration carries them
+/// (that rule has its own suite, `tests/all/action_artifact_lists.rs`).
+///
+/// Used by the suites that compare a reported structure against the one they sent, so
+/// "as stored" stays strict about every other member.
+pub(crate) fn reported_stages(declaration: &Value) -> Value {
+    let mut stages = declaration["stages"].clone();
+    for stage in stages.as_array_mut().into_iter().flatten() {
+        for action in stage["actions"].as_array_mut().into_iter().flatten() {
+            for member in ["inputArtifacts", "outputArtifacts"] {
+                if action[member].is_null() {
+                    action[member] = Value::Array(Vec::new());
+                }
+            }
+        }
+    }
+    stages
+}
+
 pub(crate) fn stage_names(pipeline: &Value) -> Vec<String> {
     pipeline["stages"]
         .as_array()
@@ -438,7 +459,8 @@ async fn every_declaration_round_trips_as_stored() {
         let fetched = emulator.ok("GetPipeline", &json!({"name": name})).await;
         let stored = &fetched["pipeline"];
         assert_eq!(
-            stored["stages"], declaration["stages"],
+            stored["stages"],
+            reported_stages(&declaration),
             "case {case:?}: the stages must come back exactly as stored, got {stored}"
         );
         assert_eq!(

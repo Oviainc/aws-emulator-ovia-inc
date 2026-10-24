@@ -235,7 +235,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let stored = pipeline.update(input.pipeline, ::std::time::SystemTime::now());
 
         Ok(UpdatePipelineOutput {
-            pipeline: Some(stored),
+            // Reported through the one declaration projection `GetPipeline` reports
+            // from, so the update answers with the same structure a later read does.
+            pipeline: Some(crate::state::reported_declaration(&stored)),
         })
     }
 }
