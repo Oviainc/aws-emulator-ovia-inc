@@ -163,8 +163,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ///
     /// A read: it projects what the store holds about that entity and persists nothing.
     /// The range is refused when it does not run forwards — a rule about the PAIR of
-    /// members, so it is enforced here rather than by a per-member constraint — and the
-    /// reported range is the requested one, as `GetService` reports it.
+    /// members, so it is enforced here rather than by a per-member constraint — and so is a
+    /// `KeyAttributes` map that identifies no entity
+    /// ([`crate::state::entity_identity_refusal`], the rule `GetService` applies to the
+    /// same member). The reported range is the requested one, as `GetService` reports it.
     ///
     /// The projection itself is derived in `crate::state`
     /// ([`crate::state::ComAmazonawsApplicationsignalsApplicationsignalsState::observed_dependents`]),
@@ -179,6 +181,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         if let Some(message) = crate::state::time_range_refusal(&input.start_time, &input.end_time)
         {
+            return Err(refused(message));
+        }
+        if let Some(message) = crate::state::entity_identity_refusal(&input.key_attributes) {
             return Err(refused(message));
         }
 

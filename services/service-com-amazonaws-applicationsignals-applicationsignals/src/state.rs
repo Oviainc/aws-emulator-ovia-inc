@@ -950,6 +950,75 @@ pub fn attributes_contain(
         .all(|(key, value)| candidate.get(key) == Some(value))
 }
 
+/// The `Attributes` entry that says WHICH KIND of object a key-attribute map identifies:
+/// "`Type` designates the type of object this is"
+/// (`smithy_query(query="doc", shape="GetServiceInput", member="KeyAttributes")`).
+pub const TYPE_ATTRIBUTE: &str = "Type";
+
+/// The entity types `Type` designates, in sorted order.
+///
+/// The `KeyAttributes` doc names them as the values the rest of the map is interpreted
+/// against: `Name` "is used only if the value of the `Type` field is `Service`,
+/// `RemoteService`, or `AWS::Service`", and `ResourceType`/`Identifier` "only when the value
+/// of the `Type` field is `Resource` or `AWS::Resource`"
+/// (`smithy_query(query="doc", shape="GetServiceInput", member="KeyAttributes")` — the same
+/// text on `ListServiceOperationsInput`, `ListServiceDependenciesInput` and
+/// `ListServiceDependentsInput`). A value outside this set designates no kind of object, so
+/// none of the other attributes has a meaning.
+pub const ENTITY_TYPES: [&str; 5] = [
+    "AWS::Resource",
+    "AWS::Service",
+    "RemoteService",
+    "Resource",
+    "Service",
+];
+
+/// The refusal a key-attribute map that is supposed to IDENTIFY an entity earns, or `None`
+/// when it identifies one.
+///
+/// The identity rule the member documents is that the map designates the kind of object it
+/// names: "You must specify at least the `Type`, `Name`, and `Environment` attributes", with
+/// `Type` designating "the type of object this is" and the other attributes applicable only
+/// for particular `Type` values ([`ENTITY_TYPES`]). So a map with no `Type`, or with a
+/// `Type` outside the documented set, names no entity at all and is refused with the
+/// modelled `ValidationException` rather than answered with the caller's own map echoed back
+/// as a discovered entity.
+///
+/// Only `Type` is required here, because the doc's own per-`Type` list makes `Name`
+/// applicable to three of the five types and `Identifier`/`ResourceType` to the other two:
+/// which further attributes identify the object FOLLOWS from `Type`, so `Type` is the one
+/// entry an identity cannot be read without, and a caller may name as few of the rest as
+/// pins the entity down ([`attributes_contain`]).
+///
+/// Shared so the reads that take this member as the entity to report on — `GetService`,
+/// `ListServiceOperations`, `ListServiceDependencies` and `ListServiceDependents` — cannot
+/// disagree about which identities are serviceable. The member is NOT the same rule
+/// everywhere it appears: `ListServiceLevelObjectives` takes an OPTIONAL filter whose doc
+/// drops the "must specify" sentence, and an SLO's own `KeyAttributes` records the object
+/// the SLO relates to, so neither is an entity lookup.
+pub fn entity_identity_refusal(key_attributes: &HashMap<String, String>) -> Option<String> {
+    let clause = match key_attributes.get(TYPE_ATTRIBUTE) {
+        None => constraint_clause(
+            KEY_ATTRIBUTES_MEMBER_PATH,
+            &format!("Member must contain the entity type attribute '{TYPE_ATTRIBUTE}'"),
+        ),
+        Some(entity_type) if !ENTITY_TYPES.contains(&entity_type.as_str()) => constraint_clause(
+            &format!("{KEY_ATTRIBUTES_MEMBER_PATH}.{TYPE_ATTRIBUTE}"),
+            &format!(
+                "Member must satisfy enum value set: [{}]",
+                ENTITY_TYPES.join(", ")
+            ),
+        ),
+        Some(_) => return None,
+    };
+    Some(validation_envelope(&[clause]))
+}
+
+/// The member path a refusal of the entity-identity map names: the member in the lowerCamel
+/// casing this service's `ValidationException` envelope states a member with, as the
+/// framework-level refusal of the same member's modelled bounds already does.
+const KEY_ATTRIBUTES_MEMBER_PATH: &str = "keyAttributes";
+
 /// Whether two `DependencyConfig`s name the same dependency. The shape carries no
 /// `PartialEq`, so the comparison is written out over its two members.
 pub fn same_dependency(left: Option<&DependencyConfig>, right: &DependencyConfig) -> bool {
