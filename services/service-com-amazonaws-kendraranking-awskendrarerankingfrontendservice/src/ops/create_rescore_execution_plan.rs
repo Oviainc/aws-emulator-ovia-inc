@@ -6,7 +6,10 @@
 //! 36-character id, the ARN built from the request's region, and the submitted
 //! `Name`/`Description`/`CapacityUnits`/`Tags`, all read back by
 //! `DescribeRescoreExecutionPlan` and `ListRescoreExecutionPlans`. A repeated
-//! `ClientToken` returns the plan that token already created.
+//! `ClientToken` returns the plan that token already created. A request past a quota —
+//! one plan too many, or a `CapacityUnits` asking for more extra capacity than the
+//! service publishes a ceiling for — is refused with the modelled
+//! `ServiceQuotaExceededException` and stores nothing.
 //!
 //! Provisioning is asynchronous: the plan is stored `CREATING` and the clock owes it
 //! `ACTIVE` ([`crate::state::CREATION_TRANSITION_DELAY`]), so a caller reading straight
@@ -231,6 +234,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     id: plan.id.clone(),
                     arn: plan.arn.clone(),
                 });
+            }
+        }
+
+        // The amount of extra capacity a `CapacityUnits` member may ask for has a
+        // published ceiling the model's `@range` cannot carry, so it is the handler that
+        // enforces it: a create past the ceiling is refused with the modelled quota
+        // error and no plan is stored. Checked after the idempotency lookup above, like
+        // the plan-count quota, so a repeated token still gets its plan back.
+        if let Some(capacity_units) = &input.capacity_units {
+            if let Some(over_quota) = crate::state::capacity_units_over_quota(capacity_units) {
+                return Err(
+                    CreateRescoreExecutionPlanErrorModeled::ServiceQuotaExceededException(
+                        over_quota,
+                    )
+                    .into(),
+                );
             }
         }
 
