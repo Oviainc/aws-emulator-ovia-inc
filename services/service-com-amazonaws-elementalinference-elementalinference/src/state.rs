@@ -40,7 +40,7 @@
 //! [`ComAmazonawsElementalinferenceElementalinferenceState::clear_fixtures`]) still
 //! installs or drops records, and no request mutates what a later caller sees.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
 use crate::ops::types::{
@@ -896,10 +896,10 @@ pub fn invalid_tag_key_message(length: usize) -> String {
 /// request is refused with the modelled `ValidationException` (HTTP 400), the answer a
 /// request that "fails to satisfy the constraints specified by the service" earns.
 ///
-/// `TagResource` is where the bound bites because it ACCUMULATES: the tag map a create
-/// carries is bounded by the single request that carried it, exactly as
-/// [`MAX_OUTPUTS_PER_FEED`] is needed only by the appending `AssociateFeed` and not by
-/// the creates that replace an output list wholesale.
+/// It bounds the tag set a request ASKS a resource to carry, whichever operation
+/// carries it: `TagResource` accumulates onto the stored set, while a create's tag map
+/// is the whole set the new resource would carry, so each is measured against the same
+/// cap ([`invalid_tags_message`]).
 pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 
 /// The refusal a `TagResource` whose tags would take a resource past
@@ -915,6 +915,80 @@ pub fn too_many_tags_message(resulting: usize) -> String {
         "These tags would leave the resource with {resulting} tags, more than the \
          {MAX_TAGS_PER_RESOURCE} tags a resource can have. Remove tags before adding more."
     )
+}
+
+/// The tag-key prefix AWS reserves for its own tags.
+///
+/// AWS's tag restrictions reserve this prefix on every taggable resource: the keys under
+/// it name AWS-generated tags, so a user request may not supply one and a request that
+/// does is refused rather than stored. The model constrains a `TagKey`'s length and
+/// nothing else, so the reserved namespace is the service's own rule to enforce, with
+/// the `ValidationException` (HTTP 400) a request that "fails to satisfy the constraints
+/// specified by the service" earns.
+pub const RESERVED_TAG_KEY_PREFIX: &str = "aws:";
+
+/// Whether `key` lies in the namespace [`RESERVED_TAG_KEY_PREFIX`] reserves.
+///
+/// The prefix is reserved at the START of a key, and a tag key is case-sensitive, so a
+/// key that merely contains the prefix further along, or carries it in another case, is
+/// a key of the caller's own namespace and is stored like any other.
+pub fn is_reserved_tag_key(key: &str) -> bool {
+    key.starts_with(RESERVED_TAG_KEY_PREFIX)
+}
+
+/// The refusal a tag key in the reserved namespace earns.
+///
+/// The rule is about ONE value's own validity, so the message is built from the request:
+/// it names the key at fault and the prefix that is reserved, which is what a caller has
+/// to know to fix the request. Naming the key is bounded because the key's own
+/// `@length` is decided FIRST ([`invalid_tags_message`]), so by here it is at most
+/// [`TAG_KEY_MAX_LENGTH`] characters.
+pub fn reserved_tag_key_message(key: &str) -> String {
+    format!(
+        "The tag key '{key}' begins with '{RESERVED_TAG_KEY_PREFIX}', a prefix reserved for \
+         AWS-generated tags, so it cannot be specified in a request."
+    )
+}
+
+/// The refusal the `tags` of a request earn, or `None` when the request asks for a tag
+/// set this service stores.
+///
+/// ONE copy of every rule a supplied tag map has to satisfy, so `CreateFeed`,
+/// `CreateDictionary` and `TagResource` cannot drift in which tags they accept: a key
+/// outside the modelled `TagKey` bounds ([`TAG_KEY_MIN_LENGTH`]), a key in the reserved
+/// namespace ([`RESERVED_TAG_KEY_PREFIX`]), and more tags than a resource may carry
+/// ([`MAX_TAGS_PER_RESOURCE`]). The request's own validity is decided before any
+/// resource is looked up, so a malformed tag map is refused whatever resource the rest
+/// of the request names.
+///
+/// `TagResource` ACCUMULATES onto a stored set, so it checks the resulting size against
+/// the cap as well ([`too_many_tags_message`]); the size checked here is the one the
+/// request itself asks for, which is the whole set of a resource a create mints.
+pub fn invalid_tags_message(tags: &HashMap<String, String>) -> Option<String> {
+    // Several keys can be at fault at once and one request earns one answer, so the key
+    // reported is chosen in key order rather than by the map's iteration order.
+    let mut keys: Vec<&str> = tags.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+
+    // The modelled bounds of the key first: `@length` counts characters, not bytes,
+    // exactly as the boundary walk does for the values it reaches.
+    if let Some(length) = keys
+        .iter()
+        .map(|key| key.chars().count())
+        .find(|length| !(TAG_KEY_MIN_LENGTH..=TAG_KEY_MAX_LENGTH).contains(length))
+    {
+        return Some(invalid_tag_key_message(length));
+    }
+
+    if let Some(key) = keys.iter().find(|key| is_reserved_tag_key(key)) {
+        return Some(reserved_tag_key_message(key));
+    }
+
+    if tags.len() > MAX_TAGS_PER_RESOURCE {
+        return Some(too_many_tags_message(tags.len()));
+    }
+
+    None
 }
 
 /// The ARN of a feed in `region`: `arn:aws:elemental-inference:<region>:<account>:feed/<id>`.
