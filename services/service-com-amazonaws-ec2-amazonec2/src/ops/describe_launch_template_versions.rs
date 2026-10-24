@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeLaunchTemplateVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeLaunchTemplateVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeLaunchTemplateVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: reports the versions
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::launch_templates`] holds, projected into
+//! the modelled `LaunchTemplateVersion` by [`launch_template_version_view`] below, so the
+//! `LaunchTemplateData` a writer stored round-trips through this read without a
+//! field-by-field copy that could silently drop one.
+//!
+//! A request names ONE template (by id or by name) and then names versions of it by number
+//! or by the `$Latest`/`$Default` alias; a request that names no template describes the
+//! latest or default version of EVERY template of the account, which is the only thing
+//! `Versions` may ask for then. `MinVersion`/`MaxVersion` bound the version numbers
+//! reported, the documented filters select on the version's own launch parameters, and the
+//! page is cut in (template id, version number) order with a cursor naming the version the
+//! next page starts at.
+//!
+//! This operation only REPORTS: nothing here writes to the store, so two reads of the same
+//! template answer with the same versions.
 //!
 //! ## Shape of an operation
 //!
@@ -180,18 +188,1047 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeLaunchTemplateVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeLaunchTemplateVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeLaunchTemplateVersions"))
+        use std::collections::BTreeSet;
+
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            CompiledFilter, LAUNCH_TEMPLATE_VERSION_DEFAULT, LAUNCH_TEMPLATE_VERSION_LATEST,
+            LaunchTemplateRecord, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUE_BYTES,
+            MAX_FILTER_VALUES, MAX_FILTERS, MAX_RESOURCE_IDS, MatchBudget, decode_page_token,
+            encode_page_token, invalid_launch_template_id_malformed,
+            invalid_launch_template_id_not_found, invalid_launch_template_name_not_found,
+            invalid_pagination_token_for, launch_template_id_is_well_formed, matches_every_filter,
+            require_service_state, resolve_launch_template_version,
+        };
+
+        // A launch template version carries no Region member and this operation reads no
+        // other request metadata, so the Region the call is signed for selects only the
+        // response envelope.
+        let _ = ctx;
+
+        // Matching cost is templates x versions x filters x values x value length, and the
+        // model bounds none of them: every request-chosen factor is capped here, before any
+        // work proportional to it is done, and their PRODUCT is charged to one
+        // [`MatchBudget`] below — the bound the per-factor caps cannot give.
+        let supplied_filters = input.filters.as_ref().map_or(0, Vec::len);
+        if supplied_filters > MAX_FILTERS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The request carries {supplied_filters} filters, above the maximum \
+                 of {MAX_FILTERS}"
+            )));
+        }
+
+        // A filter name this operation does not document is refused whether or not any
+        // version would have matched it, so an unsupported filter can never read as "no
+        // results". Each value is compiled into its pattern ONCE here rather than
+        // recompiled at every comparison under the lock.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        let mut selectors: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !VERSION_FILTERS.contains(&name) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is
+            // bounded too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            selectors.push(CompiledFilter::new(name.to_string(), values.to_vec()));
+        }
+
+        // "The token to request the next page of results"
+        // (`DescribeLaunchTemplateVersionsRequest$NextToken`) — anything this service did
+        // not mint is refused rather than read as a position.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => {
+                Some(decode_page_token(token).ok_or_else(|| invalid_pagination_token_for(token))?)
+            }
+        };
+
+        // "The maximum number of results to return in a single call. … This value can be
+        // between 1 and 200" (`MaxResults`). The member targets a plain `Integer` with no
+        // `@range`, so the published bounds can only be enforced here.
+        let limit = match input.max_results {
+            None => MAX_PAGE_SIZE,
+            Some(max_results) => {
+                if !(MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&max_results) {
+                    return Err(Scaffolded::invalid_parameter_value(format!(
+                        "Invalid value '{max_results}' for maxResults. \
+                         MaxResults must be between {MIN_PAGE_SIZE} and {MAX_PAGE_SIZE}"
+                    )));
+                }
+                max_results
+            }
+        };
+        let limit = usize::try_from(limit).unwrap_or(0);
+
+        // "The version number AFTER WHICH to describe launch template versions"
+        // (`MinVersion`) and "the version number UP TO WHICH to describe launch template
+        // versions" (`MaxVersion`): the two bounds are not symmetric, and each is read as
+        // the member documents it — the lower edge is the version the range starts after,
+        // so the version it names is NOT reported, and the upper edge is the last version
+        // reported.
+        let min_version = version_bound(input.min_version.as_deref(), "minVersion")?;
+        let max_version = version_bound(input.max_version.as_deref(), "maxVersion")?;
+
+        // `Versions` is a list the model declares no `@length` for, and every entry is
+        // resolved against every template described, so it is capped the way every other
+        // describe of this service caps a request's id list. A repeated entry names one
+        // version, so the list is deduplicated ONCE here rather than per template — which
+        // also leaves at most the two aliases to resolve in the account-wide case below.
+        let supplied_versions = input.versions.as_ref().map_or(0, Vec::len);
+        if supplied_versions > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "Versions carries {supplied_versions} versions, above the maximum of \
+                 {MAX_RESOURCE_IDS}"
+            )));
+        }
+        let mut named_once: BTreeSet<&str> = BTreeSet::new();
+        let requested: Vec<&str> = input
+            .versions
+            .iter()
+            .flatten()
+            .map(String::as_str)
+            .filter(|version| named_once.insert(version))
+            .collect();
+
+        // "To describe one or more versions of a specified launch template, you must
+        // specify either the launch template ID or the launch template name, but not both.
+        // To describe all the latest or default launch template versions in your account,
+        // you must omit this parameter" (`LaunchTemplateId`) — so naming both is refused,
+        // and naming neither describes every template of the account. WHICH templates a
+        // request names is a fact of the REQUEST, so it is read here, before any state is
+        // reached and before the dry run below reports a permission check.
+        let selector = match (
+            input.launch_template_id.as_deref(),
+            input.launch_template_name.as_deref(),
+        ) {
+            (Some(_), Some(_)) => {
+                return Err(Scaffolded::invalid_parameter_combination(
+                    "Either the launch template ID or the launch template name may be \
+                     specified, but not both",
+                ));
+            }
+            (Some(id), None) => {
+                if !launch_template_id_is_well_formed(id) {
+                    return Err(invalid_launch_template_id_malformed(id));
+                }
+                TemplateSelector::Id(id)
+            }
+            (None, Some(name)) => TemplateSelector::Name(name),
+            // "To describe all launch templates in your account that are defined as the
+            // latest version, the valid value is $Latest. … You can specify $Latest and
+            // $Default in the same request. You cannot specify numbers" (`Versions`):
+            // across the account a version is named by alias only, and a request that
+            // names no alias has named nothing to describe.
+            (None, None) => {
+                // A request that names neither a template nor a version has named no
+                // template at all, which is the same missing parameter
+                // `DeleteLaunchTemplate` answers for
+                // ([`crate::state::resolve_launch_template_id`]).
+                if requested.is_empty() {
+                    return Err(Scaffolded::missing_parameter(format!(
+                        "The request must contain either the parameter LaunchTemplateId \
+                         or the parameter LaunchTemplateName, or name the version \
+                         {LAUNCH_TEMPLATE_VERSION_LATEST} or \
+                         {LAUNCH_TEMPLATE_VERSION_DEFAULT}"
+                    )));
+                }
+                if let Some(numbered) = requested.iter().find(|version| {
+                    ![LAUNCH_TEMPLATE_VERSION_LATEST, LAUNCH_TEMPLATE_VERSION_DEFAULT]
+                        .contains(*version)
+                }) {
+                    return Err(Scaffolded::invalid_parameter_combination(format!(
+                        "Invalid value '{numbered}' for version. Describing the \
+                         versions of every launch template in the account admits only \
+                         {LAUNCH_TEMPLATE_VERSION_LATEST} and \
+                         {LAUNCH_TEMPLATE_VERSION_DEFAULT}"
+                    )));
+                }
+                TemplateSelector::EveryTemplate
+            }
+        };
+
+        // "Checks whether you have the required permissions for the action, WITHOUT
+        // ACTUALLY MAKING THE REQUEST, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation"
+        // (`DescribeLaunchTemplateVersionsRequest$DryRun`). Every caller of this emulator
+        // is permitted, so a well-formed dry run reports that outcome and reads nothing —
+        // but a request that is not well formed is answered with ITS OWN refusal, never
+        // getting as far as the permission check it asks about.
+        if input.dry_run.unwrap_or(false) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let store = state.lock();
+
+        // The templates the selector names, read out of the store.
+        let described: Vec<&LaunchTemplateRecord> = match selector {
+            TemplateSelector::Id(id) => {
+                let record = store
+                    .launch_templates
+                    .get(id)
+                    .ok_or_else(|| invalid_launch_template_id_not_found(id))?;
+                vec![record]
+            }
+            TemplateSelector::Name(name) => {
+                let id = store
+                    .launch_template_id_for_name(name)
+                    .ok_or_else(|| invalid_launch_template_name_not_found(name))?;
+                let record = store.launch_templates.get(&id).ok_or_else(|| {
+                    Scaffolded::internal_error(format!("launch template '{id}' is not stored"))
+                })?;
+                vec![record]
+            }
+            TemplateSelector::EveryTemplate => store.launch_templates.values().collect(),
+        };
+
+        // "If this parameter is set to true, the output includes resources that are managed
+        // by Amazon Web Services services, even if managed resource visibility is set to
+        // hidden" (`IncludeManagedResources`). A template is hidden only when its operator
+        // reports `HiddenByDefault`, which follows the account's managed-resource
+        // visibility settings — nothing in this emulator sets them, so no stored template
+        // is hidden and this parameter widens nothing today.
+        let include_managed = input.include_managed_resources.unwrap_or(false);
+
+        // "If true, and if a Systems Manager parameter is specified for ImageId, the AMI ID
+        // is displayed in the response for imageId. If false … the parameter is displayed.
+        // Default: false" (`ResolveAlias`). The parameter -> AMI mapping the visible image
+        // catalog publishes is read ONCE per request, so resolving an alias costs a map
+        // lookup per version rather than a scan of the image store.
+        let resolve_alias = input.resolve_alias.unwrap_or(false);
+        let resolvable_parameters = if resolve_alias {
+            public_ssm_parameter_image_ids(&store)
+        } else {
+            ::std::collections::BTreeMap::new()
+        };
+
+        // Every comparison this request makes is charged to ONE budget, so the PRODUCT of
+        // described templates, their versions, the filters, their values and the values'
+        // length is bounded however the caller combines them — which is also what bounds
+        // how long this read holds the state lock.
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<LaunchTemplateVersion> = Vec::new();
+        'templates: for record in described {
+            // "To describe one or more versions of a specified launch template, valid
+            // values are $Latest, $Default, and numbers" (`Versions`); a request that
+            // names none describes every version the template holds. A set, so a version
+            // is reported once and in version-number order.
+            let numbers: BTreeSet<i64> = if requested.is_empty() {
+                record.versions.keys().copied().collect()
+            } else {
+                let mut numbers = BTreeSet::new();
+                for version in &requested {
+                    match resolve_launch_template_version(record, version) {
+                        Ok(number) => {
+                            numbers.insert(number);
+                        }
+                        // A template that cannot answer the alias contributes no version to
+                        // an ACCOUNT-WIDE describe: that request named the account's
+                        // templates, not this one, so the templates that can answer it are
+                        // still described. A request that named THIS template is refused,
+                        // the caller having asked about it in particular.
+                        Err(refusal) => match selector {
+                            TemplateSelector::EveryTemplate => continue,
+                            TemplateSelector::Id(_) | TemplateSelector::Name(_) => {
+                                return Err(refusal);
+                            }
+                        },
+                    }
+                }
+                numbers
+            };
+
+            for number in numbers {
+                if budget.exhausted() {
+                    break 'templates;
+                }
+                if min_version.is_some_and(|min| number <= min)
+                    || max_version.is_some_and(|max| number > max)
+                {
+                    continue;
+                }
+                let Some(version) = record.versions.get(&number) else {
+                    continue;
+                };
+                let mut view = launch_template_version_view(record, version);
+                if !include_managed && is_hidden(&view) {
+                    continue;
+                }
+                if let Some(data) = view.launch_template_data.as_mut().filter(|_| resolve_alias) {
+                    let alias = data
+                        .image_id
+                        .as_deref()
+                        .and_then(ssm_image_alias_parameter)
+                        .map(str::to_string);
+                    // A parameter no visible image publishes resolves to no AMI, and
+                    // "the AMI ID is displayed in the response for imageId" is then
+                    // nothing this version can say: the stored value — the parameter
+                    // itself, which is what `ResolveAlias` false reports — is left in
+                    // place for that one version. A template whose alias cannot be
+                    // resolved is still a valid template, so it never hides the other
+                    // versions the same request asked for.
+                    if let Some(parameter) = alias {
+                        if let Some(image_id) = resolvable_parameters.get(&parameter) {
+                            data.image_id = Some(image_id.clone());
+                        }
+                    }
+                }
+                if matches_every_filter(&selectors, &mut budget, &|name| {
+                    filter_values(&view, name)
+                }) {
+                    selected.push(view);
+                }
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report
+        // as a result: the request asked for more filtering than one call will do, and is
+        // told so rather than given a silently truncated page.
+        if budget.exhausted() {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                 comparisons to evaluate; narrow Filters or Versions, or name a single \
+                 LaunchTemplateId"
+            )));
+        }
+
+        // Page in (launch template id, version number) order, which the cursor below names
+        // a position in: the one order every page of one request is cut in, whichever
+        // templates it spans.
+        selected.sort_by_key(page_cursor);
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => {
+                selected.partition_point(|view| page_cursor(view).as_str() < cursor)
+            }
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        // "This value is null when there are no more results to return"
+        // (`DescribeLaunchTemplateVersionsResult$NextToken`): a token only when a version
+        // follows this page.
+        let next_token = page
+            .get(limit)
+            .map(|view| encode_page_token(&page_cursor(view)));
+
+        Ok(DescribeLaunchTemplateVersionsOutput {
+            launch_template_versions: Some(page.iter().take(limit).cloned().collect()),
+            next_token,
+        })
+    }
+}
+
+/// Which launch templates a request names — read off the request alone, before any state
+/// is reached.
+///
+/// "To describe one or more versions of a specified launch template, you must specify
+/// either the launch template ID or the launch template name, but not both. To describe all
+/// the latest or default launch template versions in your account, you must omit this
+/// parameter" (`DescribeLaunchTemplateVersionsRequest$LaunchTemplateId`), so a request
+/// names exactly one of these three things.
+#[derive(Debug, Clone, Copy)]
+enum TemplateSelector<'a> {
+    /// The one template this id names.
+    Id(&'a str),
+    /// The one template this name names.
+    Name(&'a str),
+    /// Every launch template of the account.
+    EveryTemplate,
+}
+
+/// The smallest page a request may ask for: "This value can be between 1 and 200"
+/// (`DescribeLaunchTemplateVersionsRequest$MaxResults`).
+const MIN_PAGE_SIZE: i32 = 1;
+/// The largest page a request may ask for, from the same sentence — and the page a request
+/// that names no `MaxResults` gets, so the `NextToken` path behaves the same whether or not
+/// a page size was asked for.
+const MAX_PAGE_SIZE: i32 = 200;
+
+/// The filter names this operation documents, from
+/// `DescribeLaunchTemplateVersionsRequest$Filters`:
+///
+/// ```text
+/// smithy_query(query="doc",shape="DescribeLaunchTemplateVersionsRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// Every entry must be answered by [`filter_values`]; this operation documents no `tag:`
+/// filter, a launch template VERSION carrying no tags of its own.
+const VERSION_FILTERS: [&str; 14] = [
+    "create-time",
+    "ebs-optimized",
+    "host-resource-group-arn",
+    "http-endpoint",
+    "http-protocol-ipv4",
+    "http-tokens",
+    "iam-instance-profile",
+    "image-id",
+    "instance-type",
+    "is-default-version",
+    "kernel-id",
+    "license-configuration-arn",
+    "network-card-index",
+    "ram-disk-id",
+];
+
+/// A version number a `MinVersion`/`MaxVersion` bound names.
+///
+/// Both members target a plain `String` and document a version NUMBER, so anything that is
+/// not one names no bound and is refused rather than read as zero.
+fn version_bound(
+    bound: Option<&str>,
+    member: &str,
+) -> Result<Option<i64>, DescribeLaunchTemplateVersionsError> {
+    match bound {
+        None => Ok(None),
+        Some(value) => value.parse::<i64>().map(Some).map_err(|_| {
+            crate::scaffolded::Scaffolded::invalid_parameter_value(format!(
+                "Invalid value '{value}' for {member}. {member} must be a version number"
+            ))
+        }),
+    }
+}
+
+/// The position of `view` in the one order a page of this operation is cut in: its
+/// template's id, then its version number — zero-padded, so the text order the cursor is
+/// compared in is the numeric order of the versions.
+fn page_cursor(view: &LaunchTemplateVersion) -> String {
+    format!(
+        "{}#{:020}",
+        view.launch_template_id.as_deref().unwrap_or_default(),
+        view.version_number.unwrap_or_default()
+    )
+}
+
+/// Is this version one a request has to ask for by name?
+///
+/// `OperatorResponse$HiddenByDefault` is "whether the resource is hidden from public view",
+/// which is what `IncludeManagedResources` overrides.
+fn is_hidden(view: &LaunchTemplateVersion) -> bool {
+    view.operator
+        .as_ref()
+        .and_then(|operator| operator.hidden_by_default)
+        .unwrap_or(false)
+}
+
+/// A boolean attribute as a filter value compares against it: the wire rendering of the
+/// member, `true` or `false`. A member that is not set carries no value for the filter to
+/// match, like any other absent attribute.
+fn boolean_values(value: Option<bool>) -> Vec<::std::borrow::Cow<'static, str>> {
+    value
+        .map(|set| ::std::borrow::Cow::Borrowed(if set { "true" } else { "false" }))
+        .into_iter()
+        .collect()
+}
+
+/// The values the EC2 filter `name` compares against this launch template version.
+///
+/// A filter naming an attribute this version does not carry compares against NO values, so
+/// it selects nothing — the same answer AWS gives for, say, `kernel-id` on a version that
+/// names no kernel. `name` is a name [`VERSION_FILTERS`] admits.
+fn filter_values<'a>(
+    view: &'a LaunchTemplateVersion,
+    name: &str,
+) -> Vec<::std::borrow::Cow<'a, str>> {
+    use ::std::borrow::Cow;
+
+    let data = view.launch_template_data.as_ref();
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    let metadata = |pick: fn(&'a LaunchTemplateInstanceMetadataOptions) -> Option<&'a String>| {
+        data.and_then(|data| data.metadata_options.as_ref())
+            .and_then(pick)
+            .map(|value| Cow::Borrowed(value.as_str()))
+            .into_iter()
+            .collect::<Vec<Cow<'a, str>>>()
+    };
+    match name {
+        // The version's create time as the wire reports it, which is the text a filter
+        // value — EC2's wildcards included — is compared against.
+        "create-time" => view
+            .create_time
+            .and_then(|at| at.fmt(::aws_smithy_types::date_time::Format::DateTime).ok())
+            .map(Cow::Owned)
+            .into_iter()
+            .collect(),
+        "ebs-optimized" => boolean_values(data.and_then(|data| data.ebs_optimized)),
+        "host-resource-group-arn" => text(
+            data.and_then(|data| data.placement.as_ref())
+                .and_then(|placement| placement.host_resource_group_arn.as_deref()),
+        ),
+        "http-endpoint" => metadata(|options| options.http_endpoint.as_ref()),
+        // The modelled `LaunchTemplateInstanceMetadataOptions` carries no IPv4 member —
+        // only `HttpProtocolIpv6`
+        // (`smithy_query(query="shape",shape="LaunchTemplateInstanceMetadataOptions")`) —
+        // so a version says nothing about the IPv4 endpoint and the filter selects nothing.
+        "http-protocol-ipv4" => Vec::new(),
+        "http-tokens" => metadata(|options| options.http_tokens.as_ref()),
+        // "iam-instance-profile - The ARN of the IAM instance profile."
+        "iam-instance-profile" => text(
+            data.and_then(|data| data.iam_instance_profile.as_ref())
+                .and_then(|profile| profile.arn.as_deref()),
+        ),
+        "image-id" => text(data.and_then(|data| data.image_id.as_deref())),
+        "instance-type" => text(data.and_then(|data| data.instance_type.as_deref())),
+        "is-default-version" => boolean_values(view.default_version),
+        "kernel-id" => text(data.and_then(|data| data.kernel_id.as_deref())),
+        "license-configuration-arn" => data
+            .map(|data| {
+                data.license_specifications
+                    .iter()
+                    .flatten()
+                    .filter_map(|specification| {
+                        specification
+                            .license_configuration_arn
+                            .as_deref()
+                            .map(Cow::Borrowed)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        // Every network card index the version names: a card is named by a network
+        // interface and by a secondary interface alike.
+        "network-card-index" => data
+            .map(|data| {
+                data.network_interfaces
+                    .iter()
+                    .flatten()
+                    .filter_map(|interface| interface.network_card_index)
+                    .chain(
+                        data.secondary_interfaces
+                            .iter()
+                            .flatten()
+                            .filter_map(|interface| interface.network_card_index),
+                    )
+                    .map(|index| Cow::Owned(index.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        "ram-disk-id" => text(data.and_then(|data| data.ram_disk_id.as_deref())),
+        // Unreachable: every other name has already been refused. An undefined name
+        // compares against nothing, so it could never widen a result even if that check
+        // were bypassed.
+        _ => Vec::new(),
+    }
+}
+
+/// The prefix an `ImageId` carries when it names a Systems Manager parameter instead of an
+/// AMI: "if a Systems Manager parameter is specified for `ImageId`, the AMI ID is displayed
+/// in the response for `imageId`" (`ResolveAlias`), and such a value is written
+/// `resolve:ssm:<parameter-name>` (Amazon EC2 User Guide, "Use a Systems Manager parameter
+/// instead of an AMI ID").
+pub const SSM_IMAGE_ALIAS_PREFIX: &str = "resolve:ssm:";
+
+/// The Systems Manager parameter name `image_id` is an alias for, or `None` when it names
+/// an AMI directly.
+fn ssm_image_alias_parameter(image_id: &str) -> Option<&str> {
+    image_id
+        .strip_prefix(SSM_IMAGE_ALIAS_PREFIX)
+        .filter(|parameter| !parameter.is_empty())
+}
+
+/// The public Systems Manager parameter of every image this account can see that publishes
+/// one, and the id of the image it resolves to.
+///
+/// `Image$PublicSsmParameterName` is "the name of the public Systems Manager parameter that
+/// resolves to this AMI", so the stored images are what an alias is resolved against — the
+/// one place this emulator records which AMI a parameter names, rather than a second table
+/// that could disagree with the catalog. Built ONCE per request and then looked up, so
+/// resolving the aliases of many versions costs one pass over the image store
+/// ([`crate::state::MAX_IMAGES`] bounds it) instead of one pass per version.
+fn public_ssm_parameter_image_ids(
+    store: &crate::state::ComAmazonawsEc2Amazonec2State,
+) -> ::std::collections::BTreeMap<String, String> {
+    let account = ::engine::emulator_account_id();
+    store
+        .images
+        .values()
+        .filter(|image| crate::state::image_is_visible(image, account))
+        .filter_map(|image| {
+            Some((
+                image.public_ssm_parameter_name.clone()?,
+                image.image_id.clone()?,
+            ))
+        })
+        .collect()
+}
+
+/// One stored launch template version as this operation reports it: the modelled
+/// [`LaunchTemplateVersion`].
+///
+/// `LaunchTemplateVersion$DefaultVersion` is read off the TEMPLATE's `DefaultVersionNumber`
+/// rather than off a second flag on the version, so the template and its versions cannot
+/// disagree about which version is the default one. `Operator` is the template's: "the
+/// entity that manages the launch template" is a fact of the template, and every version of
+/// it is managed by the same entity.
+fn launch_template_version_view(
+    record: &crate::state::LaunchTemplateRecord,
+    version: &crate::state::LaunchTemplateVersionRecord,
+) -> LaunchTemplateVersion {
+    LaunchTemplateVersion {
+        launch_template_id: Some(record.launch_template_id().to_string()),
+        launch_template_name: Some(record.launch_template_name().to_string()),
+        version_number: Some(version.version_number),
+        version_description: version.version_description.clone(),
+        create_time: Some(crate::state::system_time_to_date_time(version.create_time)),
+        created_by: Some(version.created_by.clone()),
+        default_version: Some(
+            record.template.default_version_number == Some(version.version_number),
+        ),
+        launch_template_data: Some(response_launch_template_data(&version.data)),
+        operator: record.template.operator.clone(),
+    }
+}
+
+/// `LaunchTemplateInstanceMetadataOptionsState`'s `applied` member: "the metadata options
+/// have been successfully applied"
+/// (`smithy_query(query="doc",shape="LaunchTemplateInstanceMetadataOptions",member="State")`).
+const LAUNCH_TEMPLATE_METADATA_OPTIONS_APPLIED: &str = "applied";
+
+/// The launch parameters of a stored version as a READER reports them: the modelled
+/// `ResponseLaunchTemplateData` built from the `RequestLaunchTemplateData` the writer gave.
+///
+/// The two shapes carry the same members under the same names — the request side is simply
+/// the mutable mirror of the response side — so this is a member-for-member projection and
+/// nothing a caller set is dropped or invented. The three places the response side says
+/// MORE than the request side are the only decisions here, and each is taken from that
+/// member's own documentation:
+///
+/// * `LaunchTemplateInstanceMetadataOptions$State` — "`applied` - The metadata options have
+///   been successfully applied" — is reported for a version that carries metadata options
+///   at all: a stored version's options are the selection itself, with no update in flight
+///   for `pending` to describe.
+/// * `OperatorResponse$Managed` is "`true` if the resource is managed by a service
+///   provider", so data naming a principal is managed data, and `HiddenByDefault` follows
+///   the account's managed-resource visibility settings, which nothing in this emulator
+///   sets — the same reading `CreateLaunchTemplate` takes of the template's own operator.
+/// * `InstanceIpv6Address$IsPrimaryIpv6` has no member on the request side of an IPv6
+///   address (`InstanceIpv6AddressRequest` carries the address alone), so nothing was said
+///   about it and nothing is reported.
+fn response_launch_template_data(
+    data: &RequestLaunchTemplateData,
+) -> ResponseLaunchTemplateData {
+    ResponseLaunchTemplateData {
+        kernel_id: data.kernel_id.clone(),
+        ebs_optimized: data.ebs_optimized,
+        iam_instance_profile: data.iam_instance_profile.as_ref().map(|profile| {
+            LaunchTemplateIamInstanceProfileSpecification {
+                arn: profile.arn.clone(),
+                name: profile.name.clone(),
+            }
+        }),
+        block_device_mappings: data.block_device_mappings.as_ref().map(|mappings| {
+            mappings
+                .iter()
+                .map(|mapping| LaunchTemplateBlockDeviceMapping {
+                    device_name: mapping.device_name.clone(),
+                    virtual_name: mapping.virtual_name.clone(),
+                    ebs: mapping.ebs.as_ref().map(|ebs| LaunchTemplateEbsBlockDevice {
+                        encrypted: ebs.encrypted,
+                        delete_on_termination: ebs.delete_on_termination,
+                        iops: ebs.iops,
+                        kms_key_id: ebs.kms_key_id.clone(),
+                        snapshot_id: ebs.snapshot_id.clone(),
+                        volume_size: ebs.volume_size,
+                        volume_type: ebs.volume_type.clone(),
+                        throughput: ebs.throughput,
+                        volume_initialization_rate: ebs.volume_initialization_rate,
+                        ebs_card_index: ebs.ebs_card_index,
+                    }),
+                    no_device: mapping.no_device.clone(),
+                })
+                .collect()
+        }),
+        network_interfaces: data.network_interfaces.as_ref().map(|interfaces| {
+            interfaces
+                .iter()
+                .map(
+                    |interface| LaunchTemplateInstanceNetworkInterfaceSpecification {
+                        associate_carrier_ip_address: interface.associate_carrier_ip_address,
+                        associate_public_ip_address: interface.associate_public_ip_address,
+                        delete_on_termination: interface.delete_on_termination,
+                        description: interface.description.clone(),
+                        device_index: interface.device_index,
+                        groups: interface.groups.clone(),
+                        interface_type: interface.interface_type.clone(),
+                        ipv6_address_count: interface.ipv6_address_count,
+                        ipv6_addresses: interface.ipv6_addresses.as_ref().map(|addresses| {
+                            addresses
+                                .iter()
+                                .map(|address| InstanceIpv6Address {
+                                    ipv6_address: address.ipv6_address.clone(),
+                                    is_primary_ipv6: None,
+                                })
+                                .collect()
+                        }),
+                        network_interface_id: interface.network_interface_id.clone(),
+                        private_ip_address: interface.private_ip_address.clone(),
+                        private_ip_addresses: interface.private_ip_addresses.clone(),
+                        secondary_private_ip_address_count: interface
+                            .secondary_private_ip_address_count,
+                        subnet_id: interface.subnet_id.clone(),
+                        network_card_index: interface.network_card_index,
+                        ipv4_prefixes: interface.ipv4_prefixes.as_ref().map(|prefixes| {
+                            prefixes
+                                .iter()
+                                .map(|prefix| Ipv4PrefixSpecificationResponse {
+                                    ipv4_prefix: prefix.ipv4_prefix.clone(),
+                                })
+                                .collect()
+                        }),
+                        ipv4_prefix_count: interface.ipv4_prefix_count,
+                        ipv6_prefixes: interface.ipv6_prefixes.as_ref().map(|prefixes| {
+                            prefixes
+                                .iter()
+                                .map(|prefix| Ipv6PrefixSpecificationResponse {
+                                    ipv6_prefix: prefix.ipv6_prefix.clone(),
+                                })
+                                .collect()
+                        }),
+                        ipv6_prefix_count: interface.ipv6_prefix_count,
+                        primary_ipv6: interface.primary_ipv6,
+                        ena_srd_specification: interface.ena_srd_specification.as_ref().map(
+                            |ena_srd| LaunchTemplateEnaSrdSpecification {
+                                ena_srd_enabled: ena_srd.ena_srd_enabled,
+                                ena_srd_udp_specification: ena_srd
+                                    .ena_srd_udp_specification
+                                    .as_ref()
+                                    .map(|udp| LaunchTemplateEnaSrdUdpSpecification {
+                                        ena_srd_udp_enabled: udp.ena_srd_udp_enabled,
+                                    }),
+                            },
+                        ),
+                        connection_tracking_specification: interface
+                            .connection_tracking_specification
+                            .as_ref()
+                            .map(|tracking| ConnectionTrackingSpecification {
+                                tcp_established_timeout: tracking.tcp_established_timeout,
+                                udp_timeout: tracking.udp_timeout,
+                                udp_stream_timeout: tracking.udp_stream_timeout,
+                            }),
+                        ena_queue_count: interface.ena_queue_count,
+                    },
+                )
+                .collect()
+        }),
+        image_id: data.image_id.clone(),
+        instance_type: data.instance_type.clone(),
+        key_name: data.key_name.clone(),
+        monitoring: data
+            .monitoring
+            .as_ref()
+            .map(|monitoring| LaunchTemplatesMonitoring {
+                enabled: monitoring.enabled,
+            }),
+        placement: data.placement.as_ref().map(|placement| LaunchTemplatePlacement {
+            availability_zone: placement.availability_zone.clone(),
+            availability_zone_id: placement.availability_zone_id.clone(),
+            affinity: placement.affinity.clone(),
+            group_name: placement.group_name.clone(),
+            host_id: placement.host_id.clone(),
+            tenancy: placement.tenancy.clone(),
+            spread_domain: placement.spread_domain.clone(),
+            host_resource_group_arn: placement.host_resource_group_arn.clone(),
+            partition_number: placement.partition_number,
+            group_id: placement.group_id.clone(),
+        }),
+        ram_disk_id: data.ram_disk_id.clone(),
+        disable_api_termination: data.disable_api_termination,
+        instance_initiated_shutdown_behavior: data.instance_initiated_shutdown_behavior.clone(),
+        user_data: data.user_data.clone(),
+        tag_specifications: data.tag_specifications.as_ref().map(|specifications| {
+            specifications
+                .iter()
+                .map(|specification| LaunchTemplateTagSpecification {
+                    resource_type: specification.resource_type.clone(),
+                    tags: specification.tags.clone(),
+                })
+                .collect()
+        }),
+        elastic_gpu_specifications: data
+            .elastic_gpu_specifications
+            .as_ref()
+            .map(|specifications| {
+                specifications
+                    .iter()
+                    .map(|specification| ElasticGpuSpecificationResponse {
+                        r#type: Some(specification.r#type.clone()),
+                    })
+                    .collect()
+            }),
+        elastic_inference_accelerators: data.elastic_inference_accelerators.as_ref().map(
+            |accelerators| {
+                accelerators
+                    .iter()
+                    .map(
+                        |accelerator| LaunchTemplateElasticInferenceAcceleratorResponse {
+                            r#type: Some(accelerator.r#type.clone()),
+                            count: accelerator.count,
+                        },
+                    )
+                    .collect()
+            },
+        ),
+        security_group_ids: data.security_group_ids.clone(),
+        security_groups: data.security_groups.clone(),
+        instance_market_options: data.instance_market_options.as_ref().map(|options| {
+            LaunchTemplateInstanceMarketOptions {
+                market_type: options.market_type.clone(),
+                spot_options: options.spot_options.as_ref().map(|spot| {
+                    LaunchTemplateSpotMarketOptions {
+                        max_price: spot.max_price.clone(),
+                        spot_instance_type: spot.spot_instance_type.clone(),
+                        block_duration_minutes: spot.block_duration_minutes,
+                        valid_until: spot.valid_until,
+                        instance_interruption_behavior: spot.instance_interruption_behavior.clone(),
+                    }
+                }),
+            }
+        }),
+        credit_specification: data
+            .credit_specification
+            .as_ref()
+            .map(|specification| CreditSpecification {
+                cpu_credits: Some(specification.cpu_credits.clone()),
+            }),
+        cpu_options: data.cpu_options.as_ref().map(|options| LaunchTemplateCpuOptions {
+            core_count: options.core_count,
+            threads_per_core: options.threads_per_core,
+            amd_sev_snp: options.amd_sev_snp.clone(),
+            nested_virtualization: options.nested_virtualization.clone(),
+        }),
+        capacity_reservation_specification: data
+            .capacity_reservation_specification
+            .as_ref()
+            .map(
+                |specification| LaunchTemplateCapacityReservationSpecificationResponse {
+                    capacity_reservation_preference: specification
+                        .capacity_reservation_preference
+                        .clone(),
+                    capacity_reservation_target: specification
+                        .capacity_reservation_target
+                        .as_ref()
+                        .map(|target| CapacityReservationTargetResponse {
+                            capacity_reservation_id: target.capacity_reservation_id.clone(),
+                            capacity_reservation_resource_group_arn: target
+                                .capacity_reservation_resource_group_arn
+                                .clone(),
+                        }),
+                },
+            ),
+        license_specifications: data.license_specifications.as_ref().map(|specifications| {
+            specifications
+                .iter()
+                .map(|specification| LaunchTemplateLicenseConfiguration {
+                    license_configuration_arn: specification.license_configuration_arn.clone(),
+                })
+                .collect()
+        }),
+        hibernation_options: data.hibernation_options.as_ref().map(|options| {
+            LaunchTemplateHibernationOptions {
+                configured: options.configured,
+            }
+        }),
+        metadata_options: data.metadata_options.as_ref().map(|options| {
+            LaunchTemplateInstanceMetadataOptions {
+                state: Some(LAUNCH_TEMPLATE_METADATA_OPTIONS_APPLIED.to_string()),
+                http_tokens: options.http_tokens.clone(),
+                http_put_response_hop_limit: options.http_put_response_hop_limit,
+                http_endpoint: options.http_endpoint.clone(),
+                http_protocol_ipv6: options.http_protocol_ipv6.clone(),
+                instance_metadata_tags: options.instance_metadata_tags.clone(),
+            }
+        }),
+        enclave_options: data
+            .enclave_options
+            .as_ref()
+            .map(|options| LaunchTemplateEnclaveOptions {
+                enabled: options.enabled,
+            }),
+        instance_requirements: data
+            .instance_requirements
+            .as_ref()
+            .map(response_instance_requirements),
+        private_dns_name_options: data.private_dns_name_options.as_ref().map(|options| {
+            LaunchTemplatePrivateDnsNameOptions {
+                hostname_type: options.hostname_type.clone(),
+                enable_resource_name_dns_a_record: options.enable_resource_name_dns_a_record,
+                enable_resource_name_dns_aaaa_record: options.enable_resource_name_dns_aaaa_record,
+            }
+        }),
+        maintenance_options: data.maintenance_options.as_ref().map(|options| {
+            LaunchTemplateInstanceMaintenanceOptions {
+                auto_recovery: options.auto_recovery.clone(),
+            }
+        }),
+        disable_api_stop: data.disable_api_stop,
+        operator: data
+            .operator
+            .as_ref()
+            .and_then(|operator| operator.principal.clone())
+            .filter(|principal| !principal.is_empty())
+            .map(|principal| OperatorResponse {
+                managed: Some(true),
+                principal: Some(principal),
+                hidden_by_default: None,
+            }),
+        network_performance_options: data.network_performance_options.as_ref().map(|options| {
+            LaunchTemplateNetworkPerformanceOptions {
+                bandwidth_weighting: options.bandwidth_weighting.clone(),
+            }
+        }),
+        secondary_interfaces: data.secondary_interfaces.as_ref().map(|interfaces| {
+            interfaces
+                .iter()
+                .map(
+                    |interface| LaunchTemplateInstanceSecondaryInterfaceSpecification {
+                        delete_on_termination: interface.delete_on_termination,
+                        device_index: interface.device_index,
+                        private_ip_addresses: interface.private_ip_addresses.as_ref().map(
+                            |addresses| {
+                                addresses
+                                    .iter()
+                                    .map(|address| {
+                                        SecondaryInterfacePrivateIpAddressSpecification {
+                                            private_ip_address: address.private_ip_address.clone(),
+                                        }
+                                    })
+                                    .collect()
+                            },
+                        ),
+                        private_ip_address_count: interface.private_ip_address_count,
+                        secondary_subnet_id: interface.secondary_subnet_id.clone(),
+                        interface_type: interface.interface_type.clone(),
+                        network_card_index: interface.network_card_index,
+                    },
+                )
+                .collect()
+        }),
+    }
+}
+
+/// The attribute-based instance selection of a stored version as a reader reports it: the
+/// modelled `InstanceRequirements` built from the `InstanceRequirementsRequest` the writer
+/// gave.
+///
+/// Member for member, like [`response_launch_template_data`]; the only difference between
+/// the two shapes is that the request side makes `VCpuCount`, `MemoryMiB` and each range's
+/// `Min` required, which the reader reports as the values they were given.
+fn response_instance_requirements(
+    requirements: &InstanceRequirementsRequest,
+) -> InstanceRequirements {
+    InstanceRequirements {
+        v_cpu_count: Some(VCpuCountRange {
+            min: Some(requirements.v_cpu_count.min),
+            max: requirements.v_cpu_count.max,
+        }),
+        memory_mi_b: Some(MemoryMiB {
+            min: Some(requirements.memory_mi_b.min),
+            max: requirements.memory_mi_b.max,
+        }),
+        cpu_manufacturers: requirements.cpu_manufacturers.clone(),
+        memory_gi_b_per_v_cpu: requirements
+            .memory_gi_b_per_v_cpu
+            .as_ref()
+            .map(|range| MemoryGiBPerVCpu {
+                min: range.min,
+                max: range.max,
+            }),
+        excluded_instance_types: requirements.excluded_instance_types.clone(),
+        instance_generations: requirements.instance_generations.clone(),
+        spot_max_price_percentage_over_lowest_price: requirements
+            .spot_max_price_percentage_over_lowest_price,
+        on_demand_max_price_percentage_over_lowest_price: requirements
+            .on_demand_max_price_percentage_over_lowest_price,
+        bare_metal: requirements.bare_metal.clone(),
+        burstable_performance: requirements.burstable_performance.clone(),
+        require_hibernate_support: requirements.require_hibernate_support,
+        network_interface_count: requirements
+            .network_interface_count
+            .as_ref()
+            .map(|range| NetworkInterfaceCount {
+                min: range.min,
+                max: range.max,
+            }),
+        local_storage: requirements.local_storage.clone(),
+        local_storage_types: requirements.local_storage_types.clone(),
+        total_local_storage_gb: requirements
+            .total_local_storage_gb
+            .as_ref()
+            .map(|range| TotalLocalStorageGB {
+                min: range.min,
+                max: range.max,
+            }),
+        baseline_ebs_bandwidth_mbps: requirements
+            .baseline_ebs_bandwidth_mbps
+            .as_ref()
+            .map(|range| BaselineEbsBandwidthMbps {
+                min: range.min,
+                max: range.max,
+            }),
+        accelerator_types: requirements.accelerator_types.clone(),
+        accelerator_count: requirements
+            .accelerator_count
+            .as_ref()
+            .map(|range| AcceleratorCount {
+                min: range.min,
+                max: range.max,
+            }),
+        accelerator_manufacturers: requirements.accelerator_manufacturers.clone(),
+        accelerator_names: requirements.accelerator_names.clone(),
+        accelerator_total_memory_mi_b: requirements
+            .accelerator_total_memory_mi_b
+            .as_ref()
+            .map(|range| AcceleratorTotalMemoryMiB {
+                min: range.min,
+                max: range.max,
+            }),
+        network_bandwidth_gbps: requirements
+            .network_bandwidth_gbps
+            .as_ref()
+            .map(|range| NetworkBandwidthGbps {
+                min: range.min,
+                max: range.max,
+            }),
+        allowed_instance_types: requirements.allowed_instance_types.clone(),
+        max_spot_price_as_percentage_of_optimal_on_demand_price: requirements
+            .max_spot_price_as_percentage_of_optimal_on_demand_price,
+        baseline_performance_factors: requirements
+            .baseline_performance_factors
+            .as_ref()
+            .map(|factors| BaselinePerformanceFactors {
+                cpu: factors.cpu.as_ref().map(|cpu| CpuPerformanceFactor {
+                    references: cpu.references.as_ref().map(|references| {
+                        references
+                            .iter()
+                            .map(|reference| PerformanceFactorReference {
+                                instance_family: reference.instance_family.clone(),
+                            })
+                            .collect()
+                    }),
+                }),
+            }),
+        require_encryption_in_transit: requirements.require_encryption_in_transit,
     }
 }
