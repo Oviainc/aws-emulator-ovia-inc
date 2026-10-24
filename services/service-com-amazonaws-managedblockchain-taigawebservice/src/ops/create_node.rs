@@ -197,7 +197,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "An idempotent operation completes no more than once" (`ClientRequestToken`):
         // a token already used replays the node id its first call minted.
-        let token = crate::state::idempotency_key(Self::NAME, &input.client_request_token);
+        let token = crate::state::idempotency_key(&region, Self::NAME, &input.client_request_token);
         if let Some(created) = guard.replay_idempotent(&token) {
             return Ok(CreateNodeOutput {
                 node_id: created.node_id.clone(),
@@ -206,8 +206,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The node this call creates does not exist yet, so the resources it was asked
         // to act on are the network it is created in and the member that will own it:
-        // those are the ones a not-found failure here names.
-        let Some(network) = guard.networks.get(&input.network_id) else {
+        // those are the ones a not-found failure here names. A network of another Region
+        // is not one this request can create a node on.
+        let Some(network) = guard.network(&region, &input.network_id) else {
             return Err(CreateNodeErrorModeled::ResourceNotFoundException(
                 crate::state::not_found(crate::state::RESOURCE_NETWORK, &input.network_id),
             )
@@ -260,7 +261,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             };
-            let Some(member) = network.members.get(&member_id) else {
+            let Some(member) = network.member(&region, &member_id) else {
                 return Err(CreateNodeErrorModeled::ResourceNotFoundException(
                     crate::state::not_found(crate::state::RESOURCE_MEMBER, &member_id),
                 )
@@ -288,7 +289,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`Node$KmsKeyArn`).
         let kms_key_arn = member_id
             .as_ref()
-            .and_then(|member_id| network.members.get(member_id))
+            .and_then(|member_id| network.member(&region, member_id))
             .map(|member| member.kms_key_arn.clone());
 
         // Which node sizes the network can run depends on its edition
@@ -402,7 +403,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             kms_key_arn,
         };
 
-        let Some(network) = guard.networks.get_mut(&input.network_id) else {
+        let Some(network) = guard.network_mut(&region, &input.network_id) else {
             return Err(CreateNodeErrorModeled::InternalServiceErrorException(
                 InternalServiceErrorException {},
             )
@@ -421,11 +422,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
 
         // Answer from the STORED record, so this is the id every later read of the node
-        // answers to.
+        // answers to — read back through the same Region-scoped resolver every other read
+        // goes through.
         let stored = guard
-            .networks
-            .get(&input.network_id)
-            .and_then(|network| network.nodes.get(&node_id));
+            .network(&region, &input.network_id)
+            .and_then(|network| network.node(&region, &node_id));
         let Some(stored) = stored else {
             return Err(CreateNodeErrorModeled::InternalServiceErrorException(
                 InternalServiceErrorException {},
