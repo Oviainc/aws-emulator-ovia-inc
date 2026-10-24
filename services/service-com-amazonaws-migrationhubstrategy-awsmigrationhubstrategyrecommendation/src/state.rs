@@ -16,7 +16,9 @@
 //!
 //! Beside them sits the account's **server inventory** ([`ServerRecord`]), which
 //! `ListServers` reports: the servers an import file task ingested, each carrying the
-//! import groups it came in with.
+//! import groups it came in with, the recommendation the service holds for it and the
+//! strategy option the account prefers for it — what `UpdateServerConfig` writes and
+//! `GetServerStrategies` reports.
 //!
 //! And beside those, the account's one **portfolio preferences** record
 //! ([`PortfolioPreferences`]): what `PutPortfolioPreferences` saves and
@@ -35,7 +37,8 @@ use crate::ops::types::{
     ApplicationPreferences, AssessmentTarget, DataCollectionDetails, DatabasePreferences,
     GetImportFileTaskOutput, GetPortfolioPreferencesOutput, Group, ImportFileTaskInformation,
     OSInfo, PrioritizeBusinessGoals, RecommendationReportDetails, RecommendationSet,
-    ResourceNotFoundException, ServerDetail, ServerError, SystemInfo, ValidationException,
+    ResourceNotFoundException, ServerDetail, ServerError, ServerStrategy, StrategyOption,
+    SystemInfo, TransformationTool, ValidationException,
 };
 
 /// `ImportFileTaskStatus`'s non-terminal import status: the status a task carries from
@@ -467,6 +470,16 @@ pub const SORT_ASCENDING: &str = "ASC";
 /// `SortOrder`'s descending value.
 pub const SORT_DESCENDING: &str = "DESC";
 
+/// `StrategyRecommendation`'s value for a strategy the service itself recommends: the
+/// status the recommendation set stored on a server is reported with.
+///
+/// The other three values this enumeration declares (`viableOption`, `notRecommended`,
+/// `potential`) rank a strategy some analysis considered and did not recommend. Nothing in
+/// this emulator ranks strategies, so no strategy is reported with one of them, and a
+/// strategy nothing recommended is reported with no status at all rather than with a rank
+/// nothing computed.
+pub const STRATEGY_RECOMMENDED: &str = "recommended";
+
 /// One server of this account's portfolio, as this emulator persists it.
 ///
 /// A server enters the portfolio when an import file task ingests it — that ingestion
@@ -513,6 +526,15 @@ pub struct ServerRecord {
     /// of the import that brought it in. Not a member of `ServerDetail`: it is what
     /// `ListServers`'s `groupIdFilter` scopes a list by.
     pub group_id: Vec<Group>,
+    /// The strategy option the account PREFERS for this server, as `UpdateServerConfig`
+    /// stored it — member for member, so nothing here is derived from the request that
+    /// reads it. `None` until a caller sets one.
+    ///
+    /// It records the CUSTOMER's choice rather than any analysis, so it is held beside the
+    /// recommendation members above instead of overwriting them: `GetServerStrategies`
+    /// reports both, and `ServerStrategy$isPreferred` is the member the model gives the
+    /// distinction to.
+    pub preferred_strategy: Option<StrategyOption>,
 }
 
 impl ServerRecord {
@@ -595,6 +617,91 @@ impl ServerRecord {
             "ERROR_CATEGORY" => self.error_category.as_deref() == Some(value),
             _ => false,
         }
+    }
+
+    /// The `RecommendationSet` the service's own recommendation for this server amounts
+    /// to, or `None` when it holds none.
+    ///
+    /// The same two members `to_server_detail` reports: a recommendation is a strategy
+    /// and/or a destination, and no transformation tool is part of it, because nothing in
+    /// this emulator picks one.
+    fn analyzed_recommendation(&self) -> Option<RecommendationSet> {
+        (self.strategy.is_some() || self.target_destination.is_some()).then(|| {
+            RecommendationSet {
+                transformation_tool: None,
+                target_destination: self.target_destination.clone(),
+                strategy: self.strategy.clone(),
+            }
+        })
+    }
+
+    /// The `RecommendationSet` the stored preference names, or `None` when no preference
+    /// is stored.
+    ///
+    /// `StrategyOption` and `RecommendationSet` carry the same three things under
+    /// different names — a strategy, a destination and a tool — so the preference is
+    /// reported as the recommendation it selects, its `toolName` becoming the
+    /// `TransformationTool` the option named and nothing more (no description and no
+    /// installation link: the caller named a tool, not a tool catalog entry).
+    fn preferred_recommendation(&self) -> Option<RecommendationSet> {
+        let option = self.preferred_strategy.as_ref()?;
+        Some(RecommendationSet {
+            transformation_tool: option.tool_name.clone().map(|name| TransformationTool {
+                name: Some(name),
+                description: None,
+                tranformation_tool_installation_link: None,
+            }),
+            target_destination: option.target_destination.clone(),
+            strategy: option.strategy.clone(),
+        })
+    }
+
+    /// The strategies a read reports for this server: the one the account prefers first,
+    /// then the service's own recommendation when it is a different one.
+    ///
+    /// Both come from this record, so a server nothing recommended and nobody chose a
+    /// preference for reports NO strategy rather than a canned list. `isPreferred` is
+    /// "set to true if the recommendation is set as preferred", so it is true exactly for
+    /// the option a `UpdateServerConfig` call stored (the flag that call carried when it
+    /// carried one) and false for a recommendation nobody chose. A preference naming the
+    /// same strategy and destination as the service's recommendation is ONE strategy, not
+    /// two, and is reported once — carrying the recommended status, since it is also what
+    /// the service recommends.
+    pub fn to_server_strategies(&self) -> Vec<ServerStrategy> {
+        let analyzed = self.analyzed_recommendation();
+        let preferred = self.preferred_recommendation();
+        let mut strategies: Vec<ServerStrategy> = Vec::new();
+        let same_strategy = |left: &RecommendationSet, right: &RecommendationSet| {
+            left.strategy == right.strategy && left.target_destination == right.target_destination
+        };
+        let also_recommended = match (&analyzed, &preferred) {
+            (Some(analyzed), Some(preferred)) => same_strategy(analyzed, preferred),
+            _ => false,
+        };
+        if let Some(preferred) = preferred {
+            strategies.push(ServerStrategy {
+                recommendation: Some(preferred),
+                status: also_recommended.then(|| STRATEGY_RECOMMENDED.to_string()),
+                // This emulator holds no application component, so there is no count of
+                // the ones running this strategy on the server to report.
+                number_of_application_components: None,
+                is_preferred: Some(
+                    self.preferred_strategy
+                        .as_ref()
+                        .and_then(|option| option.is_preferred)
+                        .unwrap_or(true),
+                ),
+            });
+        }
+        if let Some(analyzed) = analyzed.filter(|_| !also_recommended) {
+            strategies.push(ServerStrategy {
+                recommendation: Some(analyzed),
+                status: Some(STRATEGY_RECOMMENDED.to_string()),
+                number_of_application_components: None,
+                is_preferred: Some(false),
+            });
+        }
+        strategies
     }
 
     /// True when this server came in with one of `groups`.
@@ -1046,6 +1153,20 @@ pub fn assessment_not_found() -> ResourceNotFoundException {
 /// Like every other refusal of this service it interpolates nothing from the request —
 /// the caller already holds the id it sent.
 pub fn recommendation_report_not_found() -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(INVALID_RESOURCE_ID.to_string()),
+    }
+}
+
+/// The refusal of a `serverId` that names no server of this account's portfolio, which is
+/// what `UpdateServerConfig` and `GetServerStrategies` answer for one: the not-found both
+/// operations' error lists carry (`ResourceNotFoundException`, HTTP 404, "The specified ID
+/// in the request is not found."), worded with the service's [`INVALID_RESOURCE_ID`]
+/// sentence.
+///
+/// Takes no id: like every other refusal of this service it interpolates nothing from the
+/// request — the caller already holds the id it sent.
+pub fn server_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(INVALID_RESOURCE_ID.to_string()),
     }

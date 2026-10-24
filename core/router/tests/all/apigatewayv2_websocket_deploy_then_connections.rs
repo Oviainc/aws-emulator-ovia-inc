@@ -131,6 +131,22 @@ async fn call(
     path: &str,
     body: Vec<u8>,
 ) -> (u16, String) {
+    let (status, _headers, text) =
+        call_with_headers(router, authorization, host, method, path, body).await;
+    (status, text)
+}
+
+/// As [`call`], and also the response headers: a restJson1 client resolves the error
+/// SHAPE of a failure from `x-amzn-errortype` and decodes the envelope with
+/// `content-type`, so both are part of the answer an `@connections` caller gets.
+async fn call_with_headers(
+    router: &MultiServiceRouter,
+    authorization: &str,
+    host: &str,
+    method: &str,
+    path: &str,
+    body: Vec<u8>,
+) -> (u16, http::HeaderMap, String) {
     let request = http::Request::builder()
         .method(method)
         .uri(format!("https://{host}{path}"))
@@ -143,8 +159,17 @@ async fn call(
     let status = response.status().as_u16();
     (
         status,
+        response.headers().clone(),
         String::from_utf8_lossy(response.body().as_ref()).to_string(),
     )
+}
+
+/// One header's value as text, or `"<absent>"`.
+fn header(headers: &http::HeaderMap, name: &str) -> String {
+    headers
+        .get(name)
+        .map(|value| String::from_utf8_lossy(value.as_bytes()).to_string())
+        .unwrap_or_else(|| "<absent>".to_string())
 }
 
 /// One API Gateway V2 control-plane call, as JSON.
@@ -541,7 +566,7 @@ fn the_two_execute_api_services_route_apart_under_one_signing_name() {
                 router.set_request_authentication(false);
 
                 for claim in CLAIMS {
-                    let (status, text) = call(
+                    let (status, headers, text) = call_with_headers(
                         &router,
                         EXECUTE_API_AUTHORIZATION,
                         claim.host,
@@ -568,6 +593,29 @@ fn the_two_execute_api_services_route_apart_under_one_signing_name() {
                             "case {:?}: expected HTTP {expected} from the owning service, \
                              got {status} {text}",
                             claim.name
+                        );
+                        // And in the OWNING service's envelope, not the router's: the
+                        // refusal this test exists for answered `500 AmbiguousService` in
+                        // an `application/x-amz-json-1.1` body, so the media type and the
+                        // error shape are as much a part of the fix as the status. Both
+                        // are the management API's restJson1 answer — `GoneException` is
+                        // the shape all three `@connections` operations declare for a
+                        // connection the registry does not hold.
+                        assert_eq!(
+                            header(&headers, "content-type"),
+                            "application/json",
+                            "case {:?}: expected the restJson1 media type from the owning \
+                             service, got {:?} with {status} {text}",
+                            claim.name,
+                            header(&headers, "content-type")
+                        );
+                        assert_eq!(
+                            header(&headers, "x-amzn-errortype"),
+                            "GoneException",
+                            "case {:?}: expected x-amzn-errortype to name the modelled \
+                             GoneException, got {:?} with {status} {text}",
+                            claim.name,
+                            header(&headers, "x-amzn-errortype")
                         );
                     }
                 }

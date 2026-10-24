@@ -87,7 +87,18 @@
 //! `BatchApplyUpdateAction` and `BatchStopUpdateAction` are what store a record
 //! for one, and the clock carries it from there.
 //!
-//! Everything else in this service (user groups, migrations, and the
+//! A user group is the RBAC resource built out of those users:
+//! `CreateUserGroup` mints one, `DescribeUserGroups` reports it and
+//! `ModifyUserGroup` changes the users that belong to it and the engine it is
+//! listed for. A membership change is not applied at the call — the group
+//! answers `modifying` and carries the change on
+//! [`UserGroupRecord::pending_user_ids_to_add`] /
+//! [`UserGroupRecord::pending_user_ids_to_remove`], which is what
+//! `UserGroup$PendingChanges` reports until the clock applies it
+//! ([`UserGroupRecord::settle`]) — so the membership still has ONE copy, the
+//! group's `user_ids`, and `User$UserGroupIds` stays derived from it.
+//!
+//! Everything else in this service (`DeleteUserGroup`, migrations, and the
 //! parameter-group operations that would change a parameter's value) is still a
 //! scaffolded 501 and owns its own gap issue; where a member of an implemented
 //! operation belongs to one of those resources, the comment beside it says so.
@@ -120,6 +131,7 @@ use crate::ops::types::{
     PendingModifiedValues, ProcessedUpdateAction, RecurringCharge, ReplicationGroup,
     ReservedCacheNode, ReservedCacheNodesOffering, ScaleConfig, SecurityGroupMembership,
     ServerlessCache, ServiceUpdate, Snapshot, Subnet, Tag, UnprocessedUpdateAction, UpdateAction,
+    UserGroupPendingChanges,
 };
 
 /// The region a request is treated as having been made in when its SigV4
@@ -7382,6 +7394,15 @@ impl ComAmazonawsElasticacheAmazonelasticachev9State {
     pub fn withdraw_user_from_groups(&mut self, user_id: &str) {
         for group in self.user_groups.values_mut() {
             group.user_ids.retain(|member| member != user_id);
+            // A membership the clock has not applied yet ends here too: a user
+            // that has stopped existing must not be carried into a group when
+            // the pending change falls due.
+            group
+                .pending_user_ids_to_add
+                .retain(|member| member != user_id);
+            group
+                .pending_user_ids_to_remove
+                .retain(|member| member != user_id);
         }
     }
 
@@ -8377,10 +8398,26 @@ fn transition_to(status: &str, now: SystemTime) -> Option<PendingTransition> {
     })
 }
 
-/// The transition the clock owes a just-created user group:
+/// The transition the clock owes a just-created or just-modified user group:
 /// [`USER_STATUS_ACTIVE`], which is what `UserGroup$Status` settles at.
 pub fn user_group_transition(now: SystemTime) -> Option<PendingTransition> {
     transition_to(USER_STATUS_ACTIVE, now)
+}
+
+/// Why a user group cannot take a change at this instant, or `None` when it
+/// can.
+///
+/// `InvalidUserGroupStateFault` is "the user group is not in an active state",
+/// so a group that is still `creating`, already `modifying` or on its way out
+/// is refused. Stated once, over the settled status, so every operation that
+/// changes a group agrees about which statuses it accepts.
+pub fn user_group_state_refusal(group: &UserGroupRecord) -> Option<String> {
+    (group.status != USER_STATUS_ACTIVE).then(|| {
+        format!(
+            "User group {} is in status {}; it must be {} to be changed.",
+            group.user_group_id, group.status, USER_STATUS_ACTIVE
+        )
+    })
 }
 
 /// True when `value` is one of the engines access control exists for, lowercased
@@ -8553,6 +8590,13 @@ pub struct UserGroupRecord {
     pub status: String,
     /// The status change the clock owes this group, if any.
     pub pending_status: Option<PendingTransition>,
+    /// The membership change the clock owes this group, as
+    /// `ModifyUserGroup` accepted it: the ids to be added and the ids to be
+    /// removed, which is what `UserGroup$PendingChanges` reports until
+    /// [`Self::settle`] applies them to `user_ids` together with the status.
+    pub pending_user_ids_to_add: Vec<String>,
+    /// See [`Self::pending_user_ids_to_add`].
+    pub pending_user_ids_to_remove: Vec<String>,
     /// The replication groups and serverless caches this group is attached to,
     /// which is what `UserGroup$ReplicationGroups` / `$ServerlessCaches` report.
     pub replication_group_ids: Vec<String>,
@@ -8563,9 +8607,29 @@ pub struct UserGroupRecord {
 }
 
 impl UserGroupRecord {
-    /// Materialise the status change the clock owes this group.
+    /// Materialise the change the clock owes this group: the status, and with it
+    /// the membership change `ModifyUserGroup` accepted.
+    ///
+    /// The two fall due together — the group is `modifying` exactly while the
+    /// change is pending — so one settle applies both and no read can see an
+    /// `active` group that still has a change outstanding.
     pub fn settle(&mut self, now: SystemTime) {
-        settle_status(&mut self.status, &mut self.pending_status, now);
+        if !settle_status(&mut self.status, &mut self.pending_status, now) {
+            return;
+        }
+        for user_id in ::std::mem::take(&mut self.pending_user_ids_to_add) {
+            if !self.user_ids.contains(&user_id) {
+                self.user_ids.push(user_id);
+            }
+        }
+        let removed = ::std::mem::take(&mut self.pending_user_ids_to_remove);
+        self.user_ids.retain(|member| !removed.contains(member));
+    }
+
+    /// True while the clock still owes this group a membership change, which is
+    /// what `UserGroup$PendingChanges` reports.
+    pub fn has_pending_changes(&self) -> bool {
+        !self.pending_user_ids_to_add.is_empty() || !self.pending_user_ids_to_remove.is_empty()
     }
 
     /// This record as the modelled `UserGroup`.
@@ -8576,9 +8640,13 @@ impl UserGroupRecord {
             engine: Some(self.engine.clone()),
             user_ids: Some(self.user_ids.clone()),
             minimum_engine_version: Some(USER_MIN_ENGINE_VERSION.to_string()),
-            // A membership change is applied by `ModifyUserGroup`, a scaffolded
-            // 501, so no group of this slice has one pending.
-            pending_changes: None,
+            // "Returns the updates being applied to the user group": reported
+            // only while `ModifyUserGroup` has left one outstanding, so a group
+            // with nothing pending reports no `PendingChanges` at all.
+            pending_changes: self.has_pending_changes().then(|| UserGroupPendingChanges {
+                user_ids_to_add: Some(self.pending_user_ids_to_add.clone()),
+                user_ids_to_remove: Some(self.pending_user_ids_to_remove.clone()),
+            }),
             replication_groups: Some(self.replication_group_ids.clone()),
             serverless_caches: Some(self.serverless_cache_names.clone()),
             arn: Some(self.arn.clone()),

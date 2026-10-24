@@ -179,6 +179,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let scope_start_time_millis = input.scope_start_time.to_millis().unwrap_or(now);
         let scope_end_time_millis = input.scope_end_time.to_millis().unwrap_or(now);
 
+        // The two scope members are the bounds of ONE interval — "the data and time when
+        // the investigation began" and "when the investigation ended" — so the request
+        // only describes an investigable window when the start is strictly earlier than
+        // the end. A window that is inverted or empty names no period to investigate,
+        // which is a bad request rather than an empty result. The message states the
+        // rule and echoes neither instant back.
+        if scope_start_time_millis >= scope_end_time_millis {
+            return Err(StartInvestigationErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(
+                        "ScopeStartTime must be earlier than ScopeEndTime".to_string(),
+                    ),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
         let mut store = state.lock();
         if store.graph(&input.graph_arn).is_none() {
             return Err(StartInvestigationErrorModeled::ResourceNotFoundException(

@@ -11,7 +11,9 @@
 //! * `GetConfig` names the id and the type its two path labels carried, for every one of
 //!   the model's eight `ConfigCapabilityType` values;
 //! * `CreateConfig` names the capability its reference required, spelled as the model
-//!   spells that capability's shape, plus the ARN the request gave;
+//!   spells that capability's shape, plus the ARN the request gave — for a reference that
+//!   resolves to NOTHING; a reference that resolves to a config of another type is not a
+//!   not-found at all (see `tests/all/config_defaults_and_references.rs`);
 //! * `DescribeContact` and `CancelContact` answer DIFFERENT texts for the SAME missing
 //!   contact — one a bare literal, one quoting the id;
 //! * `GetMissionProfile` and `ReserveContact` answer the SAME literal, which echoes
@@ -177,8 +179,9 @@ async fn get_config_not_found_names_the_id_and_the_type_its_path_asked_for() {
 async fn create_config_names_the_capability_its_reference_required() {
     let router = harness();
 
-    // The config an `uplinkEchoConfig` may legitimately echo, and one of another type,
-    // so both ways of failing the reference are covered.
+    // The config an `uplinkEchoConfig` may legitimately echo; the rows below all fail
+    // because the reference resolves to NO config at all, which is what this operation's
+    // not-found text is for.
     let (_, _, uplink_arn) = create_config(
         &router,
         "echo source",
@@ -186,7 +189,6 @@ async fn create_config_names_the_capability_its_reference_required() {
         None,
     )
     .await;
-    let tracking_arn = create_tracking_config(&router, "echo wrong type").await;
 
     // Rows differ in WHY the reference does not resolve and in the ARN's own spelling
     // (region, account, config type, id): the message names the capability the member
@@ -215,7 +217,6 @@ async fn create_config_names_the_capability_its_reference_required() {
             "absent-in-another-account",
             config_arn("us-west-2", "123456789012", "s3-recording", ABSENT_UUIDS[0]),
         ),
-        ("resolves-to-another-type", tracking_arn),
     ];
 
     for (case, arn) in rows {

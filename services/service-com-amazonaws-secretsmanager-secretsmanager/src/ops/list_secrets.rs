@@ -203,8 +203,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         return Err(ListSecretsErrorModeled::InvalidNextTokenException(
                             InvalidNextTokenException {
                                 message: Some(
-                                    "The NextToken you provided is not valid for this request."
-                                        .to_string(),
+                                    crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string(),
                                 ),
                             },
                         )

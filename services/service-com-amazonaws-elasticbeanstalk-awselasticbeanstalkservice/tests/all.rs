@@ -27,6 +27,8 @@ mod describe_application_versions;
 mod dns_availability;
 #[path = "all/environment_operations.rs"]
 mod environment_operations;
+#[path = "all/environment_resources.rs"]
+mod environment_resources;
 #[path = "all/events.rs"]
 mod events;
 // Not a suite of its own: the name the suites below import the shared harness

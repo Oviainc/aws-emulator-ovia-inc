@@ -225,10 +225,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(secret) = store.get(&input.secret_id) else {
             return Err(DescribeSecretErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "Secrets Manager can't find the specified secret: {}",
-                        input.secret_id
-                    )),
+                    message: Some(crate::state::SECRET_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());

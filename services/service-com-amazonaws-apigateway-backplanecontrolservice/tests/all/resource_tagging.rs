@@ -48,12 +48,11 @@ const STAGE: &str = "prod";
 
 /// The taggable resource kinds this emulator keeps no records of — the first path
 /// segment of each one's read URI. Source: `UNSTORED_TAGGABLE_KINDS` in
-/// `src/state.rs`, which lists them because the operations that would create a usage
-/// plan, a client certificate, a VPC link or a domain name access association are still
-/// scaffolds. An ARN of one of these is well formed, so it resolves to a missing
-/// resource rather than to a bad request.
+/// `src/state.rs`, which lists them because the operations that would create a client
+/// certificate, a VPC link or a domain name access association are still scaffolds. An
+/// ARN of one of these is well formed, so it resolves to a missing resource rather than
+/// to a bad request.
 const UNSTORED_KINDS: &[&str] = &[
-    "usageplans",
     "clientcertificates",
     "vpclinks",
     "domainnameaccessassociations",
@@ -396,6 +395,12 @@ async fn a_resource_arn_is_read_as_the_arn_form_a_taggable_resource_takes() {
         (
             "an unknown API key".to_string(),
             apigateway_arn(&format!("/apikeys/{missing}")),
+            404,
+            "NotFoundException",
+        ),
+        (
+            "an unknown usage plan".to_string(),
+            apigateway_arn(&format!("/usageplans/{missing}")),
             404,
             "NotFoundException",
         ),

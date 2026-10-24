@@ -148,13 +148,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let mut guard = state.lock();
-        // A config is addressed by BOTH labels, so a delete only removes the config whose
+        // A config is addressed by BOTH labels, so a delete only touches the config whose
         // stored type is the `{configType}` label; an id under another type addresses no
-        // config, just as an unknown id does. The removal drops the config AND the ARN
-        // index entry that resolved to it, so from here on every read and every
-        // ARN-valued reference to it answers as it does for a config that never existed.
-        let removed = guard
-            .remove_config(&input.config_type, &input.config_id)
+        // config, just as an unknown id does.
+        let key = (input.config_type.clone(), input.config_id.clone());
+        let config_arn = guard
+            .configs
+            .get(&key)
+            .map(|config| config.config_arn.clone())
             .ok_or_else(|| {
                 DeleteConfigErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
                     message: Some(crate::state::config_not_found_message(
@@ -163,6 +164,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )),
                 })
             })?;
+
+        // A config a live mission profile still depends on is NOT deleted: a mission
+        // profile names its configs by ARN, and dropping one out from under it would
+        // leave it pointing at a reference that no longer resolves. So the inbound
+        // references are counted first and, when there are any, the delete is refused as
+        // a bad parameter naming the profiles that hold them — the caller deletes those
+        // first and retries. Nothing is written on this path, so both the config and
+        // every profile are left exactly as they were.
+        let referencing = guard.mission_profiles_referencing(&config_arn);
+        if !referencing.is_empty() {
+            return Err(DeleteConfigErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(crate::state::config_in_use_message(&referencing)),
+                    parameter_name: None,
+                },
+            )
+            .into());
+        }
+
+        // The removal drops the config AND the ARN index entry that resolved to it, so
+        // from here on every read and every ARN-valued reference to it answers as it does
+        // for a config that never existed.
+        let removed = guard
+            .remove_config(&input.config_type, &input.config_id)
+            .expect("the config whose presence was just checked under this lock");
 
         Ok(DeleteConfigOutput {
             config_id: Some(removed.config_id),

@@ -1085,9 +1085,16 @@ pub const OPEN_ACCESS_ACL_NAME: &str = "open-access";
 /// The pub/sub channel rule a Redis OSS / Valkey ACL falls back to when the access
 /// string names none: no channel is allowed. MemoryDB CANONICALISES the access string
 /// it was given before storing it, and the canonical form always states the channel
-/// permission, so `on ~* +@all` reads back as `on ~* resetchannels +@all` (see
-/// [`normalise_access_string`]).
+/// permission, so `on ~* resetchannels +@read` reads back with the command baseline
+/// stated too (see [`normalise_access_string`]).
 pub const DEFAULT_CHANNEL_RULE: &str = "resetchannels";
+
+/// The command rule a Redis OSS / Valkey ACL falls back to when the access string
+/// states no command baseline: no command is allowed. The canonical form always OPENS
+/// its command section with the full-set rule the command rules after it modify, so
+/// `on ~* resetchannels +@read` reads back as `on ~* resetchannels -@all +@read` (see
+/// [`normalise_access_string`]).
+pub const DEFAULT_COMMAND_RULE: &str = "-@all";
 
 /// The engine version a password- or no-password-authenticated user (and an ACL whose
 /// members are all of those) reports as `MinimumEngineVersion`: MemoryDB has supported
@@ -2052,6 +2059,26 @@ pub fn builtin_resource_rejection(
     })
 }
 
+/// Why the built-in `default` user cannot be a member of the ACL named `acl_name`, or
+/// `None` when the membership is one the caller may ask for.
+///
+/// The `default` user MemoryDB provides in every account is the member of the built-in
+/// `open-access` ACL and of no other: it is the account's open-access identity, not a
+/// user whose permissions a caller-owned ACL may carry. So NEITHER write path of an
+/// ACL's membership (`CreateACL$UserNames`, `UpdateACL$UserNamesToAdd`) may put it in
+/// any other ACL, and both read this before they persist a membership and map it onto
+/// their modelled `InvalidParameterValueException`.
+pub fn default_user_membership_rejection<'a>(
+    acl_name: &str,
+    user_names: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
+    (acl_name != OPEN_ACCESS_ACL_NAME
+        && user_names
+            .into_iter()
+            .any(|name| name == DEFAULT_USER_NAME))
+    .then(|| format!("{DEFAULT_USER_NAME} user can't be added to another ACL."))
+}
+
 /// Why a listing cannot serve this `MaxResults`, or `None` when it can.
 ///
 /// EVERY paginated listing in this service reads the page-size window through here, so
@@ -2072,26 +2099,44 @@ pub fn max_results_rejection(max_results: Option<i32>) -> Option<String> {
 /// reports for `User$AccessString`.
 ///
 /// `AccessString` is a Redis OSS / Valkey ACL rule list, and MemoryDB canonicalises it
-/// before storing it: the rules are rendered one space apart, and the pub/sub channel
-/// permission is always stated — a string that names no channel rule gets the engine's
-/// own default, [`DEFAULT_CHANNEL_RULE`], in the position the canonical order puts it
-/// (after the key patterns, before the command rules). So `on ~* +@all` is stored and
-/// reported as `on ~* resetchannels +@all`, while a string that already names its
-/// channels (`on ~* &* +@all`) keeps them.
+/// before storing it: the rules are rendered one space apart, and BOTH permissions the
+/// engine holds a default for are always stated —
+///
+/// * the pub/sub channel permission: a string that names no channel rule gets the
+///   engine's own default, [`DEFAULT_CHANNEL_RULE`];
+/// * the command permission BASELINE: the command section always opens with the
+///   full-set rule (`+@all`/`allcommands` or `-@all`/`nocommands`) that the command and
+///   category rules after it modify, so a string whose command rules do not begin with
+///   one gets the engine's own default, [`DEFAULT_COMMAND_RULE`].
+///
+/// Each default goes in the position the canonical order puts it: the channel rule after
+/// the key patterns, then the command baseline, then the command rules — so both land in
+/// front of the first command rule, or at the end in that order when the string carries
+/// none. So `on ~* +@read` is stored and reported as `on ~* resetchannels -@all +@read`,
+/// while a string that already states its channels and opens its commands with a
+/// full-set rule (`on ~* &* +@all`) is returned as given.
 pub fn normalise_access_string(access_string: &str) -> String {
-    let mut rules: Vec<&str> = access_string.split_whitespace().collect();
-    let names_channels = rules.iter().any(|rule| is_channel_rule(rule));
-    if !names_channels {
-        // The canonical order states the channel permission after the key patterns and
-        // before the command rules, so the default goes in front of the first command
-        // rule — or at the end when the string carries none.
-        let position = rules
-            .iter()
-            .position(|rule| rule.starts_with('+') || rule.starts_with('-'))
-            .unwrap_or(rules.len());
-        rules.insert(position, DEFAULT_CHANNEL_RULE);
+    let rules: Vec<&str> = access_string.split_whitespace().collect();
+    // Where the command section starts — the end of the string when it names no command
+    // rule at all, which is where both defaults then go.
+    let commands_at = rules
+        .iter()
+        .position(|rule| is_command_rule(rule))
+        .unwrap_or(rules.len());
+    let mut canonical: Vec<&str> = rules[..commands_at].to_vec();
+    if !rules.iter().any(|rule| is_channel_rule(rule)) {
+        canonical.push(DEFAULT_CHANNEL_RULE);
     }
-    rules.join(" ")
+    // A command section that does not OPEN with a full-set rule states no baseline of
+    // its own, so the engine's is stated for it.
+    if rules[commands_at..]
+        .first()
+        .is_none_or(|rule| !is_full_command_set_rule(rule))
+    {
+        canonical.push(DEFAULT_COMMAND_RULE);
+    }
+    canonical.extend_from_slice(&rules[commands_at..]);
+    canonical.join(" ")
 }
 
 /// Whether one ACL rule states the pub/sub channel permission: a channel pattern
@@ -2100,6 +2145,27 @@ fn is_channel_rule(rule: &str) -> bool {
     rule.starts_with('&')
         || rule.eq_ignore_ascii_case(DEFAULT_CHANNEL_RULE)
         || rule.eq_ignore_ascii_case("allchannels")
+}
+
+/// Whether one ACL rule states a command permission: a command or category rule
+/// (`+<command>`, `-@<category>`, …) or one of the two keywords that set the whole
+/// command set at once. No other rule of the syntax — the `on`/`off` flags, the key
+/// patterns, the password rules — begins with `+` or `-`.
+fn is_command_rule(rule: &str) -> bool {
+    rule.starts_with('+')
+        || rule.starts_with('-')
+        || rule.eq_ignore_ascii_case("allcommands")
+        || rule.eq_ignore_ascii_case("nocommands")
+}
+
+/// Whether one command rule sets the WHOLE command set, and so is a baseline the rules
+/// after it modify rather than a modification itself. `allcommands` and `nocommands` are
+/// the keyword spellings of `+@all` and `-@all`.
+fn is_full_command_set_rule(rule: &str) -> bool {
+    rule.eq_ignore_ascii_case("+@all")
+        || rule.eq_ignore_ascii_case(DEFAULT_COMMAND_RULE)
+        || rule.eq_ignore_ascii_case("allcommands")
+        || rule.eq_ignore_ascii_case("nocommands")
 }
 
 /// Why no engine version this service runs matches `engine_version` under `engine`, or

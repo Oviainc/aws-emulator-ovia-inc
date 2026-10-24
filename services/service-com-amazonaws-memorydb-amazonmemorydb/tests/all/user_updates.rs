@@ -99,8 +99,8 @@ async fn an_update_patches_only_the_members_it_supplies() {
             created_mode: password_mode(&[&one_password]),
             update: json!({ "AccessString": "on ~app:* +@read" }),
             // The service canonicalises the rule list, which always states the pub/sub
-            // channel permission.
-            expected_access_string: "on ~app:* resetchannels +@read",
+            // channel permission and the command baseline.
+            expected_access_string: "on ~app:* resetchannels -@all +@read",
             // Untouched: the request named no authentication mode.
             expected_authentication: password_authentication(1),
         },
@@ -111,7 +111,7 @@ async fn an_update_patches_only_the_members_it_supplies() {
             update: json!({ "AuthenticationMode": { "Type": "iam" } }),
             // Untouched: the request named no access string, so the user keeps the
             // canonical form the create stored.
-            expected_access_string: "on ~metrics:* resetchannels +get",
+            expected_access_string: "on ~metrics:* resetchannels -@all +get",
             expected_authentication: json!({ "Type": "iam" }),
         },
         Patch {
@@ -135,7 +135,7 @@ async fn an_update_patches_only_the_members_it_supplies() {
                 "AccessString": "on ~cache:* &news:* +@write",
                 "AuthenticationMode": { "Type": "password", "Passwords": [other_password.clone()] },
             }),
-            expected_access_string: "on ~cache:* &news:* +@write",
+            expected_access_string: "on ~cache:* &news:* -@all +@write",
             expected_authentication: password_authentication(1),
         },
         Patch {
@@ -456,7 +456,7 @@ async fn an_update_needs_an_existing_user_in_a_valid_state() {
     let described = describe_user(&router, name, case).await;
     assert_eq!(
         described["AccessString"],
-        json!("on ~* resetchannels +@read"),
+        json!("on ~* resetchannels -@all +@read"),
         "case {case:?}: the refused update must not have changed the stored user, got \
          {described}"
     );
