@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdatePipe
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdatePipe`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdatePipe::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: applies the members the request carries to the pipe record persisted in
+//! [`crate::state`], leaves every member it omits unchanged, and answers from the record
+//! it just wrote. An unknown name is `NotFoundException` (404); a pipe already
+//! mid-transition is `ConflictException` (409). This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -195,18 +191,314 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdatePipe` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdatePipeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdatePipe"))
+        // The update is applied to the stored pipe (the ARN was minted at create time),
+        // so nothing here depends on request metadata.
+        let _ = ctx;
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdatePipeErrorModeled::InternalException(InternalException {
+                message: "the pipes store is not reachable from this engine".to_string(),
+                retry_after_seconds: None,
+            })
+        })?;
+
+        // `DesiredState` targets `RequestedPipeState`; the boundary validator refuses a
+        // value outside that enum, and this re-states the same rule for any path that
+        // reaches the handler with one, naming the member and its legal values. Absent,
+        // it leaves the pipe's own desired state alone.
+        let requested_state = match input.desired_state.as_deref() {
+            None => None,
+            Some(value) if REQUESTED_PIPE_STATE_VALUES.contains(&value) => Some(value.to_string()),
+            Some(value) => {
+                return Err(UpdatePipeErrorModeled::ValidationException(ValidationException {
+                    message: Some(format!(
+                        "DesiredState must be one of {}; got '{value}'",
+                        REQUESTED_PIPE_STATE_VALUES.join(", "),
+                    )),
+                    field_list: Some(vec![ValidationExceptionField {
+                        name: "DesiredState".to_string(),
+                        message: format!(
+                            "must be one of {}",
+                            REQUESTED_PIPE_STATE_VALUES.join(", ")
+                        ),
+                    }]),
+                })
+                .into());
+            }
+        };
+
+        let mut state = store.lock();
+        state.settle_due_transitions();
+
+        let pipe = state.pipes.get_mut(&input.name).ok_or_else(|| {
+            UpdatePipeErrorModeled::NotFoundException(NotFoundException {
+                message: Some(format!("Pipe not found: {}", input.name)),
+            })
+        })?;
+
+        // A pipe whose last call left it mid-transition is not reconfigurable: the move
+        // in flight has to land first. Reported with the conflict error the model
+        // declares, naming the state that blocks the update.
+        if let Some(transient) = pipe.transient_state() {
+            return Err(UpdatePipeErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "Pipe {} is in state {transient} and cannot be updated.",
+                    pipe.name
+                ),
+                resource_id: pipe.name.clone(),
+                resource_type: crate::state::PIPE_RESOURCE_TYPE.to_string(),
+            })
+            .into());
+        }
+
+        // Computed BEFORE anything is written, so a refused update leaves the stored
+        // record exactly as it was.
+        let source_parameters = match input.source_parameters.as_ref() {
+            None => None,
+            Some(update) => {
+                Some(updated_source_parameters(update, pipe.source_parameters.as_ref())?)
+            }
+        };
+
+        // Only the members the request carries move; the rest stay as stored.
+        if let Some(description) = input.description.clone() {
+            pipe.description = Some(description);
+        }
+        if let Some(target) = input.target.clone() {
+            pipe.target = target;
+        }
+        if let Some(target_parameters) = input.target_parameters.clone() {
+            // A service-specific parameters object is overridden atomically as one, so
+            // the request's object REPLACES the stored one rather than being merged into
+            // it: a field it omits returns to its system default (absent).
+            pipe.target_parameters = Some(target_parameters);
+        }
+        if let Some(enrichment) = input.enrichment.clone() {
+            // `OptionalArn` admits the empty string (`^$|arn:…`), which is how a caller
+            // removes the enrichment resource.
+            pipe.enrichment = if enrichment.is_empty() {
+                None
+            } else {
+                Some(enrichment)
+            };
+        }
+        if let Some(enrichment_parameters) = input.enrichment_parameters.clone() {
+            pipe.enrichment_parameters = Some(enrichment_parameters);
+        }
+        if let Some(source_parameters) = source_parameters {
+            pipe.source_parameters = Some(source_parameters);
+        }
+        if let Some(log_configuration) = input.log_configuration.as_ref() {
+            pipe.log_configuration = Some(super::create_pipe::log_configuration_of(
+                log_configuration,
+            ));
+        }
+        if let Some(kms_key_identifier) = input.kms_key_identifier.clone() {
+            // "To update a pipe that is using a customer managed key to use the default
+            // Amazon Web Services owned key, specify an empty string." — so the empty
+            // string drops the customer managed key rather than storing itself.
+            pipe.kms_key_identifier = if kms_key_identifier.is_empty() {
+                None
+            } else {
+                Some(kms_key_identifier)
+            };
+        }
+        // `RoleArn` is a required member of this request, so every update sets it.
+        pipe.role_arn = input.role_arn.clone();
+
+        // The desired state the request named, or the one the pipe already had: an
+        // update that does not mention `DesiredState` never moves it.
+        if let Some(requested_state) = requested_state {
+            pipe.desired_state = requested_state;
+        }
+        let settled = pipe.desired_state.clone();
+        // The move the clock owes: `UPDATING` now, then the state the pipe is meant to
+        // be in. Never zero, so a caller acting straight after this call still sees
+        // `UPDATING`.
+        pipe.begin_transition(crate::state::pipe_state::UPDATING, &settled);
+        pipe.last_modified_time = ::std::time::SystemTime::now();
+
+        Ok(UpdatePipeOutput {
+            arn: Some(pipe.arn.clone()),
+            name: Some(pipe.name.clone()),
+            desired_state: Some(pipe.desired_state.clone()),
+            current_state: Some(pipe.current_state.clone()),
+            creation_time: Some(crate::state::timestamp(pipe.creation_time)),
+            last_modified_time: Some(crate::state::timestamp(pipe.last_modified_time)),
+        })
     }
+}
+
+/// The `PipeSourceParameters` to store for an `UpdatePipeSourceParameters` the caller
+/// sent, given what the pipe currently holds.
+///
+/// Each service-specific object is overridden atomically as one (see the operation doc
+/// above), so the request's object REPLACES the stored one member for member. The
+/// members `UpdatePipeSourceParameters` cannot express are exactly those fixed when the
+/// pipe was created — a stream's starting position, a queue or topic name, a consumer
+/// group id — and they are carried over from the stored object of the same source type.
+/// An update naming a source type the pipe holds no parameters for has nowhere to carry
+/// those required members from, so it is refused rather than guessed at.
+fn updated_source_parameters(
+    update: &UpdatePipeSourceParameters,
+    stored: Option<&PipeSourceParameters>,
+) -> Result<PipeSourceParameters, UpdatePipeError> {
+    let kinesis = match (&update.kinesis_stream_parameters, stored_kinesis(stored)) {
+        (None, _) => None,
+        (Some(new), Some(old)) => Some(PipeSourceKinesisStreamParameters {
+            batch_size: new.batch_size,
+            dead_letter_config: new.dead_letter_config.clone(),
+            on_partial_batch_item_failure: new.on_partial_batch_item_failure.clone(),
+            maximum_batching_window_in_seconds: new.maximum_batching_window_in_seconds,
+            maximum_record_age_in_seconds: new.maximum_record_age_in_seconds,
+            maximum_retry_attempts: new.maximum_retry_attempts,
+            parallelization_factor: new.parallelization_factor,
+            starting_position: old.starting_position.clone(),
+            starting_position_timestamp: old.starting_position_timestamp,
+        }),
+        (Some(_), None) => return Err(not_that_source_type("KinesisStreamParameters")),
+    };
+    let dynamo_db = match (&update.dynamo_db_stream_parameters, stored_dynamo_db(stored)) {
+        (None, _) => None,
+        (Some(new), Some(old)) => Some(PipeSourceDynamoDBStreamParameters {
+            batch_size: new.batch_size,
+            dead_letter_config: new.dead_letter_config.clone(),
+            on_partial_batch_item_failure: new.on_partial_batch_item_failure.clone(),
+            maximum_batching_window_in_seconds: new.maximum_batching_window_in_seconds,
+            maximum_record_age_in_seconds: new.maximum_record_age_in_seconds,
+            maximum_retry_attempts: new.maximum_retry_attempts,
+            parallelization_factor: new.parallelization_factor,
+            starting_position: old.starting_position.clone(),
+        }),
+        (Some(_), None) => return Err(not_that_source_type("DynamoDBStreamParameters")),
+    };
+    // `SqsQueueParameters` is the one branch whose read shape has no member the update
+    // shape lacks, so it needs nothing carried over and applies to any pipe.
+    let sqs = update
+        .sqs_queue_parameters
+        .as_ref()
+        .map(|new| PipeSourceSqsQueueParameters {
+            batch_size: new.batch_size,
+            maximum_batching_window_in_seconds: new.maximum_batching_window_in_seconds,
+        });
+    let active_mq = match (&update.active_mq_broker_parameters, stored_active_mq(stored)) {
+        (None, _) => None,
+        (Some(new), Some(old)) => Some(PipeSourceActiveMQBrokerParameters {
+            credentials: new.credentials.clone(),
+            queue_name: old.queue_name.clone(),
+            batch_size: new.batch_size,
+            maximum_batching_window_in_seconds: new.maximum_batching_window_in_seconds,
+        }),
+        (Some(_), None) => return Err(not_that_source_type("ActiveMQBrokerParameters")),
+    };
+    let rabbit_mq = match (&update.rabbit_mq_broker_parameters, stored_rabbit_mq(stored)) {
+        (None, _) => None,
+        (Some(new), Some(old)) => Some(PipeSourceRabbitMQBrokerParameters {
+            credentials: new.credentials.clone(),
+            queue_name: old.queue_name.clone(),
+            virtual_host: old.virtual_host.clone(),
+            batch_size: new.batch_size,
+            maximum_batching_window_in_seconds: new.maximum_batching_window_in_seconds,
+        }),
+        (Some(_), None) => return Err(not_that_source_type("RabbitMQBrokerParameters")),
+    };
+    let msk = match (
+        &update.managed_streaming_kafka_parameters,
+        stored_msk(stored),
+    ) {
+        (None, _) => None,
+        (Some(new), Some(old)) => Some(PipeSourceManagedStreamingKafkaParameters {
+            topic_name: old.topic_name.clone(),
+            starting_position: old.starting_position.clone(),
+            batch_size: new.batch_size,
+            maximum_batching_window_in_seconds: new.maximum_batching_window_in_seconds,
+            consumer_group_id: old.consumer_group_id.clone(),
+            credentials: new.credentials.clone(),
+        }),
+        (Some(_), None) => {
+            return Err(not_that_source_type("ManagedStreamingKafkaParameters"));
+        }
+    };
+    let self_managed = match (
+        &update.self_managed_kafka_parameters,
+        stored_self_managed(stored),
+    ) {
+        (None, _) => None,
+        (Some(new), Some(old)) => Some(PipeSourceSelfManagedKafkaParameters {
+            topic_name: old.topic_name.clone(),
+            starting_position: old.starting_position.clone(),
+            additional_bootstrap_servers: old.additional_bootstrap_servers.clone(),
+            batch_size: new.batch_size,
+            maximum_batching_window_in_seconds: new.maximum_batching_window_in_seconds,
+            consumer_group_id: old.consumer_group_id.clone(),
+            credentials: new.credentials.clone(),
+            server_root_ca_certificate: new.server_root_ca_certificate.clone(),
+            vpc: new.vpc.clone(),
+        }),
+        (Some(_), None) => return Err(not_that_source_type("SelfManagedKafkaParameters")),
+    };
+
+    // `SourceParameters` is itself one of the objects AWS overrides atomically, so a
+    // branch the request omits is dropped rather than inherited from the stored record.
+    Ok(PipeSourceParameters {
+        filter_criteria: update.filter_criteria.clone(),
+        kinesis_stream_parameters: kinesis,
+        dynamo_db_stream_parameters: dynamo_db,
+        sqs_queue_parameters: sqs,
+        active_mq_broker_parameters: active_mq,
+        rabbit_mq_broker_parameters: rabbit_mq,
+        managed_streaming_kafka_parameters: msk,
+        self_managed_kafka_parameters: self_managed,
+    })
+}
+
+/// The refusal for a `SourceParameters` branch the stored pipe holds nothing for: its
+/// create-time members (a starting position, a queue or topic name) have no source.
+fn not_that_source_type(member: &str) -> UpdatePipeError {
+    UpdatePipeErrorModeled::ValidationException(ValidationException {
+        message: Some(format!(
+            "SourceParameters.{member} cannot be updated: this pipe has no \
+             {member} to update."
+        )),
+        field_list: Some(vec![ValidationExceptionField {
+            name: format!("SourceParameters.{member}"),
+            message: "must name the source type the pipe was created with".to_string(),
+        }]),
+    })
+    .into()
+}
+
+fn stored_kinesis(
+    stored: Option<&PipeSourceParameters>,
+) -> Option<&PipeSourceKinesisStreamParameters> {
+    stored?.kinesis_stream_parameters.as_ref()
+}
+
+fn stored_dynamo_db(
+    stored: Option<&PipeSourceParameters>,
+) -> Option<&PipeSourceDynamoDBStreamParameters> {
+    stored?.dynamo_db_stream_parameters.as_ref()
+}
+
+fn stored_active_mq(
+    stored: Option<&PipeSourceParameters>,
+) -> Option<&PipeSourceActiveMQBrokerParameters> {
+    stored?.active_mq_broker_parameters.as_ref()
+}
+
+fn stored_rabbit_mq(
+    stored: Option<&PipeSourceParameters>,
+) -> Option<&PipeSourceRabbitMQBrokerParameters> {
+    stored?.rabbit_mq_broker_parameters.as_ref()
+}
+
+fn stored_msk(
+    stored: Option<&PipeSourceParameters>,
+) -> Option<&PipeSourceManagedStreamingKafkaParameters> {
+    stored?.managed_streaming_kafka_parameters.as_ref()
+}
+
+fn stored_self_managed(
+    stored: Option<&PipeSourceParameters>,
+) -> Option<&PipeSourceSelfManagedKafkaParameters> {
+    stored?.self_managed_kafka_parameters.as_ref()
 }

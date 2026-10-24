@@ -23,7 +23,21 @@ pub mod pipe_state {
     pub const STOPPED: &str = "STOPPED";
     pub const STOPPING: &str = "STOPPING";
     pub const DELETING: &str = "DELETING";
+    pub const UPDATING: &str = "UPDATING";
 }
+
+/// The `PipeState` values that mean "a move this pipe is already making has not landed
+/// yet" — every state above that is not one a pipe rests in (`RUNNING`, `STOPPED`).
+///
+/// A pipe in one of these is mid-transition, so a call that would start ANOTHER
+/// transition on it is refused rather than interleaved with the one in flight.
+pub const TRANSIENT_PIPE_STATES: &[&str] = &[
+    pipe_state::CREATING,
+    pipe_state::STARTING,
+    pipe_state::STOPPING,
+    pipe_state::DELETING,
+    pipe_state::UPDATING,
+];
 
 /// The states a caller may ask a pipe to be in (`RequestedPipeState`), plus the
 /// `DELETED` that only a response reports (`RequestedPipeStateDescribeResponse`).
@@ -50,7 +64,7 @@ pub const MAX_PIPES: usize = 100;
 const DEFAULT_REGION: &str = "us-east-1";
 
 /// How long after a lifecycle call a pipe settles out of its transient state
-/// (`CREATING`, `STARTING`, `STOPPING`) into the state the caller asked for.
+/// (`CREATING`, `STARTING`, `STOPPING`, `UPDATING`) into the state the caller asked for.
 ///
 /// AWS does not publish this duration, so it is CHOSEN, not cited: long enough that a
 /// caller acting straight after the call still observes the transient state, short
@@ -123,6 +137,16 @@ impl PipeRecord {
         };
         self.current_state = settled;
         self.pending = None;
+    }
+
+    /// The transient state this pipe is in, or `None` when it is resting in a settled
+    /// one. Call [`ComAmazonawsPipesPipesState::settle_due_transitions`] first, so a move
+    /// the clock has already made due is not mistaken for one still in flight.
+    pub fn transient_state(&self) -> Option<&str> {
+        TRANSIENT_PIPE_STATES
+            .iter()
+            .find(|state| **state == self.current_state)
+            .copied()
     }
 
     /// This record as the `Pipe` summary `ListPipes` returns.

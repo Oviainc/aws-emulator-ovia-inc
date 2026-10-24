@@ -8,6 +8,9 @@
 //! Rust helper. The tables span the class each rule generalises over; the pipe the issue
 //! cited is one row.
 
+//! `UpdatePipe` has its own suite in `tests/all/pipe_update.rs`; the harness below is
+//! `pub(crate)` so that suite reaches the SAME one request path rather than copying it.
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -17,10 +20,10 @@ use service_com_amazonaws_pipes_pipes::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The region every request is signed for unless a case says otherwise.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// Long enough after a lifecycle call that the state move it owes is certainly due.
-const PAST_SETTLE: Duration = STATE_SETTLE_DELAY.saturating_add(Duration::from_millis(400));
+pub(crate) const PAST_SETTLE: Duration = STATE_SETTLE_DELAY.saturating_add(Duration::from_millis(400));
 
 /// Every `CreatePipe` input member that is optional and carries NO declared default.
 /// Source: the `CreatePipe` input in `OPERATIONS.md` (`DesiredState` is excluded because
@@ -37,7 +40,7 @@ const OPTIONAL_CREATE_MEMBERS: &[&str] = &[
 ];
 
 /// One emulator holding only this service, reached exactly as the router reaches it.
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.register_service(EmulatedService::new(engine));
@@ -47,29 +50,29 @@ fn router() -> MultiServiceRouter {
 /// What one call answered: the HTTP status, the wire error code (empty on success) and
 /// the parsed JSON body.
 #[derive(Debug, Clone)]
-struct Reply {
-    status: u16,
-    error_code: String,
-    body: Value,
+pub(crate) struct Reply {
+    pub(crate) status: u16,
+    pub(crate) error_code: String,
+    pub(crate) body: Value,
 }
 
 impl Reply {
     /// A member of the response body, or `Value::Null` when it carries none.
-    fn member(&self, name: &str) -> &Value {
+    pub(crate) fn member(&self, name: &str) -> &Value {
         self.body.get(name).unwrap_or(&Value::Null)
     }
 
-    fn string(&self, name: &str) -> String {
+    pub(crate) fn string(&self, name: &str) -> String {
         self.member(name).as_str().unwrap_or_default().to_string()
     }
 
-    fn number(&self, name: &str) -> f64 {
+    pub(crate) fn number(&self, name: &str) -> f64 {
         self.member(name).as_f64().unwrap_or_default()
     }
 }
 
 /// Dispatch one signed restJson1 request and read the reply.
-async fn call(
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     method: &str,
     uri: &str,
@@ -132,7 +135,7 @@ async fn call(
 }
 
 /// A `CreatePipe` body carrying only the three required members.
-fn minimal_body(source: &str, target: &str) -> Value {
+pub(crate) fn minimal_body(source: &str, target: &str) -> Value {
     json!({
         "Source": source,
         "Target": target,
@@ -140,20 +143,20 @@ fn minimal_body(source: &str, target: &str) -> Value {
     })
 }
 
-async fn create(router: &MultiServiceRouter, name: &str, body: Value) -> Reply {
+pub(crate) async fn create(router: &MultiServiceRouter, name: &str, body: Value) -> Reply {
     call(router, "POST", &format!("/v1/pipes/{name}"), Some(body), REGION).await
 }
 
-async fn describe(router: &MultiServiceRouter, name: &str) -> Reply {
+pub(crate) async fn describe(router: &MultiServiceRouter, name: &str) -> Reply {
     call(router, "GET", &format!("/v1/pipes/{name}"), None, REGION).await
 }
 
-async fn list(router: &MultiServiceRouter, query: &str) -> Reply {
+pub(crate) async fn list(router: &MultiServiceRouter, query: &str) -> Reply {
     call(router, "GET", &format!("/v1/pipes{query}"), None, REGION).await
 }
 
 /// The names `ListPipes` reported, in the order it reported them.
-fn listed_names(reply: &Reply) -> Vec<String> {
+pub(crate) fn listed_names(reply: &Reply) -> Vec<String> {
     reply
         .member("Pipes")
         .as_array()
