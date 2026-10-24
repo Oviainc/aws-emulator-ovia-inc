@@ -19,6 +19,8 @@ mod domain_response_projection;
 mod domain_subscription_lifecycle;
 #[path = "all/error_detail_member.rs"]
 mod error_detail_member;
+#[path = "all/list_tags_for_resource.rs"]
+mod list_tags_for_resource;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
 #[path = "all/state_roundtrip.rs"]

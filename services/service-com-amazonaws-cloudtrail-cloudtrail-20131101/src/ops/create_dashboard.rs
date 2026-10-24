@@ -137,21 +137,6 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-/// The HTTP status this operation answers its `ConflictException` with.
-///
-/// The model annotates the shape `@httpError(409)`
-/// (`smithy_query(query="shape",shape="ConflictException")`), but `@httpError` is an
-/// HTTP-BINDING trait and the recorded response to a dashboard name that is already
-/// taken carries HTTP **400** with `__type: ConflictException` — the status a client's
-/// retry classifier sees is the service's, not the model's. The recorded unit is
-/// `cloudtrail-dashboard-error-paths#task#2`, a second create of the name that
-/// fixture's first step took. It is answered through
-/// [`crate::scaffolded::Scaffolded::modeled_with_status`], which keeps the modelled
-/// shape's body and changes only the status line — the same deviation
-/// `crate::state::TRAIL_NOT_FOUND_STATUS` and
-/// `crate::state::IMPORT_NOT_FOUND_HTTP_STATUS` already carry for this service.
-const DASHBOARD_CONFLICT_HTTP_STATUS: u16 = 400;
-
 /// The refusal text a name already taken is answered with.
 ///
 /// Like `crate::state::DASHBOARD_NOT_FOUND_MESSAGE` it is a FIXED service sentence —
@@ -358,15 +343,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The name must be unique to your account": a name already taken is a
         // conflict, never an overwrite. CloudTrail answers it with the one fixed
-        // sentence below, at the status it sends on the wire (400, not the shape's
-        // modelled 409).
+        // sentence below, at the status it sends on the wire for this service's
+        // dashboard `ConflictException` (400, not the shape's modelled 409 —
+        // `crate::state::DASHBOARD_CONFLICT_HTTP_STATUS` cites the recording).
         let key = (input.name.clone(), region.clone());
         if store.dashboards.contains_key(&key) {
             return Err(crate::scaffolded::Scaffolded::modeled_with_status(
                 CreateDashboardErrorModeled::ConflictException(ConflictException {
                     message: Some(DASHBOARD_NAME_CONFLICT_MESSAGE.to_string()),
                 }),
-                DASHBOARD_CONFLICT_HTTP_STATUS,
+                crate::state::DASHBOARD_CONFLICT_HTTP_STATUS,
             ));
         }
 

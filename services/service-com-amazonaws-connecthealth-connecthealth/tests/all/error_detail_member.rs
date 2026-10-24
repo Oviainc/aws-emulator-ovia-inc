@@ -346,12 +346,16 @@ async fn an_error_the_framework_renders_reports_its_text_in_the_message_member_t
 
     // The scaffold's 501 is rendered by the framework as well, from a synthetic shape of
     // its own; it reports which operation is unimplemented, in the same member.
-    // `ListTagsForResource` is one of this service's remaining stubs
-    // (`src/ops/list_tags_for_resource.rs`).
+    // `UntagResource` is one of this service's remaining stubs
+    // (`src/ops/untag_resource.rs`); `ListTagsForResource`, at the same URI, is
+    // implemented and answers this unresolvable ARN with a modelled 404 instead.
     let arn = "arn:aws:health-agent:us-west-2:000000000000:domain/dom-zzzzzzzzzzzzzzzz";
     let encoded = arn.replace(':', "%3A").replace('/', "%2F");
+    // `tagKeys` is a required `@httpQuery` list of 1..50 keys
+    // (`smithy_query(query="operation",operation="UntagResource")`), so a request that
+    // omits it is refused at the boundary and never reaches the stub.
     let (status, body) = emulator
-        .send("GET", &format!("/tags/{encoded}"), None)
+        .send("DELETE", &format!("/tags/{encoded}?tagKeys=env"), None)
         .await;
     assert_eq!(
         (status, error_code(&body).as_str()),
@@ -360,7 +364,7 @@ async fn an_error_the_framework_renders_reports_its_text_in_the_message_member_t
     );
     let text = detail_text("the scaffold's 501", &body);
     assert!(
-        text.contains("ListTagsForResource"),
+        text.contains("UntagResource"),
         "the 501 must name the unimplemented operation, got {text:?}"
     );
 }

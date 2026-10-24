@@ -363,6 +363,14 @@ fn template_cases() -> Vec<(&'static str, Value)> {
                         "startAfter": ["stopInstances"]
                     }
                 },
+                // This row's target is identified by TAG, and this emulator holds no other
+                // service's resources to resolve a tag against, so that target resolves to
+                // nothing. Under the documented default (`fail`) such a run ends `failed`
+                // on the resolution rather than running, which
+                // `experiment_options_decide_the_run.rs` asserts; this row is about the
+                // round trip of the stored template, so it names the mode that SKIPS the
+                // action instead and keeps running.
+                "experimentOptions": { "emptyTargetResolutionMode": "skip" },
                 "tags": { "Key1": "Val1", "Owner": "chaos", "Stage": "test" }
             }),
         ),

@@ -358,6 +358,10 @@ async fn a_started_experiment_runs_and_reaches_a_terminal_status_on_the_compress
 /// RULE: the run is the experiment's own, so the experiment an `actionsMode` of `skip-all`
 /// starts still walks the lifecycle, and a second experiment started from the same template
 /// runs independently of the first.
+///
+/// What that mode makes of the run itself — the actions it carries out, the durations it
+/// spends and the failures it can earn — is asserted in
+/// `experiment_options_decide_the_run.rs`; this case is about the two runs being two.
 #[tokio::test]
 async fn two_experiments_from_one_template_run_independently() {
     let router = emulator();
@@ -413,6 +417,14 @@ async fn two_experiments_from_one_template_run_independently() {
             actions_mode,
             "case {case:?}: expected the experiment to carry the mode it was started with, \
              got {experiment:?}"
+        );
+        // And the mode is more than an echo: it decides whether the run carries the action
+        // out at all, which the action's own state is what says.
+        assert_eq!(
+            experiment["actions"]["fault"]["state"]["status"].as_str(),
+            (actions_mode == "skip-all").then_some("skipped"),
+            "case {case:?}: expected the action's state to say whether the run carries it \
+             out, got {experiment:?}"
         );
         ids.push((
             case,

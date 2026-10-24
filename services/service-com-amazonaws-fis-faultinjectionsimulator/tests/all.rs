@@ -19,6 +19,8 @@ mod control_plane_rules;
 mod delete_target_account_configuration;
 #[path = "all/experiment_lifecycle.rs"]
 mod experiment_lifecycle;
+#[path = "all/experiment_options_decide_the_run.rs"]
+mod experiment_options_decide_the_run;
 #[path = "all/experiment_run.rs"]
 mod experiment_run;
 #[path = "all/experiment_target_account_configurations.rs"]

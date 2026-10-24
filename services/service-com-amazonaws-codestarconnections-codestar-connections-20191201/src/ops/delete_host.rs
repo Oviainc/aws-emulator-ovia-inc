@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteHost
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteHost`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteHost::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: deletes the host its `HostArn` names from [`crate::state`], refusing a
+//! host that is not deletable yet. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -80,9 +73,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-codestarconnections-cod
 // here — hence the `DeleteHostError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.codestarconnections#DeleteHost")]
+// `InternalServerException` is widened in through `extra_errors`: the service models it
+// (see `types::shared_types`) but this operation does not list it, and it is the only
+// honest answer for "this service is mounted on an engine that holds no state" — a 400
+// would blame the caller's request and a 501 would claim the operation is unwritten.
+#[smithy_macros::operation_error(
+    "com.amazonaws.codestarconnections#DeleteHost",
+    extra_errors = ["InternalServerException"]
+)]
 #[derive(Debug)]
 pub enum DeleteHostErrorModeled {
+    InternalServerException(InternalServerException),
     ResourceNotFoundException(ResourceNotFoundException),
     ResourceUnavailableException(ResourceUnavailableException),
 }
@@ -101,6 +102,18 @@ impl From<DeleteHostErrorModeled> for DeleteHostError {
         crate::scaffolded::Scaffolded::Modeled(modeled)
     }
 }
+
+/// The status the LIVE service answers a `DeleteHost` whose `HostArn` names no host
+/// with.
+///
+/// The model puts `@httpError 404` on `ResourceNotFoundException`, but the recorded
+/// wire response for this exact call (corpus `simparity-wire-aws-v1`, fixture
+/// `codestar-connections-host-error-paths#task#3`: "status: expected 400", `__type`
+/// `com.amazonaws.codestar.connections#ResourceNotFoundException`) is HTTP 400 — so the
+/// shape, its wire code and its message stay the model's while the STATUS is the one a
+/// client of the real service branches on. See
+/// [`crate::scaffolded::Scaffolded::ModeledWithStatus`].
+const HOST_NOT_FOUND_STATUS: u16 = 400;
 
 /// The `DeleteHost` operation.
 ///
@@ -138,18 +151,85 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteHost` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteHostErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteHost"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DeleteHostErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "CodeStar connections state is unavailable on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+
+        // An ARN that resolves to no host this service holds names a resource that is
+        // ABSENT, which this operation reports with the modeled
+        // `ResourceNotFoundException` and a message naming the ARN that was supplied —
+        // the other modeled refusal, `ResourceUnavailableException`, is the "the host
+        // IS there but is not usable" signal and is reserved for the two refusals
+        // below. Nothing is written on this path, so deleting a host that is already
+        // gone is this same answer and never a partial teardown.
+        let Some(host) = store.hosts.get(&input.host_arn) else {
+            return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                DeleteHostErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(format!("No host exists with the ARN: {}", input.host_arn)),
+                }),
+                HOST_NOT_FOUND_STATUS,
+            ));
+        };
+        // "A host cannot be deleted if it is in the VPC_CONFIG_INITIALIZING or
+        // VPC_CONFIG_DELETING state" (this operation's doc): the host is there but its
+        // VPC configuration is in flight, so it is UNAVAILABLE for a delete rather than
+        // absent. The borrow of the record ends here, before the removal below.
+        let blocking_status = host.delete_blocked_by_status().then(|| host.status.clone());
+        if let Some(status) = blocking_status {
+            return Err(DeleteHostErrorModeled::ResourceUnavailableException(
+                ResourceUnavailableException {
+                    message: Some(format!(
+                        "The host {} is in status {status} and cannot be deleted.",
+                        input.host_arn
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "Before you delete a host, all connections associated to the host must be
+        // deleted" (same doc): the association lives on the connections, so it is read
+        // out of the connection store, and the count is what the caller has to clear.
+        let attached = store.connections_attached_to_host_count(&input.host_arn);
+        if attached > 0 {
+            return Err(DeleteHostErrorModeled::ResourceUnavailableException(
+                ResourceUnavailableException {
+                    message: Some(format!(
+                        "The host {} cannot be deleted because {attached} connection(s) are \
+                         still associated with it. Delete those connections first.",
+                        input.host_arn
+                    )),
+                },
+            )
+            .into());
+        }
+
+        store.hosts.remove(&input.host_arn);
+        // The ARN is never reused, so the tags keyed by it go with the host — the rule
+        // `DeleteConnection` removes a connection's tags under.
+        store.tags.remove(&input.host_arn);
+        drop(store);
+
+        // Audit record for a state-changing operation: who presented which access key
+        // id, what changed, and the outcome. No secret is logged — the access key id is
+        // the public half the request already carries in its SigV4 scope.
+        ::tracing::info!(
+            operation = "DeleteHost",
+            access_key_id = %::emulator_server::extract_akid(&ctx.parts().headers),
+            host_arn = %input.host_arn,
+            outcome = "deleted",
+            "host deleted"
+        );
+
+        Ok(DeleteHostOutput::default())
     }
 }
