@@ -21,6 +21,8 @@ mod config_listing;
 mod dataflow_endpoint_group_listing;
 #[path = "all/dataflow_endpoint_groups.rs"]
 mod dataflow_endpoint_groups;
+#[path = "all/ephemeris_catalog.rs"]
+mod ephemeris_catalog;
 #[path = "all/lifecycle_writes.rs"]
 mod lifecycle_writes;
 #[path = "all/minute_usage.rs"]

@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEphemeris
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEphemeris`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEphemeris::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation stores
+//!
+//! An ephemeris is admitted in `VALIDATING` and the service owes it the move out of that
+//! status: to `INVALID` when its supplied data describes no usable validity range, else to
+//! `ENABLED` or `DISABLED` according to the request's `enabled`, and to `EXPIRED` once its
+//! expiration time passes. The verdict is taken here, from the data as supplied, and
+//! materialised by `state::settle_due_ephemerides` when it falls due — see
+//! `state::EPHEMERIS_VALIDATION_SETTLES_AFTER`.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +154,162 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEphemeris` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEphemerisErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEphemeris"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateEphemerisErrorModeled::DependencyException(DependencyException {
+                message: Some("this service's state store is unavailable".to_string()),
+                parameter_name: None,
+            })
+        })?;
+
+        // The platform's tagging rules, refused before an ephemeris id is minted and
+        // before the store is read: the model's `TagsMap` carries no constraint, so this
+        // is the only gate (see `crate::state::validate_tags`).
+        crate::state::validate_tags(input.tags.as_ref())
+            .map_err(CreateEphemerisErrorModeled::InvalidParameterException)?;
+
+        // The resource this operation creates IS an ephemeris: there is no trajectory to
+        // validate, type, expire or point an antenna over without the data, so a request
+        // that supplies none is refused rather than stored. The member is modelled
+        // optional (`smithy_query(query="operation", operation="CreateEphemeris")`), so
+        // this is the handler's gate rather than the validator's.
+        let data = input.ephemeris.ok_or_else(|| {
+            CreateEphemerisErrorModeled::InvalidParameterException(InvalidParameterException {
+                message: Some("ephemeris data is required to create an ephemeris".to_string()),
+                parameter_name: Some(EPHEMERIS_PARAMETER.to_string()),
+            })
+        })?;
+
+        // Data is supplied EITHER inline OR from an Amazon S3 object — the model
+        // documents the inline member of each type as the data "you provide directly
+        // instead of using an Amazon S3 object" (`smithy_query(query="shape",
+        // shape="TLEEphemeris")` / `shape="OEMEphemeris"`) — so naming both, or neither,
+        // describes no one source to read the trajectory from.
+        if let Some(fault) = supply_fault(&data) {
+            return Err(CreateEphemerisErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(fault),
+                    parameter_name: Some(EPHEMERIS_PARAMETER.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let mut guard = state.lock();
+
+        // An ephemeris applies to a satellite of this account, so a request naming one
+        // this account is not on-boarded to references nothing: that is a missing
+        // resource, not a bad value.
+        if let Some(satellite_id) = input.satellite_id.as_deref() {
+            if !guard.satellites.contains_key(satellite_id) {
+                return Err(CreateEphemerisErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::satellite_not_found_message(satellite_id)),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // The store this emulator keeps is bounded, so a caller cannot grow it without
+        // limit. This operation models no account-limit error (its client errors are
+        // `InvalidParameterException` and `ResourceNotFoundException`, neither of which
+        // describes a full store), so the bound is reported as what it is: a failure of
+        // the store this service depends on, not of the request.
+        if guard.ephemerides.len() >= crate::state::MAX_RECORDS_PER_STORE {
+            return Err(CreateEphemerisErrorModeled::DependencyException(
+                DependencyException {
+                    message: Some(format!(
+                        "this account already holds the maximum of {} ephemerides",
+                        crate::state::MAX_RECORDS_PER_STORE
+                    )),
+                    parameter_name: None,
+                },
+            )
+            .into());
+        }
+
+        let ephemeris_id = crate::state::new_uuid();
+        let region = crate::state::request_region(ctx.parts());
+        let ephemeris_arn = ::engine::emulator_arn(
+            crate::state::ARN_SERVICE,
+            &region,
+            &format!("ephemeris/{ephemeris_id}"),
+        );
+        let stored = crate::state::Ephemeris {
+            ephemeris_id: ephemeris_id.clone(),
+            ephemeris_arn: ephemeris_arn.clone(),
+            satellite_id: input.satellite_id,
+            name: input.name,
+            ephemeris_type: crate::state::ephemeris_type_of(&data).to_string(),
+            priority: input
+                .priority
+                .unwrap_or(crate::state::DEFAULT_EPHEMERIS_PRIORITY),
+            enabled: input
+                .enabled
+                .unwrap_or(crate::state::EPHEMERIS_ENABLED_BY_DEFAULT),
+            creation_time: crate::state::now_timestamp(),
+            // The expiration the request named, or the end of the supplied data's own
+            // validity when it named none: the data stops being usable when its validity
+            // ends.
+            expiration_time: input
+                .expiration_time
+                .or_else(|| crate::state::ephemeris_validity_end(&data)),
+            source_s3_object: crate::state::ephemeris_source_s3_object(&data),
+            kms_key_arn: input.kms_key_arn,
+            // The validation verdict is taken here, from the data as supplied, and
+            // applied when the validation falls due — nothing about the data changes in
+            // between.
+            invalid_reason: crate::state::ephemeris_invalid_reason(&data),
+            supplied_data: data,
+            tags: input.tags.unwrap_or_default(),
+            // An ephemeris is admitted into VALIDATING; the service owes it the move out
+            // of it, which any later read materialises once it is due.
+            status: crate::state::EPHEMERIS_VALIDATING.to_string(),
+            validation_settles_at: Some(
+                ::std::time::SystemTime::now() + crate::state::EPHEMERIS_VALIDATION_SETTLES_AFTER,
+            ),
+        };
+
+        // An ephemeris has an ARN even though no operation implemented so far returns
+        // one: it is what `TagResource`/`UntagResource`/`ListTagsForResource` address an
+        // ephemeris by, so it is minted here and registered in the one index that
+        // resolves every ARN this service hands out.
+        guard.arn_index.insert(
+            ephemeris_arn,
+            crate::state::ResourceRef::Ephemeris {
+                ephemeris_id: ephemeris_id.clone(),
+            },
+        );
+        guard.ephemerides.insert(ephemeris_id.clone(), stored);
+
+        Ok(CreateEphemerisOutput {
+            ephemeris_id: Some(ephemeris_id),
+        })
+    }
+}
+
+/// The request member every refusal of the supplied data names.
+const EPHEMERIS_PARAMETER: &str = "ephemeris";
+
+/// Why `data` names no one source to read the trajectory from, or `None` when it names
+/// exactly one.
+///
+/// A TLE or OEM ephemeris carries its data inline or names an Amazon S3 object; the az/el
+/// form is a union of the two, so the deserializer has already settled it at one.
+fn supply_fault(data: &EphemerisData) -> Option<String> {
+    let (inline, from_s3, member) = match data {
+        EphemerisData::Tle(tle) => (tle.tle_data.is_some(), tle.s3_object.is_some(), "tle"),
+        EphemerisData::Oem(oem) => (oem.oem_data.is_some(), oem.s3_object.is_some(), "oem"),
+        EphemerisData::azEl(_) => return None,
+    };
+    match (inline, from_s3) {
+        (true, true) => Some(format!(
+            "{member} ephemeris data is supplied either inline or from an Amazon S3 object, not \
+             both"
+        )),
+        (false, false) => Some(format!(
+            "{member} ephemeris data must be supplied inline or from an Amazon S3 object"
+        )),
+        _ => None,
     }
 }

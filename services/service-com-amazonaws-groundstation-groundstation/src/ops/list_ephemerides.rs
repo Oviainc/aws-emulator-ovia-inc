@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListEphemerides
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListEphemerides`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListEphemerides::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! ## What this operation reports
+//!
+//! A REPORT of the ephemerides this account holds, filtered by the request: the window the
+//! caller named is tested against each ephemeris's EXPIRATION time (`startTime`/`endTime`
+//! are documented as "returns ephemerides with expiration times within your specified time
+//! range"), beside the optional `satelliteId`, `ephemerisType` and `statusList` filters.
+//! It writes only what the clock already owed: the status moves
+//! `state::settle_due_ephemerides` materialises.
 //!
 //! ## Shape of an operation
 //!
@@ -151,20 +151,152 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListEphemerides` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListEphemeridesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListEphemerides"))
+        /// Names this listing inside its pagination tokens, so a token another listing
+        /// issued is not accepted here.
+        const LISTING: &str = "ephemerides";
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListEphemeridesErrorModeled::DependencyException(DependencyException {
+                message: Some("this service's state store is unavailable".to_string()),
+                parameter_name: None,
+            })
+        })?;
+
+        // The window a listing searches runs forwards: a request whose `endTime` precedes
+        // its `startTime` describes no interval at all, so it is refused rather than
+        // answered with the empty page the window test would produce.
+        if input.end_time.as_secs_f64() < input.start_time.as_secs_f64() {
+            return Err(ListEphemeridesErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some("endTime must not precede startTime".to_string()),
+                    parameter_name: Some("endTime".to_string()),
+                },
+            )
+            .into());
+        }
+
+        // An offset counts within the FILTERED sequence, so the filters are part of the
+        // scope its token is issued under: resuming with a different window, satellite,
+        // type or status list is refused rather than landing at an offset into a
+        // different sequence. The status list is sorted first, so naming the same
+        // statuses in another order is the same scope.
+        let mut statuses = input.status_list.clone().unwrap_or_default();
+        statuses.sort();
+        let scope = crate::state::page_scope(
+            LISTING,
+            &[
+                statuses.join(","),
+                input.start_time.as_secs_f64().to_string(),
+                input.end_time.as_secs_f64().to_string(),
+                input.satellite_id.clone().unwrap_or_default(),
+                input.ephemeris_type.clone().unwrap_or_default(),
+            ],
+        );
+
+        let offset = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => crate::state::decode_page_token(&scope, token).ok_or_else(|| {
+                ListEphemeridesErrorModeled::InvalidParameterException(InvalidParameterException {
+                    message: Some(
+                        "nextToken was not issued by a previous ListEphemerides call with these \
+                         filters"
+                            .to_string(),
+                    ),
+                    parameter_name: Some("nextToken".to_string()),
+                })
+            })?,
+        };
+
+        let window_start = input.start_time.as_secs_f64();
+        let window_end = input.end_time.as_secs_f64();
+
+        let mut guard = state.lock();
+
+        // A satellite filter names a satellite of this account; one this account is not
+        // on-boarded to references nothing, so the request is answered as the missing
+        // resource it names rather than with the empty page it would otherwise select —
+        // which a caller could not tell from "no ephemeris applies to it".
+        if let Some(satellite_id) = input.satellite_id.as_deref() {
+            if !guard.satellites.contains_key(satellite_id) {
+                return Err(ListEphemeridesErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::satellite_not_found_message(satellite_id)),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Apply every ephemeris status move already due — the end of a validation, and an
+        // expiration whose time has passed — so the status filter and the reported status
+        // are the status in force now.
+        guard.settle_due_ephemerides();
+
+        // Ordered by creation time, then by ephemeris id so the order is total whatever
+        // the store holds: a page boundary is only stable over a stable order. CHOSEN —
+        // the API documents no order for this listing.
+        let mut held: Vec<&crate::state::Ephemeris> = guard.ephemerides.values().collect();
+        held.sort_by(|left, right| {
+            left.creation_time
+                .as_secs_f64()
+                .total_cmp(&right.creation_time.as_secs_f64())
+                .then_with(|| left.ephemeris_id.cmp(&right.ephemeris_id))
+        });
+
+        let items: Vec<EphemerisItem> = held
+            .into_iter()
+            .filter(|ephemeris| {
+                input
+                    .satellite_id
+                    .as_ref()
+                    .is_none_or(|wanted| ephemeris.satellite_id.as_ref() == Some(wanted))
+            })
+            .filter(|ephemeris| {
+                input
+                    .ephemeris_type
+                    .as_ref()
+                    .is_none_or(|wanted| *wanted == ephemeris.ephemeris_type)
+            })
+            // An empty (or absent) status list selects every status: the member is
+            // modelled `len 0..500` and documented as "the list of ephemeris status to
+            // return", so naming none narrows nothing.
+            .filter(|ephemeris| {
+                input
+                    .status_list
+                    .as_ref()
+                    .is_none_or(|wanted| wanted.is_empty() || wanted.contains(&ephemeris.status))
+            })
+            // The window is tested against the EXPIRATION time, as both members
+            // document ("returns ephemerides with expiration times within your specified
+            // time range"). An ephemeris with no expiration time never expires, so no
+            // window excludes it.
+            .filter(|ephemeris| {
+                ephemeris.expiration_time.is_none_or(|expiration| {
+                    (window_start..=window_end).contains(&expiration.as_secs_f64())
+                })
+            })
+            .map(|ephemeris| EphemerisItem {
+                ephemeris_id: Some(ephemeris.ephemeris_id.clone()),
+                ephemeris_type: Some(ephemeris.ephemeris_type.clone()),
+                status: Some(ephemeris.status.clone()),
+                priority: Some(ephemeris.priority),
+                enabled: Some(ephemeris.enabled),
+                creation_time: Some(ephemeris.creation_time),
+                name: Some(ephemeris.name.clone()),
+                source_s3_object: ephemeris.source_s3_object.clone(),
+            })
+            .collect();
+
+        let (page, next_token) = crate::state::paginate(&scope, &items, input.max_results, offset);
+
+        Ok(ListEphemeridesOutput {
+            next_token,
+            // Present and empty when nothing matched, as every other listing of this
+            // service answers: a client's pagination loop then reads the same member on
+            // every page.
+            ephemerides: Some(page),
+        })
     }
 }
