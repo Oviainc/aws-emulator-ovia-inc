@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RejectAgreementPaymentRequest
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RejectAgreementPaymentRequest`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RejectAgreementPaymentRequest::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -158,6 +149,32 @@ impl<Eng> RejectAgreementPaymentRequest<Eng> {
     }
 }
 
+/// The `RejectAgreementPaymentRequest` answer for the payment request this call
+/// has just rejected.
+///
+/// Every member is read from the stored record — `name`, `description`,
+/// `chargeAmount` and `currencyCode` are the ones the send recorded,
+/// `statusMessage` is "the rejection reason provided by the buyer, if any" as
+/// the rejecting call stored it, `createdAt` is "when the payment request was
+/// originally created" and `updatedAt` "when the payment request was rejected"
+/// — so nothing here is echoed from this call's own input, and a later
+/// `GetAgreementPaymentRequest` of the same request reports the same values
+/// from the same record.
+fn to_output(stored: &crate::state::PaymentRequest) -> RejectAgreementPaymentRequestOutput {
+    RejectAgreementPaymentRequestOutput {
+        payment_request_id: Some(stored.id.clone()),
+        agreement_id: Some(stored.agreement_id.clone()),
+        status: Some(stored.status.clone()),
+        status_message: stored.status_message.clone(),
+        name: Some(stored.name.clone()),
+        description: stored.description.clone(),
+        charge_amount: Some(stored.charge_amount.clone()),
+        currency_code: stored.currency_code.clone(),
+        created_at: Some(::aws_smithy_types::DateTime::from(stored.created_at)),
+        updated_at: Some(::aws_smithy_types::DateTime::from(stored.updated_at)),
+    }
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for RejectAgreementPaymentRequest<Eng>
 {
@@ -175,18 +192,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RejectAgreementPaymentRequest` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RejectAgreementPaymentRequestErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RejectAgreementPaymentRequest"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                RejectAgreementPaymentRequestErrorModeled::InternalServerException(
+                    crate::state::store_unavailable(),
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // A payment request is a child of the agreement it was sent under, and
+        // this call names both. Resolution goes PARENT-FIRST, so
+        // `ResourceNotFoundException`'s `resourceType` and `resourceId` name the
+        // OUTERMOST resource that failed to resolve, the way the sibling
+        // `CancelAgreementPaymentRequest` and `GetAgreementPaymentRequest`
+        // resolve the same pair.
+        if !store.agreements.contains_key(&input.agreement_id) {
+            return Err(crate::state::not_found(
+                RejectAgreementPaymentRequestErrorModeled::ResourceNotFoundException(
+                    crate::state::agreement_not_found(&input.agreement_id),
+                ),
+            ));
+        }
+
+        // The agreement resolved, so the child is what this call acts on. Both
+        // ids are required and both select: a payment request of another
+        // agreement is not the one this call names.
+        let found = store
+            .payment_requests
+            .get_mut(&input.payment_request_id)
+            .filter(|request| request.agreement_id == input.agreement_id);
+        let Some(request) = found else {
+            return Err(crate::state::not_found(
+                RejectAgreementPaymentRequestErrorModeled::ResourceNotFoundException(
+                    crate::state::payment_request_not_found(&input.payment_request_id),
+                ),
+            ));
+        };
+
+        // "Only payment requests in PENDING_APPROVAL status can be rejected. A
+        // ConflictException is thrown if the payment request is in any other
+        // status." Every other `PaymentRequestStatus` value is one the request
+        // has already been moved to, so rejecting it now would move it a second
+        // time — which also makes a replayed reject of the same request a
+        // conflict rather than a second rejection.
+        if !request.is_pending_approval() {
+            let status = request.status.clone();
+            return Err(RejectAgreementPaymentRequestErrorModeled::ConflictException(
+                crate::state::conflict(
+                    crate::state::RESOURCE_TYPE_PAYMENT_REQUEST,
+                    &input.payment_request_id,
+                    format!(
+                        "payment request {} is {status}, and only a {} payment request can be \
+                         rejected",
+                        input.payment_request_id,
+                        crate::state::PAYMENT_REQUEST_STATUS_PENDING_APPROVAL
+                    ),
+                ),
+            )
+            .into());
+        }
+
+        // "Once rejected, the payment request transitions to REJECTED status and
+        // cannot be accepted", and the buyer's optional `rejectionReason` is
+        // what the request reports as its `statusMessage` from then on — both
+        // written through [`crate::state::PaymentRequest::reject`], the one
+        // writer of that transition, so `GetAgreementPaymentRequest` and
+        // `ListAgreementPaymentRequests` report the rejected request from the
+        // same record this call wrote. REJECTED is terminal, so nothing is owed
+        // to the clock here.
+        request.reject(now, input.rejection_reason);
+        let output = to_output(request);
+        crate::state::audit(
+            Self::NAME,
+            "rejected",
+            &input.payment_request_id,
+            ctx.parts(),
+        );
+
+        Ok(output)
     }
 }

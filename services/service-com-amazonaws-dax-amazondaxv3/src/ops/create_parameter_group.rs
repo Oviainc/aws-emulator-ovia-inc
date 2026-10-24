@@ -174,12 +174,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(
                 CreateParameterGroupErrorModeled::ParameterGroupAlreadyExistsFault(
-                    ParameterGroupAlreadyExistsFault {
-                        message: Some(format!(
-                            "Parameter group {} already exists",
-                            input.parameter_group_name
-                        )),
-                    },
+                    crate::state::parameter_group_already_exists(),
                 )
                 .into(),
             );

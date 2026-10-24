@@ -27,7 +27,7 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
     available_network, call, create_network_body, member_configuration, new_router,
-    router_and_engine, Answer, ACCOUNT,
+    router_and_engine, Answer, ACCOUNT, PAST_TRANSITION,
 };
 use crate::public_networks_and_membership::invite;
 use crate::resource_tags::{
@@ -468,6 +468,9 @@ async fn every_create_refuses_a_reserved_tag_key_and_creates_nothing() {
         );
 
         let created_arn = arn(case.arn_type, &accepted.text(&[case.id_member]));
+        // A resource the create left `CREATING` is not in a status that can complete a
+        // tagging operation, so the listing waits for the transition the clock owes it.
+        tokio::time::sleep(PAST_TRANSITION).await;
         let listing = list_tags(&router, &created_arn).await;
         assert_eq!(
             tag_map(&listing.body["Tags"])

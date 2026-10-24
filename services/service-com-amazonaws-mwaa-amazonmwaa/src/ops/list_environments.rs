@@ -2,9 +2,9 @@
 
 //! @op ListEnvironments
 //!
-//! Lists the NAMES of the environments currently stored, in a stable (name) order, one
-//! `MaxResults` page at a time. A reporting operation: the only write it makes is
-//! materialising the status transitions the clock already owed.
+//! Lists the NAMES of the environments stored in the Region the request was signed for,
+//! in a stable (name) order, one `MaxResults` page at a time. A reporting operation: the
+//! only write it makes is materialising the status transitions the clock already owed.
 //!
 //! ## Shape of an operation
 //!
@@ -136,8 +136,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let now = ::std::time::SystemTime::now();
+        // An environment lives in the Region it was created in, and this endpoint serves
+        // one Region: the listing names that Region's environments and no others.
+        let region = crate::state::request_region(ctx);
 
         // A `NextToken` this service never minted names no position to resume from. The
         // operation models no pagination-token error, so it is refused as a bad request.
@@ -158,9 +160,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The only write a report may make: the transitions the clock already owes.
         store.settle(now);
 
-        // `environments` is a `BTreeMap` keyed by name, so this order is the sorted one
-        // and a cursor naming a name always resumes at the right position.
-        let names: Vec<String> = store.environments.keys().cloned().collect();
+        // Sorted within the Region, so a cursor naming a name always resumes at the right
+        // position.
+        let names = store.names_in_region(&region);
         let page = crate::state::page_of(names, after.as_deref(), input.max_results);
 
         Ok(ListEnvironmentsOutput {

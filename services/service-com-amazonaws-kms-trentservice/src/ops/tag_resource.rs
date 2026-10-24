@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -198,18 +189,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(TagResourceErrorModeled::KMSInternalException(KMSInternalException {
+                message: Some("the KMS state store is unavailable".to_string()),
+            })
+            .into());
+        };
+
+        // Which tag lists KMS stores lives in ONE place for the whole service, so a
+        // list `CreateKey` keeps is one this operation keeps too.
+        let requested = match crate::state::requested_tags(&input.tags) {
+            Ok(requested) => requested,
+            Err(reason) => {
+                return Err(TagResourceErrorModeled::TagException(TagException {
+                    message: Some(reason),
+                })
+                .into());
+            }
+        };
+
+        let region = crate::state::request_region(ctx);
+        let mut state = state.lock();
+        let key = match state.resolve_mut(&region, &input.key_id) {
+            crate::state::KeyRefMut::Found(key) => key,
+            crate::state::KeyRefMut::MalformedArn => {
+                return Err(TagResourceErrorModeled::InvalidArnException(InvalidArnException {
+                    message: Some(crate::state::invalid_arn_message(&input.key_id)),
+                })
+                .into());
+            }
+            crate::state::KeyRefMut::NotFound => {
+                return Err(TagResourceErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::key_not_found_message(&region, &input.key_id)),
+                })
+                .into());
+            }
+        };
+
+        // "The KMS key that you use for this operation must be in a compatible key
+        // state" (`smithy_query(query="doc",shape="TagResource")`): a key whose
+        // deletion is scheduled keeps the tags it had until `CancelKeyDeletion`
+        // restores it, so tagging it is refused and nothing is written.
+        if key.key_state == crate::state::KEY_STATE_PENDING_DELETION {
+            return Err(TagResourceErrorModeled::KMSInvalidStateException(
+                KMSInvalidStateException {
+                    message: Some(crate::state::invalid_state_message(key)),
+                },
+            )
+            .into());
+        }
+
+        // The per-key tag quota is measured on what the key would END UP carrying,
+        // since editing a tag the key already has adds nothing to the count. Past it
+        // the request is refused with the modelled "a length constraint or quota was
+        // exceeded" and not one tag of it is applied, which is also what bounds how far
+        // one key's tag map can grow.
+        let resulting = key
+            .tags
+            .keys()
+            .chain(requested.keys())
+            .collect::<std::collections::BTreeSet<&String>>()
+            .len();
+        if resulting > crate::state::MAX_TAGS_PER_KEY {
+            return Err(TagResourceErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "A KMS key can carry at most {} tags, and the request would leave \
+                         {resulting} on {}.",
+                        crate::state::MAX_TAGS_PER_KEY,
+                        key.arn
+                    )),
+                },
+            )
+            .into());
+        }
+
+        key.apply_tags(requested);
+
+        Ok(TagResourceOutput)
     }
 }

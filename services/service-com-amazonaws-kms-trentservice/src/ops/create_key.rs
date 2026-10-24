@@ -493,21 +493,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::MAX_TAGS_PER_KEY
             )));
         }
-        let mut tags = std::collections::BTreeMap::new();
-        for tag in input.tags.iter().flatten() {
-            if tags
-                .insert(tag.tag_key.clone(), tag.tag_value.clone())
-                .is_some()
-            {
+        // Which tag lists KMS stores is `crate::state::requested_tags`, shared with
+        // every other operation that accepts tags, so a list this one keeps is one
+        // `TagResource` would also keep.
+        let tags = match crate::state::requested_tags(input.tags.as_deref().unwrap_or_default()) {
+            Ok(tags) => tags,
+            Err(reason) => {
                 return Err(CreateKeyErrorModeled::TagException(TagException {
-                    message: Some(format!(
-                        "One or more tags are not valid: the tag key {} appears more than once.",
-                        tag.tag_key
-                    )),
+                    message: Some(reason),
                 })
                 .into());
             }
-        }
+        };
 
         let multi_region = input.multi_region.unwrap_or(false);
         let mut state = state.lock();

@@ -3,6 +3,10 @@
 //! The Call Analytics job family, end to end over the wire:
 //! `StartCallAnalyticsJob` -> `GetCallAnalyticsJob` -> `ListCallAnalyticsJobs`.
 //!
+//! The family's delete is the sibling suite `crate::call_analytics_job_delete`, which
+//! reuses this one's request table and helpers rather than standing up a second set;
+//! that is why they are `pub(crate)`.
+//!
 //! Every call goes through the same `MultiServiceRouter` the production router
 //! dispatches on, so these tests exercise the awsJson1_1 envelope, the boundary
 //! constraint validation and the handlers' own refusals — not just the handler
@@ -38,7 +42,7 @@ use crate::transcription_jobs::{Reply, Transcribe};
 /// Waited out with `std::thread::sleep`: the workspace enables tokio's `macros`,
 /// `rt` and `rt-multi-thread` features only, so `tokio::time::sleep` is not
 /// available here.
-const PAST_THE_TRANSITION: Duration = Duration::from_millis(900);
+pub(crate) const PAST_THE_TRANSITION: Duration = Duration::from_millis(900);
 
 /// A valid `DataAccessRoleArn`, whose `@pattern` pins it to an IAM role ARN
 /// (`smithy_query(query="operation", operation="StartCallAnalyticsJob")`).
@@ -62,7 +66,7 @@ const ECHOED_MEMBERS: &[&str] = &[
 /// request leaves identification to choose between, which custom vocabulary / filter /
 /// language model is applied, whether content is redacted or summarized, whether the
 /// speakers are pinned to channels, and how many tags are attached.
-fn start_requests() -> Vec<(&'static str, Value)> {
+pub(crate) fn start_requests() -> Vec<(&'static str, Value)> {
     vec![
         (
             "minimal: s3 media, no output location, no settings",
@@ -134,7 +138,7 @@ fn start_requests() -> Vec<(&'static str, Value)> {
 }
 
 /// The job name of a start request.
-fn job_name(request: &Value) -> String {
+pub(crate) fn job_name(request: &Value) -> String {
     request["CallAnalyticsJobName"]
         .as_str()
         .expect("every row names its job")
@@ -152,7 +156,7 @@ fn expected_language(request: &Value) -> Value {
 }
 
 /// `GetCallAnalyticsJob` for `name`.
-async fn get(transcribe: &Transcribe, name: &str) -> Reply {
+pub(crate) async fn get(transcribe: &Transcribe, name: &str) -> Reply {
     transcribe
         .call("GetCallAnalyticsJob", json!({"CallAnalyticsJobName": name}))
         .await
@@ -167,7 +171,7 @@ async fn get(transcribe: &Transcribe, name: &str) -> Reply {
 /// the same sentence for the filter and the model
 /// (`smithy_query(query="shape", shape="CallAnalyticsJobSettings")`) — so a suite that
 /// starts a job with settings creates what those settings name first.
-async fn create_named_resources(transcribe: &Transcribe) {
+pub(crate) async fn create_named_resources(transcribe: &Transcribe) {
     transcribe
         .call(
             "CreateVocabulary",
@@ -208,12 +212,12 @@ async fn create_named_resources(transcribe: &Transcribe) {
 }
 
 /// `ListCallAnalyticsJobs` with `request`.
-async fn list(transcribe: &Transcribe, request: Value) -> Reply {
+pub(crate) async fn list(transcribe: &Transcribe, request: Value) -> Reply {
     transcribe.call("ListCallAnalyticsJobs", request).await
 }
 
 /// The job names of a listing's summaries, in the order the page reported them.
-fn names_of(summaries: &Value) -> Vec<String> {
+pub(crate) fn names_of(summaries: &Value) -> Vec<String> {
     summaries
         .as_array()
         .expect("CallAnalyticsJobSummaries must be a list")

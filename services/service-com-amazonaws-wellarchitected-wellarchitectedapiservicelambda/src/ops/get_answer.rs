@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAnswer
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAnswer`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAnswer::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reads the answer to ONE question of ONE lens review of a workload — the live review,
+//! or the one a milestone recorded.
+//!
+//! A read, so it writes nothing: every member it reports about the question is either
+//! the lens's own content or derived from the answer the workload stores for it
+//! ([`crate::state::answer_projection`]), which is also what the answer list and the
+//! risk roll-up read.
 //!
 //! ## Shape of an operation
 //!
@@ -167,18 +166,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAnswer` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAnswerErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAnswer"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetAnswerErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool workload store is unavailable".to_string(),
+            })
+        })?;
+
+        let store = state.lock();
+        let live = store.workloads.get(&input.workload_id).ok_or_else(|| {
+            GetAnswerErrorModeled::ResourceNotFoundException(crate::state::workload_not_found(
+                &input.workload_id,
+            ))
+        })?;
+
+        // "A milestone records the state of a workload at a particular point in time"
+        // (`CreateMilestone` doc): a request that names one reads the answer the RECORDED
+        // workload carried, not the live one.
+        let workload = match input.milestone_number {
+            None => live,
+            Some(number) => {
+                &store
+                    .milestone(&input.workload_id, number)
+                    .ok_or_else(|| {
+                        GetAnswerErrorModeled::ResourceNotFoundException(
+                            crate::state::milestone_not_found(&input.workload_id, number),
+                        )
+                    })?
+                    .workload
+            }
+        };
+
+        // The answers of a lens review exist only while that lens is associated with the
+        // workload, so a lens the workload does not carry has no review to report.
+        if !workload.reviews_lens(&input.lens_alias) {
+            return Err(GetAnswerErrorModeled::ResourceNotFoundException(
+                crate::state::lens_review_not_found(&input.workload_id, &input.lens_alias),
+            )
+            .into());
+        }
+
+        // A question belongs to the LENS under review, so a `QuestionId` that lens does
+        // not ask names no answer of this lens review to report.
+        let question = crate::state::lens_question(&input.lens_alias, &input.question_id)
+            .ok_or_else(|| {
+                GetAnswerErrorModeled::ResourceNotFoundException(crate::state::question_not_found(
+                    &input.workload_id,
+                    &input.lens_alias,
+                    &input.question_id,
+                ))
+            })?;
+
+        Ok(GetAnswerOutput {
+            workload_id: Some(workload.workload_id.clone()),
+            // Echoed only when the request scoped the read to a milestone: a read of the
+            // live review is not a read of any milestone.
+            milestone_number: input.milestone_number,
+            // The lens as the request named it, beside the ARN it resolves to
+            // (`crate::state::...::lens_arn_of`, the one place this service resolves a
+            // lens's ARN).
+            lens_alias: Some(input.lens_alias.clone()),
+            lens_arn: Some(store.lens_arn_of(
+                &input.lens_alias,
+                &crate::state::request_region(ctx.parts()),
+            )),
+            answer: Some(crate::state::answer_projection(
+                question,
+                workload.answer(&input.lens_alias, &input.question_id),
+            )),
+        })
     }
 }

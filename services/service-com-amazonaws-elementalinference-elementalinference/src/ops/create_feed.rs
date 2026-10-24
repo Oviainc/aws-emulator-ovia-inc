@@ -328,6 +328,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "When you create the feed, this property is empty": a resource is
             // associated later, with AssociateFeed or UpdateFeed.
             association: None,
+            // No release has been served for a feed that has just been created, so there
+            // is no release for a retry to repeat yet.
+            released_resource_name: None,
             // A feed is created with no resource-based policy attached: PutFeedPolicy
             // is what attaches one, so GetFeedPolicy has nothing to report until it
             // runs.

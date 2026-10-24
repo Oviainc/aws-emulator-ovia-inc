@@ -137,8 +137,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let now = ::std::time::SystemTime::now();
+        // An environment lives in the Region it was created in, so an ARN is resolved in
+        // the Region this request was signed for and nowhere else.
+        let region = crate::state::request_region(ctx);
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             TagResourceErrorModeled::InternalServerException(InternalServerException {
@@ -153,9 +155,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the wire error code the service publishes for the tagging operations,
         // `NotFoundException` — not the name of the modeled shape (see
         // `crate::scaffolded::Scaffolded::not_found`).
-        let stored = store.environment_by_arn_mut(&resource_arn).ok_or_else(|| {
-            crate::scaffolded::Scaffolded::not_found(crate::state::RESOURCE_NOT_FOUND_MESSAGE)
-        })?;
+        let stored = store
+            .environment_by_arn_mut(&region, &resource_arn)
+            .ok_or_else(|| {
+                crate::scaffolded::Scaffolded::not_found(crate::state::RESOURCE_NOT_FOUND_MESSAGE)
+            })?;
 
         // How many DISTINCT keys the environment would end up carrying. `TagMap` is
         // `@length(1, 50)`, so a merge that would take the environment past 50 tags is a

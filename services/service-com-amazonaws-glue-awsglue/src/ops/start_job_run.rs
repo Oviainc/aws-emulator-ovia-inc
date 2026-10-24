@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartJobRun
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartJobRun`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartJobRun::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts a run of a stored job definition: the run is recorded in [`crate::state`] on
+//! the job it runs, keyed by a freshly minted `JobRunId`, and that id is what this
+//! answers with. `GetJobRun` then reports the run until it reaches a terminal
+//! `JobRunState`.
+//!
+//! The run is recorded in `STARTING`, and the clock owes it its terminal state one span
+//! later ([`crate::state::JOB_RUN_SETTLES_AFTER`]) — so a caller that polls straight
+//! after this call still sees the run in flight, and a second start of a job already at
+//! its `MaxConcurrentRuns` is refused. Because this emulator runs no job script, the
+//! state the clock owes is the modelled failure state carrying
+//! [`crate::state::JOB_RUN_NOT_EXECUTED_MESSAGE`] rather than a result nothing computed.
 //!
 //! ## Shape of an operation
 //!
@@ -215,18 +218,146 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartJobRun` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartJobRunErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartJobRun"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // An unreachable store is an internal mounting fault, reported through this
+            // operation's own server error, the same way `CreateJob` reports it.
+            return Err(StartJobRunErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue job store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // `JobName` is `@required` with `length 1..255`, and `Timeout`'s `range 1..` and
+        // the `WorkerType`/`ExecutionClass` enums are refused at the boundary — so the
+        // checks here are the ones the MODEL cannot express.
+
+        // "Jobs must have timeout values less than 7 days or 10080 minutes. Otherwise,
+        // the jobs will throw an exception." (`StartJobRun$Timeout`.)
+        if input
+            .timeout
+            .is_some_and(|timeout| timeout > crate::state::MAX_TIMEOUT_MINUTES)
+        {
+            return Err(invalid_input(format!(
+                "Timeout must be at most {} minutes",
+                crate::state::MAX_TIMEOUT_MINUTES
+            )));
+        }
+
+        // "Do not set `MaxCapacity` if using `WorkerType` and `NumberOfWorkers`": the
+        // two name the same capacity two ways, so a request carrying both is ambiguous
+        // rather than merely redundant.
+        if input.max_capacity.is_some()
+            && (input.worker_type.is_some() || input.number_of_workers.is_some())
+        {
+            return Err(invalid_input(
+                "Please do not set MaxCapacity if using WorkerType and NumberOfWorkers"
+                    .to_string(),
+            ));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        let Some(job) = store.jobs.get_mut(&input.job_name) else {
+            return Err(StartJobRunErrorModeled::EntityNotFoundException(
+                EntityNotFoundException {
+                    message: Some(format!("Job {} not found", input.job_name)),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        };
+
+        // "Only jobs with Glue version 3.0 and above and command type `glueetl` will be
+        // allowed to set `ExecutionClass` to `FLEX`": the restriction is over the command
+        // and the Glue version of the JOB being run, neither of which this request can
+        // change.
+        if input.execution_class.as_deref() == Some(crate::state::EXECUTION_CLASS_FLEX)
+            && !crate::state::admits_flex_execution_class(&job.command, &job.glue_version)
+        {
+            return Err(invalid_input(format!(
+                "ExecutionClass {} is allowed only on a {} job with Glue version {} or \
+                 above, not on a {:?} job with Glue version {}",
+                crate::state::EXECUTION_CLASS_FLEX,
+                crate::state::SPARK_ETL_COMMAND,
+                crate::state::MIN_FLEX_GLUE_VERSION,
+                job.command.name.as_deref().unwrap_or_default(),
+                job.glue_version
+            )));
+        }
+
+        // Everything the clock already owed this job's runs is materialised before they
+        // are counted, so a run the clock has already finished does not count as one in
+        // flight.
+        job.settle_due_runs(now);
+
+        // "The ID of a previous JobRun to retry": a request that names one names a run of
+        // THIS job, and the run started here is the next attempt of it.
+        let retries = match input.job_run_id.as_deref() {
+            Some(previous_run_id) => {
+                let Some(previous) = job.run(previous_run_id) else {
+                    return Err(StartJobRunErrorModeled::EntityNotFoundException(
+                        EntityNotFoundException {
+                            message: Some(format!(
+                                "Job run {previous_run_id} not found for job {}",
+                                input.job_name
+                            )),
+                            from_federation_source: None,
+                        },
+                    )
+                    .into());
+                };
+                Some((previous.id.clone(), previous.attempt))
+            }
+            None => None,
+        };
+
+        // `ExecutionProperty$MaxConcurrentRuns` is "the maximum number of concurrent runs
+        // allowed for this job", so a start that would exceed it is refused with this
+        // operation's own modelled error ("Too many jobs are being run concurrently")
+        // rather than admitted.
+        let in_flight = job.runs_in_flight();
+        let allowed = job.max_concurrent_runs();
+        if in_flight >= usize::try_from(allowed).unwrap_or(usize::MAX) {
+            return Err(
+                StartJobRunErrorModeled::ConcurrentRunsExceededException(
+                    ConcurrentRunsExceededException {
+                        message: Some(format!(
+                            "Job {} already has {in_flight} of {allowed} concurrent runs in \
+                             flight",
+                            input.job_name
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let run_id = crate::state::new_job_run_id();
+        let run = crate::state::JobRunEntry::start(job, &input, run_id.clone(), now, retries);
+        job.record_run(run);
+        ::tracing::info!(
+            operation = "StartJobRun",
+            job = %input.job_name,
+            run = %run_id,
+            "started a Glue job run"
+        );
+
+        Ok(StartJobRunOutput {
+            // "The ID assigned to this job run."
+            job_run_id: Some(run_id),
+        })
     }
+}
+
+/// This operation's modelled refusal for a request it cannot serve: "The input provided
+/// was not valid."
+fn invalid_input(message: String) -> StartJobRunError {
+    StartJobRunErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        from_federation_source: None,
+    })
+    .into()
 }

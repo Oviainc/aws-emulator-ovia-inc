@@ -25,9 +25,9 @@ use sha2::{Digest, Sha256};
 use crate::ops::types::{
     Cluster, ClusterNotFoundFault, Endpoint, Event, InvalidClusterStateFault,
     InvalidParameterCombinationException, InvalidParameterValueException, Node,
-    NotificationConfiguration, Parameter, ParameterGroup, ParameterGroupNotFoundFault,
-    ParameterGroupStatus, SSEDescription, SecurityGroupMembership, Subnet, SubnetGroup,
-    SubnetGroupNotFoundFault,
+    NotificationConfiguration, Parameter, ParameterGroup, ParameterGroupAlreadyExistsFault,
+    ParameterGroupNotFoundFault, ParameterGroupStatus, SSEDescription, SecurityGroupMembership,
+    Subnet, SubnetGroup, SubnetGroupNotFoundFault,
 };
 
 /// The region an ARN or an endpoint hostname carries when the request is unsigned and
@@ -124,15 +124,26 @@ pub const MAX_SUBNET_GROUPS: usize = 50;
 /// emulator picks the bound, as it does for [`MAX_CLUSTERS`] and [`MAX_SUBNET_GROUPS`].
 pub const MAX_PARAMETER_GROUPS: usize = 50;
 
+/// The parameter group family a service-provided parameter group belongs to: the caching
+/// software and the version of it whose defaults the group carries. AWS names a group it
+/// provides itself after the family rather than after the service alone, so the name a
+/// client reads back and passes to `CreateCluster$ParameterGroupName` is version-qualified.
+pub const DEFAULT_PARAMETER_GROUP_FAMILY: &str = "dax1.0";
+
 /// The parameter group every DAX account already has: `DescribeParameterGroups` lists it
 /// before anything has been created, it is what a cluster created without an explicit
 /// `ParameterGroupName` runs with, and `DescribeDefaultParameters` describes its
 /// parameters. It is a RESERVED name — a create cannot take it and a delete cannot remove
 /// it.
-pub const DEFAULT_PARAMETER_GROUP: &str = "default.dax";
+///
+/// The name is `default.` followed by [`DEFAULT_PARAMETER_GROUP_FAMILY`] (a `const` cannot
+/// be assembled from another `const` string, so the two are kept in step by
+/// `tests/all/dax_parameter_groups.rs`).
+pub const DEFAULT_PARAMETER_GROUP: &str = "default.dax1.0";
 
-/// The description the default parameter group carries.
-pub const DEFAULT_PARAMETER_GROUP_DESCRIPTION: &str = "Default parameter group.";
+/// The description the default parameter group carries: `Default parameter group for `
+/// followed by [`DEFAULT_PARAMETER_GROUP_FAMILY`], the family whose defaults it holds.
+pub const DEFAULT_PARAMETER_GROUP_DESCRIPTION: &str = "Default parameter group for dax1.0";
 
 /// The number of subnets one group may name, so one request cannot store an
 /// arbitrarily long identifier list that every page then re-renders. Past it the create
@@ -570,9 +581,19 @@ impl SubnetGroupRecord {
 // The system-defined parameter catalog.
 // ---------------------------------------------------------------------------
 
-/// `Parameter$Source` for a value no caller has overridden: "How the parameter is
-/// defined. For example, `system` denotes a system-defined parameter."
+/// `Parameter$Source` for a parameter the caching software's own parameter group defines:
+/// "How the parameter is defined. For example, `system` denotes a system-defined
+/// parameter." DAX publishes its two cluster parameters as `user`, which is the value each
+/// catalog entry below carries and what every read of the catalog reports.
+pub const PARAMETER_SOURCE_USER: &str = "user";
+
+/// `Parameter$Source` for a parameter defined by the service itself rather than by a
+/// parameter group — the other value the member's documentation names.
 pub const PARAMETER_SOURCE_SYSTEM: &str = "system";
+
+/// The `Source` values this service reports, so a reported `Source` can be checked
+/// against the vocabulary the member documents.
+pub const PARAMETER_SOURCES: [&str; 2] = [PARAMETER_SOURCE_SYSTEM, PARAMETER_SOURCE_USER];
 
 /// `Parameter$ParameterType` (`ParameterType` enum) for a parameter that applies to
 /// "any nodes" rather than only nodes of a particular type.
@@ -602,8 +623,12 @@ pub struct ParameterDefinition {
     /// The value the system defines for it — what a group that has never been updated
     /// reports.
     pub default_value: &'static str,
-    /// `Parameter$Description`.
+    /// `Parameter$Description`, as the catalog publishes it.
     pub description: &'static str,
+    /// `Parameter$Source`: how this parameter is defined, one of [`PARAMETER_SOURCES`].
+    /// It is a property of the catalog entry, so every read of this parameter reports the
+    /// same `Source` rather than one chosen where the parameter is projected.
+    pub source: &'static str,
     /// `Parameter$DataType`.
     pub data_type: &'static str,
     /// `Parameter$AllowedValues`: "A range of values within which the parameter can be
@@ -639,11 +664,11 @@ impl ParameterDefinition {
         }
     }
 
-    /// This parameter as the SYSTEM defines it: its default value, sourced
-    /// [`PARAMETER_SOURCE_SYSTEM`]. This is the view `DescribeDefaultParameters`
+    /// This parameter as the catalog defines it: its default value, carrying the entry's
+    /// own [`ParameterDefinition::source`]. This is the view `DescribeDefaultParameters`
     /// reports, and the one a group that has never been updated carries.
     pub fn default_view(&self) -> Parameter {
-        self.view(self.default_value, PARAMETER_SOURCE_SYSTEM)
+        self.view(self.default_value, self.source)
     }
 }
 
@@ -655,12 +680,14 @@ impl ParameterDefinition {
 /// document exactly two DAX cluster parameters — `query-ttl-millis`, the time to live
 /// for the query cache, and `record-ttl-millis`, the time to live for the item cache —
 /// each a duration in milliseconds, each defaulting to 300000 (five minutes), each
-/// modifiable by the customer and applied to the cluster without a node reboot.
+/// modifiable by the customer and applied to the cluster without a node reboot; the
+/// description and `Source` of each are the ones DAX publishes for that entry.
 pub const DEFAULT_PARAMETERS: &[ParameterDefinition] = &[
     ParameterDefinition {
         name: "query-ttl-millis",
         default_value: "300000",
         description: "Duration in milliseconds for queries to remain cached",
+        source: PARAMETER_SOURCE_USER,
         data_type: DATA_TYPE_INTEGER,
         allowed_values: "0-",
         is_modifiable: IS_MODIFIABLE_TRUE,
@@ -669,7 +696,9 @@ pub const DEFAULT_PARAMETERS: &[ParameterDefinition] = &[
     ParameterDefinition {
         name: "record-ttl-millis",
         default_value: "300000",
-        description: "Duration in milliseconds for records to remain cached",
+        description: "Duration in milliseconds for records to remain valid in cache \
+                      (Default: 0 = infinite)",
+        source: PARAMETER_SOURCE_USER,
         data_type: DATA_TYPE_INTEGER,
         allowed_values: "0-",
         is_modifiable: IS_MODIFIABLE_TRUE,
@@ -1072,5 +1101,14 @@ pub fn events_beyond_retention() -> InvalidParameterCombinationException {
 pub fn parameter_group_not_found() -> ParameterGroupNotFoundFault {
     ParameterGroupNotFoundFault {
         message: Some(parameter_group_not_found_message()),
+    }
+}
+
+/// `ParameterGroupAlreadyExistsFault` for a name this store already holds. Like this
+/// service's other parameter-group fault the template is generic: the name the request
+/// carried is NOT echoed back.
+pub fn parameter_group_already_exists() -> ParameterGroupAlreadyExistsFault {
+    ParameterGroupAlreadyExistsFault {
+        message: Some("Parameter Group already exists.".to_string()),
     }
 }

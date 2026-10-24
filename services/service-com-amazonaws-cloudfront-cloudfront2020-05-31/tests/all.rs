@@ -79,5 +79,7 @@ mod streaming_distribution_list;
 mod tag_resource;
 #[path = "all/tenant_distribution_and_method_order.rs"]
 mod tenant_distribution_and_method_order;
+#[path = "all/tenant_invalidations.rs"]
+mod tenant_invalidations;
 #[path = "all/web_acl_association.rs"]
 mod web_acl_association;
