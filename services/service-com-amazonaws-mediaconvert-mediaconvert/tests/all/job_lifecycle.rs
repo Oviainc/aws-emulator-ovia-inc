@@ -758,7 +758,19 @@ async fn create_job_persists_its_input_and_get_job_reads_it_back() {
     let created_template = emulator
         .create_job_template(json!({
             "name": "my-template",
-            "settings": { "inputs": [{ "timecodeSource": "ZEROBASED" }] }
+            // A graph a job can be built from: `JobTemplateSettings` needs an output
+            // group, so the fixture states one rather than inputs alone.
+            "settings": {
+                "inputs": [{ "timecodeSource": "ZEROBASED" }],
+                "outputGroups": [{
+                    "name": "File Group",
+                    "outputs": [{ "nameModifier": "_tpl" }],
+                    "outputGroupSettings": {
+                        "type": "FILE_GROUP_SETTINGS",
+                        "fileGroupSettings": { "destination": "s3://example-bucket/out/" }
+                    }
+                }]
+            }
         }))
         .await;
     assert_eq!(

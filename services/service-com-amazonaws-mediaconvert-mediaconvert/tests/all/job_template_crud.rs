@@ -154,11 +154,11 @@ async fn a_created_job_template_reads_back_through_get() {
             groups: 1,
         },
         Row {
-            case: "three inputs and two output groups",
-            request: json!({ "name": "wide", "settings": settings(3, 2) }),
+            case: "the one input a template may carry and three output groups",
+            request: json!({ "name": "wide", "settings": settings(1, 3) }),
             expected: json!({ "name": "wide" }),
-            inputs: 3,
-            groups: 2,
+            inputs: 1,
+            groups: 3,
         },
         Row {
             case: "a queue referenced by name",
@@ -404,7 +404,7 @@ async fn a_name_already_in_use_returns_the_stored_template() {
         ),
         (
             "a different description",
-            json!({ "name": "taken", "description": "the second one", "settings": settings(2, 2) }),
+            json!({ "name": "taken", "description": "the second one", "settings": settings(1, 2) }),
         ),
     ] {
         let again = emulator.create_job_template(request).await;
@@ -652,9 +652,9 @@ async fn an_update_replaces_only_the_members_it_names_and_reflects_in_get() {
         },
         UpdateRow {
             case: "wholly new settings",
-            update: json!({ "settings": settings(2, 3) }),
+            update: json!({ "settings": settings(1, 3) }),
             changed: json!({}),
-            inputs: 2,
+            inputs: 1,
             groups: 3,
         },
         UpdateRow {
@@ -873,7 +873,7 @@ async fn deleting_a_job_template_removes_only_that_template() {
 
         // And the name is free again, so a create under it succeeds.
         let recreated = emulator
-            .create_job_template(json!({ "name": target, "settings": settings(2, 1) }))
+            .create_job_template(json!({ "name": target, "settings": settings(1, 2) }))
             .await;
         assert_eq!(
             recreated.status, 201,

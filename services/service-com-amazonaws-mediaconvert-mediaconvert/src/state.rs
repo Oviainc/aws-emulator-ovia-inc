@@ -916,6 +916,78 @@ pub fn job_settings_problem(
     None
 }
 
+/// How many entries `JobTemplateSettings$Inputs` can carry.
+///
+/// From the member itself: "There can only be one input in a job template. Using the API,
+/// you can include multiple inputs when referencing a job template." The extra inputs are
+/// the JOB's to state, so the bound is on what a template stores, not on what a job built
+/// from one may carry.
+pub const MAX_JOB_TEMPLATE_INPUTS: usize = 1;
+
+/// Why a `JobTemplateSettings` graph is not a set of encoding instructions this service
+/// can store.
+///
+/// `JobTemplateSettings` is "all the transcode settings saved in the template that will be
+/// applied to jobs created from it", so the graph a template stores has to be one jobs can
+/// be created from. Two members of it decide that:
+///
+/// * `OutputGroups` "contains one group of settings for each set of outputs" — a template
+///   with none describes nothing to write, and neither does any job that takes its outputs
+///   from it (see [`job_settings_problem`], which refuses exactly that job);
+/// * `Inputs` states the cardinality: "There can only be one input in a job template."
+///
+/// Either way the request states a graph the service cannot save, which is the modelled
+/// `BadRequestException` (400) rather than a stored template.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobTemplateSettingsProblem {
+    /// Nothing supplies an output group, so the template names no outputs.
+    NoOutputGroups,
+    /// More inputs than a job template can hold, with the count the request carried.
+    TooManyInputs(usize),
+}
+
+impl JobTemplateSettingsProblem {
+    /// The refusal's wording: the settings member at fault and the rule it broke, built
+    /// from the request's own members as every member-naming refusal in this crate is
+    /// (see [`not_found_message`]).
+    pub fn message(self) -> String {
+        match self {
+            Self::NoOutputGroups => format!(
+                "{} Your job template settings must specify at least one entry in \
+                 OutputGroups: use OutputGroups to define each set of outputs that jobs \
+                 created from this template produce.",
+                invalid_value_sentence("settings")
+            ),
+            Self::TooManyInputs(count) => format!(
+                "{} There can only be {MAX_JOB_TEMPLATE_INPUTS} input in a job template, \
+                 and Inputs carries {count}; include the additional inputs on each job \
+                 that references the template.",
+                invalid_value_sentence("settings")
+            ),
+        }
+    }
+}
+
+/// What is wrong with the settings graph a request asks this service to SAVE in a job
+/// template, or `None` when the graph is one jobs can be created from.
+///
+/// Every door into a stored job template takes this test — creating one and updating one —
+/// so a template cannot be stored, or left, in a state no job can be built from. An absent
+/// list and an empty list are the same thing, exactly as in [`job_settings_problem`]: a
+/// list with no entries supplies nothing.
+pub fn job_template_settings_problem(
+    settings: &JobTemplateSettings,
+) -> Option<JobTemplateSettingsProblem> {
+    let inputs = settings.inputs.iter().flatten().count();
+    if inputs > MAX_JOB_TEMPLATE_INPUTS {
+        return Some(JobTemplateSettingsProblem::TooManyInputs(inputs));
+    }
+    if settings.output_groups.iter().flatten().count() == 0 {
+        return Some(JobTemplateSettingsProblem::NoOutputGroups);
+    }
+    None
+}
+
 /// The resource-type prefixes a MediaConvert resource ARN can carry.
 ///
 /// `TagResource`'s own documentation: "Add tags to a MediaConvert queue, preset, job, or

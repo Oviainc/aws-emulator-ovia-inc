@@ -260,6 +260,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // The graph itself takes the test every stored template's graph takes, on this
+        // door as on `UpdateJobTemplate`: a template is "all the transcode settings ...
+        // that will be applied to jobs created from it", so one jobs cannot be built from
+        // is the modelled 400 rather than a stored record. Refused before the store is
+        // reached, so nothing is persisted — including for a name already in use, whose
+        // idempotent return is an answer to a request this one is not.
+        if let Some(problem) = crate::state::job_template_settings_problem(&input.settings) {
+            return Err(CreateJobTemplateErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(problem.message()),
+                },
+            )
+            .into());
+        }
 
         // "A name you create for each job template. Each name must be unique within your
         // account." A create under a name that is already in use does NOT conflict: see
