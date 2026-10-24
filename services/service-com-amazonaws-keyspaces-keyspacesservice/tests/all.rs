@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/column_types_and_auto_scaling.rs"]
 mod column_types_and_auto_scaling;
+#[path = "all/delete_table_in_flight.rs"]
+mod delete_table_in_flight;
 #[path = "all/get_keyspace.rs"]
 mod get_keyspace;
 #[path = "all/keyspace_table_lifecycle.rs"]

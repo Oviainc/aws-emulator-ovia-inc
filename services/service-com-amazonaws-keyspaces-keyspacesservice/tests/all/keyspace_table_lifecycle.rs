@@ -703,8 +703,9 @@ async fn deleting_a_table_and_its_keyspace_is_observable_by_the_next_call() {
     }
 
     // "If a table is either in the CREATING or UPDATING states, then Amazon Keyspaces
-    // returns a ResourceInUseException" — a shape this model does not declare, so the
-    // claim lands on the ConflictException it does declare.
+    // returns a ResourceInUseException" — the code this operation's documentation names,
+    // even though the model declares no such shape. The full table of in-flight statuses
+    // is in `tests/all/delete_table_in_flight.rs`.
     assert_failure(
         "delete a table that is still CREATING",
         emulator
@@ -713,8 +714,8 @@ async fn deleting_a_table_and_its_keyspace_is_observable_by_the_next_call() {
                 json!({"keyspaceName": keyspace, "tableName": "doomed_tbl"}),
             )
             .await,
-        409,
-        "ConflictException",
+        400,
+        "ResourceInUseException",
     );
     let refused = assert_ok(
         "the refused delete left the table alone",
