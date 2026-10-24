@@ -1785,6 +1785,131 @@ mod tests {
         );
     }
 
+    /// Every minted export-task id matches the modelled `ExportTaskId` pattern
+    /// `^t-[a-z0-9]{10}$` and no id repeats — the same contract the graph-id generator
+    /// has, over the generator this slice added.
+    #[test]
+    fn minted_export_task_ids_match_the_modelled_pattern_and_are_unique() {
+        let mut state = ComAmazonawsNeptunegraphAmazonneptunegraphState::default();
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..2_000 {
+            let id = state.next_export_task_id();
+            assert!(
+                is_export_task_id(&id),
+                "id {id:?}: expected a match for ^t-[a-z0-9]{{10}}$"
+            );
+            assert!(seen.insert(id.clone()), "id {id:?}: minted twice");
+        }
+    }
+
+    /// An export task's terminal status is owed by the CLOCK, not by the read: it
+    /// reports `INITIALIZING` until the span has passed, then `FAILED` carrying
+    /// [`EXPORT_NOT_PERFORMED_REASON`], and settling again changes nothing.
+    ///
+    /// The rows span the instants a read can fall on, including the span's own bound
+    /// and one tick short of it, so the transient status cannot be skipped.
+    #[test]
+    fn an_export_task_settles_into_the_modelled_failure_state() {
+        let now = Instant::now();
+        let tick = Duration::from_millis(1);
+        let task_at = |started: Instant| ExportTask {
+            id: "t-0123456789".to_string(),
+            arn: "arn:aws:neptune-graph:us-east-1:000000000000:export-task/t-0123456789"
+                .to_string(),
+            source_graph_id: "g-0000000000".to_string(),
+            role_arn: "arn:aws:iam::000000000000:role/NeptuneExportRole".to_string(),
+            format: "CSV".to_string(),
+            parquet_type: None,
+            destination: "s3://export-bucket/nightly".to_string(),
+            kms_key_identifier:
+                "arn:aws:kms:us-east-1:000000000000:key/12345678-1234-1234-1234-123456789012"
+                    .to_string(),
+            export_filter: None,
+            status: ExportTaskStatus::Initializing,
+            status_reason: None,
+            tags: BTreeMap::new(),
+            start_time: SystemTime::now(),
+            started_at: started,
+            settles_at: Some(started + EXPORT_TASK_SPAN),
+        };
+
+        // (case, when the task is read, whether the terminal status is due by then)
+        let cases: &[(&str, Duration, bool)] = &[
+            ("read at once", Duration::ZERO, false),
+            ("read one tick in", tick, false),
+            ("read one tick before the span is out", EXPORT_TASK_SPAN - tick, false),
+            ("read when the span is out", EXPORT_TASK_SPAN, true),
+            ("read a span later", EXPORT_TASK_SPAN * 2, true),
+        ];
+        for (case, after, terminal) in cases {
+            let mut task = task_at(now);
+            task.settle(now + *after);
+            let expected = if *terminal {
+                ExportTaskStatus::Failed
+            } else {
+                ExportTaskStatus::Initializing
+            };
+            assert_eq!(
+                task.status, expected,
+                "case {case:?}: expected {expected:?}, got {:?}",
+                task.status
+            );
+            let expected_reason = if *terminal {
+                Some(EXPORT_NOT_PERFORMED_REASON.to_string())
+            } else {
+                None
+            };
+            assert_eq!(
+                task.status_reason, expected_reason,
+                "case {case:?}: expected the reason {expected_reason:?}, got {:?}",
+                task.status_reason
+            );
+            assert_eq!(
+                task.elapsed_seconds(now + *after),
+                after.as_secs() as i64,
+                "case {case:?}: expected the whole seconds since the task started, got {}",
+                task.elapsed_seconds(now + *after)
+            );
+
+            // Settling again at the same instant leaves the record where it is: the
+            // transition is owed once, and a read never moves a record on by itself.
+            task.settle(now + *after);
+            assert_eq!(
+                task.status, expected,
+                "case {case:?}: a second settle must not change the status, expected \
+                 {expected:?}, got {:?}",
+                task.status
+            );
+        }
+    }
+
+    /// `destination` is an Amazon S3 URI: the `s3://` scheme and a bucket. The rows
+    /// span the scheme (absent, another one, upper-cased), the bucket segment (named,
+    /// missing, empty) and the key prefix.
+    #[test]
+    fn is_s3_uri_accepts_only_an_amazon_s3_uri() {
+        for (candidate, accepted) in [
+            ("s3://export-bucket", true),
+            ("s3://export-bucket/key", true),
+            ("s3://export-bucket/a/b/c", true),
+            ("s3://export.bucket.with.dots/prefix", true),
+            ("s3://a", true),
+            ("s3://", false),
+            ("s3:///key", false),
+            ("export-bucket/key", false),
+            ("https://export-bucket.s3.amazonaws.com/key", false),
+            ("file:///tmp/export-bucket", false),
+            ("S3://export-bucket", false),
+            ("", false),
+        ] {
+            let actual = is_s3_uri(candidate);
+            assert_eq!(
+                actual, accepted,
+                "case {candidate:?}: expected accepted={accepted}, got {actual}"
+            );
+        }
+    }
+
     /// The id shape test, over values that break each clause of the pattern.
     #[test]
     fn is_graph_id_rejects_anything_the_modelled_pattern_rejects() {
