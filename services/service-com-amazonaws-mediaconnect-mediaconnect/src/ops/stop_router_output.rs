@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StopRouterOutput
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StopRouterOutput`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StopRouterOutput::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Stops the router output the request's `@httpLabel Arn` addresses: the STORED record
+//! enters the non-terminal `STOPPING` state and the clock settles it into `STANDBY` one
+//! [`crate::state::TRANSITION_SPAN`] later, so a caller reading the output straight
+//! afterwards still sees the stop in flight. An output that is already stopped, or already
+//! stopping, keeps the state it is in; one the clock still owes a DIFFERENT change (a
+//! create or a reconfiguration still settling, a delete already accepted) is refused with
+//! the modelled `ConflictException`, the same precondition
+//! [`crate::ops::restart_router_input`] applies.
 //!
 //! ## Shape of an operation
 //!
@@ -163,18 +163,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StopRouterOutput` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StopRouterOutputErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StopRouterOutputErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: "the mediaconnect router output store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The state changes the clock already owes are materialised before the stop is
+        // judged — including the completion of an earlier delete, which is what makes a
+        // router output whose deletion has finished a not-found rather than something this
+        // call can still stop.
+        store.settle_due_transitions(now);
+
+        let Some(router_output) = store.router_outputs.get_mut(&input.arn) else {
+            return Err(StopRouterOutputErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: crate::state::not_found_message(&input.arn),
+                },
+            )
+            .into());
+        };
+
+        // A stop MOVES the output's state, so it cannot be accepted for an output that is
+        // not one a later call can still act on, or one the clock already owes a DIFFERENT
+        // state (a create or a reconfiguration still settling): the output is on its way out
+        // or between two states, which is the conflict `ConflictException` describes ("would
+        // cause a conflict with the current state of a service resource associated with the
+        // request", 409 and retryable — the caller retries once the transition it is waiting
+        // on has settled). The status and the error code are the contract; the sentence
+        // states the precondition.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StopRouterOutput"))
+        // The on-its-way-out case is judged FIRST, before the already-stopped one below, so
+        // an output whose removal is owed is refused whatever state it is reported in rather
+        // than answered as a stop that succeeded.
+        let conflict = |router_output: &crate::state::StoredRouterOutput| {
+            StopRouterOutputErrorModeled::ConflictException(ConflictException {
+                message: format!(
+                    "Router output {} is in state {} and a state change is already in \
+                     progress, so it cannot be stopped yet.",
+                    router_output.arn, router_output.state
+                ),
+            })
+        };
+        if router_output.is_deleting() {
+            return Err(conflict(router_output).into());
+        }
+
+        // A router output that is already stopped, or already on its way there, keeps the
+        // state it is in: a repeat of the stop answers the same thing rather than restarting
+        // the transition the first one began.
+        let already_stopped = router_output.state == crate::state::ROUTER_OUTPUT_STATE_STANDBY
+            || router_output.state == crate::state::ROUTER_OUTPUT_STATE_STOPPING;
+
+        if !already_stopped {
+            if router_output.is_transitioning() {
+                return Err(conflict(router_output).into());
+            }
+
+            // Stopping is not instantaneous: the output reports `STOPPING` and the clock
+            // owes it `STANDBY` — not carrying content, where a created output also waits —
+            // one transition span later.
+            router_output.begin_transition(
+                crate::state::ROUTER_OUTPUT_STATE_STOPPING,
+                crate::state::ROUTER_OUTPUT_STATE_STANDBY,
+                now,
+            );
+            // The stop changed the resource, so the record's `UpdatedAt` moves with it.
+            router_output.updated_at = now;
+        }
+
+        // The response is the STORED record: "the current state of the router output after
+        // being stopped".
+        Ok(StopRouterOutputOutput {
+            arn: router_output.arn.clone(),
+            name: router_output.name.clone(),
+            state: router_output.state.clone(),
+        })
     }
 }

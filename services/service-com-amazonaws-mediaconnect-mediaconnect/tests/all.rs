@@ -65,6 +65,8 @@ mod router_input_restart;
 mod router_network_interfaces;
 #[path = "all/router_output_lifecycle.rs"]
 mod router_output_lifecycle;
+#[path = "all/router_output_stop.rs"]
+mod router_output_stop;
 #[path = "all/router_outputs.rs"]
 mod router_outputs;
 #[path = "all/state_roundtrip.rs"]

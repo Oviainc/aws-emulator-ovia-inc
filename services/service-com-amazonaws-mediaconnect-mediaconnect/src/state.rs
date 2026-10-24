@@ -2131,13 +2131,29 @@ pub const ROUTER_INPUT_TYPE_MEDIALIVE_CHANNEL: &str = "MEDIALIVE_CHANNEL";
 /// The `RouterOutputState` enum the model declares for a router output
 /// (`smithy_query(query="shape",shape="RouterOutputState")`: CREATING | STANDBY | STARTING
 /// | ACTIVE | STOPPING | DELETING | UPDATING | ERROR | RECOVERING | MIGRATING). Only the
-/// two a router output's creation reaches, the one its reconfiguration passes through and
-/// the one its deletion reaches are named here; the rest belong to operations that are
-/// still scaffolded.
+/// states a router output's creation, stop, reconfiguration and deletion reach are named
+/// here; the rest belong to operations that are still scaffolded.
 pub const ROUTER_OUTPUT_STATE_CREATING: &str = "CREATING";
 /// See [`ROUTER_OUTPUT_STATE_CREATING`]. A router output that finished being created is
-/// not carrying content yet: it waits in `STANDBY` until StartRouterOutput.
+/// not carrying content yet: it waits in `STANDBY` until StartRouterOutput — and it is
+/// where a STOPPED output settles, because stopping an output is what returns it to not
+/// carrying content (see [`ROUTER_OUTPUT_STATE_STOPPING`]).
 pub const ROUTER_OUTPUT_STATE_STANDBY: &str = "STANDBY";
+/// See [`ROUTER_OUTPUT_STATE_CREATING`]. The state of a router output that is carrying
+/// content — what StartRouterOutput (still scaffolded) settles an output into, and the
+/// state StopRouterOutput takes it out of.
+pub const ROUTER_OUTPUT_STATE_ACTIVE: &str = "ACTIVE";
+/// See [`ROUTER_OUTPUT_STATE_CREATING`]. The non-terminal state a router output is
+/// answered in while a stop is in flight: StopRouterOutput accepts the stop and the clock
+/// settles the output into [`ROUTER_OUTPUT_STATE_STANDBY`] one [`TRANSITION_SPAN`] later,
+/// so a caller reading the output straight after the stop still sees it stopping.
+pub const ROUTER_OUTPUT_STATE_STOPPING: &str = "STOPPING";
+/// See [`ROUTER_OUTPUT_STATE_CREATING`]. The settled state of a router output that is not
+/// carrying content because something is wrong with it. Nothing in this emulator PUTS an
+/// output here (there is no data plane to fail), so it is reached only by a caller seeding
+/// the store — the same way [`ROUTER_INPUT_STATE_ERROR`] is; a stop takes an output out of
+/// it like any other settled state.
+pub const ROUTER_OUTPUT_STATE_ERROR: &str = "ERROR";
 /// See [`ROUTER_OUTPUT_STATE_CREATING`]. The transient state an output is RECONFIGURED in:
 /// UpdateRouterOutput answers `202 Accepted`, so the settings it accepted are not in effect
 /// the instant it answers, and the clock settles the output back into the state it was
@@ -2925,14 +2941,24 @@ impl StoredRouterOutput {
     }
 
     /// Enter `transient` now and owe `settled` once [`TRANSITION_SPAN`] has passed — the
-    /// router output counterpart of [`StoredFlow::begin_transition`], so every state a
-    /// router output is answered in while the clock still owes a change is started one way.
+    /// router output counterpart of [`StoredFlow::begin_transition`] and
+    /// [`StoredRouterInput::begin_transition`], so every state a router output is answered
+    /// in while the clock still owes a change is started one way.
     pub fn begin_transition(&mut self, transient: &str, settled: &str, now: SystemTime) {
         self.state = transient.to_string();
         self.pending = Some(PendingStatus {
             status: settled.to_string(),
             due_at: now + TRANSITION_SPAN,
         });
+    }
+
+    /// Whether a state change is in flight for this output: the clock still owes it one, so
+    /// the output is between two states rather than settled in one — including the deletion
+    /// it owes once DeleteRouterOutput has accepted one, because an output on its way out is
+    /// not an output a later call can still act on. The router output counterpart of
+    /// [`StoredRouterInput::is_transitioning`].
+    pub fn is_transitioning(&self) -> bool {
+        self.pending.is_some() || self.is_deleting()
     }
 
     /// The state this output is heading for: the one the clock already owes it, or the one
