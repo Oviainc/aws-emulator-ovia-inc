@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAnomalousLogGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAnomalousLogGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAnomalousLogGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the log groups DevOps Guru's log anomaly detection found log anomalies in
+//! for ONE insight: the page of
+//! [`crate::state::ComAmazonawsDevopsguruCapstonecontrolplaneserviceState::anomalous_log_groups`]
+//! the request's `InsightId` keys, in the store's stable `LogGroupName` order. An
+//! `InsightId` the store holds no insight under names no insight and is refused with
+//! `ResourceNotFoundException`, the same rule `DescribeInsight` applies to the same
+//! map. It is a REPORTING operation: it never writes.
 //!
 //! ## Shape of an operation
 //!
@@ -90,6 +89,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The largest page this operation serves, from `ListAnomalousLogGroupsMaxResults`'s
+/// modelled range of 1..200.
+const MAX_RESULTS_CEILING: usize = 200;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -162,18 +165,79 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAnomalousLogGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAnomalousLogGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAnomalousLogGroups"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListAnomalousLogGroupsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the DevOps Guru insight store is unavailable".to_string(),
+                    retry_after_seconds: 0,
+                },
+            )
+            .into());
+        };
+
+        // A caller may ask for a smaller page than the service's own default; the
+        // ceiling is the modelled maximum of `ListAnomalousLogGroupsMaxResults`,
+        // which the boundary validator has already enforced, so the clamp only keeps
+        // the page size sane if that constraint ever widens.
+        let page_size = input.max_results.map_or(crate::state::PAGE_SIZE, |requested| {
+            (requested as usize).clamp(1, MAX_RESULTS_CEILING)
+        });
+
+        let store = state.lock();
+        // The log groups are reported FOR an insight, so an id the store holds no
+        // insight under names no insight at all — the same refusal `DescribeInsight`
+        // gives for that id, rather than an empty page that would claim the insight
+        // exists and simply has no anomalous logs.
+        if !store.insights.contains_key(&input.insight_id) {
+            return Err(ListAnomalousLogGroupsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("no insight with id {} exists", input.insight_id),
+                    resource_id: input.insight_id.clone(),
+                    resource_type: crate::state::INSIGHT_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // An insight whose logs analysis flagged nothing in holds no entry, which is
+        // an empty list rather than a refusal: the insight exists either way.
+        let log_groups: Vec<AnomalousLogGroup> = store
+            .anomalous_log_groups
+            .get(&input.insight_id)
+            .map(|per_log_group| {
+                per_log_group
+                    .values()
+                    .map(crate::state::AnomalousLogGroupRecord::to_anomalous_log_group)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // A token names an offset into ONE insight's log groups, so it is scoped to
+        // that insight and does not resolve against another's.
+        let (page, next_token) = crate::state::page_sized(
+            &log_groups,
+            &format!("ListAnomalousLogGroups/{}", input.insight_id),
+            input.next_token.as_deref(),
+            page_size,
+        )
+        .ok_or_else(|| -> ListAnomalousLogGroupsError {
+            ListAnomalousLogGroupsErrorModeled::ValidationException(
+                crate::state::FilterRejection::stale_cursor(
+                    "ListAnomalousLogGroups",
+                    "the anomalous log groups of this insight",
+                    "InsightId",
+                )
+                .validation_exception(),
+            )
+            .into()
+        })?;
+
+        Ok(ListAnomalousLogGroupsOutput {
+            // The insight the reported log groups belong to: the one asked for.
+            insight_id: input.insight_id,
+            anomalous_log_groups: page,
+            next_token,
+        })
     }
 }

@@ -23,14 +23,20 @@
 //! in [`ComAmazonawsDevopsguruCapstonecontrolplaneserviceState::anomalies`], which
 //! `DescribeAnomaly` reads under the same rule: an `AnomalyId` the map does not hold
 //! names no anomaly and is refused with `ResourceNotFoundException`.
+//!
+//! The LOG anomalies that analysis found in the covered resources' CloudWatch logs
+//! have the same provenance again, and live in
+//! [`ComAmazonawsDevopsguruCapstonecontrolplaneserviceState::anomalous_log_groups`],
+//! which `ListAnomalousLogGroups` reports for the insight they belong to.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AccountInsightHealth, AnomalyReportedTimeRange, AnomalyResource, AnomalySourceDetails,
-    AnomalySourceMetadata, AnomalyTimeRange, CloudFormationCollection, CloudFormationHealth,
-    CloudWatchMetricsDetail, InsightHealth, InsightTimeRange, ListInsightsStatusFilter,
+    AccountInsightHealth, AnomalousLogGroup, AnomalyReportedTimeRange, AnomalyResource,
+    AnomalySourceDetails, AnomalySourceMetadata, AnomalyTimeRange, CloudFormationCollection,
+    CloudFormationHealth, CloudWatchMetricsDetail, InsightHealth, InsightTimeRange,
+    ListInsightsStatusFilter, LogAnomalyShowcase,
     MonitoredResourceIdentifier, PerformanceInsightsMetricsDetail, PredictionTimeRange,
     ProactiveAnomaly, ProactiveInsight, ProactiveInsightSummary,
     ProactiveOrganizationInsightSummary, ReactiveAnomaly, ReactiveInsight, ReactiveInsightSummary,
@@ -92,6 +98,20 @@ pub struct ComAmazonawsDevopsguruCapstonecontrolplaneserviceState {
     /// [`AnomalyRecord::associated_insight_id`], which is the link `DeleteInsight`
     /// follows when it deletes "the insight along with the associated anomalies".
     pub anomalies: BTreeMap<String, AnomalyRecord>,
+    /// The log groups DevOps Guru's log anomaly detection found log anomalies in,
+    /// keyed by the `InsightId` whose anomalous behaviour those log anomalies belong
+    /// to and then by `LogGroupName`.
+    ///
+    /// The same provenance as [`Self::insights`] and [`Self::anomalies`]: the log
+    /// anomalies are found by DevOps Guru's own analysis of the covered resources'
+    /// CloudWatch logs, so no modelled operation mints one and this map is what that
+    /// analysis writes and `ListAnomalousLogGroups` reports. It stays empty on an
+    /// emulator over which no analysis ran, so the read over it reports nothing
+    /// rather than inventing a log group, and one log group is reported at most once
+    /// per insight because the inner map is keyed by its name. `BTreeMap` at both
+    /// levels because the read pages over the inner one: the key order is stable,
+    /// which is what a page cursor needs.
+    pub anomalous_log_groups: BTreeMap<String, BTreeMap<String, AnomalousLogGroupRecord>>,
     /// The account that administers DevOps Guru for the organization this store
     /// records, if any.
     ///
@@ -265,6 +285,10 @@ impl ComAmazonawsDevopsguruCapstonecontrolplaneserviceState {
         self.anomalies.retain(|_, anomaly| {
             anomaly.associated_insight_id.as_deref() != Some(insight_id)
         });
+        // The log anomalies rolled into the deleted insight are part of that same
+        // cascade: they are anomalies of the insight, keyed by it, so the log groups
+        // they were found in are no longer reported for it.
+        self.anomalous_log_groups.remove(insight_id);
         Some(removed)
     }
 }
@@ -870,6 +894,46 @@ impl AnomalyRecord {
 
     fn wire_anomaly_resources(&self) -> Option<Vec<AnomalyResource>> {
         (!self.anomaly_resources.is_empty()).then(|| self.anomaly_resources.clone())
+    }
+}
+
+/// One log group DevOps Guru found log anomalies in, as `ListAnomalousLogGroups`
+/// reports it.
+///
+/// Holds every member the modelled `AnomalousLogGroup` carries. The showcases are
+/// kept as the modelled shape, the way [`AnomalyRecord`] keeps its source details:
+/// clustering anomalous log events is the analysis's own output, so the store keeps
+/// what it produced rather than a second encoding of it.
+#[derive(Debug, Clone, Default)]
+pub struct AnomalousLogGroupRecord {
+    /// `InsightId` — the outer map key, repeated here so a record is self-contained.
+    pub insight_id: String,
+    /// `LogGroupName` — the inner map key, repeated for the same reason.
+    pub log_group_name: String,
+    /// `ImpactStartTime`: when the log anomalies in this log group began. Absent when
+    /// the analysis placed no start on the impact.
+    pub impact_start_time_millis: Option<i64>,
+    /// `ImpactEndTime`: when they ended, absent while the impact is still open.
+    pub impact_end_time_millis: Option<i64>,
+    /// `NumberOfLogLinesScanned`: how many log lines the analysis read in this log
+    /// group. Zero is the modelled default.
+    pub number_of_log_lines_scanned: i32,
+    /// `LogAnomalyShowcases`: the clusters of similar anomalous log events found in
+    /// this log group. Empty when the analysis showcased none.
+    pub log_anomaly_showcases: Vec<LogAnomalyShowcase>,
+}
+
+impl AnomalousLogGroupRecord {
+    /// This record as the modelled `AnomalousLogGroup` the read reports.
+    pub fn to_anomalous_log_group(&self) -> AnomalousLogGroup {
+        AnomalousLogGroup {
+            log_group_name: Some(self.log_group_name.clone()),
+            impact_start_time: self.impact_start_time_millis.map(timestamp),
+            impact_end_time: self.impact_end_time_millis.map(timestamp),
+            number_of_log_lines_scanned: self.number_of_log_lines_scanned,
+            log_anomaly_showcases: (!self.log_anomaly_showcases.is_empty())
+                .then(|| self.log_anomaly_showcases.clone()),
+        }
     }
 }
 
