@@ -51,6 +51,8 @@ mod function_version_listing;
 mod layer_listing;
 #[path = "all/layer_version_listing.rs"]
 mod layer_version_listing;
+#[path = "all/layer_version_permissions.rs"]
+mod layer_version_permissions;
 #[path = "all/layer_versions.rs"]
 mod layer_versions;
 #[path = "all/policy_versions_and_resources.rs"]

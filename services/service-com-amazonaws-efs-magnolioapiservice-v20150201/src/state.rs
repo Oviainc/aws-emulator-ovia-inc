@@ -31,7 +31,10 @@ pub const LIFE_CYCLE_CREATING: &str = "creating";
 /// See [`LIFE_CYCLE_CREATING`].
 pub const LIFE_CYCLE_AVAILABLE: &str = "available";
 /// See [`LIFE_CYCLE_CREATING`]. The phase a file system is in while a change the
-/// service applies in the background — a throughput change — is still settling.
+/// service applies in the background — a throughput change — is still settling, and
+/// `UpdateFileSystem`'s `IncorrectFileSystemLifeCycleState` is "returned if the file
+/// system's lifecycle state is not available", so a second change cannot start while
+/// one is in flight.
 pub const LIFE_CYCLE_UPDATING: &str = "updating";
 /// See [`LIFE_CYCLE_CREATING`]. The phase a resource a delete was accepted for is in
 /// until that deletion completes: `DeleteAccessPoint` documents that "after deletion is
