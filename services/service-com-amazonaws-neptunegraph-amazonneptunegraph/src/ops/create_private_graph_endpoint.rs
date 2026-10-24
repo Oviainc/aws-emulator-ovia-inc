@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePrivateGraphEndpoint
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePrivateGraphEndpoint`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePrivateGraphEndpoint::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints and persists the private graph endpoint of one graph in one VPC,
+//! and reports the stored record.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +154,132 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePrivateGraphEndpoint` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePrivateGraphEndpointErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePrivateGraphEndpoint"))
+        // The record this call stores is built from the request alone: an endpoint
+        // carries no ARN and no region-scoped identifier, so nothing here reads `ctx`.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreatePrivateGraphEndpointErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the neptune-graph store is not mounted on this engine"
+                            .to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `vpcId` and `subnetIds` are optional on the wire because the real service
+        // defaults them from the account's VPC inventory — the default VPC, and the
+        // subnets of the VPC the endpoint is created in. This emulator holds no VPC
+        // inventory, and `subnetIds` is a REQUIRED output member, so defaulting them
+        // would mean inventing a VPC and subnets that exist nowhere. The facet this
+        // emulator cannot perform is reported as the 501 it has not been written for,
+        // rather than answered with fabricated ids; a request that names both is served
+        // in full below.
+        let (Some(vpc_id), Some(subnet_ids)) = (input.vpc_id, input.subnet_ids) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreatePrivateGraphEndpoint without vpcId and subnetIds (which the service \
+                 defaults from the account's default VPC and that VPC's subnets)",
+            ));
+        };
+        // Both lists arrive within their modelled `@length` and `@uniqueItems` bounds
+        // and with every element matching its member `@pattern`: the boundary validator
+        // refuses the rest before this handler runs.
+        let security_group_ids = input.vpc_security_group_ids.unwrap_or_default();
+
+        let now = ::std::time::Instant::now();
+        let mut store = state.lock();
+
+        // A private graph endpoint is the private route INTO a graph, so the graph has
+        // to exist. The lookup settles the transitions the clock already made due
+        // first, so a graph whose provisioning has come due can take an endpoint.
+        let Some(graph) = store.settled_graph(&input.graph_identifier, now) else {
+            return Err(
+                CreatePrivateGraphEndpointErrorModeled::ResourceNotFoundException(
+                    crate::state::graph_not_found(&input.graph_identifier),
+                )
+                .into(),
+            );
+        };
+        let graph_id = graph.id.clone();
+        let graph_status = graph.status;
+
+        // One endpoint per VPC per graph: `(graphIdentifier, vpcId)` is the identity
+        // `GetPrivateGraphEndpoint` and `DeletePrivateGraphEndpoint` address an endpoint
+        // by, so a second endpoint in a VPC that already has one conflicts with the
+        // stored record. Checked before the graph's status so a duplicate is reported as
+        // the conflict it is, whatever the graph is doing.
+        if let Some(existing) = store.settled_private_endpoint(&graph_id, &vpc_id, now) {
+            return Err(CreatePrivateGraphEndpointErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "graph {graph_id} already has a private graph endpoint in vpc \
+                         {vpc_id} with vpc endpoint id {}",
+                        existing.vpc_endpoint_id
+                    ),
+                    reason: None,
+                },
+            )
+            .into());
+        }
+
+        // The store is shared and grows by one endpoint per call, so it has a ceiling
+        // (`crate::state::MAX_PRIVATE_GRAPH_ENDPOINTS`). Reaching it is the condition
+        // the model's `ServiceQuotaExceededException` (402) describes.
+        if store.private_endpoint_count() >= crate::state::MAX_PRIVATE_GRAPH_ENDPOINTS {
+            return Err(
+                CreatePrivateGraphEndpointErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "this emulator holds at most {} private graph endpoints; delete \
+                             an endpoint before creating another",
+                            crate::state::MAX_PRIVATE_GRAPH_ENDPOINTS
+                        ),
+                        resource_id: None,
+                        resource_type: Some("PrivateGraphEndpoint".to_string()),
+                        service_code: Some(crate::state::ARN_NAMESPACE.to_string()),
+                        quota_code: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Only a serving graph can be reached through a new endpoint: while an earlier
+        // transition is still outstanding the graph is not serving, which is the same
+        // precondition `CreateGraphSnapshot` and `StartImportTask` state.
+        if graph_status != crate::state::GraphStatus::Available {
+            return Err(CreatePrivateGraphEndpointErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "graph {graph_id} is in status {} and cannot take a private graph \
+                         endpoint",
+                        graph_status.as_wire()
+                    ),
+                    reason: None,
+                },
+            )
+            .into());
+        }
+
+        let endpoint = crate::state::PrivateGraphEndpoint {
+            vpc_endpoint_id: store.next_vpc_endpoint_id(),
+            graph_id,
+            vpc_id,
+            subnet_ids,
+            security_group_ids,
+            // The endpoint is not reachable when the call returns; the clock owes the
+            // move to AVAILABLE a fixed span later
+            // (`crate::state::PROVISIONING_SPAN`).
+            status: crate::state::PrivateGraphEndpointStatus::Creating,
+            due: Some(now + crate::state::PROVISIONING_SPAN),
+        };
+
+        // Report the record that was stored, so this response cannot drift from what a
+        // later GetPrivateGraphEndpoint answers.
+        let output = Self::Output::from(&endpoint);
+        store.insert_private_endpoint(endpoint);
+        Ok(output)
     }
 }

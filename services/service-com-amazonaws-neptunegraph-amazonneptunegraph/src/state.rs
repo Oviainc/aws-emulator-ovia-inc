@@ -54,6 +54,17 @@ pub const CANCELLATION_SPAN: Duration = Duration::from_millis(500);
 /// No handler sleeps for it — the due instant is stored and compared on read.
 pub const QUERY_RUN_SPAN: Duration = Duration::from_millis(750);
 
+/// How long after the `DeletePrivateGraphEndpoint` that accepts it a private graph
+/// endpoint's removal is owed: the endpoint answers `DELETING` until this span has
+/// passed, then the next read finds it gone.
+///
+/// The real service tears a VPC endpoint down over minutes; this emulator picks a span
+/// inside the emulator-wide 250ms..750ms band for a transition the clock owes, so a
+/// caller that reads the endpoint straight after deleting it still observes the
+/// transient `DELETING` status. No handler ever sleeps for it — the due instant is
+/// stored and compared on read.
+pub const ENDPOINT_DELETION_SPAN: Duration = Duration::from_millis(500);
+
 /// The lifecycle statuses this slice of the emulator puts a graph into.
 ///
 /// Every variant's wire form is one of the modelled `GraphStatus` values
@@ -666,6 +677,98 @@ fn millis_between(from: Instant, to: Instant) -> i32 {
     i32::try_from(to.saturating_duration_since(from).as_millis()).unwrap_or(i32::MAX)
 }
 
+/// The lifecycle statuses this slice of the emulator puts a private graph endpoint
+/// into.
+///
+/// Every variant's wire form is one of the modelled `PrivateGraphEndpointStatus`
+/// values (`crate::ops::types::PRIVATE_GRAPH_ENDPOINT_STATUS_VALUES`). `FAILED` is
+/// deliberately never produced: nothing here can fail to attach an endpoint, so no
+/// endpoint may report a failure that did not happen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrivateGraphEndpointStatus {
+    /// `CreatePrivateGraphEndpoint` has accepted the endpoint; it is not reachable
+    /// yet.
+    Creating,
+    /// The endpoint is provisioned: the graph is reachable through it from the VPC.
+    Available,
+    /// `DeletePrivateGraphEndpoint` has accepted the deletion; the endpoint is on its
+    /// way out and is reclaimed once the clock makes its removal due.
+    Deleting,
+}
+
+impl PrivateGraphEndpointStatus {
+    /// This status as the modelled `PrivateGraphEndpointStatus` enum value.
+    pub const fn as_wire(self) -> &'static str {
+        match self {
+            Self::Creating => "CREATING",
+            Self::Available => "AVAILABLE",
+            Self::Deleting => "DELETING",
+        }
+    }
+}
+
+/// One stored private graph endpoint: every member `GetPrivateGraphEndpoint` reports,
+/// the graph and VPC the pair of identifiers it is addressed by names, the security
+/// groups it was created with, and the instant at which the transition the clock owes
+/// it falls due.
+///
+/// An endpoint belongs to ONE graph in ONE VPC — `GetPrivateGraphEndpoint` and
+/// `DeletePrivateGraphEndpoint` address it by `(graphIdentifier, vpcId)` and nothing
+/// else — so that pair is its identity and the minted `vpcEndpointId` is a property of
+/// the record rather than a second key.
+#[derive(Debug, Clone)]
+pub struct PrivateGraphEndpoint {
+    /// The graph the endpoint reaches. Kept as the graph's id, so the endpoint is
+    /// reclaimed with the graph it belongs to.
+    pub graph_id: String,
+    pub vpc_id: String,
+    pub subnet_ids: Vec<String>,
+    /// The security groups the request attached to the endpoint. Stored because they
+    /// are part of the record the service accepted, even though no modelled output
+    /// member reports them back.
+    pub security_group_ids: Vec<String>,
+    /// The minted `^vpce-[0-9a-f]{17}$` id of the VPC endpoint behind this record.
+    pub vpc_endpoint_id: String,
+    pub status: PrivateGraphEndpointStatus,
+    /// When the transition the clock owes this endpoint falls due: the move from
+    /// `CREATING` to `AVAILABLE`, or the removal of a `DELETING` endpoint. `None` once
+    /// the endpoint rests `AVAILABLE`, which is the only status nothing is owed out of.
+    pub due: Option<Instant>,
+}
+
+impl PrivateGraphEndpoint {
+    /// Materialise the transition the clock has already made due.
+    ///
+    /// The same one write a reporting operation may make as [`Graph::settle`]: the
+    /// endpoint would have become `AVAILABLE` at `due` whether or not anybody called,
+    /// so applying it on read is bookkeeping rather than a state change caused by the
+    /// read. A `DELETING` endpoint is not settled here — it is RECLAIMED, by
+    /// [`ComAmazonawsNeptunegraphAmazonneptunegraphState::materialise_private_endpoints`],
+    /// since the record itself goes away.
+    pub fn settle(&mut self, now: Instant) {
+        if self.status == PrivateGraphEndpointStatus::Creating
+            && self.due.is_some_and(|due| now >= due)
+        {
+            self.status = PrivateGraphEndpointStatus::Available;
+            self.due = None;
+        }
+    }
+
+    /// Whether the accepted deletion of this endpoint has fallen due, so the record is
+    /// gone and no read may still report it.
+    pub fn is_reclaimed(&self, now: Instant) -> bool {
+        self.status == PrivateGraphEndpointStatus::Deleting
+            && self.due.is_some_and(|due| now >= due)
+    }
+
+    /// Accept this endpoint's deletion: it answers `DELETING` until
+    /// [`ENDPOINT_DELETION_SPAN`] has passed, after which it is reclaimed.
+    pub fn begin_deletion(&mut self, now: Instant) {
+        self.status = PrivateGraphEndpointStatus::Deleting;
+        self.due = Some(now + ENDPOINT_DELETION_SPAN);
+    }
+}
+
 /// Per-service state for com-amazonaws-neptunegraph-amazonneptunegraph. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsNeptunegraphAmazonneptunegraphState {
@@ -695,6 +798,12 @@ pub struct ComAmazonawsNeptunegraphAmazonneptunegraphState {
     /// Every stored export task, keyed by its minted `t-xxxxxxxxxx` id. A `BTreeMap`
     /// so `ListExportTasks` has one stable total order to page over.
     pub export_tasks: BTreeMap<String, ExportTask>,
+    /// Every stored private graph endpoint, keyed by the graph it reaches and then by
+    /// the VPC it lives in. A `BTreeMap` of `BTreeMap`s so `ListPrivateGraphEndpoints`
+    /// — which lists the endpoints of ONE graph — has one stable total order to page
+    /// over, and so an endpoint is resolved by the `(graphIdentifier, vpcId)` pair it
+    /// is addressed by: the same VPC id against another graph names another endpoint.
+    pub private_endpoints: BTreeMap<String, BTreeMap<String, PrivateGraphEndpoint>>,
     /// Feeds the graph-id generator, so ids are unique within a store.
     pub id_counter: u64,
     /// Feeds the snapshot-id generator, so ids are unique within a store.
@@ -703,6 +812,8 @@ pub struct ComAmazonawsNeptunegraphAmazonneptunegraphState {
     pub import_task_id_counter: u64,
     /// Feeds the export-task-id generator, so ids are unique within a store.
     pub export_task_id_counter: u64,
+    /// Feeds the VPC-endpoint-id generator, so ids are unique within a store.
+    pub vpc_endpoint_id_counter: u64,
 }
 
 impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
@@ -804,17 +915,101 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
         self.import_tasks.insert(task.id.clone(), task);
     }
 
-    /// Drop a graph, its name index entry and every query that was running on it.
+    /// Drop a graph, its name index entry, every query that was running on it and
+    /// every private endpoint that reached it.
     ///
     /// A query exists only while the graph it runs on does, so a deleted graph takes
     /// its in-flight queries with it rather than leaving entries a later `GetQuery` on
-    /// a re-minted id could find. An import task is NOT dropped with its graph: it is
-    /// read by its own id and keeps the provenance of the load it describes.
+    /// a re-minted id could find. A private graph endpoint is the same: it is the
+    /// private route INTO one graph, addressed as an endpoint of that graph, so it
+    /// cannot outlive it. An import task is NOT dropped with its graph: it is read by
+    /// its own id and keeps the provenance of the load it describes.
     pub fn remove_graph(&mut self, id: &str) -> Option<Graph> {
         let graph = self.graphs.remove(id)?;
         self.graph_names.remove(&graph.name);
         self.queries.remove(id);
+        self.private_endpoints.remove(id);
         Some(graph)
+    }
+
+    /// Mint a VPC endpoint id no endpoint in this store holds, matching the modelled
+    /// `VpcEndpointId` pattern `^vpce-[0-9a-f]{17}$`.
+    pub fn next_vpc_endpoint_id(&mut self) -> String {
+        loop {
+            self.vpc_endpoint_id_counter = self.vpc_endpoint_id_counter.wrapping_add(1);
+            let id = encode_vpc_endpoint_id(self.vpc_endpoint_id_counter);
+            if !self.holds_vpc_endpoint_id(&id) {
+                return id;
+            }
+        }
+    }
+
+    /// Whether this store already holds a private endpoint under `vpc_endpoint_id`, on
+    /// any graph: the id names one VPC endpoint across the whole store.
+    pub fn holds_vpc_endpoint_id(&self, vpc_endpoint_id: &str) -> bool {
+        self.private_endpoints
+            .values()
+            .flat_map(BTreeMap::values)
+            .any(|endpoint| endpoint.vpc_endpoint_id == vpc_endpoint_id)
+    }
+
+    /// Store a newly accepted private graph endpoint, under the graph it reaches.
+    ///
+    /// Replaces nothing: the growth site refuses a second endpoint in the same VPC
+    /// before reaching here, because `(graphIdentifier, vpcId)` is the identity the
+    /// read and the delete address an endpoint by.
+    pub fn insert_private_endpoint(&mut self, endpoint: PrivateGraphEndpoint) {
+        self.private_endpoints
+            .entry(endpoint.graph_id.clone())
+            .or_default()
+            .insert(endpoint.vpc_id.clone(), endpoint);
+    }
+
+    /// How many private graph endpoints this store holds, across every graph.
+    pub fn private_endpoint_count(&self) -> usize {
+        self.private_endpoints.values().map(BTreeMap::len).sum()
+    }
+
+    /// Materialise every private-endpoint transition the clock has already made due:
+    /// each accepted deletion whose span has passed is reclaimed, and each endpoint
+    /// whose provisioning has come due settles to `AVAILABLE`.
+    ///
+    /// The same one write a reporting operation may make as [`Graph::settle`]: each of
+    /// these was owed at that instant whether or not anybody called.
+    pub fn materialise_private_endpoints(&mut self, now: Instant) {
+        for endpoints in self.private_endpoints.values_mut() {
+            endpoints.retain(|_, endpoint| !endpoint.is_reclaimed(now));
+            for endpoint in endpoints.values_mut() {
+                endpoint.settle(now);
+            }
+        }
+        // A graph with no endpoints left holds no entry, so the outer map does not grow
+        // one bucket per graph that ever had one.
+        self.private_endpoints.retain(|_, endpoints| !endpoints.is_empty());
+    }
+
+    /// Materialise what the clock owes, then borrow the one private endpoint the
+    /// `(graph_id, vpc_id)` pair names.
+    pub fn settled_private_endpoint(
+        &mut self,
+        graph_id: &str,
+        vpc_id: &str,
+        now: Instant,
+    ) -> Option<&PrivateGraphEndpoint> {
+        self.materialise_private_endpoints(now);
+        self.private_endpoints.get(graph_id)?.get(vpc_id)
+    }
+
+    /// [`Self::settled_private_endpoint`], mutably: what `DeletePrivateGraphEndpoint`
+    /// writes the accepted deletion through.
+    pub fn settled_private_endpoint_mut(
+        &mut self,
+        graph_id: &str,
+        vpc_id: &str,
+        now: Instant,
+    ) -> Option<&mut PrivateGraphEndpoint> {
+        self.materialise_private_endpoints(now);
+        self.private_endpoints.get_mut(graph_id)?.get_mut(vpc_id)
     }
 
     /// Store a newly accepted query, under the graph it runs on.
@@ -925,6 +1120,7 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
         for task in self.export_tasks.values_mut() {
             task.settle(now);
         }
+        self.materialise_private_endpoints(now);
     }
 
     /// Apply the snapshot transition the clock has made due, then borrow one
@@ -961,8 +1157,9 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
     /// Tags live on the resource record itself, which is what makes a tag supplied at
     /// create time and one written later by `TagResource` the same bytes, read back by
     /// this one lookup. Graphs, snapshots and export tasks are the taggable resources
-    /// this slice stores; private endpoints and import tasks join this lookup with the
-    /// operations that mint them.
+    /// this slice stores; import tasks join this lookup with the operation that would
+    /// tag them. A private graph endpoint never does: the model gives it neither an ARN
+    /// nor a `tags` member, so the tagging surface has nothing to address it by.
     pub fn tags_of(&self, arn: &str) -> Option<&BTreeMap<String, String>> {
         self.graphs
             .values()
@@ -1115,6 +1312,16 @@ pub const MAX_QUERY_STRING_CHARS: usize = 65_536;
 /// AWS's tagging limit of 50 tags per resource, which this service models as
 /// `TagMap`'s `@length(0..50)`.
 pub const MAX_TAGS: usize = 50;
+
+/// The most private graph endpoints one store holds, across every graph.
+///
+/// Emulator resource guard, NOT a quota AWS publishes, and the same bound
+/// [`MAX_GRAPHS`] puts on the graph map: the store is shared process-wide and grows by
+/// one entry per `CreatePrivateGraphEndpoint`, so without a ceiling repeated calls grow
+/// the emulator's memory without bound. `CreatePrivateGraphEndpoint` reports reaching
+/// it with the `ServiceQuotaExceededException` (402) the model declares for exactly
+/// this condition. Set well above any realistic use of a local emulator.
+pub const MAX_PRIVATE_GRAPH_ENDPOINTS: usize = 100;
 
 /// From the modelled `TagKey`: `@length(1..128)`.
 pub const MAX_TAG_KEY_CHARS: usize = 128;
@@ -1336,6 +1543,24 @@ pub fn export_task_not_found(task_identifier: &str) -> ResourceNotFoundException
     }
 }
 
+/// The modelled `ResourceNotFoundException` for a `(graphIdentifier, vpcId)` pair that
+/// names no stored private graph endpoint.
+///
+/// A private graph endpoint is addressed as the endpoint of one graph in one VPC, so
+/// the failure names both halves of that pair — which is what lets a caller tell an
+/// endpoint that has already been deleted apart from one created in another VPC. The
+/// modelled shape carries only `message`
+/// (`smithy_query(query="shape",shape="ResourceNotFoundException")`), so the message is
+/// the only place either fact can go.
+pub fn private_endpoint_not_found(graph_identifier: &str, vpc_id: &str) -> ResourceNotFoundException
+{
+    ResourceNotFoundException {
+        message: format!(
+            "No private graph endpoint found on graph [{graph_identifier}] in vpc [{vpc_id}]"
+        ),
+    }
+}
+
 /// The modelled `ResourceNotFoundException` for a `resourceArn` that names no stored
 /// resource.
 ///
@@ -1479,6 +1704,19 @@ fn scramble(seed: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)
+}
+
+/// Spell the VPC endpoint id of the `value`th endpoint this store minted, matching the
+/// modelled `VpcEndpointId` pattern `^vpce-[0-9a-f]{17}$`: seventeen lowercase hex
+/// digits, scrambled off the counter the same way [`encode_resource_id`]'s input is, so
+/// ids are not guessable neighbours while still being a pure function of the counter.
+///
+/// Seventeen hex digits are 68 bits, one more than a `u64` carries, so the leading digit
+/// comes from a second, independently scrambled word.
+fn encode_vpc_endpoint_id(counter: u64) -> String {
+    let low = scramble(counter);
+    let high = scramble(counter ^ 0x5DEE_CE66_D1B5_A1C3);
+    format!("vpce-{:x}{low:016x}", high & 0xf)
 }
 
 /// Spell `value` (already reduced below [`BASE36_POW10`]) as `prefix` plus exactly
@@ -1648,6 +1886,31 @@ impl From<&ExportTask> for crate::ops::types::StartExportTaskOutput {
     }
 }
 
+/// The three `*Output` shapes that carry a whole private-graph-endpoint record are
+/// structurally identical, so one macro renders the stored endpoint into each rather
+/// than one hand-copied field list per operation, which could drift apart.
+/// `PrivateGraphEndpointSummary` joins this list with `ListPrivateGraphEndpoints`.
+macro_rules! private_graph_endpoint_output {
+    ($($ty:ident),+ $(,)?) => {$(
+        impl From<&PrivateGraphEndpoint> for crate::ops::types::$ty {
+            fn from(endpoint: &PrivateGraphEndpoint) -> Self {
+                Self {
+                    vpc_id: endpoint.vpc_id.clone(),
+                    subnet_ids: endpoint.subnet_ids.clone(),
+                    status: endpoint.status.as_wire().to_string(),
+                    vpc_endpoint_id: Some(endpoint.vpc_endpoint_id.clone()),
+                }
+            }
+        }
+    )+};
+}
+
+private_graph_endpoint_output!(
+    CreatePrivateGraphEndpointOutput,
+    GetPrivateGraphEndpointOutput,
+    DeletePrivateGraphEndpointOutput,
+);
+
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
 /// Answer `None` with a modelled server error, never with a fresh engine.
@@ -1673,6 +1936,33 @@ mod tests {
             assert!(
                 is_graph_id(&id),
                 "id {id:?}: expected a match for ^g-[a-z0-9]{{10}}$"
+            );
+            assert!(seen.insert(id.clone()), "id {id:?}: minted twice");
+        }
+    }
+
+    /// Every minted VPC endpoint id matches the modelled `VpcEndpointId` pattern
+    /// `^vpce-[0-9a-f]{17}$` and no id repeats.
+    #[test]
+    fn minted_vpc_endpoint_ids_match_the_modelled_pattern_and_are_unique() {
+        let mut state = ComAmazonawsNeptunegraphAmazonneptunegraphState::default();
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..2_000 {
+            let id = state.next_vpc_endpoint_id();
+            let suffix = id
+                .strip_prefix("vpce-")
+                .unwrap_or_else(|| panic!("id {id:?}: expected the vpce- prefix"));
+            assert_eq!(
+                suffix.len(),
+                17,
+                "id {id:?}: expected 17 characters after the prefix, got {}",
+                suffix.len()
+            );
+            assert!(
+                suffix
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || matches!(c, 'a'..='f')),
+                "id {id:?}: expected a match for ^vpce-[0-9a-f]{{17}}$"
             );
             assert!(seen.insert(id.clone()), "id {id:?}: minted twice");
         }

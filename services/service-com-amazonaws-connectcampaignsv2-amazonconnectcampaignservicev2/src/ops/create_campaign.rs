@@ -168,6 +168,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The modelled `@length` of `communicationLimitsList` sits on a union member,
+        // which the centralized constraint walk does not reach, so an over-long list
+        // is refused here — as a bad request, before anything is stored.
+        if let Some(message) = crate::state::communication_limits_violation(
+            "communicationLimitsOverride.allChannelSubtypes.communicationLimitsList",
+            input
+                .communication_limits_override
+                .as_ref()
+                .and_then(|config| config.all_channel_subtypes.as_ref()),
+        ) {
+            return Err(CreateCampaignErrorModeled::ValidationException(ValidationException {
+                message,
+                x_amz_error_type: None,
+            })
+            .into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateCampaignErrorModeled::InternalServerException(
                 InternalServerException {
