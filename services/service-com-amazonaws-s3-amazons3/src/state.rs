@@ -4124,6 +4124,21 @@ pub const MALFORMED_POLICY_MESSAGE: &str =
 /// the bucket-policy limit it publishes, 20 KB, and refuses a longer document.
 pub const MAX_BUCKET_POLICY_BYTES: usize = 20 * 1024;
 
+/// The statements `policy` carries, or `None` when the document is not a JSON object with
+/// a `Statement` of the shape a policy writes it in: a list of statements, or a single
+/// statement object.
+///
+/// One place locates a document's statements, so the grammar check
+/// ([`is_valid_policy_document`]) and the public-access check
+/// ([`policy_grants_public_access`]) cannot drift on what they are reading.
+fn policy_statements(parsed: &::serde_json::Value) -> Option<Vec<&::serde_json::Value>> {
+    match parsed.as_object()?.get("Statement")? {
+        ::serde_json::Value::Array(list) => Some(list.iter().collect()),
+        single @ ::serde_json::Value::Object(_) => Some(vec![single]),
+        _ => None,
+    }
+}
+
 /// Whether `policy` is a policy document S3 accepts on `PutBucketPolicy`.
 ///
 /// The grammar an IAM resource policy has to satisfy: a JSON object carrying a
@@ -4134,16 +4149,8 @@ pub fn is_valid_policy_document(policy: &str) -> bool {
     let Ok(parsed) = ::serde_json::from_str::<::serde_json::Value>(policy) else {
         return false;
     };
-    let Some(object) = parsed.as_object() else {
+    let Some(statements) = policy_statements(&parsed) else {
         return false;
-    };
-    let Some(statement) = object.get("Statement") else {
-        return false;
-    };
-    let statements: Vec<&::serde_json::Value> = match statement {
-        ::serde_json::Value::Array(list) => list.iter().collect(),
-        single @ ::serde_json::Value::Object(_) => vec![single],
-        _ => return false,
     };
     !statements.is_empty()
         && statements.iter().all(|statement| {
@@ -4153,6 +4160,152 @@ pub fn is_valid_policy_document(policy: &str) -> bool {
             let effect = statement.get("Effect").and_then(::serde_json::Value::as_str);
             matches!(effect, Some("Allow") | Some("Deny")) && statement.contains_key("Action")
         })
+}
+
+/// The condition keys that, when a statement's `Condition` names one, keep that statement
+/// from granting access to EVERYONE: each of them limits the grant to a set of fixed
+/// values (an account, an organization, a VPC, an access point, a caller, a key), so the
+/// statement reaches those callers rather than the public.
+///
+/// The catalog is the one Amazon S3 publishes under "The Meaning of 'Public'" (Amazon S3
+/// User Guide, Blocking public access): a policy that grants access to a wildcard
+/// principal is public "unless it contains a `Condition` that restricts access to a set of
+/// fixed values" for one of these keys. Lower-case because IAM condition keys are
+/// case-insensitive, so lookups fold the policy's spelling to this one.
+const PUBLIC_ACCESS_RESTRICTING_CONDITION_KEYS: [&str; 13] = [
+    "aws:principalarn",
+    "aws:principalorgid",
+    "aws:principalorgpaths",
+    "aws:sourceaccount",
+    "aws:sourcearn",
+    "aws:sourceip",
+    "aws:sourceowner",
+    "aws:sourcevpc",
+    "aws:sourcevpce",
+    "aws:userid",
+    "s3:dataaccesspointaccount",
+    "s3:dataaccesspointarn",
+    "s3:x-amz-server-side-encryption-aws-kms-key-id",
+];
+
+/// The one entry of [`PUBLIC_ACCESS_RESTRICTING_CONDITION_KEYS`] whose values are address
+/// ranges rather than identifiers, so what "every value" means for it is
+/// [`WHOLE_INTERNET_CIDRS`] rather than the bare wildcard.
+const SOURCE_IP_CONDITION_KEY: &str = "aws:sourceip";
+
+/// The `aws:SourceIp` values that name no fixed set of addresses: the whole IPv4 and IPv6
+/// space.
+///
+/// From the same guide: an `aws:SourceIp` condition keeps a statement non-public only when
+/// the addresses it names are not the entire internet, so a statement conditioned on one
+/// of these still grants access to everyone.
+const WHOLE_INTERNET_CIDRS: [&str; 2] = ["0.0.0.0/0", "::/0"];
+
+/// The operand value that names no fixed set at all: it matches every value the key could
+/// take, so a condition on it restricts nothing.
+const MATCHES_EVERY_VALUE: &str = "*";
+
+/// Whether `policy` grants access to the PUBLIC — the question
+/// `GetBucketPolicyStatus`'s `PolicyStatus$IsPublic` answers about the bucket's policy.
+///
+/// The rule, from "The Meaning of 'Public'": a policy is public when ANY of its statements
+/// both allows and reaches everyone — an `Effect` of `Allow` whose principal is the
+/// wildcard (`"*"`, or `"*"` among the values of a principal map such as `{"AWS": "*"}`),
+/// or an `Allow` that names a `NotPrincipal` and so grants to every principal it does not
+/// list — and is not held back by a `Condition` restricting it to FIXED values of one of
+/// [`PUBLIC_ACCESS_RESTRICTING_CONDITION_KEYS`]. A statement that grants nobody anything
+/// (no principal at all), one whose `Effect` is `Deny`, and a document that is not a policy
+/// are all non-public, as is a bucket carrying no policy — which is why the caller passes
+/// the policy it HAS, and reports a bucket without one as not public.
+pub fn policy_grants_public_access(policy: &str) -> bool {
+    let Ok(parsed) = ::serde_json::from_str::<::serde_json::Value>(policy) else {
+        return false;
+    };
+    let Some(statements) = policy_statements(&parsed) else {
+        return false;
+    };
+    statements.iter().any(|statement| {
+        let Some(statement) = statement.as_object() else {
+            return false;
+        };
+        let allows = statement
+            .get("Effect")
+            .and_then(::serde_json::Value::as_str)
+            .is_some_and(|effect| effect == "Allow");
+        allows && grants_every_principal(statement) && !condition_restricts_principals(statement)
+    })
+}
+
+/// Whether `statement` grants to every principal: a wildcard `Principal`, or a
+/// `NotPrincipal` (which names the principals the statement does NOT reach, so an `Allow`
+/// carrying one reaches all the others).
+fn grants_every_principal(statement: &::serde_json::Map<String, ::serde_json::Value>) -> bool {
+    if statement.contains_key("NotPrincipal") {
+        return true;
+    }
+    let Some(principal) = statement.get("Principal") else {
+        // A statement with no principal grants nothing to anybody.
+        return false;
+    };
+    principal_names_wildcard(principal)
+}
+
+/// Whether a `Principal` value names the wildcard, in any of the forms a policy writes it:
+/// the bare string, a list carrying it, or a principal map (`{"AWS": "*"}`,
+/// `{"AWS": ["*", …]}`) one of whose values is it.
+fn principal_names_wildcard(principal: &::serde_json::Value) -> bool {
+    match principal {
+        ::serde_json::Value::String(value) => value == "*",
+        ::serde_json::Value::Array(list) => list.iter().any(principal_names_wildcard),
+        ::serde_json::Value::Object(map) => map.values().any(principal_names_wildcard),
+        _ => false,
+    }
+}
+
+/// Whether `statement`'s `Condition` holds its grant back from the public: it restricts
+/// one of [`PUBLIC_ACCESS_RESTRICTING_CONDITION_KEYS`] to FIXED values, which is what the
+/// guide requires — a key whose operand names every value it could take (the bare
+/// wildcard, or the whole address space for `aws:SourceIp`) leaves the grant public, and a
+/// list restricts only while every value in it is fixed.
+fn condition_restricts_principals(
+    statement: &::serde_json::Map<String, ::serde_json::Value>,
+) -> bool {
+    let Some(condition) = statement.get("Condition").and_then(::serde_json::Value::as_object) else {
+        return false;
+    };
+    condition.values().any(|operands| {
+        operands
+            .as_object()
+            .into_iter()
+            .flatten()
+            .any(|(key, values)| {
+                let key = key.to_ascii_lowercase();
+                PUBLIC_ACCESS_RESTRICTING_CONDITION_KEYS.contains(&key.as_str())
+                    && names_fixed_values(&key, values)
+            })
+    })
+}
+
+/// Whether a condition key's operand names fixed values: a single fixed value, or a
+/// non-empty list of them.
+fn names_fixed_values(key: &str, values: &::serde_json::Value) -> bool {
+    match values {
+        ::serde_json::Value::String(value) => is_fixed_value(key, value.trim()),
+        ::serde_json::Value::Array(list) => {
+            !list.is_empty() && list.iter().all(|value| names_fixed_values(key, value))
+        }
+        _ => false,
+    }
+}
+
+/// Whether one operand value of `key` is a fixed value rather than one matching everything
+/// the key could be: the bare wildcard names no set, and for `aws:SourceIp` neither does
+/// the whole address space ([`WHOLE_INTERNET_CIDRS`]).
+fn is_fixed_value(key: &str, value: &str) -> bool {
+    if value.is_empty() || value == MATCHES_EVERY_VALUE {
+        return false;
+    }
+    key != SOURCE_IP_CONDITION_KEY || !WHOLE_INTERNET_CIDRS.contains(&value)
 }
 
 /// The Region a `CreateBucket` request places its bucket in, from the
