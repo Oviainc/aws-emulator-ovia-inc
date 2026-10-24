@@ -7,13 +7,16 @@
 //!
 //! The catalog is the whole integrated-service list — the documented way to discover
 //! a valid `ServiceCode` — so it runs past the largest page the model allows and a
-//! walk takes many `NextToken`-chained pages.
+//! walk with a caller-named page size takes many `NextToken`-chained pages.
 //!
 //! `MaxResults` is the page size and `NextToken` resumes where the previous page
 //! stopped; the last page carries no `NextToken`. A caller that names no
-//! `MaxResults` gets the WHOLE catalog in one page (`MaxResults`' 1..100 range
-//! bounds what a caller may ask for, not what the service returns unasked). A token
-//! this service did not issue is refused with `InvalidPaginationTokenException`.
+//! `MaxResults` gets the WHOLE catalog in one page and no `NextToken`
+//! ([`crate::state::SERVICE_CATALOG_UNASKED_PAGE_SIZE`]): `MaxResults`' 1..100 range
+//! bounds what a caller may ask for, not what this listing returns unasked, and the
+//! recorded answer to an empty `ListServices` body carries the inventory whole. A
+//! token this service did not issue is refused with
+//! `InvalidPaginationTokenException`.
 //!
 //! The catalog is seeded in `ComAmazonawsServicequotasServicequotasv20190624State::default`
 //! and never mutated, so this operation only reads.
@@ -113,11 +116,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let services = state.lock().services();
-        let page = crate::state::paginate(
+        // The unasked page is the WHOLE inventory, not `state::UNASKED_PAGE_SIZE`:
+        // `MaxResults` bounds only what a caller asks for.
+        let page = crate::state::paginate_bounded(
             Self::NAME,
             services,
             input.max_results,
             input.next_token.as_deref(),
+            crate::state::MAX_PAGE_SIZE,
+            crate::state::SERVICE_CATALOG_UNASKED_PAGE_SIZE,
         )
         .map_err(|_| {
             ListServicesErrorModeled::InvalidPaginationTokenException(

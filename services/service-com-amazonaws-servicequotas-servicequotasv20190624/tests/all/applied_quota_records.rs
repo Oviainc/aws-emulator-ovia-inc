@@ -495,19 +495,20 @@ async fn a_pair_the_catalog_does_not_publish_is_refused_rather_than_substituted(
     }
 }
 
-/// RULE: every listing of this service serves a bounded page even when the caller
-/// names no `MaxResults`, carrying a `NextToken` for exactly as long as items remain
-/// — so a client that walks the chain sees the whole listing and one that reads a
-/// single page knows there is more.
+/// RULE: every QUOTA listing of this service serves a bounded page even when the
+/// caller names no `MaxResults`, carrying a `NextToken` for exactly as long as items
+/// remain — so a client that walks the chain sees the whole listing and one that reads
+/// a single page knows there is more. (`ListServices` is NOT one of these: its unasked
+/// page is the whole inventory, which `catalog_pagination.rs` pins.)
 #[tokio::test]
-async fn an_unasked_page_is_bounded_and_resumes_while_items_remain() {
+async fn an_unasked_quota_page_is_bounded_and_resumes_while_items_remain() {
     let engine = emulator();
     let client = client(&engine, "us-east-1");
 
-    // Rows: the listings of this service, over item sets that are shorter than one
-    // unasked page (iam's four quotas), a few pages long (lambda, vpc) and hundreds
-    // long (ec2's quotas, the service catalog itself).
-    let mut listings: Vec<(&str, Value, &str)> = vec![("ListServices", json!({}), "Services")];
+    // Rows: the quota listings of this service, over item sets that are shorter than
+    // one unasked page (iam's four quotas), a few pages long (lambda, vpc) and
+    // hundreds long (ec2's quotas).
+    let mut listings: Vec<(&str, Value, &str)> = Vec::new();
     for service_code in PAGED_SERVICES {
         listings.push((
             "ListServiceQuotas",
