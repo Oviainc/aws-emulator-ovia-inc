@@ -5,6 +5,9 @@
 //! absent member is left untouched, never nulled — refreshes `UpdatedAt`, and returns
 //! the full updated `Workload`. The path `WorkloadId` is resolved by lookup, so an id
 //! no workload carries — whatever its syntax — is `ResourceNotFoundException` (404).
+//! Every invariant of the resource is judged on the record the merge WOULD leave
+//! behind, so an update cannot reach a workload a create would have refused: a
+//! workload always names at least one Region.
 //!
 //! ## Shape of an operation
 //!
@@ -231,11 +234,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
-        if !store.workloads.contains_key(&input.workload_id) {
-            return Err(UpdateWorkloadErrorModeled::ResourceNotFoundException(
-                crate::state::workload_not_found(&input.workload_id),
-            )
-            .into());
+        {
+            let Some(stored) = store.workloads.get(&input.workload_id) else {
+                return Err(UpdateWorkloadErrorModeled::ResourceNotFoundException(
+                    crate::state::workload_not_found(&input.workload_id),
+                )
+                .into());
+            };
+
+            // "Either `AwsRegions`, `NonAwsRegions`, or both must be specified" is an
+            // invariant of the workload, not a rule about one request: a workload always
+            // names at least one Region it runs in. A merge is therefore judged on the
+            // record it WOULD leave behind — the list the request carries where it
+            // carries one, the stored list where it does not — and refused before
+            // anything is mutated, so a workload no create could have produced cannot be
+            // reached by updating one that could.
+            let aws_regions = input.aws_regions.as_deref().unwrap_or(&stored.aws_regions);
+            let non_aws_regions = input
+                .non_aws_regions
+                .as_deref()
+                .unwrap_or(&stored.non_aws_regions);
+            if aws_regions.is_empty() && non_aws_regions.is_empty() {
+                return Err(UpdateWorkloadErrorModeled::ValidationException(
+                    crate::state::either_regions_exception(),
+                )
+                .into());
+            }
         }
 
         // A rename has to keep the name index unique, so resolve it before mutating: the

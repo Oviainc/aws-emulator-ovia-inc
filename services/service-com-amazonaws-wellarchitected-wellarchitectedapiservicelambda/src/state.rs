@@ -6056,9 +6056,10 @@ pub fn absent_member_exception(member: &str) -> crate::ops::types::ValidationExc
 
 /// The refusal for a workload that names neither `AwsRegions` nor `NonAwsRegions`:
 /// "Either AwsRegions, NonAwsRegions, or both must be specified when creating a
-/// workload" (the `CreateWorkload` doc). The rule spans both members, so `Fields`
-/// carries an entry for EACH of them with the one sentence that states it, and
-/// `Message` states that sentence once.
+/// workload" (the `CreateWorkload` doc) — an invariant of the resource, so it guards
+/// every call that would leave a stored workload naming no Region. The rule spans both
+/// members, so `Fields` carries an entry for EACH of them with the one sentence that
+/// states it, and `Message` states that sentence once.
 pub fn either_regions_exception() -> crate::ops::types::ValidationException {
     let sentence = format!("Either {AWS_REGIONS_MEMBER} or {NON_AWS_REGIONS_MEMBER} is required.");
     field_validation_exception(&[
