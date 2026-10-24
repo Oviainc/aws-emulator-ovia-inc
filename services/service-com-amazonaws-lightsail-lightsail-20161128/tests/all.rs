@@ -101,3 +101,5 @@ mod relational_database_snapshot_listing;
 mod state_roundtrip;
 #[path = "all/static_ip_allocation.rs"]
 mod static_ip_allocation;
+#[path = "all/vpc_peering.rs"]
+mod vpc_peering;
