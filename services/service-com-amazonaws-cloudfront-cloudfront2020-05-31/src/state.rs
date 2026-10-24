@@ -167,7 +167,8 @@ pub const MAX_DISTRIBUTIONS: usize = 10_000;
 /// distributions allowed."
 pub const MAX_STREAMING_DISTRIBUTIONS: usize = 10_000;
 
-/// The most invalidations this emulator holds for ONE distribution.
+/// The most invalidations this emulator holds for ONE distribution, or for ONE
+/// distribution tenant.
 ///
 /// Same shape as [`MAX_DISTRIBUTIONS`]: an invalidation record is what `GetInvalidation`
 /// answers from, so it is bounded by a maximum entry count refused before the insert
@@ -799,7 +800,7 @@ pub fn no_such_resource(arn: &str) -> NoSuchResource {
     }
 }
 
-/// One invalidation batch submitted against one distribution.
+/// One invalidation batch submitted against one distribution or one distribution tenant.
 #[derive(Debug, Clone)]
 pub struct StoredInvalidation {
     /// `Invalidation$Id` — "The identifier for the invalidation request."
@@ -839,6 +840,113 @@ impl StoredInvalidation {
             status: self.status.clone(),
         }
     }
+}
+
+/// Materialise the batch completions the clock owes `invalidations` at `now`.
+///
+/// Idempotent and monotonic: a batch that has already finished stays finished, and one
+/// whose deadline has not passed is left alone, so applying this on a read never changes
+/// what a later caller sees. The invalidations of a distribution and those of a
+/// distribution tenant are held in the same kind of map and finish under the same rule, so
+/// this is one function rather than one per owner.
+pub fn settle_invalidations(
+    invalidations: &mut BTreeMap<String, StoredInvalidation>,
+    now: SystemTime,
+) {
+    for invalidation in invalidations.values_mut() {
+        if invalidation.status != STATUS_COMPLETED && now >= invalidation.completed_due {
+            invalidation.status = STATUS_COMPLETED.to_string();
+        }
+    }
+}
+
+/// `invalidations` in the order a list serves them.
+///
+/// CloudFront documents the order on the `Marker` of every invalidation listing: "the
+/// results are returned in decreasing order from most recent to oldest, [so] the most
+/// recent results are on the first page". Two invalidations stamped with the SAME instant
+/// are ordered by id, which makes this a stable TOTAL order rather than merely a sorted
+/// one — and that is what lets a `Marker` naming one of them resume at exactly one
+/// position.
+///
+/// Reads [`StoredInvalidation::status`] nowhere, so the caller decides whether to settle
+/// the clock first; every list handler does, because the summaries it builds from these
+/// records report that status.
+pub fn invalidations_most_recent_first(
+    invalidations: &BTreeMap<String, StoredInvalidation>,
+) -> Vec<&StoredInvalidation> {
+    let mut ordered: Vec<&StoredInvalidation> = invalidations.values().collect();
+    ordered.sort_by(|left, right| {
+        right
+            .create_time
+            .cmp(&left.create_time)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    ordered
+}
+
+/// ONE page of `invalidations`, as the `InvalidationList` every CloudFront invalidation
+/// listing answers with — or `None` when `marker` names none of them.
+///
+/// The page contract is the same whichever resource the invalidations hang off, so it
+/// lives here once rather than in each handler:
+///
+/// * the order is the documented one, most recent first
+///   ([`invalidations_most_recent_first`]);
+/// * "To get the next page of results, set Marker to the value of the NextMarker from the
+///   current page's response. This value is the same as the ID of the last invalidation
+///   batch on that page" — so the marker is a resume point this service handed out, and
+///   this page starts after the invalidation it names. A value naming none of them was
+///   never such a resume point: this answers `None`, and the caller refuses it with the
+///   modelled `InvalidArgument` naming the resource it asked about, rather than silently
+///   serving the first page again;
+/// * `page_size` is how many summaries this response serves (see [`page_size`]), and
+///   `max_items` is reported as "the value that you provided for the MaxItems request
+///   parameter";
+/// * `NextMarker` is present exactly when invalidations remain, carrying the id this page
+///   ended at, and `IsTruncated` says the same thing;
+/// * `Quantity` is the length of `Items`, and a page that lists nothing carries no `Items`
+///   element at all rather than an empty one.
+///
+/// Each summary is [`StoredInvalidation::to_summary`] of the one stored record, so a list
+/// page and a read of the same invalidation can never disagree about it.
+pub fn invalidation_page(
+    invalidations: &BTreeMap<String, StoredInvalidation>,
+    marker: Option<&str>,
+    max_items: i32,
+    page_size: usize,
+) -> Option<crate::ops::types::InvalidationList> {
+    let ordered = invalidations_most_recent_first(invalidations);
+    let start = match marker {
+        Some(marker) => {
+            ordered
+                .iter()
+                .position(|invalidation| invalidation.id == marker)?
+                + 1
+        }
+        None => 0,
+    };
+
+    let remaining = &ordered[start..];
+    let served = remaining.len().min(page_size);
+    let items: Vec<InvalidationSummary> = remaining[..served]
+        .iter()
+        .map(|invalidation| invalidation.to_summary())
+        .collect();
+    let is_truncated = remaining.len() > served;
+
+    Some(crate::ops::types::InvalidationList {
+        marker: marker.unwrap_or_default().to_string(),
+        next_marker: if is_truncated {
+            items.last().map(|summary| summary.id.clone())
+        } else {
+            None
+        },
+        max_items,
+        is_truncated,
+        quantity: i32::try_from(items.len()).unwrap_or(i32::MAX),
+        items: if items.is_empty() { None } else { Some(items) },
+    })
 }
 
 /// One CloudFront distribution, as this emulator persists it.
@@ -893,34 +1001,13 @@ impl StoredDistribution {
         if self.status != STATUS_DEPLOYED && now >= self.deployed_due {
             self.status = STATUS_DEPLOYED.to_string();
         }
-        for invalidation in self.invalidations.values_mut() {
-            if invalidation.status != STATUS_COMPLETED && now >= invalidation.completed_due {
-                invalidation.status = STATUS_COMPLETED.to_string();
-            }
-        }
+        settle_invalidations(&mut self.invalidations, now);
     }
 
-    /// This distribution's invalidations in the order a list serves them.
-    ///
-    /// CloudFront documents the order on `ListInvalidations`'s `Marker`: "the results are
-    /// returned in decreasing order from most recent to oldest, [so] the most recent
-    /// results are on the first page". Two invalidations stamped with the SAME instant are
-    /// ordered by id, which makes this a stable TOTAL order rather than merely a sorted
-    /// one — and that is what lets a `Marker` naming one of them resume at exactly one
-    /// position.
-    ///
-    /// Reads [`StoredInvalidation::status`] nowhere, so the caller decides whether to
-    /// settle the clock first; every list handler does, because the summaries it builds
-    /// from these records report that status.
+    /// This distribution's invalidations in the order a list serves them — the one order
+    /// every invalidation listing uses ([`invalidations_most_recent_first`]).
     pub fn invalidations_most_recent_first(&self) -> Vec<&StoredInvalidation> {
-        let mut ordered: Vec<&StoredInvalidation> = self.invalidations.values().collect();
-        ordered.sort_by(|left, right| {
-            right
-                .create_time
-                .cmp(&left.create_time)
-                .then_with(|| left.id.cmp(&right.id))
-        });
-        ordered
+        invalidations_most_recent_first(&self.invalidations)
     }
 
     /// "The number of invalidation batches currently in progress" — counted from the
@@ -1608,10 +1695,19 @@ pub struct StoredDistributionTenant {
     /// The version token the last mutation handed back, and the single source of truth for
     /// every `If-Match` check against this tenant.
     pub etag: String,
+    /// Every invalidation created under this distribution tenant, keyed by invalidation id.
+    ///
+    /// A tenant's invalidations are addressed under the TENANT
+    /// (`/distribution-tenant/{Id}/invalidation/...`), so they are held on its record
+    /// rather than on the multi-tenant distribution's: a create, a read and a list of one
+    /// tenant's invalidations all answer from here, and no other tenant's listing reaches
+    /// them.
+    pub invalidations: BTreeMap<String, StoredInvalidation>,
 }
 
 impl StoredDistributionTenant {
-    /// Apply the propagation transition the clock owes at `now`.
+    /// Apply every transition the clock owes this tenant at `now`: its own propagation, and
+    /// the completion of each invalidation batch created under it.
     ///
     /// Idempotent and monotonic, for the same reason
     /// [`StoredDistribution::settle`] is: it only ever moves the non-terminal status to the
@@ -1621,6 +1717,7 @@ impl StoredDistributionTenant {
         if self.status == STATUS_IN_PROGRESS && now >= self.deployed_due {
             self.status = STATUS_DEPLOYED.to_string();
         }
+        settle_invalidations(&mut self.invalidations, now);
     }
 
     /// Whether this tenant holds `domain`, compared as DNS names are.
@@ -2879,6 +2976,20 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         format!("d{label}.cloudfront.net")
     }
 
+    /// Allocate an invalidation id no invalidation of the named distribution tenant holds.
+    pub fn allocate_tenant_invalidation_id(&mut self, tenant_id: &str) -> String {
+        loop {
+            let candidate = format!("I{}", self.mint(ID_BODY_LEN));
+            let taken = self
+                .distribution_tenants
+                .get(tenant_id)
+                .is_some_and(|tenant| tenant.invalidations.contains_key(&candidate));
+            if !taken {
+                break candidate;
+            }
+        }
+    }
+
     /// Allocate an invalidation id no invalidation of the named distribution holds.
     pub fn allocate_invalidation_id(&mut self, distribution_id: &str) -> String {
         loop {
@@ -3213,6 +3324,12 @@ pub fn streaming_distribution_path(id: &str) -> String {
 /// The path of one invalidation of one distribution.
 pub fn invalidation_path(distribution_id: &str, invalidation_id: &str) -> String {
     format!("/2020-05-31/distribution/{distribution_id}/invalidation/{invalidation_id}")
+}
+
+/// The path of one invalidation of one distribution TENANT — the URI the tenant
+/// invalidation operations are bound to.
+pub fn distribution_tenant_invalidation_path(tenant_id: &str, invalidation_id: &str) -> String {
+    format!("/2020-05-31/distribution-tenant/{tenant_id}/invalidation/{invalidation_id}")
 }
 
 /// The ARN of a key value store. CloudFront is a GLOBAL service, so the ARN's region
@@ -4898,6 +5015,27 @@ pub const NO_SUCH_DISTRIBUTION_MESSAGE: &str = "The specified distribution does 
 /// `NoSuchInvalidation`'s message: the sentence the model states on the shape itself,
 /// "The specified invalidation does not exist."
 pub const NO_SUCH_INVALIDATION_MESSAGE: &str = "The specified invalidation does not exist.";
+
+/// `TooManyInvalidationsInProgress`'s message, as CloudFront sends it: "Processing your
+/// request will cause you to exceed the maximum number of in-progress invalidations."
+///
+/// The model's doc text for the shape states the CONDITION ("You have exceeded the maximum
+/// number of allowable InProgress invalidation batch requests, or invalidation objects.");
+/// this is the sentence the service puts on the wire. Fixed service text that names no
+/// request value, for the same reason [`PRECONDITION_FAILED_MESSAGE`] is: the quota is the
+/// service's own, and a caller learns what it asked for from the request it sent.
+pub const TOO_MANY_INVALIDATIONS_MESSAGE: &str =
+    "Processing your request will cause you to exceed the maximum number of in-progress \
+     invalidations.";
+
+/// The modelled `TooManyInvalidationsInProgress` for a request the invalidation quota
+/// cannot admit: one batch naming more invalidation objects than a request may, or one that
+/// would take the invalidations held for a resource past what this emulator keeps.
+pub fn too_many_invalidations_in_progress() -> crate::ops::types::TooManyInvalidationsInProgress {
+    crate::ops::types::TooManyInvalidationsInProgress {
+        message: Some(TOO_MANY_INVALIDATIONS_MESSAGE.to_string()),
+    }
+}
 
 /// `PreconditionFailed`'s message, as CloudFront sends it: "The request failed because it
 /// didn't meet the preconditions in one or more request-header fields."
