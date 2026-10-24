@@ -31,6 +31,8 @@ mod minute_usage;
 mod not_found_messages;
 #[path = "all/request_validation.rs"]
 mod request_validation;
+#[path = "all/resource_tagging.rs"]
+mod resource_tagging;
 #[path = "all/s3_recording_buckets.rs"]
 mod s3_recording_buckets;
 #[path = "all/satellite_catalog.rs"]

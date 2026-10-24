@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListTagsForResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListTagsForResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListTagsForResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the tags assigned to the resource `resourceArn` names — the one map that
+//! resource's own reads report, so a tag write through `TagResource` is visible here and
+//! nothing else is. A resource carrying no tag is reported as the EMPTY map, never as an
+//! omitted member ([`crate::state::response_tags`]).
+//!
+//! A read: it resolves the ARN through `crate::state`'s one ARN index
+//! ([`crate::state::ComAmazonawsGroundstationGroundstationState::tags_of`]) and writes
+//! nothing. An ARN this service never minted, or one whose resource has been deleted, is
+//! `ResourceNotFoundException` (HTTP 434).
 //!
 //! ## Shape of an operation
 //!
@@ -137,20 +138,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListTagsForResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListTagsForResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListTagsForResource"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListTagsForResourceErrorModeled::DependencyException(DependencyException {
+                message: Some("this service's state store is unavailable".to_string()),
+                parameter_name: None,
+            })
+        })?;
+
+        // `@readonly`: this reports the stored map and writes nothing, so a later caller
+        // sees exactly what it would have seen had nobody listed the tags.
+        let guard = state.lock();
+        let tags = guard.tags_of(&input.resource_arn).ok_or_else(|| {
+            ListTagsForResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                message: Some(crate::state::tagged_resource_not_found_message(
+                    &input.resource_arn,
+                )),
+            })
+        })?;
+
+        Ok(ListTagsForResourceOutput {
+            tags: crate::state::response_tags(tags),
+        })
     }
 }

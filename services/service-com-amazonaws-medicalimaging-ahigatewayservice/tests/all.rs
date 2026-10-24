@@ -15,6 +15,8 @@
 mod datastore_lifecycle;
 #[path = "all/error_message_texts.rs"]
 mod error_message_texts;
+#[path = "all/image_frames.rs"]
+mod image_frames;
 #[path = "all/image_set_copy.rs"]
 mod image_set_copy;
 #[path = "all/resource_tagging.rs"]

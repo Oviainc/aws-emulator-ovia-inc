@@ -33,6 +33,7 @@ use crate::ops::types::{
 // The dynamic instrumentation shapes, on their own `use` for the same reason.
 use crate::ops::types::{
     InstrumentationConfiguration, InstrumentationConfigurationWithoutServiceEnv, Location,
+    LocationIdentifier,
 };
 
 /// This service's SigV4 signing name, which is also its ARN namespace
@@ -1705,6 +1706,22 @@ pub fn location_hash(location: &Location) -> String {
     }
 }
 
+/// The `LocationHash` a `GetInstrumentationConfiguration` request's `LocationIdentifier`
+/// denotes, for either form the model admits: "either full code location or a pre-computed
+/// hash".
+///
+/// A full location is hashed by [`location_hash`] — the same function the create path keyed
+/// the record by, so a request naming the location and one naming the hash resolve to one
+/// record — and a hash the caller already holds IS the value, taken verbatim.
+pub fn identified_location_hash(identifier: &LocationIdentifier) -> String {
+    match identifier {
+        LocationIdentifier::CodeLocation(code) => {
+            location_hash(&Location::CodeLocation(code.clone()))
+        }
+        LocationIdentifier::LocationHash(hash) => hash.clone(),
+    }
+}
+
 /// 16 lowercase hex characters of SHA-256 over `fields`.
 ///
 /// The digest is the maintained `sha2` crate's, and the rendering is INJECTIVE: each field
@@ -1802,5 +1819,35 @@ pub fn requested_expiry(
 pub fn instrumentation_configuration_already_exists(arn: &str) -> ConflictException {
     ConflictException {
         message: format!("Instrumentation configuration with arn '{arn}' already exists."),
+    }
+}
+
+/// The `ResourceType` an instrumentation configuration failure reports: the resource's TYPE
+/// NAME (the modelled `InstrumentationConfiguration` shape), not the camel-case segment an
+/// ARN spells ([`INSTRUMENTATION_CONFIG_ARN_RESOURCE`]) — the same distinction
+/// [`SLO_RESOURCE_TYPE`] draws for an SLO, and what a client comparing `ResourceType`
+/// compares against.
+pub const INSTRUMENTATION_CONFIG_RESOURCE_TYPE: &str = "InstrumentationConfiguration";
+
+/// The modelled `ResourceNotFoundException` for an identity that names no stored
+/// configuration.
+///
+/// `ResourceType` and `ResourceId` are both `@required` members a client branches on, so the
+/// failure reports the type name and the full resource identifier. There is no record to
+/// read an ARN off, so the ARN is derived from the identity the REQUEST named — exactly as
+/// [`slo_not_found`] does for an SLO — and the message states the same two facts.
+pub fn instrumentation_configuration_not_found(
+    region: &str,
+    scope: &InstrumentationScope,
+    signal_type: &str,
+    location_hash: &str,
+) -> ResourceNotFoundException {
+    let arn = instrumentation_configuration_arn(region, scope, signal_type, location_hash);
+    ResourceNotFoundException {
+        message: format!(
+            "{INSTRUMENTATION_CONFIG_RESOURCE_TYPE} with arn '{arn}' does not exist."
+        ),
+        resource_type: INSTRUMENTATION_CONFIG_RESOURCE_TYPE.to_string(),
+        resource_id: arn,
     }
 }

@@ -31,12 +31,16 @@ use serde_json::{json, Value};
 use crate::transcription_jobs::Transcribe;
 
 /// The resource kinds this service's own refusals name, one per ARN resource type it
-/// stores records of, plus the neutral word for a type it holds none of. The three
-/// stored types are the ones `TranscribeArn`'s `<type>/<name>` segment spells
-/// (`smithy_query(query="operation", operation="TagResource")`).
+/// stores records of, plus the neutral word for a type it holds none of. The stored
+/// types are the ones `TranscribeArn`'s `<type>/<name>` segment spells
+/// (`smithy_query(query="operation", operation="TagResource")`), whose own doc lists
+/// the valid values ("transcription-job, medical-transcription-job, vocabulary,
+/// medical-vocabulary, vocabulary-filter, and language-model") — of which
+/// `medical-transcription-job` is one this emulator stores no records of.
 const KIND_VOCABULARY: &str = "vocabulary";
 const KIND_VOCABULARY_FILTER: &str = "vocabulary filter";
 const KIND_JOB: &str = "job";
+const KIND_LANGUAGE_MODEL: &str = "language model";
 const KIND_RESOURCE: &str = "resource";
 
 /// The region the unsigned rows of this suite are served in, so a tagging ARN is
@@ -264,9 +268,21 @@ async fn a_resource_this_account_does_not_hold_is_a_bad_request() {
             KIND_VOCABULARY_FILTER,
         ),
         (
-            "ListTagsForResource for a resource type this emulator holds none of",
+            "DescribeLanguageModel for a model that was never created",
+            "DescribeLanguageModel",
+            json!({"ModelName": "never-created"}),
+            KIND_LANGUAGE_MODEL,
+        ),
+        (
+            "ListTagsForResource for a language-model ARN that names nothing",
             "ListTagsForResource",
             json!({"ResourceArn": arn("language-model", "any-model")}),
+            KIND_LANGUAGE_MODEL,
+        ),
+        (
+            "ListTagsForResource for a resource type this emulator holds none of",
+            "ListTagsForResource",
+            json!({"ResourceArn": arn("medical-transcription-job", "any-job")}),
             KIND_RESOURCE,
         ),
     ];

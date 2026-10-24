@@ -998,8 +998,10 @@ pub const MAX_TAGS_PER_RESOURCE: usize = 50;
 /// `TagsMap` carries no constraint in the model, so the boundary validator lets every map
 /// through and this is the only gate: a tag map is checked HERE, before any id, ARN or
 /// record is minted, so a caller never holds a resource AWS would have refused to tag
-/// that way. Every create of this service that accepts tags calls it, so one illegal map
-/// is refused identically whichever resource it was sent to.
+/// that way. Every create of this service that accepts tags calls it, as does
+/// `TagResource` (which additionally judges the MERGED map against the per-resource
+/// bound — see [`validate_tag_merge`]), so one illegal map is refused identically
+/// whichever resource and whichever operation it was sent to.
 ///
 /// The conditions, each from a constant above: more than [`MAX_TAGS_PER_RESOURCE`]
 /// entries (a property of the map as a whole, so it is judged first — the request is
@@ -1065,6 +1067,40 @@ pub fn validate_tags(
         }
     }
 
+    Ok(())
+}
+
+/// Refuse a tag ASSIGNMENT whose merge would leave the resource carrying more than
+/// [`MAX_TAGS_PER_RESOURCE`] tags, with the modelled `InvalidParameterException`
+/// (HTTP 431) naming the [`TAGS_PARAMETER`] member.
+///
+/// [`validate_tags`] judges the map a request CARRIES; this judges the map the resource
+/// would be left with, which is the quantity the rule is actually about ("the most tags
+/// one resource may carry"): assigning tags merges them into what the resource already
+/// holds, so a legal request map can still take the resource past the bound. A key the
+/// resource already holds is an OVERWRITE and adds nothing to the count, so only the
+/// genuinely new keys are counted.
+///
+/// Checked before anything is written, so a refused assignment leaves the resource
+/// exactly as it was rather than half-tagged.
+pub fn validate_tag_merge(
+    stored: &HashMap<String, String>,
+    assigned: &HashMap<String, String>,
+) -> Result<(), InvalidParameterException> {
+    let added = assigned
+        .keys()
+        .filter(|key| !stored.contains_key(*key))
+        .count();
+    let merged = stored.len() + added;
+    if merged > MAX_TAGS_PER_RESOURCE {
+        return Err(invalid_parameter(
+            TAGS_PARAMETER,
+            format!(
+                "Value at '{TAGS_PARAMETER}' would leave the resource carrying {merged} tags; a \
+                 resource may carry at most {MAX_TAGS_PER_RESOURCE} tags."
+            ),
+        ));
+    }
     Ok(())
 }
 
@@ -1345,6 +1381,19 @@ pub struct Agent {
 /// agent that is not there answer one text.
 pub fn agent_not_found_message(agent_id: &str) -> String {
     format!("No agent found with id {agent_id}")
+}
+
+/// What an operation addressed at a resource by its `resourceArn` answers when that ARN
+/// names no resource of this account.
+///
+/// Shared by every tag operation, so a read and a write of the tags of a resource that is
+/// not there answer one text. The CONTRACT is the error shape and its status —
+/// `ResourceNotFoundException`, HTTP 434 (`smithy_query(query="operation",
+/// operation="TagResource")`); AWS documents no wording for it, so this composition — the
+/// ARN the request asked about, which is the only thing these operations address a
+/// resource by — is this service's.
+pub fn tagged_resource_not_found_message(arn: &str) -> String {
+    format!("No resource found with ARN {arn}")
 }
 
 /// A satellite this account is on-boarded to, as [`SATELLITES_ENV`] described it.
@@ -1968,6 +2017,92 @@ impl ComAmazonawsGroundstationGroundstationState {
                 self.mission_profiles.get(mission_profile_id)
             }
             _ => None,
+        }
+    }
+
+    /// The tags of the resource `arn` names, when this service holds one.
+    ///
+    /// EVERY resource this service hands out is taggable — a config, a mission profile, a
+    /// contact, a dataflow endpoint group, an agent and an ephemeris each carry their own
+    /// `tags` map, which is what their creates store and their reads report — so the
+    /// lookup is by ARN through the one
+    /// [`ComAmazonawsGroundstationGroundstationState::arn_index`] rather than per resource
+    /// kind: that index is what makes an ARN-addressed operation resolve without knowing
+    /// which map the resource lives in. An ARN this service never minted, or one whose
+    /// resource has since been DELETED (a delete drops the index entry), resolves to
+    /// nothing.
+    ///
+    /// This is the READ half, for the operation that reports a resource's tags;
+    /// [`Self::tags_mut`] is the write half.
+    pub fn tags_of(&self, arn: &str) -> Option<&HashMap<String, String>> {
+        match self.arn_index.get(arn)? {
+            ResourceRef::Config {
+                config_type,
+                config_id,
+            } => self
+                .configs
+                .get(&(config_type.clone(), config_id.clone()))
+                .map(|config| &config.tags),
+            ResourceRef::MissionProfile { mission_profile_id } => self
+                .mission_profiles
+                .get(mission_profile_id)
+                .map(|profile| &profile.tags),
+            ResourceRef::Contact { contact_id } => {
+                self.contacts.get(contact_id).map(|contact| &contact.tags)
+            }
+            ResourceRef::DataflowEndpointGroup {
+                dataflow_endpoint_group_id,
+            } => self
+                .dataflow_endpoint_groups
+                .get(dataflow_endpoint_group_id)
+                .map(|group| &group.tags),
+            ResourceRef::Agent { agent_id } => self.agents.get(agent_id).map(|agent| &agent.tags),
+            ResourceRef::Ephemeris { ephemeris_id } => self
+                .ephemerides
+                .get(ephemeris_id)
+                .map(|ephemeris| &ephemeris.tags),
+        }
+    }
+
+    /// The tags of the resource `arn` names, for WRITING, when this service holds one.
+    ///
+    /// The write half of [`Self::tags_of`]: the same ARN resolution, handing back the
+    /// stored map itself so a tag write is a read-modify-write of the ONE map the
+    /// resource's reads report, under the single lock the caller already holds. Two
+    /// writers that each add a key therefore both persist, whatever order they arrive in.
+    pub fn tags_mut(&mut self, arn: &str) -> Option<&mut HashMap<String, String>> {
+        // Resolved to an owned reference first: the index borrow ends here, so the
+        // resource's own map can be borrowed mutably below.
+        match self.arn_index.get(arn)?.clone() {
+            ResourceRef::Config {
+                config_type,
+                config_id,
+            } => self
+                .configs
+                .get_mut(&(config_type, config_id))
+                .map(|config| &mut config.tags),
+            ResourceRef::MissionProfile { mission_profile_id } => self
+                .mission_profiles
+                .get_mut(&mission_profile_id)
+                .map(|profile| &mut profile.tags),
+            ResourceRef::Contact { contact_id } => self
+                .contacts
+                .get_mut(&contact_id)
+                .map(|contact| &mut contact.tags),
+            ResourceRef::DataflowEndpointGroup {
+                dataflow_endpoint_group_id,
+            } => self
+                .dataflow_endpoint_groups
+                .get_mut(&dataflow_endpoint_group_id)
+                .map(|group| &mut group.tags),
+            ResourceRef::Agent { agent_id } => self
+                .agents
+                .get_mut(&agent_id)
+                .map(|agent| &mut agent.tags),
+            ResourceRef::Ephemeris { ephemeris_id } => self
+                .ephemerides
+                .get_mut(&ephemeris_id)
+                .map(|ephemeris| &mut ephemeris.tags),
         }
     }
 
