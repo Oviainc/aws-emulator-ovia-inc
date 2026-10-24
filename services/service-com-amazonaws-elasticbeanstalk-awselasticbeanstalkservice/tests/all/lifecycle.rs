@@ -195,6 +195,23 @@ impl Emulator {
         Answer::of(self.router.dispatch(request).await)
     }
 
+    /// `GET` `url` with NO `Authorization` header — a request whose only
+    /// credential is the one its own query string carries.
+    ///
+    /// For a suite that follows a PRESIGNED URL this emulator handed out: a
+    /// presigned request is signed in the query string, so adding a header
+    /// credential would make it a different (and unsigned) request. The URL is
+    /// dispatched exactly as the service reported it, so the emulator's own
+    /// signature verification is what decides the answer.
+    pub(crate) async fn get_url(&self, url: &str) -> Answer {
+        let request = http::Request::builder()
+            .method("GET")
+            .uri(url)
+            .body(bytes::Bytes::new())
+            .expect("a well-formed request");
+        Answer::of(self.router.dispatch(request).await)
+    }
+
     /// Store `body` at `key` in `bucket` in the emulator's object storage, creating
     /// the bucket first, so a create that DOWNLOADS that archive finds it there.
     ///

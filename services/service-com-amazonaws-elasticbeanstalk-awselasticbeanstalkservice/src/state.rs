@@ -7,7 +7,9 @@
 //! custom platform versions and the
 //! environments the lifecycle
 //! operations create, describe and delete, plus the managed platform branch
-//! catalog the service publishes and the event log those operations append to
+//! catalog the service publishes, the environment information
+//! `RequestEnvironmentInfo` compiles and `RetrieveEnvironmentInfo` reports,
+//! and the event log those operations append to
 //! and `DescribeEvents` reports. It also owns the few derivations all
 //! of them share — the server clock, the request's region, this service's ARN
 //! forms, and the clock-owed environment status transitions — so no handler
@@ -19,8 +21,8 @@ use std::time::{Duration, Instant};
 
 use crate::ops::types::{
     ApplicationDescription, ApplicationResourceLifecycleConfig, ApplicationVersionDescription,
-    ApplicationVersionLifecycleConfig, ConfigurationOptionSetting, CustomAmi, EnvironmentTier,
-    CONFIGURATION_DEPLOYMENT_STATUS_VALUES,
+    ApplicationVersionLifecycleConfig, ConfigurationOptionSetting, CustomAmi,
+    EnvironmentInfoDescription, EnvironmentTier, CONFIGURATION_DEPLOYMENT_STATUS_VALUES,
     EventDescription, ManagedActionHistoryItem, MaxAgeRule, MaxCountRule, OptionSpecification,
     PlatformBranchSummary, PlatformDescription, PlatformFramework, PlatformProgrammingLanguage,
     PlatformSummary, S3Location, Tag,
@@ -45,6 +47,52 @@ const DEFAULT_REGION: &str = "us-east-1";
 /// The due instant is stored on the record and materialised when a later call
 /// observes it — nothing sleeps.
 pub const STATUS_TRANSITION_SPAN: Duration = Duration::from_millis(500);
+
+/// How long after the `RequestEnvironmentInfo` that starts it the compile of an
+/// environment's information finishes, so that `RetrieveEnvironmentInfo`
+/// reports it.
+///
+/// "Initiates a request to compile the specified type of information of the
+/// deployed environment … Use RetrieveEnvironmentInfo to obtain the set of
+/// logs": the compile runs after the call that asks for it, so the information
+/// is not retrievable the instant it was asked for. The real service takes as
+/// long as the environment's instances take, so this span is CHOSEN — it is the
+/// one every other change this service owes the clock takes
+/// ([`STATUS_TRANSITION_SPAN`]), so the two cannot drift, and it is
+/// deliberately non-zero: a caller that retrieves straight after requesting
+/// observes the compile still running, as it does against the real service.
+pub const ENVIRONMENT_INFO_COMPILE_SPAN: Duration = STATUS_TRANSITION_SPAN;
+
+/// How long the information one compile produced stays retrievable once the
+/// compile has finished: "The files are deleted after 15 minutes"
+/// (`EnvironmentInfoDescription$Message`), after which `RetrieveEnvironmentInfo`
+/// reports nothing for it. DOCUMENTED, so it keeps the value the documentation
+/// gives it rather than a span of this emulator's choosing.
+pub const ENVIRONMENT_INFO_RETENTION: Duration = Duration::from_secs(15 * 60);
+
+/// The `EnvironmentInfoType` value whose compile is the LAST lines of the
+/// environment's log rather than the whole of it.
+pub const ENVIRONMENT_INFO_TYPE_TAIL: &str = "tail";
+
+/// How many lines of the log a `tail` compiles: "setting the `InfoType` to
+/// `tail` compiles the last lines from the … log files of every Amazon EC2
+/// instance in your environment". How many lines "the last lines" is, is not
+/// documented, so this bound is CHOSEN — it only decides how much of the log a
+/// `tail` carries, where `bundle` and `analyze` carry the whole of it.
+pub const ENVIRONMENT_INFO_TAIL_LINES: usize = 100;
+
+/// How much of an environment's log the information `info_type` asks for
+/// carries: the last [`ENVIRONMENT_INFO_TAIL_LINES`] lines for `tail`, and the
+/// whole log for every other value of the modelled set.
+pub fn environment_info_log_lines(info_type: &str) -> Option<usize> {
+    (info_type == ENVIRONMENT_INFO_TYPE_TAIL).then_some(ENVIRONMENT_INFO_TAIL_LINES)
+}
+
+/// The operation name `RequestEnvironmentInfo`'s events are recorded under —
+/// the lower-camel-case form this service's event log names an operation in.
+/// Named once so the event the call records and the event its completion
+/// records cannot word it differently.
+pub const REQUEST_ENVIRONMENT_INFO_ACTIVITY: &str = "requestEnvironmentInfo";
 
 /// `EnvironmentStatus` values this service writes. The full modelled value set is
 /// `crate::ops::types::ENVIRONMENT_STATUS_VALUES`.
@@ -1467,6 +1515,293 @@ pub async fn create_storage_bucket(
                  as it stands",
             );
             Ok(())
+        }
+    }
+}
+
+/// The Amazon S3 key the information compiled from one of an environment's
+/// instances is stored at in the account's Elastic Beanstalk storage bucket.
+///
+/// `CreateStorageLocation` creates the bucket Elastic Beanstalk "store[s]
+/// application versions, LOGS, and other files used by Elastic Beanstalk
+/// environments" in, so that bucket is where a compiled file goes, under a key
+/// naming what was compiled, for which environment and from which instance. The
+/// layout below is this emulator's own: the model documents only that the file
+/// is an Amazon S3 object the `Message` URL names, never where it sits — and the
+/// file name is `eb-activity.log`, the environment activity log the compiled
+/// content IS (see [`ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState::environment_activity_log`]).
+pub fn environment_info_key(
+    info_type: &str,
+    environment_id: &str,
+    ec2_instance_id: &str,
+) -> String {
+    format!(
+        "resources/environments/logs/{info_type}/{environment_id}/{ec2_instance_id}/eb-activity.log"
+    )
+}
+
+/// One compiled file of an environment's information: the instance it was
+/// compiled from, where object storage holds it, and the URL a caller downloads
+/// it at.
+#[derive(Debug, Clone)]
+pub struct CompiledEnvironmentInfoFile {
+    pub ec2_instance_id: String,
+    pub s3_key: String,
+    /// The presigned Amazon S3 URL of that object — `EnvironmentInfoDescription`'s
+    /// `Message`, which "currently contains a presigned Amazon S3 URL". `None`
+    /// when object storage did not store the file or the URL could not be
+    /// signed: an entry then carries no `Message` rather than a URL to
+    /// something a caller cannot download.
+    pub message: Option<String>,
+}
+
+/// What compiling one environment's information produced: the bucket it was
+/// stored in, one file per instance, and the credential the URLs are signed
+/// with — withdrawn when the files are deleted.
+#[derive(Debug, Clone, Default)]
+pub struct CompiledEnvironmentInfo {
+    pub bucket: String,
+    pub files: Vec<CompiledEnvironmentInfoFile>,
+    pub credential_id: Option<String>,
+}
+
+/// A compile whose files the clock has deleted: the objects object storage must
+/// forget, and the credential whose only purpose was signing their URLs.
+#[derive(Debug, Clone)]
+pub struct DiscardedEnvironmentInfo {
+    pub bucket: String,
+    pub s3_keys: Vec<String>,
+    pub credential_id: Option<String>,
+}
+
+/// The credential's name in the presigned URL's provider, for diagnostics only.
+const ENVIRONMENT_INFO_SIGNER: &str = "ElasticBeanstalkEnvironmentInfo";
+
+/// Compile `log` into the account's Elastic Beanstalk storage bucket, one object
+/// per instance in `ec2_instance_ids`, and sign a download URL for each.
+///
+/// This is the work `RequestEnvironmentInfo` "initiates": the compiled file is a
+/// REAL object in the emulator's own object storage, written over the in-process
+/// callback (see [`s3_client`]), and the `Message` a later
+/// `RetrieveEnvironmentInfo` reports is a presigned `GetObject` URL of it — so a
+/// client that follows the URL downloads the bytes this service stored, and no
+/// URL names an object nothing wrote.
+///
+/// The URL is signed with a credential the emulator's credential store MINTS for
+/// it, never with the emulator's own: a service may hand a caller a credential
+/// it minted, and a presigned URL carries only that credential's id and the
+/// signature of this one `GetObject`, so the URL grants exactly the download it
+/// names. It is signed for [`ENVIRONMENT_INFO_RETENTION`], which is how long the
+/// files live ("the files are deleted after 15 minutes"), so the URL stops
+/// working at the instant the file it names is deleted.
+///
+/// Every failure is answered by compiling fewer files rather than by failing the
+/// request: an emulator assembled without object storage, or one that refused
+/// the write, leaves the entry with no `Message`, which is what
+/// [`CompiledEnvironmentInfoFile::message`] records.
+pub async fn compile_environment_info(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    environment_id: &str,
+    info_type: &str,
+    ec2_instance_ids: &[String],
+    log: &str,
+) -> CompiledEnvironmentInfo {
+    use ::emulator_server::aws_credentials::{AWS_ACCESS_KEY, SECRET_ACCESS_KEY};
+
+    let bucket = storage_bucket_name(region);
+    if ec2_instance_ids.is_empty() {
+        return CompiledEnvironmentInfo {
+            bucket,
+            ..Default::default()
+        };
+    }
+    // The compiled files are stored where the account's Elastic Beanstalk files
+    // are stored, so the bucket has to be there; a refusal is logged and the
+    // writes below then say, per file, whether anything was stored.
+    if let Err(refusal) = create_storage_bucket(ctx, region, &bucket).await {
+        ::tracing::warn!(
+            bucket,
+            region,
+            refusal = ?refusal,
+            "object storage would not stand up the Elastic Beanstalk storage bucket, so the \
+             compiled environment information could not be stored in it",
+        );
+    }
+
+    let credentials = ctx.credential_store();
+    let minted = credentials.create(&AWS_ACCESS_KEY);
+    let signer = minted.secret(SECRET_ACCESS_KEY).map(|secret| {
+        (
+            minted.id.clone(),
+            s3_signing_client(ctx, region, &minted.id, secret),
+        )
+    });
+    if signer.is_none() {
+        // A credential without its secret cannot sign anything, so it is
+        // withdrawn rather than left in the store.
+        let _ = credentials.delete(&minted.id);
+    }
+
+    let mut files = Vec::with_capacity(ec2_instance_ids.len());
+    for ec2_instance_id in ec2_instance_ids {
+        let s3_key = environment_info_key(info_type, environment_id, ec2_instance_id);
+        let stored = s3_client(ctx, region)
+            .put_object()
+            .bucket(&bucket)
+            .key(&s3_key)
+            .body(::aws_sdk_s3::primitives::ByteStream::from(
+                log.as_bytes().to_vec(),
+            ))
+            .send()
+            .await;
+        let message = match (stored, signer.as_ref()) {
+            (Ok(_), Some((_, client))) => presigned_download(client, &bucket, &s3_key).await,
+            (Ok(_), None) => None,
+            (Err(failure), _) => {
+                ::tracing::warn!(
+                    bucket,
+                    key = %s3_key,
+                    detail = %::aws_smithy_types::error::display::DisplayErrorContext(&failure),
+                    "object storage did not store the compiled environment information, so the \
+                     entry reports no download URL",
+                );
+                None
+            }
+        };
+        files.push(CompiledEnvironmentInfoFile {
+            ec2_instance_id: ec2_instance_id.clone(),
+            s3_key,
+            message,
+        });
+    }
+
+    // A credential that signed no URL is of no use to anyone, so it does not
+    // stay in the store either.
+    let credential_id = match signer {
+        Some((id, _)) if files.iter().any(|file| file.message.is_some()) => Some(id),
+        Some((id, _)) => {
+            let _ = credentials.delete(&id);
+            None
+        }
+        None => None,
+    };
+    CompiledEnvironmentInfo {
+        bucket,
+        files,
+        credential_id,
+    }
+}
+
+/// Delete the objects of every compile the clock has deleted and withdraw the
+/// credential that signed their URLs — the housekeeping behind "the files are
+/// deleted after 15 minutes".
+///
+/// Called by the two operations that have a request context to reach object
+/// storage and the credential store through, with the records
+/// [`ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState::take_deleted_environment_info`]
+/// handed back. Nothing a caller can observe depends on it: a deleted compile is
+/// never reported, and its presigned URL expired at the same instant.
+pub async fn discard_compiled_environment_info(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    discarded: &[DiscardedEnvironmentInfo],
+) {
+    for compile in discarded {
+        for key in &compile.s3_keys {
+            if let Err(failure) = s3_client(ctx, region)
+                .delete_object()
+                .bucket(&compile.bucket)
+                .key(key)
+                .send()
+                .await
+            {
+                ::tracing::warn!(
+                    bucket = %compile.bucket,
+                    key = %key,
+                    detail = %::aws_smithy_types::error::display::DisplayErrorContext(&failure),
+                    "object storage did not delete a compiled environment information file",
+                );
+            }
+        }
+        if let Some(credential_id) = &compile.credential_id {
+            if let Err(why) = ctx.credential_store().delete(credential_id) {
+                ::tracing::warn!(
+                    reason = ?why,
+                    "the credential that signed a compiled environment information URL could not \
+                     be withdrawn",
+                );
+            }
+        }
+    }
+}
+
+/// The Amazon S3 client a download URL is SIGNED with: the same configuration
+/// [`s3_client`] uses, with the minted credential in place of the emulator's own
+/// so the URL carries that credential's id and nothing else.
+///
+/// It sends no request — presigning only signs — but it is given the same
+/// in-process transport anyway, so the URL it signs addresses the endpoint the
+/// emulator's own Amazon S3 requests go to.
+fn s3_signing_client(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    access_key_id: &str,
+    secret_access_key: &str,
+) -> ::aws_sdk_s3::Client {
+    let config = ::aws_sdk_s3::Config::builder()
+        .behavior_version(::aws_sdk_s3::config::BehaviorVersion::latest())
+        .region(::aws_sdk_s3::config::Region::new(region.to_string()))
+        .endpoint_url(format!("https://s3.{region}.amazonaws.com"))
+        .force_path_style(true)
+        .credentials_provider(::aws_sdk_s3::config::Credentials::new(
+            access_key_id,
+            secret_access_key,
+            None,
+            None,
+            ENVIRONMENT_INFO_SIGNER,
+        ))
+        .http_client(ctx.callback().http_client())
+        .retry_config(::aws_sdk_s3::config::retry::RetryConfig::disabled())
+        .timeout_config(::aws_sdk_s3::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(::aws_sdk_s3::config::IdentityCache::no_cache())
+        .stalled_stream_protection(::aws_sdk_s3::config::StalledStreamProtectionConfig::disabled())
+        .build();
+    ::aws_sdk_s3::Client::from_conf(config)
+}
+
+/// The presigned `GetObject` URL of `bucket`/`key`, valid as long as the file it
+/// names lives, or `None` when the URL could not be signed.
+async fn presigned_download(
+    client: &::aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+) -> Option<String> {
+    let expires = match ::aws_sdk_s3::presigning::PresigningConfig::expires_in(
+        ENVIRONMENT_INFO_RETENTION,
+    ) {
+        Ok(config) => config,
+        Err(failure) => {
+            ::tracing::warn!(detail = %failure, "the download URL's validity is not a presignable span");
+            return None;
+        }
+    };
+    match client
+        .get_object()
+        .bucket(bucket)
+        .key(key)
+        .presigned(expires)
+        .await
+    {
+        Ok(request) => Some(request.uri().to_string()),
+        Err(failure) => {
+            ::tracing::warn!(
+                bucket,
+                key,
+                detail = %::aws_smithy_types::error::display::DisplayErrorContext(&failure),
+                "the compiled environment information file's download URL could not be signed",
+            );
+            None
         }
     }
 }
@@ -3876,6 +4211,110 @@ impl Environment {
     }
 }
 
+/// The compile of one environment's information that a `RequestEnvironmentInfo`
+/// started, and what a later `RetrieveEnvironmentInfo` of the same `InfoType`
+/// reports from it.
+///
+/// "Initiates a request to compile the specified type of information of the
+/// deployed environment … Use RetrieveEnvironmentInfo to obtain the set of
+/// logs": the two operations are a request and a later read of its result, so
+/// this record is what the store holds between them. One record per environment
+/// and `InfoType`, kept until the clock deletes the files the compile produced
+/// ([`ENVIRONMENT_INFO_RETENTION`]).
+#[derive(Debug, Clone)]
+pub struct EnvironmentInfoCompilation {
+    /// The information compiled, one of
+    /// [`crate::ops::types::ENVIRONMENT_INFO_TYPE_VALUES`] — the `InfoType` the
+    /// request asked for and the one a retrieve of it reports.
+    pub info_type: String,
+    /// When the compile finishes, one [`ENVIRONMENT_INFO_COMPILE_SPAN`] after
+    /// the call that started it. Until then there is nothing to retrieve.
+    pub due_at: Instant,
+    /// The same instant on the server clock: the `SampleTimestamp` every entry
+    /// of this compile reports ("the time stamp when this information was
+    /// retrieved"), dated when the compile FINISHED rather than when some later
+    /// retrieve happened to observe it as finished.
+    pub sample_timestamp: ::aws_smithy_types::DateTime,
+    /// When the files this compile produced are deleted, one
+    /// [`ENVIRONMENT_INFO_RETENTION`] after it finished.
+    pub expires_at: Instant,
+    /// The Amazon EC2 instances the information is compiled from, and the file
+    /// compiled from each: the environment's own inventory at the moment of the
+    /// request, so an instance its Auto Scaling group has since replaced is not
+    /// reported as sampled and one it has since added is not either.
+    pub files: Vec<CompiledEnvironmentInfoFile>,
+    /// The Amazon S3 bucket the compiled files were stored in.
+    pub bucket: String,
+    /// The credential the files' download URLs are signed with, withdrawn when
+    /// the files are deleted. `None` when no URL was signed.
+    pub credential_id: Option<String>,
+    /// The request that started the compile, which the event its completion
+    /// records belongs to.
+    pub request_id: String,
+    /// Whether the event the FINISHED compile owes has been recorded yet, so
+    /// the completion is recorded exactly once however many calls observe it.
+    pub completion_recorded: bool,
+}
+
+impl EnvironmentInfoCompilation {
+    /// The compile `RequestEnvironmentInfo` starts for `info_type` from
+    /// `compiled`, due one [`ENVIRONMENT_INFO_COMPILE_SPAN`] from now.
+    pub fn started(info_type: &str, compiled: CompiledEnvironmentInfo, request_id: &str) -> Self {
+        let due_at = Instant::now() + ENVIRONMENT_INFO_COMPILE_SPAN;
+        Self {
+            info_type: info_type.to_string(),
+            due_at,
+            // The same span on the server clock; the two constants are one
+            // value, so `due_date` dates this compile too.
+            sample_timestamp: due_date(),
+            expires_at: due_at + ENVIRONMENT_INFO_RETENTION,
+            files: compiled.files,
+            bucket: compiled.bucket,
+            credential_id: compiled.credential_id,
+            request_id: request_id.to_string(),
+            completion_recorded: false,
+        }
+    }
+
+    /// Whether the compile has finished by `at`.
+    pub fn is_compiled(&self, at: Instant) -> bool {
+        self.due_at <= at
+    }
+
+    /// Whether the files the compile produced have been deleted by `at`.
+    pub fn is_deleted(&self, at: Instant) -> bool {
+        self.expires_at <= at
+    }
+
+    /// What object storage and the credential store must forget once the files
+    /// are deleted.
+    pub fn to_discarded(&self) -> DiscardedEnvironmentInfo {
+        DiscardedEnvironmentInfo {
+            bucket: self.bucket.clone(),
+            s3_keys: self.files.iter().map(|file| file.s3_key.clone()).collect(),
+            credential_id: self.credential_id.clone(),
+        }
+    }
+
+    /// What `RetrieveEnvironmentInfo` reports from this compile: one
+    /// `EnvironmentInfoDescription` per instance the information was compiled
+    /// from, each naming the information compiled, the instance it came from,
+    /// the instant the compile sampled it and the URL its file downloads at.
+    pub fn to_descriptions(&self) -> Vec<EnvironmentInfoDescription> {
+        self.files
+            .iter()
+            .map(|file| EnvironmentInfoDescription {
+                info_type: Some(self.info_type.clone()),
+                ec2_instance_id: Some(file.ec2_instance_id.clone()),
+                sample_timestamp: Some(self.sample_timestamp),
+                // "The retrieved information. Currently contains a presigned
+                // Amazon S3 URL."
+                message: file.message.clone(),
+            })
+            .collect()
+    }
+}
+
 /// A status change the clock has made due and this store has applied, and the
 /// event that change records: the request it belongs to, its message, the
 /// instant it came due and the resources it is about.
@@ -4087,6 +4526,12 @@ pub struct ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
     /// `EnvironmentName` -> `EnvironmentId`, so an operation that takes either
     /// one resolves the same record.
     pub environment_name_index: BTreeMap<String, String>,
+    /// The environment information `RequestEnvironmentInfo` has compiled, by
+    /// `(EnvironmentId, InfoType)` — the one record `RetrieveEnvironmentInfo`
+    /// reports that information from. A second request for the same
+    /// information recompiles it, replacing what the previous one left, so a
+    /// retrieve reports the newest sample rather than both.
+    pub environment_info: BTreeMap<(String, String), EnvironmentInfoCompilation>,
     /// The service's event log, OLDEST first: every lifecycle call appends here
     /// and `DescribeEvents` reports from it. Append order is the record's
     /// `sequence`, which breaks a tie between two events the clock dated alike.
@@ -4140,6 +4585,8 @@ impl Default for ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
             platform_versions: BTreeMap::new(),
             environments: BTreeMap::new(),
             environment_name_index: BTreeMap::new(),
+            // Nothing has asked for an environment's information yet.
+            environment_info: BTreeMap::new(),
             events: Vec::new(),
             // No managed action has executed on any environment: see
             // `ManagedActionRecord`.
@@ -4547,6 +4994,184 @@ impl ComAmazonawsElasticbeanstalkAwselasticbeanstalkserviceState {
             platform_version.materialize_due(at);
         }
         self.evict_retired_environments();
+        // After the eviction, so the completion of a compile whose environment
+        // the store no longer holds is not recorded against a record that is
+        // gone.
+        self.record_due_environment_info_completions(at);
+    }
+
+    /// Start the compile of `info_type` for the environment `environment_id`
+    /// from `compiled` — the write `RequestEnvironmentInfo` performs, and the
+    /// only thing that puts a record in [`Self::environment_info`].
+    ///
+    /// A second request for the same information of the same environment
+    /// recompiles it, so the record REPLACES whatever an earlier request of
+    /// that type left behind, and answers what that earlier compile left in
+    /// object storage, for the caller to discard.
+    pub fn begin_environment_info_compile(
+        &mut self,
+        environment_id: &str,
+        info_type: &str,
+        compiled: CompiledEnvironmentInfo,
+        request_id: &str,
+    ) -> Option<DiscardedEnvironmentInfo> {
+        self.environment_info
+            .insert(
+                (environment_id.to_string(), info_type.to_string()),
+                EnvironmentInfoCompilation::started(info_type, compiled, request_id),
+            )
+            .as_ref()
+            .map(EnvironmentInfoCompilation::to_discarded)
+    }
+
+    /// The compiled `info_type` information of the environment
+    /// `environment_id` that is retrievable now — what
+    /// `RetrieveEnvironmentInfo` answers with.
+    ///
+    /// Empty when no request has asked for that information, when the compile
+    /// the last request started has not finished, and once the files it
+    /// produced have been deleted: in each of those cases the service holds
+    /// nothing to retrieve.
+    pub fn compiled_environment_info(
+        &self,
+        environment_id: &str,
+        info_type: &str,
+    ) -> Vec<EnvironmentInfoDescription> {
+        let at = Instant::now();
+        self.environment_info
+            .get(&(environment_id.to_string(), info_type.to_string()))
+            .filter(|compile| compile.is_compiled(at) && !compile.is_deleted(at))
+            .map(EnvironmentInfoCompilation::to_descriptions)
+            .unwrap_or_default()
+    }
+
+    /// Drop the record of every compile whose files the clock has deleted — and
+    /// of every compile whose environment the store no longer holds, which has
+    /// nothing left to retrieve — and answer what object storage and the
+    /// credential store must forget for them.
+    ///
+    /// The deletion was due at an instant that had passed whether or not
+    /// anybody called, so applying it here cannot hide information that was
+    /// still retrievable: [`Self::compiled_environment_info`] reports nothing
+    /// for a deleted compile either way. Called by the two operations that can
+    /// then carry the discard out
+    /// ([`discard_compiled_environment_info`]).
+    pub fn take_deleted_environment_info(&mut self) -> Vec<DiscardedEnvironmentInfo> {
+        let at = Instant::now();
+        let deleted: Vec<(String, String)> = self
+            .environment_info
+            .iter()
+            .filter(|((environment_id, _), compile)| {
+                compile.is_deleted(at) || !self.environments.contains_key(environment_id)
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        deleted
+            .into_iter()
+            .filter_map(|key| self.environment_info.remove(&key))
+            .map(|compile| compile.to_discarded())
+            .collect()
+    }
+
+    /// Record the event every compile that has FINISHED by `at` owes.
+    ///
+    /// The compile finished at an instant that had passed whether or not
+    /// anybody called, so its event is dated by that instant rather than by the
+    /// call that noticed, and it is recorded exactly once.
+    fn record_due_environment_info_completions(&mut self, at: Instant) {
+        // The event cannot be appended while `environment_info` is borrowed, so
+        // the finished compiles are collected first and recorded below.
+        let finished: Vec<(
+            (String, String),
+            String,
+            ::aws_smithy_types::DateTime,
+            EventSubject,
+        )> = self
+            .environment_info
+            .iter()
+            .filter(|(_, compile)| compile.is_compiled(at) && !compile.completion_recorded)
+            .filter_map(|(key, compile)| {
+                let environment = self.environments.get(&key.0)?;
+                Some((
+                    key.clone(),
+                    compile.request_id.clone(),
+                    compile.sample_timestamp,
+                    environment.event_subject(),
+                ))
+            })
+            .collect();
+        for (key, request_id, finished_at, subject) in finished {
+            if let Some(compile) = self.environment_info.get_mut(&key) {
+                compile.completion_recorded = true;
+            }
+            self.record_event_at(
+                &request_id,
+                SEVERITY_INFO,
+                format!("{REQUEST_ENVIRONMENT_INFO_ACTIVITY} completed successfully."),
+                subject,
+                finished_at,
+            );
+        }
+    }
+
+    /// The activity log of the environment `environment_id`: the content the
+    /// information compiled from one of its instances carries.
+    ///
+    /// Elastic Beanstalk writes what it DOES to an environment to the activity
+    /// log on the environment's instances, and this store's event log is that
+    /// record — the real events this service appended for this environment, one
+    /// line each, OLDEST first (by the instant the event is dated, with the
+    /// append order breaking a tie, the same total order `DescribeEvents`
+    /// reports them in reversed), in the `<date> <severity> <message>` form a
+    /// log line takes. Nothing here is invented: an environment whose log holds
+    /// nothing compiles to nothing.
+    ///
+    /// This emulator runs no application server on an environment's instances —
+    /// the same reason `DescribeInstancesHealth` reports no measured
+    /// per-instance health — so there are no application server log files to
+    /// compile, and the activity log is the one log it has. It is therefore the
+    /// same content for every instance of an environment.
+    ///
+    /// `max_lines`, where given, keeps only the LAST that many lines: "setting
+    /// the `InfoType` to `tail` compiles the last lines" of the log, while
+    /// `bundle` is the whole of it.
+    pub fn environment_activity_log(
+        &self,
+        environment_id: &str,
+        max_lines: Option<usize>,
+    ) -> String {
+        let mut dated: Vec<&Event> = self
+            .events
+            .iter()
+            .filter(|event| event.subject.environment_id.as_deref() == Some(environment_id))
+            .collect();
+        // A completion the CLOCK owed is dated when it came due but appended
+        // when a later call observed it, so the log is ordered by date rather
+        // than by append position.
+        dated.sort_by(|left, right| {
+            instant_key(&left.event_date)
+                .cmp(&instant_key(&right.event_date))
+                .then_with(|| left.sequence.cmp(&right.sequence))
+        });
+        let mut lines: Vec<String> = dated
+            .into_iter()
+            .map(|event| {
+                let at = event
+                    .event_date
+                    .fmt(::aws_smithy_types::date_time::Format::DateTime)
+                    .unwrap_or_default();
+                format!("{at} {} {}", event.severity, event.message)
+            })
+            .collect();
+        if let Some(max_lines) = max_lines {
+            let excess = lines.len().saturating_sub(max_lines);
+            lines.drain(..excess);
+        }
+        if lines.is_empty() {
+            return String::new();
+        }
+        // A text log file ends in a newline, so the last line is a line.
+        format!("{}\n", lines.join("\n"))
     }
 
     /// Materialise just the application deletions the clock has already
