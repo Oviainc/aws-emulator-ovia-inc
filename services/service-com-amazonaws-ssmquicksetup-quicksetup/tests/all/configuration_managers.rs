@@ -866,11 +866,12 @@ async fn a_filter_narrows_the_listing_and_an_unknown_filter_key_is_refused() {
 // ListConfigurations
 // ---------------------------------------------------------------------------
 
-/// Each manager's create produced one configuration record per configuration
-/// definition, and `ListConfigurations` reports exactly those — narrowed by the
-/// `ManagerArn` and `ConfigurationDefinitionId` the request names.
+/// Each manager's create produced one configuration record per account and Region the
+/// definition targets, and `ListConfigurations` reports exactly those — narrowed by
+/// the `ManagerArn` and `ConfigurationDefinitionId` the request names, and by a
+/// `Region` filter that sees the deployment Regions, not the signing one.
 #[tokio::test]
-async fn the_configuration_listing_reports_one_record_per_stored_definition() {
+async fn the_configuration_listing_reports_one_record_per_deployed_target() {
     let router = emulator();
     let first = create_ok(
         &router,
@@ -911,30 +912,34 @@ async fn the_configuration_listing_reports_one_record_per_stored_definition() {
     );
     assert_eq!(first_ids.len(), 2, "got {first_ids:?}");
 
-    // (case, request, the (ManagerArn, ConfigurationDefinitionId) pairs it must report)
-    type ListingCase = (&'static str, Value, Vec<(String, String)>);
+    // (case, request, the (ManagerArn, ConfigurationDefinitionId, Region) rows it must
+    // report) — the first definition targets us-east-1, the other two name no Region,
+    // so they deploy in the manager's own.
+    type ListingCase = (&'static str, Value, Vec<(String, String, String)>);
+    let targeted = "us-east-1".to_string();
+    let local = REGION.to_string();
     let cases: Vec<ListingCase> = vec![
         (
             "every configuration",
             json!({}),
             vec![
-                (first.clone(), first_ids[0].clone()),
-                (first.clone(), first_ids[1].clone()),
-                (second.clone(), second_ids[0].clone()),
+                (first.clone(), first_ids[0].clone(), targeted.clone()),
+                (first.clone(), first_ids[1].clone(), local.clone()),
+                (second.clone(), second_ids[0].clone(), local.clone()),
             ],
         ),
         (
             "one manager",
             json!({ "ManagerArn": first }),
             vec![
-                (first.clone(), first_ids[0].clone()),
-                (first.clone(), first_ids[1].clone()),
+                (first.clone(), first_ids[0].clone(), targeted.clone()),
+                (first.clone(), first_ids[1].clone(), local.clone()),
             ],
         ),
         (
             "one definition of one manager",
             json!({ "ManagerArn": first, "ConfigurationDefinitionId": first_ids[1] }),
-            vec![(first.clone(), first_ids[1].clone())],
+            vec![(first.clone(), first_ids[1].clone(), local.clone())],
         ),
         (
             "a definition id that manager does not own",
@@ -944,15 +949,19 @@ async fn the_configuration_listing_reports_one_record_per_stored_definition() {
         (
             "a filter on the configuration type",
             json!({ "Filters": [{ "Key": "Type", "Values": ["AWSQuickSetupType-DHMC"] }] }),
-            vec![(second.clone(), second_ids[0].clone())],
+            vec![(second.clone(), second_ids[0].clone(), local.clone())],
         ),
         (
-            "a filter on the deployment region",
+            "a filter on the targeted deployment region",
+            json!({ "Filters": [{ "Key": "Region", "Values": [targeted] }] }),
+            vec![(first.clone(), first_ids[0].clone(), "us-east-1".to_string())],
+        ),
+        (
+            "a filter on the manager's own region",
             json!({ "Filters": [{ "Key": "Region", "Values": [REGION] }] }),
             vec![
-                (first.clone(), first_ids[0].clone()),
-                (first.clone(), first_ids[1].clone()),
-                (second.clone(), second_ids[0].clone()),
+                (first.clone(), first_ids[1].clone(), local.clone()),
+                (second.clone(), second_ids[0].clone(), local.clone()),
             ],
         ),
     ];
@@ -967,7 +976,7 @@ async fn the_configuration_listing_reports_one_record_per_stored_definition() {
             .get("ConfigurationsList")
             .and_then(Value::as_array)
             .unwrap_or_else(|| panic!("case {case}: expected a list, got {answer:?}"));
-        let mut got: Vec<(String, String)> = rows
+        let mut got: Vec<(String, String, String)> = rows
             .iter()
             .map(|row| {
                 (
@@ -976,6 +985,7 @@ async fn the_configuration_listing_reports_one_record_per_stored_definition() {
                         .as_str()
                         .unwrap_or_default()
                         .to_string(),
+                    row["Region"].as_str().unwrap_or_default().to_string(),
                 )
             })
             .collect();
@@ -991,12 +1001,8 @@ async fn the_configuration_listing_reports_one_record_per_stored_definition() {
             assert_eq!(
                 row.get("Account").and_then(Value::as_str),
                 Some(ACCOUNT),
-                "case {case}: a configuration is deployed in the emulator account, got {row:?}"
-            );
-            assert_eq!(
-                row.get("Region").and_then(Value::as_str),
-                Some(REGION),
-                "case {case}: a configuration is deployed in the signing region, got {row:?}"
+                "case {case}: a definition naming no target account is deployed in the \
+                 account this emulator serves, got {row:?}"
             );
             let id = row
                 .get("Id")
@@ -1561,7 +1567,8 @@ async fn a_stored_configuration_is_read_back_by_its_service_generated_id() {
         assert_eq!(
             listed.len(),
             submitted.len(),
-            "case {case}: expected one configuration per submitted definition, got {listed:?}"
+            "case {case}: every definition here targets exactly one account and Region, so \
+             one configuration each was deployed, got {listed:?}"
         );
 
         for summary in &listed {
@@ -1626,12 +1633,20 @@ async fn a_stored_configuration_is_read_back_by_its_service_generated_id() {
             assert_eq!(
                 got.get("Account").and_then(Value::as_str),
                 Some(ACCOUNT),
-                "case {case}: a configuration is deployed in the emulator account, got {got:?}"
+                "case {case}: a definition naming no target account is deployed in the account \
+                 this emulator serves, got {got:?}"
             );
+            // Where the definition targets a Region, that is the Region the deployed
+            // configuration reports; where it targets none, the manager's own.
+            let targeted = want
+                .get("Parameters")
+                .and_then(|parameters| parameters.get("TargetRegions"))
+                .and_then(Value::as_str)
+                .unwrap_or(REGION);
             assert_eq!(
                 got.get("Region").and_then(Value::as_str),
-                Some(REGION),
-                "case {case}: a configuration is deployed in the signing region, got {got:?}"
+                Some(targeted),
+                "case {case}: expected the deployment Region {targeted}, got {got:?}"
             );
             let created = epoch_seconds(case, &got, "CreatedAt");
             let modified = epoch_seconds(case, &got, "LastModifiedAt");

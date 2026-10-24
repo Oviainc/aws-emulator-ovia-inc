@@ -31,14 +31,14 @@ use crate::asset_lifecycle::{
 
 /// Where every gateway request goes, as `OPERATIONS.md` reports the route:
 /// `POST /20200301/gateways`, `GET /20200301/gateways/{gatewayId}`.
-const GATEWAYS: &str = "/20200301/gateways";
+pub(crate) const GATEWAYS: &str = "/20200301/gateways";
 
 /// A `greengrassV2` platform naming `thing`, optionally with an operating system.
 ///
 /// The three `CoreDeviceOperatingSystem` values used below — `LINUX_AARCH64`,
 /// `LINUX_AMD64`, `WINDOWS_AMD64` — are the enum's whole value list
 /// (smithy_query query="shape" shape="CoreDeviceOperatingSystem").
-fn greengrass_v2(thing: &str, operating_system: Option<&str>) -> Value {
+pub(crate) fn greengrass_v2(thing: &str, operating_system: Option<&str>) -> Value {
     match operating_system {
         Some(os) => json!({
             "greengrassV2": { "coreDeviceThingName": thing, "coreDeviceOperatingSystem": os }
@@ -48,12 +48,12 @@ fn greengrass_v2(thing: &str, operating_system: Option<&str>) -> Value {
 }
 
 /// A legacy `greengrass` (V1) platform naming a Greengrass group ARN.
-fn greengrass(group: &str) -> Value {
+pub(crate) fn greengrass(group: &str) -> Value {
     json!({ "greengrass": { "groupArn": format!("arn:aws:greengrass:{REGION}:123456789012:/greengrass/groups/{group}") } })
 }
 
 /// A `siemensIE` platform naming an IoT Core thing.
-fn siemens_ie(thing: &str) -> Value {
+pub(crate) fn siemens_ie(thing: &str) -> Value {
     json!({ "siemensIE": { "iotCoreThingName": thing } })
 }
 
