@@ -664,11 +664,18 @@ impl Workspace {
             || built_in_component_type_id(component_type_id)
     }
 
-    /// Every component type `extends_from` reaches — the ids it names plus,
-    /// transitively, the ids those stored component types themselves extend —
-    /// and whether any of them is NOT stored in this workspace, i.e. is one of
-    /// the service's built-in types, whose own definitions this emulator does
-    /// not hold.
+    /// The transitive `extendsFrom` closure of `seeds`, in ONE walk: the stored
+    /// component types it reaches (breadth-first, nearest first, each at most
+    /// once), every id it reached whether stored or not, and whether any of
+    /// those ids is NOT stored in this workspace — one of the service's
+    /// built-in types, whose own definitions this emulator does not hold.
+    ///
+    /// The single walk over `extendsFrom` every reader of inherited structure
+    /// shares, so an inheritance chain is resolved ONE way:
+    /// [`component_type_chain`](Self::component_type_chain) takes the component
+    /// types it reached,
+    /// [`ancestor_component_type_ids`](Self::ancestor_component_type_ids) their
+    /// ids.
     ///
     /// TERMINATION is structural, the same way [`subtree_of`](Self::subtree_of)
     /// gets it: an id is expanded only the first time it is seen and the ids
@@ -676,19 +683,37 @@ impl Workspace {
     /// most one id per stored component type plus the declared parents however
     /// the stored `extendsFrom` values point — a self-extending component type
     /// or an already-stored cycle cannot make it loop.
-    pub fn ancestor_component_type_ids(&self, extends_from: &[String]) -> (BTreeSet<String>, bool) {
+    fn component_type_closure(
+        &self,
+        seeds: impl IntoIterator<Item = String>,
+    ) -> (Vec<&ComponentType>, BTreeSet<String>, bool) {
         let mut reached: BTreeSet<String> = BTreeSet::new();
-        let mut queue: VecDeque<String> = extends_from.iter().cloned().collect();
+        let mut queue: VecDeque<String> = seeds.into_iter().collect();
+        let mut chain = Vec::new();
         let mut holds_unstored = false;
         while let Some(ancestor) = queue.pop_front() {
             if !reached.insert(ancestor.clone()) {
                 continue;
             }
             match self.component_types.get(&ancestor) {
-                Some(stored) => queue.extend(stored.extends_from.iter().cloned()),
+                Some(stored) => {
+                    chain.push(stored);
+                    queue.extend(stored.extends_from.iter().cloned());
+                }
                 None => holds_unstored = true,
             }
         }
+        (chain, reached, holds_unstored)
+    }
+
+    /// Every component type `extends_from` reaches — the ids it names plus,
+    /// transitively, the ids those stored component types themselves extend —
+    /// and whether any of them is NOT stored in this workspace, i.e. is one of
+    /// the service's built-in types, whose own definitions this emulator does
+    /// not hold.
+    pub fn ancestor_component_type_ids(&self, extends_from: &[String]) -> (BTreeSet<String>, bool) {
+        let (_, reached, holds_unstored) =
+            self.component_type_closure(extends_from.iter().cloned());
         (reached, holds_unstored)
     }
 
@@ -749,6 +774,108 @@ impl Workspace {
             }
         }
         ordered
+    }
+
+    /// The component type `component_type_id` and every component type it
+    /// extends, nearest first.
+    ///
+    /// `extendsFrom` is where a property definition a component type does not
+    /// declare itself comes from, so a reader that has to resolve one walks this
+    /// chain rather than a single map. The walk is
+    /// [`component_type_closure`](Self::component_type_closure)'s, seeded with
+    /// the component type itself; a parent this workspace does not hold (a
+    /// built-in type, of which this emulator holds no registry) contributes
+    /// nothing rather than failing the walk.
+    pub fn component_type_chain(&self, component_type_id: &str) -> Vec<&ComponentType> {
+        let (chain, _, _) = self.component_type_closure([component_type_id.to_string()]);
+        chain
+    }
+
+    /// Every component type an instance of `component_type_id` may name: the id
+    /// itself plus every stored component type that extends it, directly or
+    /// through another.
+    ///
+    /// The scope of a query addressed to a component TYPE, resolved in ONE pass
+    /// over this workspace's component types (their `extendsFrom` edges,
+    /// reversed) plus a walk of the ids those edges reach, so a scope is
+    /// resolved once per request rather than once per component tested against
+    /// it. Empty when this workspace holds no such component type, which is
+    /// refused before a scope is wanted.
+    ///
+    /// TERMINATION is structural, as in
+    /// [`component_type_closure`](Self::component_type_closure): an id is
+    /// expanded only the first time it is seen and every id comes from this
+    /// workspace's own component-type map.
+    pub fn component_type_instance_ids(&self, component_type_id: &str) -> BTreeSet<&str> {
+        let Some(named) = self.component_types.get(component_type_id) else {
+            return BTreeSet::new();
+        };
+        let mut extenders: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for component_type in self.component_types.values() {
+            for parent in &component_type.extends_from {
+                extenders
+                    .entry(parent.as_str())
+                    .or_default()
+                    .push(component_type.component_type_id.as_str());
+            }
+        }
+        let mut reached: BTreeSet<&str> = BTreeSet::new();
+        let mut queue: VecDeque<&str> = VecDeque::from([named.component_type_id.as_str()]);
+        while let Some(id) = queue.pop_front() {
+            if !reached.insert(id) {
+                continue;
+            }
+            if let Some(children) = extenders.get(id) {
+                queue.extend(children.iter().copied());
+            }
+        }
+        reached
+    }
+
+    /// The definition that gives one property of a component its meaning: the
+    /// component's OWN definition where it declares one, else the definition it
+    /// inherits from the component type the component instantiates (or from a
+    /// type that type extends).
+    ///
+    /// A component may carry a property its entity's create never restated —
+    /// naming the component's `componentTypeId` is what gives the component that
+    /// type's properties — so a reader of a property's definition, its default
+    /// value or its data type resolves it through here rather than off the
+    /// component alone.
+    pub fn effective_property_definition<'a>(
+        &'a self,
+        component_type_id: Option<&str>,
+        properties: &'a BTreeMap<String, PropertyRecord>,
+        property_name: &str,
+    ) -> Option<&'a crate::ops::types::PropertyDefinitionRequest> {
+        if let Some(definition) = properties
+            .get(property_name)
+            .and_then(|property| property.definition.as_ref())
+        {
+            return Some(definition);
+        }
+        self.component_type_chain(component_type_id?)
+            .into_iter()
+            .find_map(|component_type| component_type.property_definitions.get(property_name))
+    }
+
+    /// The property group `group_name` as it applies to a component: the group
+    /// the component itself declares, else the one it inherits from the
+    /// component type it instantiates — the same resolution
+    /// [`effective_property_definition`](Self::effective_property_definition)
+    /// makes for a definition.
+    pub fn effective_property_group<'a>(
+        &'a self,
+        component_type_id: Option<&str>,
+        property_groups: &'a BTreeMap<String, PropertyGroupRecord>,
+        group_name: &str,
+    ) -> Option<&'a PropertyGroupRecord> {
+        if let Some(group) = property_groups.get(group_name) {
+            return Some(group);
+        }
+        self.component_type_chain(component_type_id?)
+            .into_iter()
+            .find_map(|component_type| component_type.property_groups.get(group_name))
     }
 }
 
@@ -1444,6 +1571,27 @@ pub fn property_definition_response(
         configuration: definition.configuration.clone(),
         display_name: definition.display_name.clone(),
     })
+}
+
+/// The value a read reports for ONE property: the value written to the
+/// property, else the DEFAULT its definition declares, and nothing at all when
+/// neither exists.
+///
+/// `defaultValue` is "an object that contains the default value" of the
+/// property, so a property nothing has written to still reads as the value its
+/// definition gave it, and a write to the property replaces it. Shared by every
+/// reader of a property's current value, so one property reads the same way
+/// wherever it is reported; `definition` is the one
+/// [`Workspace::effective_property_definition`] resolved, which is what makes a
+/// default declared only on the component TYPE apply to a component that
+/// restates nothing.
+pub fn latest_property_value(
+    property: Option<&PropertyRecord>,
+    definition: Option<&crate::ops::types::PropertyDefinitionRequest>,
+) -> Option<crate::ops::types::DataValue> {
+    property
+        .and_then(|property| property.value.clone())
+        .or_else(|| definition.and_then(|definition| definition.default_value.clone()))
 }
 
 /// One component of an entity.
