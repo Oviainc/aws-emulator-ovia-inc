@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RestoreFHIRDatastore
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RestoreFHIRDatastore`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RestoreFHIRDatastore::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a NEW data store in [`crate::state`] from the record a backup-enabled
+//! source data store already holds there, as that record stood at the requested
+//! restore point, and reports it in the `CREATING` status the clock settles to
+//! `ACTIVE` — so the restored data store is readable through
+//! `DescribeFHIRDatastore` / `ListFHIRDatastores` and serves its own FHIR
+//! endpoint, while the source is left exactly as it was.
 //!
 //! ## Shape of an operation
 //!
@@ -172,21 +170,376 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
     async fn handle(
         &self,
-        input: Self::Input,
+        mut input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RestoreFHIRDatastore` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RestoreFHIRDatastoreErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RestoreFHIRDatastore"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(RestoreFHIRDatastoreErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the HealthLake data store registry is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let restored_at = ::aws_smithy_types::DateTime::from(now);
+
+        let mut store = state.lock();
+        // A transition the clock already made due is materialised before the
+        // status gate below reads it, so this call agrees with `Describe` about
+        // what the source data store's status is at this instant.
+        store.settle_lifecycle();
+
+        // Keyed, so two requests that differ only in the order their tags arrive
+        // are the same request.
+        let requested_tags: ::std::collections::BTreeMap<String, String> = input
+            .tags
+            .take()
+            .into_iter()
+            .flatten()
+            .map(|tag| (tag.key, tag.value))
+            .collect();
+
+        // `ClientToken` is this operation's `@idempotencyToken`: a repeat of the
+        // SAME call carrying a token already seen resolves to the data store that
+        // token minted instead of restoring a second one. A token reused with a
+        // different request — including a `CreateFHIRDatastore` one, which
+        // fingerprints under its own operation — is a different request, and is
+        // refused rather than answered with the earlier data store.
+        let fingerprint = request_fingerprint(&region, &requested_tags, &input);
+        if let Some(recorded) = input
+            .client_token
+            .as_deref()
+            .and_then(|token| store.client_tokens.get(token))
+            .cloned()
+        {
+            if recorded.fingerprint != fingerprint {
+                return Err(RestoreFHIRDatastoreErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(
+                            "ClientToken was already used for a different request".to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+            if let Some(existing) = store.datastores.get(&recorded.datastore_id) {
+                return Ok(datastore_output(existing));
+            }
+        }
+
+        // What the restored data store takes from its source is read in ONE
+        // borrow of the source record, so the mint below can take the registry
+        // mutably; every refusal happens inside it, so a refused call leaves the
+        // registry exactly as it was.
+        let snapshot = {
+            let Some(source) = store.datastores.get(&input.source_datastore_id) else {
+                return Err(RestoreFHIRDatastoreErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::DATASTORE_NOT_FOUND_MESSAGE.to_string()),
+                    },
+                )
+                .into());
+            };
+
+            match source.status {
+                // Only a settled, usable data store can be restored from.
+                crate::state::DatastoreStatus::Active => {}
+                // `ConflictException` is modelled as "the data store is in a
+                // transition state and the user requested action cannot be
+                // performed" — which is exactly `CREATING` and `DELETING`.
+                crate::state::DatastoreStatus::Creating
+                | crate::state::DatastoreStatus::Deleting => {
+                    return Err(RestoreFHIRDatastoreErrorModeled::ConflictException(
+                        ConflictException {
+                            // The status is the SERVICE's own state, so the
+                            // sentence states it; the requested id is caller
+                            // input, which this service's error text never
+                            // quotes back.
+                            message: Some(format!(
+                                "Specified datastore is in status {} and cannot be restored.",
+                                source.status.as_wire()
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                // A deleted data store is not in transition — it is gone, and
+                // this service retains no backup of its own beyond the record.
+                crate::state::DatastoreStatus::Deleted => {
+                    return Err(RestoreFHIRDatastoreErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(crate::state::DATASTORE_NOT_FOUND_MESSAGE.to_string()),
+                        },
+                    )
+                    .into());
+                }
+            }
+
+            // Only a data store with backup ENABLED has anything to restore
+            // from: this operation "restores a backup-enabled data store to a
+            // point in time".
+            let Some(window) = source.restore_window(now) else {
+                return Err(RestoreFHIRDatastoreErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(
+                            crate::state::DATASTORE_BACKUP_NOT_ENABLED_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into());
+            };
+
+            // The restore point the configuration names, or — when it names
+            // none — the latest instant the continuous backup covers.
+            let restore_point = match &input.restore_configuration {
+                RestoreConfiguration::ContinuousBackupRestoreConfiguration(configuration) => {
+                    configuration.restore_point_time
+                }
+            }
+            .unwrap_or(window.latest);
+
+            let requested = crate::state::epoch_nanos(&restore_point);
+            if requested < crate::state::epoch_nanos(&window.earliest)
+                || requested > crate::state::epoch_nanos(&window.latest)
+            {
+                return Err(RestoreFHIRDatastoreErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(restore_point_out_of_window_message(&window)),
+                    },
+                )
+                .into());
+            }
+
+            let (fhir_resources, fhir_resource_bytes) = source.fhir_resources_as_of(&restore_point);
+            SourceSnapshot {
+                type_version: source.type_version.clone(),
+                name: source.name.clone(),
+                sse_configuration: source.sse_configuration.clone(),
+                preload_data_config: source.preload_data_config.clone(),
+                identity_provider_configuration: source.identity_provider_configuration.clone(),
+                analytics_configuration: source.analytics_configuration.clone(),
+                nlp_configuration: source.nlp_configuration.clone(),
+                profile_configuration: source.profile_configuration.clone(),
+                backed_up_tags: source.backed_up_tags(),
+                fhir_resources,
+                fhir_resource_bytes,
+            }
+        };
+
+        // The backup carries the source's tags only when its configuration says
+        // it does; whatever this request names is applied over them, so a
+        // caller can retag the restored data store key by key.
+        let mut tags = snapshot.backed_up_tags;
+        tags.extend(requested_tags);
+        if tags.len() > crate::state::MAX_TAGS_PER_DATASTORE {
+            return Err(RestoreFHIRDatastoreErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "Tags must hold at most {} distinct keys, got {}",
+                        crate::state::MAX_TAGS_PER_DATASTORE,
+                        tags.len()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The store holds a bounded number of data stores. Terminal records are
+        // reaped before the refusal, so a caller that deletes what it restored
+        // can always restore again; only a genuinely full store is refused.
+        if store.datastores.len() >= crate::state::MAX_DATASTORES {
+            store.reap_terminal_records();
+        }
+        if store.datastores.len() >= crate::state::MAX_DATASTORES {
+            return Err(RestoreFHIRDatastoreErrorModeled::ThrottlingException(
+                ThrottlingException {
+                    message: Some(format!(
+                        "The maximum number of data stores ({}) already exists",
+                        crate::state::MAX_DATASTORES
+                    )),
+                },
+            )
+            .into());
+        }
+        // A restore copies the source's FHIR resources, so it charges the bytes
+        // every data store retains TOGETHER, exactly as a FHIR write does.
+        if store
+            .fhir_resource_bytes_total()
+            .saturating_add(snapshot.fhir_resource_bytes)
+            > crate::state::MAX_FHIR_RESOURCE_BYTES_TOTAL
+        {
+            return Err(RestoreFHIRDatastoreErrorModeled::ThrottlingException(
+                ThrottlingException {
+                    message: Some(format!(
+                        "The restored data store would push the FHIR resources this service \
+                         retains past its {} byte ceiling",
+                        crate::state::MAX_FHIR_RESOURCE_BYTES_TOTAL
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let id = store.next_datastore_id(now);
+        let datastore = crate::state::Datastore {
+            arn: crate::state::datastore_arn(&region, &id),
+            endpoint: crate::state::datastore_endpoint(&region, &id),
+            id: id.clone(),
+            // Every configuration member this operation accepts is "for the
+            // restored data store", so one the request carries applies to it and
+            // one it omits is inherited from the data store being restored
+            // rather than dropped.
+            name: input.datastore_name.or(snapshot.name),
+            // A resource AWS returns in a non-terminal status owes the clock one
+            // transition. The due instant is stored on the record and
+            // materialised by whichever call reads it next; nothing sleeps.
+            status: crate::state::DatastoreStatus::Creating,
+            pending: Some((
+                ::std::time::Instant::now() + crate::state::LIFECYCLE_TRANSITION,
+                crate::state::DatastoreStatus::Active,
+            )),
+            reap_at: None,
+            // Not an input: the restored data store holds the source's FHIR
+            // resources, so it speaks the same release version.
+            type_version: snapshot.type_version,
+            created_at: restored_at,
+            sse_configuration: input.sse_configuration.or(snapshot.sse_configuration),
+            preload_data_config: snapshot.preload_data_config,
+            identity_provider_configuration: input
+                .identity_provider_configuration
+                .or(snapshot.identity_provider_configuration),
+            analytics_configuration: input
+                .analytics_configuration
+                .or(snapshot.analytics_configuration),
+            nlp_configuration: input.nlp_configuration.or(snapshot.nlp_configuration),
+            profile_configuration: input
+                .profile_configuration
+                .or(snapshot.profile_configuration),
+            // This operation models no `BackupConfiguration` input, so the
+            // restored data store starts with no backup of its own: backup is
+            // turned on by the call that configures it, `UpdateFHIRDatastore`,
+            // and claiming a window this data store never had one for would
+            // offer a restore point nothing was backed up at.
+            backup_configuration: None,
+            backup_enabled_at: None,
+            error_cause: None,
+            tags,
+            // The source's resources as of the restore point, copied verbatim:
+            // the restored data store serves exactly what the source held then.
+            fhir_resources: snapshot.fhir_resources,
+            fhir_resource_bytes: snapshot.fhir_resource_bytes,
+        };
+
+        let output = datastore_output(&datastore);
+        store.datastores.insert(id.clone(), datastore);
+        if let Some(token) = input.client_token {
+            store.record_client_token(token, &id, fingerprint);
+        }
+        Ok(output)
     }
+}
+
+/// Everything the restored data store takes from the data store it is restored
+/// from, read in ONE borrow of the source record so the mint that follows can
+/// take the registry mutably.
+struct SourceSnapshot {
+    type_version: String,
+    name: Option<String>,
+    sse_configuration: Option<SseConfiguration>,
+    preload_data_config: Option<PreloadDataConfig>,
+    identity_provider_configuration: Option<IdentityProviderConfiguration>,
+    analytics_configuration: Option<AnalyticsConfiguration>,
+    nlp_configuration: Option<NlpConfiguration>,
+    profile_configuration: Option<ProfileConfiguration>,
+    /// The source's tags, empty unless its backup configuration includes them.
+    backed_up_tags: ::std::collections::BTreeMap<String, String>,
+    /// The source's FHIR resources as of the restore point.
+    fhir_resources: ::std::collections::BTreeMap<(String, String), crate::state::FhirResource>,
+    /// How many bytes those resources hold together.
+    fhir_resource_bytes: usize,
+}
+
+/// One stored data store as this operation's response: the four members the
+/// model requires, all read off the record rather than echoed from the request.
+fn datastore_output(datastore: &crate::state::Datastore) -> RestoreFHIRDatastoreOutput {
+    RestoreFHIRDatastoreOutput {
+        datastore_id: datastore.id.clone(),
+        datastore_arn: datastore.arn.clone(),
+        datastore_status: datastore.status.as_wire().to_string(),
+        datastore_endpoint: datastore.endpoint.clone(),
+    }
+}
+
+/// Why a `RestorePointTime` was refused: the member, and the window it has to
+/// fall in — the one [`crate::state::Datastore::restore_window`] derives from
+/// the source's backup configuration at the instant this call runs.
+///
+/// It states the SERVICE's own window and does not quote the rejected instant
+/// back at the caller.
+fn restore_point_out_of_window_message(window: &crate::state::RestoreWindow) -> String {
+    format!(
+        "RestorePointTime must be at or after the earliest restore point ({}) and at or before \
+         the latest restore point ({})",
+        timestamp(&window.earliest),
+        timestamp(&window.latest)
+    )
+}
+
+/// One modelled timestamp as a sentence reads it, falling back to epoch seconds
+/// for an instant no date-time rendering can express.
+fn timestamp(at: &::aws_smithy_types::DateTime) -> String {
+    at.fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_else(|_| at.as_secs_f64().to_string())
+}
+
+/// The field that leads this operation's fingerprints, so a `ClientToken`
+/// recorded by the other operation that mints a data store
+/// (`CreateFHIRDatastore`) in the same map can never fingerprint alike.
+const FINGERPRINT_DOMAIN: &str = "RestoreFHIRDatastore";
+
+/// A stable fingerprint of everything this request asks for, so one
+/// `ClientToken` resolves to the data store it restored only for a repeat of the
+/// SAME request.
+///
+/// Built from the members that define the restored data store — never from the
+/// token itself — with tags taken keyed rather than in arrival order, and the
+/// region included because it is what the minted ARN and endpoint are built
+/// from. The operation name leads the fields so a token recorded by
+/// `CreateFHIRDatastore` in the same map can never fingerprint alike. The
+/// length-prefixed folding itself lives in [`crate::state::request_fingerprint`],
+/// shared with the other mints that honour an idempotency token.
+fn request_fingerprint(
+    region: &str,
+    tags: &::std::collections::BTreeMap<String, String>,
+    input: &RestoreFHIRDatastoreInput,
+) -> String {
+    let mut fields = vec![
+        FINGERPRINT_DOMAIN.to_string(),
+        region.to_string(),
+        input.source_datastore_id.clone(),
+        // The configuration shapes carry no map, so their derived `Debug` has a
+        // canonical form for a given value, which is all a fingerprint needs.
+        format!("{:?}", input.restore_configuration),
+        // An absent name and an empty one are different requests, so presence
+        // is part of the field rather than collapsed by a default.
+        crate::state::optional_field("DatastoreName", input.datastore_name.as_deref()),
+        format!("Tags={}", tags.len()),
+    ];
+    // Keyed and ordered, so two requests that differ only in the order their
+    // tags arrived are the same request.
+    for (key, value) in tags {
+        fields.push(key.clone());
+        fields.push(value.clone());
+    }
+    fields.extend([
+        format!("{:?}", input.sse_configuration),
+        format!("{:?}", input.identity_provider_configuration),
+        format!("{:?}", input.analytics_configuration),
+        format!("{:?}", input.nlp_configuration),
+        format!("{:?}", input.profile_configuration),
+    ]);
+    crate::state::request_fingerprint(fields)
 }

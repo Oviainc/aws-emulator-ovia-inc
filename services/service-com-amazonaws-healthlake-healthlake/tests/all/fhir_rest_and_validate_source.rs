@@ -43,7 +43,9 @@ const AUTHORIZATION: &str = "AWS4-HMAC-SHA256 \
 /// The emulated HealthLake service behind the production router.
 ///
 /// `pub(crate)` so the sibling suites of this test target drive the service exactly the
-/// way this one does, rather than each growing its own copy of the harness.
+/// way this one does, rather than each growing its own copy of the harness — including
+/// `tests/all/restore_fhir_datastore.rs`, which needs BOTH wires (the awsJson1_0
+/// control plane and a data store's FHIR REST endpoint).
 pub(crate) struct HealthLake {
     router: MultiServiceRouter,
 }
@@ -59,7 +61,7 @@ impl HealthLake {
     }
 
     /// Dispatch one awsJson1_0 control-plane call.
-    async fn rpc(&self, operation: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn rpc(&self, operation: &str, body: &Value) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
@@ -185,7 +187,7 @@ fn decoded(response: http::Response<bytes::Bytes>) -> (u16, Value) {
 /// The PATH of an advertised `DatastoreEndpoint`, which is what a client sends its
 /// FHIR interactions to. Taking it from the advertised endpoint — rather than writing
 /// it out here — is what ties the served path space to the one the service publishes.
-fn endpoint_path(endpoint: &str) -> String {
+pub(crate) fn endpoint_path(endpoint: &str) -> String {
     let after_scheme = endpoint
         .split_once("://")
         .map_or(endpoint, |(_scheme, rest)| rest);
@@ -221,7 +223,12 @@ fn error_code(payload: &Value) -> String {
 
 /// A FHIR create of `resource` against `endpoint_path`, asserted to have succeeded,
 /// returning the stored resource.
-async fn created(service: &HealthLake, path: &str, resource_type: &str, resource: &Value) -> Value {
+pub(crate) async fn created(
+    service: &HealthLake,
+    path: &str,
+    resource_type: &str,
+    resource: &Value,
+) -> Value {
     let (status, body, headers) = service
         .fhir("POST", &format!("{path}{resource_type}"), resource)
         .await;
