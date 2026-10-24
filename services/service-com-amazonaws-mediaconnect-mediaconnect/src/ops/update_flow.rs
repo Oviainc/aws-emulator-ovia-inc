@@ -127,44 +127,6 @@ const STATE_ENABLED: &str = crate::state::STATE_ENABLED;
 /// (`smithy_query(query="doc",shape="UpdateMaintenance",member="MaintenanceStartHour")`).
 const DEFAULT_MAINTENANCE_START_HOUR: &str = "02:00";
 
-/// Whether `hour` is a maintenance start hour: "UTC time when the maintenance will happen.
-/// Use 24-hour HH:MM format. Minutes must be 00. Example: 13:00."
-/// (`smithy_query(query="doc",shape="UpdateMaintenance",member="MaintenanceStartHour")`).
-fn is_maintenance_start_hour(hour: &str) -> bool {
-    let Some((hours, minutes)) = hour.split_once(':') else {
-        return false;
-    };
-    hours.len() == 2
-        && minutes == "00"
-        && hours.bytes().all(|byte| byte.is_ascii_digit())
-        && hours
-            .parse::<u8>()
-            .is_ok_and(|hours| (0..=23).contains(&hours))
-}
-
-/// Whether `date` is a scheduled maintenance date: "a scheduled date in ISO UTC format
-/// when the maintenance will happen. Use YYYY-MM-DD format. Example: 2021-01-30."
-/// (`smithy_query(query="doc",shape="UpdateMaintenance",member="MaintenanceScheduledDate")`).
-/// The day is bounded by the longest month rather than by the month named, which is as far
-/// as the documented format goes.
-fn is_maintenance_scheduled_date(date: &str) -> bool {
-    let parts: Vec<&str> = date.split('-').collect();
-    let [year, month, day] = parts.as_slice() else {
-        return false;
-    };
-    year.len() == 4
-        && month.len() == 2
-        && day.len() == 2
-        && [year, month, day]
-            .iter()
-            .all(|part| part.bytes().all(|byte| byte.is_ascii_digit()))
-        && year.parse::<u16>().is_ok()
-        && month
-            .parse::<u8>()
-            .is_ok_and(|month| (1..=12).contains(&month))
-        && day.parse::<u8>().is_ok_and(|day| (1..=31).contains(&day))
-}
-
 /// Refuse the request with the service's own client-input error, `BadRequestException`
 /// (HTTP 400): "thrown if the request contains a semantic error". `detail` states what was
 /// unacceptable; the message carries it inside this service's refusal envelope
@@ -339,27 +301,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .or_else(|| flow.encoding_config.clone());
 
         // The maintenance window the request asks for has to be expressible as one: the
-        // two members the request shape leaves free-form carry documented formats.
+        // two members the request shape leaves free-form carry documented formats, checked
+        // through the one function in `crate::state` every path that writes a window checks
+        // them with (CreateFlow checks the create shape there too).
         if let Some(update) = input.maintenance.as_ref() {
-            if let Some(hour) = update
-                .maintenance_start_hour
-                .as_deref()
-                .filter(|hour| !is_maintenance_start_hour(hour))
-            {
-                return Err(bad_request(format!(
-                    "Invalid MaintenanceStartHour {hour:?}. Use 24-hour HH:MM format with \
-                     minutes 00, for example 13:00."
-                )));
-            }
-            if let Some(date) = update
-                .maintenance_scheduled_date
-                .as_deref()
-                .filter(|date| !is_maintenance_scheduled_date(date))
-            {
-                return Err(bad_request(format!(
-                    "Invalid MaintenanceScheduledDate {date:?}. Use YYYY-MM-DD format, for \
-                     example 2021-01-30."
-                )));
+            if let Some(rejection) = crate::state::maintenance_window_rejection(
+                update.maintenance_start_hour.as_deref(),
+                update.maintenance_scheduled_date.as_deref(),
+            ) {
+                return Err(bad_request(rejection));
             }
         }
 

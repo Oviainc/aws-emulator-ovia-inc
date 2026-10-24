@@ -14,9 +14,12 @@
 //! `StatusMessage` the service explains an empty scope with
 //! ([`crate::state::scan_outcome`]).
 //!
-//! `ClientToken` is idempotent: the same token with the same body answers with the job
-//! the first call minted, and the same token with a different body is a
-//! `ConflictException` (409).
+//! `ClientToken` is idempotent while the token's validity window is open: the same token
+//! with the same body answers with the job the first call minted, and the same token with
+//! a different body is a `ConflictException` (409). The window is the one the model
+//! publishes on the member ([`crate::state::CLIENT_TOKEN_VALIDITY`]), so a call carrying
+//! a token whose window the clock has closed is a NEW request — it mints another job, and
+//! a body differing from the expired call's is no longer a conflict.
 //!
 //! ## Shape of an operation
 //!
@@ -199,11 +202,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
-        // `ClientToken` idempotency: the same token with the same body answers with the
-        // job the first call minted and creates nothing; with a different body it is a
-        // conflict, because that token already names another job.
+        // `ClientToken` idempotency, for as long as the token's validity window is open
+        // (`crate::state::CLIENT_TOKEN_VALIDITY`): the same token with the same body
+        // answers with the job the first call minted and creates nothing; with a
+        // different body it is a conflict, because that token already names another job.
+        // Past that window the token names nothing, so the call below falls through and
+        // mints a new job — which is what the model says a request carrying an expired
+        // token is.
         if let Some(token) = input.client_token.as_deref() {
-            if let Some(job) = state.job_by_client_token(token) {
+            if let Some(job) = state.job_by_client_token(token, now) {
                 if job.request_fingerprint != fingerprint {
                     return Err(StartSearchJobErrorModeled::ConflictException(ConflictException {
                         message: format!(
@@ -317,7 +324,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // is what `ListSearchJobBackups` reports.
             backups,
             tags,
-            client_token: input.client_token.clone(),
+            // The window the token takes part in idempotency for starts when the
+            // request that used it completed, which is this call.
+            client_token: input
+                .client_token
+                .clone()
+                .map(|token| crate::state::ClientToken::minted(token, now)),
             request_fingerprint: fingerprint,
             owed_statuses: VecDeque::from([
                 (now + crate::state::CREATING_DELAY, crate::state::RUNNING, None),

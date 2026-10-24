@@ -511,6 +511,8 @@ pub const OPERATION_TYPE_STOP_RELATIONAL_DATABASE: &str = "StopRelationalDatabas
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_CREATE_LOAD_BALANCER: &str = "CreateLoadBalancer";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
+pub const OPERATION_TYPE_DELETE_LOAD_BALANCER: &str = "DeleteLoadBalancer";
+/// See [`OPERATION_TYPE_CREATE_INSTANCE`].
 pub const OPERATION_TYPE_ATTACH_INSTANCES_TO_LOAD_BALANCER: &str =
     "AttachInstancesToLoadBalancer";
 /// See [`OPERATION_TYPE_CREATE_INSTANCE`].
@@ -8847,6 +8849,30 @@ impl ComAmazonawsLightsailLightsail20161128State {
     ) -> Option<&mut StoredLoadBalancer> {
         self.load_balancers
             .get_mut(&(region.to_string(), name.to_string()))
+    }
+
+    /// Remove the load balancer `name` names in `region`, answering it. `None`
+    /// when nothing matched.
+    ///
+    /// Everything the load balancer holds goes with the record it lives on: its
+    /// SSL/TLS certificates — "Deletes a Lightsail load balancer and all its
+    /// associated SSL/TLS certificates" ([the modelled `DeleteLoadBalancer`
+    /// documentation]) — its configuration options and the registrations of the
+    /// instances that were attached to it, so no read can observe a certificate
+    /// or a registration of a load balancer this account no longer holds, and
+    /// there is no second map to keep in step. An INSTANCE that was registered
+    /// is untouched: a registration lives on the load balancer, and nothing
+    /// about the instance itself changes when the load balancer it served goes
+    /// away.
+    ///
+    /// [the modelled `DeleteLoadBalancer` documentation]: crate::ops::delete_load_balancer
+    pub fn remove_load_balancer(
+        &mut self,
+        region: &str,
+        name: &str,
+    ) -> Option<StoredLoadBalancer> {
+        self.load_balancers
+            .remove(&(region.to_string(), name.to_string()))
     }
 
     /// Store a newly created load balancer.
