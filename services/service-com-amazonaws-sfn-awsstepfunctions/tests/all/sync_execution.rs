@@ -73,7 +73,7 @@ fn billed(body: &Value, name: &str) -> i64 {
 
 /// The JSON document a string member of `body` carries, or `None` when the member is
 /// absent or null.
-fn document(body: &Value, name: &str) -> Option<Value> {
+pub(crate) fn document(body: &Value, name: &str) -> Option<Value> {
     body.get(name)
         .filter(|value| !value.is_null())
         .map(|value| {

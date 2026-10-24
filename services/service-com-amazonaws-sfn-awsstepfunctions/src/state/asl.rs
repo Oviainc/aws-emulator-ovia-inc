@@ -1475,6 +1475,103 @@ fn looks_like_an_intrinsic(text: &str) -> bool {
     text.starts_with("States.") && text.contains('(') && text.ends_with(')')
 }
 
+/// The name the ONE state `TestState` tests is declared under while it is judged.
+///
+/// A `definition` that carries the state alone gives it no name, and every diagnostic
+/// the walk words names the state it was found in, so the state is judged under this
+/// one.
+const SINGLE_STATE_NAME: &str = "TheStateUnderTest";
+
+/// The transition targets `state` names: its own `Next`, a `Choice` rule's `Next` and
+/// the `Default` beside them, and a `Catch` catcher's `Next`.
+///
+/// Linear in the state's own size, which the modelled `Definition` (1 MiB) bounds, so
+/// the list this builds is bounded by the request exactly as the state is.
+fn transition_targets(state: &Value) -> Vec<String> {
+    let mut targets = Vec::new();
+    let Some(state) = state.as_object() else {
+        return targets;
+    };
+    for member in ["Next", "Default"] {
+        if let Some(target) = state.get(member).and_then(Value::as_str) {
+            targets.push(target.to_string());
+        }
+    }
+    for member in ["Choices", "Catch"] {
+        let entries = state
+            .get(member)
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        for entry in entries {
+            if let Some(target) = entry.get("Next").and_then(Value::as_str) {
+                targets.push(target.to_string());
+            }
+        }
+    }
+    targets
+}
+
+/// Why `definition` is not the definition of a SINGLE state this service accepts, or
+/// `Ok` when it is — what `TestState` takes when it names no `stateName`, since it
+/// "accepts the definition of a single state".
+///
+/// The state is judged by the SAME walk every state of a state machine is, by
+/// declaring it as the one state of a machine: each rule of the Amazon States
+/// Language then applies to it unchanged, down to the machines nested inside it and
+/// the query language it is written in. Two things about a LONE state are declared
+/// around it rather than checked against it, because no definition encloses it:
+///
+/// * its transition targets name states no `States` map declares, so each one is
+///   declared beside it as a `Succeed` state — `TestState` REPORTS the target it
+///   names as `nextState` rather than resolving it;
+/// * it need not say where it goes at all ("if you haven't defined a next state in
+///   your definition [...] this field doesn't contain a value"), where a state
+///   DECLARED in a machine must carry `Next` or `"End": true`, so a state naming no
+///   transition is declared as the machine's terminal state.
+///
+/// Nothing else about the state is altered, and the `Err` is the same first-error
+/// diagnostic [`validate`] answers, in the same words.
+pub fn validate_single_state(definition: &str) -> Result<(), String> {
+    let Ok(state) = serde_json::from_str::<Value>(definition) else {
+        // A definition that is not JSON at all is refused in the same words whichever
+        // form it was sent in, by the walk that words every other definition refusal.
+        return match validate(definition) {
+            Err(why) => Err(why),
+            Ok(()) => Err(error(
+                INVALID_JSON_DESCRIPTION,
+                None,
+                "the definition is not valid JSON",
+            )
+            .stated()),
+        };
+    };
+    let mut judged = state.clone();
+    if let Some(object) = judged.as_object_mut() {
+        let continuing = object
+            .get("Type")
+            .and_then(Value::as_str)
+            .is_some_and(|state_type| CONTINUING_STATE_TYPES.contains(&state_type));
+        if continuing && !object.contains_key("Next") && !object.contains_key("End") {
+            object.insert("End".to_string(), Value::Bool(true));
+        }
+    }
+    let mut states = Map::new();
+    states.insert(SINGLE_STATE_NAME.to_string(), judged);
+    for target in transition_targets(&state) {
+        states
+            .entry(target)
+            .or_insert_with(|| json!({ "Type": "Succeed" }));
+    }
+    let machine = json!({ "StartAt": SINGLE_STATE_NAME, "States": Value::Object(states) });
+    let mut found = Diagnosis::until_first_error();
+    diagnose_machine(&machine, "", JSONPATH, 1, &mut found);
+    match found.diagnostics.iter().find(|found| found.is_error()) {
+        Some(found) => Err(found.stated()),
+        None => Ok(()),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // What a state REFERENCES
 // ---------------------------------------------------------------------------
@@ -2297,24 +2394,8 @@ impl Interpreter {
         context: &Value,
         with_selector: bool,
     ) -> Result<Value, Failure> {
-        let result = match state.get("ResultSelector").filter(|_| with_selector) {
-            Some(template) => payload_template(template, &result, context)?,
-            None => result,
-        };
-        let placed = match state.get("ResultPath") {
-            // "ResultPath (Optional) ... The default value is $, which matches the
-            // entire input."
-            None => result,
-            // "If the ResultPath is null, that means that the state's own raw input
-            // is the state's output."
-            Some(Value::Null) => raw.clone(),
-            Some(Value::String(path)) => set_at_reference_path(raw, path, result)?,
-            Some(other) => {
-                return Err(runtime(format!(
-                    "'ResultPath' must be a reference-path string or null, not {other}"
-                )));
-            }
-        };
+        let result = select_result(state, result, context, with_selector)?;
+        let placed = path_result(state, raw, result)?;
         self.output_value(state, placed, context)
     }
 
@@ -2906,25 +2987,7 @@ impl Interpreter {
                 if taken >= max_attempts {
                     break;
                 }
-                let interval = finite_seconds(retrier, "IntervalSeconds")
-                    .unwrap_or(DEFAULT_RETRY_INTERVAL_SECONDS);
-                let backoff =
-                    finite_seconds(retrier, "BackoffRate").unwrap_or(DEFAULT_RETRY_BACKOFF_RATE);
-                let mut delay = interval * backoff.powi(i32::try_from(taken).unwrap_or(0));
-                if let Some(cap) = finite_seconds(retrier, "MaxDelaySeconds") {
-                    delay = delay.min(cap);
-                }
-                // `delay` is a product of two numbers the definition chose, so it can
-                // overflow to infinity (or to NaN, when a zero interval meets an
-                // infinite backoff). A wait no longer than the longest one this
-                // service waits for is what such a retrier gets: the conversion below
-                // is total only for a finite, in-range value.
-                let delay = if delay.is_finite() {
-                    delay.clamp(0.0, MAX_WAIT_SECONDS as f64)
-                } else {
-                    MAX_WAIT_SECONDS as f64
-                };
-                at += Duration::from_secs_f64(delay);
+                at += Duration::from_secs_f64(retry_delay_seconds(retrier, taken));
                 if let Some(slot) = attempts.get_mut(index) {
                     *slot = taken + 1;
                 }
@@ -3070,6 +3133,32 @@ fn finite_seconds(retrier: &Map<String, Value>, member: &str) -> Option<f64> {
         .filter(|number| number.is_finite() && *number >= 0.0)
 }
 
+/// How long a retrier waits before the attempt after `taken` ones:
+/// "IntervalSeconds" scaled by "BackoffRate" once per attempt already taken, capped
+/// by `MaxDelaySeconds` where the retrier declares one.
+///
+/// The product is of two numbers the definition chose, so it can overflow to infinity
+/// (or to NaN, when a zero interval meets an infinite backoff). A wait no longer than
+/// the longest one this service waits for is what such a retrier gets: the figure
+/// this returns is always finite and in range, which is what makes converting it to a
+/// `Duration` total. An attempt count past `i32::MAX` — which `MaxAttempts` and the
+/// step budget both make unreachable — scales to that same maximum rather than to the
+/// bare interval.
+fn retry_delay_seconds(retrier: &Map<String, Value>, taken: u64) -> f64 {
+    let interval =
+        finite_seconds(retrier, "IntervalSeconds").unwrap_or(DEFAULT_RETRY_INTERVAL_SECONDS);
+    let backoff = finite_seconds(retrier, "BackoffRate").unwrap_or(DEFAULT_RETRY_BACKOFF_RATE);
+    let mut delay = interval * backoff.powi(i32::try_from(taken).unwrap_or(i32::MAX));
+    if let Some(cap) = finite_seconds(retrier, "MaxDelaySeconds") {
+        delay = delay.min(cap);
+    }
+    if delay.is_finite() {
+        delay.clamp(0.0, MAX_WAIT_SECONDS as f64)
+    } else {
+        MAX_WAIT_SECONDS as f64
+    }
+}
+
 /// Whether a retrier's or catcher's `ErrorEquals` names `error`.
 ///
 /// "States.ALL — A wildcard that matches any known error name", with one documented
@@ -3108,6 +3197,41 @@ fn with_map_item(context: &Value, map_item: &Value) -> Value {
         object.insert("Map".to_string(), json!({ "Item": map_item }));
     }
     context
+}
+
+/// `ResultSelector` applied to a state's raw result, when the state declares one and
+/// its type has one (`with_selector`).
+fn select_result(
+    state: &Map<String, Value>,
+    result: Value,
+    context: &Value,
+    with_selector: bool,
+) -> Result<Value, Failure> {
+    match state.get("ResultSelector").filter(|_| with_selector) {
+        Some(template) => payload_template(template, &result, context),
+        None => Ok(result),
+    }
+}
+
+/// `ResultPath` applied to a state's result: where in the state's own RAW input the
+/// result is placed.
+fn path_result(
+    state: &Map<String, Value>,
+    raw: &Value,
+    result: Value,
+) -> Result<Value, Failure> {
+    match state.get("ResultPath") {
+        // "ResultPath (Optional) ... The default value is $, which matches the
+        // entire input."
+        None => Ok(result),
+        // "If the ResultPath is null, that means that the state's own raw input is
+        // the state's output."
+        Some(Value::Null) => Ok(raw.clone()),
+        Some(Value::String(path)) => set_at_reference_path(raw, path, result),
+        Some(other) => Err(runtime(format!(
+            "'ResultPath' must be a reference-path string or null, not {other}"
+        ))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3291,7 +3415,14 @@ fn select_optional(
 /// paths are ("a Path with syntax limited so that it can identify only a single
 /// node"). A reference path identifies ONE node, so the cost of evaluating it is its
 /// segment count and does NOT grow with the size of the document: a descendant
-/// (`..`), a wildcard or a filter would walk the whole document and is refused here.
+/// (`..`), a wildcard, a union or a filter would walk the whole document, or multiply
+/// the node list by its own length, and is refused here.
+///
+/// That guard is STRUCTURAL, not textual: the engine is handed
+/// [`canonical_path`]'s rendering of the segments the validator produced, never the
+/// caller's own text, so no syntax the validator does not produce can reach the
+/// engine however the caller's text would otherwise have parsed. The node count is
+/// still checked afterwards, as defence in depth.
 fn select_path(expression: &str, root: &Value) -> Result<Option<Value>, Failure> {
     if expression.len() > MAX_PATH_CHARS {
         return Err(runtime(format!(
@@ -3299,12 +3430,13 @@ fn select_path(expression: &str, root: &Value) -> Result<Option<Value>, Failure>
             expression.len()
         )));
     }
-    reference_segments(expression).map_err(|why| {
+    let segments = reference_segments(expression).map_err(|why| {
         runtime(format!(
             "'{expression}' is not a reference path this service evaluates: {why}"
         ))
     })?;
-    let parsed = JsonPath::parse(expression).map_err(|error| {
+    let canonical = canonical_path(&segments);
+    let parsed = JsonPath::parse(&canonical).map_err(|error| {
         runtime(format!(
             "'{expression}' is not a JSONPath this service can evaluate: {error}"
         ))
@@ -3334,6 +3466,11 @@ enum Segment {
 /// number of segments is capped at [`MAX_PATH_SEGMENTS`]: a reference path names a
 /// place in a document, so it is short, and a longer one is refused rather than
 /// walked.
+///
+/// A segment names exactly ONE place, which is what makes a reference path's cost its
+/// segment count: the wildcard `*` and a comma-separated union are therefore refused
+/// here in both the `.name` and the `['name']` form, since either one would select a
+/// list of nodes whose length the path text does not bound.
 fn reference_segments(path: &str) -> Result<Vec<Segment>, String> {
     let mut rest = path
         .strip_prefix('$')
@@ -3353,6 +3490,12 @@ fn reference_segments(path: &str) -> Result<Vec<Segment>, String> {
             let (name, tail) = tail.split_at(end);
             if name.is_empty() {
                 return Err(format!("'{path}' carries an empty member name"));
+            }
+            if name.contains(SELECTOR_CHARS) {
+                return Err(format!(
+                    "'{path}' carries the member name '{name}', and a reference path names one \
+                     member rather than a wildcard or a list of them"
+                ));
             }
             segments.push(Segment::Key(name.to_string()));
             rest = tail;
@@ -3374,6 +3517,16 @@ fn reference_segments(path: &str) -> Result<Vec<Segment>, String> {
                         .and_then(|value| value.strip_suffix('"'))
                 });
             match quoted {
+                // A subscript still carrying a quote or a comma inside the quotes it
+                // was stripped of is a UNION of names, which selects as many nodes as
+                // it lists; `*` is the wildcard. Neither names one place, so neither
+                // is a reference path, whatever the two outer quotes suggest.
+                Some(name) if name.contains(SELECTOR_CHARS) => {
+                    return Err(format!(
+                        "'{path}' carries the subscript '{inside}', and a reference path names one \
+                         member rather than a wildcard or a list of them"
+                    ));
+                }
                 Some(name) => segments.push(Segment::Key(name.to_string())),
                 None => {
                     let index = inside
@@ -3389,6 +3542,44 @@ fn reference_segments(path: &str) -> Result<Vec<Segment>, String> {
         ));
     }
     Ok(segments)
+}
+
+/// The characters a member name of a reference path may not carry, because each one
+/// turns a single-node selector into one that selects a list: the wildcard `*`, the
+/// union separator `,` and the two quotes a union's members are written in.
+const SELECTOR_CHARS: &[char] = &['*', ',', '\'', '"'];
+
+/// The canonical reference path for `segments`: `$['name'][0]`, with every member
+/// name quoted and every quote and backslash inside it escaped.
+///
+/// This is the ONLY expression handed to the JSONPath engine. The caller's path text
+/// is validated into segments and then WRITTEN OUT again from them, so the engine
+/// evaluates a path this module produced rather than one a caller wrote: a text that
+/// would otherwise have parsed as a union, a wildcard, a slice or a filter cannot
+/// reach it, and the node list it builds is bounded by the segment count the
+/// validator counted.
+fn canonical_path(segments: &[Segment]) -> String {
+    let mut path = String::from("$");
+    for segment in segments {
+        match segment {
+            Segment::Key(key) => {
+                path.push_str("['");
+                for character in key.chars() {
+                    if character == '\\' || character == '\'' {
+                        path.push('\\');
+                    }
+                    path.push(character);
+                }
+                path.push_str("']");
+            }
+            Segment::Index(index) => {
+                path.push('[');
+                path.push_str(&index.to_string());
+                path.push(']');
+            }
+        }
+    }
+    path
 }
 
 /// `raw` with `result` placed at the reference path `path`.
@@ -4139,6 +4330,517 @@ fn json_number(value: f64) -> Value {
         return json!(value as i64);
     }
     json!(value)
+}
+
+// ---------------------------------------------------------------------------
+// One state, tested by itself (`TestState`)
+// ---------------------------------------------------------------------------
+
+/// How a failure of the ONE state `TestState` tests names it: the state the request
+/// carries alone has no name of its own, so what a failure it raised says about it
+/// names it as the state under test rather than inventing a name for it.
+pub const SINGLE_STATE_LABEL: &str = "the state under test";
+
+/// `TestExecutionStatus`' `SUCCEEDED`: the state's work produced an output
+/// (`smithy_query(query="shape",shape="TestExecutionStatus")` -> `CAUGHT_ERROR |
+/// FAILED | RETRIABLE | SUCCEEDED`).
+pub const TEST_STATUS_SUCCEEDED: &str = "SUCCEEDED";
+
+/// `TestExecutionStatus`' `FAILED`: the state failed, and neither a `Retry` nor a
+/// `Catch` of its own answers for the error it failed with.
+pub const TEST_STATUS_FAILED: &str = "FAILED";
+
+/// `TestExecutionStatus`' `RETRIABLE`: the state failed with an error one of its
+/// `Retry` retriers matches and still has attempts left for, so the state machine
+/// would re-run it.
+pub const TEST_STATUS_RETRIABLE: &str = "RETRIABLE";
+
+/// `TestExecutionStatus`' `CAUGHT_ERROR`: the state failed and one of its `Catch`
+/// catchers took the failure over, so the execution continues at that catcher's
+/// `Next` with the error output.
+pub const TEST_STATUS_CAUGHT_ERROR: &str = "CAUGHT_ERROR";
+
+/// The state types whose `Parameters` member is a payload template over the state's
+/// effective INPUT (see [`executable_members`]); the other types declare no such
+/// member, so no `afterParameters` stage exists for them.
+const TEMPLATED_STATE_TYPES: &[&str] = &["Map", "Parallel", "Pass", "Task"];
+
+/// The state types whose `ResultSelector` member is a payload template over the
+/// state's raw RESULT. `Pass` is absent: the Amazon States Language gives it a
+/// `Result`, not a `ResultSelector`.
+const SELECTOR_STATE_TYPES: &[&str] = &["Map", "Parallel", "Task"];
+
+/// The state types whose own work is an INVOCATION — a service integration, an
+/// iteration over items, a set of branches — rather than a function of the state's
+/// data alone.
+///
+/// "TestState only supports the following when a mock is specified: Activity tasks,
+/// .sync or .waitForTaskToken service integration patterns, Parallel, or Map states":
+/// a state of one of these types is tested through its mocked outcome, and the
+/// operation refuses to test a `Map` or a `Parallel` without one.
+pub const INVOKING_STATE_TYPES: &[&str] = &["Map", "Parallel", "Task"];
+
+/// A mocked outcome for the state under test: "A JSON object that contains a mocked
+/// `result` or `errorOutput`", which stands in for the invocation the state would
+/// otherwise make. Nothing is invoked for a mocked state; what the mock names IS the
+/// state's result or failure, and the state's own data flow is applied to it.
+#[derive(Debug, Clone)]
+pub enum Mock {
+    /// `mock.result`: "A JSON string containing the mocked result of the state
+    /// invocation."
+    Result(Value),
+    /// `mock.errorOutput`: "the mocked response is returned as a JSON object that
+    /// contains an `error` and `cause` field."
+    Error(Failure),
+}
+
+/// What `TestState` reports about one state's data processing: the document the state
+/// carried after each filter of the Amazon States Language's data flow.
+///
+/// A stage a state has no member for is left unreported rather than repeated, and the
+/// result-side stages exist only for a state that produces a result of its own.
+#[derive(Debug, Clone, Default)]
+pub struct Inspection {
+    /// "The raw state input", as the caller wrote it.
+    pub input: Option<String>,
+    /// "The input after Step Functions applies the InputPath filter."
+    pub after_input_path: Option<String>,
+    /// "The effective input after Step Functions applies the Parameters filter."
+    pub after_parameters: Option<String>,
+    /// "The state's raw result."
+    pub result: Option<String>,
+    /// "The effective result after Step Functions applies the ResultSelector filter."
+    pub after_result_selector: Option<String>,
+    /// "The effective result combined with the raw state input after Step Functions
+    /// applies the ResultPath filter."
+    pub after_result_path: Option<String>,
+}
+
+/// What one state, tested by itself, produced.
+#[derive(Debug, Clone)]
+pub struct Trial {
+    /// One of [`TEST_STATUS_SUCCEEDED`], [`TEST_STATUS_FAILED`],
+    /// [`TEST_STATUS_RETRIABLE`] and [`TEST_STATUS_CAUGHT_ERROR`].
+    pub status: &'static str,
+    pub output: Option<String>,
+    /// Where the state transitions to. "If you haven't defined a next state in your
+    /// definition or if the execution of the state fails, this field doesn't contain
+    /// a value."
+    pub next_state: Option<String>,
+    pub error: Option<String>,
+    pub cause: Option<String>,
+    pub inspection: Inspection,
+    /// The position in `Retry` of the retrier that matched a [`TEST_STATUS_RETRIABLE`]
+    /// failure, and how long that retrier waits before the attempt it owes.
+    pub retry_index: Option<i32>,
+    pub retry_backoff_seconds: Option<i32>,
+    /// The position in `Catch` of the catcher that took a
+    /// [`TEST_STATUS_CAUGHT_ERROR`] failure over.
+    pub catch_index: Option<i32>,
+}
+
+impl Trial {
+    /// The trial of a state that produced `output`.
+    fn succeeded(output: Option<String>, next_state: Option<String>, inspection: Inspection) -> Self {
+        Self {
+            status: TEST_STATUS_SUCCEEDED,
+            output,
+            next_state,
+            error: None,
+            cause: None,
+            inspection,
+            retry_index: None,
+            retry_backoff_seconds: None,
+            catch_index: None,
+        }
+    }
+
+    /// The trial of a state that failed with nothing of its own to answer for it.
+    ///
+    /// `error` and `cause` leave through the modelled `SensitiveError` (0..256) and
+    /// `SensitiveCause` (0..32768) shapes, so they are bounded exactly as an
+    /// execution's are: a name past its maximum is reported as ASL's own data-limit
+    /// error, since a name carries meaning and cannot be shortened, while an
+    /// over-long cause keeps the error name and is clipped to what the service
+    /// reports.
+    fn failed(inspection: Inspection, failure: Failure) -> Self {
+        let Failure { error, cause } = failure;
+        if error
+            .as_ref()
+            .is_some_and(|error| error.len() > MAX_ERROR_BYTES)
+        {
+            return Self {
+                status: TEST_STATUS_FAILED,
+                output: None,
+                next_state: None,
+                error: Some(DATA_LIMIT_ERROR.to_string()),
+                cause: Some(format!(
+                    "the state's error name is longer than the {MAX_ERROR_BYTES} bytes this \
+                     service reports it through"
+                )),
+                inspection,
+                retry_index: None,
+                retry_backoff_seconds: None,
+                catch_index: None,
+            };
+        }
+        Self {
+            status: TEST_STATUS_FAILED,
+            output: None,
+            next_state: None,
+            error,
+            cause: cause.map(clip_cause),
+            inspection,
+            retry_index: None,
+            retry_backoff_seconds: None,
+            catch_index: None,
+        }
+    }
+}
+
+/// One `TestState` call: the state under test, and everything the request fixed
+/// about it.
+pub struct StateTest<'a> {
+    /// The state's name, which `$$.State.Name` reports. Empty for a `definition`
+    /// that is the state alone, which carries no name — only a `stateName` naming a
+    /// state of a full definition gives it one.
+    pub name: &'a str,
+    /// The state's own definition: the object the Amazon States Language declares it
+    /// as.
+    pub state: &'a Map<String, Value>,
+    /// "A string that contains the JSON input data for the state", as the caller
+    /// wrote it.
+    pub input: &'a str,
+    /// When the state is being tested, which `$$.State.EnteredTime` reports.
+    pub start: SystemTime,
+    /// What the context object reports about this test, for the members the request
+    /// fixes.
+    pub context: &'a Context,
+    /// "A JSON string representing a valid Context object for the state under test":
+    /// the whole `$$` document, which replaces the one built from `context`.
+    pub context_override: Option<&'a Value>,
+    pub mock: Option<&'a Mock>,
+    /// `stateConfiguration.retrierRetryCount`: "The number of retry attempts that
+    /// have occurred for the state's Retry that applies to the mocked error", which
+    /// is what decides whether the state's failure is still RETRIABLE.
+    pub retries_taken: u64,
+}
+
+/// Run the ONE state `test` names over its input and report what it produced.
+///
+/// This is `TestState`'s walk: a single state, with no state machine around it, so
+/// nothing is transitioned to and nothing is persisted. The state's data flow, its
+/// `Choice` rules, its `Wait` members and its `Fail` members are evaluated by the
+/// same code an execution's walk uses; an invocation this process cannot make is
+/// answered by the request's `mock`, and without one the state fails with ASL's own
+/// [`RUNTIME_ERROR`] rather than with a fabricated result.
+pub fn test_state(test: &StateTest<'_>) -> Trial {
+    let inspection = Inspection {
+        input: Some(test.input.to_string()),
+        ..Inspection::default()
+    };
+    let raw: Value = match serde_json::from_str(test.input) {
+        Ok(value) => value,
+        Err(error) => {
+            return Trial::failed(
+                inspection,
+                runtime(format!("the state input is not valid JSON: {error}")),
+            );
+        }
+    };
+    // The input is a caller's document too, so it is measured against the ceiling
+    // every document a state produces is measured against: an input larger than a
+    // state's output may carry is answered with ASL's own data-limit error rather
+    // than evaluated, which is also what bounds what one path or one `StringMatches`
+    // rule can be asked to walk.
+    if let Err(failure) = measure_payload(&raw, "the state's input") {
+        return Trial::failed(inspection, failure);
+    }
+    let base_context = match test.context_override {
+        Some(context) => context.clone(),
+        None => test.context.value(&raw, test.start),
+    };
+    let mut interpreter = Interpreter {
+        budget: MAX_STATE_TRANSITIONS,
+        depth: 0,
+        deadline: super::after(super::now(), MAX_INTERPRET_DURATION),
+        // The state is tested as the attempt the request says it is on, which is what
+        // it reads through `$$.State.RetryCount`.
+        retry_count: test.retries_taken,
+        steps: Vec::new(),
+        start: test.start,
+        base_context,
+    };
+    interpreter.trial(test, &raw, inspection)
+}
+
+impl Interpreter {
+    /// [`test_state`]'s walk of the one state under test.
+    fn trial(&mut self, test: &StateTest<'_>, raw: &Value, mut inspection: Inspection) -> Trial {
+        let state = test.state;
+        let state_type = state.get("Type").and_then(Value::as_str).unwrap_or_default();
+        let context = self.context_for(&Scope::default(), test.name, Duration::ZERO);
+
+        if let Some(language) = state.get("QueryLanguage").and_then(Value::as_str) {
+            if language != JSONPATH {
+                return Trial::failed(
+                    inspection,
+                    runtime(format!(
+                        "{SINGLE_STATE_LABEL} is written in '{language}', and this emulator \
+                         evaluates only '{JSONPATH}' states, so nothing was run for it"
+                    )),
+                );
+            }
+        }
+        // A member this emulator does not interpret changes what the state does, so
+        // the state is not run for it — the rule the walk applies at every state. A
+        // MOCKED state is exempt: the members that describe the invocation the mock
+        // stands in for are the mock's business, and nothing is invoked for them; a
+        // type this emulator does not run at all is reported by `produce` as the
+        // invocation it is, not as a member.
+        if test.mock.is_none() && EXECUTED_STATE_TYPES.contains(&state_type) {
+            if let Some(member) = unexecutable_member(state_type, state) {
+                return Trial::failed(
+                    inspection,
+                    runtime(format!(
+                        "{SINGLE_STATE_LABEL} carries the member '{member}', which this emulator \
+                         does not interpret, so nothing was run for it"
+                    )),
+                );
+            }
+        }
+        // The input side: `InputPath`, then the `Parameters` payload template.
+        let effective = match self.input_value(state, raw, &context) {
+            Ok(value) => value,
+            Err(failure) => return self.classify(test, raw, &context, failure, inspection),
+        };
+        inspection.after_input_path = Some(effective.to_string());
+        let templated = TEMPLATED_STATE_TYPES.contains(&state_type);
+        let after_parameters = match state.get("Parameters").filter(|_| templated) {
+            Some(template) => match payload_template(template, &effective, &context) {
+                Ok(value) => value,
+                Err(failure) => return self.classify(test, raw, &context, failure, inspection),
+            },
+            None => effective.clone(),
+        };
+        if templated {
+            inspection.after_parameters = Some(after_parameters.to_string());
+        }
+
+        // A `Choice` state's transition is what the state DOES, and the walk decides
+        // it before the state's output is built, so a rule that cannot be evaluated
+        // is what such a state fails with.
+        let chosen = if state_type == "Choice" {
+            match self.choose(state, &effective, &context) {
+                Ok(next) => Some(next),
+                Err(failure) => return self.classify(test, raw, &context, failure, inspection),
+            }
+        } else {
+            None
+        };
+
+        let produced = self.produce(state, state_type, &after_parameters, &effective, &context, test.mock);
+        let placed = match produced {
+            Ok(Some(result)) => {
+                self.place_recorded(state, state_type, raw, result, &context, &mut inspection)
+            }
+            Ok(None) => self.output_value(state, effective.clone(), &context),
+            Err(failure) => Err(failure),
+        };
+        let output = match placed {
+            Ok(output) => output,
+            Err(failure) => return self.classify(test, raw, &context, failure, inspection),
+        };
+        // The document the state produced is measured here, at the state that
+        // produced it, against what a state's output may carry — as the walk measures
+        // every state's.
+        if let Err(failure) = measure_payload(&output, SINGLE_STATE_LABEL) {
+            return self.classify(test, raw, &context, failure, inspection);
+        }
+
+        let next_state = match chosen {
+            Some(next) => Some(next),
+            None if TERMINAL_STATE_TYPES.contains(&state_type) => None,
+            None if state.get("End").and_then(Value::as_bool) == Some(true) => None,
+            // A single state's `Next` names a state no definition around it declares,
+            // so it is REPORTED rather than resolved; a state that names none has no
+            // next state at all.
+            None => state.get("Next").and_then(Value::as_str).map(str::to_string),
+        };
+        Trial::succeeded(
+            Some(output_text(&output, raw, test.input)),
+            next_state,
+            inspection,
+        )
+    }
+
+    /// The RAW result the state's own work produced: the document the result-side
+    /// filters place, `None` for a state that produces no result of its own (its
+    /// effective input is what `OutputPath` reads), or the failure it ended in.
+    fn produce(
+        &mut self,
+        state: &Map<String, Value>,
+        state_type: &str,
+        after_parameters: &Value,
+        effective: &Value,
+        context: &Value,
+        mock: Option<&Mock>,
+    ) -> Result<Option<Value>, Failure> {
+        // The mock IS the outcome of the invocation it stands in for, so nothing is
+        // invoked for it and the state's result is the one the request named.
+        match mock {
+            Some(Mock::Result(result)) => return Ok(Some(result.clone())),
+            Some(Mock::Error(failure)) => return Err(failure.clone()),
+            None => {}
+        }
+        match state_type {
+            // "Parameters ... Used to create a collection of key-value pairs that
+            // will be passed as input": it transforms the state's effective INPUT,
+            // while `Result` is the state's RESULT — the rule the walk applies.
+            "Pass" => Ok(Some(
+                state
+                    .get("Result")
+                    .cloned()
+                    .unwrap_or_else(|| after_parameters.clone()),
+            )),
+            // A `Wait` state produces no result of its own. Its members are still
+            // evaluated, so a malformed one is reported as the failure it is, but
+            // nothing sleeps for the span it declares.
+            "Wait" => {
+                self.wait_duration(state, effective, context, Duration::ZERO)
+                    .map_err(|why| runtime(format!("{SINGLE_STATE_LABEL}: {why}")))?;
+                Ok(None)
+            }
+            "Choice" | "Succeed" => Ok(None),
+            // A `Fail` state ends with the error and cause it declares, either of
+            // which ASL may instead read from the state's input through a `*Path`.
+            "Fail" => {
+                let error = self.fail_member(state, "Error", "ErrorPath", effective, context)?;
+                let cause = self.fail_member(state, "Cause", "CausePath", effective, context)?;
+                Err(Failure { error, cause })
+            }
+            // Every remaining type's work is an invocation this process does not
+            // make: a service integration, an iteration over items, a set of
+            // branches. Without a mock to stand in for it, nothing ran — which is
+            // what the state fails with, rather than a synthesised result.
+            other => Err(runtime(format!(
+                "a '{other}' state's own work is an invocation this emulator does not make, and \
+                 the request names no mock to stand in for it, so nothing was run for it"
+            ))),
+        }
+    }
+
+    /// The result-side filters over a state's raw result — `ResultSelector`,
+    /// `ResultPath` against the state's own raw input, then `OutputPath` — recording
+    /// what the state carried after each one.
+    fn place_recorded(
+        &self,
+        state: &Map<String, Value>,
+        state_type: &str,
+        raw: &Value,
+        result: Value,
+        context: &Value,
+        inspection: &mut Inspection,
+    ) -> Result<Value, Failure> {
+        inspection.result = Some(result.to_string());
+        let with_selector = SELECTOR_STATE_TYPES.contains(&state_type);
+        let selected = select_result(state, result, context, with_selector)?;
+        if with_selector {
+            inspection.after_result_selector = Some(selected.to_string());
+        }
+        let placed = path_result(state, raw, selected)?;
+        inspection.after_result_path = Some(placed.to_string());
+        self.output_value(state, placed, context)
+    }
+
+    /// What `TestState` reports for a state whose work failed: the attempt one of its
+    /// `Retry` retriers still owes (RETRIABLE), the catcher that takes the failure
+    /// over (CAUGHT_ERROR), or the failure itself (FAILED).
+    ///
+    /// The two are the state's OWN error handling, read exactly as the walk reads it:
+    /// the first retrier whose `ErrorEquals` names the error decides, and `Catch` is
+    /// consulted only once no retrier has an attempt left.
+    fn classify(
+        &self,
+        test: &StateTest<'_>,
+        raw: &Value,
+        context: &Value,
+        failure: Failure,
+        inspection: Inspection,
+    ) -> Trial {
+        let state = test.state;
+        let name = failure.name().to_string();
+        for (index, retrier) in retry_entries(state, "Retry").iter().enumerate() {
+            let Some(retrier) = retrier.as_object() else {
+                continue;
+            };
+            if !errors_match(retrier, &name) {
+                continue;
+            }
+            let max_attempts = retrier
+                .get("MaxAttempts")
+                .and_then(Value::as_u64)
+                .unwrap_or(DEFAULT_RETRY_MAX_ATTEMPTS);
+            if test.retries_taken >= max_attempts {
+                break;
+            }
+            let mut trial = Trial::failed(inspection, failure);
+            trial.status = TEST_STATUS_RETRIABLE;
+            trial.retry_index = Some(i32::try_from(index).unwrap_or(i32::MAX));
+            trial.retry_backoff_seconds = Some(
+                retry_delay_seconds(retrier, test.retries_taken).round() as i32,
+            );
+            return trial;
+        }
+        for (index, catcher) in retry_entries(state, "Catch").iter().enumerate() {
+            let Some(catcher) = catcher.as_object() else {
+                continue;
+            };
+            if !errors_match(catcher, &name) {
+                continue;
+            }
+            let Some(next) = catcher.get("Next").and_then(Value::as_str) else {
+                return Trial::failed(
+                    inspection,
+                    runtime("a 'Catch' catcher must carry a string 'Next'".to_string()),
+                );
+            };
+            // "When a state reports an error and it matches a catcher, the state's
+            // output is the error output", placed through the catcher's own
+            // `ResultPath`.
+            let output = match self.place_result(catcher, raw, failure.payload(), context, true) {
+                Ok(output) => output,
+                Err(failure) => return Trial::failed(inspection, failure),
+            };
+            let mut trial = Trial::failed(inspection, failure);
+            trial.status = TEST_STATUS_CAUGHT_ERROR;
+            trial.output = Some(output.to_string());
+            trial.next_state = Some(next.to_string());
+            trial.catch_index = Some(i32::try_from(index).unwrap_or(i32::MAX));
+            return trial;
+        }
+        Trial::failed(inspection, failure)
+    }
+}
+
+/// A state's `Retry` or `Catch` entries, or none when it declares no such array.
+fn retry_entries<'a>(state: &'a Map<String, Value>, member: &str) -> &'a [Value] {
+    state
+        .get(member)
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+}
+
+/// A state's output as the response carries it: the caller's OWN bytes when the
+/// document the state put out is the one the caller wrote, and the encoding the walk
+/// produced otherwise — the rule an execution's output follows.
+fn output_text(output: &Value, raw: &Value, input: &str) -> String {
+    if output == raw {
+        input.to_string()
+    } else {
+        output.to_string()
+    }
 }
 
 // ---------------------------------------------------------------------------
