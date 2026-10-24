@@ -1282,8 +1282,8 @@ pub fn to_date_time(at: SystemTime) -> ::aws_smithy_types::DateTime {
 /// How AppConfig words a `ResourceNotFoundException`, as the recorded refusals show it:
 ///
 /// ```text
-/// <Resource kind> with <Label> <value>[, <Label> <value>]… and <Label> <value> \
-///     could not be found for account <account id>
+/// <Resource kind>[ with <Label> <value>[, <Label> <value>]… and <Label> <value>] \
+///     could not be found[ for account <account id>]
 /// ```
 ///
 /// The sentence is DERIVED from the request — the kind of resource that was looked up,
@@ -1292,15 +1292,43 @@ pub fn to_date_time(at: SystemTime) -> ::aws_smithy_types::DateTime {
 /// request's values and nothing is stored. The account is always
 /// [`::engine::emulator_account_id`], the single account a generated emulator presents.
 ///
+/// The two optional clauses are NOT uniform across resource kinds, and each builder
+/// below states which its own recorded refusal carries: the deployment strategy's
+/// message ends at `could not be found` with no account clause, and the extension's
+/// echoes no identifier at all. So `identifiers` is empty for a kind whose template
+/// names none, and `account` says whether that kind's template reports the account.
+///
 /// `terminator` is the sentence's final punctuation: the recorded messages end with a
 /// full stop for every resource except the hosted configuration version, whose recorded
 /// message ends without one, so it is passed in per resource rather than appended here.
-fn not_found_message(kind: &str, identifiers: &[(&str, &str)], terminator: &str) -> String {
-    format!(
-        "{kind} with {} could not be found for account {}{terminator}",
-        identifier_phrase(identifiers),
-        ::engine::emulator_account_id()
-    )
+fn not_found_message(
+    kind: &str,
+    identifiers: &[(&str, &str)],
+    account: AccountClause,
+    terminator: &str,
+) -> String {
+    let subject = if identifiers.is_empty() {
+        kind.to_string()
+    } else {
+        format!("{kind} with {}", identifier_phrase(identifiers))
+    };
+    match account {
+        AccountClause::Reported => format!(
+            "{subject} could not be found for account {}{terminator}",
+            ::engine::emulator_account_id()
+        ),
+        AccountClause::Omitted => format!("{subject} could not be found{terminator}"),
+    }
+}
+
+/// Whether a resource kind's refusal names the account the lookup was scoped to, as
+/// that kind's recorded message shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AccountClause {
+    /// `… could not be found for account <account id>`.
+    Reported,
+    /// `… could not be found` — the form the deployment strategy's refusal uses.
+    Omitted,
 }
 
 /// The identifier clause of a [`not_found_message`]: each `<Label> <value>` pair in the
@@ -1331,6 +1359,7 @@ pub fn application_not_found(application_id: &str) -> String {
     not_found_message(
         "Application",
         &[("Id", application_id)],
+        AccountClause::Reported,
         NOT_FOUND_FULL_STOP,
     )
 }
@@ -1343,6 +1372,7 @@ pub fn environment_not_found(application_id: &str, environment_id: &str) -> Stri
             ("Application Id", application_id),
             ("Environment Id", environment_id),
         ],
+        AccountClause::Reported,
         NOT_FOUND_FULL_STOP,
     )
 }
@@ -1358,6 +1388,7 @@ pub fn configuration_profile_not_found(
             ("Application Id", application_id),
             ("Configuration Profile Id", configuration_profile_id),
         ],
+        AccountClause::Reported,
         NOT_FOUND_FULL_STOP,
     )
 }
@@ -1375,6 +1406,7 @@ pub fn hosted_configuration_version_not_found(
             ("Configuration Profile Id", configuration_profile_id),
             ("Version", &version_number.to_string()),
         ],
+        AccountClause::Reported,
         NOT_FOUND_NO_FULL_STOP,
     )
 }
@@ -1392,35 +1424,53 @@ pub fn deployment_not_found(
             ("Environment Id", environment_id),
             ("Deployment Number", &deployment_number.to_string()),
         ],
+        AccountClause::Reported,
         NOT_FOUND_FULL_STOP,
     )
 }
 
 /// `Message` for a deployment strategy that is neither created nor predefined.
+///
+/// The strategy's recorded refusal is the one form that reports NO account, and spells
+/// the kind as one word (`DeploymentStrategy`) rather than two: `DeploymentStrategy with
+/// Id <id> could not be found.`
 pub fn deployment_strategy_not_found(deployment_strategy_id: &str) -> String {
     not_found_message(
-        "Deployment Strategy",
+        "DeploymentStrategy",
         &[("Id", deployment_strategy_id)],
+        AccountClause::Omitted,
         NOT_FOUND_FULL_STOP,
     )
 }
 
 /// `Message` for an extension no `ExtensionIdentifier` resolves to.
-pub fn extension_not_found(extension_identifier: &str) -> String {
-    not_found_message(
-        "Extension",
-        &[("Id", extension_identifier)],
-        NOT_FOUND_FULL_STOP,
-    )
+///
+/// The extension's recorded refusal echoes NO identifier — `Extension could not be found
+/// for account <account id>.` — so the caller-supplied `ExtensionIdentifier` is not
+/// reflected back into it.
+pub fn extension_not_found() -> String {
+    not_found_message("Extension", &[], AccountClause::Reported, NOT_FOUND_FULL_STOP)
 }
 
 /// `Message` for a `ResourceArn` that addresses no resource this service holds — the
 /// identifier the tagging operations scope their lookup with.
 pub fn resource_arn_not_found(resource_arn: &str) -> String {
-    not_found_message("Resource", &[("Arn", resource_arn)], NOT_FOUND_FULL_STOP)
+    not_found_message(
+        "Resource",
+        &[("Arn", resource_arn)],
+        AccountClause::Reported,
+        NOT_FOUND_FULL_STOP,
+    )
 }
 
 /// `Message` for a version an extension does not hold.
+///
+/// A version-level miss is a DIFFERENT refusal from [`extension_not_found`] and has no
+/// recorded instance, so it keeps naming the extension and the version the request asked
+/// for: AppConfig's templates demonstrably differ per lookup (the strategy's omits the
+/// account, the extension's omits the identifier), and carrying one kind's wording over
+/// to a lookup it was not recorded for is exactly what this message had to be corrected
+/// for.
 pub fn extension_version_not_found(extension_identifier: &str, version_number: i32) -> String {
     not_found_message(
         "Extension",
@@ -1428,7 +1478,28 @@ pub fn extension_version_not_found(extension_identifier: &str, version_number: i
             ("Id", extension_identifier),
             ("Version Number", &version_number.to_string()),
         ],
+        AccountClause::Reported,
         NOT_FOUND_FULL_STOP,
+    )
+}
+
+// =============================================================================
+// `ConflictException` messages
+// =============================================================================
+
+/// `Message` for a deployment refused because the environment it targets is not in a
+/// state that accepts one.
+///
+/// AppConfig attributes this conflict to the ENVIRONMENT rather than to the deployment
+/// holding it: the recorded refusal names the environment and the state it currently
+/// has, and nothing else — no deployment number. `state` is the `DeploymentState` of the
+/// deployment still in flight, which is the state the recorded refusal reports (the
+/// uppercase `DEPLOYING` / `BAKING` form, not `Environment$State`'s CamelCase wire
+/// value), so a retry loop keyed on the environment reads the subject AppConfig names.
+pub fn environment_not_ready_for_deployment(environment_id: &str, state: &str) -> String {
+    format!(
+        "Environment {environment_id} currently has a state of {state}. The current deployment \
+         must finish before a new deployment can be started."
     )
 }
 

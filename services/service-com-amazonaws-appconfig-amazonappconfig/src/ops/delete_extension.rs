@@ -173,9 +173,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // version to delete unless the request names one explicitly.
         let Some((extension, pinned_version)) = store.resolve_extension(&input.extension_identifier)
         else {
-            return Err(not_found(crate::state::extension_not_found(
-                &input.extension_identifier,
-            )));
+            return Err(not_found(crate::state::extension_not_found()));
         };
         // "A specific version of an extension to delete. If omitted, the highest version
         // is deleted." An extension is reachable only through its versions, so one that
@@ -186,9 +184,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .or(pinned_version)
             .or_else(|| extension.latest_version().map(|version| version.version_number))
         else {
-            return Err(not_found(crate::state::extension_not_found(
-                &input.extension_identifier,
-            )));
+            return Err(not_found(crate::state::extension_not_found()));
         };
 
         // The delete IS the removal of the stored record: the version goes, and with it

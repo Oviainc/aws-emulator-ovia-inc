@@ -214,21 +214,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 );
             };
             // Only a deployment whose lifecycle hooks are Lambda validation
-            // functions has a validation result to report.
-            let Some(hooks) = platform_hooks(&deployment.compute_platform) else {
-                return Err(
-                    PutLifecycleEventHookExecutionStatusErrorModeled::UnsupportedActionForDeploymentTypeException(
-                        UnsupportedActionForDeploymentTypeException {
-                            message: Some(format!(
-                                "A lifecycle event hook execution status can only be reported \
-                                 for a deployment on the Lambda or ECS compute platform; \
-                                 deployment {deployment_id} uses the {} compute platform",
-                                deployment.compute_platform
-                            )),
-                        },
-                    ),
-                );
-            };
+            // functions HAS hook executions at all; a deployment on any other
+            // compute platform runs its lifecycle events through the CodeDeploy
+            // agent and issues no hook execution id, so an id reported against
+            // one names no hook execution of it. That is the same refusal as an
+            // id this deployment never issued — `InvalidLifecycleEventHookExecutionIdException`
+            // — rather than `UnsupportedActionForDeploymentTypeException`, which
+            // is what a hook execution of a deployment TYPE that cannot report a
+            // result would be refused with.
+            let hooks = platform_hooks(&deployment.compute_platform).unwrap_or_default();
             // A validation function reports a RESULT, so only the two terminal
             // lifecycle statuses are reportable.
             if status != crate::state::LIFECYCLE_EVENT_STATUS_SUCCEEDED
@@ -289,18 +283,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 );
             }
             // A deployment has one hook execution per lifecycle hook its compute
-            // platform runs, so an id past that count names no hook execution of
-            // this deployment. Each accepted report takes the next of those hooks,
-            // in the order the platform runs them.
+            // platform runs, so an id past that count — and ANY id against a
+            // platform that runs none — names no hook execution of this
+            // deployment. Each accepted report takes the next of those hooks, in
+            // the order the platform runs them.
             let Some(lifecycle_event_name) = hooks.get(deployment.lifecycle_hook_executions.len())
             else {
                 return Err(
                     PutLifecycleEventHookExecutionStatusErrorModeled::InvalidLifecycleEventHookExecutionIdException(
                         InvalidLifecycleEventHookExecutionIdException {
                             message: Some(format!(
-                                "The lifecycle event hook execution ID {hook_execution_id} is \
-                                 invalid: deployment {deployment_id} has no further lifecycle \
-                                 event hook executions"
+                                "The lifecycleEventHookExecutionId {hook_execution_id} is \
+                                 invalid: it names no lifecycle event hook execution of \
+                                 deployment {deployment_id}"
                             )),
                         },
                     ),
@@ -384,9 +379,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// (`smithy_query(query="doc",shape="PutLifecycleEventHookExecutionStatus")`).
 ///
 /// `None` for every other compute platform: EC2/on-premises lifecycle events are
-/// run by the CodeDeploy agent rather than by a Lambda validation function, which
-/// is what `UnsupportedActionForDeploymentTypeException` answers. How many hooks
-/// a platform has is also how many hook executions one deployment can ever have.
+/// run by the CodeDeploy agent rather than by a Lambda validation function, so
+/// such a deployment issues no hook execution id and has no hook execution an id
+/// could name — which is why a report against one is refused as an invalid
+/// hook-execution id. How many hooks a platform has is also how many hook
+/// executions one deployment can ever have.
 fn platform_hooks(compute_platform: &str) -> Option<&'static [&'static str]> {
     match compute_platform {
         "Lambda" => Some(&["BeforeAllowTraffic", "AfterAllowTraffic"]),
