@@ -265,9 +265,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The stored rule as this request leaves it: a member the request carries
 /// replaces the stored one, a member it omits keeps what state holds. Which of the
 /// two rate members the resulting `Type` may hold is
-/// [`crate::state::reconcile_pricing_rule_rate`]'s rule — the MERGING form, which
-/// only an update needs: `CreatePricingRule` has no stored record to merge with and
-/// states its create-time half of the same rule in its own handler.
+/// [`crate::state::reconcile_pricing_rule_rate`]'s rule — the same function
+/// `CreatePricingRule` decides a new rule's rate with, applied here to the stored
+/// record merged with the request rather than to the request alone.
 fn merge(
     stored: &crate::state::PricingRuleRecord,
     input: &UpdatePricingRuleInput,

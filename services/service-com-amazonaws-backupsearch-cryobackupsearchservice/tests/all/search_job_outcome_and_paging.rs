@@ -317,12 +317,15 @@ async fn the_terminal_status_a_scan_settles_to_follows_the_resolved_scope() {
 
 #[tokio::test]
 async fn stopping_a_job_is_idempotent_and_only_an_unreachable_end_state_conflicts() {
-    // One row per value of the model's `SearchJobState` (`types::SEARCH_JOB_STATE_VALUES`):
-    // the status the job is seeded in, what a StopSearchJob against it must answer, and
-    // the status the job holds afterwards. A status that already is the end state this
-    // `@idempotent` operation asks for, or is on its way to it, is a no-op success; only
-    // a terminal status this operation does not produce is a conflict.
+    // One row per status a search job can be observed in: every value of the model's
+    // `SearchJobState` (`types::SEARCH_JOB_STATE_VALUES`) plus the `CREATING` a
+    // just-started job reports, the status the job is seeded in, what a StopSearchJob
+    // against it must answer, and the status the job holds afterwards. A status that
+    // already is the end state this `@idempotent` operation asks for, or is on its way to
+    // it, is a no-op success; only a terminal status this operation does not produce is a
+    // conflict.
     let cases: Vec<(&str, u16, &str)> = vec![
+        (state::CREATING, 200, state::STOPPING),
         (state::RUNNING, 200, state::STOPPING),
         (state::STOPPING, 200, state::STOPPING),
         (state::STOPPED, 200, state::STOPPED),
@@ -331,15 +334,15 @@ async fn stopping_a_job_is_idempotent_and_only_an_unreachable_end_state_conflict
     ];
     assert_eq!(
         cases.len(),
-        types::SEARCH_JOB_STATE_VALUES.len(),
-        "every status the model declares must have a row, got {:?}",
+        types::SEARCH_JOB_STATE_VALUES.len() + 1,
+        "every status the model declares must have a row, and so must CREATING, got {:?}",
         types::SEARCH_JOB_STATE_VALUES
     );
 
     for (seeded, expected_status, expected_after) in cases {
         assert!(
-            types::SEARCH_JOB_STATE_VALUES.contains(&seeded),
-            "case {seeded:?}: the seeded status must be one the model declares"
+            types::SEARCH_JOB_STATE_VALUES.contains(&seeded) || seeded == state::CREATING,
+            "case {seeded:?}: the seeded status must be one this service reports"
         );
         let (emulator, engine) = emulator_with_engine();
         let identifier = seed_job(&engine, seeded);
@@ -421,7 +424,7 @@ fn seed_job(engine: &engine::InMemoryEngine, status: &str) -> String {
         tags: std::collections::HashMap::new(),
         client_token: None,
         request_fingerprint: identifier.clone(),
-        next_status_due: None,
+        owed_statuses: std::collections::VecDeque::new(),
     });
     identifier
 }

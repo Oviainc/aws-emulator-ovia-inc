@@ -520,6 +520,44 @@ pub fn name_already_exists_message(kind: &str) -> String {
     format!("The requested {kind} name already exists. Use a different {kind} name.")
 }
 
+/// How this service refuses a `Settings` toggle and the value that qualifies it when
+/// only one of the two is in the request, or `None` when the pair holds together.
+///
+/// A settings toggle and the value that qualifies it are CO-REQUIRED in both
+/// directions: the model documents each direction on the member itself — "If you
+/// enable `ShowSpeakerLabels` in your request, you must also include
+/// `MaxSpeakerLabels`" and "If you specify the `MaxSpeakerLabels` field, you must set
+/// the `ShowSpeakerLabels` field to true", with the same two sentences for
+/// `ShowAlternatives` / `MaxAlternatives` and for `VocabularyFilterName` /
+/// `VocabularyFilterMethod` (`smithy_query(query="shape",
+/// shape="Settings,MedicalTranscriptionSetting,MedicalScribeSettings")`). A request
+/// that satisfies only one side of such a pair is refused rather than stored, so a
+/// stored job never reports speaker partitioning with no speaker ceiling (or the
+/// reverse). Single-homed here because every settings shape of this service that
+/// documents such a pair applies the same rule.
+///
+/// `enabled` is whether the toggle is present AND asks for the feature; `qualifier_set`
+/// whether the qualifying member is present at all — a qualifier with the toggle
+/// absent and one with the toggle explicitly off are the same refusal.
+pub fn co_required_setting_error(
+    toggle: &str,
+    enabled: bool,
+    qualifier: &str,
+    qualifier_set: bool,
+) -> Option<String> {
+    match (enabled, qualifier_set) {
+        (true, false) => Some(format!(
+            "Settings.{qualifier} is required when Settings.{toggle} is set. Correct \
+             your request and try again."
+        )),
+        (false, true) => Some(format!(
+            "Settings.{toggle} must be set when Settings.{qualifier} is specified. \
+             Correct your request and try again."
+        )),
+        _ => None,
+    }
+}
+
 /// The most tags one Amazon Transcribe resource may carry.
 ///
 /// A CHOSEN ceiling, not a modelled one: `TagList` is modelled

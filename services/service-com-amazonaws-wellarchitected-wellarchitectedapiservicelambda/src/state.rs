@@ -15,8 +15,8 @@
 //! imports, the versions `CreateLensVersion` publishes from them, the content
 //! `ExportLens` reads back and the versions `GetLensVersionDifference` compares are backed
 //! the same way, and `ListLenses` pages over those
-//! lenses beside the AWS-official lens this emulator ships. The Well-Architected Tool
-//! profiles (`CreateProfile`, `GetProfile`) are backed the same way, each keyed by the
+//! lenses beside the AWS-official lens this emulator ships. The Well-Architected
+//! Tool profiles (`CreateProfile`, `GetProfile`) are backed the same way, each keyed by the
 //! `ProfileArn` the create minted. The agent profiles
 //! (`CreateAgentProfile`, `GetAgentProfile`, `ListAgentProfiles`) and the optimization
 //! goals recorded against one (`CreateAgentGoal`, `GetAgentGoal`, `DeleteAgentGoal`) are
@@ -27,13 +27,16 @@
 //! their projections live here rather than in a handler because several operations reach
 //! them.
 //!
-//! The one lens definition this emulator ships itself — the AWS-official Well-Architected
-//! Framework lens's question set — lives here too, for the same reason: the risk roll-up
-//! of a workload and the answer list of a lens review must agree about which questions
-//! a lens asks. The aliases of the lenses Amazon Web Services publishes
+//! The lens content this emulator ships itself — the AWS-official lens catalog, whose
+//! entries carry each official lens's name, version, pillars and question set
+//! ([`official_lenses`]) — lives here too, for the same reason: the risk roll-up of a
+//! workload and the answer list of a lens review must agree about which questions a lens
+//! asks. The aliases of the lenses Amazon Web Services publishes
 //! ([`AWS_OFFICIAL_LENS_ALIASES`]) live beside it, because a lens is applied BY NAME and
 //! every operation that applies one has to resolve that name against the same catalog
-//! ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::resolve_lens`]).
+//! ([`ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState::resolve_lens`]) —
+//! the aliases are every lens AWS publishes, of which the content catalog carries the ones
+//! this emulator holds questions for.
 //!
 //! The modelled `ResourceNotFoundException` / `ConflictException` constructors live
 //! here for the same reason: every operation that resolves an identifier or enforces a
@@ -44,6 +47,14 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use sha2::{Digest, Sha256};
+
+pub mod official_lenses;
+
+pub use official_lenses::{
+    framework_lens_published_at, lens_metadata, lens_pillars, lens_question_count, lens_questions,
+    official_lens, LensMetadata, OfficialLens, OFFICIAL_LENS_CATALOG, SPECIALISED_LENS_VERSION,
+    WELL_ARCHITECTED_PILLARS,
+};
 
 use crate::ops::types::{
     AgentProfileSummary, AggregationConfiguration, Choice, ConflictException, ContextContent,
@@ -94,14 +105,15 @@ pub const CHOICE_STATUS_UNSELECTED: &str = "UNSELECTED";
 /// workload nobody enabled the integration for is not integrated.
 pub const DEFAULT_TRUSTED_ADVISOR_INTEGRATION_STATUS: &str = "DISABLED";
 
-/// The lens alias of the AWS-official Well-Architected Framework lens — the one lens
-/// definition this emulator carries. A lens is named on the wire either by this alias
-/// or by its ARN, whose resource part ends in `lens/<alias>`
+/// The lens alias of the AWS-official Well-Architected Framework lens — the first entry
+/// of the AWS-official lens catalog this emulator publishes
+/// ([`official_lenses::OFFICIAL_LENS_CATALOG`]). A lens is named on the wire either by its
+/// alias or by its ARN, whose resource part ends in `lens/<alias>`
 /// (`smithy_query(query="shape", shape="LensAlias")`).
 pub const FRAMEWORK_LENS_ALIAS: &str = "wellarchitected";
 
 /// The `LensSummary$Description` of the AWS-official Well-Architected Framework lens —
-/// what the one lens definition this emulator ships ([`FRAMEWORK_LENS_QUESTIONS`]) asks
+/// what that lens's question set ([`FRAMEWORK_LENS_QUESTIONS`]) asks
 /// about, within `LensDescription`'s modelled 1..1024 characters
 /// (`smithy_query(query="shape", shape="LensSummary")`). Catalog content rather than a
 /// stored value, so it lives beside the question set it describes, next to that lens's
@@ -109,20 +121,6 @@ pub const FRAMEWORK_LENS_ALIAS: &str = "wellarchitected";
 pub const FRAMEWORK_LENS_DESCRIPTION: &str = "The Amazon Web Services Well-Architected \
      Framework provides a consistent approach for customers and partners to evaluate \
      architectures, and implement designs that scale over time.";
-
-/// When [`FRAMEWORK_LENS_VERSION`] was published, in seconds since the Unix epoch:
-/// `2023-10-03T00:00:00Z`, the date that version names.
-///
-/// `LensSummary$CreatedAt`/`UpdatedAt` are "The date and time when the lens was
-/// created"/"last updated", and for AWS's own lens that is when the version this
-/// emulator ships was published. Fixed, not read from the clock: a lens nobody changed
-/// must report the same instants to every caller.
-const FRAMEWORK_LENS_PUBLISHED_AT_EPOCH_SECONDS: u64 = 1_696_291_200;
-
-/// [`FRAMEWORK_LENS_PUBLISHED_AT_EPOCH_SECONDS`] as an instant.
-pub fn framework_lens_published_at() -> SystemTime {
-    SystemTime::UNIX_EPOCH + Duration::from_secs(FRAMEWORK_LENS_PUBLISHED_AT_EPOCH_SECONDS)
-}
 
 /// `LensSummary$LensStatus` for a lens whose current content no version has been
 /// published from.
@@ -190,34 +188,8 @@ pub const LENS_STATUS_TYPE_DRAFT: &str = "DRAFT";
 /// (`ImportLens` doc).
 pub const LENS_STATUS_TYPE_PUBLISHED: &str = "PUBLISHED";
 
-/// The AWS Well-Architected Framework lens's pillars, in the order the framework
-/// presents them: the id each is named by on the wire, the name the framework publishes
-/// for it, and the number of questions that pillar asks.
-///
-/// `PillarId` is how a pillar is named on the wire (`smithy_query(query="shape",
-/// shape="PillarId")`: "The ID used to identify a pillar, for example, `security`"), and
-/// `PillarName` is its display name (`smithy_query(query="shape",
-/// shape="PillarReviewSummary")`) — the six pillar names the Well-Architected Framework
-/// publishes. The question counts are the framework's published question numbering —
-/// operational excellence OPS 1-11, security SEC 1-11, reliability REL 1-13,
-/// performance efficiency PERF 1-5, cost optimization COST 1-11 and sustainability
-/// SUS 1-6 — 57 questions in all. This table is the pillar ORDER (it is what a workload
-/// without priorities is reviewed in, and the order a lens review reports its pillar
-/// summaries in); the questions themselves are [`FRAMEWORK_LENS_QUESTIONS`], and a test
-/// pins the two against each other so the counts restated here cannot drift from the
-/// catalog.
-pub const FRAMEWORK_LENS_PILLARS: &[(&str, &str, usize)] = &[
-    ("operationalExcellence", "Operational Excellence", 11),
-    ("security", "Security", 11),
-    ("reliability", "Reliability", 13),
-    ("performance", "Performance Efficiency", 5),
-    ("costOptimization", "Cost Optimization", 11),
-    ("sustainability", "Sustainability", 6),
-];
-
 /// The `LensName` of the AWS-official Well-Architected Framework lens: the name AWS
-/// publishes for the lens [`FRAMEWORK_LENS_ALIAS`] names, which is the one lens this
-/// emulator ships content for.
+/// publishes for the lens [`FRAMEWORK_LENS_ALIAS`] names.
 pub const FRAMEWORK_LENS_NAME: &str = "Well-Architected Framework";
 
 /// The `LensVersion` the framework lens content in this file is: the revision of the
@@ -230,11 +202,11 @@ pub const FRAMEWORK_LENS_VERSION: &str = "2023-10-03";
 
 /// `LensStatus$CURRENT`: the lens review is against the lens's latest version
 /// (`smithy_query(query="shape", shape="LensStatus")` publishes `CURRENT`,
-/// `NOT_CURRENT`, `DEPRECATED`, `DELETED` and `UNSHARED`). The framework lens content
-/// here has exactly one version ([`FRAMEWORK_LENS_VERSION`]), and the operations that
-/// could move a review off it — `CreateLensVersion`, `DeleteLens`, `CreateLensShare` and
-/// `UpgradeLensReview` — are still stubs, each with its own issue, so a review of a lens
-/// this emulator holds content for is on that lens's current version.
+/// `NOT_CURRENT`, `DEPRECATED`, `DELETED` and `UNSHARED`). Each AWS-official lens in the
+/// catalog carries exactly one version (its [`OfficialLens::version`]), and the operations
+/// that could move a review off it — `CreateLensVersion`, `DeleteLens`, `CreateLensShare`
+/// and `UpgradeLensReview` — are still stubs, each with its own issue, so a review of a
+/// lens this emulator holds content for is on that lens's current version.
 pub const LENS_STATUS_CURRENT: &str = "CURRENT";
 
 /// One question of the AWS-official framework lens, as this emulator's lens content:
@@ -247,7 +219,7 @@ pub const LENS_STATUS_CURRENT: &str = "CURRENT";
 #[derive(Debug, Clone, Copy)]
 pub struct FrameworkQuestion {
     /// `AnswerSummary$PillarId` — the pillar this question belongs to, one of
-    /// [`FRAMEWORK_LENS_PILLARS`].
+    /// [`WELL_ARCHITECTED_PILLARS`].
     pub pillar_id: &'static str,
     /// `AnswerSummary$QuestionId` (`@length(1, 128)`), stable for the life of the lens.
     pub question_id: &'static str,
@@ -304,8 +276,10 @@ impl FrameworkQuestion {
     }
 }
 
-/// The AWS Well-Architected Framework lens's question set: the one lens definition this
-/// emulator ships, in pillar order and then in the framework's question order.
+/// The AWS Well-Architected Framework lens's question set: the content this emulator
+/// carries for the lens [`FRAMEWORK_LENS_ALIAS`] names, in pillar order and then in the
+/// framework's question order. It is that lens's entry in the AWS-official lens catalog
+/// ([`official_lenses::OFFICIAL_LENS_CATALOG`]), which carries one question set per lens.
 ///
 /// The pillars and the number of questions each asks are the framework's published
 /// numbering (OPS 1-11, SEC 1-11, REL 1-13, PERF 1-5, COST 1-11, SUS 1-6 — 57
@@ -2146,40 +2120,6 @@ impl LensRecord {
     }
 }
 
-/// The `LensSummary` of the one AWS-official lens this emulator ships, in the Region the
-/// request was signed for.
-///
-/// The framework lens's content is this emulator's own ([`FRAMEWORK_LENS_QUESTIONS`]), so
-/// its summary comes from that catalog rather than from the lens store, which holds only
-/// the custom lenses `ImportLens` imported. Its name and version come from
-/// [`lens_metadata`], the one projection of the shipped lens's metadata — so this summary
-/// cannot name the lens differently from the lens reviews that report the same lens — and
-/// only the description and the publication instant are facts the catalog adds here.
-///
-/// An official lens ARN names no owner account — "the lens ARN, such as
-/// `arn:aws:wellarchitected:us-east-1::lens/serverless`" (`LensAlias` doc), the same
-/// distinction [`is_aws_official_lens`] reads — so the summary reports no `Owner` either:
-/// AWS publishes the lens rather than an account owning it, and `Owner` is modelled an
-/// `AwsAccountId` (`^[0-9]{12}$`), which no placeholder would satisfy honestly.
-pub fn framework_lens_summary(region: &str) -> LensSummary {
-    let published_at = ::aws_smithy_types::DateTime::from(framework_lens_published_at());
-    let metadata = lens_metadata(FRAMEWORK_LENS_ALIAS);
-    LensSummary {
-        lens_arn: Some(official_lens_arn(region, FRAMEWORK_LENS_ALIAS)),
-        lens_alias: Some(FRAMEWORK_LENS_ALIAS.to_string()),
-        lens_name: metadata.map(|metadata| metadata.name.to_string()),
-        lens_type: Some(LENS_TYPE_AWS_OFFICIAL.to_string()),
-        description: Some(FRAMEWORK_LENS_DESCRIPTION.to_string()),
-        created_at: Some(published_at),
-        updated_at: Some(published_at),
-        lens_version: metadata.map(|metadata| metadata.version.to_string()),
-        owner: None,
-        // AWS's own lens is published content: its content IS the version it is published
-        // at.
-        lens_status: Some(LENS_STATUS_PUBLISHED.to_string()),
-    }
-}
-
 /// The stable enumeration key of one lens in the lens catalog `ListLenses` pages over:
 /// the AWS-official lenses this emulator ships first, then the custom lenses, each group
 /// in its own identifier order.
@@ -2484,33 +2424,6 @@ pub fn lens_alias(lens: &str) -> &str {
     alias.split('/').next().unwrap_or(alias)
 }
 
-/// The questions a lens ATTACHED TO A WORKLOAD asks, as this emulator knows it, in the
-/// lens's own order.
-///
-/// Only the AWS-official Well-Architected Framework lens has a definition here
-/// ([`FRAMEWORK_LENS_QUESTIONS`]); another lens — an AWS-published specialised lens, or
-/// a custom one — carries no question set in this emulator yet, so it asks nothing. A
-/// custom lens is not a counter-example even once `CreateLensVersion` has published a
-/// version of it: its question set is lens CONTENT, held on its own
-/// [`LensRecord`] in the store rather than in this static catalog, and
-/// "the lens cannot be applied to workloads … until it's published with
-/// CreateLensVersion" (`ImportLens` doc) is enforced by `AssociateLenses`, still a stub
-/// with its own issue — so no custom lens in this emulator is attached to a workload for
-/// its questions to be reported or counted.
-pub fn lens_questions(lens: &str) -> &'static [FrameworkQuestion] {
-    if lens_alias(lens) == FRAMEWORK_LENS_ALIAS {
-        FRAMEWORK_LENS_QUESTIONS
-    } else {
-        &[]
-    }
-}
-
-/// How many questions the named lens asks: the length of its [`lens_questions`], so the
-/// roll-up and the answer list cannot disagree about the question set.
-pub fn lens_question_count(lens: &str) -> usize {
-    lens_questions(lens).len()
-}
-
 /// Whether `alias` names `record`: an ARN must agree with the lens's own ARN (so the
 /// account and Region it carries have to match), optionally pinning a version after it;
 /// a bare id names the lens whose id it is.
@@ -2554,23 +2467,25 @@ pub fn is_aws_official_lens(alias: &str) -> bool {
 /// outside the published set names no lens at all, and an operation that APPLIES a lens
 /// refuses it rather than recording it.
 ///
-/// This emulator ships the QUESTION CONTENT of exactly one of these lenses
-/// ([`FRAMEWORK_LENS_ALIAS`]); the others are lenses it knows exist and holds no questions
-/// for ([`lens_questions`]), which is why the catalog is a list of aliases rather than of
-/// lens definitions.
+/// This emulator ships the QUESTION CONTENT of the lenses in
+/// [`official_lenses::OFFICIAL_LENS_CATALOG`], whose entries are drawn from the aliases
+/// below; an alias here that the content catalog does not carry is a lens this emulator
+/// knows exists and holds no questions for ([`lens_questions`]), which is why this catalog
+/// is a list of aliases rather than of lens definitions.
 ///
-/// `ListLenses` therefore ENUMERATES only the lens whose content is shipped
-/// ([`framework_lens_summary`]) beside the account's custom lenses: a `LensSummary` is lens
+/// `ListLenses` therefore ENUMERATES the lenses whose content is shipped
+/// ([`OfficialLens::summary`]) beside the account's custom lenses: a `LensSummary` is lens
 /// CONTENT — its `LensName`, `Description`, `LensVersion` and publication instants — and
-/// this emulator holds none of that for the other aliases, so listing them would mean
-/// inventing it. Applying one is a different question: a lens is applied BY NAME, and the
-/// name is all this catalog has to resolve.
+/// for an alias the content catalog does not carry this emulator holds none of that, so
+/// listing it would mean inventing it. Applying one is a different question: a lens is
+/// applied BY NAME, and the name is all this catalog has to resolve.
 pub const AWS_OFFICIAL_LENS_ALIASES: &[&str] = &[
     "connectedmobility",
     "dataanalytics",
     "devops",
     "financialservices",
     "games",
+    "genai",
     "healthcareindustry",
     "iot",
     "machinelearning",
@@ -2651,54 +2566,10 @@ pub fn official_lens_arn(region: &str, lens: &str) -> String {
 /// improvement plan (`WorkloadPillarPriorities` doc: "The priorities of the pillars,
 /// which are used to order items in the improvement plan").
 pub fn default_pillar_priorities() -> Vec<String> {
-    FRAMEWORK_LENS_PILLARS
+    WELL_ARCHITECTED_PILLARS
         .iter()
-        .map(|(pillar_id, _, _)| (*pillar_id).to_string())
+        .map(|(pillar_id, _)| (*pillar_id).to_string())
         .collect()
-}
-
-/// The pillars the named lens is organized into, in the lens's own order, each with its
-/// `PillarName` — the pillar half of [`lens_questions`].
-///
-/// Only the AWS-official Well-Architected Framework lens has content here
-/// ([`FRAMEWORK_LENS_PILLARS`]); any other lens carries no question set in this emulator
-/// yet (see [`lens_questions`] for why), so it is organized into no pillars.
-pub fn lens_pillars(lens: &str) -> &'static [(&'static str, &'static str, usize)] {
-    if lens_alias(lens) == FRAMEWORK_LENS_ALIAS {
-        FRAMEWORK_LENS_PILLARS
-    } else {
-        &[]
-    }
-}
-
-/// What this emulator knows ABOUT a lens, as a lens review reports it: the members that
-/// describe the LENS itself rather than the answers recorded against it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LensMetadata {
-    /// `LensReview$LensName`.
-    pub name: &'static str,
-    /// `LensReview$LensVersion`.
-    pub version: &'static str,
-    /// `LensReview$LensStatus`.
-    pub status: &'static str,
-}
-
-/// The named lens's own metadata, when this emulator holds that lens's content.
-///
-/// `None` for any lens but the AWS-official framework lens: a lens's name, version and
-/// status are lens CONTENT, and this emulator ships one lens definition (see
-/// [`lens_questions`] for why), so for another lens there is nothing to report and the
-/// optional members are omitted rather than guessed at.
-pub fn lens_metadata(lens: &str) -> Option<LensMetadata> {
-    if lens_alias(lens) == FRAMEWORK_LENS_ALIAS {
-        Some(LensMetadata {
-            name: FRAMEWORK_LENS_NAME,
-            version: FRAMEWORK_LENS_VERSION,
-            status: LENS_STATUS_CURRENT,
-        })
-    } else {
-        None
-    }
 }
 
 /// What a `CreateWorkload` idempotency token resolves to: the workload the original

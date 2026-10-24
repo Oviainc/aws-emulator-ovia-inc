@@ -35,6 +35,8 @@ mod medical_vocabulary_constraints;
 mod rpc_success_status;
 #[path = "all/service_claim.rs"]
 mod service_claim;
+#[path = "all/settings_co_requirements.rs"]
+mod settings_co_requirements;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tagging_resource_families.rs"]

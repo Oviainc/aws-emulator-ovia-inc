@@ -44,8 +44,11 @@ const FRAMEWORK_QUESTIONS: usize = 11 + 11 + 13 + 5 + 11 + 6;
 /// The alias of the one lens this emulator ships a question set for.
 const FRAMEWORK_LENS: &str = "wellarchitected";
 
-/// A lens alias AWS publishes but this emulator ships no question set for.
-const UNSHIPPED_LENS: &str = "serverless";
+/// A lens alias AWS publishes that this emulator's AWS-official lens catalog carries no
+/// content for, so its review asks no questions here. The catalog itself — every lens it
+/// DOES carry, each reviewable with its own question set — is pinned by
+/// `super::official_lens_catalog`.
+const UNSHIPPED_LENS: &str = "mergersandacquisitions";
 
 /// A well-formed `WorkloadId` (32 lowercase hex) that no workload carries.
 const ABSENT_HEX_ID: &str = "00000000000000000000000000000000";

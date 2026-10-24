@@ -156,6 +156,29 @@ fn expected_transcript_uri(request: &Value) -> String {
     }
 }
 
+/// `CreateMedicalVocabulary` for every custom medical vocabulary the rows of
+/// [`start_requests`] apply, so the account holds them: a start may only name a custom
+/// medical vocabulary this account created (see the `settings_co_requirements` suite,
+/// which asserts that rule).
+async fn create_the_vocabularies_the_rows_name(transcribe: &Transcribe) {
+    for (_, request) in start_requests() {
+        let Some(name) = request["Settings"]["VocabularyName"].as_str() else {
+            continue;
+        };
+        transcribe
+            .call(
+                "CreateMedicalVocabulary",
+                json!({
+                    "VocabularyName": name,
+                    "LanguageCode": "en-US",
+                    "VocabularyFileUri": "s3://DOC-EXAMPLE-BUCKET/clinical-terms.txt"
+                }),
+            )
+            .await
+            .ok(&format!("CreateMedicalVocabulary {name:?}"));
+    }
+}
+
 /// `GetMedicalTranscriptionJob` for `name`.
 async fn get(transcribe: &Transcribe, name: &str) -> crate::transcription_jobs::Reply {
     transcribe
@@ -169,6 +192,7 @@ async fn get(transcribe: &Transcribe, name: &str) -> crate::transcription_jobs::
 #[tokio::test]
 async fn a_started_medical_transcription_job_reads_back_exactly_as_it_was_started() {
     let transcribe = Transcribe::new();
+    create_the_vocabularies_the_rows_name(&transcribe).await;
 
     for (case, request) in start_requests() {
         let started = transcribe
@@ -248,6 +272,7 @@ async fn a_started_medical_transcription_job_reads_back_exactly_as_it_was_starte
 #[tokio::test]
 async fn a_medical_transcription_job_completes_once_its_processing_span_has_elapsed() {
     let transcribe = Transcribe::new();
+    create_the_vocabularies_the_rows_name(&transcribe).await;
 
     for (case, request) in start_requests() {
         transcribe
@@ -421,6 +446,7 @@ async fn a_start_whose_members_cannot_hold_together_is_refused() {
 #[tokio::test]
 async fn a_second_start_under_a_live_job_name_is_a_conflict() {
     let transcribe = Transcribe::new();
+    create_the_vocabularies_the_rows_name(&transcribe).await;
 
     for (case, request) in start_requests() {
         transcribe
@@ -453,6 +479,7 @@ async fn a_second_start_under_a_live_job_name_is_a_conflict() {
 #[tokio::test]
 async fn a_medical_job_and_a_transcription_job_may_share_a_name() {
     let transcribe = Transcribe::new();
+    create_the_vocabularies_the_rows_name(&transcribe).await;
 
     for (case, request) in start_requests() {
         let name = job_name(&request);
