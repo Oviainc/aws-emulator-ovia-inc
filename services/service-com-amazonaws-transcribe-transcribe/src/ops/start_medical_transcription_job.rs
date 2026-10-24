@@ -14,8 +14,11 @@
 //! emulates.
 //!
 //! The rules the model's own constraint traits cannot express — `Media.MediaFileUri`,
-//! and a `LanguageCode` that must be `en-US` because the member targets the
-//! service-wide language enum — are refused with the modelled `BadRequestException`.
+//! a `LanguageCode` that must be `en-US` because the member targets the service-wide
+//! language enum, the co-dependencies `MedicalTranscriptionSetting` documents between
+//! a toggle and the value that qualifies it, and a `Settings.VocabularyName` that must
+//! name a custom medical vocabulary this account holds — are refused with the modelled
+//! `BadRequestException`.
 //!
 //! ## Shape of an operation
 //!
@@ -290,8 +293,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // The co-dependencies `MedicalTranscriptionSetting` documents between a
+        // toggle and the value that qualifies it, in both directions — see
+        // [`crate::state::co_required_setting_error`], which words them for every
+        // settings shape of this service that carries such a pair.
+        if let Some(settings) = input.settings.as_ref() {
+            for (toggle, enabled, qualifier, qualifier_set) in [
+                (
+                    "ShowSpeakerLabels",
+                    settings.show_speaker_labels == Some(true),
+                    "MaxSpeakerLabels",
+                    settings.max_speaker_labels.is_some(),
+                ),
+                (
+                    "ShowAlternatives",
+                    settings.show_alternatives == Some(true),
+                    "MaxAlternatives",
+                    settings.max_alternatives.is_some(),
+                ),
+            ] {
+                if let Some(message) = crate::state::co_required_setting_error(
+                    toggle,
+                    enabled,
+                    qualifier,
+                    qualifier_set,
+                ) {
+                    return Err(bad_request(&message));
+                }
+            }
+        }
+
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
+
+        // "The name of the custom vocabulary you want to use when processing your
+        // medical transcription job" (model doc for
+        // `MedicalTranscriptionSetting$VocabularyName`): a job may only apply a custom
+        // medical vocabulary this account holds, so a name no `CreateMedicalVocabulary`
+        // ever recorded is refused here rather than stored on a job that would report
+        // it back. The name belongs to the MEDICAL vocabulary family, which is a family
+        // of its own: a custom vocabulary of the same name is a different resource.
+        if let Some(vocabulary) = input
+            .settings
+            .as_ref()
+            .and_then(|settings| settings.vocabulary_name.as_deref())
+        {
+            if !store.medical_vocabularies.contains_key(vocabulary) {
+                return Err(bad_request(&crate::state::not_found_message(
+                    crate::state::KIND_MEDICAL_VOCABULARY,
+                )));
+            }
+        }
 
         // "This name is case sensitive, cannot contain spaces, and must be unique
         // within an Amazon Web Services account. If you try to create a new job with

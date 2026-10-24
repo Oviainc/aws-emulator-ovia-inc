@@ -330,6 +330,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // The co-dependencies `Settings` documents between a toggle and the value that
+        // qualifies it, in both directions — see
+        // [`crate::state::co_required_setting_error`], which words them for every
+        // settings shape of this service that carries such a pair.
+        if let Some(settings) = input.settings.as_ref() {
+            for (toggle, enabled, qualifier, qualifier_set) in [
+                (
+                    "ShowSpeakerLabels",
+                    settings.show_speaker_labels == Some(true),
+                    "MaxSpeakerLabels",
+                    settings.max_speaker_labels.is_some(),
+                ),
+                (
+                    "ShowAlternatives",
+                    settings.show_alternatives == Some(true),
+                    "MaxAlternatives",
+                    settings.max_alternatives.is_some(),
+                ),
+            ] {
+                if let Some(message) = crate::state::co_required_setting_error(
+                    toggle,
+                    enabled,
+                    qualifier,
+                    qualifier_set,
+                ) {
+                    return Err(bad_request(&message));
+                }
+            }
+        }
+
         let now = ::std::time::SystemTime::now();
         let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
