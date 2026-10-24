@@ -188,7 +188,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => LIST_CHANNELS_DEFAULT_PAGE_SIZE,
         };
         let resume_at = match input.next_token.as_deref() {
-            Some(token) => Some(decode_page_token(token, page_size, &region)?),
+            Some(token) => Some(
+                crate::state::page_token::decode(
+                    token,
+                    page_size,
+                    &region,
+                    Self::NAME,
+                    crate::state::channels::is_minted_channel_id,
+                )
+                .map_err(|message| {
+                    ListChannelsErrorModeled::InvalidNextTokenException(InvalidNextTokenException {
+                        message: Some(message),
+                    })
+                })?,
+            ),
             None => None,
         };
 
@@ -206,7 +219,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if channels.len() == page_size {
                 // One channel past a full page: report where to resume rather than
                 // carrying it.
-                next_token = Some(encode_page_token(page_size, &region, &record.channel_id));
+                next_token = Some(crate::state::page_token::encode(
+                    page_size,
+                    &region,
+                    &record.channel_id,
+                ));
                 break;
             }
             channels.push(Channel {
@@ -222,67 +239,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The page token this operation hands back: the hex of
-/// `<page size>|<region>|<channel id>`, where the id is the one the next page resumes
-/// AT. The registry is keyed by `(channel id, Region)` and iterates id-ordered, which
-/// is the order this operation pages through; neither a Region nor a channel id
-/// carries a `|`, so the split is unambiguous.
-///
-/// The page size and the Region are carried because both are parameters of the walk
-/// the token belongs to: the registry spans every Region, so a token replayed in
-/// another Region would otherwise resume at a key that Region cannot reach and report
-/// an empty page as a success instead of refusing.
-///
-/// It is hex-coded because a `PaginationToken` is opaque to the caller — it is only
-/// ever handed straight back — and because the coding keeps the token inside the
-/// member's modelled `@length 4..1000`: the shortest payload is already 4 bytes, and
-/// the longest (a channel id, a Region, at most four digits of page size and the
-/// separators) codes to well under 1000 characters.
-fn encode_page_token(page_size: usize, region: &str, resume_at: &str) -> String {
-    ::hex::encode(format!("{page_size}|{region}|{resume_at}"))
-}
-
-/// Read a page token this operation issued for THIS walk, or refuse the request.
-///
-/// `InvalidNextTokenException` is documented as "a token that is not valid, or a token
-/// that was previously used in a request with different parameters", which is exactly
-/// the ways this can fail: a token whose resume key is not even an id CloudTrail
-/// mints, so this operation cannot have issued it, and one issued for
-/// another page size or in another Region — the parameters `ListChannels` pages with.
-fn decode_page_token(
-    token: &str,
-    page_size: usize,
-    region: &str,
-) -> Result<String, ListChannelsErrorModeled> {
-    let invalid = |reason: &str| {
-        ListChannelsErrorModeled::InvalidNextTokenException(InvalidNextTokenException {
-            message: Some(format!("Invalid NextToken '{token}': {reason}")),
-        })
-    };
-    let unissued = || invalid("it was not issued by ListChannels");
-
-    let decoded = ::hex::decode(token)
-        .ok()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .ok_or_else(unissued)?;
-    let (issued_for, rest) = decoded.split_once('|').ok_or_else(unissued)?;
-    let (issued_in, resume_at) = rest.split_once('|').ok_or_else(unissued)?;
-    if issued_for.parse::<usize>() != Ok(page_size) {
-        return Err(invalid(&format!(
-            "it was issued for a different MaxResults than the {page_size} this request asks for"
-        )));
-    }
-    if issued_in != region {
-        return Err(invalid(&format!(
-            "it was issued for the channels of another Region than {region}"
-        )));
-    }
-    // Every token this operation issues resumes at a channel id, which is the UUID
-    // CloudTrail mints; anything else is a key no page of this walk ever stopped at.
-    // A channel released since the page was issued is NOT refused here: the walk
-    // resumes from where it stopped whether or not that channel is still stored.
-    if !crate::state::channels::is_minted_channel_id(resume_at) {
-        return Err(unissued());
-    }
-    Ok(resume_at.to_string())
-}
+// How this operation's page token is built and read is
+// `crate::state::page_token`, the one statement of that rule for every listing in
+// this service: the hex of `<page size>|<region>|<resume key>`, carrying the page
+// size and the Region because both are parameters of the walk the token belongs to
+// — the registry spans every Region, so a token replayed in another Region would
+// otherwise resume at a key that Region cannot reach and report a truncated page as
+// a success instead of refusing. What stays this operation's own is the shape of a
+// resume key it could have issued — a channel id CloudTrail mints
+// (`crate::state::channels::is_minted_channel_id`), the registry being keyed by
+// `(channel id, Region)` and iterating id-ordered, which is the order this operation
+// pages through — and the modelled error it refuses with.
