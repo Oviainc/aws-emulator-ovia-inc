@@ -230,7 +230,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = ::std::time::SystemTime::now();
-        let reported_version = match input.content.clone() {
+        let reported_version: Option<u64> = match input.content.clone() {
             // `Content` IS the schema definition, so sending it writes a new,
             // immutable version and leaves every earlier one as it was.
             Some(content) => {
@@ -248,7 +248,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .copied()
                     .filter(|version| schema.versions.contains_key(version));
                 match already_minted {
-                    Some(version) => version,
+                    Some(version) => Some(version),
                     None => {
                         if schema.versions.len() >= crate::state::MAX_VERSIONS_PER_SCHEMA {
                             return Err(UpdateSchemaErrorModeled::BadRequestException(
@@ -281,7 +281,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         if let Some(token) = input.client_token_id.clone() {
                             schema.minted_by_token.insert(token, minted);
                         }
-                        minted
+                        Some(minted)
                     }
                 }
             }
@@ -295,20 +295,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     schema.description = Some(description);
                     schema.last_modified = now;
                 }
-                schema.latest_version
+                // The newest version the schema still HOLDS: a version a delete took
+                // out is reported by nothing afterwards, and a schema every version of
+                // which has been deleted has no definition to report at all.
+                schema.latest_stored_version()
             }
         };
 
         // Answer from the STORED schema and its stored version, never from `input`.
-        let version = schema
-            .versions
-            .get(&reported_version)
-            .ok_or_else(|| {
-                UpdateSchemaError::from(UpdateSchemaErrorModeled::InternalServerErrorException(
-                    crate::state::internal_error(),
-                ))
-            })?
-            .clone();
+        // A schema that holds no version still exists and still carries its own
+        // metadata; the members that describe a definition are then absent, rather
+        // than naming a version the store does not hold.
+        let version = match reported_version {
+            Some(number) => Some(
+                schema
+                    .versions
+                    .get(&number)
+                    .ok_or_else(|| {
+                        UpdateSchemaError::from(
+                            UpdateSchemaErrorModeled::InternalServerErrorException(
+                                crate::state::internal_error(),
+                            ),
+                        )
+                    })?
+                    .clone(),
+            ),
+            None => None,
+        };
         let schema_arn = schema.arn.clone();
         Ok(UpdateSchemaOutput {
             // The schema's own metadata, not the version's: the description a read
@@ -317,10 +330,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             last_modified: Some(schema.last_modified.into()),
             schema_arn: Some(schema_arn),
             schema_name: Some(schema.name.clone()),
-            schema_version: Some(version.version.to_string()),
+            schema_version: version.as_ref().map(|version| version.version.to_string()),
             tags: crate::state::tags_to_output(&schema.tags),
-            r#type: Some(version.r#type.clone()),
-            version_created_date: Some(version.created_date.into()),
+            // The type of the definition this response reports. A schema holding no
+            // version has no definition to read it from, and the type is also the
+            // SCHEMA's own stored member (`Schema::r#type`, which `add_version` keeps
+            // at the type of the definition last written), so that is what a response
+            // reporting no version carries — the same member `DescribeSchema` answers
+            // for a schema whose versions it reports nothing of.
+            r#type: Some(
+                version
+                    .as_ref()
+                    .map_or_else(|| schema.r#type.clone(), |version| version.r#type.clone()),
+            ),
+            version_created_date: version.as_ref().map(|version| version.created_date.into()),
         })
     }
 }

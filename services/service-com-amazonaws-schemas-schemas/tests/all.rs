@@ -45,6 +45,8 @@ mod registry_schema_lifecycle;
 mod resource_policy;
 #[path = "all/schema_name_collation.rs"]
 mod schema_name_collation;
+#[path = "all/schema_version_deletion.rs"]
+mod schema_version_deletion;
 #[path = "all/search_schemas.rs"]
 mod search_schemas;
 #[path = "all/state_roundtrip.rs"]

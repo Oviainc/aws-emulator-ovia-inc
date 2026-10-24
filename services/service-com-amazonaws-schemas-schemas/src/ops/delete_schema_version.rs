@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteSchemaVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteSchemaVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteSchemaVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes ONE stored version of a schema, leaving the schema itself and every other
+//! version of it in place.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +160,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteSchemaVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteSchemaVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries request metadata only; this delete reports nothing, so it
+        // needs neither the request's region nor any header.
+        let _ = ctx;
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteSchemaVersionError::from(
+                DeleteSchemaVersionErrorModeled::InternalServerErrorException(
+                    crate::state::internal_error(),
+                ),
+            )
+        })?;
+        let mut state = store.lock();
+
+        let registry = state
+            .registries
+            .get_mut(&input.registry_name)
+            .ok_or_else(|| {
+                DeleteSchemaVersionError::from(DeleteSchemaVersionErrorModeled::NotFoundException(
+                    crate::state::registry_not_found(&input.registry_name),
+                ))
+            })?;
+        // AWS owns what is in a service-owned registry, so a caller can no more delete
+        // a version of one of its schemas than the schema itself.
+        if registry.scope.is_managed() {
+            return Err(DeleteSchemaVersionErrorModeled::ForbiddenException(
+                crate::state::managed_registry_is_read_only(&input.registry_name),
+            )
+            .into());
+        }
+        let schema = registry
+            .schemas
+            .get_mut(&input.schema_name)
+            .ok_or_else(|| {
+                DeleteSchemaVersionError::from(DeleteSchemaVersionErrorModeled::NotFoundException(
+                    crate::state::schema_not_found(&input.schema_name),
+                ))
+            })?;
+
+        // `SchemaVersion` names ONE stored version, resolved by the same state helper
+        // every read of a version resolves it through, so a value that is not a
+        // decimal version number matches no stored version and is as absent as a
+        // version already deleted. Only that version goes — the schema, its metadata
+        // and its other versions survive, and the freed number is never minted again.
+        // `DeleteSchema` is what removes a schema with all of its versions.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteSchemaVersion"))
+        // The schema's `LastModified` is deliberately NOT advanced: it reports when a
+        // definition of the schema was last WRITTEN, which taking one away does not
+        // change, and what a caller reads to see which versions a schema holds is the
+        // version set itself (`ListSchemaVersions`, and `ListSchemas`' `VersionCount`),
+        // both read from the stored versions rather than from a timestamp.
+        if !schema.remove_version_named(&input.schema_version) {
+            return Err(DeleteSchemaVersionErrorModeled::NotFoundException(
+                crate::state::schema_version_not_found(
+                    &input.registry_name,
+                    &input.schema_name,
+                    Some(&input.schema_version),
+                ),
+            )
+            .into());
+        }
+        Ok(DeleteSchemaVersionOutput)
     }
 }
