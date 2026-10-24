@@ -49,6 +49,8 @@ mod notification_channel_deletion;
 mod policy_administrator_gate;
 #[path = "all/policy_document_validation.rs"]
 mod policy_document_validation;
+#[path = "all/policy_identifier_lookup.rs"]
+mod policy_identifier_lookup;
 #[path = "all/policy_lifecycle.rs"]
 mod policy_lifecycle;
 #[path = "all/protection_status.rs"]
