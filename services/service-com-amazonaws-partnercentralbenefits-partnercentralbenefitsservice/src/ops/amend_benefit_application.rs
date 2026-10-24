@@ -487,7 +487,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // It is checked BEFORE the revision, because the first call moved the revision
         // the retry still carries.
         if application
-            .applied_amendment(&input.client_token)
+            .applied_write(Self::NAME, &input.client_token)
             .is_some()
         {
             return Ok(AmendBenefitApplicationOutput {});
@@ -558,10 +558,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         amended.revise(now);
-        amended.record_amendment(crate::state::AppliedAmendment {
+        amended.record_write(crate::state::AppliedWrite {
+            operation: Self::NAME,
             client_token: input.client_token.clone(),
-            reason: input.amendment_reason.clone(),
-            field_paths: input
+            reason: Some(input.amendment_reason.clone()),
+            fields: input
                 .amendments
                 .iter()
                 .map(|amendment| amendment.field_path.clone())
