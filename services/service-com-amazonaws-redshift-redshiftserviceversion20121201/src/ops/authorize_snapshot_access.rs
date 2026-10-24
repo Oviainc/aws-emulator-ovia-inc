@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AuthorizeSnapshotAccess
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AuthorizeSnapshotAccess`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AuthorizeSnapshotAccess::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records the account the request names on the stored snapshot's
+//! `AccountsWithRestoreAccess` list and reports the snapshot back, so a later
+//! read of that snapshot reports the share.
 //!
 //! ## Shape of an operation
 //!
@@ -104,7 +99,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `AuthorizeSnapshotAccessError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#AuthorizeSnapshotAccess")]
+// `DependentServiceUnavailableFault` is widened in: the model does not list it for
+// this operation, but the service declares the shape, and it is the only modelled
+// way to say "the control-plane store could not be reached".
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#AuthorizeSnapshotAccess",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum AuthorizeSnapshotAccessErrorModeled {
     AuthorizationAlreadyExistsFault(AuthorizationAlreadyExistsFault),
@@ -114,6 +115,7 @@ pub enum AuthorizeSnapshotAccessErrorModeled {
     InvalidClusterSnapshotStateFault(InvalidClusterSnapshotStateFault),
     LimitExceededFault(LimitExceededFault),
     UnsupportedOperationFault(UnsupportedOperationFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -167,18 +169,156 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AuthorizeSnapshotAccess` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AuthorizeSnapshotAccessErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AuthorizeSnapshotAccess"))
+        use crate::state as st;
+
+        // This operation reads and writes the store alone; nothing it reports is
+        // Region-derived, so `ctx` carries nothing it needs.
+        let _ = ctx;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                AuthorizeSnapshotAccessErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let started = ::std::time::Instant::now();
+
+        // The grantee, in the shape the snapshot stores it in: an account
+        // identifier under `AccountId`, the documented Amazon Web Services
+        // Support alias under `AccountAlias`.
+        let authorized = match st::account_with_restore_access(&input.account_with_restore_access) {
+            Ok(account) => account,
+            Err(message) => return Err(crate::scaffolded::Scaffolded::validation(message)),
+        };
+
+        // The snapshot is named by identifier or by ARN, exactly as
+        // `RestoreFromClusterSnapshot` names one; a request carrying neither
+        // names nothing to authorize access to.
+        let snapshot_identifier = input
+            .snapshot_identifier
+            .as_deref()
+            .filter(|value| !value.is_empty());
+        let snapshot_arn = input
+            .snapshot_arn
+            .as_deref()
+            .filter(|value| !value.is_empty());
+        if snapshot_identifier.is_none() && snapshot_arn.is_none() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "Either SnapshotIdentifier or SnapshotArn must be supplied.",
+            ));
+        }
+
+        let mut store = state.lock();
+        store.settle(started);
+
+        let Some(index) = store.snapshot_located_position(snapshot_identifier, snapshot_arn) else {
+            return Err(
+                AuthorizeSnapshotAccessErrorModeled::ClusterSnapshotNotFoundFault(
+                    ClusterSnapshotNotFoundFault {
+                        message: Some(format!(
+                            "Cluster snapshot {} not found.",
+                            snapshot_identifier.or(snapshot_arn).unwrap_or_default()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let snapshot = &store.snapshots[index].snapshot;
+        // `SnapshotClusterIdentifier` is "the identifier of the cluster the
+        // snapshot was created from", so a request naming a different cluster
+        // names no snapshot.
+        if let Some(wanted) = input
+            .snapshot_cluster_identifier
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        {
+            if snapshot.cluster_identifier.as_deref() != Some(wanted) {
+                return Err(
+                    AuthorizeSnapshotAccessErrorModeled::ClusterSnapshotNotFoundFault(
+                        ClusterSnapshotNotFoundFault {
+                            message: Some(format!(
+                                "Cluster snapshot {} of cluster {wanted} not found.",
+                                snapshot.snapshot_identifier.as_deref().unwrap_or_default()
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+        // `InvalidClusterSnapshotStateFault` is "the specified cluster snapshot
+        // is not in the available state": only a finished snapshot holds the
+        // data another account would restore.
+        if snapshot.status.as_deref() != Some(st::STATUS_AVAILABLE) {
+            return Err(
+                AuthorizeSnapshotAccessErrorModeled::InvalidClusterSnapshotStateFault(
+                    InvalidClusterSnapshotStateFault {
+                        message: Some(format!(
+                            "Cluster snapshot {} is in the {} state, not {}.",
+                            snapshot.snapshot_identifier.as_deref().unwrap_or_default(),
+                            snapshot.status.as_deref().unwrap_or_default(),
+                            st::STATUS_AVAILABLE
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // An account that already holds restore access on this snapshot is
+        // authorized already: the grant is a SET, so a repeat would add nothing.
+        if snapshot
+            .accounts_with_restore_access
+            .iter()
+            .flatten()
+            .any(|held| st::same_restore_account(held, &authorized))
+        {
+            return Err(
+                AuthorizeSnapshotAccessErrorModeled::AuthorizationAlreadyExistsFault(
+                    AuthorizationAlreadyExistsFault {
+                        message: Some(format!(
+                            "Account {} already has restore access to cluster snapshot {}.",
+                            input.account_with_restore_access,
+                            snapshot.snapshot_identifier.as_deref().unwrap_or_default()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // Identity before capacity, as everywhere else in this service: a
+        // request that would add nothing keeps the more specific fault even when
+        // the list is full.
+        if snapshot.accounts_with_restore_access.iter().flatten().count()
+            >= st::RESTORE_ACCOUNTS_PER_SNAPSHOT_QUOTA
+        {
+            return Err(
+                AuthorizeSnapshotAccessErrorModeled::AuthorizationQuotaExceededFault(
+                    AuthorizationQuotaExceededFault {
+                        message: Some(format!(
+                            "The request would exceed the allowed number of accounts authorized to restore one cluster snapshot ({}).",
+                            st::RESTORE_ACCOUNTS_PER_SNAPSHOT_QUOTA
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let stored = &mut store.snapshots[index];
+        stored
+            .snapshot
+            .accounts_with_restore_access
+            .get_or_insert_with(Vec::new)
+            .push(authorized);
+
+        Ok(AuthorizeSnapshotAccessOutput {
+            snapshot: Some(stored.snapshot.clone()),
+        })
     }
 }

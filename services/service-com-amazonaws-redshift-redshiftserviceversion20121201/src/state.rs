@@ -22,10 +22,10 @@
 //! [`PROVISIONING_SPAN`]).
 
 use crate::ops::types::{
-    AquaConfiguration, AvailabilityZone, Cluster, ClusterNode, ClusterParameterGroup,
-    ClusterParameterGroupStatus, ClusterParameterStatus, ClusterSubnetGroup, ClusterVersion,
-    NetworkInterface, Parameter, PendingModifiedValues, Snapshot, Subnet, SupportedPlatform,
-    VpcEndpoint, VpcSecurityGroupMembership,
+    AccountWithRestoreAccess, AquaConfiguration, AvailabilityZone, Cluster, ClusterNode,
+    ClusterParameterGroup, ClusterParameterGroupStatus, ClusterParameterStatus, ClusterSubnetGroup,
+    ClusterVersion, NetworkInterface, Parameter, PendingModifiedValues, Snapshot, Subnet,
+    SupportedPlatform, VpcEndpoint, VpcSecurityGroupMembership,
 };
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -742,6 +742,79 @@ pub const CLUSTER_QUOTA: usize = 1_000;
 /// because a cluster accumulates snapshots over its life.
 pub const SNAPSHOT_QUOTA: usize = 10_000;
 
+/// How many accounts one snapshot may be shared with before
+/// `AuthorizeSnapshotAccess` refuses with the modelled
+/// `AuthorizationQuotaExceededFault`.
+///
+/// The same reasoning as [`CLUSTER_QUOTA`]: neither the model nor the shape docs
+/// state a number, so this is the emulator's OWN bound on one snapshot's
+/// `Snapshot$AccountsWithRestoreAccess` list rather than a claim about any
+/// account's published limit. It is what stops that list growing without end:
+/// `RevokeSnapshotAccess` releases an entry.
+pub const RESTORE_ACCOUNTS_PER_SNAPSHOT_QUOTA: usize = 20;
+
+/// The identifier a request names to share a snapshot with Amazon Web Services
+/// Support, rather than with an account of its own.
+///
+/// Source: `smithy_query(query="doc", shape="AuthorizeSnapshotAccessMessage",
+/// member="AccountWithRestoreAccess")` — "To share a snapshot with Amazon Web
+/// Services Support, specify amazon-redshift-support" — and
+/// `smithy_query(query="doc", shape="AccountWithRestoreAccess",
+/// member="AccountAlias")` — "For Amazon Web Services Support, the identifier is
+/// amazon-redshift-support".
+pub const SUPPORT_ACCOUNT_ALIAS: &str = "amazon-redshift-support";
+
+/// How many digits an Amazon Web Services account identifier has, which is what
+/// [`account_with_restore_access`] admits beside [`SUPPORT_ACCOUNT_ALIAS`].
+///
+/// Source: `engine::emulator_account_id()`, the account every ARN this service
+/// mints is scoped to, is a 12-digit identifier — the one form an Amazon Web
+/// Services account id takes.
+pub const ACCOUNT_ID_DIGITS: usize = 12;
+
+/// The `AccountWithRestoreAccess` record the account an
+/// `AuthorizeSnapshotAccess` / `RevokeSnapshotAccess` request names authorizes,
+/// or why the value names no account.
+///
+/// One rule for both operations, so an authorization cannot be stored under a
+/// shape a revoke then fails to recognise: an account IDENTIFIER is reported as
+/// `AccountId` ("The identifier of an Amazon Web Services account authorized to
+/// restore a snapshot") and the documented support alias as `AccountAlias`
+/// ("For Amazon Web Services Support, the identifier is
+/// `amazon-redshift-support`") — this emulator knows no account number for
+/// Amazon Web Services Support, so it invents none.
+pub fn account_with_restore_access(value: &str) -> Result<AccountWithRestoreAccess, String> {
+    if value == SUPPORT_ACCOUNT_ALIAS {
+        return Ok(AccountWithRestoreAccess {
+            account_id: None,
+            account_alias: Some(value.to_string()),
+        });
+    }
+    if value.len() == ACCOUNT_ID_DIGITS && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Ok(AccountWithRestoreAccess {
+            account_id: Some(value.to_string()),
+            account_alias: None,
+        });
+    }
+    Err(format!(
+        "Invalid value for AccountWithRestoreAccess: '{value}'. It must be a {ACCOUNT_ID_DIGITS}-digit Amazon Web Services account identifier or '{SUPPORT_ACCOUNT_ALIAS}'."
+    ))
+}
+
+/// Whether two authorization records name the SAME grantee — the account id
+/// where one is held, the alias otherwise.
+///
+/// This is what makes authorizing an account twice an
+/// `AuthorizationAlreadyExistsFault` and what a revoke matches the entry to
+/// release by.
+pub fn same_restore_account(
+    left: &AccountWithRestoreAccess,
+    right: &AccountWithRestoreAccess,
+) -> bool {
+    (left.account_id.is_some() && left.account_id == right.account_id)
+        || (left.account_alias.is_some() && left.account_alias == right.account_alias)
+}
+
 /// How many cluster subnet groups the account's own groups may number before
 /// `CreateClusterSubnetGroup` refuses with the modelled
 /// `ClusterSubnetGroupQuotaExceededFault`.
@@ -1030,14 +1103,35 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
         identifier: Option<&str>,
         snapshot_arn: Option<&str>,
     ) -> Option<&StoredSnapshot> {
-        self.snapshots.iter().find(|s| {
-            identifier.is_some_and(|wanted| {
+        self.snapshot_located_position(identifier, snapshot_arn)
+            .map(|index| &self.snapshots[index])
+    }
+
+    /// The POSITION of the snapshot an `Identifier`-or-`Arn` pair names — the
+    /// same match [`Self::snapshot_located`] makes, for an operation that has to
+    /// WRITE the record it found.
+    ///
+    /// EVERY locator the request carries must match the one record: a request
+    /// naming an identifier and an ARN that belong to different snapshots names
+    /// neither.
+    pub fn snapshot_located_position(
+        &self,
+        identifier: Option<&str>,
+        snapshot_arn: Option<&str>,
+    ) -> Option<usize> {
+        // Naming neither names no snapshot — without this guard every locator
+        // would match vacuously and the first stored record would answer.
+        if identifier.is_none() && snapshot_arn.is_none() {
+            return None;
+        }
+        self.snapshots.iter().position(|s| {
+            identifier.is_none_or(|wanted| {
                 s.snapshot
                     .snapshot_identifier
                     .as_deref()
                     .is_some_and(|stored| stored.eq_ignore_ascii_case(wanted))
-            }) || snapshot_arn
-                .is_some_and(|wanted| s.snapshot.snapshot_arn.as_deref() == Some(wanted))
+            }) && snapshot_arn
+                .is_none_or(|wanted| s.snapshot.snapshot_arn.as_deref() == Some(wanted))
         })
     }
 
