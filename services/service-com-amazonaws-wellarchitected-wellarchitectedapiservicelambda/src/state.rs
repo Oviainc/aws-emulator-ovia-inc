@@ -14,8 +14,11 @@
 //! lenses beside the AWS-official lens this emulator ships. The agent profiles
 //! (`CreateAgentProfile`, `GetAgentProfile`) and the optimization goals recorded against
 //! one (`CreateAgentGoal`, `GetAgentGoal`, `DeleteAgentGoal`) are backed the same way,
-//! each goal keyed under the profile it belongs to. The record types and their
-//! projections live here rather than in a handler because several operations reach them.
+//! each goal keyed under the profile it belongs to. The contexts recorded against a
+//! profile (`CreateAgentContext`, `GetAgentContext`, `ListAgentContexts`) are held
+//! exactly like the goals, keyed under the profile they belong to. The record types and
+//! their projections live here rather than in a handler because several operations reach
+//! them.
 //!
 //! The one lens definition this emulator ships itself — the AWS-official Well-Architected
 //! Framework lens's question set — lives here too, for the same reason: the risk roll-up
@@ -33,13 +36,15 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    AggregationConfiguration, Choice, ConflictException, GoalSummary, LensSummary, Milestone,
+    AggregationConfiguration, Choice, ConflictException, ContextContent, ContextSummary,
+    GoalSummary, LensSummary, Milestone,
     MilestoneSummary,
     ResourceNotFoundException,
     ReviewTemplate, ReviewTemplateLensReview, ReviewTemplatePillarReviewSummary,
     ShareInvitation, ShareInvitationSummary, Tag, Workload, WorkloadDiscoveryConfig,
     WorkloadJiraConfigurationInput, WorkloadJiraConfigurationOutput, WorkloadShare,
-    WorkloadShareSummary, WorkloadSummary, QUESTION_VALUES, RISK_VALUES,
+    WorkloadShareSummary, WorkloadSummary, APPLICATION_TYPE_VALUES, CONTEXT_TYPE_VALUES,
+    CRITICALITY_VALUES, QUESTION_VALUES, RISK_VALUES,
 };
 
 /// `Workload$ImprovementStatus` before any lens review has been answered. The
@@ -2645,6 +2650,12 @@ pub const AGENT_PROFILE_RESOURCE_TYPE: &str = "AGENT_PROFILE";
 /// of resource that was missing: a goal.
 pub const AGENT_GOAL_RESOURCE_TYPE: &str = "GOAL";
 
+/// `ResourceNotFoundException$ResourceType` / `ConflictException$ResourceType` for a
+/// context of an agent profile — "application and environment information used during
+/// recommendation generation" (`CreateAgentContext` doc). `ExceptionResourceType` is a
+/// free-form string, so it names the kind of resource the failure is about: a context.
+pub const AGENT_CONTEXT_RESOURCE_TYPE: &str = "CONTEXT";
+
 /// The most agent profiles this emulator holds.
 ///
 /// `CreateAgentProfile` models `ServiceQuotaExceededException` (HTTP 402, "The user has
@@ -2660,10 +2671,97 @@ pub const MAX_AGENT_PROFILES: usize = 1_000;
 /// the reasons [`MAX_AGENT_PROFILES`] gives, and it bounds the goal map per profile.
 pub const MAX_GOALS_PER_AGENT_PROFILE: usize = 100;
 
+/// The most contexts one agent profile holds here. `CreateAgentContext` models
+/// `ServiceQuotaExceededException` for the case; the ceiling is this emulator's own, for
+/// the reasons [`MAX_AGENT_PROFILES`] gives, and it bounds the context map per profile.
+pub const MAX_CONTEXTS_PER_AGENT_PROFILE: usize = 100;
+
+/// The largest page the agent-profile list operations serve, and the ceiling their
+/// `maxResults` is held to.
+///
+/// Unlike the workload-era lists ([`MAX_RESULTS_CEILING`]), every agent list member is
+/// modelled `@range(min: 1, max: 1000)` with `@default(100)` —
+/// `smithy_query(query="operation", operation="ListAgentContexts")` shows
+/// `maxResults` that way — so the agent lists get their own ceiling rather than the
+/// workload one.
+pub const MAX_AGENT_LIST_RESULTS: i32 = 1_000;
+
+/// The page size an agent list request asks for: the modelled
+/// `@range(min: 1, max: 1000)` restated in the handler, so the page size is in
+/// `1..=MAX_AGENT_LIST_RESULTS` whatever reaches it. The member carries
+/// `@default(100)`, so a request that omits it arrives here already carrying 100.
+pub fn agent_list_page_size(max_results: i32) -> usize {
+    let clamped = max_results.clamp(1, MAX_AGENT_LIST_RESULTS);
+    usize::try_from(clamped).expect(
+        "maxResults is clamped into 1..=MAX_AGENT_LIST_RESULTS, which always fits in a usize",
+    )
+}
+
 /// The modelled input member a pillar-set finding names
 /// (`CreateAgentProfileRequest$pillars`, `CreateAgentGoalRequest$pillars`), as
 /// `ValidationExceptionField$Name` reports it.
 pub const PILLARS_MEMBER: &str = "pillars";
+
+/// The modelled input member a context-type finding names
+/// (`CreateAgentContextRequest$contextType`), as `ValidationExceptionField$Name` reports
+/// it.
+pub const CONTEXT_TYPE_MEMBER: &str = "contextType";
+
+/// The member an application-type finding of a context's content names
+/// (`ContextContent$applicationType`, reached through `…Request$content`), as the path
+/// `ValidationExceptionField$Name` reports for a member inside a structure.
+pub const CONTENT_APPLICATION_TYPE_MEMBER: &str = "content.applicationType";
+
+/// The member a criticality finding of a context's content names
+/// (`ContextContent$criticality`). See [`CONTENT_APPLICATION_TYPE_MEMBER`].
+pub const CONTENT_CRITICALITY_MEMBER: &str = "content.criticality";
+
+/// The refusal for a context whose enum-typed members carry a value their enum does not
+/// publish, or `None` when every one of them does.
+///
+/// Defence in depth for a caller that builds the input directly: `ContextType`,
+/// `ApplicationType` and `Criticality` are enums, so the boundary walk in
+/// `crate::service` already refuses a value outside their published sets with this same
+/// 400 before a handler runs. It is kept so a context is never STORED naming a value the
+/// enums do not publish, and shared by every operation that writes one so they cannot
+/// word the refusal differently.
+pub fn unknown_context_enum_exception(
+    context_type: Option<&str>,
+    content: &ContextContent,
+) -> Option<crate::ops::types::ValidationException> {
+    let candidates: [(&str, Option<&str>, &[&str]); 3] = [
+        (CONTEXT_TYPE_MEMBER, context_type, CONTEXT_TYPE_VALUES),
+        (
+            CONTENT_APPLICATION_TYPE_MEMBER,
+            content.application_type.as_deref(),
+            APPLICATION_TYPE_VALUES,
+        ),
+        (
+            CONTENT_CRITICALITY_MEMBER,
+            content.criticality.as_deref(),
+            CRITICALITY_VALUES,
+        ),
+    ];
+    let findings: Vec<(String, String)> = candidates
+        .iter()
+        .filter_map(|(member, value, values)| {
+            let value = (*value)?;
+            (!values.contains(&value)).then(|| {
+                (
+                    (*member).to_string(),
+                    constraint_sentence(
+                        member,
+                        &format!(
+                            "Member must satisfy enum value set: [{}], got {value}",
+                            values.join(", ")
+                        ),
+                    ),
+                )
+            })
+        })
+        .collect();
+    (!findings.is_empty()).then(|| field_validation_exception(&findings))
+}
 
 /// The modelled input member an agent profile's generation-eligibility finding names
 /// (`CreateAgentProfileRequest$aggregationConfiguration`), as
@@ -2792,6 +2890,57 @@ impl AgentGoalRecord {
     }
 }
 
+/// One stored context of an agent profile: "application and environment information used
+/// during recommendation generation" (`CreateAgentContext` doc).
+///
+/// A context belongs to the profile its `profileArn` names — it is reached only through
+/// that profile's `/contexts` routes — and carries, beside what the request sent, the id
+/// the service minted for it and the identity and instant the create is attributed to.
+/// Held exactly as a goal is, for the same reason: several operations reach it.
+#[derive(Debug, Clone)]
+pub struct AgentContextRecord {
+    pub id: String,
+    pub profile_arn: String,
+    pub title: String,
+    pub context_type: String,
+    pub content: ContextContent,
+    pub created_by: String,
+    pub created_at: SystemTime,
+    pub last_modified_by: Option<String>,
+    pub last_modified_at: Option<SystemTime>,
+}
+
+impl AgentContextRecord {
+    /// The `ContextSummary` projection every context operation answers with
+    /// (`CreateAgentContext`, `ListAgentContexts`, and — once they are implemented —
+    /// `GetAgentContext` and `UpdateAgentContext`), so one place decides how a stored
+    /// context is reported.
+    ///
+    /// `applicationType` and `criticality` are DERIVED from the stored content rather
+    /// than held twice: the summary's members describe "the application described by
+    /// this context" and `ContextContent` is where that application's type and
+    /// criticality are recorded (`smithy_query(query="shape",
+    /// shape="ContextSummary")` / `shape="ContextContent"`), so they cannot drift from
+    /// the content they summarise.
+    pub fn to_summary(&self) -> ContextSummary {
+        ContextSummary {
+            id: self.id.clone(),
+            profile_arn: self.profile_arn.clone(),
+            title: self.title.clone(),
+            context_type: self.context_type.clone(),
+            application_type: self.content.application_type.clone(),
+            criticality: self.content.criticality.clone(),
+            content: self.content.clone(),
+            created_by: self.created_by.clone(),
+            created_at: ::aws_smithy_types::DateTime::from(self.created_at),
+            last_modified_by: self.last_modified_by.clone(),
+            last_modified_at: self
+                .last_modified_at
+                .map(::aws_smithy_types::DateTime::from),
+        }
+    }
+}
+
 /// What a `CreateAgentProfile` idempotency token resolves to: the profile the original
 /// request created, plus that request's parameter fingerprint.
 #[derive(Debug, Clone)]
@@ -2806,6 +2955,15 @@ pub struct CreateAgentProfileToken {
 pub struct CreateAgentGoalToken {
     pub profile_arn: String,
     pub goal_id: String,
+    pub fingerprint: String,
+}
+
+/// What a `CreateAgentContext` idempotency token resolves to: the context the original
+/// request created, the profile it belongs to, and that request's parameter fingerprint.
+#[derive(Debug, Clone)]
+pub struct CreateAgentContextToken {
+    pub profile_arn: String,
+    pub context_id: String,
     pub fingerprint: String,
 }
 
@@ -2872,6 +3030,13 @@ pub struct ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// `CreateAgentGoal`'s `clientToken` -> what the original request created. Caller
     /// input keys it, so it is a BOUNDED [`TokenLedger`].
     pub create_agent_goal_tokens: TokenLedger<CreateAgentGoalToken>,
+    /// Every context recorded against an agent profile, keyed by that profile's ARN then
+    /// by the context's `UUID`. A `BTreeMap` because context-id order is the stable order
+    /// `ListAgentContexts` pages over.
+    pub agent_contexts: HashMap<String, BTreeMap<String, AgentContextRecord>>,
+    /// `CreateAgentContext`'s `clientToken` -> what the original request created. Caller
+    /// input keys it, so it is a BOUNDED [`TokenLedger`].
+    pub create_agent_context_tokens: TokenLedger<CreateAgentContextToken>,
     /// Monotonic input to [`Self::next_hex_id`]; never returned to a caller.
     id_counter: u64,
 }
@@ -2983,15 +3148,7 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
     /// ambiguous in anything that reports goals side by side.
     pub fn mint_agent_goal_id(&mut self) -> String {
         loop {
-            let hex = self.next_hex_id();
-            let id = format!(
-                "{}-{}-{}-{}-{}",
-                &hex[0..8],
-                &hex[8..12],
-                &hex[12..16],
-                &hex[16..20],
-                &hex[20..32]
-            );
+            let id = self.next_uuid();
             if !self
                 .agent_goals
                 .values()
@@ -3000,6 +3157,21 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
                 return id;
             }
         }
+    }
+
+    /// The next candidate id in the dashed form the modelled `UUID` pattern requires,
+    /// from [`Self::next_hex_id`]'s 32 hex characters. The callers above are what check a
+    /// candidate against the resources they mint for.
+    fn next_uuid(&mut self) -> String {
+        let hex = self.next_hex_id();
+        format!(
+            "{}-{}-{}-{}-{}",
+            &hex[0..8],
+            &hex[8..12],
+            &hex[12..16],
+            &hex[16..20],
+            &hex[20..32]
+        )
     }
 
     /// The goal `id` of the agent profile `profile_arn` names, if that profile holds one.
@@ -3028,6 +3200,41 @@ impl ComAmazonawsWellarchitectedWellarchitectedapiservicelambdaState {
             .get(profile_arn)
             .map_or(0, BTreeMap::len)
     }
+
+    /// A fresh context id, in the five dashed groups the modelled `UUID` pattern requires
+    /// (`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`), and unused by
+    /// any context this store holds.
+    ///
+    /// Uniqueness is checked across EVERY profile's contexts, for the reason
+    /// [`Self::mint_agent_goal_id`] gives: a context id identifies a context, so two
+    /// profiles handing out the same one would make the id ambiguous.
+    pub fn mint_agent_context_id(&mut self) -> String {
+        loop {
+            let id = self.next_uuid();
+            if !self
+                .agent_contexts
+                .values()
+                .any(|contexts| contexts.contains_key(&id))
+            {
+                return id;
+            }
+        }
+    }
+
+    /// The context `id` of the agent profile `profile_arn` names, if that profile holds
+    /// one.
+    pub fn agent_context(&self, profile_arn: &str, id: &str) -> Option<&AgentContextRecord> {
+        self.agent_contexts.get(profile_arn)?.get(id)
+    }
+
+    /// How many contexts the agent profile `profile_arn` names currently holds — what
+    /// [`MAX_CONTEXTS_PER_AGENT_PROFILE`] bounds.
+    pub fn agent_context_count(&self, profile_arn: &str) -> usize {
+        self.agent_contexts
+            .get(profile_arn)
+            .map_or(0, BTreeMap::len)
+    }
+
 
     /// The next 32-lowercase-hex candidate id: a per-store counter and the wall clock,
     /// hashed, so it is never derived from the request. The callers above are what check
@@ -3290,6 +3497,31 @@ pub fn parameter_fingerprint(parameters: &::serde_json::Value) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// A context's typed content as a JSON value, for [`parameter_fingerprint`]: every
+/// member of `ContextContent` in one fixed order, so two requests fingerprint alike
+/// exactly when they carry the same content. Lives here because every operation that
+/// takes a `ContextContent` under an `@idempotencyToken` has to fingerprint it the same
+/// way.
+pub fn context_content_fingerprint(content: &ContextContent) -> ::serde_json::Value {
+    ::serde_json::json!({
+        "accountIds": &content.account_ids,
+        "additionalContext": &content.additional_context,
+        "applicationOverview": &content.application_overview,
+        "applicationType": &content.application_type,
+        "architectureOverview": &content.architecture_overview,
+        "awsServices": &content.aws_services,
+        "criticality": &content.criticality,
+        "industry": &content.industry,
+        "regions": &content.regions,
+        "resourceTags": content.resource_tags.as_ref().map(|tags| {
+            tags.iter()
+                .map(|tag| ::serde_json::json!({ "key": &tag.key, "value": &tag.value }))
+                .collect::<Vec<::serde_json::Value>>()
+        }),
+        "resourceTypes": &content.resource_types,
+    })
+}
+
 /// Encode a paging cursor as an opaque, self-describing `NextToken`.
 ///
 /// Hex of the JSON cursor: it satisfies the modelled `NextToken` pattern
@@ -3359,6 +3591,20 @@ pub fn encode_milestone_next_token(milestone_number: i32) -> String {
 pub fn decode_milestone_next_token(token: &str) -> Option<i32> {
     let cursor = decode_cursor(token)?;
     i32::try_from(cursor.get("m")?.as_i64()?).ok()
+}
+
+/// Encode a `ListAgentContexts` cursor: the context `UUID` last served, in the same
+/// opaque scheme as [`encode_next_token`]. Contexts are enumerated in id order, so that
+/// id is the whole cursor. Its own key, so a cursor issued by another paginated
+/// operation is not a cursor here.
+pub fn encode_agent_context_next_token(context_id: &str) -> String {
+    encode_cursor(&::serde_json::json!({ "x": context_id }))
+}
+
+/// The context `UUID` a `ListAgentContexts` `NextToken` points just past, or `None` when
+/// the token is not one this service issued.
+pub fn decode_agent_context_next_token(token: &str) -> Option<String> {
+    Some(decode_cursor(token)?.get("x")?.as_str()?.to_string())
 }
 
 /// What a `NextToken` this service did not issue is answered with. The token is this
@@ -3677,6 +3923,24 @@ pub fn agent_goal_not_found(profile_arn: &str, id: &str) -> ResourceNotFoundExce
 /// How a goal of an agent profile is named in an exception's `ResourceId`: the profile
 /// it belongs to and its own id, which together identify it.
 pub fn agent_goal_resource_id(profile_arn: &str, id: &str) -> String {
+    format!("{profile_arn}.{id}")
+}
+
+/// [`resource_not_found`] for a context id that names no context of the agent profile
+/// `profile_arn`. Worded exactly as [`agent_goal_not_found`], because a context is
+/// reached through its profile the same way: a context id that belongs to ANOTHER
+/// profile is as absent here as one that belongs to none.
+pub fn agent_context_not_found(profile_arn: &str, id: &str) -> ResourceNotFoundException {
+    resource_not_found(
+        AGENT_CONTEXT_RESOURCE_TYPE,
+        agent_context_resource_id(profile_arn, id),
+        &format!("context with ID {id} in an agent profile with ARN {profile_arn}"),
+    )
+}
+
+/// How a context of an agent profile is named in an exception's `ResourceId`: the profile
+/// it belongs to and its own id, which together identify it.
+pub fn agent_context_resource_id(profile_arn: &str, id: &str) -> String {
     format!("{profile_arn}.{id}")
 }
 

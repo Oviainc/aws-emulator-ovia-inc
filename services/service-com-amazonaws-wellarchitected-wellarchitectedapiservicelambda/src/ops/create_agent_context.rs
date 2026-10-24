@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateAgentContext
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateAgentContext`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateAgentContext::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records one context of an agent profile: the request's `title`, `contextType` and
+//! typed `content`, under a freshly minted `UUID`, in this service's state keyed by the
+//! profile's ARN — so `ListAgentContexts` and `GetAgentContext` report what this call
+//! stored. A `clientToken` makes the create idempotent the same way
+//! `CreateAgentGoal`'s does.
 //!
 //! ## Shape of an operation
 //!
@@ -158,20 +155,140 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateAgentContext` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateAgentContextErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateAgentContext"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateAgentContextErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool agent profile store is unavailable".to_string(),
+            })
+        })?;
+
+        // Defence in depth for a caller that builds the input directly: the boundary walk
+        // in `crate::service` already refuses a value outside an enum's published set
+        // with this same 400 before the handler runs. It is kept so a context is never
+        // STORED naming a value `ContextType`, `ApplicationType` or `Criticality` does
+        // not publish.
+        if let Some(exception) =
+            crate::state::unknown_context_enum_exception(Some(&input.context_type), &input.content)
+        {
+            return Err(CreateAgentContextErrorModeled::ValidationException(exception).into());
+        }
+
+        let fingerprint = crate::state::parameter_fingerprint(&serde_json::json!({
+            "content": crate::state::context_content_fingerprint(&input.content),
+            "contextType": &input.context_type,
+            "profileArn": &input.profile_arn,
+            "title": &input.title,
+        }));
+
+        let mut store = state.lock();
+
+        // `@idempotencyToken` replay: the same token with the same parameters answers the
+        // context the original request created instead of recording a second one. The
+        // token is OPTIONAL on this operation, so a request that carries none is never a
+        // replay.
+        if let Some(client_token) = input.client_token.clone() {
+            if let Some(token) = store.create_agent_context_tokens.get(&client_token) {
+                let (profile_arn, context_id) =
+                    (token.profile_arn.clone(), token.context_id.clone());
+                if token.fingerprint != fingerprint {
+                    return Err(CreateAgentContextErrorModeled::ConflictException(
+                        crate::state::idempotency_token_conflict(
+                            crate::state::AGENT_CONTEXT_RESOURCE_TYPE,
+                            crate::state::agent_context_resource_id(&profile_arn, &context_id),
+                            &client_token,
+                        ),
+                    )
+                    .into());
+                }
+                if let Some(existing) = store.agent_context(&profile_arn, &context_id) {
+                    return Ok(CreateAgentContextOutput {
+                        context: existing.to_summary(),
+                    });
+                }
+                // The token names a context that is no longer stored (a context whose
+                // PROFILE is gone), so there is no original result to answer with: forget
+                // the token and let this request be judged on its own.
+                store.create_agent_context_tokens.forget(&client_token);
+            }
+        }
+
+        // "Creates a context associated with an optimization profile": the profile the
+        // context is associated with is resolved by this lookup, so a well-formed ARN
+        // that names no stored profile is this operation's modelled 404 and nothing is
+        // recorded.
+        if !store.agent_profiles.contains_key(&input.profile_arn) {
+            return Err(CreateAgentContextErrorModeled::ResourceNotFoundException(
+                crate::state::agent_profile_not_found(&input.profile_arn),
+            )
+            .into());
+        }
+
+        // Contexts are metered per profile, and this operation models
+        // `ServiceQuotaExceededException` for the case. Refusing here is also what keeps
+        // the store bounded: a context and its create token are both 1:1 with a live
+        // context.
+        if store.agent_context_count(&input.profile_arn)
+            >= crate::state::MAX_CONTEXTS_PER_AGENT_PROFILE
+        {
+            return Err(CreateAgentContextErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The agent profile with ARN {} already holds the maximum of {} contexts",
+                        input.profile_arn,
+                        crate::state::MAX_CONTEXTS_PER_AGENT_PROFILE
+                    ),
+                    resource_id: Some(input.profile_arn.clone()),
+                    resource_type: Some(crate::state::AGENT_CONTEXT_RESOURCE_TYPE.to_string()),
+                    // `QuotaCode` and `ServiceCode` are modelled `@required`. The service
+                    // code is this service's own signing name; the model publishes no
+                    // numeric Service Quotas code for this quota, so the quota is named
+                    // by what it meters.
+                    quota_code: "ContextsPerAgentProfile".to_string(),
+                    service_code: crate::state::ARN_NAMESPACE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        let id = store.mint_agent_context_id();
+        let record = crate::state::AgentContextRecord {
+            id: id.clone(),
+            profile_arn: input.profile_arn.clone(),
+            title: input.title,
+            context_type: input.context_type,
+            content: input.content,
+            // "The identifier of the user or system that created this context": every
+            // request this emulator serves is attributed to its one account, so that is
+            // the identity the create is recorded under — never a value read off the
+            // request.
+            created_by: ::engine::emulator_account_id().to_string(),
+            created_at: std::time::SystemTime::now(),
+            // Nothing has modified a context that has just been created, so the
+            // `lastModified…` members are absent rather than echoing the create.
+            last_modified_by: None,
+            last_modified_at: None,
+        };
+        let context = record.to_summary();
+        store
+            .agent_contexts
+            .entry(input.profile_arn.clone())
+            .or_default()
+            .insert(id.clone(), record);
+        // Written through the ledger's bounded `remember`, which holds the remembered
+        // tokens at `MAX_REMEMBERED_REQUEST_TOKENS` by forgetting the oldest: the token is
+        // caller-chosen, so the ledger cannot be allowed to grow with the stream of them.
+        if let Some(client_token) = input.client_token {
+            store.create_agent_context_tokens.remember(
+                client_token,
+                crate::state::CreateAgentContextToken {
+                    profile_arn: input.profile_arn,
+                    context_id: id,
+                    fingerprint,
+                },
+            );
+        }
+
+        Ok(CreateAgentContextOutput { context })
     }
 }

@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAgentContexts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAgentContexts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAgentContexts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Lists contexts associated with a profile": one page of the `ContextSummary`
+//! projections of the contexts `CreateAgentContext` recorded against the profile the
+//! path names, in context-id order, resumed from the opaque `nextToken` a previous page
+//! issued. A reporting operation — modelled `@readonly` — so it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -149,20 +145,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAgentContexts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAgentContextsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListAgentContextsErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool agent profile store is unavailable".to_string(),
+            })
+        })?;
+
+        // `maxResults` is modelled `@default(100)`, so it arrives as a value rather than
+        // an option; the clamp restates the member's `@range(min: 1, max: 1000)`.
+        let page_size = crate::state::agent_list_page_size(input.max_results);
+
+        // An opaque token this service did not issue is a bad request, not an empty page.
+        // A token is this service's own cursor, not a value a caller composes: it cannot
+        // be corrected, only obtained again, so the refusal is classified `CANNOT_PARSE`
+        // ("restart the pagination") rather than as a field rule to fix — and it still
+        // names the member whose value could not be decoded.
+        let cursor = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_agent_context_next_token(token) {
+                Some(cursor) => Some(cursor),
+                None => {
+                    return Err(ListAgentContextsErrorModeled::ValidationException(
+                        crate::state::cannot_parse_exception(
+                            crate::state::NEXT_TOKEN_MEMBER,
+                            crate::state::INVALID_NEXT_TOKEN_MESSAGE,
+                        ),
+                    )
+                    .into());
+                }
+            },
+        };
+
+        let store = state.lock();
+        // The contexts of ONE profile: a context is reached only through the profile it
+        // was created against, so another profile's contexts are not reported here, and a
+        // `profileArn` no stored profile carries reports no contexts.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAgentContexts"))
+        // That empty page is what the model asks for: this operation declares
+        // `AccessDeniedException`, `InternalServerException`, `ThrottlingException` and
+        // `ValidationException` and NO `ResourceNotFoundException`
+        // (`smithy_query(query="operation", operation="ListAgentContexts")`), while every
+        // operation that resolves a SINGLE context — `CreateAgentContext`,
+        // `GetAgentContext`, `UpdateAgentContext`, `DeleteAgentContext` — does declare
+        // one. The list has no modelled way to report a missing profile, so it reports
+        // the contexts stored under the ARN, which for an unknown profile is none.
+        //
+        // Context ids are never reused, so the stored key order IS this service's list
+        // order and a cursor is a single id. It is start-EXCLUSIVE: the page resumes just
+        // past the last id already returned, so every context is enumerated exactly once
+        // across the pages.
+        let remaining: Vec<&crate::state::AgentContextRecord> = store
+            .agent_contexts
+            .get(&input.profile_arn)
+            .map(|contexts| {
+                contexts
+                    .range::<String, _>((
+                        cursor.as_ref().map_or(::std::ops::Bound::Unbounded, |last| {
+                            ::std::ops::Bound::Excluded(last)
+                        }),
+                        ::std::ops::Bound::Unbounded,
+                    ))
+                    .map(|(_, record)| record)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let page = &remaining[..remaining.len().min(page_size)];
+        let next_token = match page.last() {
+            Some(last) if remaining.len() > page.len() => {
+                Some(crate::state::encode_agent_context_next_token(&last.id))
+            }
+            _ => None,
+        };
+
+        Ok(ListAgentContextsOutput {
+            items: page.iter().map(|record| record.to_summary()).collect(),
+            next_token,
+        })
     }
 }

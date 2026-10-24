@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAgentContext
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAgentContext`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAgentContext::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the `ContextSummary` of the context the path's `(profileArn, id)` pair
+//! resolves to — what `CreateAgentContext` recorded — or this operation's modelled 404
+//! when it resolves nothing. A reporting operation, so it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -146,20 +141,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAgentContext` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAgentContextErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAgentContext"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetAgentContextErrorModeled::InternalServerException(InternalServerException {
+                message: "the Well-Architected Tool agent profile store is unavailable".to_string(),
+            })
+        })?;
+
+        let store = state.lock();
+        // A context is reached only THROUGH its profile, so the pair is resolved in one
+        // lookup: an id that belongs to another profile is as absent here as one that
+        // belongs to none, and a `profileArn` that names no stored profile resolves
+        // nothing either.
+        let record = store
+            .agent_context(&input.profile_arn, &input.id)
+            .ok_or_else(|| {
+                GetAgentContextErrorModeled::ResourceNotFoundException(
+                    crate::state::agent_context_not_found(&input.profile_arn, &input.id),
+                )
+            })?;
+
+        Ok(GetAgentContextOutput {
+            context: record.to_summary(),
+        })
     }
 }

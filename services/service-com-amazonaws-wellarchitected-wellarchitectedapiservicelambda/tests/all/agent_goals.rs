@@ -158,7 +158,10 @@ async fn delete_goal(client: &Client, profile_arn: &str, id: &str) -> Answer {
 }
 
 /// The ARN of a profile this suite creates, with the create itself asserted.
-async fn profile_arn_of(client: &Client, name: &str, aggregation: usize) -> String {
+///
+/// `pub(crate)` because the context suite beside this one hangs its contexts off a
+/// profile the same way, and a profile is minted by exactly one operation.
+pub(crate) async fn profile_arn_of(client: &Client, name: &str, aggregation: usize) -> String {
     let answer = create_profile(client, profile_body(name, &["SECURITY"], aggregation)).await;
     assert_eq!(
         answer.status, 200,
