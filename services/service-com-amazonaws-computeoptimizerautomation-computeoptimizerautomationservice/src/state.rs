@@ -131,6 +131,17 @@ pub const EVENT_STATUS_COMPLETE: &str = "Complete";
 /// currently reports.
 pub const EVENT_STATUS_FAILED: &str = "Failed";
 
+/// The `EventStatus` an automation event carries while the rollback of its
+/// automation is running (`smithy_query(query="shape",shape="EventStatus")`).
+/// `RollbackAutomationEvent` "Initiates a rollback", so the event the call
+/// answers with is not yet terminal.
+pub const EVENT_STATUS_ROLLBACK_IN_PROGRESS: &str = "RollbackInProgress";
+
+/// The terminal `EventStatus` of a rollback that was carried out: the modelled
+/// success status a rolled-back event reaches once its rollback run is over
+/// (`smithy_query(query="shape",shape="EventStatus")`).
+pub const EVENT_STATUS_ROLLBACK_COMPLETE: &str = "RollbackComplete";
+
 /// The `StepStatus` of a step that has not started: it is queued behind the
 /// steps ahead of it in its event's sequence
 /// (`smithy_query(query="shape",shape="StepStatus")`).
@@ -164,6 +175,10 @@ pub const STEP_TYPE_DELETE_EBS_VOLUME: &str = "DeleteEbsVolume";
 
 /// The `StepType` that changes a volume in place (its type, for an upgrade).
 pub const STEP_TYPE_MODIFY_EBS_VOLUME: &str = "ModifyEbsVolume";
+
+/// The `StepType` that creates a volume, which is how the rollback of a deleted
+/// volume restores it from the snapshot the forward run took.
+pub const STEP_TYPE_CREATE_EBS_VOLUME: &str = "CreateEbsVolume";
 
 /// How long after the start call an automation event's terminal status is due,
 /// and so the window the event's run occupies: its steps run back to back
@@ -1122,6 +1137,36 @@ pub fn step_types_for_event_type(event_type: &str) -> &'static [&'static str] {
     }
 }
 
+/// The steps the ROLLBACK of an automation event of `event_type` performs, in
+/// the order it performs them: the work that undoes what
+/// [`step_types_for_event_type`] did, named with the same `StepType` value set.
+///
+/// Undoing a snapshot-and-delete means putting the volume back, which is
+/// [`STEP_TYPE_CREATE_EBS_VOLUME`] — the step type no forward run performs,
+/// restoring the volume from the snapshot the forward run took, which the
+/// rollback leaves in place. Undoing a volume-type upgrade changes the volume
+/// back in place, which is the same [`STEP_TYPE_MODIFY_EBS_VOLUME`] the upgrade
+/// performed. An event type outside the modelled set has no known step sequence
+/// forwards, so it has none backwards either.
+pub fn rollback_step_types_for_event_type(event_type: &str) -> &'static [&'static str] {
+    match event_type {
+        EVENT_TYPE_SNAPSHOT_AND_DELETE_UNATTACHED_EBS_VOLUME => &[STEP_TYPE_CREATE_EBS_VOLUME],
+        EVENT_TYPE_UPGRADE_EBS_VOLUME_TYPE => &[STEP_TYPE_MODIFY_EBS_VOLUME],
+        _ => &[],
+    }
+}
+
+/// The `InvalidParameterValueException` message for an event no rollback may be
+/// initiated for. States the RULE — which status a rollback starts from, which
+/// is the one fact the caller needs — and echoes neither the event the request
+/// named nor the status that event is in.
+pub fn rollback_not_allowed_message() -> String {
+    format!(
+        "A rollback can only be initiated for an automation event in the \
+         {EVENT_STATUS_COMPLETE} status"
+    )
+}
+
 /// One step of an automation event as stored, which is what
 /// `ListAutomationEventSteps` reports. A step belongs to exactly one event and
 /// is stored with it, so an evicted event takes its steps with it and no reader
@@ -1227,50 +1272,130 @@ pub struct StoredEvent {
     /// them (see [`steps_for_started_event`]). Stored WITH the event because a
     /// step is only ever reached through its event.
     pub steps: Vec<StoredStep>,
-    /// When this event's terminal status falls due, or `None` when it owes no
-    /// transition (it is already terminal). Stored as an instant rather than
-    /// slept for, so no handler blocks on it.
-    pub settles_at: Option<SystemTime>,
+    /// The status transition the clock owes this event, or `None` when it owes
+    /// none (it is already terminal).
+    pub pending: Option<PendingTransition>,
+}
+
+/// A status transition the clock owes an automation event: the terminal
+/// `EventStatus` the event reaches, when it falls due, and where in the event's
+/// step sequence the run that is still in flight begins.
+///
+/// Stored as an instant rather than slept for, so no handler blocks on it, and
+/// it carries the terminal status because an event has more than one run in its
+/// life: the automation itself settles to [`EVENT_STATUS_COMPLETE`], and the
+/// rollback of that automation to [`EVENT_STATUS_ROLLBACK_COMPLETE`].
+#[derive(Debug, Clone)]
+pub struct PendingTransition {
+    /// When the terminal status falls due.
+    pub due: SystemTime,
+    /// The terminal `EventStatus` the event reaches then.
+    pub terminal_status: String,
+    /// The index of the first step of the run in flight. The steps from here on
+    /// share the run window that ends at `due`; the ones before it belong to a
+    /// run that is already over and keep the timestamps they were stamped with.
+    pub first_step: usize,
 }
 
 impl StoredEvent {
     /// Materialise the status the clock has already made due.
     ///
-    /// The transition was owed at `settles_at` whether or not anybody called, so
+    /// The transition was owed at its due instant whether or not anybody called, so
     /// applying it on a read reports what the event already is rather than
     /// advancing it because it was read. A no-op before the due instant and
     /// after the event has settled.
     ///
-    /// A started automation the service accepted runs its steps and then ENDS:
-    /// the event reaches the terminal [`EVENT_STATUS_COMPLETE`], carrying the
-    /// instant it completed and no `eventStatusReason` — the reason member
-    /// explains a status that needs explaining, which a completion does not, and
+    /// A run the service accepted performs its steps and then ENDS: the event
+    /// reaches the terminal status that run settles to (see
+    /// [`PendingTransition`]), carrying the instant it ended and no
+    /// `eventStatusReason` — the reason member explains a status that needs
+    /// explaining, which neither a completion nor a completed rollback does, and
     /// [`EVENT_STATUS_FAILED`] stays reserved for an automation that could not be
     /// carried out. Every step of the run is terminal too
     /// ([`STEP_STATUS_COMPLETE`]), stamped with the slice of the run window it
     /// occupied so the steps read back in the order the event performed them.
     pub fn settle(&mut self, now: SystemTime) {
-        let Some(due) = self.settles_at else { return };
-        if now < due {
+        let Some(pending) = self.pending.clone() else {
+            return;
+        };
+        if now < pending.due {
             return;
         }
-        self.event_status = EVENT_STATUS_COMPLETE.to_string();
+        self.event_status = pending.terminal_status;
         self.event_status_reason = None;
-        self.completed_timestamp = Some(::aws_smithy_types::DateTime::from(due));
-        self.settle_steps(due);
-        self.settles_at = None;
+        self.completed_timestamp = Some(::aws_smithy_types::DateTime::from(pending.due));
+        self.settle_steps(pending.due, pending.first_step);
+        self.pending = None;
+    }
+
+    /// May a rollback be initiated for this event?
+    ///
+    /// `RollbackAutomationEvent` "Initiates a rollback for a COMPLETED
+    /// automation event", so the automation has to have been carried out:
+    /// [`EVENT_STATUS_COMPLETE`] is the one status a rollback starts from. An
+    /// event whose run is not over, or that has already been rolled back, is in
+    /// no such state.
+    pub fn rollback_can_start(&self) -> bool {
+        self.event_status == EVENT_STATUS_COMPLETE
+    }
+
+    /// Start the rollback of this completed automation at `at`.
+    ///
+    /// The event goes back to running — the non-terminal
+    /// [`EVENT_STATUS_ROLLBACK_IN_PROGRESS`], with no completion instant, since
+    /// the instant it completed its automation is not when its rollback ends —
+    /// and the terminal [`EVENT_STATUS_ROLLBACK_COMPLETE`] falls due
+    /// [`EVENT_SETTLEMENT_DELAY`] later. The rollback's steps
+    /// ([`rollback_step_types_for_event_type`]) are APPENDED to the ones the
+    /// forward run performed, with the first of them running and every later one
+    /// queued, so a reader sees the whole history of the event in the order it
+    /// happened and the forward steps keep the timestamps they were stamped
+    /// with.
+    pub fn begin_rollback(&mut self, at: SystemTime) {
+        let first_step = self.steps.len();
+        let started_at = ::aws_smithy_types::DateTime::from(at);
+        let step_types = rollback_step_types_for_event_type(&self.event_type);
+        for (offset, step_type) in step_types.iter().enumerate() {
+            self.steps.push(StoredStep {
+                step_id: step_id(&self.event_id, first_step + offset),
+                step_type: (*step_type).to_string(),
+                step_status: if offset == 0 {
+                    STEP_STATUS_IN_PROGRESS.to_string()
+                } else {
+                    STEP_STATUS_READY.to_string()
+                },
+                // Every step of a rollback acts on the resource the event
+                // automated, exactly as the forward steps did.
+                resource_id: self.resource_id.clone(),
+                start_timestamp: (offset == 0).then_some(started_at),
+                completed_timestamp: None,
+                // A rollback undoes the change the automation made, so it
+                // realises none of the event's estimated monthly savings.
+                estimated_monthly_savings: None,
+            });
+        }
+        self.event_status = EVENT_STATUS_ROLLBACK_IN_PROGRESS.to_string();
+        self.event_status_reason = None;
+        self.completed_timestamp = None;
+        self.pending = Some(PendingTransition {
+            due: at + EVENT_SETTLEMENT_DELAY,
+            terminal_status: EVENT_STATUS_ROLLBACK_COMPLETE.to_string(),
+            first_step,
+        });
     }
 
     /// Stamp every step of a completed run as terminal.
     ///
-    /// The steps of an event are a SEQUENCE ([`steps_for_started_event`]), so
-    /// they share the run window that ends at `due`: step `i` of `n` occupies
-    /// the `i`-th of its `n` equal slices, and the last one ends exactly when
-    /// the event did. A step that was already running keeps the start timestamp
-    /// it was stamped with, so settling never rewrites when the run began — and
-    /// a step never ends before it started, whatever that stored start is.
-    fn settle_steps(&mut self, due: SystemTime) {
-        let total = self.steps.len();
+    /// The steps of a run are a SEQUENCE ([`steps_for_started_event`]), so they
+    /// share the run window that ends at `due`: step `i` of the `n` steps from
+    /// `first_step` on occupies the `i`-th of its `n` equal slices, and the last
+    /// one ends exactly when the run did. A step that was already running keeps
+    /// the start timestamp it was stamped with, so settling never rewrites when
+    /// the run began — and a step never ends before it started, whatever that
+    /// stored start is. The steps BEFORE `first_step` belong to an earlier run
+    /// of the same event and are left exactly as they are.
+    fn settle_steps(&mut self, due: SystemTime, first_step: usize) {
+        let total = self.steps.len().saturating_sub(first_step);
         let Ok(slices) = u32::try_from(total) else {
             return;
         };
@@ -1285,7 +1410,7 @@ impl StoredEvent {
                 .checked_add(slice * slices_in)
                 .map_or(completed, ::aws_smithy_types::DateTime::from)
         };
-        for (position, step) in (0u32..slices).zip(self.steps.iter_mut()) {
+        for (position, step) in (0u32..slices).zip(self.steps.iter_mut().skip(first_step)) {
             step.step_status = STEP_STATUS_COMPLETE.to_string();
             let start = *step.start_timestamp.get_or_insert_with(|| boundary(position));
             let end = if position + 1 == slices {
@@ -1386,7 +1511,7 @@ impl EventStore {
 ///
 /// The event is built from the stored recommended action — never from the
 /// request — and starts in the non-terminal [`EVENT_STATUS_IN_PROGRESS`] with
-/// its terminal status due [`EVENT_SETTLEMENT_DELAY`] later. Its steps are the
+/// [`EVENT_STATUS_COMPLETE`] due [`EVENT_SETTLEMENT_DELAY`] later. Its steps are the
 /// sequence its event type performs ([`steps_for_started_event`]), stored at
 /// start so every later read reports the same steps with the same ids.
 pub fn event_for_action(
@@ -1426,7 +1551,12 @@ pub fn event_for_action(
         completed_timestamp: None,
         estimated_monthly_savings: action.estimated_monthly_savings.clone(),
         steps,
-        settles_at: Some(started_at + EVENT_SETTLEMENT_DELAY),
+        pending: Some(PendingTransition {
+            due: started_at + EVENT_SETTLEMENT_DELAY,
+            terminal_status: EVENT_STATUS_COMPLETE.to_string(),
+            // The automation's own steps are the event's first run.
+            first_step: 0,
+        }),
     }
 }
 

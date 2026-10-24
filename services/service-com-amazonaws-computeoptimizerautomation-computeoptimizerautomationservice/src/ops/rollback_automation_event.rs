@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RollbackAutomationEvent
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RollbackAutomationEvent`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RollbackAutomationEvent::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED. Resolves `eventId` against the automation events this service
+//! holds: an id no event has is `ResourceNotFoundException` (404), and an event
+//! whose automation was not carried out — one that is still running, or one
+//! already rolled back — is `InvalidParameterValueException` (400), because a
+//! rollback is initiated for a COMPLETED event. A completed event goes back to
+//! running in the non-terminal `RollbackInProgress` status, and the clock
+//! settles it to the modelled `RollbackComplete` once its rollback window has
+//! passed — see `crate::state::StoredEvent::begin_rollback`.
 //!
 //! ## Shape of an operation
 //!
@@ -170,18 +170,140 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RollbackAutomationEvent` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RollbackAutomationEventErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RollbackAutomationEvent"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal(
+                "the service is not mounted on a state-bearing engine",
+            ));
+        };
+
+        let mut probe = input.clone();
+        probe.client_token = None;
+        let request_fingerprint = crate::state::fingerprint(&probe);
+        let client_token = input.client_token.as_deref();
+        let now = ::std::time::SystemTime::now();
+
+        let mut guard = state.lock();
+
+        // The service-wide enrollment gate, AHEAD of the token ledger and of
+        // the event lookup: an account that is not opted in may not roll back
+        // an automation, and a refused call must not consume its client token
+        // either. See `crate::state::…::opt_in_required`.
+        if let Some(refusal) = guard.opt_in_required() {
+            return Err(RollbackAutomationEventErrorModeled::OptInRequiredException(refusal).into());
+        }
+
+        match guard.classify_token(client_token, Self::NAME, &request_fingerprint) {
+            crate::state::TokenOutcome::Fresh => {}
+            // A retry of the same rollback: report the event the first call
+            // acted on instead of starting a second rollback of one automation.
+            crate::state::TokenOutcome::Replay(record) => {
+                let replayed = record
+                    .subject
+                    .as_ref()
+                    .and_then(crate::state::TokenSubject::event_id)
+                    .map(str::to_string);
+                return match replayed.and_then(|id| guard.events.get_mut(&id)) {
+                    Some(event) => {
+                        // Report the status the clock has already made due, so a
+                        // replay never claims a rollback is still running after
+                        // it has settled.
+                        event.settle(now);
+                        Ok(output_for(event))
+                    }
+                    // The event the token acted on is no longer in the store, so
+                    // there is nothing to replay.
+                    None => Err(not_found()),
+                };
+            }
+            crate::state::TokenOutcome::ParameterMismatch => {
+                return Err(
+                    RollbackAutomationEventErrorModeled::IdempotentParameterMismatchException(
+                        IdempotentParameterMismatchException {
+                            message: Some(
+                                crate::state::IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE.into(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            crate::state::TokenOutcome::TokenInUse => {
+                return Err(
+                    RollbackAutomationEventErrorModeled::IdempotencyTokenInUseException(
+                        IdempotencyTokenInUseException {
+                            message: Some("The specified client token is already in use.".into()),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // The rollback is initiated for an AUTOMATION EVENT, so the event is
+        // what the request has to name; an id no stored event carries names no
+        // resource of this service.
+        let Some(event) = guard.events.get_mut(&input.event_id) else {
+            return Err(not_found());
+        };
+        // The clock's own transition first, so eligibility is judged on the
+        // status the event ALREADY has: an automation whose run window has
+        // passed is completed whether or not anybody read it since.
+        event.settle(now);
+        if !event.rollback_can_start() {
+            return Err(
+                RollbackAutomationEventErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        message: Some(crate::state::rollback_not_allowed_message()),
+                    },
+                )
+                .into(),
+            );
+        }
+        event.begin_rollback(now);
+        let event_id = event.event_id.clone();
+        guard.record_token(
+            client_token,
+            Self::NAME,
+            &request_fingerprint,
+            Some(crate::state::TokenSubject::Event(event_id.clone())),
+        );
+
+        // Answer from the store, not from the value written above.
+        match guard.events.get(&event_id) {
+            Some(event) => Ok(output_for(event)),
+            None => Err(internal(
+                "the event that was just rolled back could not be read back",
+            )),
+        }
     }
+}
+
+/// The response for a stored event. The ONE place this operation's output is
+/// built, so a fresh rollback and an idempotent replay answer from the same
+/// stored fields.
+fn output_for(event: &crate::state::StoredEvent) -> RollbackAutomationEventOutput {
+    RollbackAutomationEventOutput {
+        event_id: Some(event.event_id.clone()),
+        event_status: Some(event.event_status.clone()),
+    }
+}
+
+/// The modelled 404 (`ResourceNotFoundException`, HTTP 404). The message is this
+/// service's fixed not-found text and names no resource, so the rejection
+/// discloses nothing about what the store holds.
+fn not_found() -> RollbackAutomationEventError {
+    RollbackAutomationEventErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.into()),
+    })
+    .into()
+}
+
+/// The modelled 500 (`InternalServerException`), for a store this handler
+/// cannot reach or read back.
+fn internal(message: &str) -> RollbackAutomationEventError {
+    RollbackAutomationEventErrorModeled::InternalServerException(InternalServerException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }
