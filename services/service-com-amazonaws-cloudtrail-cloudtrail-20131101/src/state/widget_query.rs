@@ -10,7 +10,10 @@
 //! (`smithy_query(query="shape",shape="InvalidQueryStatementException")`) — so the
 //! reading of a statement, and the bound on how many widgets one request may carry,
 //! live here once rather than in each handler, the way [`super::channels`] holds the
-//! channel identifier reading.
+//! channel identifier reading. `StartQuery` reads the statement it RUNS through the
+//! same reading ([`read_runnable_statement`]), which also answers with the tables the
+//! parser read, because the event data store a run reads is whichever of them names
+//! one.
 //!
 //! The statement is READ, not matched: the `sqlparser` crate parses it, so a statement
 //! is judged by the SQL it IS rather than by any text this emulator searches for.
@@ -28,9 +31,11 @@
 //! * the event data store a widget selects FROM, which CloudTrail names by the id or
 //!   the ARN of the store ("you can query across multiple event data stores as long as
 //!   all event data stores exist in your account" — the model doc for
-//!   `RequestWidget$QueryStatement`); neither form is a bare SQL identifier, so such a
-//!   word is quoted as one. Whether the store it names EXISTS is a different question,
-//!   answered by `EventDataStoreNotFoundException`, not by this reading.
+//!   `RequestWidget$QueryStatement`); neither form is a bare SQL identifier — an id can
+//!   even begin with a digit, which no SQL dialect reads as the start of a name — so
+//!   such a word is quoted as the identifier it is. Whether the store it names EXISTS
+//!   is a different question, answered by `EventDataStoreNotFoundException`, not by
+//!   this reading.
 //!
 //! The work one statement can cause is bounded before the parser is entered:
 //! `QueryStatement` is `@length(1, 10000)` (`smithy_query(query="shape",
@@ -38,11 +43,17 @@
 //! runs, so the parse is over at most 10 000 characters; and
 //! [`MAX_QUERY_NESTING_DEPTH`] and [`MAX_QUERY_TOKENS`] bound the DEPTH that statement
 //! can ask for, in the parser and in the drop of the tree it builds, whatever
-//! `sqlparser`'s own recursion limit admits.
+//! `sqlparser`'s own recursion limit admits. Both are counted on the tokens the
+//! TOKENIZER read — one iterative pass that never recurses — so they hold before
+//! anything descends.
 
-use sqlparser::ast::Statement;
+use std::ops::ControlFlow;
+
+use sqlparser::ast::{visit_relations, SetExpr, Statement};
 use sqlparser::dialect::GenericDialect;
+use sqlparser::keywords::Keyword;
 use sqlparser::parser::Parser;
+use sqlparser::tokenizer::{Token, Tokenizer};
 
 use crate::ops::types::RequestWidget;
 
@@ -185,7 +196,12 @@ fn as_sql(statement: &str) -> String {
 }
 
 /// The deepest BRACKETING one `QueryStatement` may carry, counted before the parser is
-/// entered.
+/// entered — and, on the same terms, the longest run of prefix operators it may apply
+/// to one expression.
+///
+/// `pub` because this is the crate's ONE bound on the depth a `QueryStatement` may ask
+/// the parser for, asserted by the test suites of both callers rather than repeated as
+/// a number.
 ///
 /// This is the EMULATOR's own bound, and it is what keeps a caller-controlled statement
 /// from turning into a deep recursion — in the parser, or in the DROP of the tree it
@@ -196,9 +212,11 @@ fn as_sql(statement: &str) -> String {
 /// reach the end of a worker thread's stack. The sibling reading in
 /// `services/service-com-amazonaws-bcmdataexports-awsbillingandcostmanagementdataexports/src/state/query.rs`
 /// bounds its own parse the same way.
-const MAX_QUERY_NESTING_DEPTH: usize = 32;
+pub const MAX_QUERY_NESTING_DEPTH: usize = 32;
 
 /// The most TOKENS one `QueryStatement` may carry.
+///
+/// `pub` for the same reason as [`MAX_QUERY_NESTING_DEPTH`].
 ///
 /// The general bound, for the nesting brackets do NOT express: a chain of binary or
 /// unary operators, of set operations or of joins all nest the TREE at bracket depth
@@ -212,71 +230,157 @@ const MAX_QUERY_NESTING_DEPTH: usize = 32;
 /// bound (a projection list of two thousand short identifiers, say), and such a
 /// statement is refused rather than read: a bound a caller can pass is the whole point
 /// of having one, and nothing a dashboard widget queries needs that many tokens.
-const MAX_QUERY_TOKENS: usize = 4_096;
+pub const MAX_QUERY_TOKENS: usize = 4_096;
 
-/// The depth of `statement`'s bracketing: the most brackets open at any one point.
+/// The depth of a tokenized statement's bracketing: the most brackets open at any one
+/// point, or the longest run of PREFIX operators applied to one expression, whichever
+/// is greater — the two things that make a recursive-descent SQL parser, and the walk
+/// of the tree it builds, descend.
 ///
-/// One pass over the characters, so the bound costs less than the parse it guards.
-/// Brackets inside a literal or a comment are counted too, which can only make this
-/// OVER-count: a statement refused here is refused for carrying that many brackets,
-/// never served when it nests deeper.
-fn nesting_depth(statement: &str) -> usize {
+/// Counted on the TOKENS the tokenizer read, so a bracket inside a string literal or a
+/// comment is not one: the depth measured is the depth the parser would descend to.
+/// Tokenizing is one iterative pass and never recurses, so this bound still costs less
+/// than the parse it guards and is still applied before it.
+///
+/// A prefix operator descends only while it applies to the operator after it, so an
+/// INFIX chain (`1 + 1 + 1`, whose operands sit between the operators) counts one, not
+/// its length: its tree nests, but the token bound is what holds that.
+fn nesting_depth(tokens: &[Token]) -> usize {
     let mut depth: usize = 0;
     let mut deepest: usize = 0;
-    for character in statement.chars() {
-        match character {
-            '(' | '[' => {
+    let mut prefix_run: usize = 0;
+    let mut longest_prefix_run: usize = 0;
+    for token in tokens {
+        match token {
+            Token::Whitespace(_) => {}
+            Token::LParen | Token::LBracket => {
                 depth += 1;
                 deepest = deepest.max(depth);
+                prefix_run = 0;
             }
-            ')' | ']' => depth = depth.saturating_sub(1),
-            _ => {}
+            Token::RParen | Token::RBracket => {
+                depth = depth.saturating_sub(1);
+                prefix_run = 0;
+            }
+            Token::Minus | Token::Plus | Token::Tilde => {
+                prefix_run += 1;
+                longest_prefix_run = longest_prefix_run.max(prefix_run);
+            }
+            Token::Word(word) if word.keyword == Keyword::NOT => {
+                prefix_run += 1;
+                longest_prefix_run = longest_prefix_run.max(prefix_run);
+            }
+            _ => prefix_run = 0,
         }
     }
-    deepest
+    deepest.max(longest_prefix_run)
 }
 
-/// The number of tokens `statement` carries: each run of word characters, and each
-/// other non-whitespace character, counts once.
+/// The number of tokens a tokenized statement carries: the tokenizer's own tokens,
+/// whitespace apart.
 ///
-/// One pass over the characters, and it OVER-counts rather than under-counts the
-/// parser's own tokens (a two-character operator counts twice, the characters of a
-/// literal count individually) — the safe direction for a bound on depth.
-fn token_count(statement: &str) -> usize {
-    let mut tokens: usize = 0;
-    let mut inside_word = false;
-    for character in statement.chars() {
-        if is_word_character(character) {
-            if !inside_word {
-                tokens += 1;
-                inside_word = true;
-            }
-        } else {
-            inside_word = false;
-            if !character.is_whitespace() {
-                tokens += 1;
-            }
-        }
-    }
+/// The parser builds at most one AST node per token, so this is what bounds the number
+/// of nodes the tree can have — and a literal, however long, is ONE token, because the
+/// tree it becomes is one node.
+fn token_count(tokens: &[Token]) -> usize {
     tokens
+        .iter()
+        .filter(|token| !matches!(token, Token::Whitespace(_)))
+        .count()
 }
 
 /// Whether `statement` is a query CloudTrail Lake can run: ONE SQL statement, and that
 /// statement a query.
-///
-/// The two structural bounds are checked FIRST, on the characters, so a statement that
-/// would turn into a deep recursion is refused before the parser is entered rather than
-/// descended with.
 pub fn is_runnable_statement(statement: &str) -> bool {
-    if nesting_depth(statement) > MAX_QUERY_NESTING_DEPTH
-        || token_count(statement) > MAX_QUERY_TOKENS
-    {
-        return false;
+    read_runnable_statement(statement).is_ok()
+}
+
+/// The depth the parser may descend to, stated here rather than left to the crate's
+/// default so it cannot change under either caller.
+///
+/// It is above [`MAX_QUERY_NESTING_DEPTH`], so the EMULATOR's bound is the one a
+/// statement meets first and a statement at that bound is one the parser still reads.
+pub const QUERY_RECURSION_LIMIT: usize = 50;
+
+/// The tables `statement` reads, or why it is no query CloudTrail Lake can run.
+///
+/// This is the crate's ONE reading of a `QueryStatement`, for both the dashboard
+/// operations (which only need to know whether it is runnable) and `StartQuery` (which
+/// needs the tables, because the event data store the run reads is whichever of them
+/// names one). CloudTrail Lake runs SQL `SELECT` queries over event data stores, so a
+/// runnable statement is ONE statement, that statement a query, and that query a READ:
+/// the `WITH … INSERT` / `WITH … UPDATE` forms parse as a query whose body writes, and
+/// a Lake query reads.
+///
+/// The tables answered with are the RELATIONS THE PARSER read, never a position in the
+/// text, and only the single-part ones: a name in several parts (`catalog.table`) names
+/// no event data store. A quoted identifier is answered unquoted, so an id or an ARN
+/// reads back as the caller wrote it. Whether a table names a store that EXISTS is a
+/// different question, answered by the registry.
+///
+/// The two structural bounds are checked on the TOKENS, before the parse, so a
+/// statement that would turn into a deep recursion is refused rather than descended
+/// with: tokenizing is iterative and never recurses, the parse is what descends. The
+/// `Err` is the reason, for a trace record — never for the wire:
+/// both callers answer [`INVALID_QUERY_STATEMENT_MESSAGE`].
+pub fn read_runnable_statement(statement: &str) -> Result<Vec<String>, String> {
+    let sql = as_sql(statement);
+    let tokens = Tokenizer::new(&GenericDialect {}, &sql)
+        .tokenize()
+        .map_err(|error| error.to_string())?;
+
+    let depth = nesting_depth(&tokens);
+    if depth > MAX_QUERY_NESTING_DEPTH {
+        return Err(format!(
+            "the statement nests {depth} deep; a query may nest {MAX_QUERY_NESTING_DEPTH}"
+        ));
     }
-    let Ok(statements) = Parser::parse_sql(&GenericDialect {}, &as_sql(statement)) else {
-        return false;
+    let counted = token_count(&tokens);
+    if counted > MAX_QUERY_TOKENS {
+        return Err(format!(
+            "the statement carries {counted} tokens; a query may carry {MAX_QUERY_TOKENS}"
+        ));
+    }
+
+    let mut parser = Parser::new(&GenericDialect {})
+        .with_recursion_limit(QUERY_RECURSION_LIMIT)
+        .try_with_sql(&sql)
+        .map_err(|error| error.to_string())?;
+    let parsed = parser
+        .parse_statements()
+        .map_err(|error| error.to_string())?;
+    let [Statement::Query(query)] = parsed.as_slice() else {
+        return Err(format!(
+            "a query is one SELECT statement; this one is {} statement(s) the parser read as \
+             something else",
+            parsed.len()
+        ));
     };
-    matches!(statements.as_slice(), [Statement::Query(_)])
+    if !reads_only(&query.body) {
+        return Err("a query reads an event data store, so it may not write".to_string());
+    }
+
+    let mut relations: Vec<String> = Vec::new();
+    let _: ControlFlow<()> = visit_relations(query.as_ref(), |name| {
+        let rendered = name.to_string();
+        if !rendered.contains('.') {
+            relations.push(rendered.trim_matches('"').to_string());
+        }
+        ControlFlow::Continue(())
+    });
+    Ok(relations)
+}
+
+/// Whether a parsed query body only READS.
+///
+/// `Statement::Query` is not enough on its own: the `WITH … INSERT` / `WITH … UPDATE`
+/// forms parse as a query whose BODY writes.
+fn reads_only(body: &SetExpr) -> bool {
+    match body {
+        SetExpr::Query(inner) => reads_only(&inner.body),
+        SetExpr::SetOperation { left, right, .. } => reads_only(left) && reads_only(right),
+        other => !matches!(other, SetExpr::Insert(_) | SetExpr::Update(_)),
+    }
 }
 
 /// The first statement of `widgets` CloudTrail Lake cannot run, if any.

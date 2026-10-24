@@ -29,13 +29,21 @@ tokio = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
-# `sqlparser`: the SQL parse a dashboard widget's `QueryStatement` is READ with, so a
-# query CloudTrail Lake cannot run is refused by its syntax rather than by matching text.
-sqlparser = "0.59"
 tracing = { workspace = true }
-# Mints the event data store id that is the suffix of its ARN, and the modelled `UUID`
-# import id `StartImport` hands back (36 characters of `^[a-f0-9\-]+$`): a v4 UUID, the
-# form CloudTrail Lake uses.
+# Parses the SQL of a CloudTrail Lake `QueryStatement` — the one a dashboard
+# widget carries and the one `StartQuery` runs — so a query CloudTrail Lake
+# cannot run is refused by a real SQL parser rather than by matching text or by
+# a hand-written subset of the language. Both read it through
+# `src/state/widget_query.rs`: the crate's default `recursive-protection` is the
+# crate's own guard against a deeply nested statement exhausting the thread's
+# stack (that module bounds the statement before parsing it as well), and
+# `visitor` is what lets it report the RELATIONS the parser found, which is how
+# `StartQuery` resolves the event data store a run reads.
+sqlparser = { version = "0.59", features = ["visitor"] }
+# Mints the event data store id that is the suffix of its ARN, the modelled `UUID`
+# import id `StartImport` hands back and the `QueryId` `StartQuery` returns for a new
+# query run (36 characters of `^[a-f0-9\-]+$`): a v4 UUID, the form CloudTrail Lake
+# uses.
 uuid = { version = "1", features = ["v4"] }
 # Hex-codes the opaque `ListChannels` pagination token (`src/ops/list_channels.rs`).
 hex = { workspace = true }

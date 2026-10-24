@@ -1,15 +1,59 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartQuery
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartQuery`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartQuery::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts ONE CloudTrail Lake query and persists it in the query registry in
+//! [`crate::state`], so `DescribeQuery` reports the run this call minted and the
+//! concurrency limit counts it.
+//!
+//! Resolution order, which decides which refusal a caller sees:
+//!
+//! 1. the SELECTOR: "StartQuery requires you specify either the QueryStatement
+//!    parameter, or a QueryAlias and any QueryParameters" — exactly one of the
+//!    two, and `QueryParameters` only alongside the alias ⇒ otherwise
+//!    `InvalidParameterException`. An alias names a query template, which is
+//!    what a dashboard widget's `QueryAlias` carries
+//!    ([`crate::state::ComAmazonawsCloudtrailCloudtrail20131101State::query_template`]);
+//!    an alias naming none is refused the same way. CloudTrail publishes no
+//!    rule for how `QueryParameters` bind into a template's statement, so a
+//!    request that supplies them is refused with the modelled
+//!    `UnsupportedOperationException` rather than run as if they had been
+//!    substituted.
+//! 2. the STATEMENT, read by the crate's ONE reading of a `QueryStatement`
+//!    ([`crate::state::widget_query::read_runnable_statement`], the same one the
+//!    dashboard operations judge a widget's query with): the `sqlparser` crate
+//!    parses it under that module's stated bounds, and it must parse as exactly
+//!    ONE read-only `SELECT` (the `WITH … INSERT` forms write, so they are not
+//!    one) ⇒ otherwise `InvalidQueryStatementException`.
+//! 3. the STORE it reads, which is whichever of the tables THE PARSER read names
+//!    an event data store the Region that table addresses holds — the caller's
+//!    Region for a bare id, the ARN's own Region for an ARN, the way every
+//!    operation of this service reads a store identifier. A statement whose
+//!    tables name none is no Lake query ⇒ `InvalidQueryStatementException`: the
+//!    store is resolved as part of validating the statement, so naming no store
+//!    makes the STATEMENT invalid rather than the store missing. That is also
+//!    what the recorded CloudTrail response for a query over an account holding
+//!    no store is: HTTP 400 `InvalidQueryStatementException`. A statement naming
+//!    SEVERAL stores is a query CloudTrail runs ("you can query across multiple
+//!    event data stores as long as all event data stores exist in your account")
+//!    but this emulator cannot: a run is recorded against the one store it reads,
+//!    so it answers the modelled `UnsupportedOperationException` rather than
+//!    calling valid SQL invalid. A store the request's
+//!    `EventDataStoreOwnerAccountId` does not own ⇒
+//!    `EventDataStoreNotFoundException` (HTTP 400, the crate's
+//!    [`crate::state::EVENT_DATA_STORE_NOT_FOUND_STATUS`]), one
+//!    awaiting deletion ⇒ `InactiveEventDataStoreException`.
+//! 4. the CONCURRENCY limit: "The maximum number of concurrent queries is 10"
+//!    ⇒ `MaxConcurrentQueriesException` (HTTP 429), counted per Region because
+//!    one engine's store stands for one account.
+//!
+//! A new run is `QUEUED` and the clock settles it into `FINISHED`
+//! ([`crate::state::QueryRecord::settle`]) — the model carries both states
+//! precisely because a Lake query is asynchronous. The run scans the store it
+//! reads, which holds no events in this emulator (nothing here ingests CloudTrail
+//! events), so its statistics are zero; a `DeliveryS3Uri` is persisted with the
+//! modelled `PENDING` delivery status, because this service writes no object to
+//! S3 and so cannot report a delivery that completed.
 //!
 //! ## Shape of an operation
 //!
@@ -199,18 +243,292 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartQuery` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartQueryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartQuery"))
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            StartQueryErrorModeled::UnsupportedOperationException(UnsupportedOperationException {
+                message: Some(
+                    "StartQuery needs the CloudTrail Lake query registry, which this engine \
+                     does not carry"
+                        .to_string(),
+                ),
+            })
+        })?;
+        let mut store = state.lock();
+        // Every run whose settle instant has passed has already ended, whether or
+        // not anybody looked; the concurrency limit below counts what is actually
+        // still in flight.
+        store.settle_queries(now);
+
+        // "StartQuery requires you specify either the QueryStatement parameter,
+        // or a QueryAlias and any QueryParameters": one of the two selects the SQL
+        // to run, and `QueryParameters` are the alias's, so they mean nothing
+        // without one.
+        let query_parameters = input.query_parameters.unwrap_or_default();
+        let statement = match (input.query_statement.as_deref(), input.query_alias.as_deref()) {
+            (Some(_), Some(_)) => {
+                return Err(invalid_parameter(
+                    "QueryStatement and QueryAlias cannot both be specified: specify either \
+                     QueryStatement, or QueryAlias and any QueryParameters.",
+                ));
+            }
+            (None, None) => {
+                return Err(invalid_parameter(
+                    "You must specify either QueryStatement, or QueryAlias and any \
+                     QueryParameters.",
+                ));
+            }
+            (Some(statement), None) => {
+                if !query_parameters.is_empty() {
+                    return Err(invalid_parameter(
+                        "QueryParameters can be specified only together with QueryAlias.",
+                    ));
+                }
+                statement.to_string()
+            }
+            // An alias names a query template, and the templates this account
+            // holds are the ones its dashboards' widgets carry.
+            (None, Some(alias)) => {
+                let template = store
+                    .query_template(alias, &region)
+                    .ok_or_else(|| {
+                        invalid_parameter(format!(
+                            "The QueryAlias value {alias} does not name a query template in \
+                             this account."
+                        ))
+                    })?
+                    .to_string();
+                // `QueryParameters` are "the query parameters for the specified
+                // QueryAlias", and CloudTrail publishes no rule for how they
+                // bind into a template's statement. Running the template as if
+                // they had been substituted would report a run that did not
+                // happen, so this is refused with the modelled error for what
+                // the service does not support here rather than guessed at.
+                if !query_parameters.is_empty() {
+                    return Err(StartQueryErrorModeled::UnsupportedOperationException(
+                        UnsupportedOperationException {
+                            message: Some(format!(
+                                "QueryParameters are the parameters of the query template \
+                                 {alias}; substituting them into its statement is not \
+                                 supported by this emulator."
+                            )),
+                        },
+                    )
+                    .into());
+                }
+                template
+            }
+        };
+
+        // The statement decides WHICH event data store the run reads, so reading
+        // it is how the store is resolved. Every way a statement fails to be a
+        // Lake query — the SQL itself, or its tables resolving to no store — is
+        // one refusal: it is the statement as a whole that failed to validate.
+        let relations = crate::state::widget_query::read_runnable_statement(&statement)
+            .map_err(invalid_query_statement)?;
+
+        // The store the query runs on is whichever of the tables THE PARSER read
+        // names one: a CTE name, a derived table's alias or any other relation
+        // resolves to nothing, and it is the registry that decides.
+        let mut addressed: Vec<(String, String, crate::state::EventDataStoreState)> = Vec::new();
+        for relation in &relations {
+            let Ok(identifier) = crate::state::parse_event_data_store_identifier(relation) else {
+                continue;
+            };
+            if let Some(record) = store.addressed_event_data_store(&identifier, &region) {
+                if !addressed.iter().any(|(id, ..)| *id == record.id) {
+                    // The id, the account that owns it and its status — every
+                    // value the checks below read — taken from the record while
+                    // it is in hand, so nothing looks it up a second time.
+                    addressed.push((
+                        record.id.clone(),
+                        record.owner().to_string(),
+                        record.status,
+                    ));
+                }
+            }
+        }
+        let [(event_data_store_id, store_owner, store_status)] = addressed.as_slice() else {
+            // A statement whose tables name no store this Region holds is no Lake
+            // query at all — which is what the recorded CloudTrail response for a
+            // query over an account holding no store is: HTTP 400
+            // `InvalidQueryStatementException`.
+            if addressed.is_empty() {
+                return Err(invalid_query_statement(format!(
+                    "none of the statement's tables names an event data store {region} holds"
+                )));
+            }
+            // "You can query across multiple event data stores as long as all
+            // event data stores exist in your account" (the model doc for
+            // `RequestWidget$QueryStatement`), so such a statement is VALID SQL
+            // and a valid Lake query — it is this emulator that cannot run it: a
+            // run is recorded against the one store it reads
+            // ([`crate::state::QueryRecord::event_data_store_id`], which
+            // `CancelQuery` and `ListQueries` resolve a query through), so there
+            // is nowhere to record a run over several. Answering the modelled
+            // error for what is not supported says that, where
+            // `InvalidQueryStatementException` would call the caller's SQL
+            // invalid when it is not.
+            let named: Vec<&str> = addressed.iter().map(|(id, ..)| id.as_str()).collect();
+            return Err(StartQueryErrorModeled::UnsupportedOperationException(
+                UnsupportedOperationException {
+                    message: Some(format!(
+                        "The statement queries across {} event data stores ({}); a query over \
+                         more than one event data store is not supported by this emulator.",
+                        named.len(),
+                        named.join(", ")
+                    )),
+                },
+            )
+            .into());
+        };
+
+        // `EventDataStoreOwnerAccountId` is the account the store the query runs
+        // on has to belong to: a store of another account is not the one the
+        // caller addressed.
+        if let Some(owner) = input.event_data_store_owner_account_id.as_deref() {
+            if store_owner != owner {
+                return Err(event_data_store_not_found());
+            }
+        }
+        if !store_status.is_queryable() {
+            return Err(StartQueryErrorModeled::InactiveEventDataStoreException(
+                InactiveEventDataStoreException {
+                    message: Some(format!(
+                        "The event data store {event_data_store_id} is {} and does not serve \
+                         queries.",
+                        store_status.as_wire()
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "You are already running the maximum number of concurrent queries. The
+        // maximum number of concurrent queries is 10." CloudTrail's limit is per
+        // account per Region, and one engine's store stands for ONE account, so
+        // the Region is the whole key: `EventDataStoreOwnerAccountId` names the
+        // account a store is SHARED FROM, not another account running queries
+        // here.
+        let in_flight = store.queries_in_flight(&region);
+        if in_flight >= crate::state::MAX_CONCURRENT_QUERIES {
+            return Err(StartQueryErrorModeled::MaxConcurrentQueriesException(
+                MaxConcurrentQueriesException {
+                    message: Some(format!(
+                        "{in_flight} queries are already running in {region}; the maximum \
+                         number of concurrent queries is {}. Wait a minute for some queries \
+                         to finish, and then run the query again.",
+                        crate::state::MAX_CONCURRENT_QUERIES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let record = crate::state::QueryRecord {
+            // A `UUID` is 36 characters of `[a-f0-9-]`, which is what a
+            // hyphenated v4 UUID renders as.
+            query_id: ::uuid::Uuid::new_v4().to_string(),
+            event_data_store_id: event_data_store_id.clone(),
+            region: region.clone(),
+            query_string: statement,
+            query_alias: input.query_alias,
+            // A dashboard refresh starts its queries through
+            // `StartDashboardRefresh`, and a prompt comes from `GenerateQuery`;
+            // neither is what this call carries.
+            refresh_id: None,
+            prompt: None,
+            // The run has not started yet, so it has no statistics and no run
+            // time; the clock settles it into `FINISHED`.
+            status: crate::state::QueryState::Queued,
+            statistics: crate::state::QueryStatisticsRecord::default(),
+            delivery: input
+                .delivery_s3_uri
+                .map(|s3_uri| crate::state::QueryDelivery {
+                    s3_uri,
+                    status: crate::state::DELIVERY_STATUS_PENDING.to_string(),
+                }),
+            error_message: None,
+            event_data_store_owner_account_id: input.event_data_store_owner_account_id,
+            created_at: Some(now),
+            settles_at: Some(now + crate::state::QUERY_SETTLE_AFTER),
+        };
+
+        // Report the stored record, so the response and every later read of this
+        // query are the same values.
+        let output = StartQueryOutput {
+            query_id: Some(record.query_id.clone()),
+            event_data_store_owner_account_id: record.event_data_store_owner_account_id.clone(),
+        };
+
+        store.queries.insert(record.query_id.clone(), record);
+        store.trim_query_history(crate::state::QUERY_HISTORY_LIMIT);
+        Ok(output)
     }
 }
+
+/// Refuse the request with the modelled `InvalidParameterException` (HTTP 400),
+/// whose text names the members that cannot hold together as given.
+fn invalid_parameter(message: impl Into<String>) -> StartQueryError {
+    StartQueryErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// The text every `InvalidQueryStatementException` this operation answers with:
+/// the crate's ONE such sentence
+/// ([`crate::state::widget_query::INVALID_QUERY_STATEMENT_MESSAGE`], "Query is
+/// not valid."), which the dashboard operations refuse an unreadable widget
+/// query with and which the recorded CloudTrail response for an invalid
+/// statement carries, so the two paths cannot word one refusal two ways.
+///
+/// It is the WHOLE text, for every way a statement fails to be a Lake query.
+/// The service is not known to word any of them more precisely, and the reason
+/// a given statement was refused is the caller's own SQL — so the reason is
+/// recorded through `tracing` for whoever runs the emulator, rather than
+/// invented onto the wire.
+const INVALID_QUERY_MESSAGE: &str = crate::state::widget_query::INVALID_QUERY_STATEMENT_MESSAGE;
+
+/// Refuse the request with the modelled `InvalidQueryStatementException` (HTTP
+/// 400): "The query that was submitted has validation errors, or uses incorrect
+/// syntax or unsupported keywords."
+///
+/// `reason` says which of those it was; it is traced, not answered (see
+/// [`INVALID_QUERY_MESSAGE`]).
+fn invalid_query_statement(reason: impl ::std::fmt::Display) -> StartQueryError {
+    ::tracing::debug!(%reason, "StartQuery refused a query statement");
+    StartQueryErrorModeled::InvalidQueryStatementException(InvalidQueryStatementException {
+        message: Some(INVALID_QUERY_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// Refuse the request because the store the statement reads is not one the
+/// account the request named owns.
+///
+/// The status is the crate's one statement of it
+/// ([`crate::state::EVENT_DATA_STORE_NOT_FOUND_STATUS`]): the model annotates
+/// `EventDataStoreNotFoundException` `@httpError(404)` and CloudTrail answers 400
+/// for it on the wire, so the error CODE and body are the model's and only the
+/// status is the service's, applied through
+/// [`crate::scaffolded::Scaffolded::modeled_with_status`].
+fn event_data_store_not_found() -> StartQueryError {
+    crate::scaffolded::Scaffolded::modeled_with_status(
+        StartQueryErrorModeled::EventDataStoreNotFoundException(EventDataStoreNotFoundException {
+            message: Some(crate::state::EVENT_DATA_STORE_NOT_FOUND_MESSAGE.to_string()),
+        }),
+        crate::state::EVENT_DATA_STORE_NOT_FOUND_STATUS,
+    )
+}
+
+// The statement a caller asks to RUN is read by the crate's ONE reading of a
+// `QueryStatement`, `crate::state::widget_query::read_runnable_statement`: the
+// bounds it applies before the parse, the recursion limit it parses under, the
+// `SELECT`-and-read-only rule and the relations it answers with are stated there
+// once, for this handler and for the dashboard operations alike. An event data
+// store id or ARN is not a bare SQL identifier — a minted id can even begin with
+// a digit — which is why that reading quotes such a word as the identifier it is
+// before the parse, rather than widening the dialect under it.
+

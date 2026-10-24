@@ -42,7 +42,7 @@ use service_com_amazonaws_cloudtrail_cloudtrail_20131101::ops::types::{
     EVENT_DATA_STORE_STATUS_VALUES, QUERY_STATUS_VALUES,
 };
 use service_com_amazonaws_cloudtrail_cloudtrail_20131101::state::{
-    event_data_store_arn, EventDataStoreRecord, EventDataStoreState, QueryRecord, QueryState,
+    self, event_data_store_arn, EventDataStoreRecord, EventDataStoreState, QueryRecord, QueryState,
 };
 
 use super::emulator::{Emulator, HOME_REGION};
@@ -100,7 +100,7 @@ fn seed_store_owned_by(
     );
 }
 
-/// Seed one query run, the way `StartQuery` will once it is implemented.
+/// Seed one query run, the way `StartQuery` mints one.
 fn seed_query(emulator: &Emulator, record: &QueryRecord) {
     emulator
         .state()
@@ -351,6 +351,74 @@ async fn a_terminated_query_cannot_be_cancelled_and_is_left_alone() {
                 "case {case:?}: a query that had not terminated must be cancelled"
             );
         }
+    }
+}
+
+/// RULE: the transition the CLOCK owes a run has already happened when a
+/// cancellation arrives — a run whose settle instant
+/// ([`state::QUERY_SETTLE_AFTER`]) has passed had ended whether or not anybody
+/// asked, so it is terminated and `InactiveQueryException` refuses the
+/// cancellation; a run still inside that span is cancelled.
+///
+/// The rows vary HOW FAR the settle instant is from now, on both sides of it and at
+/// the span itself, so the case is the clock rather than one offset.
+#[tokio::test]
+async fn a_run_the_clock_has_already_ended_cannot_be_cancelled() {
+    let emulator = Emulator::new();
+    seed_store(&emulator, STORE_ID, HOME_REGION, EventDataStoreState::Enabled);
+
+    // (how long ago the run was started, whether the clock had ended it by now).
+    let rows: Vec<(Duration, bool)> = vec![
+        (Duration::ZERO, false),
+        (state::QUERY_SETTLE_AFTER / 2, false),
+        (state::QUERY_SETTLE_AFTER, true),
+        (state::QUERY_SETTLE_AFTER + Duration::from_millis(250), true),
+        (state::QUERY_SETTLE_AFTER + Duration::from_secs(3_600), true),
+    ];
+
+    for (nth, (started_ago, ended)) in rows.into_iter().enumerate() {
+        let started = SystemTime::now() - started_ago;
+        let record = QueryRecord {
+            // `QUEUED` is the status `StartQuery` mints a run in; the settle instant
+            // is what says whether the clock has moved it on since.
+            created_at: Some(started),
+            settles_at: Some(started + state::QUERY_SETTLE_AFTER),
+            ..query_in(nth as u8, QueryState::Queued)
+        };
+        seed_query(&emulator, &record);
+        let case = format!("a run started {started_ago:?} ago");
+
+        let reply = emulator
+            .call(
+                "CancelQuery",
+                &json!({ "QueryId": record.query_id, "EventDataStore": STORE_ID }),
+            )
+            .await;
+        if ended {
+            reply.expect_error(&case, 400, "InactiveQueryException");
+            let status = stored_status(&emulator, &record.query_id);
+            assert_eq!(
+                status,
+                QueryState::Finished.as_wire(),
+                "case {case:?}: the clock had ended the run, so it must read FINISHED, got \
+                 {status:?}"
+            );
+        } else {
+            reply.expect_ok(&case);
+            let status = stored_status(&emulator, &record.query_id);
+            assert_eq!(
+                status,
+                QueryState::Cancelled.as_wire(),
+                "case {case:?}: the run was still in flight, so it must be cancelled, got \
+                 {status:?}"
+            );
+        }
+        let described = described_status(&emulator, &case, &record.query_id).await;
+        assert_eq!(
+            described, stored_status(&emulator, &record.query_id),
+            "case {case:?}: DescribeQuery must report the status the registry holds, got \
+             {described:?}"
+        );
     }
 }
 

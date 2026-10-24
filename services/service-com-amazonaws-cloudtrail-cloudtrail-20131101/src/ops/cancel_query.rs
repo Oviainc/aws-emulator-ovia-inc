@@ -200,6 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             CancelQueryErrorModeled::UnsupportedOperationException(
@@ -213,6 +214,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
         })?;
         let mut store = state.lock();
+        // The transition the clock owed each run is applied before this call reads
+        // any status, the way `DescribeQuery` applies it: a run that was due to end
+        // before this call was made HAD ended whether or not anybody asked, so a
+        // cancellation cannot overtake it — "Cancels a query if the query is not in
+        // a terminated state" is decided on the status the run is already in.
+        store.settle_queries(now);
 
         // An event data store NAMED in the request is resolved first — the member is
         // deprecated here ("EventDataStore is no longer required by
