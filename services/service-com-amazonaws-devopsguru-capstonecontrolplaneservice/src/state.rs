@@ -30,8 +30,9 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{
     AccountInsightHealth, AnomalyReportedTimeRange, AnomalyResource, AnomalySourceDetails,
     AnomalySourceMetadata, AnomalyTimeRange, CloudFormationCollection, CloudFormationHealth,
-    InsightHealth, InsightTimeRange, ListInsightsStatusFilter, MonitoredResourceIdentifier,
-    PredictionTimeRange, ProactiveAnomaly, ProactiveInsight, ProactiveInsightSummary,
+    CloudWatchMetricsDetail, InsightHealth, InsightTimeRange, ListInsightsStatusFilter,
+    MonitoredResourceIdentifier, PerformanceInsightsMetricsDetail, PredictionTimeRange,
+    ProactiveAnomaly, ProactiveInsight, ProactiveInsightSummary,
     ProactiveOrganizationInsightSummary, ReactiveAnomaly, ReactiveInsight, ReactiveInsightSummary,
     ReactiveOrganizationInsightSummary, ResourceCollection, ServiceCollection, ServiceHealth,
     ServiceInsightHealth, TagCollection, TagHealth, ValidationException, ValidationExceptionField,
@@ -216,6 +217,40 @@ impl ComAmazonawsDevopsguruCapstonecontrolplaneserviceState {
         InsightTally::over(self.insights.values(), |_| true)
     }
 
+    /// How many metrics this store records DevOps Guru's analysis as having analysed —
+    /// what `MetricsAnalyzed` counts, "the number of metrics that have been analyzed in
+    /// your Amazon Web Services account".
+    ///
+    /// A metric enters this store only as the evidence an anomaly carries in its
+    /// `SourceDetails`: those are the metrics the analysis read, from either modelled
+    /// metric source. Counted by metric IDENTITY, so one metric that two anomalies both
+    /// name is one metric analysed, and an account over which no analysis has run has
+    /// analysed none.
+    pub fn analyzed_metric_count(&self) -> i32 {
+        let analysed: BTreeSet<AnalysedMetric> = self
+            .anomalies
+            .values()
+            .filter_map(|anomaly| anomaly.source_details.as_ref())
+            .flat_map(|details| {
+                details
+                    .cloud_watch_metrics
+                    .iter()
+                    .flatten()
+                    .map(AnalysedMetric::of_cloud_watch)
+                    .chain(
+                        details
+                            .performance_insights_metrics
+                            .iter()
+                            .flatten()
+                            .map(AnalysedMetric::of_performance_insights),
+                    )
+            })
+            .collect();
+        // The set is bounded by what the store holds, so the saturating arm is
+        // unreachable; it is here so the conversion cannot panic.
+        i32::try_from(analysed.len()).unwrap_or(i32::MAX)
+    }
+
     /// Remove the insight `insight_id` names together with the anomalies that belong
     /// to it, answering the record removed, or `None` when the store held no insight
     /// under that id and nothing was removed.
@@ -246,6 +281,91 @@ impl ComAmazonawsDevopsguruCapstonecontrolplaneserviceState {
 /// reports over the same store — the reads of one store agree instead of contradicting
 /// each other.
 pub const MEMBER_ANALYZED_RESOURCE_COUNT: i64 = 1;
+
+/// The IDENTITY of one metric DevOps Guru's analysis read, as the anomaly evidence in
+/// the store names it: the members that pick out WHICH metric, with the statistic,
+/// period and sampled data the analysis read off it left out.
+///
+/// Counting identities rather than source-detail entries is what makes
+/// [`ComAmazonawsDevopsguruCapstonecontrolplaneserviceState::analyzed_metric_count`] a
+/// count of metrics: the same metric is often the evidence of more than one anomaly,
+/// and it was analysed once.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum AnalysedMetric {
+    /// A CloudWatch metric, named by the namespace and metric name it is published
+    /// under together with the dimensions that select the one time series.
+    CloudWatch {
+        namespace: String,
+        metric_name: String,
+        /// Sorted: a dimension set is unordered, so the identity must not depend on
+        /// the order one record happens to list it in.
+        dimensions: Vec<(String, String)>,
+    },
+    /// A Performance Insights metric, named by its display name and the query that
+    /// selects it — the metric, the dimension group it is grouped by and the filter
+    /// applied to it.
+    PerformanceInsights {
+        display_name: String,
+        metric: String,
+        group: String,
+        group_dimensions: Vec<String>,
+        /// Sorted for the same reason the CloudWatch dimensions are: the filter is a
+        /// map, which has no order of its own.
+        filter: Vec<(String, String)>,
+    },
+}
+
+impl AnalysedMetric {
+    fn of_cloud_watch(metric: &CloudWatchMetricsDetail) -> Self {
+        let mut dimensions: Vec<(String, String)> = metric
+            .dimensions
+            .iter()
+            .flatten()
+            .map(|dimension| {
+                (
+                    dimension.name.clone().unwrap_or_default(),
+                    dimension.value.clone().unwrap_or_default(),
+                )
+            })
+            .collect();
+        dimensions.sort();
+        Self::CloudWatch {
+            namespace: metric.namespace.clone().unwrap_or_default(),
+            metric_name: metric.metric_name.clone().unwrap_or_default(),
+            dimensions,
+        }
+    }
+
+    fn of_performance_insights(metric: &PerformanceInsightsMetricsDetail) -> Self {
+        let query = metric.metric_query.as_ref();
+        let group_by = query.and_then(|query| query.group_by.as_ref());
+        let mut group_dimensions: Vec<String> = group_by
+            .and_then(|group_by| group_by.dimensions.clone())
+            .unwrap_or_default();
+        group_dimensions.sort();
+        let mut filter: Vec<(String, String)> = query
+            .and_then(|query| query.filter.as_ref())
+            .map(|filter| {
+                filter
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        filter.sort();
+        Self::PerformanceInsights {
+            display_name: metric.metric_display_name.clone().unwrap_or_default(),
+            metric: query
+                .and_then(|query| query.metric.clone())
+                .unwrap_or_default(),
+            group: group_by
+                .and_then(|group_by| group_by.group.clone())
+                .unwrap_or_default(),
+            group_dimensions,
+            filter,
+        }
+    }
+}
 
 /// `InsightType`'s `REACTIVE` member, as the model spells it — see
 /// `INSIGHT_TYPE_VALUES` in `ops/types/shared_types.rs`. Its `PROACTIVE` member is
