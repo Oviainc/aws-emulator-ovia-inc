@@ -87,8 +87,15 @@ async fn update_deployment(
         .await
 }
 
-/// `GetDeployment` for `deployment` of `api`, asserting the modelled 200.
-async fn get_deployment(gateway: &Gateway, api: &str, deployment: &str, case: &str) -> Value {
+/// `GetDeployment` for `deployment` of `api`, asserting the modelled 200. Shared with
+/// the `delete_stage` suite, which reads an API's deployments back to show a stage delete
+/// left them alone.
+pub(crate) async fn get_deployment(
+    gateway: &Gateway,
+    api: &str,
+    deployment: &str,
+    case: &str,
+) -> Value {
     let answer = gateway
         .call(
             "GET",
