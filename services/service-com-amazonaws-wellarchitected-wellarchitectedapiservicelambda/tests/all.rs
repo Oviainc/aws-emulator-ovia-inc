@@ -23,6 +23,9 @@ mod custom_lens_import;
 #[path = "all/custom_lens_versions.rs"]
 mod custom_lens_versions;
 
+#[path = "all/get_agent_profile.rs"]
+mod get_agent_profile;
+
 #[path = "all/lens_listing.rs"]
 mod lens_listing;
 

@@ -7,6 +7,14 @@
 //! has made due already applied. An `environmentId` this service holds no environment
 //! for in the request's Region is a `ResourceNotFoundException`.
 //!
+//! `connectorId` is a FILTER on that environment's records here, not a lookup of its
+//! own: "Returns existing entitlements for virtual machines associated with the
+//! specified environment and connector" (this operation's doc), so a connector that
+//! holds no entitlement in the environment is an empty page. It cannot report a
+//! phantom connector's entitlement either way, because
+//! [`crate::ops::create_entitlement`] refuses to create one through a `connectorId`
+//! the environment holds no live vCenter connector for.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements

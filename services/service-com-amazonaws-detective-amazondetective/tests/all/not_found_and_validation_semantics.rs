@@ -143,6 +143,14 @@ fn graph_scoped_calls() -> Vec<GraphScopedCall> {
             uri: |arn| format!("/tags/{arn}"),
             body: |_| Value::Null,
         },
+        GraphScopedCall {
+            // `UntagResource` binds `TagKeys` to the repeated `tagKeys` query
+            // parameter, so its keys live in the URI beside the ARN.
+            name: "UntagResource",
+            method: "DELETE",
+            uri: |arn| format!("/tags/{arn}?tagKeys=Env"),
+            body: |_| Value::Null,
+        },
     ]
 }
 
@@ -785,25 +793,10 @@ fn stored_package_states(
     .collect()
 }
 
-/// Every tag of `graph_arn`, as `ListTagsForResource` reports them.
+/// Every tag of `graph_arn` in this suite's Region, as `ListTagsForResource` reports
+/// them: the shared harness's one reader, bound to the Region this suite signs for.
 async fn tags_of(router: &MultiServiceRouter, graph_arn: &str) -> Map<String, Value> {
-    let (status, listed) = call_with(
-        router,
-        "GET",
-        REGION,
-        &format!("/tags/{graph_arn}"),
-        &Value::Null,
-    )
-    .await;
-    assert_eq!(
-        status, 200,
-        "ListTagsForResource: expected 200, got {status} {listed:?}"
-    );
-    listed
-        .get("Tags")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_else(|| panic!("ListTagsForResource carried no Tags, got {listed:?}"))
+    crate::support::tags_of(router, REGION, graph_arn).await
 }
 
 #[tokio::test]
