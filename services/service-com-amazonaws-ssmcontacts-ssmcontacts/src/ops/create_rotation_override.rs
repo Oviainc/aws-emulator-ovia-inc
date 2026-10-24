@@ -163,7 +163,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // derived from the rotation's own ARN, so nothing is read off the request envelope.
         let _ = ctx;
 
-        use crate::state::{rotation_override_id, rotation_override_key, RotationOverrideRecord};
+        use crate::state::{
+            instant, rotation_override_id, rotation_override_key, RotationOverrideRecord,
+        };
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(internal());
@@ -285,11 +287,6 @@ const ROTATION_OVERRIDE_RESOURCE_TYPE: &str = "rotation-override";
 /// The `resourceType` a not-found error names for a contact, spelled as the contact
 /// handlers spell it.
 const CONTACT_RESOURCE_TYPE: &str = "contact";
-
-/// One instant as a total-ordering key, so two `DateTime`s compare to the nanosecond.
-fn instant(at: &::aws_smithy_types::DateTime) -> (i64, u32) {
-    (at.secs(), at.subsec_nanos())
-}
 
 /// This operation's modelled 404, carrying the ARN the request named.
 fn not_found(

@@ -27,6 +27,8 @@ mod capacity_provider_naming;
 mod capacity_providers;
 #[path = "all/code_signing_configs.rs"]
 mod code_signing_configs;
+#[path = "all/event_source_mapping_deletion.rs"]
+mod event_source_mapping_deletion;
 #[path = "all/event_source_mappings.rs"]
 mod event_source_mappings;
 #[path = "all/function_aliases.rs"]

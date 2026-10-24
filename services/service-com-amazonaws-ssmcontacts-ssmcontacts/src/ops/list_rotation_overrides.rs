@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListRotationOverrides
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListRotationOverrides`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListRotationOverrides::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the overrides of ONE on-call rotation whose own window covers some instant of
+//! the time range the request names, in the order the store minted them, one page at a
+//! time. A read: it reports what `CreateRotationOverride` persisted and writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +156,137 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListRotationOverrides` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListRotationOverridesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListRotationOverrides"))
+        use crate::state::{
+            decode_next_token, instant, invalid_next_token_message, page_size,
+            rotation_override_summary, take_page, TOKEN_SCOPE_ROTATION_OVERRIDES,
+        };
+
+        // The listing is addressed entirely by `RotationId` and the requested window, so
+        // nothing is read off the request envelope.
+        let _ = ctx;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal());
+        };
+
+        let state = state.lock();
+
+        // The account gate comes FIRST: before the pagination token is read and before any
+        // override is, so a non-onboarded account is refused identically whether or not the
+        // rotation it named exists and whatever else the request carries. The refusal is the
+        // ARN-shaped one `GetRotation`/`GetRotationOverride` answer, since this listing's
+        // whole subject is the resources under one rotation ARN.
+        state
+            .require_active_replication_set_for(&input.rotation_id)
+            .map_err(account_precondition_failed)?;
+
+        // The resume point: the creation sequence the previous page ended on, as
+        // `ListContactChannels` encodes its own — this list's order is the store's minting
+        // order, which an override's id (a digest) does not follow.
+        let after: Option<u64> = match input.next_token.as_deref().filter(|token| !token.is_empty())
+        {
+            Some(token) => Some(
+                decode_next_token(TOKEN_SCOPE_ROTATION_OVERRIDES, token)
+                    .and_then(|decoded| decoded.parse::<u64>().ok())
+                    .ok_or_else(|| validation(invalid_next_token_message(token)))?,
+            ),
+            None => None,
+        };
+
+        // An override is an override OF a rotation, so a rotation the store does not hold
+        // has no overrides to report — and no empty list either, exactly as
+        // `ListContactChannels` refuses a contact it cannot resolve.
+        if !state.rotations.contains_key(&input.rotation_id) {
+            return Err(ListRotationOverridesErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: format!("Rotation {} not found", input.rotation_id),
+                    resource_id: input.rotation_id.clone(),
+                    resource_type: ROTATION_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // A range whose end precedes its start names no time range at all, so it is refused
+        // rather than answered with the empty page it would select. The message is built
+        // from the request, naming the member at fault and the bound it failed.
+        if instant(&input.end_time) < instant(&input.start_time) {
+            return Err(validation(format!(
+                "Value at 'endTime' failed to satisfy constraint: Member must not be earlier \
+                 than 'startTime' ({})",
+                input.start_time.as_secs_f64()
+            )));
+        }
+
+        // The requested range as a closed interval, against which each override's own
+        // closed window is tested: an override is "in the time range" when the two
+        // intersect, i.e. the override covers some instant of the range. An override
+        // entirely before or entirely after the range covers none of it and is left out.
+        let from = instant(&input.start_time);
+        let to = instant(&input.end_time);
+
+        let matching: Vec<(u64, RotationOverride)> = state
+            .rotation_overrides_of(&input.rotation_id)
+            .into_iter()
+            .filter(|record| after.is_none_or(|last| record.sequence > last))
+            .filter(|record| instant(&record.start_time) <= to && instant(&record.end_time) >= from)
+            .map(|record| (record.sequence, rotation_override_summary(record)))
+            .collect();
+
+        let (page, next_token) = take_page(
+            matching,
+            page_size(input.max_results),
+            TOKEN_SCOPE_ROTATION_OVERRIDES,
+            |(sequence, _)| sequence.to_string(),
+        );
+
+        Ok(ListRotationOverridesOutput {
+            next_token,
+            rotation_overrides: Some(
+                page.into_iter()
+                    .map(|(_, rotation_override)| rotation_override)
+                    .collect(),
+            ),
+        })
     }
+}
+
+/// The `resourceType` this operation's not-found error names for the rotation whose
+/// overrides were asked for, spelled as `CreateRotation`'s own errors spell it.
+const ROTATION_RESOURCE_TYPE: &str = "rotation";
+
+/// The account precondition's refusal: this operation's modelled `ValidationException`,
+/// which the model classifies `client` with `httpError` 400.
+///
+/// `reason` carries `OTHER` and `fields` is present but EMPTY, exactly as every gated
+/// operation in this service answers: the failure is account level, so no field of the
+/// request is at fault.
+fn account_precondition_failed(message: String) -> ListRotationOverridesError {
+    ListRotationOverridesErrorModeled::ValidationException(ValidationException {
+        message,
+        reason: Some("OTHER".to_string()),
+        fields: Some(Vec::new()),
+    })
+    .into()
+}
+
+/// A member-level refusal: the same modelled `ValidationException`, carrying `message`.
+fn validation(message: impl Into<String>) -> ListRotationOverridesError {
+    ListRotationOverridesErrorModeled::ValidationException(ValidationException {
+        message: message.into(),
+        reason: Some("FIELD_VALIDATION_FAILED".to_string()),
+        fields: None,
+    })
+    .into()
+}
+
+/// The modelled server fault for an engine that holds no state at all: without a store
+/// there is nothing to list overrides from, and that is this emulator's own failure rather
+/// than anything about the request.
+fn internal() -> ListRotationOverridesError {
+    ListRotationOverridesErrorModeled::InternalServerException(InternalServerException {
+        message: "this service is mounted on an engine that holds no state".to_string(),
+        retry_after_seconds: 0,
+    })
+    .into()
 }

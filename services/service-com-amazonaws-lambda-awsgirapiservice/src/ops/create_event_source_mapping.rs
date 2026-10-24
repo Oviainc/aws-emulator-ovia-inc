@@ -7,6 +7,13 @@
 //! answers `Creating`, and the move to the state its `Enabled` setting asks for is owed
 //! by the CLOCK (see [`crate::state::EventSourceMappingRecord::materialize`]).
 //!
+//! The event source has to be one `EventSourceArn` names: a resource of one of the
+//! vendors and resource types that member enumerates, in this account (see
+//! [`crate::state::names_event_source`] and
+//! [`crate::state::event_source_is_mappable_by_this_account`]). Anything else is refused
+//! with the modelled `InvalidParameterValueException` rather than stored as a mapping of
+//! a source nothing could poll.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -363,6 +370,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // Each entry of that enumeration is a resource of ONE vendor namespace and ONE
+        // resource type, in the account doing the mapping, so an ARN naming anything else
+        // names nothing this mapping could poll however well formed it is.
+        if let Some(event_source) = event_source_arn.as_deref() {
+            let Some(parsed) = ::service_common::arn::parse(event_source) else {
+                return Err(invalid_parameter(format!(
+                    "Value '{event_source}' at 'eventSourceArn' failed to satisfy constraint: \
+                     Member must be the Amazon Resource Name of an event source"
+                )));
+            };
+            if !crate::state::names_event_source(&parsed) {
+                return Err(invalid_parameter(format!(
+                    "Unrecognized event source '{event_source}'. An event source mapping polls \
+                     an Amazon Kinesis data stream or stream consumer, an Amazon DynamoDB \
+                     stream, an Amazon Simple Queue Service queue, an Amazon Managed Streaming \
+                     for Apache Kafka cluster or VPC connection, an Amazon MQ broker or an \
+                     Amazon DocumentDB change stream"
+                )));
+            }
+            if !crate::state::event_source_is_mappable_by_this_account(&parsed) {
+                return Err(invalid_parameter(format!(
+                    "The event source '{event_source}' belongs to account '{}' rather than to \
+                     account '{}', which this request is made in",
+                    parsed.account,
+                    ::engine::emulator_account_id()
+                )));
+            }
+        }
+
         // Which service the event source belongs to is what the per-source defaults and
         // requirements the model documents are keyed on.
         let vendor = event_source_arn
@@ -411,6 +447,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx);
         let mut store = state.lock();
+        // Every mapping this store reports is first brought up to whatever the clock has
+        // already made due, so a mapping whose deletion is due is gone before this call
+        // looks for a conflict with it.
+        store.materialize_all(now);
 
         // The mapping invokes one function, so the `FunctionName` it names — in any of
         // its documented forms, qualified or not — has to resolve to a record this store
@@ -559,6 +599,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state: crate::state::EVENT_SOURCE_MAPPING_STATE_CREATING.to_string(),
             state_transition_reason: crate::state::EVENT_SOURCE_MAPPING_USER_INITIATED.to_string(),
             settled_due: now + crate::state::EVENT_SOURCE_MAPPING_SETTLE_DELAY,
+            // Nobody has deleted this mapping, so no removal is owed.
+            removal_due: None,
             last_modified: now,
         };
         store.event_source_mappings.insert(uuid.clone(), record);
