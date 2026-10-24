@@ -37,6 +37,11 @@ use crate::ops::types::ScopeConfiguration;
 // resource's current configuration as.
 use crate::ops::types::BaseConfigurationItem;
 
+// `AggregateResourceIdentifier` and `ConfigurationItem` are named separately for the
+// same reason: the first is how an aggregate read path NAMES one resource, the second
+// is the FULL configuration item the single-resource aggregate read reports.
+use crate::ops::types::{AggregateResourceIdentifier, ConfigurationItem};
+
 // `StoredQueryMetadata` is named separately for the same reason: it is what a listing
 // of stored queries reports each one as.
 use crate::ops::types::StoredQueryMetadata;
@@ -1714,6 +1719,64 @@ impl DiscoveredResourceEntry {
         }
     }
 
+    /// The resource's CURRENT configuration item as the FULL `ConfigurationItem` the
+    /// single-resource aggregate read reports, which is
+    /// [`Self::to_base_configuration_item`] plus the four members a
+    /// `BaseConfigurationItem` leaves out.
+    ///
+    /// Built from the base item so the two read paths cannot drift: every member they
+    /// share is computed in ONE place.
+    ///
+    /// Of those four extra members, the resource's TAGS are reported — the tags the
+    /// inventory recorded with the configuration item, which only the APIs that
+    /// document dropping them (`BatchGetAggregateResourceConfig`: "The API does not
+    /// return tags and relationships") leave out — while `relationships` and
+    /// `relatedEvents` stay unset because nothing in this emulator knows them: a
+    /// relationship is another resource the owning service links this one to, and a
+    /// related event is a CloudTrail event id, neither of which a recorded
+    /// configuration item carries.
+    pub fn to_configuration_item(
+        &self,
+        aws_region: &str,
+        recording_frequency: &str,
+    ) -> ConfigurationItem {
+        let base = self.to_base_configuration_item(aws_region, recording_frequency);
+        ConfigurationItem {
+            version: base.version,
+            account_id: base.account_id,
+            configuration_item_capture_time: base.configuration_item_capture_time,
+            configuration_item_status: base.configuration_item_status,
+            configuration_state_id: base.configuration_state_id,
+            // "Unique MD5 hash that represents the configuration item's state", which a
+            // caller uses "to compare the states of two or more configuration items".
+            // This store holds no digest of a recorded configuration item — nothing that
+            // writes one computes or persists it — so none is reported rather than one
+            // being synthesised here; the member is optional, and
+            // `configurationStateId` is the value this API reports for ordering and
+            // comparing a resource's items.
+            configuration_item_md5_hash: None,
+            arn: base.arn,
+            resource_type: base.resource_type,
+            resource_id: base.resource_id,
+            resource_name: base.resource_name,
+            aws_region: base.aws_region,
+            availability_zone: base.availability_zone,
+            resource_creation_time: base.resource_creation_time,
+            tags: (!self.tags.is_empty()).then(|| {
+                self.tags
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect()
+            }),
+            related_events: None,
+            relationships: None,
+            configuration: base.configuration,
+            supplementary_configuration: base.supplementary_configuration,
+            recording_frequency: base.recording_frequency,
+            configuration_item_delivery_time: base.configuration_item_delivery_time,
+        }
+    }
+
     /// The `ConfigurationItemStatus` of the resource's current configuration item: the
     /// resource has been deleted, its configuration has been recorded, or it has been
     /// discovered without its configuration being recorded.
@@ -2301,6 +2364,44 @@ impl ComAmazonawsConfigserviceStarlingdoveserviceState {
             .or(Some(mode.recording_frequency.as_str()))
             .filter(|frequency| !frequency.is_empty())
             .unwrap_or(RECORDING_FREQUENCY_CONTINUOUS)
+    }
+
+    /// The CURRENT configuration item the aggregator `aggregator` holds for the
+    /// aggregate resource identifier `identifier`, where this store holds one.
+    ///
+    /// The ONE lookup every aggregate configuration-item read uses, so the batch path
+    /// and the single-resource path cannot disagree about what an identifier names.
+    ///
+    /// The identity of an aggregated resource is the source account, the source
+    /// Region, the resource type and the resource id — every required member of
+    /// `AggregateResourceIdentifier`. `ResourceName` is optional, so it names no
+    /// resource on its own and is not part of the lookup. This store stands for ONE
+    /// account in ONE Region (`account_id` in `region`), so an identifier naming any
+    /// other source names data this store does not hold, and nothing is held either
+    /// for a source or a resource type outside the aggregator's own scope, for a
+    /// resource the inventory does not hold, or for a deleted one ("The API does not
+    /// return results for deleted resources").
+    pub fn aggregated_resource(
+        &self,
+        aggregator: &ConfigurationAggregatorEntry,
+        identifier: &AggregateResourceIdentifier,
+        account_id: &str,
+        region: &str,
+    ) -> Option<&DiscoveredResourceEntry> {
+        let aggregated = aggregator
+            .aggregates_source(&identifier.source_account_id, &identifier.source_region)
+            && aggregator.aggregates_resource_type(&identifier.resource_type)
+            && identifier.source_account_id == account_id
+            && identifier.source_region == region;
+        if !aggregated {
+            return None;
+        }
+        self.discovered_resources
+            .get(&(
+                identifier.resource_type.clone(),
+                identifier.resource_id.clone(),
+            ))
+            .filter(|entry| entry.deleted_at.is_none())
     }
 
     /// How many discovered resources Config holds of each resource type it is
@@ -3492,6 +3593,24 @@ pub fn retention_configurations_quota_message() -> String {
         "Failed to add the retention configuration because this account already holds \
          the maximum of {RETENTION_CONFIGURATIONS_QUOTA} retention configuration(s) in \
          this region."
+    )
+}
+
+/// How Config words `ResourceNotDiscoveredException` — "You have specified a resource
+/// that is either unknown or has not been discovered" — for an aggregate resource
+/// identifier the named aggregator holds no current configuration item for.
+///
+/// The message is BUILT FROM THE REQUEST: it quotes all four members that identify an
+/// aggregated resource, so a caller can tell which of them put the resource outside
+/// what the aggregator holds.
+pub fn resource_not_discovered_message(identifier: &AggregateResourceIdentifier) -> String {
+    format!(
+        "The resource '{}' of type '{}' in account '{}' and region '{}' is either \
+         unknown or has not been discovered.",
+        identifier.resource_id,
+        identifier.resource_type,
+        identifier.source_account_id,
+        identifier.source_region,
     )
 }
 

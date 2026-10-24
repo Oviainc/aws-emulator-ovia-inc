@@ -80,6 +80,46 @@ pub enum AlarmTemplateRefusal {
     StoreFull,
 }
 
+/// Why [`ComAmazonawsMedialiveMedialiveState::update_alarm_template`] changed
+/// nothing. Each variant is one modelled refusal of
+/// `UpdateCloudWatchAlarmTemplate`.
+#[derive(Debug)]
+pub enum AlarmTemplateUpdateRefusal {
+    /// No template in the request's region has that id or name, so there is no
+    /// template to change. Carries the identifier that resolved to nothing.
+    NotFound { identifier: String },
+    /// No cloudwatch alarm template group in the request's region has that id or
+    /// name, so there is no group to move the template into. Carries the
+    /// identifier that resolved to nothing.
+    GroupNotFound { identifier: String },
+    /// Another template in the same region already carries the name asked for,
+    /// which `Name` is documented to make unique there. Carries the name and the
+    /// id of the template that holds it.
+    NameTaken { id: String, name: String },
+}
+
+/// What one update asks the store to change: a member the request carried is
+/// `Some` and replaces the stored one, a member it omitted is `None` and leaves
+/// that setting as it was.
+#[derive(Debug, Clone, Default)]
+pub struct CloudWatchAlarmTemplateChanges {
+    /// The identifier of the group to move the template into ("Can be either be
+    /// its id or current name"), resolved to a group id before anything is
+    /// written.
+    pub group_identifier: Option<String>,
+    pub name: Option<String>,
+    pub description: Option<String>,
+    pub comparison_operator: Option<String>,
+    pub datapoints_to_alarm: Option<i32>,
+    pub evaluation_periods: Option<i32>,
+    pub metric_name: Option<String>,
+    pub period: Option<i32>,
+    pub statistic: Option<String>,
+    pub target_resource_type: Option<String>,
+    pub threshold: Option<f64>,
+    pub treat_missing_data: Option<String>,
+}
+
 /// One created cloudwatch alarm template, as `CreateCloudWatchAlarmTemplate`
 /// stored it.
 ///
@@ -212,6 +252,109 @@ impl ComAmazonawsMedialiveMedialiveState {
         Ok(id)
     }
 
+    /// Apply `changes` to the cloudwatch alarm template `identifier` names in
+    /// `region` and answer its id — or refuse, changing nothing.
+    ///
+    /// "Updates the specified cloudwatch alarm template": a member `changes`
+    /// carries replaces the stored one and a member it omits leaves that setting
+    /// as it was, so an update is a partial write rather than a replacement of
+    /// the whole record. The id, the ARN, the region, the tags and `CreatedAt`
+    /// are the template's identity and are never rewritten; `ModifiedAt` moves
+    /// to `now` because this call is what modified it.
+    ///
+    /// The identifier resolution, the group resolution, the name-uniqueness rule
+    /// and the write live together here, so a handler cannot check one of them
+    /// and write past another; the handler's job is only to turn an
+    /// [`AlarmTemplateUpdateRefusal`] into the operation's own modelled error.
+    pub fn update_alarm_template(
+        &mut self,
+        region: &str,
+        identifier: &str,
+        changes: CloudWatchAlarmTemplateChanges,
+        now: SystemTime,
+    ) -> Result<String, AlarmTemplateUpdateRefusal> {
+        let Some(template) = self.alarm_template(region, identifier) else {
+            return Err(AlarmTemplateUpdateRefusal::NotFound {
+                identifier: identifier.to_string(),
+            });
+        };
+        let id = template.id.clone();
+
+        // A `GroupIdentifier` is resolved against the groups of the request's
+        // region, exactly as the create resolves it, so the stored `GroupId` is
+        // a group that exists rather than whatever the request spelled.
+        let group_id = match changes.group_identifier.as_deref() {
+            Some(group_identifier) => {
+                let Some(group) = self.alarm_template_group(region, group_identifier) else {
+                    return Err(AlarmTemplateUpdateRefusal::GroupNotFound {
+                        identifier: group_identifier.to_string(),
+                    });
+                };
+                Some(group.id.clone())
+            }
+            None => None,
+        };
+
+        // A rename collides only with ANOTHER template: a request that renames a
+        // template to the name it already carries asks for no change and is not
+        // a conflict.
+        if let Some(name) = changes.name.as_deref() {
+            if let Some(taken) = self
+                .alarm_template_named(region, name)
+                .filter(|taken| taken.id != id)
+            {
+                return Err(AlarmTemplateUpdateRefusal::NameTaken {
+                    id: taken.id.clone(),
+                    name: name.to_string(),
+                });
+            }
+        }
+
+        let Some(template) = self.alarm_templates.get_mut(&id) else {
+            return Err(AlarmTemplateUpdateRefusal::NotFound {
+                identifier: identifier.to_string(),
+            });
+        };
+        if let Some(group_id) = group_id {
+            template.group_id = group_id;
+        }
+        if let Some(name) = changes.name {
+            template.name = name;
+        }
+        if let Some(description) = changes.description {
+            template.description = Some(description);
+        }
+        if let Some(comparison_operator) = changes.comparison_operator {
+            template.comparison_operator = comparison_operator;
+        }
+        if let Some(datapoints_to_alarm) = changes.datapoints_to_alarm {
+            template.datapoints_to_alarm = Some(datapoints_to_alarm);
+        }
+        if let Some(evaluation_periods) = changes.evaluation_periods {
+            template.evaluation_periods = evaluation_periods;
+        }
+        if let Some(metric_name) = changes.metric_name {
+            template.metric_name = metric_name;
+        }
+        if let Some(period) = changes.period {
+            template.period = period;
+        }
+        if let Some(statistic) = changes.statistic {
+            template.statistic = statistic;
+        }
+        if let Some(target_resource_type) = changes.target_resource_type {
+            template.target_resource_type = target_resource_type;
+        }
+        if let Some(threshold) = changes.threshold {
+            template.threshold = threshold;
+        }
+        if let Some(treat_missing_data) = changes.treat_missing_data {
+            template.treat_missing_data = treat_missing_data;
+        }
+        template.modified_at = now;
+        Ok(id)
+    }
+
     /// The template `identifier` names in `region`, resolving it as the
     /// template's id or its current name — the two forms
     /// `GetCloudWatchAlarmTemplateRequest$Identifier` documents ("Can be either
@@ -290,9 +433,8 @@ impl ComAmazonawsMedialiveMedialiveState {
 
 /// Project a stored [`CloudWatchAlarmTemplateRecord`] onto one of the
 /// structurally identical per-operation template output shapes
-/// (`CreateCloudWatchAlarmTemplateOutput` and
-/// `GetCloudWatchAlarmTemplateOutput` today;
-/// `UpdateCloudWatchAlarmTemplateOutput` when its own issue lands).
+/// (`CreateCloudWatchAlarmTemplateOutput`, `GetCloudWatchAlarmTemplateOutput`
+/// and `UpdateCloudWatchAlarmTemplateOutput`).
 ///
 /// One macro rather than a hand-written copy per operation, so a create and the
 /// read that follows it cannot report the same stored template differently.

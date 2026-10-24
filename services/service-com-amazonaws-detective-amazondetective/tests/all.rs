@@ -15,6 +15,8 @@
 mod account_behavior_graph_singleton;
 #[path = "all/behavior_graph_lifecycle.rs"]
 mod behavior_graph_lifecycle;
+#[path = "all/datasource_package_ingest.rs"]
+mod datasource_package_ingest;
 #[path = "all/member_verification_outcome.rs"]
 mod member_verification_outcome;
 #[path = "all/not_found_and_validation_semantics.rs"]
