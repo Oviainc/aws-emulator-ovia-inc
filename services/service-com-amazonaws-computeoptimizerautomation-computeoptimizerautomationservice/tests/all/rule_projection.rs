@@ -1,20 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! Every read path projects a stored automation rule IN FULL.
+//! Every read path projects a stored automation rule as it is STORED.
 //!
-//! A rule's `description`, `priority` and `lastUpdatedTimestamp` are members of
-//! the rule itself, not of the request that created it: a create that named none
-//! of them still yields a rule that reports all three, because the store holds a
-//! value for each one from the moment the rule exists. These cases drive
-//! `CreateAutomationRule`, `GetAutomationRule`, `ListAutomationRules` and
-//! `UpdateAutomationRule` over a table of creates that differ in WHICH optional
-//! members they carry and in the values they carry, and assert each response
-//! carries the member the model declares on it.
+//! A rule holds only the values its create (or a later update) supplied. The
+//! optional members of a rule — `description` and `priority` — have no default
+//! in the model or in the operation docs, so a rule whose create named neither
+//! holds neither, and `CreateAutomationRule`, `GetAutomationRule`,
+//! `ListAutomationRules` and `UpdateAutomationRule` all leave them out of their
+//! responses instead of reporting a value of the emulator's own. What the create
+//! DID supply comes back verbatim, and `lastUpdatedTimestamp` — which is known
+//! for every rule that exists, because a rule never updated was last changed
+//! when it was created — is reported always.
+//!
+//! These cases drive the four operations over a table of creates that differ in
+//! WHICH optional members they carry and in the values they carry.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_computeoptimizerautomation_computeoptimizerautomationservice::state::{
-    DEFAULT_RULE_DESCRIPTION, DEFAULT_RULE_PRIORITY,
-};
 
 use crate::automation_rule_lifecycle::{call_ok, emulator, member, minimal_rule, string_member};
 
@@ -31,14 +32,22 @@ fn present_string(body: &Value, name: &str, case: &str) -> String {
         .to_string()
 }
 
-/// The member, required to be present and an epoch-seconds Timestamp.
-fn present_timestamp(body: &Value, name: &str, case: &str) -> f64 {
-    let value = member(body, name).as_f64();
-    assert!(
-        value.is_some_and(|seconds| seconds > 0.0),
-        "case {case:?}: {name} must be present and an epoch-seconds Timestamp, got {body}"
-    );
-    value.unwrap_or_default()
+/// Assert `name` is projected exactly as the store holds it: the string the
+/// service holds a value for, and NOTHING AT ALL when it holds none.
+fn assert_projected(body: &Value, name: &str, expected: Option<&String>, case: &str) {
+    match expected {
+        Some(expected) => assert_eq!(
+            &present_string(body, name, case),
+            expected,
+            "case {case:?}: {name} must be reported as stored, got {body}"
+        ),
+        None => assert!(
+            body.get(name).is_none(),
+            "case {case:?}: the service holds no {name} for this rule, so the response must \
+             carry no {name} member, got {:?} in {body}",
+            body.get(name)
+        ),
+    }
 }
 
 /// The rule with `rule_id` in a `ListAutomationRules` page.
@@ -57,114 +66,112 @@ fn listed_rule(listed: &Value, rule_id: &str, case: &str) -> Value {
     found.unwrap_or(Value::Null)
 }
 
-/// `priority` is "a string representation of a decimal number between 0 and 1
-/// (having up to 30 digits after the decimal point)"
-/// (`smithy_query(query="doc",shape="AutomationRule",member="priority")`).
-fn is_documented_priority(priority: &str) -> bool {
-    priority
-        .parse::<f64>()
-        .is_ok_and(|value| (0.0..=1.0).contains(&value))
+/// The member, required to be present and an epoch-seconds Timestamp.
+fn present_timestamp(body: &Value, name: &str, case: &str) -> f64 {
+    let value = member(body, name).as_f64();
+    assert!(
+        value.is_some_and(|seconds| seconds > 0.0),
+        "case {case:?}: {name} must be present and an epoch-seconds Timestamp, got {body}"
+    );
+    value.unwrap_or_default()
 }
 
-/// A create that omits an optional rule member still produces a rule whose
-/// `description`, `priority` and `lastUpdatedTimestamp` every read path reports:
-/// the omitted description is the empty string, the omitted priority is the
-/// service's default precedence, and a rule never updated was last changed when
-/// it was created.
-#[tokio::test]
-async fn every_read_path_projects_a_rules_description_priority_and_last_update() {
-    let router = emulator();
-
-    // (case, the optional members the create carries, expected description,
-    // expected priority). The rows differ along WHICH optional members are sent
-    // and along the values they carry: `description` at nothing, a sentence, the
-    // empty string and the model's 1024-character maximum
-    // (`RuleDescription`, len 0..1024), and `priority` at both documented bounds,
-    // in between, and with the documented maximum of 30 fraction digits.
+/// (case, the optional members the create carries, expected `description`,
+/// expected `priority`) — `None` meaning the member must be ABSENT from every
+/// response.
+///
+/// The rows differ along WHICH optional members are sent and along the values
+/// they carry: `description` at nothing, a sentence, the explicitly empty string
+/// and the model's 1024-character maximum (`RuleDescription`, len 0..1024), and
+/// `priority` at nothing, at both documented bounds, in between, and with the
+/// documented maximum of 30 fraction digits
+/// (`smithy_query(query="doc",shape="AutomationRule",member="priority")`).
+fn projection_cases() -> Vec<(&'static str, Value, Option<String>, Option<String>)> {
     let max_length_description = "d".repeat(1024);
     let smallest_priority = format!("0.{}1", "0".repeat(29));
-    let cases: Vec<(&str, Value, String, String)> = vec![
-        (
-            "no-optional-members",
-            json!({}),
-            DEFAULT_RULE_DESCRIPTION.to_string(),
-            DEFAULT_RULE_PRIORITY.to_string(),
-        ),
+    vec![
+        ("no-optional-members", json!({}), None, None),
         (
             "description-only",
             json!({"description": "Upgrades gp2 volumes overnight."}),
-            "Upgrades gp2 volumes overnight.".to_string(),
-            DEFAULT_RULE_PRIORITY.to_string(),
+            Some("Upgrades gp2 volumes overnight.".to_string()),
+            None,
         ),
         (
             "priority-only",
             json!({"priority": "0.25"}),
-            DEFAULT_RULE_DESCRIPTION.to_string(),
-            "0.25".to_string(),
+            None,
+            Some("0.25".to_string()),
         ),
         (
             "description-and-priority",
             json!({"description": "both members", "priority": "0.5"}),
-            "both members".to_string(),
-            "0.5".to_string(),
+            Some("both members".to_string()),
+            Some("0.5".to_string()),
         ),
         (
             "explicitly-empty-description",
             json!({"description": ""}),
-            String::new(),
-            DEFAULT_RULE_PRIORITY.to_string(),
+            Some(String::new()),
+            None,
         ),
         (
             "description-at-its-maximum-length",
             json!({"description": max_length_description.clone()}),
-            max_length_description.clone(),
-            DEFAULT_RULE_PRIORITY.to_string(),
+            Some(max_length_description),
+            None,
         ),
         (
             "priority-at-the-bottom-of-its-range",
             json!({"priority": "0"}),
-            DEFAULT_RULE_DESCRIPTION.to_string(),
-            "0".to_string(),
+            None,
+            Some("0".to_string()),
         ),
         (
             "priority-at-the-top-of-its-range",
             json!({"priority": "1"}),
-            DEFAULT_RULE_DESCRIPTION.to_string(),
-            "1".to_string(),
+            None,
+            Some("1".to_string()),
         ),
         (
             "priority-with-thirty-fraction-digits",
             json!({"priority": smallest_priority.clone()}),
-            DEFAULT_RULE_DESCRIPTION.to_string(),
-            smallest_priority.clone(),
+            None,
+            Some(smallest_priority),
         ),
-    ];
+    ]
+}
+
+/// A create request carrying the row's optional members.
+fn request_for(index: usize, optional: &Value) -> Value {
+    let mut request = minimal_rule(&format!("projection-rule-{index}"));
+    for (name, value) in optional.as_object().expect("the row is an object") {
+        request[name.as_str()] = value.clone();
+    }
+    request
+}
+
+/// Every read path reports the optional rule members the create supplied, and
+/// omits the ones it did not: no emulator-chosen description or precedence is
+/// invented for a rule whose create named none.
+#[tokio::test]
+async fn every_read_path_projects_only_the_optional_rule_members_the_create_supplied() {
+    let router = emulator();
 
     for (index, (case, optional, expected_description, expected_priority)) in
-        cases.iter().enumerate()
+        projection_cases().iter().enumerate()
     {
-        let mut request = minimal_rule(&format!("projection-rule-{index}"));
-        for (name, value) in optional.as_object().expect("the row is an object") {
-            request[name.as_str()] = value.clone();
-        }
+        let request = request_for(index, optional);
 
-        // Create reports both members the shape declares on its response.
+        // Create reports what it stored.
         let created = call_ok(&router, "CreateAutomationRule", &request, case).await;
         let rule_id = string_member(&created, "ruleId");
         let rule_arn = string_member(&created, "ruleArn");
-        assert_eq!(
-            &present_string(&created, "description", case),
-            expected_description,
-            "case {case:?}: create must report the stored description, got {created}"
-        );
-        assert_eq!(
-            &present_string(&created, "priority", case),
-            expected_priority,
-            "case {case:?}: create must report the stored priority, got {created}"
-        );
+        assert_projected(&created, "description", expected_description.as_ref(), case);
+        assert_projected(&created, "priority", expected_priority.as_ref(), case);
 
-        // Get reports all three, and a rule never updated was last changed when
-        // it was created.
+        // Get reports exactly the same, and a rule never updated was last
+        // changed when it was created.
         let fetched = call_ok(
             &router,
             "GetAutomationRule",
@@ -172,16 +179,8 @@ async fn every_read_path_projects_a_rules_description_priority_and_last_update()
             case,
         )
         .await;
-        assert_eq!(
-            &present_string(&fetched, "description", case),
-            expected_description,
-            "case {case:?}: Get must report the stored description, got {fetched}"
-        );
-        assert_eq!(
-            &present_string(&fetched, "priority", case),
-            expected_priority,
-            "case {case:?}: Get must report the stored priority, got {fetched}"
-        );
+        assert_projected(&fetched, "description", expected_description.as_ref(), case);
+        assert_projected(&fetched, "priority", expected_priority.as_ref(), case);
         let created_at = present_timestamp(&fetched, "createdTimestamp", case);
         let last_updated = present_timestamp(&fetched, "lastUpdatedTimestamp", case);
         assert!(
@@ -190,8 +189,8 @@ async fn every_read_path_projects_a_rules_description_priority_and_last_update()
              {last_updated} against {created_at}"
         );
 
-        // List projects exactly what Get reports — the AutomationRule summary
-        // carries description, priority and lastUpdatedTimestamp too.
+        // The AutomationRule summary carries the same two optional members, so
+        // List projects them the same way.
         let listed = call_ok(
             &router,
             "ListAutomationRules",
@@ -200,27 +199,161 @@ async fn every_read_path_projects_a_rules_description_priority_and_last_update()
         )
         .await;
         let summary = listed_rule(&listed, &rule_id, case);
-        assert_eq!(
-            &present_string(&summary, "description", case),
-            expected_description,
-            "case {case:?}: the listed rule must carry the stored description, got {summary}"
-        );
-        assert_eq!(
-            &present_string(&summary, "priority", case),
-            expected_priority,
-            "case {case:?}: the listed rule must carry the stored priority, got {summary}"
-        );
+        assert_projected(&summary, "description", expected_description.as_ref(), case);
+        assert_projected(&summary, "priority", expected_priority.as_ref(), case);
         assert!(
             (present_timestamp(&summary, "lastUpdatedTimestamp", case) - last_updated).abs()
                 < f64::EPSILON,
             "case {case:?}: the listed rule must carry the same lastUpdatedTimestamp Get \
              reports ({last_updated}), got {summary}"
         );
-        assert!(
-            is_documented_priority(expected_priority),
-            "case {case:?}: a projected priority is a decimal between 0 and 1, got \
-             {expected_priority:?}"
-        );
+    }
+}
+
+/// An update that carries neither optional member leaves the rule exactly as the
+/// create left it — so a rule created without a description or a precedence
+/// still reports none after it has been updated, on every read path.
+#[tokio::test]
+async fn an_update_that_names_neither_optional_member_keeps_the_rules_projection() {
+    let router = emulator();
+
+    for (index, (case, optional, expected_description, expected_priority)) in
+        projection_cases().iter().enumerate()
+    {
+        let request = request_for(1_000 + index, optional);
+        let created = call_ok(&router, "CreateAutomationRule", &request, case).await;
+        let rule_arn = string_member(&created, "ruleArn");
+        let rule_id = string_member(&created, "ruleId");
+
+        let updated = call_ok(
+            &router,
+            "UpdateAutomationRule",
+            &json!({
+                "ruleArn": &rule_arn,
+                "ruleRevision": member(&created, "ruleRevision").clone(),
+                "status": "Inactive",
+            }),
+            case,
+        )
+        .await;
+        assert_projected(&updated, "description", expected_description.as_ref(), case);
+        assert_projected(&updated, "priority", expected_priority.as_ref(), case);
+
+        let fetched = call_ok(
+            &router,
+            "GetAutomationRule",
+            &json!({"ruleArn": &rule_arn}),
+            case,
+        )
+        .await;
+        assert_projected(&fetched, "description", expected_description.as_ref(), case);
+        assert_projected(&fetched, "priority", expected_priority.as_ref(), case);
+
+        let listed = call_ok(
+            &router,
+            "ListAutomationRules",
+            &json!({"maxResults": 100}),
+            case,
+        )
+        .await;
+        let summary = listed_rule(&listed, &rule_id, case);
+        assert_projected(&summary, "description", expected_description.as_ref(), case);
+        assert_projected(&summary, "priority", expected_priority.as_ref(), case);
+    }
+}
+
+/// An update is what gives a rule created without one a description or a
+/// precedence: the member it supplies becomes the stored value and every read
+/// path reports it, while the one it leaves alone stays as it was.
+#[tokio::test]
+async fn an_update_sets_an_optional_member_a_rule_was_created_without() {
+    let router = emulator();
+
+    // (case, the member the update carries, expected description after it,
+    // expected priority after it) — each row starts from a rule created with no
+    // optional members at all.
+    let long_description = "u".repeat(1024);
+    let cases: Vec<(&str, Value, Option<String>, Option<String>)> = vec![
+        (
+            "update-adds-a-description",
+            json!({"description": "described by the update"}),
+            Some("described by the update".to_string()),
+            None,
+        ),
+        (
+            "update-adds-an-empty-description",
+            json!({"description": ""}),
+            Some(String::new()),
+            None,
+        ),
+        (
+            "update-adds-a-maximum-length-description",
+            json!({"description": long_description.clone()}),
+            Some(long_description),
+            None,
+        ),
+        (
+            "update-adds-a-priority",
+            json!({"priority": "0.125"}),
+            None,
+            Some("0.125".to_string()),
+        ),
+        (
+            "update-adds-the-top-priority-value",
+            json!({"priority": "1"}),
+            None,
+            Some("1".to_string()),
+        ),
+        (
+            "update-adds-both",
+            json!({"description": "both at once", "priority": "0"}),
+            Some("both at once".to_string()),
+            Some("0".to_string()),
+        ),
+    ];
+
+    for (index, (case, change, expected_description, expected_priority)) in
+        cases.iter().enumerate()
+    {
+        let created = call_ok(
+            &router,
+            "CreateAutomationRule",
+            &minimal_rule(&format!("late-set-rule-{index}")),
+            case,
+        )
+        .await;
+        let rule_arn = string_member(&created, "ruleArn");
+        let rule_id = string_member(&created, "ruleId");
+        assert_projected(&created, "description", None, case);
+        assert_projected(&created, "priority", None, case);
+
+        let mut update = change.clone();
+        update["ruleArn"] = json!(&rule_arn);
+        update["ruleRevision"] = member(&created, "ruleRevision").clone();
+        let updated = call_ok(&router, "UpdateAutomationRule", &update, case).await;
+        assert_projected(&updated, "description", expected_description.as_ref(), case);
+        assert_projected(&updated, "priority", expected_priority.as_ref(), case);
+
+        let fetched = call_ok(
+            &router,
+            "GetAutomationRule",
+            &json!({"ruleArn": &rule_arn}),
+            case,
+        )
+        .await;
+        assert_projected(&fetched, "description", expected_description.as_ref(), case);
+        assert_projected(&fetched, "priority", expected_priority.as_ref(), case);
+
+        let listed = call_ok(
+            &router,
+            "ListAutomationRules",
+            &json!({"maxResults": 100}),
+            case,
+        )
+        .await;
+        let summary = listed_rule(&listed, &rule_id, case);
+        assert_projected(&summary, "description", expected_description.as_ref(), case);
+        assert_projected(&summary, "priority", expected_priority.as_ref(), case);
     }
 }
 

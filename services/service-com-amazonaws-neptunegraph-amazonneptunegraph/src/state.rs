@@ -29,6 +29,17 @@ pub const ARN_NAMESPACE: &str = "neptune-graph";
 /// ever sleeps for it — the due instant is stored and compared on read.
 pub const PROVISIONING_SPAN: Duration = Duration::from_millis(500);
 
+/// How long after the `DeleteGraph` that starts it a graph's deletion is owed: the
+/// graph answers `DELETING` — and stays listed, with its name still reserved — until
+/// this span has passed, after which the next read finds the record gone.
+///
+/// The real service takes minutes to tear a graph down; this emulator picks a span
+/// inside the emulator-wide 250ms..750ms band for a transition the clock owes, so a
+/// caller that reads the graph straight after `DeleteGraph` still observes the
+/// transient status (and the state errors that go with it). No handler ever sleeps for
+/// it — the due instant is stored and compared on read.
+pub const DELETION_SPAN: Duration = Duration::from_millis(500);
+
 /// How long after the `CancelQuery` that starts it a query's cancellation is owed: the
 /// query answers `CANCELLING` until this span has passed, then the next read finds it
 /// terminated and no longer reports it.
@@ -170,6 +181,14 @@ pub struct Graph {
     /// The status change the clock owes this graph, and when it falls due. `None`
     /// once there is nothing outstanding.
     pub pending: Option<PendingTransition>,
+    /// When the accepted deletion of this graph completes, after which the record is
+    /// no longer one this service holds. `None` for a graph nobody has deleted.
+    ///
+    /// A deletion is a transition like any other — the graph reports `DELETING` and
+    /// stays observable while it runs — but what it settles into is the ABSENCE of
+    /// the record, which no `GraphStatus` can express, so it is carried here rather
+    /// than in [`Graph::pending`].
+    pub deletes_at: Option<Instant>,
 }
 
 impl Graph {
@@ -194,6 +213,22 @@ impl Graph {
     pub fn begin_transition(&mut self, transient: GraphStatus, settled: GraphStatus, now: Instant) {
         self.status = transient;
         self.pending = Some(PendingTransition::owed(settled, now));
+    }
+
+    /// Report `DELETING` now and complete the deletion [`DELETION_SPAN`] after `now`.
+    ///
+    /// Any status change that was still outstanding is dropped: the graph is on its way
+    /// out, so nothing it was heading for can fall due any more.
+    pub fn begin_deletion(&mut self, now: Instant) {
+        self.status = GraphStatus::Deleting;
+        self.pending = None;
+        self.deletes_at = Some(now + DELETION_SPAN);
+    }
+
+    /// Whether the deletion this graph is undergoing has fallen due, so the record is
+    /// one the service no longer holds.
+    pub fn deletion_complete(&self, now: Instant) -> bool {
+        self.deletes_at.is_some_and(|due| now >= due)
     }
 }
 
@@ -902,6 +937,30 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
         Some(task)
     }
 
+    /// A free `snapshotName` for the FINAL snapshot of the graph named `graph_name`,
+    /// satisfying the modelled `SnapshotName` constraints (`@length(1..63)`, pattern
+    /// `^(?!gs-)[a-z][a-z0-9]*(-[a-z0-9]+)*$`).
+    ///
+    /// The request that asks for a final snapshot carries no name, so the service names
+    /// it: after the graph it is taken of, which is how a caller finds it again. A name
+    /// that would break the modelled length, or that the account already holds, falls
+    /// back to the snapshot's own freshly minted id, which no stored snapshot shares.
+    pub fn free_final_snapshot_name(&self, graph_name: &str, snapshot_id: &str) -> String {
+        let after_the_graph = format!("{graph_name}{FINAL_SNAPSHOT_SUFFIX}");
+        if after_the_graph.len() <= MAX_RESOURCE_NAME_CHARS
+            && !self.snapshot_names.contains_key(&after_the_graph)
+        {
+            return after_the_graph;
+        }
+        let mut from_the_id = format!("final-snapshot-{snapshot_id}");
+        let mut attempt = 1u32;
+        while self.snapshot_names.contains_key(&from_the_id) {
+            attempt += 1;
+            from_the_id = format!("final-snapshot-{snapshot_id}-{attempt}");
+        }
+        from_the_id
+    }
+
     /// Store a new snapshot and index its name.
     pub fn insert_snapshot(&mut self, snapshot: Snapshot) {
         self.snapshot_names
@@ -1090,9 +1149,29 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
         self.queries.get_mut(graph_id)?.get_mut(query_id)
     }
 
+    /// Drop every graph whose accepted deletion the clock has made due, along with
+    /// everything [`Self::remove_graph`] reclaims with a graph.
+    ///
+    /// The same one write a reporting operation may make as [`Graph::settle`]: each of
+    /// those graphs was gone at its `deletes_at` instant whether or not anybody called,
+    /// so reclaiming it on read is bookkeeping rather than a state change caused by the
+    /// read.
+    pub fn reap_deleted_graphs(&mut self, now: Instant) {
+        let due: Vec<String> = self
+            .graphs
+            .iter()
+            .filter(|(_, graph)| graph.deletion_complete(now))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in due {
+            self.remove_graph(&id);
+        }
+    }
+
     /// Apply every provisioning transition the clock has made due, then borrow one
     /// graph.
     pub fn settled_graph(&mut self, id: &str, now: Instant) -> Option<&Graph> {
+        self.reap_deleted_graphs(now);
         let graph = self.graphs.get_mut(id)?;
         graph.settle(now);
         Some(graph)
@@ -1101,6 +1180,7 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
     /// Apply every provisioning transition the clock has made due, then borrow one
     /// graph mutably.
     pub fn settled_graph_mut(&mut self, id: &str, now: Instant) -> Option<&mut Graph> {
+        self.reap_deleted_graphs(now);
         let graph = self.graphs.get_mut(id)?;
         graph.settle(now);
         Some(graph)
@@ -1108,6 +1188,7 @@ impl ComAmazonawsNeptunegraphAmazonneptunegraphState {
 
     /// Apply every provisioning transition the clock has made due across the store.
     pub fn settle_all(&mut self, now: Instant) {
+        self.reap_deleted_graphs(now);
         for graph in self.graphs.values_mut() {
             graph.settle(now);
         }
@@ -1235,6 +1316,15 @@ pub const MAX_GRAPHS: usize = 100;
 /// with the `ServiceQuotaExceededException` (402) the model declares for exactly
 /// this condition. Set well above any realistic use of a local emulator.
 pub const MAX_SNAPSHOTS: usize = 100;
+
+/// The most characters a `graphName` or a `snapshotName` may carry, from the modelled
+/// `@length(1..63)` on both
+/// (`smithy_query(query="operation",operation="CreateGraphSnapshot")`).
+pub const MAX_RESOURCE_NAME_CHARS: usize = 63;
+
+/// What the name of a graph's FINAL snapshot — the one a `skipSnapshot=false` delete
+/// asks for — adds to the graph's own name.
+pub const FINAL_SNAPSHOT_SUFFIX: &str = "-final-snapshot";
 
 /// The most import tasks one store holds.
 ///
@@ -2456,6 +2546,7 @@ mod tests {
             build_number: None,
             tags: BTreeMap::new(),
             pending: None,
+            deletes_at: None,
         }
     }
 
@@ -2498,6 +2589,106 @@ mod tests {
                 graph.pending.is_none(),
                 "case {case:?} due: the settled transition must be cleared, got {:?}",
                 graph.pending
+            );
+        }
+    }
+
+    /// An accepted deletion reports `DELETING` and keeps the record \u2014 and the name it
+    /// reserves \u2014 until the deletion the clock owes falls due, whatever status the
+    /// graph was resting in when it was deleted.
+    #[test]
+    fn a_deleted_graph_is_reclaimed_only_once_the_deletion_is_due() {
+        let now = Instant::now();
+        // (case, the resting status the graph was deleted from) — a deletion is
+        // accepted from either status a graph rests in.
+        for (case, resting) in [
+            ("serving", GraphStatus::Available),
+            ("stopped", GraphStatus::Stopped),
+        ] {
+            let mut state = ComAmazonawsNeptunegraphAmazonneptunegraphState::default();
+            let mut graph = sample_graph("g-0123456789", "arn");
+            graph.status = resting;
+            let name = graph.name.clone();
+            state.insert_graph(graph);
+
+            state
+                .settled_graph_mut("g-0123456789", now)
+                .expect("the stored graph resolves")
+                .begin_deletion(now);
+
+            let in_flight = state.settled_graph("g-0123456789", now);
+            assert_eq!(
+                in_flight.map(|graph| graph.status),
+                Some(GraphStatus::Deleting),
+                "case {case:?} not-yet-due: expected a graph reporting DELETING, got {:?}",
+                in_flight.map(|graph| graph.status)
+            );
+            assert!(
+                state.graph_names.contains_key(&name),
+                "case {case:?} not-yet-due: the name must stay reserved, got {:?}",
+                state.graph_names
+            );
+
+            let settled = state
+                .settled_graph("g-0123456789", now + DELETION_SPAN)
+                .cloned();
+            assert!(
+                settled.is_none(),
+                "case {case:?} due: the record must be gone, got {settled:?}"
+            );
+            assert!(
+                !state.graph_names.contains_key(&name),
+                "case {case:?} due: the name must be free again, got {:?}",
+                state.graph_names
+            );
+        }
+    }
+
+    /// The name a final snapshot takes: after the graph where that fits and is free,
+    /// otherwise after the snapshot's own id — and always a name the modelled
+    /// `SnapshotName` constraints accept.
+    #[test]
+    fn a_final_snapshots_name_satisfies_the_modelled_name_constraints() {
+        let mut state = ComAmazonawsNeptunegraphAmazonneptunegraphState::default();
+        state
+            .snapshot_names
+            .insert("taken-graph-final-snapshot".to_string(), "gs-0000000000".to_string());
+        let longest_graph_name = "a".repeat(MAX_RESOURCE_NAME_CHARS);
+
+        // (case, the graph's name, whether the name may be built from the graph's own)
+        let cases: &[(&str, &str, bool)] = &[
+            ("a free name", "plain-graph", true),
+            ("one character", "a", true),
+            (
+                "a name already held by a stored snapshot",
+                "taken-graph",
+                false,
+            ),
+            (
+                "a graph name that leaves no room for the suffix",
+                longest_graph_name.as_str(),
+                false,
+            ),
+        ];
+        for (case, graph_name, after_the_graph) in cases {
+            let minted = state.free_final_snapshot_name(graph_name, "gs-1234567890");
+            assert_eq!(
+                minted == format!("{graph_name}{FINAL_SNAPSHOT_SUFFIX}"),
+                *after_the_graph,
+                "case {case:?}: expected named-after-the-graph={after_the_graph}, got {minted:?}"
+            );
+            assert!(
+                !minted.is_empty() && minted.len() <= MAX_RESOURCE_NAME_CHARS,
+                "case {case:?}: expected a name within 1..{MAX_RESOURCE_NAME_CHARS} characters, \
+                 got {minted:?}"
+            );
+            assert!(
+                resource_name_is_well_formed(&minted, "gs-"),
+                "case {case:?}: expected a name the modelled pattern accepts, got {minted:?}"
+            );
+            assert!(
+                !state.snapshot_names.contains_key(&minted),
+                "case {case:?}: expected a name no stored snapshot holds, got {minted:?}"
             );
         }
     }

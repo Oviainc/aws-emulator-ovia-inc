@@ -27,3 +27,5 @@ mod repository_link_lifecycle;
 mod sdk_target_dispatch;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/sync_blocker_resolution.rs"]
+mod sync_blocker_resolution;

@@ -51,7 +51,7 @@ const NO_CONTENT: u16 = 204;
 ///
 /// Written out rather than pulled from `percent-encoding`, which this crate does not
 /// depend on: this is the whole of the encoding a `tagKeys=` parameter needs.
-fn urlencode(value: &str) -> String {
+pub(crate) fn urlencode(value: &str) -> String {
     value
         .bytes()
         .map(|byte| match byte {
@@ -64,7 +64,7 @@ fn urlencode(value: &str) -> String {
 }
 
 /// The `DELETE /tags/{ResourceArn}?tagKeys=...` route that removes `keys` from `arn`.
-fn untag_route(arn: &str, keys: &[&str]) -> String {
+pub(crate) fn untag_route(arn: &str, keys: &[&str]) -> String {
     let query = keys
         .iter()
         .map(|key| format!("tagKeys={}", urlencode(key)))

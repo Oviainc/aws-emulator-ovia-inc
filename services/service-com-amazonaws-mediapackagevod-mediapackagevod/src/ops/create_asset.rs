@@ -5,7 +5,9 @@
 //! and `SourceRoleArn` as ARNs of the services their documentation names (an S3
 //! object and an IAM role) and refuses a value that is not one, refuses a
 //! `PackagingGroupId` that resolves to nothing — both as request-parameter violations,
-//! `UnprocessableEntityException` (422) attributing each to its member — persists the
+//! `UnprocessableEntityException` (422) attributing each to its member — judges the
+//! `Tags` map against AWS's resource-tagging restrictions
+//! ([`crate::state::check_tags`]) with the same 422, persists the
 //! asset, and answers with the record just stored plus the `EgressEndpoints` DERIVED
 //! from the packaging configurations attached to that group.
 //!
@@ -178,6 +180,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // Tag-on-create is still tagging: the map is judged against AWS's resource
+        // tagging restrictions before the store is touched, so a refused request leaves
+        // no asset and no tag behind.
+        crate::state::check_tags(input.tags.as_ref())?;
         // `SourceArn` is "ARN of the source object in S3" and `SourceRoleArn` "The IAM
         // role ARN used to access the source S3 bucket": ingest reads that object AS
         // that role, so neither member can be arbitrary text — a value that is not an

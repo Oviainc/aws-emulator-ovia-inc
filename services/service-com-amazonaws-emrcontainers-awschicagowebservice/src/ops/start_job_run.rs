@@ -6,7 +6,9 @@
 //! run starts `PENDING` and the clock owes it `RUNNING`
 //! ([`crate::state::TRANSITION_SPAN`]) — but only once the cluster has a free running
 //! slot, when it configures a `schedulerConfiguration.maxConcurrentJobRuns`. A
-//! submission into a queue that is already `maxInQueueJobRuns` deep is refused.
+//! submission into a queue that is already `maxInQueueJobRuns` deep is refused, and so is
+//! one that names no job template and does not itself carry the `executionRoleArn`,
+//! `releaseLabel` and `jobDriver` a run cannot exist without.
 //!
 //! ## Shape of an operation
 //!
@@ -227,6 +229,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some(
                     "jobTemplateParameters requires jobTemplateId to be specified".to_string(),
                 ),
+            })
+            .into());
+        }
+
+        // Reached only when the request names NO job template (the branch above returns
+        // for every request that does): a run then has nothing but this request to be
+        // built from, so the request must carry every value running one needs.
+        // `JobTemplateData` — the shape the model documents as "the values of StartJobRun
+        // API requests used in job runs started using the job template" — marks
+        // `executionRoleArn`, `releaseLabel` and `jobDriver` @required, so no job run can
+        // exist without all three; they are optional on the request shape only because a
+        // template can supply them. A submission missing any of them is refused and
+        // nothing is stored, rather than becoming a run with no driver to run.
+        let missing: Vec<&str> = [
+            ("executionRoleArn", input.execution_role_arn.is_none()),
+            ("releaseLabel", input.release_label.is_none()),
+            ("jobDriver", input.job_driver.is_none()),
+        ]
+        .into_iter()
+        .filter_map(|(member, absent)| absent.then_some(member))
+        .collect();
+        if !missing.is_empty() {
+            return Err(StartJobRunErrorModeled::ValidationException(ValidationException {
+                message: Some(format!(
+                    "StartJobRun requires executionRoleArn, releaseLabel and jobDriver when no jobTemplateId is specified; missing: {}",
+                    missing.join(", ")
+                )),
             })
             .into());
         }

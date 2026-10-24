@@ -11,6 +11,11 @@
 //! key the resource does not carry removes nothing, which makes the call idempotent -
 //! repeating it answers 204 again and leaves the same map.
 //!
+//! A `TagKeys` entry carrying the reserved `aws:` prefix is refused with
+//! `UnprocessableEntityException` (HTTP 422) attributed to that member
+//! ([`crate::state::check_tag_keys`]): such a tag belongs to AWS, and a caller may no
+//! more delete one than create one, so nothing is removed.
+//!
 //! `ResourceArn` is resolved the way every other operation of this REGIONAL control
 //! plane resolves a resource: only a resource held in the Region the request is served
 //! in exists, so the ARN has to be exactly the one this service issued for a resource it
@@ -200,6 +205,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // MediaPackage VOD is regional: this request resolves only the resources of
         // the Region its SigV4 credential scope names.
         let region = crate::state::request_region(ctx.parts());
+        // Judged BEFORE anything is removed, so a refused call leaves the stored tags
+        // exactly as it found them. A key carrying the reserved `aws:` prefix names a
+        // tag AWS owns, which a caller may no more delete than create, so it is refused
+        // rather than reported as removed. Idempotence is about a WELL-FORMED key the
+        // resource happens not to carry, which is removed below without error.
+        crate::state::check_tag_keys("tagKeys", &input.tag_keys)?;
         let mut state = store.lock();
         if !state.holds_arn_resource(&region, &input.resource_arn) {
             return Err(UntagResourceErrorModeled::NotFoundException(

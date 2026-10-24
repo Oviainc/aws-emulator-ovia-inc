@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use service_com_amazonaws_neptunegraph_amazonneptunegraph::state::{
     ComAmazonawsNeptunegraphAmazonneptunegraphState as Store, Query, CANCELLATION_SPAN,
-    PROVISIONING_SPAN, QUERY_RUN_SPAN,
+    DELETION_SPAN, PROVISIONING_SPAN, QUERY_RUN_SPAN,
 };
 use service_com_amazonaws_neptunegraph_amazonneptunegraph::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -641,8 +641,30 @@ async fn deleting_a_graph_takes_its_in_flight_queries_with_it() {
         "case delete the graph: expected 200 from DeleteGraph, got {status}: {body}"
     );
 
-    // The graph is gone, so its queries are gone with it — reported as the graph being
-    // absent, which is the first thing either operation resolves.
+    // The delete is accepted, not performed: while it is in flight the graph is still a
+    // resource this service holds, so its query is still readable — and the other
+    // graph's query is untouched either way.
+    for (case, graph, query_id) in [
+        ("on the deleting graph", &deleted, "q-gone"),
+        ("on the kept graph", &kept, "q-kept"),
+    ] {
+        let (status, query) = get_query(&router, graph, query_id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the query must still be readable, got {status}: {query}"
+        );
+        assert_eq!(
+            query["state"],
+            json!("RUNNING"),
+            "case {case:?}: expected RUNNING, got {}",
+            query["state"]
+        );
+    }
+
+    // Once the deletion the clock owes falls due the graph is gone, and its queries are
+    // gone with it — reported as the graph being absent, which is the first thing either
+    // operation resolves.
+    tokio::time::sleep(DELETION_SPAN + SETTLE_MARGIN).await;
     let (status, body) = get_query(&router, &deleted, "q-gone").await;
     assert_eq!(
         status, 404,
@@ -657,16 +679,10 @@ async fn deleting_a_graph_takes_its_in_flight_queries_with_it() {
         "case query of a deleted graph: the record must be reclaimed, not orphaned"
     );
 
-    // And only that graph's queries: the other graph's query is untouched.
-    let (status, kept_query) = get_query(&router, &kept, "q-kept").await;
+    // And only that graph's queries: the kept graph is still there to be asked.
+    let (status, kept_graph) = call(&router, "GET", &format!("/graphs/{kept}"), None, None).await;
     assert_eq!(
         status, 200,
-        "case query of the kept graph: expected 200, got {status}: {kept_query}"
-    );
-    assert_eq!(
-        kept_query["state"],
-        json!("RUNNING"),
-        "case query of the kept graph: expected RUNNING, got {}",
-        kept_query["state"]
+        "case the kept graph: expected 200 from GetGraph, got {status}: {kept_graph}"
     );
 }

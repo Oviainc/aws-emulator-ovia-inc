@@ -3677,14 +3677,23 @@ pub fn supported_ca_certificate_identifiers() -> Vec<String> {
 /// One of the catalogs' fixed ISO-8601 instants as the modelled timestamp shapes carry
 /// it.
 ///
-/// The input is a literal in this file, never caller data, so a value that is not an
-/// instant is a typo in the catalog above: it panics at the first read rather than
-/// silently dropping `ValidFrom`/`ValidTill` from the response.
+/// The input is a literal in a catalog, never caller data, so a value that is not an
+/// instant is a typo in that catalog: it panics at the first read rather than
+/// silently dropping a timestamp member from the response.
+///
+/// `pub` because a reference catalog an OPERATION owns carries the same kind of fixed
+/// date — the engine-version support lifecycles
+/// (`crate::ops::describe_db_major_engine_versions`) are published as calendar days —
+/// and the parse and its panic belong in one place for every catalog in this service.
+pub fn catalog_timestamp(iso: &str) -> ::aws_smithy_types::DateTime {
+    ::aws_smithy_types::DateTime::from_str(iso, ::aws_smithy_types::date_time::Format::DateTime)
+        .expect("every catalog instant in this service is an ISO-8601 literal")
+}
+
+/// [`catalog_timestamp`] for an OPTIONAL timestamp member, which is how the catalogs
+/// above project `ValidFrom`/`ValidTill`.
 fn catalog_instant(iso: &str) -> Option<::aws_smithy_types::DateTime> {
-    Some(
-        ::aws_smithy_types::DateTime::from_str(iso, ::aws_smithy_types::date_time::Format::DateTime)
-            .expect("every catalog instant in this file is an ISO-8601 literal"),
-    )
+    Some(catalog_timestamp(iso))
 }
 
 /// The event source types and their categories, as `DescribeEventCategories` reports

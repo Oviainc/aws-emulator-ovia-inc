@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteGraph
-//! IMPLEMENTED: removes the stored graph and reports its final record.
+//! IMPLEMENTED: accepts the deletion, takes the final snapshot a `skipSnapshot=false`
+//! request asks for, and reports the graph as `DELETING` while the deletion the clock
+//! owes runs out.
 //! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -163,8 +165,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // `skipSnapshot` is checked further down, once the graph has been resolved.
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteGraphErrorModeled::InternalServerException(
                 InternalServerException {
@@ -174,6 +174,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        let region = crate::state::request_region(ctx);
         let now = ::std::time::Instant::now();
         let mut store = state.lock();
         let Some(graph) = store.settled_graph(&input.graph_identifier, now) else {
@@ -182,56 +183,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+        // The facts the rest of this handler needs, read off the record before the
+        // store is written to, so the decisions below and the writes they drive never
+        // hold a borrow of one graph across a change to the store.
+        let graph_id = graph.id.clone();
+        let graph_name = graph.name.clone();
+        let graph_status = graph.status;
+        let deletion_protection = graph.deletion_protection;
+        // A snapshot of an encrypted graph is encrypted with the graph's own key: the
+        // key belongs to the data being snapshotted, not to this request, which carries
+        // no key member at all.
+        let kms_key_identifier = graph.kms_key_identifier.clone();
 
         // "Graphs cannot be deleted if delete-protection is enabled."
-        if graph.deletion_protection {
+        if deletion_protection {
             return Err(DeleteGraphErrorModeled::ConflictException(ConflictException {
                 message: format!(
-                    "graph {} cannot be deleted because deletion protection is enabled",
-                    graph.id
+                    "graph {graph_id} cannot be deleted because deletion protection is enabled"
                 ),
                 reason: None,
             })
             .into());
         }
-        // A graph whose status change is still in flight cannot be deleted yet. One at
+        // A graph whose status change is still in flight cannot be deleted yet — which
+        // includes a graph already on its way out, whose deletion is in flight. One at
         // REST can, whether it rests serving (`AVAILABLE`) or stopped (`STOPPED`): a
         // stopped graph is a graph that still exists, and deletion is how it goes away.
-        if !graph.status.is_at_rest() {
+        if !graph_status.is_at_rest() {
             return Err(DeleteGraphErrorModeled::ConflictException(ConflictException {
                 message: format!(
-                    "graph {} is in status {} and cannot be deleted",
-                    graph.id,
-                    graph.status.as_wire()
+                    "graph {graph_id} is in status {} and cannot be deleted",
+                    graph_status.as_wire()
                 ),
                 reason: None,
             })
             .into());
         }
-        // `skipSnapshot` is required and is honoured by not taking one. A
-        // `skipSnapshot=false` delete asks for a FINAL snapshot, whose name the
-        // request does not carry and whose generated name is not a rule this emulator
-        // can ground, so it is refused rather than silently losing the snapshot the
-        // caller asked for. `CreateGraphSnapshot` (implemented) owns an explicitly
-        // named snapshot.
-        if !input.skip_snapshot {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "DeleteGraph with skipSnapshot=false (a final snapshot)",
-            ));
+        // `skipSnapshot` is required, and `false` asks for a FINAL snapshot of the
+        // graph, taken before the deletion carries its data away. The request carries
+        // no name for it, so the service names it (`free_final_snapshot_name`), the way
+        // it mints the id.
+        let final_snapshot = if input.skip_snapshot {
+            None
+        } else {
+            // The snapshot store grows by one entry per final snapshot, so it has the
+            // same ceiling `CreateGraphSnapshot` enforces. This operation models no
+            // quota error, so a store with no room for the snapshot the caller asked
+            // for is reported as the conflict it is: the request cannot be carried out
+            // against what the store already holds.
+            if store.snapshots.len() >= crate::state::MAX_SNAPSHOTS {
+                return Err(DeleteGraphErrorModeled::ConflictException(ConflictException {
+                    message: format!(
+                        "a final snapshot of graph {graph_id} cannot be taken because this \
+                         emulator holds at most {} graph snapshots; delete a snapshot or pass \
+                         skipSnapshot=true",
+                        crate::state::MAX_SNAPSHOTS
+                    ),
+                    reason: None,
+                })
+                .into());
+            }
+            let id = store.next_snapshot_id();
+            let name = store.free_final_snapshot_name(&graph_name, &id);
+            Some(crate::state::Snapshot {
+                arn: ::engine::emulator_arn(
+                    crate::state::ARN_NAMESPACE,
+                    &region,
+                    &format!("graph-snapshot/{id}"),
+                ),
+                id,
+                name,
+                source_graph_id: graph_id.clone(),
+                // Not restorable when the call returns; the clock owes the move to
+                // AVAILABLE a fixed span later, exactly as for an explicitly named
+                // snapshot.
+                status: crate::state::SnapshotStatus::Creating,
+                settles_at: Some(now + crate::state::PROVISIONING_SPAN),
+                snapshot_create_time: ::std::time::SystemTime::now(),
+                kms_key_identifier,
+                // The request carries no tags, and a snapshot's tags are its own: the
+                // graph's tag set is not copied onto it.
+                tags: ::std::collections::BTreeMap::new(),
+            })
+        };
+
+        if let Some(snapshot) = final_snapshot {
+            store.insert_snapshot(snapshot);
         }
 
-        let Some(mut deleted) = store.remove_graph(&input.graph_identifier) else {
+        // The deletion is ACCEPTED, not finished: the graph reports DELETING and stays
+        // observable — listed, readable, and holding its name — until the deletion the
+        // clock owes falls due (`crate::state::DELETION_SPAN`), after which the next
+        // read finds it gone. No handler sleeps for it.
+        let Some(deleting) = store.settled_graph_mut(&graph_id, now) else {
             // Unreachable: the lookup above resolved under the same lock.
             return Err(DeleteGraphErrorModeled::ResourceNotFoundException(
                 crate::state::graph_not_found(&input.graph_identifier),
             )
             .into());
         };
-        // The deletion is accepted, so the record this call reports is the graph on its
-        // way out; it is already gone from the store, so GetGraph and ListGraphs no
-        // longer show it.
-        deleted.status = crate::state::GraphStatus::Deleting;
-        deleted.pending = None;
-        Ok(Self::Output::from(&deleted))
+        deleting.begin_deletion(now);
+        // Report the record that was stored, so this response cannot drift from what a
+        // later GetGraph answers while the deletion is in flight.
+        Ok(Self::Output::from(&*deleting))
     }
 }

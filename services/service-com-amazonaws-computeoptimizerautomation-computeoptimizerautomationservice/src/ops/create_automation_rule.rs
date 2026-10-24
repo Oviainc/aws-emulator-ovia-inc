@@ -324,22 +324,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             rule_id,
             account_id,
             name: input.name,
-            // Every member of a stored rule that the response shapes report is
-            // materialised here, so a create that named none of the optional
-            // ones still yields a rule every read path projects in full: a rule
-            // described by nothing is described by the empty string, a rule
-            // whose precedence was not named takes the service default, and a
-            // rule that has never been updated was last changed when it was
-            // created.
-            description: input
-                .description
-                .unwrap_or_else(|| crate::state::DEFAULT_RULE_DESCRIPTION.to_string()),
+            // A stored rule holds only what the request supplied: `description`
+            // and `priority` are optional in every rule shape and the service
+            // documents no default for either, so a create that named neither
+            // stores neither and every read path leaves them out. A rule that
+            // has never been updated was last changed when it was created, which
+            // IS known, so that one is materialised here.
+            description: input.description,
             rule_type: input.rule_type,
             rule_revision: crate::state::INITIAL_RULE_REVISION,
             organization_configuration: input.organization_configuration,
-            priority: input
-                .priority
-                .unwrap_or_else(|| crate::state::DEFAULT_RULE_PRIORITY.to_string()),
+            priority: input.priority,
             recommended_action_types: input.recommended_action_types,
             criteria: input.criteria,
             schedule: input.schedule,
@@ -376,11 +371,11 @@ fn output_for(rule: &crate::state::StoredRule) -> CreateAutomationRuleOutput {
         rule_arn: Some(rule.rule_arn.clone()),
         rule_id: Some(rule.rule_id.clone()),
         name: Some(rule.name.clone()),
-        description: Some(rule.description.clone()),
+        description: rule.description.clone(),
         rule_type: Some(rule.rule_type.clone()),
         rule_revision: Some(rule.rule_revision),
         organization_configuration: rule.organization_configuration.clone(),
-        priority: Some(rule.priority.clone()),
+        priority: rule.priority.clone(),
         recommended_action_types: Some(rule.recommended_action_types.clone()),
         criteria: rule.criteria.clone(),
         schedule: Some(rule.schedule.clone()),

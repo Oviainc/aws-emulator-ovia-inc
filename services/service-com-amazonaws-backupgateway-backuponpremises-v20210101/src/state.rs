@@ -906,6 +906,29 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
         page_of(&self.gateways, after, limit)
     }
 
+    /// Set the bandwidth rate-limit schedule of the gateway stored under `arn`, and hand
+    /// back the record as it is now STORED — read out of the map after the write, so what
+    /// a caller gets is what the store holds.
+    ///
+    /// `None` — nothing written — when this store holds no gateway under `arn`.
+    ///
+    /// The intervals REPLACE whatever that gateway carried: the request states the whole
+    /// schedule the gateway is to have, so setting the same schedule again leaves the
+    /// record exactly as one call left it, no interval of an earlier call survives a later
+    /// one, and an empty list is a schedule of no intervals — the state a gateway that has
+    /// never had one is in, which is "no bandwidth rate limiting in effect". The stored
+    /// ORDER is the order the request listed them in, which is the order a read reports.
+    /// Nothing else on the record is touched: setting a schedule is not a maintenance
+    /// window and does not move the gateway's other members.
+    pub fn set_bandwidth_rate_limit_schedule(
+        &mut self,
+        arn: &str,
+        intervals: Vec<BandwidthRateLimitInterval>,
+    ) -> Option<StoredGateway> {
+        self.gateways.get_mut(arn)?.bandwidth_rate_limit_intervals = intervals;
+        self.gateways.get(arn).cloned()
+    }
+
     /// Set the maintenance start time of the gateway stored under `arn`, and hand back the
     /// record as it is now STORED — read out of the map after the write, so what a caller
     /// gets is what the store holds.

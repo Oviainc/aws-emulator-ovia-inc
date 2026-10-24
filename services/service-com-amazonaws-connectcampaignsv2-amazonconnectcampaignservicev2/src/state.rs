@@ -343,6 +343,36 @@ impl StoredCampaign {
             .collect()
     }
 
+    /// Remove the communication-time window this campaign holds for the channel
+    /// `config_type` names.
+    ///
+    /// `config_type` is a `CommunicationTimeConfigType` value — the catalog
+    /// `COMMUNICATION_TIME_CONFIG_TYPE_VALUES` in [`crate::ops::types`], which the
+    /// caller refuses a value outside of before reaching here, so a value naming no
+    /// channel removes nothing.
+    ///
+    /// Only the named channel's window goes. `CommunicationTimeConfig`'s
+    /// `localTimeZoneConfig` is `@required`, so the config itself stays on the record
+    /// with the time zone it was configured with and the other channels keep their
+    /// windows; a campaign carrying no communication-time config at all holds no
+    /// window for any channel, so there is nothing to remove and nothing is written.
+    pub fn clear_communication_time_window(&mut self, config_type: &str) {
+        let Some(config) = self.communication_time_config.as_mut() else {
+            return;
+        };
+        let window = match config_type {
+            "EMAIL" => &mut config.email,
+            "SMS" => &mut config.sms,
+            "TELEPHONY" => &mut config.telephony,
+            "WHATSAPP" => &mut config.whats_app,
+            // A catalog value with no window on `CommunicationTimeConfig` is a
+            // channel this emulator cannot be configured for, so it holds nothing to
+            // remove.
+            _ => return,
+        };
+        *window = None;
+    }
+
     /// This record as the modelled `Campaign` shape `DescribeCampaign` returns.
     pub fn to_campaign(&self) -> Campaign {
         Campaign {
