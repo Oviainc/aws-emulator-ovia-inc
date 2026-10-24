@@ -535,11 +535,13 @@ async fn a_request_within_every_modelled_constraint_reaches_the_operation() {
             404,
         ),
         (
-            "AssociatePricingRules with an AWS-managed plan id and a rule list",
+            "AssociatePricingRules with a conforming plan ARN and a rule list",
             "PUT",
             "/associate-pricing-rules",
-            json!({ "Arn": "BasicPricingPlan", "PricingRuleArns": [VALID_RULE_ARN] }),
-            501,
+            json!({ "Arn": VALID_PLAN_ARN, "PricingRuleArns": [VALID_RULE_ARN] }),
+            // Implemented: no pricing plan answers to this ARN, so the operation's own
+            // `ResourceNotFoundException` is what comes back.
+            404,
         ),
         (
             "ListPricingRulesAssociatedToPricingPlan at the lower MaxResults bound",
