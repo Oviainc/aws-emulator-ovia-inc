@@ -268,6 +268,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.protocol.as_deref(),
         )?;
         validate_health_check_port(input.health_check_port.as_deref())?;
+        validate_health_check_path(input.health_check_path.as_deref())?;
+        validate_protocol_version(
+            input.protocol_version.as_deref(),
+            input.protocol.as_deref(),
+            &target_type,
+        )?;
 
         // "If the target is a Lambda function, this parameter does not apply" —
         // `Protocol`, `Port` and `VpcId` each carry that sentence, and `ProtocolVersion`
@@ -293,7 +299,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             protocol_version,
             port: input.port.filter(|_| !lambda),
             vpc_id: input.vpc_id.clone().filter(|_| !lambda),
-            health_check: health_check_config(&input, &target_type),
+            health_check: health_check_config(
+                &input,
+                &target_type,
+                crate::state::protocol_family(protocol.as_deref()),
+            ),
             target_type,
             // "The IP address type. The default value is ipv4."
             ip_address_type: Some(
@@ -454,6 +464,60 @@ fn validate_health_check_protocol(
     Ok(())
 }
 
+/// Refuse a `HealthCheckPath` whose VALUE is no health-check path, as
+/// [`crate::state::check_health_check_path`] states the rule. The model bounds only its
+/// length, so this handler is the only gate; it answers this service's own
+/// `ValidationError` with the rule and the value, exactly as `validate_health_check_port`
+/// above does for the port.
+fn validate_health_check_path(path: Option<&str>) -> Result<(), CreateTargetGroupError> {
+    match path {
+        Some(value) => crate::state::check_health_check_path(value)
+            .map_err(crate::scaffolded::Scaffolded::validation_error),
+        None => Ok(()),
+    }
+}
+
+/// Refuse a `ProtocolVersion` on a target group that has no HTTP protocol to version.
+///
+/// The member is documented "[HTTP/HTTPS protocol] The protocol version", and "if the
+/// target is a Lambda function, this parameter does not apply" — so it belongs to an
+/// HTTP or HTTPS target group alone. Naming it on a target group of any other protocol
+/// asks for a combination the service cannot hold, which is its modelled
+/// `InvalidConfigurationRequest` rather than a bad value: the value is a perfectly good
+/// protocol version, just not one this target group can carry.
+fn validate_protocol_version(
+    protocol_version: Option<&str>,
+    protocol: Option<&str>,
+    target_type: &str,
+) -> Result<(), CreateTargetGroupError> {
+    if protocol_version.is_none() {
+        return Ok(());
+    }
+    let lambda = target_type == "lambda";
+    if !lambda && crate::state::is_http_protocol(protocol) {
+        return Ok(());
+    }
+    // The message states the rule over what the request carried: the protocol of the
+    // target group it cannot be set on, or the target type for a Lambda target group,
+    // which has no protocol at all.
+    let carried = if lambda {
+        "target type 'lambda'".to_string()
+    } else {
+        format!("'{}' protocol", protocol.unwrap_or_default())
+    };
+    Err(
+        CreateTargetGroupErrorModeled::InvalidConfigurationRequestException(
+            InvalidConfigurationRequestException {
+                message: Some(format!(
+                    "You cannot specify the protocol version for a target group with the \
+                     {carried}"
+                )),
+            },
+        )
+        .into(),
+    )
+}
+
 /// The tags to store. `CreateTargetGroup` models no duplicate-key error, so a
 /// repeated key keeps its last value.
 fn tag_map(tags: Option<&[Tag]>) -> std::collections::HashMap<String, String> {
@@ -475,7 +539,11 @@ fn is_http(protocol: Option<&str>) -> bool {
 /// Every default below is the sentence the Smithy model carries for that member (see
 /// this file's header, or
 /// `smithy_query(query="doc",shape="CreateTargetGroupInput",member="<Member>")`).
-fn health_check_config(input: &CreateTargetGroupInput, target_type: &str) -> HealthCheckConfig {
+fn health_check_config(
+    input: &CreateTargetGroupInput,
+    target_type: &str,
+    family: crate::state::LoadBalancerFamily,
+) -> HealthCheckConfig {
     let lambda = target_type == "lambda";
     let protocol = input.protocol.as_deref().filter(|_| !lambda);
     let geneve = protocol == Some("GENEVE");
@@ -591,6 +659,7 @@ fn health_check_config(input: &CreateTargetGroupInput, target_type: &str) -> Hea
             if health_check_is_http {
                 Some(crate::state::default_health_check_matcher(
                     input.protocol_version.as_deref(),
+                    family,
                 ))
             } else {
                 None

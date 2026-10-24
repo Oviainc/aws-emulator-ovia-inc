@@ -30,6 +30,15 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The AWS SDK for EC2, driven over the in-process callback
+# (`OperationContext::callback`): the account's subnets, VPCs, security groups and
+# instances are EC2's resources, so `CreateLoadBalancer` and `RegisterTargets` resolve the
+# ones a request names against EC2 (`src/state/network.rs`) rather than assuming them.
+# Only the generated client is needed — the emulator supplies the transport.
+aws-sdk-ec2 = { version = "1", default-features = false }
+# The ONE reading of an IPv4/IPv6 CIDR block and of whether an address is inside it, which
+# is how an `ip` target is matched against the subnets and the VPC of its target group.
+ipnet = "2"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

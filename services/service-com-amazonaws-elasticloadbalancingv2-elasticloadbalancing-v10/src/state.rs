@@ -15,6 +15,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, SystemTime};
 
+pub mod network;
+
 use crate::ops::types::{
     Action, AvailabilityZone, Certificate, Listener, LoadBalancer, LoadBalancerAddress,
     LoadBalancerState, Matcher, TargetDescription, TargetGroup, TargetGroupAttribute, TargetHealth,
@@ -56,11 +58,50 @@ pub const TARGET_GROUP_QUOTA: usize = 1_000;
 /// balancer releases its listeners.
 pub const LISTENERS_PER_LOAD_BALANCER: usize = 100;
 
-/// How many targets one target group holds before `RegisterTargets` refuses with the
-/// modelled `TooManyTargetsException`. The emulator's own bound, as
-/// [`LOAD_BALANCER_QUOTA`]; registrations live on their target group, so they are
-/// bounded by this times [`TARGET_GROUP_QUOTA`].
+/// How many targets one target group of an APPLICATION Load Balancer holds before
+/// `RegisterTargets` refuses with the modelled `TooManyTargetsException`: the per-Region
+/// default Elastic Load Balancing publishes for "targets per target group", which
+/// `DescribeAccountLimits` reports under that name. Registrations live on their target
+/// group, so the store's targets are bounded by this times [`TARGET_GROUP_QUOTA`].
 pub const TARGETS_PER_TARGET_GROUP: usize = 1_000;
+
+/// How many targets one target group of a NETWORK Load Balancer holds, from the published
+/// default `DescribeAccountLimits` reports as
+/// `targets-per-availability-zone-per-network-load-balancer`.
+///
+/// AWS publishes that number PER Availability Zone, and this emulator models no per-zone
+/// accounting, so it is applied to the group as a whole: an approximation that is never
+/// more permissive than the published quota, and the number a caller reads for that name.
+pub const TARGETS_PER_NETWORK_TARGET_GROUP: usize = 500;
+
+/// How many targets one target group of a GATEWAY Load Balancer holds, from the published
+/// default `DescribeAccountLimits` reports as
+/// `targets-per-availability-zone-per-gateway-load-balancer`, applied to the group as a
+/// whole for the reason [`TARGETS_PER_NETWORK_TARGET_GROUP`] gives.
+pub const TARGETS_PER_GATEWAY_TARGET_GROUP: usize = 300;
+
+/// How many targets a target group whose targets are not addressed by the load balancer
+/// at all holds: ONE.
+///
+/// A `lambda` target group carries a single function (`TargetGroup$TargetType`: "lambda -
+/// Register a single Lambda function as a target") and an `alb` one a single Application
+/// Load Balancer ("alb - Register a single Application Load Balancer as a target").
+pub const TARGETS_PER_SINGLETON_TARGET_GROUP: usize = 1;
+
+/// How many targets `group` holds before `RegisterTargets` refuses the registration that
+/// would exceed it, which is the quota of the load balancer family the group serves — see
+/// [`TARGETS_PER_TARGET_GROUP`], [`TARGETS_PER_NETWORK_TARGET_GROUP`],
+/// [`TARGETS_PER_GATEWAY_TARGET_GROUP`] and [`TARGETS_PER_SINGLETON_TARGET_GROUP`].
+pub fn targets_per_target_group(group: &TargetGroupRecord) -> usize {
+    if matches!(group.target_type.as_str(), "lambda" | "alb") {
+        return TARGETS_PER_SINGLETON_TARGET_GROUP;
+    }
+    match group.family() {
+        LoadBalancerFamily::Application => TARGETS_PER_TARGET_GROUP,
+        LoadBalancerFamily::Network => TARGETS_PER_NETWORK_TARGET_GROUP,
+        LoadBalancerFamily::Gateway => TARGETS_PER_GATEWAY_TARGET_GROUP,
+    }
+}
 
 /// The ARN/endpoint namespace for this service (`sigv4Name` / `arnNamespace` in the
 /// model's `aws.api#service` trait).
@@ -243,20 +284,33 @@ pub fn default_health_check_path(protocol_version: Option<&str>) -> String {
 }
 
 /// The response codes an HTTP-semantic health check accepts when the request names
-/// none: `200` for an HTTP target group, and the gRPC success code `12` for a gRPC one
-/// (`Matcher`: "[HTTP/HTTPS health checks] The HTTP or gRPC codes to use when checking
-/// for a successful response from a target").
-pub fn default_health_check_matcher(protocol_version: Option<&str>) -> MatcherRecord {
+/// none: the gRPC success code `12` for a gRPC target group, else the default
+/// `Matcher$HttpCode` documents for the load balancer family the group serves — "For
+/// Application Load Balancers, you can specify values between 200 and 499, with the
+/// default value being 200. For Network Load Balancers, you can specify values between
+/// 200 and 599, with the default value being 200-399. For Gateway Load Balancers, this
+/// must be "200-399"".
+///
+/// A health check's response codes therefore do NOT follow the protocol the check speaks:
+/// a Network Load Balancer's target group whose health check is an HTTP one still accepts
+/// that family's whole success range.
+pub fn default_health_check_matcher(
+    protocol_version: Option<&str>,
+    family: LoadBalancerFamily,
+) -> MatcherRecord {
     if protocol_version == Some("GRPC") {
-        MatcherRecord {
+        return MatcherRecord {
             http_code: None,
             grpc_code: Some("12".to_string()),
-        }
-    } else {
-        MatcherRecord {
-            http_code: Some("200".to_string()),
-            grpc_code: None,
-        }
+        };
+    }
+    let http_code = match family {
+        LoadBalancerFamily::Application => "200",
+        LoadBalancerFamily::Network | LoadBalancerFamily::Gateway => "200-399",
+    };
+    MatcherRecord {
+        http_code: Some(http_code.to_string()),
+        grpc_code: None,
     }
 }
 
@@ -287,6 +341,23 @@ pub fn target_groups_not_found_message<'a>(
 /// sentence and rejects one naming the ARN, which is why the two wordings differ).
 pub fn target_group_selection_not_found_message() -> String {
     "One or more target groups not found".to_string()
+}
+
+/// The message Elastic Load Balancing answers a `LoadBalancerNotFound` with for a read
+/// over a LIST of identifiers (`DescribeLoadBalancers`, whose `LoadBalancerArns` and
+/// `Names` are both lists).
+///
+/// Built from the request, like every other not-found message here: the identifiers that
+/// did not resolve, under the PLURAL noun, rendered as the LIST the request carried —
+/// `Load balancers '[my-alb]' not found` for one name, and the same form with more
+/// entries for more of them. The brackets are what makes it a list rather than one
+/// resource, which is what the recorded answer to a `DescribeLoadBalancers(Names=[...])`
+/// of an absent name carries.
+pub fn load_balancers_not_found_message<'a>(
+    identifiers: impl IntoIterator<Item = &'a str>,
+) -> String {
+    let named: Vec<&str> = identifiers.into_iter().collect();
+    format!("Load balancers '[{}]' not found", named.join(", "))
 }
 
 /// Whether a protocol carries HTTP semantics, which is what decides whether a health
@@ -336,6 +407,43 @@ pub fn check_health_check_port(value: &str) -> Result<(), String> {
 /// `Name` documentation: "can have a maximum of 32 characters".
 pub const TARGET_GROUP_NAME_MAX_LENGTH: usize = 32;
 
+/// The maximum length of a health-check path, from the `@length` the model puts on the
+/// `Path` shape `HealthCheckPath` targets (`smithy_query(query="shape",shape="Path")` ->
+/// `length 1..1024`).
+pub const HEALTH_CHECK_PATH_MAX_LENGTH: usize = 1024;
+
+/// Whether `value` is a health-check path this service accepts — a destination the load
+/// balancer can request: an absolute path, so it begins with `/`, written in printable
+/// ASCII with no spaces, within the length the model bounds it to — and, when it is not,
+/// the rule it broke, so the refusal can name the member, the value and the rule the
+/// caller has to fix.
+///
+/// The model types `HealthCheckPath` as `Path` with a length alone, so every other clause
+/// is server-side and this is the only gate: a path the load balancer cannot send is a
+/// probe that can never match, which is why it is refused at the create rather than
+/// stored.
+pub fn check_health_check_path(value: &str) -> Result<(), String> {
+    let printable_ascii_without_spaces = value
+        .chars()
+        .all(|character| character.is_ascii_graphic());
+    // The character rule first, so a value that is no absolute printable-ASCII path is
+    // told that rather than a length it may well be inside.
+    if !value.starts_with('/') || !printable_ascii_without_spaces {
+        return Err(format!(
+            "Health check path '{value}' must begin with a '/' character and can only \
+             contain printable ASCII characters, without spaces"
+        ));
+    }
+    // The model's `@length` counts CHARACTERS, not bytes.
+    if value.chars().count() > HEALTH_CHECK_PATH_MAX_LENGTH {
+        return Err(format!(
+            "Health check path '{value}' cannot be longer than \
+             '{HEALTH_CHECK_PATH_MAX_LENGTH}' characters"
+        ));
+    }
+    Ok(())
+}
+
 /// Which family of load balancer a target group serves, which is what decides WHICH
 /// attributes it carries (the families the model's `TargetGroupAttribute$Key`
 /// documentation groups the attributes by) and what its health check defaults to.
@@ -351,6 +459,20 @@ pub enum LoadBalancerFamily {
     Application,
     Network,
     Gateway,
+}
+
+/// The family a target group whose protocol is `protocol` serves — see
+/// [`LoadBalancerFamily`]. The ONE reading of that pairing, which
+/// [`TargetGroupRecord::family`] answers from the stored record and a create calls
+/// before there is a record to ask.
+pub fn protocol_family(protocol: Option<&str>) -> LoadBalancerFamily {
+    match protocol {
+        Some("GENEVE") => LoadBalancerFamily::Gateway,
+        Some("TCP") | Some("TLS") | Some("UDP") | Some("TCP_UDP") | Some("QUIC")
+        | Some("TCP_QUIC") => LoadBalancerFamily::Network,
+        // HTTP, HTTPS, and a `lambda` target group, which carries no protocol.
+        _ => LoadBalancerFamily::Application,
+    }
 }
 
 /// The set of values one target group attribute accepts, as its own documentation
@@ -715,13 +837,7 @@ impl TargetGroupRecord {
     /// Which load balancer family this target group serves — see
     /// [`LoadBalancerFamily`].
     pub fn family(&self) -> LoadBalancerFamily {
-        match self.protocol.as_deref() {
-            Some("GENEVE") => LoadBalancerFamily::Gateway,
-            Some("TCP") | Some("TLS") | Some("UDP") | Some("TCP_UDP") | Some("QUIC")
-            | Some("TCP_QUIC") => LoadBalancerFamily::Network,
-            // HTTP, HTTPS, and a `lambda` target group, which carries no protocol.
-            _ => LoadBalancerFamily::Application,
-        }
+        protocol_family(self.protocol.as_deref())
     }
 
     /// Whether the attributes documented "only if the load balancer is an Application
@@ -772,8 +888,10 @@ impl TargetGroupRecord {
                 self.health_check.path = Some(default_health_check_path(protocol_version.as_deref()));
             }
             if self.health_check.matcher.is_none() {
-                self.health_check.matcher =
-                    Some(default_health_check_matcher(protocol_version.as_deref()));
+                self.health_check.matcher = Some(default_health_check_matcher(
+                    protocol_version.as_deref(),
+                    self.family(),
+                ));
             }
         } else {
             self.health_check.path = None;

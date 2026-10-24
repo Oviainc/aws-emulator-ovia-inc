@@ -330,8 +330,10 @@ const LIMIT_CATALOGUE: &[LimitEntry] = &[
 /// `crate::state::TARGET_GROUP_QUOTA` (`CreateTargetGroup` ->
 /// `TooManyTargetGroupsException`), `crate::state::LISTENERS_PER_LOAD_BALANCER`
 /// (`CreateListener` -> `TooManyListenersException`, per load balancer whatever its
-/// type) and `crate::state::TARGETS_PER_TARGET_GROUP` (`RegisterTargets` ->
-/// `TooManyTargetsException`).
+/// type) and the per-family target bounds `RegisterTargets` refuses past with
+/// `TooManyTargetsException` (`crate::state::TARGETS_PER_TARGET_GROUP` for an
+/// Application Load Balancer's group, and the Network and Gateway Load Balancer
+/// constants beside it).
 fn enforced_max(name: &str) -> Option<usize> {
     match name {
         "application-load-balancers" | "network-load-balancers" | "gateway-load-balancers" => {
@@ -339,6 +341,12 @@ fn enforced_max(name: &str) -> Option<usize> {
         }
         "target-groups" => Some(crate::state::TARGET_GROUP_QUOTA),
         "targets-per-target-group" => Some(crate::state::TARGETS_PER_TARGET_GROUP),
+        "targets-per-availability-zone-per-network-load-balancer" => {
+            Some(crate::state::TARGETS_PER_NETWORK_TARGET_GROUP)
+        }
+        "targets-per-availability-zone-per-gateway-load-balancer" => {
+            Some(crate::state::TARGETS_PER_GATEWAY_TARGET_GROUP)
+        }
         "listeners-per-application-load-balancer" | "listeners-per-network-load-balancer" => {
             Some(crate::state::LISTENERS_PER_LOAD_BALANCER)
         }

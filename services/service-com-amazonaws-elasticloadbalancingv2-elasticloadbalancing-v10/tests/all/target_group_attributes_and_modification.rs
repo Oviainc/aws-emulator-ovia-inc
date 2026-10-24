@@ -74,7 +74,10 @@ fn absent_target_group_arn() -> String {
 /// The text of an element with the five XML entities the serializer writes resolved, so
 /// an assertion compares the VALUE rather than its encoding (the framework's XML codec
 /// escapes `'` as `&apos;`).
-fn unescaped(text: &str) -> String {
+///
+/// `pub(crate)` because `all/target_validation_and_quotas.rs` compares refusal messages
+/// the same way: ONE reader for the crate, so two suites cannot drift on the encoding.
+pub(crate) fn unescaped(text: &str) -> String {
     text.replace("&lt;", "<")
         .replace("&gt;", ">")
         .replace("&quot;", "\"")
@@ -848,7 +851,13 @@ async fn the_http_only_health_check_members_follow_the_health_check_protocol() {
             first_text(&http, "HealthCheckPath").as_deref(),
             first_text(&http, "HttpCode").as_deref()
         ),
-        (Some("/"), Some("200")),
+        // The documented defaults of an HTTP-semantic health check: the ping path `/`,
+        // and the success codes of the load balancer family the GROUP serves rather than
+        // of the protocol the check speaks — `Matcher$HttpCode`: "For Network Load
+        // Balancers, you can specify values between 200 and 599, with the default value
+        // being 200-399." This group's protocol is TCP, so it is a Network Load
+        // Balancer's.
+        (Some("/"), Some("200-399")),
         "case becoming an HTTP health check: expected the documented defaults, got {http}"
     );
 
@@ -907,7 +916,9 @@ async fn deregistering_removes_the_named_registrations_and_is_idempotent() {
     let arn = create_http_target_group(&router, "dereg-tg").await;
 
     // Three registrations: one on the group's port, and the same id plus another id on
-    // overridden ports.
+    // overridden ports — "you can register each EC2 instance or IP address with the same
+    // target group multiple times using different ports", so one request may ask for two
+    // registrations of one id.
     let mut form = action("RegisterTargets");
     form.push(p("TargetGroupArn", &arn));
     form.push(p("Targets.member.1.Id", "i-1111111111111111"));

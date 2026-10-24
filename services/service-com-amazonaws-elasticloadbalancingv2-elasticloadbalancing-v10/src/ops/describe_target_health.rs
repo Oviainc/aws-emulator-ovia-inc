@@ -155,10 +155,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(group) = guard.target_groups.get(&input.target_group_arn) else {
             return Err(DescribeTargetHealthErrorModeled::TargetGroupNotFoundException(
                 TargetGroupNotFoundException {
-                    message: Some(format!(
-                        "Target group '{}' not found",
-                        input.target_group_arn
-                    )),
+                    // The message every operation that acts on ONE named target group
+                    // answers, built from the request: the identifier it carried, under
+                    // the plural noun ([`crate::state::target_groups_not_found_message`]).
+                    message: Some(crate::state::target_groups_not_found_message([
+                        input.target_group_arn.as_str(),
+                    ])),
                 },
             )
             .into());
