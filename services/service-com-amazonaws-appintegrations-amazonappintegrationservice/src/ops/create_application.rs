@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateApplication
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateApplication`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateApplication::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a `UUID` id and an ARN for a new application, records everything the
+//! request carried in this service's store, and answers with the two values it
+//! minted. The record is the only source `GetApplication` reads, so nothing here
+//! reaches a later reader without being persisted first.
+//!
+//! An application's identity is its (`Namespace`, `Name`) pair: a create whose pair
+//! is already taken is refused with `DuplicateResourceException` (HTTP 409) and
+//! persists nothing. A create past this emulator's stored-application bound is
+//! refused with the modelled `ResourceQuotaExceededException`.
 //!
 //! ## Shape of an operation
 //!
@@ -183,18 +184,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateApplication` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateApplicationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateApplication"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateApplicationErrorModeled::InternalServiceError(InternalServiceError {
+                message: Some("the AppIntegrations store is unavailable".to_string()),
+            })
+        })?;
+        let mut state = state.lock();
+
+        // A retry carrying the `ClientToken` of an application this service already
+        // created answers with the id and ARN it minted then: an @idempotencyToken
+        // makes the call repeatable, so it neither creates a second resource nor
+        // fails as a duplicate.
+        if let Some(token) = input.client_token.as_deref() {
+            if let Some(existing) = state
+                .application_idempotency
+                .get(token)
+                .and_then(|id| state.applications.get(id))
+            {
+                return Ok(CreateApplicationOutput {
+                    arn: Some(existing.arn.clone()),
+                    id: Some(existing.id.clone()),
+                });
+            }
+        }
+
+        if let Some(existing) = state
+            .applications
+            .values()
+            .find(|record| record.namespace == input.namespace && record.name == input.name)
+        {
+            return Err(CreateApplicationErrorModeled::DuplicateResourceException(
+                DuplicateResourceException {
+                    message: Some(format!(
+                        "An application named {} already exists in namespace {}.",
+                        existing.name, existing.namespace
+                    )),
+                },
+            )
+            .into());
+        }
+
+        if !state.has_room_for_another_application() {
+            // Checked BEFORE the write, so this in-memory store cannot be grown
+            // without end one request at a time; a caller's delete frees a slot
+            // again. `ResourceQuotaExceededException` (HTTP 429) is what the
+            // operation models for an exceeded quota.
+            return Err(
+                CreateApplicationErrorModeled::ResourceQuotaExceededException(
+                    ResourceQuotaExceededException {
+                        message: Some(format!(
+                            "The allowed quota for the resource has been exceeded: at most {} \
+                             Applications can exist.",
+                            crate::state::MAX_STORED_APPLICATIONS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The id is minted, never derived from the request: the model types it as a
+        // `UUID` (pattern ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$),
+        // so two applications that differ in nothing a client sent still get
+        // different ids.
+        let id = ::uuid::Uuid::new_v4().to_string();
+        let region = crate::state::request_region(ctx.parts());
+        let arn = crate::state::application_arn(&region, &id);
+        let now = ::std::time::SystemTime::now();
+        let record = crate::state::ApplicationRecord {
+            id: id.clone(),
+            arn: arn.clone(),
+            name: input.name,
+            namespace: input.namespace,
+            description: input.description,
+            application_source_config: input.application_source_config,
+            subscriptions: input.subscriptions,
+            publications: input.publications,
+            permissions: input.permissions,
+            tags: input
+                .tags
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<::std::collections::BTreeMap<String, String>>(),
+            is_service: input.is_service,
+            initialization_timeout: input.initialization_timeout,
+            application_config: input.application_config,
+            iframe_config: input.iframe_config,
+            application_type: input.application_type,
+            auth_config: input.auth_config,
+            client_token: input.client_token.clone(),
+            created_time: now,
+            last_modified_time: now,
+        };
+        if let Some(token) = input.client_token {
+            state.remember_application_client_token(token, id.clone());
+        }
+        state.applications.insert(id.clone(), record);
+
+        Ok(CreateApplicationOutput {
+            arn: Some(arn),
+            id: Some(id),
+        })
     }
 }
