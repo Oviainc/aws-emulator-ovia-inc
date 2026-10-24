@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDestination
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDestination`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDestination::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Inserts the destination into `crate::state`'s `destinations` store under the region and
+//! `Name` the request names ([`crate::state::RegionalName`]), and answers with that name.
+//! A destination is identified by its name, so a create for a name the region already holds
+//! one under is refused with the modelled `ConflictException`; a replayed `ClientToken`
+//! (`@idempotencyToken`) answers with the record the first call created instead of creating
+//! a second one. `GetDestination` projects the stored record onto its output shape, and
+//! `CreateNotificationConfiguration` resolves its `DestinationName` against this store.
 //!
 //! ## Shape of an operation
 //!
@@ -137,6 +136,21 @@ pub struct CreateDestination<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
 
+/// Record this state-changing call for attribution: the access key id the caller presented
+/// (a public identifier, never a secret), the region the destination was created in, and
+/// how the call ended. No `Name` and no ARN: a log sink needs neither to attribute the
+/// change.
+fn audit(akid: &str, region: &str, outcome: &str) {
+    ::tracing::info!(
+        target: "emulator::audit",
+        operation = "CreateDestination",
+        akid = %akid,
+        region = %region,
+        outcome = %outcome,
+        "state-changing operation"
+    );
+}
+
 impl<Eng> CreateDestination<Eng> {
     /// Construct the operation from the shared engine. INFALLIBLE — the engine is a
     /// construction-time dependency, so engine access is guaranteed by the time any
@@ -163,18 +177,131 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDestination` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDestinationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDestination"))
+        // The credential scope's access key id is read only to ATTRIBUTE the change
+        // ([`audit`]); the region it names is the region this destination is created in.
+        let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
+        let region = crate::state::request_region(ctx.parts());
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            audit(&akid, &region, "unavailable");
+            CreateDestinationErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the destination store is unavailable".to_string()),
+            })
+        })?;
+
+        // `DeliveryDestinationType` is a modelled enum, so a value outside
+        // `DELIVERY_DESTINATION_TYPE_VALUES` is a client error rather than a stored record.
+        // The model's own constraint walk refuses one before this handler runs; this second
+        // line states it through the SAME formatter, so the two cannot word one refusal two
+        // ways (`crate::service::enum_value_set_refusal`).
+        if !DELIVERY_DESTINATION_TYPE_VALUES.contains(&input.delivery_destination_type.as_str()) {
+            audit(&akid, &region, "refused");
+            return Err(CreateDestinationErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::service::enum_value_set_refusal(
+                        "deliveryDestinationType",
+                        DELIVERY_DESTINATION_TYPE_VALUES,
+                        &input.delivery_destination_type,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let created_at = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // Retire the idempotency records the clock already made due, before anything reads
+        // them: a token past its TTL neither replays nor occupies the map.
+        store.retire_expired_idempotency_tokens(created_at);
+
+        // A retry with the same `ClientToken` answers with what the first call created,
+        // performing no further action — so it is answered BEFORE the duplicate-name
+        // conflict below, which the first call's own record would otherwise raise.
+        let replayed = input.client_token.as_deref().and_then(|token| {
+            store.replayed_resource_id(crate::state::DESTINATION_RESOURCE_TYPE, token)
+        });
+        if let Some(created) = replayed.and_then(|name| store.destination_in(&region, &name)) {
+            let name = created.name.clone();
+            drop(store);
+            audit(&akid, &region, "replayed");
+            return Ok(CreateDestinationOutput { name: Some(name) });
+        }
+
+        // A destination is addressed by its NAME (`GET /destinations/{Name}`), so a name
+        // the region already holds a destination under is a conflict rather than a second
+        // record: the caller updates or deletes the existing one.
+        if store.destination_in(&region, &input.name).is_some() {
+            drop(store);
+            audit(&akid, &region, "conflict");
+            return Err(CreateDestinationErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(
+                        "a destination with this name already exists; delete it or update it \
+                         instead of creating another"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The store is bounded: past its maximum a create is refused rather than grown
+        // into. The quota is per region, as the record and the conflict check are, so
+        // another region's destinations never consume this region's budget.
+        let held = store
+            .destinations
+            .keys()
+            .filter(|key| key.region == region)
+            .count();
+        if held >= crate::state::MAX_DESTINATIONS {
+            drop(store);
+            audit(&akid, &region, "refused");
+            return Err(CreateDestinationErrorModeled::ThrottlingException(
+                ThrottlingException {
+                    message: Some(format!(
+                        "this region holds the maximum of {} destinations; delete one before \
+                         creating another",
+                        crate::state::MAX_DESTINATIONS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let destination = crate::state::Destination {
+            name: input.name.clone(),
+            region: region.clone(),
+            delivery_destination_arn: input.delivery_destination_arn,
+            delivery_destination_type: input.delivery_destination_type,
+            role_arn: input.role_arn,
+            description: input.description,
+            tags: input.tags.unwrap_or_default(),
+            created_at,
+            // Nothing has changed the record since the create, so it was last updated when
+            // it was created.
+            updated_at: created_at,
+        };
+
+        if let Some(token) = input.client_token {
+            // What the token replays into is the destination's IDENTIFIER, which for this
+            // resource is its name.
+            store.record_idempotency_token(
+                crate::state::DESTINATION_RESOURCE_TYPE,
+                &token,
+                &input.name,
+                created_at,
+            );
+        }
+        store.destinations.insert(
+            crate::state::RegionalName::new(&region, &input.name),
+            destination,
+        );
+        drop(store);
+
+        audit(&akid, &region, "created");
+        Ok(CreateDestinationOutput {
+            name: Some(input.name),
+        })
     }
 }

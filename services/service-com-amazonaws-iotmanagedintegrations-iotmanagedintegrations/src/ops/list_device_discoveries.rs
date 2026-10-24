@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDeviceDiscoveries
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDeviceDiscoveries`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDeviceDiscoveries::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages over the device discovery jobs `crate::state`'s `device_discoveries` store holds
+//! for the caller's region, in the order they were started, each projected onto
+//! `DeviceDiscoverySummary` with the `Status` the CLOCK gives it
+//! ([`crate::state::DeviceDiscovery::status_at`]). `TypeFilter` and `StatusFilter` select by
+//! the member each names, `MaxResults` bounds the page and `NextToken` resumes it. A pure
+//! read: paging stores nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +155,82 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDeviceDiscoveries` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDeviceDiscoveriesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDeviceDiscoveries"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListDeviceDiscoveriesErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the device-discovery store is unavailable".to_string()),
+            })
+        })?;
+
+        let store = state.lock();
+        // A device discovery job is regional: a list reports only this region's jobs.
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // A `NextToken` is this service's own encoded cursor — the insertion sequence the
+        // page resumes at — so one it cannot have issued is a client error rather than an
+        // empty page.
+        let resume_at = match input.next_token.as_deref() {
+            None => 0u64,
+            Some(token) => crate::state::decode_page_token(token, store.next_sequence).ok_or_else(
+                || {
+                    ListDeviceDiscoveriesErrorModeled::ValidationException(ValidationException {
+                        message: Some("NextToken is not a token this service issued".to_string()),
+                    })
+                },
+            )?,
+        };
+
+        // The jobs this region holds, in the order they were started, so a page token keeps
+        // resuming at the right place.
+        let mut selected: Vec<&crate::state::DeviceDiscovery> = store
+            .device_discoveries
+            .values()
+            .filter(|discovery| discovery.region == region)
+            .filter(|discovery| discovery.sequence >= resume_at)
+            // Each modelled filter is an equality test on the member it names.
+            .filter(|discovery| {
+                input
+                    .type_filter
+                    .as_ref()
+                    .is_none_or(|wanted| &discovery.discovery_type == wanted)
+                    && input
+                        .status_filter
+                        .as_ref()
+                        .is_none_or(|wanted| discovery.status_at(now) == wanted)
+            })
+            .collect();
+        selected.sort_by_key(|discovery| discovery.sequence);
+
+        // `MaxResults` is the caller's maximum, never a minimum, so the page size is
+        // clamped to what one response may carry.
+        let page_size = input.max_results.map_or(
+            crate::state::DISCOVERED_DEVICE_PAGE_LIMIT,
+            |max| {
+                usize::try_from(max)
+                    .unwrap_or(1)
+                    .clamp(1, crate::state::DISCOVERED_DEVICE_PAGE_LIMIT)
+            },
+        );
+
+        let items: Vec<DeviceDiscoverySummary> = selected
+            .iter()
+            .take(page_size)
+            .map(|discovery| DeviceDiscoverySummary {
+                id: Some(discovery.id.clone()),
+                discovery_type: Some(discovery.discovery_type.clone()),
+                status: Some(discovery.status_at(now).to_string()),
+            })
+            .collect();
+
+        // The token resumes at the job after the last one this page emitted, so a job
+        // started in between cannot shift the resume point.
+        let next_token = selected
+            .get(page_size)
+            .map(|discovery| crate::state::encode_page_token(discovery.sequence));
+
+        Ok(ListDeviceDiscoveriesOutput {
+            items: Some(items),
+            next_token,
+        })
     }
 }

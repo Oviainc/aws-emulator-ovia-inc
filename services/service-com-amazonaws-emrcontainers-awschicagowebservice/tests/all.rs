@@ -27,3 +27,5 @@ mod security_configuration_list;
 mod state_roundtrip;
 #[path = "all/virtual_cluster_job_run_loop.rs"]
 mod virtual_cluster_job_run_loop;
+#[path = "all/virtual_cluster_scheduler_status.rs"]
+mod virtual_cluster_scheduler_status;

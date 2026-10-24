@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateNotificationConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateNotificationConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateNotificationConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! RE-POINTS the notification configuration `crate::state`'s `notification_configurations`
+//! store holds for the region and `EventType` the URI names at another destination, and
+//! stamps the record as updated. An event type this region holds no configuration for is
+//! the modelled `ResourceNotFoundException`, and a `DestinationName` the account has no
+//! destination under is the modelled `ValidationException` that changes nothing — the same
+//! resolution `CreateNotificationConfiguration` performs for the same member.
 //!
 //! ## Shape of an operation
 //!
@@ -144,6 +142,21 @@ pub struct UpdateNotificationConfiguration<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
 
+/// Record this state-changing call for attribution: the access key id the caller presented
+/// (a public identifier, never a secret), the region the configuration lives in, the event
+/// type it addresses and how the call ended.
+fn audit(akid: &str, region: &str, event_type: &str, outcome: &str) {
+    ::tracing::info!(
+        target: "emulator::audit",
+        operation = "UpdateNotificationConfiguration",
+        akid = %akid,
+        region = %region,
+        event_type = %event_type,
+        outcome = %outcome,
+        "state-changing operation"
+    );
+}
+
 impl<Eng> UpdateNotificationConfiguration<Eng> {
     /// Construct the operation from the shared engine. INFALLIBLE — the engine is a
     /// construction-time dependency, so engine access is guaranteed by the time any
@@ -170,18 +183,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateNotificationConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateNotificationConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateNotificationConfiguration"))
+        // The credential scope's access key id is read only to ATTRIBUTE the change
+        // ([`audit`]); the region it names is the region the configuration lives in.
+        let akid = ::emulator_server::extract_akid(&ctx.parts().headers);
+        let region = crate::state::request_region(ctx.parts());
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            audit(&akid, &region, &input.event_type, "unavailable");
+            UpdateNotificationConfigurationErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the notification-configuration store is unavailable".to_string(),
+                    ),
+                },
+            )
+        })?;
+
+        let updated_at = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The configuration being changed must exist: an event type this region holds none
+        // for is not created by an update.
+        if store
+            .notification_configuration_in(&region, &input.event_type)
+            .is_none()
+        {
+            drop(store);
+            audit(&akid, &region, &input.event_type, "not-found");
+            return Err(
+                UpdateNotificationConfigurationErrorModeled::ResourceNotFoundException(
+                    crate::state::notification_configuration_not_found_on_read(&input.event_type),
+                )
+                .into(),
+            );
+        }
+
+        // The destination the notifications are to be delivered to is resolved on the same
+        // terms as on the create: a name the account has no destination under names nothing
+        // to deliver to, and the stored configuration is left as it was.
+        if store
+            .destination_in(&region, &input.destination_name)
+            .is_none()
+        {
+            drop(store);
+            audit(&akid, &region, &input.event_type, "refused");
+            return Err(
+                UpdateNotificationConfigurationErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(crate::state::unknown_reference_message("DestinationName")),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let key = crate::state::RegionalName::new(&region, &input.event_type);
+        if let Some(configuration) = store.notification_configurations.get_mut(&key) {
+            configuration.destination_name = input.destination_name;
+            configuration.updated_at = updated_at;
+        }
+        drop(store);
+
+        audit(&akid, &region, &input.event_type, "updated");
+        Ok(UpdateNotificationConfigurationOutput)
     }
 }
