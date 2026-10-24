@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSAMLProvider
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSAMLProvider`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSAMLProvider::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Registers a SAML 2.0 identity provider under the account: the provider is named by
+//! its `Name`, its ARN is derived from that name, the metadata document it carries is
+//! what its expiration is read from, and the record this writes is what
+//! `GetSAMLProvider` reports.
 //!
 //! ## Shape of an operation
 //!
@@ -186,18 +182,142 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSAMLProvider` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSAMLProviderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSAMLProvider"))
+        // `ctx` carries request metadata only; nothing here depends on it — IAM is global,
+        // so not even the ARN's region segment comes from the request.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateSAMLProviderErrorModeled::ServiceFailureException(
+                ServiceFailureException {
+                    message: Some("the IAM store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // "You upload a SAML metadata document that you get from your IdP. That document
+        // includes the issuer's name, expiration information, and keys" — so the document
+        // is READ here, not just stored: a value that describes no SAML 2.0 identity
+        // provider is "an invalid … value … supplied for an input parameter", and the
+        // refusal names the member and what was wrong with it. `SAMLMetadataDocumentType`'s
+        // own length bound (1000..10000000) was already enforced before this handler ran.
+        let metadata = match crate::state::parse_saml_metadata(&input.saml_metadata_document) {
+            Ok(metadata) => metadata,
+            Err(reason) => {
+                return Err(CreateSAMLProviderErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(format!("Invalid SAMLMetadataDocument: {reason}")),
+                    },
+                )
+                .into())
+            }
+        };
+
+        // AWS reserves the `aws:` tag-key prefix, so a request naming one supplied an
+        // "invalid … value … for an input parameter" — and "if any one of the tags is
+        // invalid or if you exceed the allowed maximum number of tags, then the entire
+        // request fails and the resource is not created" (`$Tags`), which is why this is
+        // checked before anything is written.
+        let supplied_tags = input.tags.unwrap_or_default();
+        if let Some(reserved) =
+            crate::state::reserved_tag_key(supplied_tags.iter().map(|tag| tag.key.as_str()))
+        {
+            return Err(CreateSAMLProviderErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "Tag key {reserved} is reserved: keys must not begin with {}",
+                        crate::state::RESERVED_TAG_KEY_PREFIX
+                    )),
+                },
+            )
+            .into());
+        }
+        // A key repeated inside one request settles on its LAST value, the rule every tag
+        // call in this service follows, and the provider's tags are held sorted by key
+        // because "the returned list of tags is sorted by tag key" (`$Tags`).
+        let Some(mut tags) = crate::state::merge_tags(None, supplied_tags) else {
+            return Err(CreateSAMLProviderErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Cannot exceed quota for TagsPerResource: {}",
+                        crate::state::MAX_TAGS_PER_ENTITY
+                    )),
+                },
+            )
+            .into());
+        };
+        tags.sort_by(|left, right| left.key.cmp(&right.key));
+        let tags = (!tags.is_empty()).then_some(tags);
+
+        let arn = crate::state::saml_provider_arn(&input.name);
+        let mut store = state.lock();
+
+        // The provider is named by its `Name` and its ARN is derived from it, so a held
+        // ARN is a held name: "the request was rejected because it attempted to create a
+        // resource that already exists" (`EntityAlreadyExistsException`).
+        if store.saml_providers.contains_key(&arn) {
+            return Err(CreateSAMLProviderErrorModeled::EntityAlreadyExistsException(
+                EntityAlreadyExistsException {
+                    message: Some(format!(
+                        "SAML Provider with name {} already exists.",
+                        input.name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // An account holds a bounded number of SAML providers, so a caller cannot grow the
+        // account without limit; past the quota IAM refuses the create.
+        if store.saml_providers.len() >= crate::state::MAX_SAML_PROVIDERS_PER_ACCOUNT {
+            return Err(CreateSAMLProviderErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Cannot exceed quota for SAMLProvidersPerAccount: {}",
+                        crate::state::MAX_SAML_PROVIDERS_PER_ACCOUNT
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let provider_uuid = store.next_saml_provider_uuid();
+        let created = crate::state::now();
+        // "The private key generated from your external identity provider"
+        // (`$AddPrivateKey`): what the account holds afterwards is the key's identity and
+        // the instant it was uploaded, which is all `SAMLPrivateKey` reports. The key
+        // MATERIAL is not retained — the model marks it sensitive and no read hands it
+        // back, so nothing could ever report it.
+        let private_keys = match input.add_private_key {
+            None => Vec::new(),
+            Some(_) => vec![SAMLPrivateKey {
+                key_id: Some(store.next_saml_private_key_id()),
+                timestamp: Some(created),
+            }],
+        };
+
+        store.saml_providers.insert(
+            arn.clone(),
+            crate::state::SamlProviderRecord {
+                provider_uuid,
+                metadata_document: input.saml_metadata_document,
+                create_date: created,
+                // The provider's expiration is the document's, so it is a property of what
+                // the request carried rather than a value invented here.
+                valid_until: metadata.valid_until,
+                // Reported only when a request chose one: `assertionEncryptionModeType`
+                // declares no default (`smithy_query(query="shape",
+                // shape="assertionEncryptionModeType")`), and the boundary validator has
+                // already refused any value outside the set it declares.
+                assertion_encryption_mode: input.assertion_encryption_mode,
+                private_keys,
+                tags: tags.clone(),
+            },
+        );
+        // The response reports the stored record's ARN and tags, so a caller sees exactly
+        // what a later `GetSAMLProvider` reports.
+        Ok(CreateSAMLProviderOutput {
+            saml_provider_arn: Some(arn),
+            tags,
+        })
     }
 }
