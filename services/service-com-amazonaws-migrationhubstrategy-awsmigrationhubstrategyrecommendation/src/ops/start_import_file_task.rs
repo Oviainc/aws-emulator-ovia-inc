@@ -179,6 +179,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::check_bucket_usable(input.s3bucket_for_report_data.as_deref())
             .map_err(StartImportFileTaskErrorModeled::ValidationException)?;
 
+        // The same enum rule as `StartAssessment`, on this operation's own
+        // enum-targeting members: `dataSourceType` (`DataSourceType`) and, one level
+        // down, each `groupId` entry's `name` (`GroupName`). An undeclared value is
+        // refused rather than stored and reported back as a source type or a group kind
+        // the model does not declare. Both run before the task is minted.
+        crate::state::check_enum(input.data_source_type.as_deref(), DATA_SOURCE_TYPE_VALUES)
+            .map_err(StartImportFileTaskErrorModeled::ValidationException)?;
+        let group_id = input.group_id.unwrap_or_default();
+        crate::state::check_group_names(&group_id)
+            .map_err(StartImportFileTaskErrorModeled::ValidationException)?;
+
         let mut store = state.lock();
 
         // The store is bounded: past its quota an import is refused rather than adding
@@ -205,7 +216,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input_s3_bucket: input.s3_bucket,
             input_s3_key: input.s3key,
             data_source_type: input.data_source_type,
-            group_id: input.group_id.unwrap_or_default(),
+            group_id,
             // Where the import results would be uploaded, when the caller named a
             // bucket for them. The report object itself is never written, so there is
             // no `statusReportS3Key` to report.

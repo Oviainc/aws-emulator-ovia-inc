@@ -17,6 +17,9 @@ mod application_component_details;
 #[path = "all/assessment_error_paths.rs"]
 mod assessment_error_paths;
 
+#[path = "all/enum_membership.rs"]
+mod enum_membership;
+
 #[path = "all/import_and_assess.rs"]
 mod import_and_assess;
 

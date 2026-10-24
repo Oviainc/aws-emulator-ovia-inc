@@ -197,14 +197,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
         let group_id_filter = input.group_id_filter.unwrap_or_default();
-        if group_id_filter.len() > crate::state::MAX_GROUP_FILTER_ENTRIES
-            || !group_id_filter.iter().all(|group| {
-                group
-                    .name
-                    .as_deref()
-                    .is_none_or(|name| GROUP_NAME_VALUES.contains(&name))
-            })
-        {
+        // The same enum rule one level down, on each filter entry's `name`, beside the
+        // bound on how many entries the operation accepts.
+        if group_id_filter.len() > crate::state::MAX_GROUP_FILTER_ENTRIES {
             return Err(
                 StartRecommendationReportGenerationErrorModeled::ValidationException(
                     crate::state::invalid_request_body(),
@@ -212,6 +207,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
+        crate::state::check_group_names(&group_id_filter)
+            .map_err(StartRecommendationReportGenerationErrorModeled::ValidationException)?;
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
