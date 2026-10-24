@@ -529,12 +529,29 @@ pub enum ElasticIpAssociation {
         instance_id: Option<String>,
     },
     /// The account's EC2 store holds no allocation of that id, so there was no `Address`
-    /// record to associate. Whether such a request is refused is not this function's
-    /// question — it reports what it found.
+    /// record to associate: the member names an EC2 resource of the caller's account the
+    /// account does not hold, which [`invalid_allocation_clause`] is the refusal for.
     NoSuchAllocation,
     /// There is no readable EC2 store on this engine, so nothing was written and nothing
     /// is known: the same "evidence of nothing" answer every other function here gives.
     NoEc2Store,
+}
+
+/// The clause stated for an `allocationId` the account's own Amazon EC2 store holds no
+/// Elastic IP allocation for.
+///
+/// Stated in the same form as [`invalid_vpc_clause`], because it is the same kind of
+/// failure: a member naming an Amazon EC2 resource of the caller's account that the
+/// account does not hold, so the request cannot be carried out on it. The sentence is
+/// built from the request — it names the id the caller gave and nothing from the store.
+pub fn invalid_allocation_clause(allocation_id: &str) -> ValidationExceptionField {
+    super::field_failure_stated(
+        "allocationId",
+        format!(
+            "The Elastic IP address allocation id {allocation_id} is not valid or does not \
+             exist. Please verify the allocation id exists and is valid."
+        ),
+    )
 }
 
 /// Record on the account's own Amazon EC2 store that `allocation_id` is now associated
