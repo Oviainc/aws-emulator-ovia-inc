@@ -1539,6 +1539,43 @@ pub fn instant_key(at: DateTime) -> (i64, u32) {
     (at.secs(), at.subsec_nanos())
 }
 
+/// One instant in the ISO 8601 `date-time` form this service's own docs state its time
+/// members in ("This is specified using the ISO 8601 format. For example,
+/// 2020-06-01T13:15:02.001Z", `smithy_query(query="doc",
+/// shape="com.amazonaws.codeguruprofiler#GetRecommendationsRequest", member="startTime")`),
+/// so a refusal naming a bound states it the way the request carried it.
+///
+/// Falls back to epoch seconds if the instant cannot be rendered, so a refusal is never
+/// lost to a formatting failure.
+pub fn iso8601(at: DateTime) -> String {
+    at.fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_else(|_| format!("{} (epoch seconds)", at.as_secs_f64()))
+}
+
+/// This service's INTERVAL rule, in one place for every operation that takes a time
+/// range: a pair of bounds names an interval only when its start is STRICTLY before its
+/// end, so a reversed pair and a zero-width pair are both refused — before any lookup,
+/// so a request that names no interval never reports about one.
+///
+/// `Ok(())` when `start` is before `end`; otherwise the message, which states the rule
+/// and names the two offending bounds as the request gave them (the service's own
+/// sentence for this refusal), for each handler to lift into its own modelled
+/// `ValidationException` (HTTP 400).
+///
+/// The bounds are compared through [`instant_key`], exactly at nanosecond resolution,
+/// so an interval narrower than a microsecond is still ordered correctly rather than
+/// collapsing to a zero-width one through `f64` epoch seconds.
+pub fn validate_interval(start: DateTime, end: DateTime) -> Result<(), String> {
+    if instant_key(start) < instant_key(end) {
+        return Ok(());
+    }
+    Err(format!(
+        "Interval start time ({}) must be before end time ({})",
+        iso8601(start),
+        iso8601(end)
+    ))
+}
+
 /// The ARN of a profiling group:
 /// `arn:aws:codeguru-profiler:<region>:<account>:profilingGroup/<name>`.
 pub fn profiling_group_arn(region: &str, name: &str) -> String {

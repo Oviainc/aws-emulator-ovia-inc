@@ -5,6 +5,12 @@
 //! the requested aggregation period, inside the requested time range, in the requested
 //! order and a page at a time. Reporting only: it writes nothing.
 //!
+//! The requested range must be an INTERVAL — `startTime` strictly before `endTime` — a
+//! rule the model cannot express and which this service applies the same way wherever a
+//! request names both bounds of a range ([`crate::state::validate_interval`]), so a
+//! reversed or zero-width pair is refused with the operation's own modelled
+//! `ValidationException` (HTTP 400) before anything is looked up.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -202,20 +208,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
         };
+        // Both bounds are modelled required, so a request always names a pair; what the
+        // model cannot express is that the pair must be an INTERVAL — start strictly
+        // before end. `crate::state::validate_interval` is this service's one encoding
+        // of that rule, so a reversed range and a zero-width one are refused here with
+        // the operation's own modelled `ValidationException` (400), naming both bounds,
+        // before any profile is looked at.
+        if let Err(message) = crate::state::validate_interval(input.start_time, input.end_time) {
+            return Err(
+                ListProfileTimesErrorModeled::ValidationException(ValidationException { message })
+                    .into(),
+            );
+        }
         // Instants are compared through `instant_key`, which is exact at nanosecond
         // resolution, rather than through `f64` epoch seconds.
         let (range_start, range_end) = (
             crate::state::instant_key(input.start_time),
             crate::state::instant_key(input.end_time),
         );
-        if range_end < range_start {
-            return Err(ListProfileTimesErrorModeled::ValidationException(
-                ValidationException {
-                    message: "endTime must not be before startTime".to_string(),
-                },
-            )
-            .into());
-        }
 
         // The page token is this service's own opaque cursor: the index into the
         // ordered profile-time list at which the next page starts. It satisfies the
