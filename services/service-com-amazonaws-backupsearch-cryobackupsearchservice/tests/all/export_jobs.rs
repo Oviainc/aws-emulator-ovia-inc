@@ -47,7 +47,7 @@ fn passable_role(partition: &str, name: &str) -> String {
 /// below picks one, so the rule is asserted on every permitted status rather than on the
 /// one a recording happened to use.
 #[derive(Debug, Clone, Copy)]
-enum Settled {
+pub(crate) enum Settled {
     /// Let the scan be created and finish: `CREATING` -> `RUNNING` -> `COMPLETED`.
     Completed,
     /// Cancel it: `STOPPING` -> `STOPPED`.
@@ -55,7 +55,7 @@ enum Settled {
 }
 
 impl Settled {
-    fn expected_status(self) -> &'static str {
+    pub(crate) fn expected_status(self) -> &'static str {
         match self {
             Self::Completed => state::COMPLETED,
             Self::Stopped => state::STOPPED,
@@ -136,7 +136,10 @@ fn export_body(case: &ExportCase, search_job_identifier: &str) -> Value {
 /// A scan only runs to `COMPLETED` if its scope resolved to something, so the store is
 /// seeded with one recovery point the scope below selects — the Backup data plane is what
 /// would hold it, and nothing in this service creates one.
-async fn settled_search_job(
+///
+/// `pub(crate)` because the `ClientToken` window suite
+/// (`tests/all/client_token_window.rs`) needs the same exportable search job.
+pub(crate) async fn settled_search_job(
     emulator: &MultiServiceRouter,
     engine: &engine::InMemoryEngine,
     region: &str,
@@ -220,7 +223,10 @@ async fn get_export_job(
 
 /// How many export jobs the shared store holds — the check that a refused start wrote
 /// nothing, read off the store itself so it does not depend on a listing's own filters.
-fn stored_export_jobs(engine: &engine::InMemoryEngine) -> usize {
+///
+/// `pub(crate)` because the `ClientToken` window suite
+/// (`tests/all/client_token_window.rs`) counts the same records the same way.
+pub(crate) fn stored_export_jobs(engine: &engine::InMemoryEngine) -> usize {
     engine
         .state::<state::ComAmazonawsBackupsearchCryobackupsearchserviceState>()
         .lock()
