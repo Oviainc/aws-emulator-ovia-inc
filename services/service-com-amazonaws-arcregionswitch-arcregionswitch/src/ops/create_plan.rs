@@ -80,17 +80,20 @@ use super::types::*;
 // `CreatePlanError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-arcregionswitch-arcregionswitch.json");
 
-// The operation's MODELED errors. `CreatePlan` itself declares none, so two shapes the
+// The operation's MODELED errors. `CreatePlan` itself declares none, so three shapes the
 // SERVICE models (and other operations declare) are widened in through `extra_errors`:
-// `InternalServerException`, for an unreachable shared store, and
+// `InternalServerException`, for an unreachable shared store,
 // `IllegalStateException` — "the current state of the resource doesn't allow the
-// operation to proceed" — for a store already holding `crate::state::MAX_PLANS` plans.
+// operation to proceed" — for a store already holding `crate::state::MAX_PLANS` plans,
+// and `IllegalArgumentException` — "the request processing has an invalid argument" —
+// for a request carrying more than `crate::state::MAX_TAGS_PER_PLAN` tags.
 #[smithy_macros::operation_error(
     "com.amazonaws.arcregionswitch#CreatePlan",
-    extra_errors = ["IllegalStateException", "InternalServerException"]
+    extra_errors = ["IllegalArgumentException", "IllegalStateException", "InternalServerException"]
 )]
 #[derive(Debug)]
 pub enum CreatePlanErrorModeled {
+    IllegalArgumentException(IllegalArgumentException),
     IllegalStateException(IllegalStateException),
     InternalServerException(InternalServerException),
 }
@@ -183,6 +186,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::validation(violation));
         }
 
+        // A plan carries at most the documented maximum of tags however they arrive, so
+        // the ceiling `TagResource` enforces is enforced on the tags a plan is born with
+        // too. The `Tags` map's own `@length(0..200)` is wider than that maximum.
+        let requested_tags = input.tags.unwrap_or_default();
+        // A map's KEY target is not reached by the boundary validator (its VALUE target
+        // is), so `TagKey`'s modelled length is enforced here, exactly as `TagResource`
+        // enforces it.
+        if let Some(rejection) =
+            crate::state::tag_keys_rejection("tags", requested_tags.keys().map(String::as_str))
+        {
+            return Err(CreatePlanErrorModeled::IllegalArgumentException(
+                IllegalArgumentException { message: rejection },
+            )
+            .into());
+        }
+        if requested_tags.len() > crate::state::MAX_TAGS_PER_PLAN {
+            return Err(CreatePlanErrorModeled::IllegalArgumentException(
+                IllegalArgumentException {
+                    message: format!(
+                        "tags: a Region switch resource carries a maximum of {} tags; \
+                         this request carries {}",
+                        crate::state::MAX_TAGS_PER_PLAN,
+                        requested_tags.len()
+                    ),
+                },
+            )
+            .into());
+        }
+
         // The ARN suffix comes from the store's monotonic seed, so two plans that share a
         // name still get distinct ARNs and a plan's ARN never changes.
         let seed = store.next_seed();
@@ -210,7 +242,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 updated_at: Some(::aws_smithy_types::DateTime::from(now)),
             },
             revision: 1,
-            tags: input.tags.unwrap_or_default().into_iter().collect(),
+            tags: requested_tags.into_iter().collect(),
             executions: Vec::new(),
             active_execution: None,
         };

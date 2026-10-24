@@ -31,21 +31,24 @@ use crate::flow_lifecycle::{Emulator, REGION};
 /// The only `CurrencyCode` MediaConnect bills a reservation in: "the currencyCode used for
 /// your reservation is US dollars"
 /// (`smithy_query(query="shape",shape="Reservation",member="CurrencyCode")`).
-const CURRENCY_CODE: &str = "USD";
+pub(crate) const CURRENCY_CODE: &str = "USD";
 
 /// The only value the modelled `PriceUnits` enum carries
 /// (`smithy_query(query="shape",shape="PriceUnits")`: HOURLY).
-const PRICE_UNITS: &str = "HOURLY";
+pub(crate) const PRICE_UNITS: &str = "HOURLY";
 
 /// The only value the modelled `DurationUnits` enum carries
 /// (`smithy_query(query="shape",shape="DurationUnits")`: MONTHS).
-const DURATION_UNITS: &str = "MONTHS";
+pub(crate) const DURATION_UNITS: &str = "MONTHS";
 
 /// The only value the modelled `ResourceType` enum carries
 /// (`smithy_query(query="shape",shape="ResourceType")`: Mbps_Outbound_Bandwidth).
-const RESOURCE_TYPE: &str = "Mbps_Outbound_Bandwidth";
+pub(crate) const RESOURCE_TYPE: &str = "Mbps_Outbound_Bandwidth";
 
-async fn list_reservations(emulator: &Emulator, query: &str) -> (u16, Option<String>, Value) {
+pub(crate) async fn list_reservations(
+    emulator: &Emulator,
+    query: &str,
+) -> (u16, Option<String>, Value) {
     emulator
         .send("GET", &format!("/v1/reservations{query}"), None)
         .await
@@ -70,7 +73,7 @@ fn listed_arns(body: &Value) -> Vec<String> {
 }
 
 /// The listed reservation with this ARN, or `None` when the page does not carry it.
-fn listed_by_arn(body: &Value, arn: &str) -> Option<Value> {
+pub(crate) fn listed_by_arn(body: &Value, arn: &str) -> Option<Value> {
     listed(body)
         .into_iter()
         .find(|reservation| reservation["reservationArn"].as_str() == Some(arn))
@@ -83,7 +86,7 @@ fn listed_by_arn(body: &Value, arn: &str) -> Option<Value> {
 /// The check runs through the crate's own encoding of that form — the same function
 /// ListReservations validates a pagination token with — and then re-asserts, field by
 /// field, the parts the form fixes, so a bug in that function cannot hide here.
-fn assert_minted_reservation_arn(case: &str, arn: &str, name: &str) {
+pub(crate) fn assert_minted_reservation_arn(case: &str, arn: &str, name: &str) {
     assert!(
         mc::is_mintable_reservation_arn(arn),
         "case {case:?}: a listed ReservationArn must be one this service could mint, got {arn:?}"
@@ -116,7 +119,7 @@ fn assert_minted_reservation_arn(case: &str, arn: &str, name: &str) {
 /// `Reservation$Start` and `Reservation$End` carry the documented form: "Use the following
 /// format: `YYYY-MM-DDTHH:mm:SSZ`, where `T` and `Z` are literal characters"
 /// (`smithy_query(query="doc",shape="PurchaseOfferingRequest",member="Start")`).
-fn assert_documented_instant(case: &str, member: &str, value: &str) {
+pub(crate) fn assert_documented_instant(case: &str, member: &str, value: &str) {
     assert_eq!(
         value.len(),
         20,
@@ -152,27 +155,27 @@ fn assert_documented_instant(case: &str, member: &str, value: &str) {
 /// whether the clock owes the record a change, whether its `End` has passed, the offering
 /// terms copied onto it (duration, price, reserved bitrate — including the optional member
 /// left absent) and the form of its name.
-struct ReservationCase {
-    case: &'static str,
-    name: &'static str,
+pub(crate) struct ReservationCase {
+    pub(crate) case: &'static str,
+    pub(crate) name: &'static str,
     /// `Reservation$Duration`, in [`DURATION_UNITS`].
-    duration: i32,
-    price_per_unit: &'static str,
+    pub(crate) duration: i32,
+    pub(crate) price_per_unit: &'static str,
     /// `ResourceSpecification$ReservedBitrate` — the one OPTIONAL member of the
     /// specification (`smithy_query(query="shape",shape="ResourceSpecification")`).
-    reserved_bitrate: Option<i32>,
+    pub(crate) reserved_bitrate: Option<i32>,
     /// `Reservation$Start`, as an offset BEFORE the instant the case runs at.
-    start_before_now: Duration,
+    pub(crate) start_before_now: Duration,
     /// `Reservation$End`: `Ok` is that long AFTER now (the reservation is still running),
     /// `Err` that long BEFORE it (its end has passed).
-    end_from_now: Result<Duration, Duration>,
+    pub(crate) end_from_now: Result<Duration, Duration>,
     /// The `ReservationState` the record is stored in.
-    stored_state: &'static str,
+    pub(crate) stored_state: &'static str,
     /// The state the clock owes it and the instant that change is due, as an offset from
     /// now (`Ok` in the future, `Err` in the past), or `None` when nothing is owed.
-    pending: Option<(&'static str, Result<Duration, Duration>)>,
+    pub(crate) pending: Option<(&'static str, Result<Duration, Duration>)>,
     /// The `ReservationState` ListReservations must report.
-    expected_state: &'static str,
+    pub(crate) expected_state: &'static str,
 }
 
 /// An instant `offset` after now (`Ok`) or before it (`Err`).
@@ -185,7 +188,11 @@ fn instant_from(now: SystemTime, offset: Result<Duration, Duration>) -> SystemTi
 
 /// Put one reservation straight into the store, the way a purchase stores one, and answer
 /// the ARN it was minted with.
-fn seed_reservation(emulator: &Emulator, case: &ReservationCase, now: SystemTime) -> String {
+pub(crate) fn seed_reservation(
+    emulator: &Emulator,
+    case: &ReservationCase,
+    now: SystemTime,
+) -> String {
     let state = emulator
         .engine
         .state::<mc::ComAmazonawsMediaconnectMediaconnectState>();
@@ -237,9 +244,9 @@ fn seed_reservation(emulator: &Emulator, case: &ReservationCase, now: SystemTime
 /// One month, as the span the seeded reservations run for. Only its ORDER against the
 /// clock matters to the cases below — whether a reservation's `End` has passed — so the
 /// value is the test's own, not a duration the service documents.
-const ONE_MONTH: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+pub(crate) const ONE_MONTH: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 
-fn reservation_cases() -> Vec<ReservationCase> {
+pub(crate) fn reservation_cases() -> Vec<ReservationCase> {
     vec![
         ReservationCase {
             case: "active reservation still running",

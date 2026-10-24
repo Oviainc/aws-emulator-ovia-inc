@@ -7,29 +7,35 @@
 //! not computed from persisted state fails here.
 //!
 //! An idle resource recommendation is produced by Compute Optimizer's own analysis of an
-//! observed workload, and no operation of THIS API creates one, so the fixtures below
-//! record recommendations into the store the way that analysis would and then read them
-//! back only over the wire. What is asserted is the RULE the read follows — answer for the
-//! one account this emulator presents, select by resource, account and filter, sort on the
-//! requested savings dimension, page at `maxResults`, and report a requested resource that
-//! has no recommendation in `errors` — over a table of inputs, never one recorded call.
+//! observed workload, and no operation of THIS API creates one, so the analysis is part of
+//! the store's initial value: a FRESHLY BOOTED emulator already holds it, and the suite below
+//! reads it back only over the wire. What is asserted is the RULE the read follows — every
+//! member computed from the stored analysis, the ARN naming the Region the request addressed,
+//! an answer only for the one account this emulator presents, selection by resource, account
+//! and filter, sorting on the requested savings dimension, paging at `maxResults`, and a
+//! requested resource with no analysis reported in `errors` — over a table of inputs, never
+//! one recorded call.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::ops::types::{
     IdleDimension, IdleEstimatedMonthlySavings, IdleRecommendation, IdleSavingsOpportunity,
-    IdleSavingsOpportunityAfterDiscounts, IdleUtilizationMetric, Tag,
+    IdleSavingsOpportunityAfterDiscounts, IdleUtilizationMetric,
 };
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
-    service_state, IDLE_MAX_PAGE_SIZE, NO_RECOMMENDATION_CODE,
+    idle_savings_value, service_state, IdleResourceAnalysis, ANALYSIS_DELAY,
+    DIMENSION_SAVINGS_VALUE, DIMENSION_SAVINGS_VALUE_AFTER_DISCOUNT, IDLE_MAX_PAGE_SIZE,
+    NO_RECOMMENDATION_CODE,
 };
 
-use crate::harness::{call, emulator_with_engine, error_code, opt_in};
+use crate::harness::{call, call_in_region, emulator_with_engine, error_code, opt_in};
 
 /// The ONE account this emulator presents, and so the only account any reader of this
-/// service can report on. Taken from the runtime's single source of truth rather than
-/// written out, so the fixtures below cannot drift from the account the service answers for.
+/// service can report on — the account the seeded analysis is held for. Taken from the
+/// runtime's single source of truth rather than written out, so the expectations below cannot
+/// drift from the account the service answers for.
 fn own_account() -> &'static str {
     ::engine::emulator_account_id()
 }
@@ -44,177 +50,207 @@ const MEMBER_ACCOUNT: &str = "210987654321";
 const CROSS_ACCOUNT_MESSAGE: &str = "Invalid permission to access another account. If this \
      is an organization account, request the management account to enable service access.";
 
-/// The region every ARN below names.
+/// The region the harness signs for, and so the regional endpoint every call below addresses
+/// unless it names another.
 const REGION: &str = "us-east-1";
 
-/// The `lastRefreshTimestamp` the recorded recommendations carry, in epoch seconds — the
-/// form awsJson1_0 renders a timestamp in.
-const REFRESHED_AT_SECONDS: i64 = 1_761_000_000;
+/// A second regional endpoint, for the rule that the ARN a reader reports names the Region of
+/// the endpoint the request addressed.
+const OTHER_REGION: &str = "eu-west-1";
 
 /// An ARN in the grammar every AWS service shares:
 /// `arn:<partition>:<service>:<region>:<account>:<resource>`.
-fn arn(service: &str, account_id: &str, resource: &str) -> String {
-    format!("arn:aws:{service}:{REGION}:{account_id}:{resource}")
+fn arn(service: &str, region: &str, account_id: &str, resource: &str) -> String {
+    format!("arn:aws:{service}:{region}:{account_id}:{resource}")
 }
 
-/// One recorded idle resource recommendation, varying along every dimension the read
-/// selects, sorts or pages on.
-fn recorded(
-    resource_arn: &str,
-    resource_id: &str,
-    resource_type: &str,
-    account_id: &str,
-    finding: &str,
-    savings: f64,
-    savings_after_discounts: f64,
-) -> IdleRecommendation {
-    IdleRecommendation {
-        resource_arn: Some(resource_arn.to_string()),
-        resource_id: Some(resource_id.to_string()),
-        resource_type: Some(resource_type.to_string()),
-        account_id: Some(account_id.to_string()),
-        finding: Some(finding.to_string()),
-        finding_description: Some(format!("The resource is {finding}.")),
-        savings_opportunity: Some(IdleSavingsOpportunity {
-            savings_opportunity_percentage: 25.0,
-            estimated_monthly_savings: Some(IdleEstimatedMonthlySavings {
-                // `Currency` models USD | CNY.
-                currency: Some("USD".to_string()),
-                value: savings,
-            }),
-        }),
-        savings_opportunity_after_discounts: Some(IdleSavingsOpportunityAfterDiscounts {
-            savings_opportunity_percentage: 20.0,
-            estimated_monthly_savings: Some(IdleEstimatedMonthlySavings {
-                currency: Some("USD".to_string()),
-                value: savings_after_discounts,
-            }),
-        }),
-        utilization_metrics: Some(vec![IdleUtilizationMetric {
+/// One resource of the seeded analysis, as a client sees it: the `<service>` and `<resource>`
+/// ARN fields the emulator holds it under, and the members a read derives from the record.
+struct Seeded {
+    arn_service: &'static str,
+    arn_resource: &'static str,
+    resource_id: &'static str,
+    resource_type: &'static str,
+    finding: &'static str,
+    /// What the resource costs per month, which is what adopting its recommendation saves.
+    monthly_cost: f64,
+    /// `lookBackPeriodInDays`: the service default of 14 days, capped by how long the
+    /// resource has been observed.
+    look_back_days: f64,
+}
+
+impl Seeded {
+    /// This resource's ARN as the endpoint in `region` reports it.
+    fn arn_in(&self, region: &str) -> String {
+        arn(self.arn_service, region, own_account(), self.arn_resource)
+    }
+}
+
+/// The idle resource analysis a freshly booted emulator holds, in record order — the resource
+/// kinds Compute Optimizer reports only as idle resources, plus an unattached Amazon EBS
+/// volume. Each cost is the price the store records for the resource; each look-back is the
+/// 14-day default capped by the days observed (the MemoryDB cluster has been observed for 9).
+fn seeded() -> Vec<Seeded> {
+    vec![
+        Seeded {
+            arn_service: "ec2",
+            arn_resource: "natgateway/nat-0a1b2c3d4e5f60001",
+            resource_id: "nat-0a1b2c3d4e5f60001",
+            resource_type: "NatGateway",
+            finding: "Unused",
+            monthly_cost: 32.85,
+            look_back_days: 14.0,
+        },
+        Seeded {
+            arn_service: "ec2",
+            arn_resource: "volume/vol-0a1b2c3d4e5f60009",
+            resource_id: "vol-0a1b2c3d4e5f60009",
+            resource_type: "EBSVolume",
+            finding: "Unattached",
+            monthly_cost: 20.0,
+            look_back_days: 14.0,
+        },
+        Seeded {
+            arn_service: "dynamodb",
+            arn_resource: "table/legacy-sessions",
+            resource_id: "legacy-sessions",
+            resource_type: "DynamoDBTable",
+            finding: "Idle",
+            monthly_cost: 11.39,
+            look_back_days: 14.0,
+        },
+        Seeded {
+            arn_service: "elasticache",
+            arn_resource: "cluster:sessions-cache",
+            resource_id: "sessions-cache",
+            resource_type: "ElastiCacheCluster",
+            finding: "Idle",
+            monthly_cost: 112.42,
+            look_back_days: 14.0,
+        },
+        Seeded {
+            arn_service: "memorydb",
+            arn_resource: "cluster/leaderboard-archive",
+            resource_id: "leaderboard-archive",
+            resource_type: "MemoryDBCluster",
+            finding: "Unused",
+            monthly_cost: 49.64,
+            look_back_days: 9.0,
+        },
+        Seeded {
+            arn_service: "rds",
+            arn_resource: "cluster:docdb-reporting",
+            resource_id: "docdb-reporting",
+            resource_type: "DocumentDBCluster",
+            finding: "Idle",
+            monthly_cost: 56.94,
+            look_back_days: 14.0,
+        },
+        Seeded {
+            arn_service: "workspaces",
+            arn_resource: "workspace/ws-0a1b2c3d4e5f6",
+            resource_id: "ws-0a1b2c3d4e5f6",
+            resource_type: "WorkSpaces",
+            finding: "Unused",
+            monthly_cost: 35.0,
+            look_back_days: 14.0,
+        },
+        Seeded {
+            arn_service: "sagemaker",
+            arn_resource: "endpoint/scoring-canary",
+            resource_id: "scoring-canary",
+            resource_type: "SageMakerEndpoint",
+            finding: "Idle",
+            monthly_cost: 83.95,
+            look_back_days: 14.0,
+        },
+    ]
+}
+
+/// The ARN of every seeded resource at the endpoint in `region`, in record order.
+fn seeded_arns(region: &str) -> Vec<String> {
+    seeded()
+        .iter()
+        .map(|resource| resource.arn_in(region))
+        .collect()
+}
+
+/// One more idle resource of the caller's own account, recorded the way Compute Optimizer's
+/// analysis of an observed workload would be — so the suite reads a record it wrote as well as
+/// the seeded ones, and a metric `dimensions` breakdown has somewhere to be reported from.
+///
+/// It is an EC2 instance of 60.00 a month: dearer than every seeded resource but the
+/// ElastiCache cluster, so it lands inside a savings ordering rather than at an end.
+fn recorded_instance() -> IdleResourceAnalysis {
+    IdleResourceAnalysis {
+        account_id: own_account().to_string(),
+        arn_service: "ec2".to_string(),
+        arn_resource: "instance/i-0123456789abcdef0".to_string(),
+        finding: "Idle".to_string(),
+        utilization_metrics: vec![IdleUtilizationMetric {
             // `IdleMetricName` / `MetricStatistic` values.
             name: Some("CPU".to_string()),
             statistic: Some("Maximum".to_string()),
             value: 1.5,
             dimensions: Some(vec![IdleDimension {
                 key: Some("InstanceId".to_string()),
-                values: Some(vec![resource_id.to_string()]),
+                values: Some(vec!["i-0123456789abcdef0".to_string()]),
             }]),
-        }]),
-        look_back_period_in_days: 14.0,
-        last_refresh_timestamp: Some(::aws_smithy_types::DateTime::from_secs(
-            REFRESHED_AT_SECONDS,
-        )),
-        tags: Some(vec![Tag {
-            key: Some("Owner".to_string()),
-            value: Some("TeamA".to_string()),
-        }]),
+        }],
+        days_observed: 30.0,
+        monthly_cost: 60.0,
+        tags: vec![("Owner".to_string(), "TeamA".to_string())],
     }
 }
 
-/// The analysis output every fixture below reads: six recommendations spanning four
-/// resource types, both accounts, all three `IdleFinding` values and savings figures whose
-/// before- and after-discount orderings differ.
-fn corpus() -> Vec<IdleRecommendation> {
+/// The ARN of [`recorded_instance`] at the endpoint in `region`.
+fn recorded_instance_arn(region: &str) -> String {
+    arn(
+        "ec2",
+        region,
+        own_account(),
+        "instance/i-0123456789abcdef0",
+    )
+}
+
+/// Analysis recorded against ANOTHER account — an organization member account this standalone
+/// emulator records none of. Nothing a caller of this service may be told about.
+fn foreign_analyses() -> Vec<IdleResourceAnalysis> {
     vec![
-        recorded(
-            &arn("ec2", own_account(), "instance/i-0123456789abcdef0"),
-            "i-0123456789abcdef0",
-            "EC2Instance",
-            own_account(),
-            "Idle",
-            10.0,
-            8.0,
-        ),
-        recorded(
-            &arn("ec2", own_account(), "volume/vol-0123456789abcdef0"),
-            "vol-0123456789abcdef0",
-            "EBSVolume",
-            own_account(),
-            "Unattached",
-            5.0,
-            4.5,
-        ),
-        recorded(
-            &arn("ec2", own_account(), "natgateway/nat-0123456789abcdef0"),
-            "nat-0123456789abcdef0",
-            "NatGateway",
-            own_account(),
-            "Unused",
-            30.0,
-            2.0,
-        ),
-        recorded(
-            &arn("dynamodb", own_account(), "table/orders"),
-            "orders",
-            "DynamoDBTable",
-            own_account(),
-            "Idle",
-            20.0,
-            19.0,
-        ),
-        recorded(
-            &arn("ecs", own_account(), "service/web/checkout"),
-            "checkout",
-            "ECSService",
-            own_account(),
-            "Idle",
-            1.0,
-            0.5,
-        ),
-        recorded(
-            &arn("sagemaker", own_account(), "endpoint/scoring"),
-            "scoring",
-            "SageMakerEndpoint",
-            own_account(),
-            "Unused",
-            7.5,
-            7.0,
-        ),
+        IdleResourceAnalysis {
+            account_id: MEMBER_ACCOUNT.to_string(),
+            arn_service: "dynamodb".to_string(),
+            arn_resource: "table/member-orders".to_string(),
+            finding: "Idle".to_string(),
+            utilization_metrics: Vec::new(),
+            days_observed: 14.0,
+            monthly_cost: 42.0,
+            tags: Vec::new(),
+        },
+        IdleResourceAnalysis {
+            account_id: MEMBER_ACCOUNT.to_string(),
+            arn_service: "sagemaker".to_string(),
+            arn_resource: "endpoint/member-scoring".to_string(),
+            finding: "Unused".to_string(),
+            utilization_metrics: Vec::new(),
+            days_observed: 14.0,
+            monthly_cost: 3.5,
+            tags: Vec::new(),
+        },
     ]
 }
 
-/// Analysis output recorded against ANOTHER account — an organization member account this
-/// standalone emulator records none of. Nothing a caller of this service may be told about.
-fn foreign_corpus() -> Vec<IdleRecommendation> {
-    vec![
-        recorded(
-            &arn("dynamodb", MEMBER_ACCOUNT, "table/member-orders"),
-            "member-orders",
-            "DynamoDBTable",
-            MEMBER_ACCOUNT,
-            "Idle",
-            42.0,
-            40.0,
-        ),
-        recorded(
-            &arn("sagemaker", MEMBER_ACCOUNT, "endpoint/member-scoring"),
-            "member-scoring",
-            "SageMakerEndpoint",
-            MEMBER_ACCOUNT,
-            "Unused",
-            3.5,
-            3.0,
-        ),
-    ]
-}
-
-/// Record `recommendations` into the store `GetIdleRecommendations` reports from, the way
-/// Compute Optimizer's analysis would.
-fn record(engine: &Arc<engine::InMemoryEngine>, recommendations: &[IdleRecommendation]) {
+/// Record `analyses` into the store `GetIdleRecommendations` reports from, the way Compute
+/// Optimizer's analysis of an observed workload would.
+fn record(engine: &Arc<engine::InMemoryEngine>, analyses: Vec<IdleResourceAnalysis>) {
     let state = service_state(&**engine).expect("the engine bears this service's state");
     let mut guard = state.lock();
-    for recommendation in recommendations {
-        let resource_arn = recommendation
-            .resource_arn
-            .clone()
-            .expect("a recorded recommendation identifies its resource");
-        guard
-            .idle_recommendations
-            .insert(resource_arn, recommendation.clone());
+    for analysis in analyses {
+        guard.idle_recommendations.insert(analysis);
     }
 }
 
-/// How many recommendations the store holds.
+/// How many resources the store holds an idle analysis for.
 fn stored_count(engine: &Arc<engine::InMemoryEngine>) -> usize {
     service_state(&**engine)
         .expect("the engine bears this service's state")
@@ -238,17 +274,33 @@ fn reported_arns(body: &Value) -> Vec<String> {
         .collect()
 }
 
-/// An emulator whose account is opted in and whose store holds [`corpus`].
-async fn emulator_with_corpus() -> (
+/// An emulator whose account is opted in and whose analysis is due, so what it reports is the
+/// analysis its enrollment started — the service owes that transition one [`ANALYSIS_DELAY`]
+/// after the enrollment is written; the extra margin covers scheduler jitter.
+async fn analysed_emulator() -> (
     smithy_server_runtime::MultiServiceRouter,
     Arc<engine::InMemoryEngine>,
-    Vec<IdleRecommendation>,
 ) {
     let (router, engine) = emulator_with_engine();
     opt_in(&router).await;
-    let corpus = corpus();
-    record(&engine, &corpus);
-    (router, engine, corpus)
+    tokio::time::sleep(ANALYSIS_DELAY + Duration::from_millis(100)).await;
+    (router, engine)
+}
+
+/// The same emulator, with [`recorded_instance`] recorded beside the seeded analysis, and the
+/// ARN of every idle resource of the caller's own account in record order.
+async fn emulator_with_recorded_resource() -> (
+    smithy_server_runtime::MultiServiceRouter,
+    Arc<engine::InMemoryEngine>,
+    Vec<String>,
+) {
+    let (router, engine) = analysed_emulator().await;
+    record(&engine, vec![recorded_instance()]);
+    let own_arns: Vec<String> = seeded_arns(REGION)
+        .into_iter()
+        .chain([recorded_instance_arn(REGION)])
+        .collect();
+    (router, engine, own_arns)
 }
 
 /// Read, asserting the call was accepted.
@@ -265,50 +317,85 @@ async fn get_idle(
     body
 }
 
-/// Every member the analysis recorded is reported back, unchanged, and reporting it twice
-/// changes nothing a later caller sees.
+/// A freshly booted, enrolled emulator reports the analysis it holds, every member of every
+/// recommendation computed from the stored record — and reporting it twice changes nothing a
+/// later caller sees.
 #[tokio::test]
-async fn a_recorded_recommendation_is_reported_member_for_member() {
-    let (router, engine) = emulator_with_engine();
-    opt_in(&router).await;
-    let one = corpus().remove(0);
-    record(&engine, std::slice::from_ref(&one));
+async fn the_seeded_analysis_is_reported_member_for_member() {
+    let (router, engine) = analysed_emulator().await;
+    let before = stored_count(&engine);
 
-    let body = get_idle(&router, "the recorded recommendation", json!({})).await;
-    let reported = &body["idleRecommendations"][0];
-    let resource_arn = one.resource_arn.clone().expect("an ARN");
+    let body = get_idle(&router, "the whole analysis", json!({})).await;
+    let reported = body["idleRecommendations"]
+        .as_array()
+        .unwrap_or_else(|| panic!("expected a list of idleRecommendations, got {body}"));
+    assert_eq!(
+        reported.len(),
+        seeded().len(),
+        "every idle resource the analysis found is reported, got {body}"
+    );
 
-    let expected = json!({
-        "resourceArn": resource_arn,
-        "resourceId": "i-0123456789abcdef0",
-        "resourceType": "EC2Instance",
-        "accountId": own_account(),
-        "finding": "Idle",
-        "findingDescription": "The resource is Idle.",
-        "savingsOpportunity": {
-            "savingsOpportunityPercentage": 25.0,
-            "estimatedMonthlySavings": {"currency": "USD", "value": 10.0},
-        },
-        "savingsOpportunityAfterDiscounts": {
-            "savingsOpportunityPercentage": 20.0,
-            "estimatedMonthlySavings": {"currency": "USD", "value": 8.0},
-        },
-        "utilizationMetrics": [{
-            "name": "CPU",
-            "statistic": "Maximum",
-            "value": 1.5,
-            "dimensions": [{"key": "InstanceId", "values": ["i-0123456789abcdef0"]}],
-        }],
-        "lookBackPeriodInDays": 14.0,
-        "lastRefreshTimestamp": REFRESHED_AT_SECONDS,
-        "tags": [{"key": "Owner", "value": "TeamA"}],
-    });
-    for (member, wanted) in expected.as_object().expect("an object of members") {
-        assert_eq!(
-            &reported[member], wanted,
-            "member {member:?}: expected {wanted}, got {reported}"
+    for (resource, got) in seeded().iter().zip(reported) {
+        let case = resource.arn_resource;
+        // The whole of what an idle resource costs is saved by dropping it, so the
+        // opportunity is 100% of its monthly cost — before and after discounts alike, because
+        // this service prices from public pricing and records no negotiated discount.
+        let savings = json!({
+            "savingsOpportunityPercentage": 100.0,
+            "estimatedMonthlySavings": {"currency": "USD", "value": resource.monthly_cost},
+        });
+        let expected = json!({
+            "resourceArn": resource.arn_in(REGION),
+            "resourceId": resource.resource_id,
+            "resourceType": resource.resource_type,
+            "accountId": own_account(),
+            "finding": resource.finding,
+            "savingsOpportunity": savings,
+            "savingsOpportunityAfterDiscounts": savings,
+            "lookBackPeriodInDays": resource.look_back_days,
+        });
+        for (member, wanted) in expected.as_object().expect("an object of members") {
+            assert_eq!(
+                &got[member], wanted,
+                "case {case:?}: member {member:?}: expected {wanted}, got {got}"
+            );
+        }
+        // The finding description summarises the finding the analysis reached, and the
+        // metrics are the evidence for it.
+        let description = got["findingDescription"].as_str().unwrap_or_default();
+        assert!(
+            description.contains(resource.resource_type)
+                && description.contains(&format!("{} days", resource.look_back_days)),
+            "case {case:?}: expected a description of the {} finding over {} days, got {got}",
+            resource.finding,
+            resource.look_back_days
+        );
+        let metrics = got["utilizationMetrics"]
+            .as_array()
+            .unwrap_or_else(|| panic!("case {case:?}: expected utilizationMetrics, got {got}"));
+        assert!(
+            !metrics.is_empty(),
+            "case {case:?}: a finding is reported with the utilization behind it, got {got}"
+        );
+        for metric in metrics {
+            assert_eq!(
+                metric["statistic"],
+                json!("Maximum"),
+                "case {case:?}: this API reports only the Maximum statistic, got {metric}"
+            );
+            assert!(
+                metric["name"].is_string() && metric["value"].is_number(),
+                "case {case:?}: a metric names itself and carries a value, got {metric}"
+            );
+        }
+        // The recommendation was generated when the analysis the enrollment started came
+        // due, so every row carries the same instant rather than the time of the read.
+        assert!(
+            got["lastRefreshTimestamp"].is_number(),
+            "case {case:?}: expected a refresh timestamp, got {got}"
         );
     }
+
     assert_eq!(
         body["errors"],
         json!([]),
@@ -316,38 +403,139 @@ async fn a_recorded_recommendation_is_reported_member_for_member() {
     );
     assert!(
         body["nextToken"].is_null(),
-        "one recommendation fits on one page, got {body}"
+        "the whole analysis fits on one default page, got {body}"
     );
 
     // A read reports; it must not change what a later caller sees.
     let again = get_idle(&router, "the same read again", json!({})).await;
     assert_eq!(
         again, body,
-        "a second read must report the same recommendation, got {again}"
+        "a second read must report the same analysis, got {again}"
     );
     assert_eq!(
         stored_count(&engine),
-        1,
-        "a read must not add or drop a stored recommendation"
+        before,
+        "a read must not add or drop a stored analysis"
     );
 }
 
-/// The selection rule: a request reports the stored recommendations of the resources it
-/// names, of the account it names, that satisfy every filter it carries — and a member it
-/// omits selects nothing away. Each row differs along one of those dimensions.
+/// An analysis recorded against the caller's own account is reported exactly as the seeded
+/// ones are: every member derived from the record, including the metric dimensions it holds.
+#[tokio::test]
+async fn a_recorded_analysis_is_reported_from_its_own_record() {
+    let (router, _engine, own_arns) = emulator_with_recorded_resource().await;
+    let recorded = recorded_instance_arn(REGION);
+
+    let body = get_idle(
+        &router,
+        "the recorded resource",
+        json!({"resourceArns": [recorded.clone()]}),
+    )
+    .await;
+    assert_eq!(
+        reported_arns(&body),
+        vec![recorded.clone()],
+        "expected exactly the recorded resource, got {body}"
+    );
+    assert_eq!(
+        own_arns.last().map(String::as_str),
+        Some(recorded.as_str()),
+        "the recorded resource is the last one in record order"
+    );
+
+    let got = &body["idleRecommendations"][0];
+    let savings = json!({
+        "savingsOpportunityPercentage": 100.0,
+        "estimatedMonthlySavings": {"currency": "USD", "value": 60.0},
+    });
+    let expected = json!({
+        "resourceArn": recorded,
+        "resourceId": "i-0123456789abcdef0",
+        "resourceType": "EC2Instance",
+        "accountId": own_account(),
+        "finding": "Idle",
+        "savingsOpportunity": savings,
+        "savingsOpportunityAfterDiscounts": savings,
+        // Observed for 30 days, so the 14-day default is what was analysed.
+        "lookBackPeriodInDays": 14.0,
+        "utilizationMetrics": [{
+            "name": "CPU",
+            "statistic": "Maximum",
+            "value": 1.5,
+            "dimensions": [{"key": "InstanceId", "values": ["i-0123456789abcdef0"]}],
+        }],
+        "tags": [{"key": "Owner", "value": "TeamA"}],
+    });
+    for (member, wanted) in expected.as_object().expect("an object of members") {
+        assert_eq!(
+            &got[member], wanted,
+            "member {member:?}: expected {wanted}, got {got}"
+        );
+    }
+}
+
+/// Compute Optimizer is a REGIONAL service: the ARN a recommendation reports names the Region
+/// of the endpoint the request addressed, and nothing else about the record changes with it.
+#[tokio::test]
+async fn a_reported_arn_names_the_region_the_request_addressed() {
+    let (router, engine, own_arns) = emulator_with_recorded_resource().await;
+
+    for region in [REGION, OTHER_REGION] {
+        let (status, body) =
+            call_in_region(&router, region, "GetIdleRecommendations", json!({})).await;
+        assert_eq!(
+            status, 200,
+            "region {region}: expected 200, got {status}: {body}"
+        );
+        let wanted: Vec<String> = seeded_arns(region)
+            .into_iter()
+            .chain([recorded_instance_arn(region)])
+            .collect();
+        assert_eq!(
+            reported_arns(&body),
+            wanted,
+            "region {region}: every ARN must name that Region's endpoint, got {body}"
+        );
+    }
+
+    // A resource named by the ARN of ANOTHER Region's endpoint is not a resource this
+    // endpoint reports, so it is reported as having no recommendation here.
+    let elsewhere = recorded_instance_arn(OTHER_REGION);
+    let body = get_idle(
+        &router,
+        "the other Region's ARN",
+        json!({"resourceArns": [elsewhere.clone()]}),
+    )
+    .await;
+    assert_eq!(
+        reported_arns(&body),
+        Vec::<String>::new(),
+        "the {OTHER_REGION} resource is not reported by the {REGION} endpoint, got {body}"
+    );
+    assert_eq!(
+        body["errors"][0]["identifier"],
+        json!(elsewhere),
+        "the request's own ARN is what the error entry identifies, got {body}"
+    );
+    assert_eq!(
+        stored_count(&engine),
+        own_arns.len(),
+        "reading two Regions must not duplicate a stored analysis"
+    );
+}
+
+/// The selection rule: a request reports the stored analysis of the resources it names, of
+/// the account it names, that satisfies every filter it carries — and a member it omits
+/// selects nothing away. Each row differs along one of those dimensions.
 #[tokio::test]
 async fn the_read_selects_by_resource_account_and_filter() {
-    let (router, _engine, corpus) = emulator_with_corpus().await;
-    let all: Vec<String> = corpus
-        .iter()
-        .map(|recommendation| recommendation.resource_arn.clone().expect("an ARN"))
-        .collect();
-    let [instance, volume, nat_gateway, table, ecs_service, endpoint] = [0, 1, 2, 3, 4, 5]
-        .map(|index| all[index].clone());
+    let (router, _engine, own_arns) = emulator_with_recorded_resource().await;
+    let [nat_gateway, volume, table, cache, memorydb, docdb, workspace, endpoint, instance] =
+        <[String; 9]>::try_from(own_arns.clone()).expect("nine idle resources");
 
     // (case, request, the ARNs expected in the order expected)
     let rows: Vec<(&str, Value, Vec<String>)> = vec![
-        ("no selection", json!({}), all.clone()),
+        ("no selection", json!({}), own_arns.clone()),
         (
             "one resource ARN",
             json!({"resourceArns": [volume.clone()]}),
@@ -355,18 +543,13 @@ async fn the_read_selects_by_resource_account_and_filter() {
         ),
         (
             "three resource ARNs, reported in record order",
-            json!({"resourceArns": [endpoint.clone(), instance.clone(), table.clone()]}),
-            vec![instance.clone(), table.clone(), endpoint.clone()],
+            json!({"resourceArns": [endpoint.clone(), nat_gateway.clone(), table.clone()]}),
+            vec![nat_gateway.clone(), table.clone(), endpoint.clone()],
         ),
         (
-            "the caller's own account, named explicitly",
+            "the account the analysis is held for",
             json!({"accountIds": [own_account()]}),
-            all.clone(),
-        ),
-        (
-            "an empty accountIds list names no account",
-            json!({"accountIds": []}),
-            all.clone(),
+            own_arns.clone(),
         ),
         (
             "one finding",
@@ -376,7 +559,12 @@ async fn the_read_selects_by_resource_account_and_filter() {
         (
             "two findings",
             json!({"filters": [{"name": "Finding", "values": ["Unused", "Unattached"]}]}),
-            vec![volume.clone(), nat_gateway.clone(), endpoint.clone()],
+            vec![
+                nat_gateway.clone(),
+                volume.clone(),
+                memorydb.clone(),
+                workspace.clone(),
+            ],
         ),
         (
             "one resource type",
@@ -385,29 +573,36 @@ async fn the_read_selects_by_resource_account_and_filter() {
         ),
         (
             "two resource types",
-            json!({"filters": [{"name": "ResourceType", "values": ["ECSService", "EBSVolume"]}]}),
-            vec![volume.clone(), ecs_service.clone()],
+            json!({"filters": [
+                {"name": "ResourceType", "values": ["DocumentDBCluster", "EBSVolume"]},
+            ]}),
+            vec![volume.clone(), docdb.clone()],
         ),
         (
             "a finding and a resource type are ANDed",
             json!({"filters": [
                 {"name": "Finding", "values": ["Idle"]},
-                {"name": "ResourceType", "values": ["EC2Instance", "DynamoDBTable"]},
+                {"name": "ResourceType", "values": ["ElastiCacheCluster", "DynamoDBTable"]},
             ]}),
-            vec![instance.clone(), table.clone()],
+            vec![table.clone(), cache.clone()],
         ),
         (
-            "a finding no stored recommendation carries",
+            "a finding no analysed resource of that type carries",
             json!({"filters": [
                 {"name": "Finding", "values": ["Unattached"]},
-                {"name": "ResourceType", "values": ["EC2Instance"]},
+                {"name": "ResourceType", "values": ["DynamoDBTable"]},
             ]}),
+            Vec::new(),
+        ),
+        (
+            "a resource type no analysed resource is",
+            json!({"filters": [{"name": "ResourceType", "values": ["AutoScalingGroup"]}]}),
             Vec::new(),
         ),
         (
             "a filter carrying no values constrains nothing",
             json!({"filters": [{"name": "Finding", "values": []}]}),
-            all.clone(),
+            own_arns.clone(),
         ),
         (
             "an account and a resource ARN are ANDed",
@@ -415,16 +610,23 @@ async fn the_read_selects_by_resource_account_and_filter() {
                 "accountIds": [own_account()],
                 "resourceArns": [instance.clone(), table.clone()],
             }),
-            vec![instance.clone(), table.clone()],
+            vec![table.clone(), instance.clone()],
+        ),
+        (
+            // `accountIds: []` is a shape clients send: an empty list names no account, so
+            // it selects nothing away.
+            "an empty accountIds list names no account",
+            json!({"accountIds": []}),
+            own_arns.clone(),
         ),
         (
             "an account, a resource ARN and a filter are ANDed",
             json!({
                 "accountIds": [own_account()],
-                "resourceArns": [instance.clone(), table.clone()],
-                "filters": [{"name": "ResourceType", "values": ["DynamoDBTable"]}],
+                "resourceArns": [instance.clone(), table.clone(), volume.clone()],
+                "filters": [{"name": "Finding", "values": ["Idle"]}],
             }),
-            vec![table.clone()],
+            vec![table.clone(), instance.clone()],
         ),
     ];
 
@@ -438,9 +640,7 @@ async fn the_read_selects_by_resource_account_and_filter() {
     }
 }
 
-/// The account rule: this service answers for exactly ONE account, so a request that asks
-/// about any OTHER account — a well-formed `accountIds` value naming it, or a `resourceArns`
-/// entry whose account field names it — is refused with `InvalidParameterValueException`
+/// A request that asks about an account other than the one this emulator presents is REFUSED
 /// (HTTP 400) rather than used as a selection key, and a recommendation recorded against
 /// another account is never reported.
 ///
@@ -449,14 +649,10 @@ async fn the_read_selects_by_resource_account_and_filter() {
 /// both members that can name an account, alone and together with the caller's own id.
 #[tokio::test]
 async fn a_request_about_another_account_is_refused() {
-    let (router, engine, corpus) = emulator_with_corpus().await;
+    let (router, engine, own_arns) = emulator_with_recorded_resource().await;
     // Analysis recorded for another account, which no answer of this service may carry.
-    let foreign = foreign_corpus();
-    record(&engine, &foreign);
-    let own_arns: Vec<String> = corpus
-        .iter()
-        .map(|recommendation| recommendation.resource_arn.clone().expect("an ARN"))
-        .collect();
+    let foreign = foreign_analyses();
+    record(&engine, foreign.clone());
 
     let foreign_accounts = [
         MEMBER_ACCOUNT,
@@ -467,7 +663,7 @@ async fn a_request_about_another_account_is_refused() {
     ];
 
     for account_id in foreign_accounts {
-        let foreign_arn = arn("ec2", account_id, "instance/i-0123456789abcdef0");
+        let foreign_arn = arn("ec2", REGION, account_id, "instance/i-0123456789abcdef0");
         let requests = [
             ("accountIds alone", json!({"accountIds": [account_id]})),
             (
@@ -488,8 +684,7 @@ async fn a_request_about_another_account_is_refused() {
         ];
         for (member, request) in requests {
             let case = format!("{account_id} via {member}");
-            let (status, body) =
-                call(&router, "GetIdleRecommendations", request.clone()).await;
+            let (status, body) = call(&router, "GetIdleRecommendations", request.clone()).await;
             assert_eq!(
                 status, 400,
                 "case {case:?}: expected {request} to be refused, got {status}: {body}"
@@ -515,9 +710,12 @@ async fn a_request_about_another_account_is_refused() {
     // names no account, not to one naming the caller's own, and not through its own ARN.
     for (case, request) in [
         ("no account named", json!({})),
-        ("the caller's own account", json!({"accountIds": [own_account()]})),
         (
-            "every recorded resource named",
+            "the caller's own account",
+            json!({"accountIds": [own_account()]}),
+        ),
+        (
+            "every resource of the caller's own account named",
             json!({"resourceArns": own_arns.clone()}),
         ),
     ] {
@@ -533,73 +731,76 @@ async fn a_request_about_another_account_is_refused() {
     // delete them.
     assert_eq!(
         stored_count(&engine),
-        corpus.len() + foreign.len(),
-        "a read must not add or drop a stored recommendation"
+        own_arns.len() + foreign.len(),
+        "a read must not add or drop a stored analysis"
     );
 }
 
 /// The ordering rule: `orderBy` sorts the selection on the estimated monthly savings of the
-/// dimension it names, ascending unless `Desc` asks otherwise; with no dimension to sort
-/// on, the recommendations keep the order the analysis recorded them in.
-///
-/// The before- and after-discount figures of the corpus order differently, so a row that
-/// read the wrong dimension cannot pass.
+/// dimension it names, ascending unless `Desc` asks otherwise; with no dimension to sort on,
+/// the recommendations keep the order the analysis recorded them in.
 #[tokio::test]
 async fn order_by_sorts_the_selection_on_the_requested_savings_dimension() {
-    let (router, _engine, corpus) = emulator_with_corpus().await;
-    let arn_of = |index: usize| corpus[index].resource_arn.clone().expect("an ARN");
+    let (router, _engine, own_arns) = emulator_with_recorded_resource().await;
+    let [nat_gateway, volume, table, cache, memorydb, docdb, workspace, endpoint, instance] =
+        <[String; 9]>::try_from(own_arns.clone()).expect("nine idle resources");
 
-    // Savings before discounts: ecs 1.0 < volume 5.0 < endpoint 7.5 < instance 10.0 <
-    // table 20.0 < nat 30.0. After discounts: nat 2.0 < ecs 0.5 … — see each row.
-    let ascending_by_savings = [4, 1, 5, 0, 3, 2].map(arn_of).to_vec();
-    let ascending_after_discounts = [4, 2, 1, 5, 0, 3].map(arn_of).to_vec();
-    let record_order = [0, 1, 2, 3, 4, 5].map(arn_of).to_vec();
-
-    let descending_by_savings: Vec<String> =
-        ascending_by_savings.iter().rev().cloned().collect();
-    let descending_after_discounts: Vec<String> =
-        ascending_after_discounts.iter().rev().cloned().collect();
+    // Monthly cost, which is what dropping each resource saves: table 11.39 < volume 20.00 <
+    // nat 32.85 < workspace 35.00 < memorydb 49.64 < docdb 56.94 < instance 60.00 <
+    // endpoint 83.95 < cache 112.42.
+    let ascending = vec![
+        table.clone(),
+        volume.clone(),
+        nat_gateway.clone(),
+        workspace.clone(),
+        memorydb.clone(),
+        docdb.clone(),
+        instance.clone(),
+        endpoint.clone(),
+        cache.clone(),
+    ];
+    let descending: Vec<String> = ascending.iter().rev().cloned().collect();
 
     // (case, orderBy, the ARNs expected in the order expected)
     let rows: Vec<(&str, Value, Vec<String>)> = vec![
-        ("no orderBy", json!({}), record_order.clone()),
+        ("no orderBy", json!({}), own_arns.clone()),
         (
             "SavingsValue ascending",
             json!({"orderBy": {"dimension": "SavingsValue", "order": "Asc"}}),
-            ascending_by_savings.clone(),
+            ascending.clone(),
         ),
         (
             "SavingsValue descending",
             json!({"orderBy": {"dimension": "SavingsValue", "order": "Desc"}}),
-            descending_by_savings,
+            descending.clone(),
         ),
         (
             "SavingsValueAfterDiscount ascending",
             json!({"orderBy": {"dimension": "SavingsValueAfterDiscount", "order": "Asc"}}),
-            ascending_after_discounts.clone(),
+            ascending.clone(),
         ),
         (
             "SavingsValueAfterDiscount descending",
             json!({"orderBy": {"dimension": "SavingsValueAfterDiscount", "order": "Desc"}}),
-            descending_after_discounts,
+            descending.clone(),
         ),
         (
             "a dimension with no order sorts ascending",
             json!({"orderBy": {"dimension": "SavingsValue"}}),
-            ascending_by_savings.clone(),
+            ascending.clone(),
         ),
         (
             "an order with no dimension keeps the record order",
             json!({"orderBy": {"order": "Desc"}}),
-            record_order,
+            own_arns.clone(),
         ),
         (
             "ordering applies to the selection, not to the store",
             json!({
-                "resourceArns": [arn_of(0), arn_of(1), arn_of(2), arn_of(4)],
+                "filters": [{"name": "Finding", "values": ["Unused"]}],
                 "orderBy": {"dimension": "SavingsValue", "order": "Desc"},
             }),
-            [2, 0, 1, 4].map(arn_of).to_vec(),
+            vec![memorydb.clone(), workspace.clone(), nat_gateway.clone()],
         ),
     ];
 
@@ -613,19 +814,85 @@ async fn order_by_sorts_the_selection_on_the_requested_savings_dimension() {
     }
 }
 
+/// The sort KEY each `Dimension` reads: `SavingsValue` reads the savings opportunity BEFORE
+/// discounts and `SavingsValueAfterDiscount` the one AFTER them, and a recommendation that
+/// carries no estimate for the dimension asked for sorts as the modelled default of the member
+/// it lacks (`IdleEstimatedMonthlySavings$value` defaults to `0`).
+///
+/// The analysis this service holds carries equal before- and after-discount figures — it
+/// prices from public pricing and records no negotiated discount — so an ordering over it
+/// cannot tell the two dimensions apart. This is where the dimension is pinned to the member
+/// it reads, over recommendations whose two figures differ.
+#[test]
+fn each_sort_dimension_reads_its_own_savings_opportunity() {
+    let estimate = |value: f64| IdleEstimatedMonthlySavings {
+        currency: Some("USD".to_string()),
+        value,
+    };
+    let candidate = |before: Option<f64>, after: Option<f64>| IdleRecommendation {
+        savings_opportunity: before.map(|value| IdleSavingsOpportunity {
+            savings_opportunity_percentage: 100.0,
+            estimated_monthly_savings: Some(estimate(value)),
+        }),
+        savings_opportunity_after_discounts: after.map(|value| {
+            IdleSavingsOpportunityAfterDiscounts {
+                savings_opportunity_percentage: 100.0,
+                estimated_monthly_savings: Some(estimate(value)),
+            }
+        }),
+        ..IdleRecommendation::default()
+    };
+
+    // (case, the recommendation, the key SavingsValue reads, the key
+    //  SavingsValueAfterDiscount reads)
+    let rows: Vec<(&str, IdleRecommendation, f64, f64)> = vec![
+        (
+            "a discount that lowers the saving",
+            candidate(Some(30.0), Some(2.0)),
+            30.0,
+            2.0,
+        ),
+        (
+            "a discount that raises it",
+            candidate(Some(1.0), Some(9.5)),
+            1.0,
+            9.5,
+        ),
+        (
+            "no after-discount estimate",
+            candidate(Some(7.5), None),
+            7.5,
+            0.0,
+        ),
+        ("no estimate at all", candidate(None, None), 0.0, 0.0),
+    ];
+
+    for (case, recommendation, wanted_before, wanted_after) in rows {
+        for (dimension, wanted) in [
+            (DIMENSION_SAVINGS_VALUE, wanted_before),
+            (DIMENSION_SAVINGS_VALUE_AFTER_DISCOUNT, wanted_after),
+        ] {
+            let got = idle_savings_value(&recommendation, dimension);
+            assert_eq!(
+                got, wanted,
+                "case {case:?}: {dimension} must sort on {wanted}, got {got}"
+            );
+        }
+    }
+}
+
 /// The paging rule: a page carries at most `maxResults` recommendations and the `nextToken`
 /// resumes exactly where it stopped, so walking the pages reports the selection once, in
 /// order, whatever page size the walk uses — and no `maxResults` can exceed the ceiling the
 /// model puts on it.
 #[tokio::test]
 async fn paging_walks_the_selection_exactly_once() {
-    let (router, _engine, corpus) = emulator_with_corpus().await;
+    let (router, _engine, own_arns) = emulator_with_recorded_resource().await;
     let unpaged = get_idle(&router, "unpaged", json!({})).await;
     let every_arn = reported_arns(&unpaged);
     assert_eq!(
-        every_arn.len(),
-        corpus.len(),
-        "the whole corpus fits in one default page, got {unpaged}"
+        every_arn, own_arns,
+        "the whole analysis fits in one default page, got {unpaged}"
     );
     assert!(
         unpaged["nextToken"].is_null(),
@@ -633,8 +900,8 @@ async fn paging_walks_the_selection_exactly_once() {
     );
 
     // `maxResults` is modelled 0..100: both published bounds, every size that splits the
-    // corpus, and one size larger than it.
-    for page_size in [0_u64, 1, 2, 3, 5, 6, 7, 100] {
+    // analysis, and one size larger than it.
+    for page_size in [0_u64, 1, 2, 3, 4, 5, 8, 9, 10, 100] {
         let case = format!("maxResults={page_size}");
         let mut walked: Vec<String> = Vec::new();
         let mut next_token: Option<String> = None;
@@ -660,7 +927,7 @@ async fn paging_walks_the_selection_exactly_once() {
             walked.extend(page);
             pages += 1;
             assert!(
-                pages <= corpus.len() + 1,
+                pages <= every_arn.len() + 1,
                 "case {case:?}: the walk must terminate, got {pages} pages"
             );
             match body["nextToken"].as_str() {
@@ -673,6 +940,33 @@ async fn paging_walks_the_selection_exactly_once() {
             "case {case:?}: the walk must report the selection exactly once, in order"
         );
     }
+
+    // Paging a SORTED selection walks exactly that selection, in the order it was sorted in.
+    let selection = json!({
+        "filters": [{"name": "Finding", "values": ["Idle", "Unused"]}],
+        "orderBy": {"dimension": "SavingsValue", "order": "Desc"},
+    });
+    let sorted = get_idle(&router, "a sorted selection, unpaged", selection.clone()).await;
+    let wanted = reported_arns(&sorted);
+    let mut walked: Vec<String> = Vec::new();
+    let mut next_token: Option<String> = None;
+    loop {
+        let mut request = selection.clone();
+        request["maxResults"] = json!(3);
+        if let Some(token) = &next_token {
+            request["nextToken"] = json!(token);
+        }
+        let body = get_idle(&router, "a sorted selection, paged", request).await;
+        walked.extend(reported_arns(&body));
+        match body["nextToken"].as_str() {
+            Some(token) => next_token = Some(token.to_string()),
+            None => break,
+        }
+    }
+    assert_eq!(
+        walked, wanted,
+        "paging a sorted selection must walk it once, in that order"
+    );
 
     // One past the published top bound is refused by the modelled range, before the
     // handler runs.
@@ -690,17 +984,16 @@ async fn paging_walks_the_selection_exactly_once() {
 }
 
 /// `errors` is "a list of resources that doesn't have idle recommendations": every resource
-/// the request named that the store holds no recommendation for, identified by its ARN and
-/// carrying the `IdleRecommendationResourceType` the ARN names.
+/// the request named that the analysis holds nothing for, identified by its ARN and carrying
+/// the `IdleRecommendationResourceType` the ARN names.
 ///
-/// The rows span the ARN forms of the model's own `IdleRecommendationResourceType` value
-/// set, including resource types no stored recommendation covers, plus an ARN whose
-/// namespace names no idle-recommendable resource — whose type is omitted rather than
-/// invented.
+/// The rows span the ARN forms of the model's own `IdleRecommendationResourceType` value set,
+/// including resource types the analysis covers no resource of, plus an ARN whose namespace
+/// names no idle-recommendable resource — whose type is omitted rather than invented.
 #[tokio::test]
 async fn a_requested_resource_with_no_recommendation_is_reported_in_errors() {
-    let (router, _engine, corpus) = emulator_with_corpus().await;
-    let stored = corpus[0].resource_arn.clone().expect("an ARN");
+    let (router, _engine) = analysed_emulator().await;
+    let analysed = seeded()[0].arn_in(REGION);
     // The wire value of the code every entry carries, pinned here as the literal a client
     // matches on.
     assert_eq!(
@@ -708,13 +1001,16 @@ async fn a_requested_resource_with_no_recommendation_is_reported_in_errors() {
         "the no-recommendation code is part of the wire contract"
     );
 
+    // Every ARN below names the caller's own account: an ARN of another account is refused
+    // outright rather than reported as missing a recommendation.
+    let own = |service: &str, resource: &str| arn(service, REGION, own_account(), resource);
+
     // (case, the requested ARN, the resourceType expected on the error entry)
     let rows: Vec<(&str, String, Value)> = vec![
         (
             "an Auto Scaling group",
-            arn(
+            own(
                 "autoscaling",
-                own_account(),
                 "autoScalingGroup:12345678-1234-1234-1234-123456789012:\
                  autoScalingGroupName/web-tier",
             ),
@@ -722,38 +1018,42 @@ async fn a_requested_resource_with_no_recommendation_is_reported_in_errors() {
         ),
         (
             "an RDS DB instance",
-            arn("rds", own_account(), "db:orders"),
+            own("rds", "db:orders"),
             json!("RDSDBInstance"),
         ),
         (
-            "a DocumentDB cluster, which carries the rds namespace",
-            arn("rds", own_account(), "cluster:docdb-analytics"),
+            "a DocumentDB cluster the analysis never looked at, which carries the rds namespace",
+            own("rds", "cluster:docdb-analytics"),
             json!("DocumentDBCluster"),
         ),
         (
             "an ElastiCache cluster",
-            arn("elasticache", own_account(), "cluster:sessions"),
+            own("elasticache", "cluster:sessions"),
             json!("ElastiCacheCluster"),
         ),
         (
             "a MemoryDB cluster",
-            arn("memorydb", own_account(), "cluster/leaderboard"),
+            own("memorydb", "cluster/leaderboard"),
             json!("MemoryDBCluster"),
         ),
         (
             "a WorkSpace",
-            arn("workspaces", own_account(), "workspace/ws-0123456789"),
+            own("workspaces", "workspace/ws-0123456789"),
             json!("WorkSpaces"),
         ),
         (
+            "an ECS service",
+            own("ecs", "service/payments/checkout"),
+            json!("ECSService"),
+        ),
+        (
             "an EC2 instance the analysis never looked at",
-            arn("ec2", own_account(), "instance/i-00000000000000000"),
+            own("ec2", "instance/i-00000000000000000"),
             json!("EC2Instance"),
         ),
         (
-            // The account field of this ARN is empty, as it is for every ARN of a service
-            // that does not scope its resources to an account, so it names no OTHER account
-            // and is not refused: it is simply a resource with no idle recommendation.
+            // An ARN whose account field is empty names no other account, so it is not
+            // refused — it is simply a resource no idle recommendation covers.
             "an ARN whose namespace names no idle-recommendable resource",
             "arn:aws:s3:::reports-bucket".to_string(),
             Value::Null,
@@ -764,14 +1064,14 @@ async fn a_requested_resource_with_no_recommendation_is_reported_in_errors() {
         let body = get_idle(
             &router,
             case,
-            json!({"resourceArns": [requested.clone(), stored.clone()]}),
+            json!({"resourceArns": [requested.clone(), analysed.clone()]}),
         )
         .await;
-        // The stored resource is reported as a recommendation, never as an error.
+        // The analysed resource is reported as a recommendation, never as an error.
         assert_eq!(
             reported_arns(&body),
-            vec![stored.clone()],
-            "case {case:?}: expected the stored recommendation, got {body}"
+            vec![analysed.clone()],
+            "case {case:?}: expected the analysed recommendation, got {body}"
         );
         let errors = body["errors"]
             .as_array()
@@ -802,21 +1102,36 @@ async fn a_requested_resource_with_no_recommendation_is_reported_in_errors() {
         );
     }
 
-    // A resource the store holds puts nothing in `errors`, whatever else the request names.
-    let body = get_idle(&router, "only stored resources", json!({"resourceArns": [stored]})).await;
-    assert_eq!(
-        body["errors"],
-        json!([]),
-        "a request naming only stored resources reports no errors, got {body}"
-    );
+    // A resource the analysis covers puts nothing in `errors`, whatever else the request
+    // names, and a filter that selects it away still leaves it out of `errors`.
+    for (case, request) in [
+        (
+            "only analysed resources",
+            json!({"resourceArns": [analysed.clone()]}),
+        ),
+        (
+            "an analysed resource a filter selects away",
+            json!({
+                "resourceArns": [analysed.clone()],
+                "filters": [{"name": "Finding", "values": ["Idle"]}],
+            }),
+        ),
+    ] {
+        let body = get_idle(&router, case, request).await;
+        assert_eq!(
+            body["errors"],
+            json!([]),
+            "case {case:?}: a request naming only analysed resources reports no errors, got {body}"
+        );
+    }
 }
 
 /// A request outside the service's documented input rules is refused with HTTP 400 and
 /// nothing is reported — one row per rule, each on a value the rule rejects.
 #[tokio::test]
 async fn an_invalid_request_is_refused() {
-    let (router, _engine, corpus) = emulator_with_corpus().await;
-    let stored = corpus[0].resource_arn.clone().expect("an ARN");
+    let (router, _engine, own_arns) = emulator_with_recorded_resource().await;
+    let analysed = own_arns[0].clone();
 
     // A token this service really issued, taken over a different selection: resuming it
     // for another selection would report a page of a different result set.
@@ -836,7 +1151,7 @@ async fn an_invalid_request_is_refused() {
         (
             // "You can only specify one account ID per request."
             "two account ids",
-            json!({"accountIds": [own_account(), MEMBER_ACCOUNT]}),
+            json!({"accountIds": [own_account(), own_account()]}),
             "InvalidParameterValueException",
         ),
         (
@@ -897,7 +1212,7 @@ async fn an_invalid_request_is_refused() {
         ),
         (
             "a nextToken issued for another selection",
-            json!({"nextToken": foreign_token, "resourceArns": [stored]}),
+            json!({"nextToken": foreign_token, "resourceArns": [analysed]}),
             "InvalidParameterValueException",
         ),
     ];
@@ -919,13 +1234,15 @@ async fn an_invalid_request_is_refused() {
     }
 }
 
-/// The enrollment gate: "The account is not opted in to Compute Optimizer" is what a read
-/// gets while the account's enrollment is not `Active`, whatever the store holds — and the
-/// same read succeeds once it is.
+/// The enrollment gate: "The account is not opted in to Compute Optimizer" is what a read gets
+/// while the account's enrollment is not `Active`, whatever the analysis holds — and the same
+/// read reports the analysis once it is, but only after the analysis that enrollment starts is
+/// due.
 #[tokio::test]
 async fn a_read_is_refused_while_the_account_is_not_opted_in() {
     let (router, engine) = emulator_with_engine();
-    record(&engine, &corpus());
+    record(&engine, vec![recorded_instance()]);
+    let held = seeded().len() + 1;
 
     // (case, the enrollment to put the account in first, whether the read is accepted)
     let rows: Vec<(&str, Option<&str>, bool)> = vec![
@@ -951,11 +1268,21 @@ async fn a_read_is_refused_while_the_account_is_not_opted_in() {
 
         let (status, body) = call(&router, "GetIdleRecommendations", json!({})).await;
         if accepted {
+            // The analysis an enrollment starts is not due the instant it is written, so
+            // this read reports nothing yet.
             assert_eq!(status, 200, "case {case:?}: expected 200, got {status}: {body}");
             assert_eq!(
-                reported_arns(&body).len(),
-                corpus().len(),
-                "case {case:?}: expected every recorded recommendation, got {body}"
+                reported_arns(&body),
+                Vec::<String>::new(),
+                "case {case:?}: the analysis is not due yet, got {body}"
+            );
+
+            tokio::time::sleep(ANALYSIS_DELAY + Duration::from_millis(100)).await;
+            let due = get_idle(&router, case, json!({})).await;
+            assert_eq!(
+                reported_arns(&due).len(),
+                held,
+                "case {case:?}: expected every idle resource once the analysis is due, got {due}"
             );
         } else {
             assert_eq!(
@@ -971,7 +1298,7 @@ async fn a_read_is_refused_while_the_account_is_not_opted_in() {
 
     assert_eq!(
         stored_count(&engine),
-        corpus().len(),
+        held,
         "neither a refused nor an accepted read may change the store"
     );
 }

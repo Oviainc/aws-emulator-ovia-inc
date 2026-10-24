@@ -46,14 +46,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::ops::types::{
-    Certificate, CertificateDetails, ClusterPendingModifiedValues, DBCluster, DBClusterMember,
-    DBClusterOptionGroupStatus, DBClusterParameterGroup, DBClusterRole, DBClusterSnapshot,
-    DBClusterSnapshotAttribute, DBClusterSnapshotAttributesResult, DBInstance,
-    DBParameterGroupStatus, DBSecurityGroupMembership, DBSnapshot, DBSubnetGroup,
+    Certificate, CertificateDetails, ClusterPendingModifiedValues, DBCluster,
+    DBClusterAutomatedBackup, DBClusterMember, DBClusterOptionGroupStatus, DBClusterParameterGroup,
+    DBClusterRole, DBClusterSnapshot, DBClusterSnapshotAttribute, DBClusterSnapshotAttributesResult,
+    DBInstance, DBParameterGroupStatus, DBSecurityGroupMembership, DBSnapshot, DBSubnetGroup,
     DomainMembership, Endpoint, EventCategoriesMap, EventSubscription, GlobalCluster,
     GlobalClusterMember, Option2, OptionGroup, OptionGroupMembership, OptionSetting, Parameter,
-    PendingModifiedValues, ScalingConfigurationInfo, ServerlessV2ScalingConfigurationInfo, Subnet,
-    Tag, VpcSecurityGroupMembership,
+    PendingModifiedValues, RestoreWindow, ScalingConfigurationInfo,
+    ServerlessV2ScalingConfigurationInfo, Subnet, Tag, VpcSecurityGroupMembership,
 };
 
 // The catalog of engine parameters each family publishes, and the rules over it, are
@@ -73,6 +73,40 @@ pub use service_common::rds_cluster_parameters::{
 
 pub mod option_catalog;
 
+// The records of the resource families whose own fields, quotas and projections are large
+// enough to crowd this module: each lives in its own file and is re-exported here, so a
+// handler still reaches every one of them as `crate::state::<name>` and the store struct
+// below stays the one place that says which maps exist.
+pub mod blue_green;
+pub mod db_proxies;
+pub mod engine_log;
+pub mod integrations;
+pub mod tenant_databases;
+
+pub use blue_green::{
+    blue_green_deployment_identifier_of, check_blue_green_deployment_identifier, green_identifier,
+    mint_blue_green_deployment_identifier, BlueGreenDeploymentRecord,
+    BLUE_GREEN_DEPLOYMENT_QUOTA_PER_REGION, BLUE_GREEN_IDENTIFIER_PREFIX,
+    BLUE_GREEN_STATUS_AVAILABLE, BLUE_GREEN_STATUS_DELETING, BLUE_GREEN_STATUS_PROVISIONING,
+};
+pub use db_proxies::{
+    check_target_group_name, target_to_wire, DbProxyRecord, DbProxyTargetRecord, RegisteredDatabase,
+    DEFAULT_AUTH_SCHEME_NONE, DEFAULT_DB_PROXY_TARGET_GROUP, DEFAULT_IDLE_CLIENT_TIMEOUT,
+    DB_PROXY_QUOTA_PER_REGION, DB_PROXY_STATUS_AVAILABLE, DB_PROXY_STATUS_CREATING,
+    DB_PROXY_TARGET_QUOTA_PER_PROXY, NETWORK_TYPE_IPV4,
+};
+pub use engine_log::InstanceLog;
+pub use integrations::{
+    check_integration_target_arn, check_kms_key_id, mint_integration_id, IntegrationRecord,
+    INTEGRATION_QUOTA_PER_REGION, INTEGRATION_STATUS_ACTIVE, INTEGRATION_STATUS_CREATING,
+    INVALID_TARGET_TYPE_MESSAGE,
+};
+pub use tenant_databases::{
+    is_multi_tenant_engine, mint_tenant_database_resource_id, tenant_database_key,
+    TenantDatabaseRecord, TENANT_DATABASE_QUOTA_PER_INSTANCE, TENANT_DATABASE_STATUS_AVAILABLE,
+    TENANT_DATABASE_STATUS_CREATING, TENANT_DATABASE_STATUS_DELETING,
+};
+
 /// How long after the call that starts it a status transition this service owes
 /// becomes due.
 ///
@@ -82,6 +116,13 @@ pub mod option_catalog;
 /// go with it) exactly as it would against the real service. The due instant is
 /// stored on the record and materialised by the next call — nothing sleeps.
 pub const STATUS_TRANSITION_DELAY: Duration = Duration::from_millis(300);
+
+/// The status a DB cluster's automated backup reports while the cluster it was taken from
+/// is still here.
+///
+/// `DBClusterAutomatedBackup$Status` documents `retained` — "Automated backups for deleted
+/// clusters" — for the other case, which is the one that outlives its cluster.
+pub const DB_CLUSTER_AUTOMATED_BACKUP_STATUS_ACTIVE: &str = "active";
 
 /// The status a DB instance reports once a delete has been accepted for it: "If you
 /// request a final DB snapshot, the status of the Amazon RDS DB instance is deleting
@@ -210,6 +251,17 @@ pub const DB_CLUSTER_STATUS_CREATING: &str = "creating";
 
 /// The status a DB cluster reports once it is usable, as `DBCluster$Status` carries it.
 pub const DB_CLUSTER_STATUS_AVAILABLE: &str = "available";
+
+/// The status a DB cluster reports while it applies a modification, as `DBCluster$Status`
+/// carries it.
+///
+/// `ModifyDBCluster` answers with the cluster in this status and the clock owes its return
+/// to [`DB_CLUSTER_STATUS_AVAILABLE`]: a modification is applied to a cluster, not
+/// instantly, and while one is being applied the cluster is not in a state another
+/// modification can be taken in — which is what makes two concurrent `ModifyDBCluster`
+/// calls on one cluster serialise, one accepted and the other refused with
+/// `InvalidDBClusterStateFault`.
+pub const DB_CLUSTER_STATUS_MODIFYING: &str = "modifying";
 
 /// The status a DB cluster reports once a delete has been accepted for it, as
 /// `DBCluster$Status` carries it — the same `deleting` status the other delete paths of
@@ -803,6 +855,37 @@ pub struct ComAmazonawsRdsAmazonrdsv19State {
     /// against, so a name no group was created under is a not-found rather than a
     /// silently accepted reference.
     pub db_subnet_groups: BTreeMap<RegionalKey, DbSubnetGroupRecord>,
+    /// Blue/green deployments by `(region, BlueGreenDeploymentIdentifier)` — the
+    /// identifier being the one this service MINTED, so a caller cannot choose a key.
+    /// Ordered, so `DescribeBlueGreenDeployments` pages deterministically within a region.
+    ///
+    /// `CreateBlueGreenDeployment` inserts here, bounded by
+    /// [`BLUE_GREEN_DEPLOYMENT_QUOTA_PER_REGION`] per region and by [`MAX_REGIONS`]
+    /// regions.
+    pub blue_green_deployments: BTreeMap<RegionalKey, BlueGreenDeploymentRecord>,
+    /// Zero-ETL integrations by `(region, IntegrationName)`. Ordered, so
+    /// `DescribeIntegrations` pages deterministically within a region.
+    ///
+    /// `CreateIntegration` inserts here, bounded by [`INTEGRATION_QUOTA_PER_REGION`] per
+    /// region and by [`MAX_REGIONS`] regions.
+    pub integrations: BTreeMap<RegionalKey, IntegrationRecord>,
+    /// Tenant databases by `(region, <DBInstanceIdentifier>/<TenantDBName>)` — see
+    /// [`tenant_database_key`] for why the second half pairs the two. Ordered, so one
+    /// instance's tenant databases are an ordered range and
+    /// `DescribeTenantDatabases` pages deterministically within it.
+    ///
+    /// `CreateTenantDatabase` inserts here, bounded by
+    /// [`TENANT_DATABASE_QUOTA_PER_INSTANCE`] per DB instance, which the per-region
+    /// instance quota in turn bounds.
+    pub tenant_databases: BTreeMap<RegionalKey, TenantDatabaseRecord>,
+    /// RDS proxies by `(region, DBProxyName)`. Ordered, so `DescribeDBProxies` pages
+    /// deterministically within a region.
+    ///
+    /// `CreateDBProxy` inserts here — bounded by [`DB_PROXY_QUOTA_PER_REGION`] per region
+    /// and by [`MAX_REGIONS`] regions — and each proxy carries at most
+    /// [`DB_PROXY_TARGET_QUOTA_PER_PROXY`] target registrations, which
+    /// `RegisterDBProxyTargets` adds and `DeregisterDBProxyTargets` removes.
+    pub db_proxies: BTreeMap<RegionalKey, DbProxyRecord>,
     /// The account's CA certificate OVERRIDE, by region: the `CertificateIdentifier`
     /// `ModifyCertificates` pinned as the certificate new DB instances are created with,
     /// for the regions where one is set.
@@ -910,8 +993,64 @@ impl ComAmazonawsRdsAmazonrdsv19State {
                 gone.push(key.clone());
             }
         }
-        for key in gone {
+        for key in gone.drain(..) {
             self.db_clusters.remove(&key);
+        }
+        for (key, deployment) in self
+            .blue_green_deployments
+            .range_mut((region.to_string(), String::new())..)
+        {
+            if key.0 != region {
+                break;
+            }
+            if deployment.settle(now) {
+                gone.push(key.clone());
+            }
+        }
+        for key in gone.drain(..) {
+            self.blue_green_deployments.remove(&key);
+        }
+        for (key, integration) in self
+            .integrations
+            .range_mut((region.to_string(), String::new())..)
+        {
+            if key.0 != region {
+                break;
+            }
+            if integration.settle(now) {
+                gone.push(key.clone());
+            }
+        }
+        for key in gone.drain(..) {
+            self.integrations.remove(&key);
+        }
+        for (key, tenant) in self
+            .tenant_databases
+            .range_mut((region.to_string(), String::new())..)
+        {
+            if key.0 != region {
+                break;
+            }
+            if tenant.settle(now) {
+                gone.push(key.clone());
+            }
+        }
+        for key in gone.drain(..) {
+            self.tenant_databases.remove(&key);
+        }
+        for (key, proxy) in self
+            .db_proxies
+            .range_mut((region.to_string(), String::new())..)
+        {
+            if key.0 != region {
+                break;
+            }
+            if proxy.settle(now) {
+                gone.push(key.clone());
+            }
+        }
+        for key in gone {
+            self.db_proxies.remove(&key);
         }
     }
 
@@ -1045,6 +1184,33 @@ impl ComAmazonawsRdsAmazonrdsv19State {
         range_in(&self.db_cluster_parameter_groups, region)
     }
 
+    /// The cluster parameter group `named` resolves to in `region`, or `None` when nothing
+    /// of that name exists.
+    ///
+    /// `named` is "the identifier or Amazon Resource Name (ARN) for the source DB cluster
+    /// parameter group", so both forms resolve to the one record: the name folded the way
+    /// the store keys it, or an ARN matched against the stored groups' own ARNs.
+    pub fn resolve_cluster_parameter_group(
+        &self,
+        region: &str,
+        named: &str,
+    ) -> Option<&DbClusterParameterGroupRecord> {
+        if let Some(stored) = self
+            .db_cluster_parameter_groups
+            .get(&(region.to_string(), named.to_ascii_lowercase()))
+        {
+            return Some(stored);
+        }
+        // Only an ARN can match the scan below, so a plain name that named nothing does
+        // not pay for rendering a region's stored ARNs.
+        if !named.starts_with("arn:") {
+            return None;
+        }
+        self.cluster_parameter_groups_in(region)
+            .into_iter()
+            .find(|record| record.arn() == named)
+    }
+
     /// The event notification subscriptions stored in `region`, in subscription-name
     /// order.
     pub fn event_subscriptions_in(&self, region: &str) -> Vec<&EventSubscriptionRecord> {
@@ -1059,6 +1225,119 @@ impl ComAmazonawsRdsAmazonrdsv19State {
     /// The DB subnet groups stored in `region`, in name order.
     pub fn db_subnet_groups_in(&self, region: &str) -> Vec<&DbSubnetGroupRecord> {
         range_in(&self.db_subnet_groups, region)
+    }
+
+    /// The blue/green deployments stored in `region`, in identifier order.
+    pub fn blue_green_deployments_in(&self, region: &str) -> Vec<&BlueGreenDeploymentRecord> {
+        range_in(&self.blue_green_deployments, region)
+    }
+
+    /// The blue/green deployment `named` resolves to in `region`, or `None` when nothing
+    /// of that identifier exists. `named` is either the identifier or the deployment's
+    /// ARN, and "this parameter isn't case-sensitive".
+    pub fn resolve_blue_green_deployment(
+        &self,
+        region: &str,
+        named: &str,
+    ) -> Option<&BlueGreenDeploymentRecord> {
+        let identifier = blue_green_deployment_identifier_of(named).to_ascii_lowercase();
+        self.blue_green_deployments
+            .get(&(region.to_string(), identifier))
+    }
+
+    /// The integrations stored in `region`, in name order.
+    pub fn integrations_in(&self, region: &str) -> Vec<&IntegrationRecord> {
+        range_in(&self.integrations, region)
+    }
+
+    /// The integration `named` resolves to in `region`, or `None` when nothing of that
+    /// name exists.
+    ///
+    /// `DescribeIntegrations$IntegrationIdentifier` is "the unique identifier of the
+    /// integration", which is either the name a create gave it or its ARN, so both forms
+    /// are resolved — the ARN against the stored records' own ARNs, since the id inside it
+    /// is the minted one.
+    pub fn resolve_integration(&self, region: &str, named: &str) -> Option<&IntegrationRecord> {
+        if let Some(stored) = self.integrations.get(&(region.to_string(), named.to_string())) {
+            return Some(stored);
+        }
+        // Only an ARN can match the scan below, so a plain name that named nothing does
+        // not pay for rendering a region's stored ARNs.
+        if !named.starts_with("arn:") {
+            return None;
+        }
+        self.integrations_in(region)
+            .into_iter()
+            .find(|record| record.arn() == named)
+    }
+
+    /// The tenant databases stored in `region` for the DB instance `db_instance_identifier`,
+    /// in tenant-name order.
+    ///
+    /// An ordered range over the one instance's keys rather than a scan of the region, so
+    /// the work is bounded by [`TENANT_DATABASE_QUOTA_PER_INSTANCE`].
+    pub fn tenant_databases_of(
+        &self,
+        region: &str,
+        db_instance_identifier: &str,
+    ) -> Vec<&TenantDatabaseRecord> {
+        let prefix = format!("{db_instance_identifier}/");
+        self.tenant_databases
+            .range((region.to_string(), prefix.clone())..)
+            .take_while(|((stored, key), _)| stored == region && key.starts_with(&prefix))
+            .map(|(_, record)| record)
+            .collect()
+    }
+
+    /// The tenant databases stored in `region`, in instance-then-tenant-name order.
+    pub fn tenant_databases_in(&self, region: &str) -> Vec<&TenantDatabaseRecord> {
+        range_in(&self.tenant_databases, region)
+    }
+
+    /// The RDS proxies stored in `region`, in name order.
+    pub fn db_proxies_in(&self, region: &str) -> Vec<&DbProxyRecord> {
+        range_in(&self.db_proxies, region)
+    }
+
+    /// What the proxy target `target` reports about the database behind it, read from that
+    /// database's own record in `region`, or `None` when that database is no longer
+    /// stored.
+    pub fn registered_database(
+        &self,
+        region: &str,
+        target: &DbProxyTargetRecord,
+    ) -> Option<RegisteredDatabase> {
+        if target.is_cluster {
+            let cluster = self.db_clusters.get(&(
+                region.to_string(),
+                target.identifier.clone(),
+            ))?;
+            return Some(RegisteredDatabase {
+                arn: cluster.arn(),
+                endpoint: cluster.endpoint(),
+                resource_id: cluster.resource_id.clone(),
+                port: cluster.port,
+            });
+        }
+        let instance = self
+            .db_instances
+            .get(&(region.to_string(), target.identifier.clone()))?;
+        Some(RegisteredDatabase {
+            arn: instance.arn(),
+            endpoint: instance.endpoint_address(),
+            resource_id: instance.dbi_resource_id.clone(),
+            port: instance.endpoint_port,
+        })
+    }
+
+    /// The modelled `DBProxyTarget` for one registration in `region`: the registration
+    /// itself, with everything about its database read from that database's record.
+    pub fn proxy_target_to_wire(
+        &self,
+        region: &str,
+        target: &DbProxyTargetRecord,
+    ) -> crate::ops::types::DBProxyTarget {
+        target_to_wire(target, self.registered_database(region, target))
     }
 
     /// The DB subnet group `name` resolves to in `region`, or `None` when nothing of
@@ -1119,6 +1398,10 @@ impl ComAmazonawsRdsAmazonrdsv19State {
             .chain(self.event_subscriptions.keys())
             .chain(self.option_groups.keys())
             .chain(self.db_subnet_groups.keys())
+            .chain(self.blue_green_deployments.keys())
+            .chain(self.integrations.keys())
+            .chain(self.tenant_databases.keys())
+            .chain(self.db_proxies.keys())
             .map(|(stored, _)| stored.as_str())
             .chain(self.certificate_overrides.keys().map(String::as_str))
             .collect();
@@ -1239,6 +1522,11 @@ pub struct DbInstanceRecord {
     pub storage_throughput: i32,
     pub instance_create_time: ::aws_smithy_types::DateTime,
     pub tags: Vec<Tag>,
+    /// The instance's log: the lifecycle lines THIS SERVICE has recorded for it, which is
+    /// what `DescribeDBLogFiles` lists and `DownloadDBLogFilePortion` serves. See
+    /// [`engine_log`] for why those lines are the only honest content for it, and for the
+    /// bounds on the log.
+    pub engine_log: InstanceLog,
 }
 
 impl DbInstanceRecord {
@@ -1254,7 +1542,13 @@ impl DbInstanceRecord {
             return false;
         }
         match self.pending_status.take().map(|pending| pending.change) {
-            Some(PendingChange::Status(status)) => self.status = status,
+            Some(PendingChange::Status(status)) => {
+                // The instance's own log records the lifecycle events this service
+                // performs on it, and a status the clock just made due is one of them.
+                self.engine_log
+                    .record(format!("DB instance status is now {status}"));
+                self.status = status;
+            }
             Some(PendingChange::Removal) => return true,
             // Unreachable: the change was there a line ago, under this one `&mut self`.
             // Answered as "nothing was due" rather than with a panic in a request path.
@@ -1277,6 +1571,12 @@ impl DbInstanceRecord {
     pub fn begin_deletion(&mut self) {
         self.status = DB_INSTANCE_STATUS_DELETING.to_string();
         self.pending_status = Some(PendingStatus::removal_in_a_moment());
+    }
+
+    /// The name of the log file this instance writes, which follows from its engine; see
+    /// [`engine_log::log_file_name`].
+    pub fn log_file_name(&self) -> &'static str {
+        engine_log::log_file_name(&self.engine)
     }
 
     /// `arn:aws:rds:<region>:<account>:db:<identifier>`, from the stored region and
@@ -1683,6 +1983,78 @@ impl DbClusterRecord {
     pub fn begin_deletion(&mut self) {
         self.status = DB_CLUSTER_STATUS_DELETING.to_string();
         self.pending_status = Some(PendingStatus::removal_in_a_moment());
+    }
+
+    /// Whether this cluster has an automated backup at all: "The number of days for which
+    /// automated backups are retained" (`BackupRetentionPeriod`), so a cluster that
+    /// retains none has none to describe.
+    pub fn has_automated_backup(&self) -> bool {
+        self.backup_retention_period > 0
+    }
+
+    /// `DBClusterAutomatedBackupsArn`. The resource type is `cluster-auto-backup`, the one
+    /// AWS uses for a cluster's automated backup under this service's `rds` ARN namespace,
+    /// and it carries the cluster's immutable resource id rather than its identifier,
+    /// which can be renamed.
+    pub fn automated_backup_arn(&self) -> String {
+        emulator_server::emulator_arn(
+            ARN_NAMESPACE,
+            &self.region,
+            &format!("cluster-auto-backup:{}", self.resource_id),
+        )
+    }
+
+    /// Project this cluster's automated backup onto the modelled
+    /// `DBClusterAutomatedBackup` shape.
+    ///
+    /// Every member is read from the cluster the backup is OF, so the two cannot disagree,
+    /// and the restore window is computed from the clock and the retention period the
+    /// cluster carries now: "the earliest and latest time a DB cluster can be restored to"
+    /// is at most `BackupRetentionPeriod` days back, and never before the cluster existed.
+    /// `Status` is `active` while that cluster is still here — the member documents
+    /// `retained` for the backups of a cluster that has been deleted.
+    pub fn automated_backup_to_wire(&self) -> DBClusterAutomatedBackup {
+        let now = now_as_wire_timestamp();
+        let retention = f64::from(self.backup_retention_period) * 24.0 * 60.0 * 60.0;
+        let earliest = (now.as_secs_f64() - retention).max(self.cluster_create_time.as_secs_f64());
+        DBClusterAutomatedBackup {
+            engine: Some(self.engine.clone()),
+            // The VPC a cluster belongs to is not state this service holds, so the member
+            // is left out rather than invented.
+            vpc_id: None,
+            db_cluster_automated_backups_arn: Some(self.automated_backup_arn()),
+            db_cluster_identifier: Some(self.identifier.clone()),
+            restore_window: Some(RestoreWindow {
+                earliest_time: Some(::aws_smithy_types::DateTime::from_secs_f64(earliest)),
+                latest_time: Some(now),
+            }),
+            master_username: self.master_username.clone(),
+            db_cluster_resource_id: Some(self.resource_id.clone()),
+            region: Some(self.region.clone()),
+            license_model: default_license_model(&self.engine).map(str::to_string),
+            status: Some(DB_CLUSTER_AUTOMATED_BACKUP_STATUS_ACTIVE.to_string()),
+            iam_database_authentication_enabled: Some(self.iam_database_authentication_enabled),
+            cluster_create_time: Some(self.cluster_create_time),
+            storage_encrypted: Some(self.storage_encrypted),
+            storage_encryption_type: Some(self.storage_encryption_type().to_string()),
+            allocated_storage: self.allocated_storage,
+            engine_version: self.engine_version.clone(),
+            db_cluster_arn: Some(self.arn()),
+            backup_retention_period: Some(self.backup_retention_period),
+            preferred_backup_window: Some(self.preferred_backup_window.clone()),
+            engine_mode: Some(self.engine_mode.clone()),
+            availability_zones: Some(self.availability_zones.clone()),
+            port: Some(self.port),
+            kms_key_id: self.kms_key_id.clone(),
+            storage_type: self.storage_type.clone(),
+            iops: self.iops,
+            // The throughput of a cluster's storage is "not configurable" and this service
+            // stores none for a cluster, and no automated backup here was taken by Amazon
+            // Web Services Backup, so neither member is invented.
+            storage_throughput: None,
+            aws_backup_recovery_point_arn: None,
+            tag_list: Some(self.tags.clone()),
+        }
     }
 
     /// `StorageEncryptionType`: "the type of encryption used to protect data at rest in
@@ -2812,6 +3184,48 @@ pub fn arn_region(value: &str) -> Option<&str> {
         return None;
     };
     Some(region)
+}
+
+/// What an Amazon RDS resource ARN names: the region it is in, the resource TYPE and the
+/// resource's own identifier.
+#[derive(Debug, Clone, Copy)]
+pub struct RdsResourceArn<'a> {
+    /// The ARN's region field.
+    pub region: &'a str,
+    /// The ARN's resource type — `db` for a DB instance, `cluster` for a DB cluster.
+    pub resource_type: &'a str,
+    /// The resource's identifier.
+    pub identifier: &'a str,
+}
+
+/// The RDS resource `value` names, or `None` when `value` is not an ARN of this service at
+/// all.
+///
+/// Several members take "the Amazon Resource Name (ARN)" of a database rather than its
+/// identifier — `CreateBlueGreenDeployment$Source` is a `DatabaseArn`,
+/// `CreateIntegration$SourceArn` an RDS `db` or `cluster` ARN — and which resource TYPE
+/// the ARN names decides which store the lookup goes to, and so which not-found fault a
+/// request that resolves to nothing is answered with.
+pub fn parse_rds_resource_arn(value: &str) -> Option<RdsResourceArn<'_>> {
+    let fields: Vec<&str> = value.splitn(6, ':').collect();
+    let [prefix, partition, service, region, account, resource] = fields.as_slice() else {
+        return None;
+    };
+    if *prefix != "arn" || !partition.starts_with("aws") || *service != ARN_NAMESPACE {
+        return None;
+    }
+    if !account.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let (resource_type, identifier) = resource.split_once(':')?;
+    if resource_type.is_empty() || identifier.is_empty() {
+        return None;
+    }
+    Some(RdsResourceArn {
+        region,
+        resource_type,
+        identifier,
+    })
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

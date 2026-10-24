@@ -891,22 +891,28 @@ async fn another_account_is_refused_and_its_analysed_database_is_reported_to_nob
 /// record `GetIdleRecommendations` reports — and the `Idle` filter selects on it.
 #[tokio::test]
 async fn idle_is_true_exactly_where_an_idle_recommendation_is_held() {
-    use service_com_amazonaws_computeoptimizer_computeoptimizerservice::ops::types::IdleRecommendation;
+    use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::IdleResourceAnalysis;
 
     let (router, engine, corpus) = emulator_with_corpus().await;
-    let idle_database = corpus[1].arn_in(REGION);
+    let idle_row = corpus[1].clone();
+    let idle_database = idle_row.arn_in(REGION);
     {
         let state = service_state(&*engine).expect("the engine bears this service's state");
-        state.lock().idle_recommendations.insert(
-            idle_database.clone(),
-            IdleRecommendation {
-                resource_arn: Some(idle_database.clone()),
-                resource_type: Some("RDSDBInstance".to_string()),
-                account_id: Some(own_account().to_string()),
-                finding: Some("Idle".to_string()),
-                ..IdleRecommendation::default()
-            },
-        );
+        // Recorded the way Compute Optimizer's own idle analysis would: the resource's
+        // region-free identity, the finding it reached, and what the database costs.
+        state
+            .lock()
+            .idle_recommendations
+            .insert(IdleResourceAnalysis {
+                account_id: idle_row.account_id.clone(),
+                arn_service: idle_row.arn_service.clone(),
+                arn_resource: idle_row.arn_resource.clone(),
+                finding: "Idle".to_string(),
+                utilization_metrics: Vec::new(),
+                days_observed: 14.0,
+                monthly_cost: idle_row.current_monthly_cost,
+                tags: Vec::new(),
+            });
     }
 
     for resource in &corpus {

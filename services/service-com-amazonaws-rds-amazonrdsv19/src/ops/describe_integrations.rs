@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeIntegrations
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeIntegrations`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeIntegrations::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the zero-ETL integrations this service holds in the region the request is
+//! signed for. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +138,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeIntegrations` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeIntegrationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeIntegrations"))
+        let region =
+            crate::state::request_region(ctx).map_err(DescribeIntegrationsError::validation)?;
+        let page_size = crate::state::check_max_records(input.max_records)
+            .map_err(DescribeIntegrationsError::invalid_parameter_value)?;
+        // This operation's `Filters` member documents no filter name at all ("a filter
+        // that specifies one or more resources to return"), so there is none to match on:
+        // a request that carries one is refused rather than served a list the filter was
+        // meant to narrow.
+        let filters = input.filters.unwrap_or_default();
+        if let Some(filter) = filters.first() {
+            return Err(DescribeIntegrationsError::invalid_parameter_value(format!(
+                "unrecognized filter name: {}; this operation publishes no filter names",
+                filter.name
+            )));
+        }
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a fabricated empty list.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // A report materialises the transitions the clock already made due: the ones owed
+        // at this instant whether or not anybody called.
+        store.settle_due_transitions(&region);
+
+        // RDS is regional: a request sees only the integrations of the region it was
+        // signed for.
+        let candidates: Vec<&crate::state::IntegrationRecord> = match &input
+            .integration_identifier
+        {
+            Some(requested) => {
+                let record = store
+                    .resolve_integration(&region, requested)
+                    .ok_or_else(|| {
+                        DescribeIntegrationsError::from(
+                            DescribeIntegrationsErrorModeled::IntegrationNotFoundFault(
+                                IntegrationNotFoundFault {
+                                    message: Some(format!("Integration {requested} not found.")),
+                                },
+                            ),
+                        )
+                    })?;
+                vec![record]
+            }
+            None => store.integrations_in(&region),
+        };
+        let matching: Vec<(String, CreateIntegrationOutput)> = candidates
+            .into_iter()
+            .map(|record| (record.name.clone(), record.to_wire()))
+            .collect();
+
+        // A `Marker` no prior page issued is refused rather than resynchronised: see
+        // `crate::state::paginate`.
+        let page = crate::state::paginate(matching, input.marker.as_deref(), page_size)
+            .map_err(DescribeIntegrationsError::invalid_parameter_value)?;
+        Ok(DescribeIntegrationsOutput {
+            marker: page.next_marker,
+            integrations: Some(page.items),
+        })
     }
 }
