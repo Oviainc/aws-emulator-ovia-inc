@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ReleaseHosts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ReleaseHosts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ReleaseHosts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Releases the Dedicated Hosts the request names: each one moves to the `released` state
+//! and records its release time, while a host that cannot be released is reported in
+//! `Unsuccessful`. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -139,18 +134,136 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ReleaseHosts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ReleaseHostsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            HOST_STATE_RELEASED, INCORRECT_STATE, INVALID_HOST_ID_MALFORMED, MAX_RESOURCE_IDS,
+            host_is_released, require_service_state, system_time_to_date_time,
+            unresolvable_host_ids_message,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it — the host
+        // store is per account, not per Region, exactly as `DescribeHosts` reads it. The
+        // store is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "The IDs of the Dedicated Hosts to release" (`ReleaseHostsRequest$HostIds`) is a
+        // REQUIRED member, so a request naming no host has already been refused before this
+        // handler runs: what reaches here names at least one host.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ReleaseHosts"))
+        // The same ceiling the rest of this crate puts on a caller-chosen id list, charged
+        // before any per-id work is done.
+        if input.host_ids.len() > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "HostIds carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
+                input.host_ids.len()
+            )));
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // "On-Demand billing is stopped and the host goes into released state": the move is
+        // due at the instant this call is served — the clock owes nothing later — so every
+        // host this call releases carries that instant as its release time.
+        let release_time = system_time_to_date_time(::std::time::SystemTime::now());
+
+        // Each host is judged on its own and reported in `Unsuccessful` when it cannot be
+        // released — "the IDs of the Dedicated Hosts that could not be released, including
+        // an error message" — so one unreleasable host does not refuse the hosts beside it.
+        // The code carried is the one this service answers that same cause with elsewhere,
+        // so a client reads one code per cause whether it arrives as an error or as an
+        // unsuccessful item.
+        let mut successful: Vec<String> = Vec::new();
+        let mut unsuccessful: Vec<UnsuccessfulItem> = Vec::new();
+        let mut named: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
+        for host_id in &input.host_ids {
+            // One id names ONE host, so an id the list repeats names that host once: the
+            // repeat is neither released twice nor reported as a failure of its own.
+            if !named.insert(host_id.as_str()) {
+                continue;
+            }
+            let refusal = match store.dedicated_hosts.get(host_id) {
+                // An id this account holds no host for is reported as the id it is: to EC2 a
+                // host id it never issued is NOT VALID rather than merely absent, whatever
+                // its shape, so a misspelling and an id of another account read the same
+                // here as they do out of this service's other host operations — the one
+                // wording lives in `crate::state`.
+                //
+                // "The host ID of Dedicated Hosts that have been released can no longer be
+                // specified in another request" either, so a host already given back is as
+                // unreleasable as one that never existed, even though a describe still
+                // reports it.
+                None => Some((
+                    INVALID_HOST_ID_MALFORMED,
+                    unresolvable_host_ids_message([host_id.as_str()]),
+                )),
+                Some(host) if host_is_released(host) => Some((
+                    INVALID_HOST_ID_MALFORMED,
+                    unresolvable_host_ids_message([host_id.as_str()]),
+                )),
+                // "You must stop or terminate all instances on a host before it can be
+                // released": a host still running instances is in a state that does not
+                // admit the release, so it is reported instead of released under them.
+                Some(host)
+                    if host
+                        .instances
+                        .as_ref()
+                        .is_some_and(|instances| !instances.is_empty()) =>
+                {
+                    Some((
+                        INCORRECT_STATE,
+                        format!(
+                            "The Dedicated Host '{host_id}' still has instances running on it; \
+                             stop or terminate them before releasing it"
+                        ),
+                    ))
+                }
+                Some(_) => None,
+            };
+            match refusal {
+                Some((code, message)) => unsuccessful.push(UnsuccessfulItem {
+                    resource_id: Some(host_id.clone()),
+                    error: Some(UnsuccessfulItemError {
+                        code: Some(code.to_string()),
+                        message: Some(message),
+                    }),
+                }),
+                None => successful.push(host_id.clone()),
+            }
+        }
+
+        // "Released hosts still appear in a DescribeHosts response", so the record is KEPT
+        // and what changes is its state and its release time: nothing is removed from the
+        // store, and the caller-chosen bytes it holds stay charged because it is still
+        // reported.
+        for host_id in &successful {
+            let Some(host) = store.dedicated_hosts.get_mut(host_id) else {
+                return Err(Scaffolded::internal_error(format!(
+                    "the Dedicated Host '{host_id}' this call judged releasable is no longer \
+                     stored"
+                )));
+            };
+            host.state = Some(HOST_STATE_RELEASED.to_string());
+            host.release_time = Some(release_time);
+        }
+
+        // Read the moved hosts back OUT of the store, so the caller is told about hosts a
+        // later describe will report as released rather than about ids this handler merely
+        // listed.
+        if let Some(unmoved) = successful.iter().find(|host_id| {
+            store
+                .dedicated_hosts
+                .get(*host_id)
+                .is_none_or(|host| !host_is_released(host))
+        }) {
+            return Err(Scaffolded::internal_error(format!(
+                "the released Dedicated Host '{unmoved}' could not be read back as released"
+            )));
+        }
+
+        Ok(ReleaseHostsOutput {
+            successful: Some(successful),
+            unsuccessful: Some(unsuccessful),
+        })
     }
 }
