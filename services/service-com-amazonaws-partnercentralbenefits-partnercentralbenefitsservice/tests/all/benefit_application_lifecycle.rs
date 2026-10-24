@@ -56,6 +56,10 @@ pub(crate) const CATALOG: &str = "AWS";
 /// [`Harness::unentitled`]).
 pub(crate) struct Harness {
     router: MultiServiceRouter,
+    /// The same engine the registered service holds, so a test can place a stored
+    /// application into a status AWS's own review workflow produces and no operation in
+    /// this slice reaches — see [`Harness::place_status`].
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Harness {
@@ -88,8 +92,24 @@ impl Harness {
         // The signature itself is not under test here, and the fixed test credential
         // below is not this process's signing key.
         router.set_request_authentication(false);
-        router.register_service(EmulatedService::new(engine));
-        Self { router }
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        Self { router, engine }
+    }
+
+    /// Put one stored application into `status`, directly in the store.
+    ///
+    /// `APPROVED`, `REJECTED` and `ACTION_REQUIRED` are set by AWS's review workflow, and
+    /// no operation this emulator serves reaches them, so a rule stated over every
+    /// `BenefitApplicationStatus` can only be exercised by placing the status here. The
+    /// behaviour under test is still read and asserted over the wire.
+    pub(crate) fn place_status(&self, case: &str, catalog: &str, identifier: &str, status: &str) {
+        let state = service_state(&*self.engine)
+            .expect("the in-memory engine carries this service's state");
+        let mut store = state.lock();
+        let application = store
+            .application_mut(catalog, identifier)
+            .unwrap_or_else(|| panic!("case {case:?}: {identifier:?} names no stored application"));
+        application.status = status.to_string();
     }
 
     /// Call one operation and return `(http status, parsed body)`.
