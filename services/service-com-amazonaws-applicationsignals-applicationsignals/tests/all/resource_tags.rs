@@ -36,7 +36,7 @@ fn slo_arn(name: &str) -> String {
 ///
 /// `arn` is the already-escaped spelling `arn_uri_segment` produces, so the ARN's `:` and
 /// `/` are carried as `%3A`/`%2F` rather than raw in the request line.
-async fn list_tags_raw(router: &MultiServiceRouter, arn: &str) -> (u16, Value) {
+pub(crate) async fn list_tags_raw(router: &MultiServiceRouter, arn: &str) -> (u16, Value) {
     call(router, "GET", &format!("/tags?ResourceArn={arn}"), None).await
 }
 
@@ -46,7 +46,11 @@ async fn list_tags(router: &MultiServiceRouter, name: &str) -> (u16, Value) {
 }
 
 /// `POST /untag-resource` with the given `ResourceArn` and `TagKeys`.
-async fn untag(router: &MultiServiceRouter, resource_arn: &str, keys: &[String]) -> (u16, Value) {
+pub(crate) async fn untag(
+    router: &MultiServiceRouter,
+    resource_arn: &str,
+    keys: &[String],
+) -> (u16, Value) {
     call(
         router,
         "POST",
@@ -60,7 +64,7 @@ async fn untag(router: &MultiServiceRouter, resource_arn: &str, keys: &[String])
 ///
 /// `Tags` is a LIST of `Tag` structures on the wire; comparing it as a map is what makes the
 /// assertions independent of the order the service happens to report them in.
-fn reported_tags(body: &Value) -> BTreeMap<String, String> {
+pub(crate) fn reported_tags(body: &Value) -> BTreeMap<String, String> {
     body["Tags"]
         .as_array()
         .map(|tags| {
@@ -77,7 +81,7 @@ fn reported_tags(body: &Value) -> BTreeMap<String, String> {
 }
 
 /// `tags` as the modelled `TagList` a create request carries.
-fn tag_list(tags: &[(String, String)]) -> Value {
+pub(crate) fn tag_list(tags: &[(String, String)]) -> Value {
     Value::Array(
         tags.iter()
             .map(|(key, value)| json!({ "Key": key, "Value": value }))
@@ -108,7 +112,7 @@ async fn create_tagged(
 }
 
 /// An owned `(key, value)` pair, so a table row can hold both literals and generated keys.
-fn tag(key: &str, value: &str) -> (String, String) {
+pub(crate) fn tag(key: &str, value: &str) -> (String, String) {
     (key.to_string(), value.to_string())
 }
 
@@ -230,7 +234,7 @@ fn cases() -> Vec<Case> {
 }
 
 /// `expected` as the map a `ListTagsForResource` response must report.
-fn expected_map(expected: &[(String, String)]) -> BTreeMap<String, String> {
+pub(crate) fn expected_map(expected: &[(String, String)]) -> BTreeMap<String, String> {
     expected.iter().cloned().collect()
 }
 
