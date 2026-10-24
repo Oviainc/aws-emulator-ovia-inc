@@ -1661,6 +1661,7 @@ pub fn resource_not_found() -> ResourceNotFoundException {
 /// not gated here, and reaches the store directly (`GetPolicy` and `DeletePolicy`
 /// are that case — `AccessDeniedException` is in neither one's modeled error set,
 /// nor in this service's common errors).
+///
 /// The refusal [`require_administrator`] states when the organization has no
 /// Firewall Manager administrator: HTTP 400 `AccessDeniedException`, naming the
 /// calling account and the Region the request was signed for.
@@ -1675,6 +1676,16 @@ pub fn no_administrator_refusal<E>(region: &str) -> crate::scaffolded::Scaffolde
     ))
 }
 
+/// The association that authorizes an organization-scoped call: the active
+/// Firewall Manager administrator, or [`no_administrator_refusal`] when the
+/// organization holds none.
+///
+/// It is taken only by the operations whose recorded answer to a caller with no
+/// administrator association IS this refusal. The resource-level tagging
+/// operations are not among them: they name their target by the model's generic
+/// `ResourceArn` and nothing else, declare no authorization error in their error
+/// unions, and are answered from that ARN alone — its form, then its resolution
+/// — so they do not call this.
 pub fn require_administrator<'store, E>(
     store: &'store ComAmazonawsFmsAwsfms20180101State,
     region: &str,

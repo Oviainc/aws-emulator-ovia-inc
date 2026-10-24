@@ -10,6 +10,10 @@
 //! no `UserPoolId`. The two admin flows are refused as the model documents, and every
 //! remaining `AuthFlow` answers 501 until it is implemented.
 //!
+//! On a user pool that carries a `DeviceConfiguration`, a completed password sign-in
+//! also records the device it came from and answers with that device's
+//! `NewDeviceMetadata` when the pool did not recognise it.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -347,6 +351,11 @@ const ADMIN_NO_SRP_AUTH: &str = "ADMIN_NO_SRP_AUTH";
 /// (`ChallengeNameType` in this service's model).
 const NEW_PASSWORD_REQUIRED: &str = "NEW_PASSWORD_REQUIRED";
 
+/// The `AuthParameters` entry that names the device the sign-in comes from:
+/// "Add `DEVICE_KEY` if you want to bypass multi-factor authentication with a
+/// remembered device" (`InitiateAuth.AuthParameters` in this service's model).
+const DEVICE_KEY: &str = "DEVICE_KEY";
+
 /// `AuthFlow=USER_PASSWORD_AUTH`: "Client-side username-password authentication with
 /// the password sent directly in the request" (`InitiateAuth.AuthFlow`), whose
 /// `AuthParameters` are `USERNAME` and `PASSWORD`, both documented "required".
@@ -478,9 +487,21 @@ fn password_sign_in(
             user_pool_id,
             username,
         } => {
-            let authentication_result = state
+            let mut authentication_result = state
                 .issue_tokens(&user_pool_id, client_id, &username, now)
                 .ok_or_else(internal_error)?;
+            // The sign-in is complete, so the device it came from is now part of
+            // this user's state on a pool that remembers devices, and the key of a
+            // device the pool did not recognise is what the caller needs to confirm
+            // it. `AuthParameters`: "Add `DEVICE_KEY` if you want to bypass
+            // multi-factor authentication with a remembered device" — the device
+            // the request presented, if any.
+            authentication_result.new_device_metadata = state.track_sign_in_device(
+                &user_pool_id,
+                &username,
+                auth_parameters.get(DEVICE_KEY).map(String::as_str),
+                now,
+            );
             Ok(authenticated(authentication_result))
         }
     }

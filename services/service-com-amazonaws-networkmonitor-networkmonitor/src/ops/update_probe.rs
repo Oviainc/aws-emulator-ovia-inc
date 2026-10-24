@@ -237,7 +237,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // `state` is the activate/deactivate toggle: the enum admits every
         // state a probe can be REPORTED in, including the ones the service
         // assigns itself, so the settable allow-list is checked here. Refused
@@ -256,6 +255,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the networkmonitor monitor store is unavailable".to_string()),
             })
         })?;
+        // An update reaches only the region it was signed for: the same monitor
+        // and probe names in another region are different resources.
+        let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
 
         let mut store = state.lock();
@@ -263,12 +265,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // monitor and its probes, materialised before the record is changed and
         // reported — the same write `GetProbe` performs, owed at its due instant
         // whether or not anybody called.
-        store.settle_monitor(&input.monitor_name, now);
-        let monitor = store.monitors.get_mut(&input.monitor_name).ok_or_else(|| {
-            UpdateProbeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                message: Some(crate::state::monitor_not_found_message(&input.monitor_name)),
-            })
-        })?;
+        store.settle_monitor(&region, &input.monitor_name, now);
+        let monitor = store
+            .monitor_mut(&region, &input.monitor_name)
+            .ok_or_else(|| {
+                UpdateProbeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(crate::state::monitor_not_found_message(&input.monitor_name)),
+                })
+            })?;
         let probe = monitor.probes.get_mut(&input.probe_id).ok_or_else(|| {
             UpdateProbeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
                 message: Some(crate::state::probe_not_found_message(

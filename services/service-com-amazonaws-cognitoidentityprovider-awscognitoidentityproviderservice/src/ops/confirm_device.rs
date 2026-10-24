@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ConfirmDevice
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ConfirmDevice`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ConfirmDevice::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Confirms the device a sign-in minted a `DeviceKey` for: the device of the
+//! signed-in user the presented access token names is marked confirmed, which is
+//! what makes the user pool report it, and remembered unless the pool's
+//! `DeviceOnlyRememberedOnUserPrompt` asks for the user's own answer first —
+//! which is exactly what `UserConfirmationNecessary` reports back.
 //!
 //! ## Shape of an operation
 //!
@@ -200,18 +196,151 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ConfirmDevice` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ConfirmDeviceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_error());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut guard = state.lock();
+
+        // `UserConfirmationNecessary`: "When `true`, your user must confirm that
+        // they want to remember the device ... When `false`, immediately sets the
+        // device as remembered", and `DeviceOnlyRememberedOnUserPrompt` is what
+        // decides which: "When true, Amazon Cognito doesn't automatically remember
+        // a user's device when your app sends a `ConfirmDevice` API request".
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ConfirmDevice"))
+        // "Authorize this action with a signed-in user's access token" (this
+        // operation's documentation): the token resolves the user whose device is
+        // confirmed, so nothing the caller asserts picks it.
+        let (user_pool_id, username, user_confirmation_necessary) = {
+            let (pool, user) = guard
+                .signed_in_user(&input.access_token, now)
+                .map_err(token_rejected)?;
+            let configuration = pool
+                .device_configuration
+                .as_ref()
+                .ok_or_else(device_remembering_not_configured)?;
+            (
+                pool.id.clone(),
+                user.username.clone(),
+                configuration.device_only_remembered_on_user_prompt,
+            )
+        };
+
+        let pool = guard
+            .pool_mut(&user_pool_id)
+            .ok_or_else(|| user_pool_not_found(&user_pool_id))?;
+        let user = pool.user_mut(&username).ok_or_else(user_not_found)?;
+        // Only a device a sign-in of THIS user minted a key for can be confirmed:
+        // the key is "an identifier used in generating the
+        // `DEVICE_PASSWORD_VERIFIER`" that the sign-in handed out, not something a
+        // caller chooses.
+        let device = user
+            .devices
+            .get_mut(&input.device_key)
+            .ok_or_else(device_not_found)?;
+        if device.confirmed {
+            return Err(device_key_exists());
+        }
+        device.confirmed = true;
+        device.remembered = !user_confirmation_necessary;
+        // The device's own metadata, as this request registered it.
+        if let Some(device_name) = input.device_name.clone() {
+            device
+                .attributes
+                .insert(crate::state::DEVICE_NAME_ATTRIBUTE.to_string(), device_name);
+        }
+        device.secret_verifier = input.device_secret_verifier_config.clone();
+        device.last_modified_date = now;
+
+        Ok(ConfirmDeviceOutput {
+            user_confirmation_necessary,
+        })
     }
+}
+
+/// This operation's answer to an `AccessToken` that names no signed-in user:
+/// every rejection of the token itself is `NotAuthorizedException`, while a
+/// token whose pool or user has since been deleted answers for the resource that
+/// is gone.
+fn token_rejected(rejection: crate::state::TokenRejection) -> ConfirmDeviceError {
+    match rejection {
+        crate::state::TokenRejection::NotAnAccessToken => not_authorized("Invalid Access Token"),
+        crate::state::TokenRejection::Expired => not_authorized("Access Token has expired"),
+        crate::state::TokenRejection::PoolGone => {
+            ConfirmDeviceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                // The caller named no pool — the token did — so this message
+                // names none either.
+                message: Some("User pool does not exist.".to_string()),
+            })
+            .into()
+        }
+        crate::state::TokenRejection::UserGone => user_not_found(),
+    }
+}
+
+/// This operation's `NotAuthorizedException`, carrying `message`.
+fn not_authorized(message: &str) -> ConfirmDeviceError {
+    ConfirmDeviceErrorModeled::NotAuthorizedException(NotAuthorizedException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// This operation's `ResourceNotFoundException` for a pool that is gone between
+/// the token's issue and this call.
+fn user_pool_not_found(user_pool_id: &str) -> ConfirmDeviceError {
+    ConfirmDeviceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(format!("User pool {user_pool_id} does not exist.")),
+    })
+    .into()
+}
+
+/// This operation's `UserNotFoundException` for an absent user. Carries the
+/// fixed message of [`crate::state::USER_NOT_FOUND_MESSAGE`], which names no
+/// username.
+fn user_not_found() -> ConfirmDeviceError {
+    ConfirmDeviceErrorModeled::UserNotFoundException(UserNotFoundException {
+        message: Some(crate::state::USER_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// The refusal a device operation owes on a pool that activated no device
+/// remembering at all.
+fn device_remembering_not_configured() -> ConfirmDeviceError {
+    ConfirmDeviceErrorModeled::InvalidUserPoolConfigurationException(
+        InvalidUserPoolConfigurationException {
+            message: Some(crate::state::DEVICE_REMEMBERING_NOT_CONFIGURED_MESSAGE.to_string()),
+        },
+    )
+    .into()
+}
+
+/// This operation's `ResourceNotFoundException` for a `DeviceKey` no sign-in of
+/// this user minted.
+fn device_not_found() -> ConfirmDeviceError {
+    ConfirmDeviceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::DEVICE_NOT_FOUND_MESSAGE.to_string()),
+    })
+    .into()
+}
+
+/// The refusal for a device this user already confirmed: `DeviceKeyExistsException`
+/// is "thrown when a user attempts to confirm a device with a device key that
+/// already exists" (this service's model).
+fn device_key_exists() -> ConfirmDeviceError {
+    ConfirmDeviceErrorModeled::DeviceKeyExistsException(DeviceKeyExistsException {
+        message: Some("Device key already exists.".to_string()),
+    })
+    .into()
+}
+
+/// The modelled server error for an engine this service cannot reach.
+fn internal_error() -> ConfirmDeviceError {
+    ConfirmDeviceErrorModeled::InternalErrorException(InternalErrorException {
+        message: Some("the cognito-idp emulator could not reach its state store".to_string()),
+    })
+    .into()
 }

@@ -16,9 +16,9 @@ use ::sha2::Digest;
 use crate::ops::types::{
     AccountRecoverySettingType, AcrLevelConfigType, AdminCreateUserConfigType,
     AnalyticsConfigurationType, AttributeType, AuthenticationResultType, CustomDomainConfigType,
-    DeviceConfigurationType, DeviceType, DomainDescriptionType, EmailConfigurationType, GroupType,
-    IdentityProviderType, IssuerConfigurationType, KeyConfigurationType, LambdaConfigType,
-    MFAOptionType,
+    DeviceConfigurationType, DeviceSecretVerifierConfigType, DeviceType, DomainDescriptionType,
+    EmailConfigurationType, GroupType, IdentityProviderType, IssuerConfigurationType,
+    KeyConfigurationType, LambdaConfigType, MFAOptionType, NewDeviceMetadataType,
     NumberAttributeConstraintsType, PasswordPolicyType, RefreshTokenRotationType,
     ResourceServerScopeType, ResourceServerType, RoutingType,
     SchemaAttributeType, SignInPolicyType, SmsConfigurationType, StringAttributeConstraintsType,
@@ -121,6 +121,20 @@ const DEFAULT_PREVENT_USER_EXISTENCE_ERRORS: &str = "LEGACY";
 /// for. A message built from the requested username would answer a different
 /// sentence per username, which is what makes the refusal an existence oracle.
 pub const USER_NOT_FOUND_MESSAGE: &str = "User does not exist.";
+
+/// The message a device operation's `ResourceNotFoundException` carries for a
+/// `DeviceKey` the signed-in user holds no confirmed device for. Like
+/// [`USER_NOT_FOUND_MESSAGE`] it names nothing the request asked for, so the
+/// refusal is the same sentence for every key.
+pub const DEVICE_NOT_FOUND_MESSAGE: &str = "Device does not exist.";
+
+/// The message a device operation's `InvalidUserPoolConfigurationException`
+/// carries on a pool that stores no `DeviceConfiguration`: "When you provide a
+/// value for any property of `DeviceConfiguration`, you activate the device
+/// remembering for the user pool" (this service's model), so a pool that
+/// provided none remembers no device and has no device surface to serve.
+pub const DEVICE_REMEMBERING_NOT_CONFIGURED_MESSAGE: &str =
+    "Device tracking is not configured for this user pool.";
 
 /// The message a `ResourceNotFoundException` carries when the group an operation
 /// names is not one the named pool holds.
@@ -255,6 +269,11 @@ pub const MAX_USERS_PER_POOL: usize = 10_000;
 
 /// The most groups one user pool holds.
 pub const MAX_GROUPS_PER_POOL: usize = 1_000;
+
+/// The most devices one user holds. A sign-in from a device the user pool does
+/// not recognise stores one, so the device authenticated longest ago is evicted
+/// past this cap: repeated sign-ins cannot grow one user without limit.
+pub const MAX_DEVICES_PER_USER: usize = 200;
 
 /// The most resource servers one user pool holds.
 pub const MAX_RESOURCE_SERVERS_PER_POOL: usize = 1_000;
@@ -607,6 +626,52 @@ impl ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState {
         })
     }
 
+    /// Record the device a completed sign-in presented and answer the
+    /// `AuthenticationResult.NewDeviceMetadata` that sign-in owes.
+    ///
+    /// `DeviceConfigurationType`: "When you provide a value for any property of
+    /// `DeviceConfiguration`, you activate the device remembering for the user
+    /// pool", and `NewDeviceMetadataType` is "Information that your user pool
+    /// responds with in `AuthenticationResult` when you configure it to remember
+    /// devices and a user signs in with an unrecognized device" (this service's
+    /// model). So a pool that stores NO `DeviceConfiguration` answers `None`,
+    /// whatever the sign-in presented, and so does a sign-in that presented a
+    /// `DEVICE_KEY` this user already holds — that device is recognized, and only
+    /// its last-authenticated instant moves. Anything else is an unrecognized
+    /// device: a device is stored for the user and its key, beside the pool's
+    /// device group key, is what the caller gets back. A key the user does not
+    /// hold — another user's, or one nothing minted — is unrecognized by this
+    /// user pool for this user, so it is answered the same way as none at all
+    /// rather than refusing the sign-in the first factor already passed.
+    ///
+    /// The stored device is NOT confirmed yet: `ConfirmDevice` is what confirms
+    /// it and decides whether it is remembered.
+    pub fn track_sign_in_device(
+        &mut self,
+        user_pool_id: &str,
+        username: &str,
+        presented_device_key: Option<&str>,
+        now: SystemTime,
+    ) -> Option<NewDeviceMetadataType> {
+        let pool = self.user_pools.get_mut(user_pool_id)?;
+        // A pool that provided no `DeviceConfiguration` activated no device
+        // remembering, so it answers nothing whatever the sign-in presented.
+        pool.device_configuration.as_ref()?;
+        let region = pool.region.clone();
+        let device_group_key = pool.device_group_key.clone();
+        let user = pool.user_mut(username)?;
+        if let Some(device) = presented_device_key.and_then(|key| user.devices.get_mut(key)) {
+            device.last_authenticated_date = Some(now);
+            return None;
+        }
+        let device_key = new_device_key(&region);
+        user.store_device(Device::signed_in(device_key.clone(), now));
+        Some(NewDeviceMetadataType {
+            device_key: Some(device_key),
+            device_group_key: Some(device_group_key),
+        })
+    }
+
     /// Forget every session and token issued for `username` in `user_pool_id`.
     /// Called when the user it authenticates is deleted.
     pub fn forget_user_credentials(&mut self, user_pool_id: &str, username: &str) {
@@ -687,6 +752,12 @@ pub struct UserPool {
     /// so every token the pool ever issued stays verifiable against the key set
     /// it publishes now.
     pub signing_key: PoolSigningKey,
+    /// The `DeviceGroupKey` every device of this pool is reported under:
+    /// "an identifier used in generating the `DEVICE_PASSWORD_VERIFIER` for
+    /// device SRP authentication" (`NewDeviceMetadataType.DeviceGroupKey`).
+    /// Minted with the pool and kept for its lifetime, so two sign-ins of the
+    /// same pool report the same group key.
+    pub device_group_key: String,
 }
 
 impl UserPool {
@@ -767,6 +838,15 @@ impl UserPool {
             .iter()
             .find(|(_, user)| user.sub == username)
             .map(|(stored_key, _)| stored_key.clone())
+    }
+
+    /// Whether this pool remembers devices at all: `DeviceConfigurationType` is
+    /// "the device-remembering configuration for a user pool", and "when you
+    /// provide a value for any property of `DeviceConfiguration`, you activate
+    /// the device remembering for the user pool" (this service's model), so a
+    /// pool that stores none has no device surface to serve.
+    pub fn remembers_devices(&self) -> bool {
+        self.device_configuration.is_some()
     }
 
     /// The names of this pool's groups `user` belongs to, in stored (name) order.
@@ -1302,10 +1382,15 @@ impl User {
         }
     }
 
-    /// This user's device keys in ascending order — the stable order a
-    /// paginated device listing indexes into.
+    /// The keys of this user's CONFIRMED devices in ascending order — the stable
+    /// order a paginated device listing indexes into.
+    ///
+    /// `ListDevices` lists "the devices that Amazon Cognito has registered to the
+    /// currently signed-in user" and `ConfirmDevice` "confirms a device that a
+    /// user wants to remember" (this service's model), so a device a sign-in only
+    /// minted a key for is not one a listing reports until it is confirmed.
     pub fn device_keys(&self) -> Vec<String> {
-        self.devices.keys().cloned().collect()
+        self.confirmed_device_keys()
     }
 
     /// Whether the stored password is a temporary one that has outlived
@@ -1319,11 +1404,74 @@ impl User {
             None => false,
         }
     }
+
+    /// Store `device` for this user, evicting the device authenticated longest
+    /// ago while the user is already at [`MAX_DEVICES_PER_USER`].
+    pub fn store_device(&mut self, device: Device) {
+        while self.devices.len() >= MAX_DEVICES_PER_USER {
+            let Some(oldest) = self
+                .devices
+                .iter()
+                .min_by_key(|(_, stored)| stored.last_authenticated_date)
+                .map(|(key, _)| key.clone())
+            else {
+                break;
+            };
+            self.devices.remove(&oldest);
+        }
+        self.devices.insert(device.device_key.clone(), device);
+    }
+
+    /// The stored device `device_key` names, once `ConfirmDevice` has confirmed
+    /// it. `GetDevice` "returns information about a remembered device" and
+    /// `ConfirmDevice` "confirms a device that a user wants to remember" (this
+    /// service's model), so a device a sign-in minted and nothing confirmed is
+    /// not yet a device of this user pool.
+    pub fn confirmed_device(&self, device_key: &str) -> Option<&Device> {
+        self.devices
+            .get(device_key)
+            .filter(|device| device.confirmed)
+    }
+
+    /// The stored device `device_key` names, mutably, once it is confirmed.
+    pub fn confirmed_device_mut(&mut self, device_key: &str) -> Option<&mut Device> {
+        self.devices
+            .get_mut(device_key)
+            .filter(|device| device.confirmed)
+    }
+
+    /// The stored device `device_key` names, once it is confirmed AND remembered.
+    ///
+    /// The self-service reader is narrower than the admin one: `GetDevice`
+    /// "returns information about a remembered device for the current user",
+    /// while `AdminGetDevice` "returns details for a user's device" and
+    /// `ListDevices` lists "the devices that Amazon Cognito has registered to the
+    /// currently signed-in user" (this service's model). So a device the user has
+    /// not (yet) chosen to remember is registered and listed, but is not a
+    /// remembered device.
+    pub fn remembered_device(&self, device_key: &str) -> Option<&Device> {
+        self.confirmed_device(device_key)
+            .filter(|device| device.remembered)
+    }
+
+    /// The keys of this user's confirmed devices, in ascending key order: the
+    /// stable order a listing of them pages over.
+    pub fn confirmed_device_keys(&self) -> Vec<String> {
+        self.devices
+            .iter()
+            .filter(|(_, device)| device.confirmed)
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
 }
 
-/// One device remembered for a user: the device a sign-in minted a `DeviceKey`
-/// for, as the device operations stored it, and what every later device read of
-/// this user renders.
+/// One device of a user: the device a sign-in minted a `DeviceKey` for, as the
+/// device operations stored it, and what every later device read of this user
+/// renders.
+///
+/// A sign-in on a pool that remembers devices stores one of these for a device
+/// it does not recognise; `ConfirmDevice` is what confirms it — which is what
+/// makes the user pool report it — and what decides whether it is remembered.
 #[derive(Debug, Clone)]
 pub struct Device {
     /// The key this device is known by (`DeviceKeyType`, len 1..55, pattern
@@ -1331,6 +1479,18 @@ pub struct Device {
     pub device_key: String,
     /// The device's attributes keyed by name, ordered so a read is stable.
     pub attributes: BTreeMap<String, String>,
+    /// The SRP verifier `ConfirmDevice` registered for this device, when it
+    /// carried one. Stored because it is what the device's own authentication
+    /// would check; no operation implemented here reads it yet.
+    pub secret_verifier: Option<DeviceSecretVerifierConfigType>,
+    /// Whether `ConfirmDevice` has confirmed this device, which is what makes it
+    /// a device the user pool reports.
+    pub confirmed: bool,
+    /// Whether this device is remembered, i.e. eligible for device
+    /// authentication: `ConfirmDevice` sets it unless the pool asks for the
+    /// user's own prompt first, and `UpdateDeviceStatus` is what the user's
+    /// answer reaches.
+    pub remembered: bool,
     pub create_date: SystemTime,
     pub last_modified_date: SystemTime,
     /// When this device last authenticated a sign-in, absent until one has:
@@ -1341,6 +1501,21 @@ pub struct Device {
 }
 
 impl Device {
+    /// The device a sign-in just stored: known to this user pool, not confirmed
+    /// and so not remembered, and last authenticated at that sign-in.
+    pub fn signed_in(device_key: String, now: SystemTime) -> Self {
+        Self {
+            device_key,
+            attributes: BTreeMap::new(),
+            secret_verifier: None,
+            confirmed: false,
+            remembered: false,
+            create_date: now,
+            last_modified_date: now,
+            last_authenticated_date: Some(now),
+        }
+    }
+
     /// The stored attributes as the modelled list, in name order.
     pub fn attribute_list(&self) -> Vec<AttributeType> {
         self.attributes
@@ -1363,6 +1538,15 @@ impl Device {
         }
     }
 }
+
+/// The `DeviceAttributes` name a device's `ConfirmDevice.DeviceName` — "A
+/// friendly name for the device" — is reported under.
+pub const DEVICE_NAME_ATTRIBUTE: &str = "device_name";
+
+/// `DeviceRememberedStatusType`'s value for a device that is remembered, i.e.
+/// eligible for device authentication; its only other value is the one for a
+/// device that is not (`crate::ops::types::DEVICE_REMEMBERED_STATUS_TYPE_VALUES`).
+pub const DEVICE_REMEMBERED_STATUS: &str = "remembered";
 
 /// Why an access token does not identify a signed-in user
 /// ([`ComAmazonawsCognitoidentityproviderAwscognitoidentityproviderserviceState::signed_in_user`]).
@@ -1808,6 +1992,7 @@ pub fn new_user_pool(name: String, region: &str, now: SystemTime) -> UserPool {
         // on AWS, so its key set is publishable before anything signs in. One
         // scalar multiplication, so creating a pool waits on nothing.
         signing_key: PoolSigningKey::generate(),
+        device_group_key: new_device_group_key(),
     }
 }
 
@@ -1874,6 +2059,35 @@ pub fn new_uuid() -> String {
 /// A fresh `Session` token: 64 characters, inside the modelled length 20..4096.
 fn new_session_token() -> String {
     random_token(64)
+}
+
+/// A fresh `DeviceKey` for a device of a pool in `region`: `<region>_<v4 UUID>`,
+/// which satisfies the modelled pattern `^[\w-]+_[0-9a-f-]+$` — `region` carries
+/// only the characters [`sanitize_region`] admits, and a v4 UUID is lowercase
+/// hex and hyphens.
+///
+/// The prefix is clamped to [`MAX_DEVICE_KEY_PREFIX`] so the key stays inside
+/// the modelled length 1..55 whatever region the pool was created in: the
+/// region comes from the caller's credential scope, so its length is not this
+/// service's to assume.
+fn new_device_key(region: &str) -> String {
+    let prefix = region
+        .char_indices()
+        .take_while(|(at, _)| *at < MAX_DEVICE_KEY_PREFIX)
+        .map(|(_, c)| c)
+        .collect::<String>();
+    format!("{prefix}_{}", new_uuid())
+}
+
+/// How many characters of the region a minted `DeviceKey` carries ahead of its
+/// separator: `DeviceKeyType`'s modelled length is 1..55 and the UUID after the
+/// separator is 36 characters long.
+const MAX_DEVICE_KEY_PREFIX: usize = 55 - 1 - 36;
+
+/// A fresh `DeviceGroupKey` for a user pool: 9 characters, inside the modelled
+/// length 0..131072.
+fn new_device_group_key() -> String {
+    random_token(9)
 }
 
 /// `len` random hex characters, drawn from v4 UUIDs (122 bits of entropy each)

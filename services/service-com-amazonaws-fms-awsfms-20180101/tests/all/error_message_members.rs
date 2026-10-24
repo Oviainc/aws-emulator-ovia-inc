@@ -118,8 +118,10 @@ fn policy_update(policy_id: &str) -> Value {
 }
 
 /// Not-found lookups that need NO administrator association: the two that are
-/// not-found precisely BECAUSE nothing is associated, and the policy-id lookups,
-/// which are decided by the policy store alone.
+/// not-found precisely BECAUSE nothing is associated, the policy-id lookups,
+/// which are decided by the policy store alone, and the resource-level tagging
+/// lookups, which name their target by the model's generic `ResourceArn` and are
+/// answered from that ARN alone.
 fn not_found_without_administrator() -> Vec<Row> {
     vec![
         Row {
@@ -133,6 +135,49 @@ fn not_found_without_administrator() -> Vec<Row> {
             operation: "ListAdminsManagingAccount",
             body: json!({}),
             lookup: None,
+        },
+        Row {
+            case: "ListTagsForResource with a policy ARN naming no policy",
+            operation: "ListTagsForResource",
+            body: json!({ "ResourceArn": unknown_arn("policy/5cd98ad7-93fc-4c5c-9faf-8cd2b03b2bb8") }),
+            lookup: Some(unknown_arn("policy/5cd98ad7-93fc-4c5c-9faf-8cd2b03b2bb8")),
+        },
+        Row {
+            case: "ListTagsForResource with a resource-set ARN naming nothing",
+            operation: "ListTagsForResource",
+            body: json!({ "ResourceArn": unknown_arn("resource-set/0123456789AbCdEfGhIjKl") }),
+            lookup: Some(unknown_arn("resource-set/0123456789AbCdEfGhIjKl")),
+        },
+        Row {
+            case: "TagResource with a policy ARN naming no policy",
+            operation: "TagResource",
+            body: json!({
+                "ResourceArn": unknown_arn("policy/5cd98ad7-93fc-4c5c-9faf-8cd2b03b2bb8"),
+                "TagList": [{ "Key": "stage", "Value": "test" }],
+            }),
+            lookup: Some(unknown_arn("policy/5cd98ad7-93fc-4c5c-9faf-8cd2b03b2bb8")),
+        },
+        Row {
+            case: "TagResource with an applications-list ARN naming nothing",
+            operation: "TagResource",
+            body: json!({
+                "ResourceArn": unknown_arn("applications-list/11111111-2222-3333-4444-555555555555"),
+                "TagList": [{ "Key": "owner", "Value": "team" }],
+            }),
+            lookup: Some(unknown_arn(
+                "applications-list/11111111-2222-3333-4444-555555555555",
+            )),
+        },
+        Row {
+            case: "UntagResource with a protocols-list ARN naming nothing",
+            operation: "UntagResource",
+            body: json!({
+                "ResourceArn": unknown_arn("protocols-list/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
+                "TagKeys": ["owner"],
+            }),
+            lookup: Some(unknown_arn(
+                "protocols-list/aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            )),
         },
         Row {
             case: "GetPolicy with an unknown policy id",
@@ -212,41 +257,6 @@ fn not_found_with_administrator() -> Vec<Row> {
             operation: "GetNotificationChannel",
             body: json!({}),
             lookup: None,
-        },
-        // The tagging operations are organisation-scoped too, so their
-        // ARN-keyed lookups only reach the store once an administrator is
-        // associated.
-        Row {
-            case: "ListTagsForResource with a policy ARN naming no policy",
-            operation: "ListTagsForResource",
-            body: json!({ "ResourceArn": unknown_arn("policy/5cd98ad7-93fc-4c5c-9faf-8cd2b03b2bb8") }),
-            lookup: Some(unknown_arn("policy/5cd98ad7-93fc-4c5c-9faf-8cd2b03b2bb8")),
-        },
-        Row {
-            case: "ListTagsForResource with a resource-set ARN naming nothing",
-            operation: "ListTagsForResource",
-            body: json!({ "ResourceArn": unknown_arn("resource-set/0123456789AbCdEfGhIjKl") }),
-            lookup: Some(unknown_arn("resource-set/0123456789AbCdEfGhIjKl")),
-        },
-        Row {
-            case: "TagResource with a policy ARN naming no policy",
-            operation: "TagResource",
-            body: json!({
-                "ResourceArn": unknown_arn("policy/5cd98ad7-93fc-4c5c-9faf-8cd2b03b2bb8"),
-                "TagList": [{ "Key": "stage", "Value": "test" }],
-            }),
-            lookup: Some(unknown_arn("policy/5cd98ad7-93fc-4c5c-9faf-8cd2b03b2bb8")),
-        },
-        Row {
-            case: "TagResource with an applications-list ARN naming nothing",
-            operation: "TagResource",
-            body: json!({
-                "ResourceArn": unknown_arn("applications-list/11111111-2222-3333-4444-555555555555"),
-                "TagList": [{ "Key": "owner", "Value": "team" }],
-            }),
-            lookup: Some(unknown_arn(
-                "applications-list/11111111-2222-3333-4444-555555555555",
-            )),
         },
     ]
 }
@@ -380,17 +390,6 @@ async fn the_authorization_refusal_carries_a_message_built_from_the_request() {
         // organisation-scoped as well, so each of them answers this same refusal.
         ("PutPolicy", json!({ "Policy": policy_update(UNKNOWN_POLICY_ID) })),
         ("ListPolicies", json!({})),
-        (
-            "ListTagsForResource",
-            json!({ "ResourceArn": unknown_arn("policy/5cd98ad7-93fc-4c5c-9faf-8cd2b03b2bb8") }),
-        ),
-        (
-            "TagResource",
-            json!({
-                "ResourceArn": unknown_arn("policy/5cd98ad7-93fc-4c5c-9faf-8cd2b03b2bb8"),
-                "TagList": [{ "Key": "stage", "Value": "test" }],
-            }),
-        ),
     ];
 
     let mut per_region: Vec<String> = Vec::new();

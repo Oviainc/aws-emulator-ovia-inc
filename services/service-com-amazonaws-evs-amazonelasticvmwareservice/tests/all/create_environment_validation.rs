@@ -56,7 +56,7 @@ fn hosts_with(extra: &Value, at: &[usize]) -> Value {
 
 /// How many environments the service holds, so a refusal can be shown to have
 /// created nothing.
-async fn environment_count(router: &MultiServiceRouter) -> usize {
+pub(crate) async fn environment_count(router: &MultiServiceRouter) -> usize {
     let (status, body) = call(router, "ListEnvironments", &json!({})).await;
     assert_eq!(status, 200, "list: expected 200, got {status} {body}");
     body["environmentSummaries"]
@@ -68,7 +68,7 @@ async fn environment_count(router: &MultiServiceRouter) -> usize {
 /// Assert the aggregated-refusal rule on one response: HTTP 400, a
 /// `ValidationException`, one `fieldList` entry per expected member, and a top-level
 /// `message` that joins exactly those entries' text.
-fn assert_aggregated_refusal(case: &str, status: u16, body: &Value, expected_members: &[&str]) {
+pub(crate) fn assert_aggregated_refusal(case: &str, status: u16, body: &Value, expected_members: &[&str]) {
     assert_eq!(
         status, 400,
         "case {case:?}: expected HTTP 400, got {status} ({}) {body}",
