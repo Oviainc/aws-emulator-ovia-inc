@@ -103,12 +103,15 @@ fn arn_forms() -> Vec<ArnForm> {
 /// The ARN this endpoint serves `baseline` under when the request is signed for `region`:
 /// that region, and an EMPTY account segment, because a baseline is service-managed data
 /// no account owns.
-fn served_arn_in(region: &str, baseline: &CatalogBaseline) -> String {
+///
+/// Shared with `crate::list_baselines`, which asserts the same served form over the
+/// listing `ListBaselines` reports, so the two suites cannot disagree about it.
+pub(crate) fn served_arn_in(region: &str, baseline: &CatalogBaseline) -> String {
     format!("arn:aws:controltower:{region}::baseline/{}", baseline.id)
 }
 
 /// [`served_arn_in`] for the region these tests sign for by default.
-fn served_arn(baseline: &CatalogBaseline) -> String {
+pub(crate) fn served_arn(baseline: &CatalogBaseline) -> String {
     served_arn_in(REQUEST_REGION, baseline)
 }
 

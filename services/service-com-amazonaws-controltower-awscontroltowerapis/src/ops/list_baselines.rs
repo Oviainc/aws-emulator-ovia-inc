@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListBaselines
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListBaselines`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListBaselines::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports this service's baseline catalog ([`crate::state::BASELINE_CATALOG`]) as
+//! `BaselineSummary` entries, in the catalog's own published order, paginated by
+//! `maxResults` and `nextToken`. REPORTING only, and the per-account store takes no part:
+//! a baseline is AWS-managed, so no call creates, changes or deletes one and the catalog
+//! is the same for every caller — the same reason `GetBaseline` neither locks nor writes
+//! the store. An entry's `arn` is therefore the ARN THIS endpoint serves that baseline
+//! under — the request's region and an EMPTY account segment, because a baseline is
+//! catalog data no account owns — built through [`crate::state::baseline_arn`], so every
+//! ARN this operation lists resolves through `GetBaseline` to the entry listed beside it.
+//!
+//! PAGINATION: the listing has one stable order, so the `nextToken` handed out is the
+//! index of the first entry a page did not return and a token is present exactly while
+//! entries remain. A token that is not such an index is `ValidationException` (400) — the
+//! model gives `nextToken` no pattern, so the empty string reaches this handler and is
+//! read as "from the start", the way an absent token is.
+//!
+//! AUTHORIZATION and THROTTLING are NOT emulated here, so the modelled
+//! `AccessDeniedException` (403) and `ThrottlingException` (429) are deliberately
+//! unreachable from this handler: the emulator verifies the request signature at its
+//! front door and models no per-principal policy or request budget.
+//!
+//! Implemented: this operation no longer answers HTTP 501.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +161,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListBaselines` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListBaselinesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListBaselines"))
+        // The per-account store takes no part: the baselines are AWS-managed, so the
+        // answer is the catalog, the same for every caller. Binding the engine keeps the
+        // constructor seam honest without locking a store this read has no reason to
+        // touch (see the module header, and `GetBaseline`, which resolves one id against
+        // the same catalog).
+        let _ = &self.engine;
+
+        let catalog = crate::state::BASELINE_CATALOG;
+
+        // The token is the index of the first entry the previous page did not return,
+        // over the catalog's published order — the one order this operation lists in.
+        let start = match input.next_token.as_deref() {
+            None | Some("") => 0usize,
+            Some(token) => match token.parse::<usize>() {
+                Ok(index) if index <= catalog.len() => index,
+                _ => {
+                    return Err(ListBaselinesErrorModeled::ValidationException(
+                        ValidationException {
+                            message: format!(
+                                "nextToken {token} was not returned by a previous \
+                                 ListBaselines call"
+                            ),
+                        },
+                    )
+                    .into())
+                }
+            },
+        };
+
+        // `maxResults` is modelled `range 4..100`, so the front door has already refused
+        // anything outside it; absent, every remaining entry is returned. The floor of 1
+        // keeps a page from being empty-but-tokened should the model ever widen the range
+        // downwards.
+        let limit = input
+            .max_results
+            .map_or(catalog.len(), |max| max.max(1) as usize);
+        let end = start.saturating_add(limit).min(catalog.len());
+
+        // The region the entries' ARNs are served in is the request's, read once rather
+        // than per entry.
+        let region = crate::state::request_region(ctx.parts());
+
+        let baselines: Vec<BaselineSummary> = catalog[start..end]
+            .iter()
+            .map(|baseline| BaselineSummary {
+                arn: crate::state::baseline_arn(&region, baseline.id),
+                name: baseline.name.to_string(),
+                description: Some(baseline.description.to_string()),
+            })
+            .collect();
+
+        Ok(ListBaselinesOutput {
+            baselines,
+            next_token: (end < catalog.len()).then(|| end.to_string()),
+        })
     }
 }
