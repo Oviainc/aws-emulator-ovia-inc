@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeCarrierGateways
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeCarrierGateways`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeCarrierGateways::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the account's carrier gateways out of [`crate::state`]: the whole store by
+//! default, or the subset the request's `CarrierGatewayIds` and `Filters` select, one
+//! `MaxResults`-sized page at a time. A reporting operation only — the one write it makes
+//! is the clock-owed `pending` -> `available` move already due on a gateway at the instant
+//! of the call.
 //!
 //! ## Shape of an operation
 //!
@@ -81,6 +78,14 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::borrow::Cow;
+use std::collections::HashSet;
+
+use crate::state::{
+    CompiledFilter, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUE_BYTES, MAX_FILTER_VALUES, MAX_FILTERS,
+    MAX_RESOURCE_IDS, MatchBudget,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -148,18 +153,268 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeCarrierGateways` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeCarrierGatewaysErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // `ctx` carries request metadata only; this operation reads none of it. The store
+        // is reached through the engine held on `self`.
+        let _ = ctx;
+
+        // "Checks whether you have the required permissions for the action, without
+        // actually making the request, and provides an error response. If you have the
+        // required permissions, the error response is DryRunOperation"
+        // (`DescribeCarrierGatewaysRequest$DryRun`). Every caller of this emulator is
+        // permitted, so a dry run reports that outcome and reads nothing.
+        if input.dry_run.unwrap_or(false) {
+            return Err(crate::state::dry_run_operation());
+        }
+
+        let state = crate::state::require_service_state(&*self.engine)?;
+
+        // "The token for the next page of results"
+        // (`DescribeCarrierGatewaysRequest$NextToken`) — anything else is refused rather
+        // than read as an id, and it is refused before any other member is looked at, so
+        // whether a bogus token is caught never depends on the rest of the request.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(
+                crate::state::decode_page_token(token)
+                    .ok_or_else(|| crate::state::invalid_pagination_token_for(token))?,
+            ),
+        };
+
+        // Matching cost is filters x values x value length x stored gateways, and the model
+        // bounds none of them (`FilterList` and `Filter$Values` carry no `@length`), so
+        // every request-controlled factor is capped HERE, before any work proportional to
+        // it is done and before the store is locked — the same ceilings the other describes
+        // of this crate enforce, from `crate::state`.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        if filters.len() > MAX_FILTERS {
+            return Err(crate::state::invalid_parameter_value(format!(
+                "The request carries {} filters, above the maximum of {MAX_FILTERS}",
+                filters.len()
+            )));
+        }
+        // A filter name this operation does not document is refused whether or not any
+        // gateway would have matched it, so an unsupported filter can never read as "no
+        // results". Each value is compiled into its pattern ONCE here, rather than
+        // recompiled for every candidate gateway.
+        let mut compiled: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            let canonical = canonical_filter_name(name).ok_or_else(|| {
+                crate::state::invalid_parameter_value(format!("The filter '{name}' is invalid"))
+            })?;
+            let values: &[String] = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so a value's size is bounded
+            // here too.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(crate::state::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            compiled.push(CompiledFilter::new(canonical.to_string(), values.to_vec()));
+        }
+
+        // "One or more carrier gateway IDs" (`$CarrierGatewayIds`) is caller-sized as well,
+        // and each entry is resolved against the store, so it is capped the way every other
+        // EC2 operation of this crate caps a resource-id list.
+        let requested: &[String] = input.carrier_gateway_ids.as_deref().unwrap_or_default();
+        if requested.len() > MAX_RESOURCE_IDS {
+            return Err(crate::state::invalid_parameter_value(format!(
+                "CarrierGatewayIds carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
+                requested.len()
+            )));
+        }
+
+        let mut store = state.lock();
+        // The clock-owed transition this read is allowed to apply, the same call
+        // `DescribeSubnets` makes: a gateway `CreateCarrierGateway` answered as `pending`
+        // is `available` once its due instant has passed, whether or not anybody called, so
+        // applying it here changes nothing a later caller would not have seen anyway.
+        store.materialize_due_transitions();
+
+        // An id that names no carrier gateway of the account is an error, not an absent
+        // row — the same answer `DescribeSubnets` gives for an unknown `SubnetId`.
+        if let Some(unknown) = requested
+            .iter()
+            .find(|id| !store.carrier_gateways.contains_key(id.as_str()))
+        {
+            return Err(crate::state::invalid_carrier_gateway_id_not_found(unknown));
+        }
+        // A set, so narrowing below costs one lookup per gateway rather than a scan of the
+        // asked-for list.
+        let wanted: HashSet<&str> = requested.iter().map(String::as_str).collect();
+
+        // "Describes one or more of your carrier gateways": `CarrierGatewayIds` narrows the
+        // store to the ids named, and every filter must then hold ("If you specify multiple
+        // filters, the filters are joined with an AND" — `Filter`).
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeCarrierGateways"))
+        // Every comparison is charged to ONE budget, so the product of stored gateways,
+        // filters, values and value length is bounded however the caller combines them —
+        // which is also what bounds how long this holds the store's lock.
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<&CarrierGateway> = Vec::new();
+        for carrier_gateway in store.carrier_gateways.values() {
+            if budget.exhausted() {
+                break;
+            }
+            let id = carrier_gateway.carrier_gateway_id.as_deref().unwrap_or_default();
+            if !wanted.is_empty() && !wanted.contains(id) {
+                continue;
+            }
+            if crate::state::matches_every_filter(&compiled, &mut budget, &|name| {
+                filter_values(carrier_gateway, name)
+            }) {
+                selected.push(carrier_gateway);
+            }
+        }
+        // A spent budget means the answer is INCOMPLETE, which is not something to report
+        // as a result: the request asked for more filtering than one call will do, and is
+        // told so.
+        if budget.exhausted() {
+            return Err(crate::scaffolded::Scaffolded::request_limit_exceeded(
+                format!(
+                    "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                     comparisons to evaluate; narrow them or page with MaxResults"
+                ),
+            ));
+        }
+
+        // Page in `CarrierGatewayId` order, which the cursor below names a position in. The
+        // store is an ordered map, so its iteration order already satisfies this sort; doing
+        // it here establishes the invariant the cursor depends on at the point of use rather
+        // than inheriting it from the container `crate::state` happens to hold.
+        selected.sort_by(|left, right| left.carrier_gateway_id.cmp(&right.carrier_gateway_id));
+
+        // That order is both the stable paging order and the cursor, so a token naming the
+        // id the next page starts at always advances.
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => selected.partition_point(|carrier_gateway| {
+                let id = carrier_gateway.carrier_gateway_id.as_deref().unwrap_or_default();
+                id < cursor
+            }),
+        };
+        let page = selected.get(from..).unwrap_or_default();
+
+        // "The maximum number of results to return with a single call"
+        // (`DescribeCarrierGatewaysRequest$MaxResults`). A request that names none gets the
+        // largest page the model publishes, so the `NextToken` path below behaves the same
+        // whether or not a page size was asked for. The model's `range 5..1000` has already
+        // refused anything outside it, so the only value that cannot convert is one the
+        // boundary validator would have rejected.
+        let limit = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(DEFAULT_MAX_RESULTS);
+
+        // "This value is null when there are no more results to return"
+        // (`DescribeCarrierGatewaysResult$NextToken`): a token only when a gateway follows
+        // this page.
+        let next_token = page
+            .get(limit)
+            .and_then(|carrier_gateway| carrier_gateway.carrier_gateway_id.as_deref())
+            .map(crate::state::encode_page_token);
+
+        Ok(DescribeCarrierGatewaysOutput {
+            carrier_gateways: Some(
+                page.iter()
+                    .take(limit)
+                    .map(|carrier_gateway| (*carrier_gateway).clone())
+                    .collect(),
+            ),
+            next_token,
+        })
+    }
+}
+
+/// The page size a request that names no `MaxResults` gets: the largest the model publishes
+/// (`CarrierGatewayMaxResults`, `range 5..1000`), which is also the most EC2 returns in one
+/// page.
+const DEFAULT_MAX_RESULTS: usize = 1000;
+
+/// The filter names this operation documents, from
+/// `DescribeCarrierGatewaysRequest$Filters`:
+///
+/// ```text
+/// smithy_query(query="doc",shape="DescribeCarrierGatewaysRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// `tag:<key>` is the one name with a variable part, so it is matched by prefix rather than
+/// listed here. Every entry must be answered by [`filter_values`].
+const CARRIER_GATEWAY_FILTERS: [&str; 5] = [
+    "carrier-gateway-id",
+    "owner-id",
+    "state",
+    "tag-key",
+    "vpc-id",
+];
+
+/// The prefix of the tag filter: "Use the tag key in the filter name and the tag value as
+/// the filter value" (`DescribeCarrierGatewaysRequest$Filters`).
+const TAG_FILTER_PREFIX: &str = "tag:";
+
+/// The name [`filter_values`] answers for the filter the request called `name`, or `None`
+/// when this operation documents no such filter.
+///
+/// "Filter names are case-sensitive" (`Filter$Name`), so every comparison is exact — and a
+/// `tag:` prefix with no key names no tag, so it is as undocumented as any other
+/// misspelling. The `tag:<key>` family keeps its whole name, the key being part of what it
+/// selects on.
+fn canonical_filter_name(name: &str) -> Option<&str> {
+    if name
+        .strip_prefix(TAG_FILTER_PREFIX)
+        .is_some_and(|key| !key.is_empty())
+    {
+        return Some(name);
+    }
+    CARRIER_GATEWAY_FILTERS.contains(&name).then_some(name)
+}
+
+/// The values the EC2 filter `name` compares against this carrier gateway.
+///
+/// A filter naming an attribute this gateway does not carry compares against NO values, so
+/// it selects nothing rather than everything. `name` is a name [`canonical_filter_name`]
+/// resolved.
+fn filter_values<'a>(carrier_gateway: &'a CarrierGateway, name: &str) -> Vec<Cow<'a, str>> {
+    if let Some(key) = name.strip_prefix(TAG_FILTER_PREFIX) {
+        return carrier_gateway
+            .tags
+            .iter()
+            .flatten()
+            .filter(|tag| tag.key.as_deref() == Some(key))
+            .filter_map(|tag| tag.value.as_deref().map(Cow::Borrowed))
+            .collect();
+    }
+
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    match name {
+        "carrier-gateway-id" => text(carrier_gateway.carrier_gateway_id.as_deref()),
+        "owner-id" => text(carrier_gateway.owner_id.as_deref()),
+        "state" => text(carrier_gateway.state.as_deref()),
+        "tag-key" => carrier_gateway
+            .tags
+            .iter()
+            .flatten()
+            .filter_map(|tag| tag.key.as_deref().map(Cow::Borrowed))
+            .collect(),
+        "vpc-id" => text(carrier_gateway.vpc_id.as_deref()),
+        // Unreachable: `canonical_filter_name` has already refused every other name. An
+        // undefined name compares against nothing, so it could never widen a result even
+        // if that check were bypassed.
+        _ => Vec::new(),
     }
 }
