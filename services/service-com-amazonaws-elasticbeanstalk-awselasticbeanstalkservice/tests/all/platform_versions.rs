@@ -23,13 +23,20 @@ use std::collections::BTreeMap;
 
 use crate::lifecycle::{elements, Answer, Emulator, TEST_REGION};
 
-/// The documented value set of `PlatformSummary$PlatformBranchLifecycleState`:
-/// "Possible values: `beta` | `supported` | `deprecated` | `retired`".
-const BRANCH_LIFECYCLE_STATES: &[&str] = &["beta", "supported", "deprecated", "retired"];
+/// The value set of `PlatformBranchLifecycleState` as a PLATFORM VERSION reports
+/// it, from `PlatformDescription$PlatformBranchLifecycleState`: "Possible
+/// values: `Beta` | `Supported` | `Deprecated` | `Retired`" — the capitalized
+/// spelling the recorded platform-version responses carry. (`PlatformSummary`'s
+/// own doc lists the same four in lower case; the two cannot both describe one
+/// attribute, and the recording settles it. `ListPlatformBranches` reports its
+/// own `LifecycleState` member, which is that suite's subject, not this one's.)
+const BRANCH_LIFECYCLE_STATES: &[&str] = &["Beta", "Supported", "Deprecated", "Retired"];
 
-/// The documented value set of `PlatformSummary$PlatformLifecycleState`:
-/// "Possible values: `recommended` | empty".
-const PLATFORM_LIFECYCLE_STATES: &[&str] = &["recommended", ""];
+/// The value set of `PlatformLifecycleState`, from
+/// `PlatformDescription$PlatformLifecycleState`: "Possible values:
+/// `Recommended` | `null`" — again the spelling the recorded responses carry,
+/// where `PlatformSummary`'s doc spells it `recommended`.
+const PLATFORM_LIFECYCLE_STATES: &[&str] = &["Recommended", ""];
 
 /// The documented `PlatformStatus` values (the model's `PlatformStatus` enum).
 const PLATFORM_STATUS_VALUES: &[&str] = &["Creating", "Failed", "Ready", "Deleting", "Deleted"];
@@ -39,9 +46,17 @@ const PLATFORM_STATUS_VALUES: &[&str] = &["Creating", "Failed", "Ready", "Deleti
 /// `WebServer/Standard` | `Worker/SQS/HTTP`".
 const SUPPORTED_TIERS: &[&str] = &["WebServer/Standard", "Worker/SQS/HTTP"];
 
-/// The documented `SupportedAddon` values, from `PlatformFilter$Values`:
-/// "`Log/S3` | `Monitoring/Healthd` | `WorkerDaemon/SQSD`".
-const SUPPORTED_ADDONS: &[&str] = &["Log/S3", "Monitoring/Healthd", "WorkerDaemon/SQSD"];
+/// The `SupportedAddon` values a published version can carry: the three
+/// `PlatformFilter$Values` documents ("`Log/S3` | `Monitoring/Healthd` |
+/// `WorkerDaemon/SQSD`" — a list the model introduces as covering only SOME
+/// attributes) plus `Log/CloudWatch`, which the recorded responses carry beside
+/// them.
+const SUPPORTED_ADDONS: &[&str] = &[
+    "Log/CloudWatch",
+    "Log/S3",
+    "Monitoring/Healthd",
+    "WorkerDaemon/SQSD",
+];
 
 /// One `PlatformSummary` as the response carries it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,7 +230,7 @@ async fn every_reported_platform_version_is_a_well_formed_summary() {
         );
         assert!(
             PLATFORM_LIFECYCLE_STATES.contains(&summary.lifecycle_state.as_str()),
-            "case {case:?}: PlatformLifecycleState must be \"recommended\" or empty, got {:?}",
+            "case {case:?}: PlatformLifecycleState must be \"Recommended\" or empty, got {:?}",
             summary.lifecycle_state
         );
         assert!(
@@ -243,6 +258,26 @@ async fn every_reported_platform_version_is_a_well_formed_summary() {
                 .iter()
                 .all(|addon| SUPPORTED_ADDONS.contains(&addon.as_str())),
             "case {case:?}: SupportedAddonList must be documented addons, got {:?}",
+            summary.addons
+        );
+        // A published version states its category and the operating system it
+        // runs on: both are catalog data, not something a platform definition
+        // archive has to be read for.
+        assert!(
+            !summary.category.is_empty(),
+            "case {case:?}: expected a PlatformCategory, got {:?}",
+            summary.category
+        );
+        assert!(
+            !summary.operating_system_name.is_empty()
+                && !summary.operating_system_version.is_empty(),
+            "case {case:?}: expected an operating system name and version, got {:?} and {:?}",
+            summary.operating_system_name,
+            summary.operating_system_version
+        );
+        assert!(
+            !summary.addons.is_empty(),
+            "case {case:?}: expected the add-ons the version supports, got {:?}",
             summary.addons
         );
     }
@@ -286,7 +321,7 @@ async fn the_catalogue_spans_branches_versions_and_lifecycle_states() {
         in_branch.sort_by(|left, right| version_cmp(&right.version, &left.version));
         let recommended: Vec<&str> = in_branch
             .iter()
-            .filter(|summary| summary.lifecycle_state == "recommended")
+            .filter(|summary| summary.lifecycle_state == "Recommended")
             .map(|summary| summary.version.as_str())
             .collect();
         assert_eq!(
@@ -346,24 +381,32 @@ async fn every_version_agrees_with_the_branch_list_platform_branches_reports() {
                 reported.keys().collect::<Vec<&String>>()
             );
         };
-        assert_eq!(
-            &summary.branch_lifecycle_state, lifecycle_state,
-            "case {case:?}: PlatformBranchLifecycleState must be the branch's own state"
+        // One life-cycle state per branch, whichever operation is asked: the
+        // platform-version surface reports it capitalized
+        // (`PlatformDescription$PlatformBranchLifecycleState`) and
+        // `ListPlatformBranches` reports its own `LifecycleState` member, so the
+        // two must name the same state rather than carry the same text.
+        assert!(
+            summary
+                .branch_lifecycle_state
+                .eq_ignore_ascii_case(lifecycle_state),
+            "case {case:?}: PlatformBranchLifecycleState must be the branch's own state, got \
+             {:?} against {lifecycle_state:?}",
+            summary.branch_lifecycle_state
         );
         assert_eq!(
             &summary.tiers, tiers,
             "case {case:?}: a version runs exactly the tiers its branch supports"
         );
-        // The worker-daemon addon follows the worker tier wherever a summary
-        // reports addons at all; the published catalog reports none, because the
-        // addons a platform carries are read off its definition archive.
-        assert!(
-            summary.addons.is_empty()
-                || summary
-                    .addons
-                    .iter()
-                    .any(|addon| addon == "WorkerDaemon/SQSD")
-                    == tiers.iter().any(|tier| tier == "Worker/SQS/HTTP"),
+        // The worker-daemon addon follows the worker tier: it is the add-on that
+        // runs a WORKER environment, so a version whose branch supports no
+        // worker tier does not carry it and every other version does.
+        assert_eq!(
+            summary
+                .addons
+                .iter()
+                .any(|addon| addon == "WorkerDaemon/SQSD"),
+            tiers.iter().any(|tier| tier == "Worker/SQS/HTTP"),
             "case {case:?}: the worker daemon addon must follow the worker tier, got {:?} for \
              tiers {tiers:?}",
             summary.addons
@@ -456,15 +499,39 @@ async fn a_filter_term_selects_by_the_attribute_its_type_names() {
             holds: |summary| summary.status != "Ready",
             narrows: true,
         },
-        // No operator: "Type Operator Values[1]" with the equality test.
+        // No operator: "Type Operator Values[1]" with the equality test. The
+        // model documents the filter VALUE for this attribute in lower case
+        // (`PlatformFilter$Values`: "PlatformLifecycleState: recommended") while
+        // the state is REPORTED capitalized, so both spellings name the one
+        // state.
         FilterCase {
-            case: "PlatformLifecycleState recommended, operator defaulted",
+            case: "PlatformLifecycleState Recommended, operator defaulted",
             params: &[
                 ("Filters.member.1.Type", "PlatformLifecycleState"),
+                ("Filters.member.1.Values.member.1", "Recommended"),
+            ],
+            holds: |summary| summary.lifecycle_state == "Recommended",
+            narrows: false,
+        },
+        FilterCase {
+            case: "PlatformLifecycleState recommended, the documented filter spelling",
+            params: &[
+                ("Filters.member.1.Type", "PlatformLifecycleState"),
+                ("Filters.member.1.Operator", "="),
                 ("Filters.member.1.Values.member.1", "recommended"),
             ],
-            holds: |summary| summary.lifecycle_state == "recommended",
+            holds: |summary| summary.lifecycle_state == "Recommended",
             narrows: false,
+        },
+        FilterCase {
+            case: "PlatformLifecycleState != recommended",
+            params: &[
+                ("Filters.member.1.Type", "PlatformLifecycleState"),
+                ("Filters.member.1.Operator", "!="),
+                ("Filters.member.1.Values.member.1", "recommended"),
+            ],
+            holds: |summary| summary.lifecycle_state != "Recommended",
+            narrows: true,
         },
         FilterCase {
             case: "PlatformName contains Python",
@@ -555,6 +622,10 @@ async fn a_filter_term_selects_by_the_attribute_its_type_names() {
             holds: |summary| summary.tiers.iter().any(|tier| tier == "WebServer/Standard"),
             narrows: false,
         },
+        // Every published version reports enhanced health, and the worker daemon
+        // is an add-on only of a version whose branch runs the worker tier — and
+        // the catalogue holds a branch that runs only the web-server tier — so
+        // the first term holds everywhere and the second narrows.
         FilterCase {
             case: "SupportedAddon = Monitoring/Healthd",
             params: &[
@@ -563,6 +634,16 @@ async fn a_filter_term_selects_by_the_attribute_its_type_names() {
                 ("Filters.member.1.Values.member.1", "Monitoring/Healthd"),
             ],
             holds: |summary| summary.addons.iter().any(|addon| addon == "Monitoring/Healthd"),
+            narrows: false,
+        },
+        FilterCase {
+            case: "SupportedAddon = WorkerDaemon/SQSD",
+            params: &[
+                ("Filters.member.1.Type", "SupportedAddon"),
+                ("Filters.member.1.Operator", "="),
+                ("Filters.member.1.Values.member.1", "WorkerDaemon/SQSD"),
+            ],
+            holds: |summary| summary.addons.iter().any(|addon| addon == "WorkerDaemon/SQSD"),
             narrows: true,
         },
         FilterCase {
@@ -570,9 +651,9 @@ async fn a_filter_term_selects_by_the_attribute_its_type_names() {
             params: &[
                 ("Filters.member.1.Type", "SupportedAddon"),
                 ("Filters.member.1.Operator", "="),
-                ("Filters.member.1.Values.member.1", "Log/CloudWatch"),
+                ("Filters.member.1.Values.member.1", "Log/Nowhere"),
             ],
-            holds: |summary| summary.addons.iter().any(|addon| addon == "Log/CloudWatch"),
+            holds: |summary| summary.addons.iter().any(|addon| addon == "Log/Nowhere"),
             narrows: true,
         },
         FilterCase {
@@ -627,10 +708,11 @@ async fn a_filter_term_selects_by_the_attribute_its_type_names() {
             holds: |summary| version_cmp(&summary.version, "0.0.1") == Ordering::Less,
             narrows: true,
         },
-        // `ProgrammingLanguageName` is not a member of `PlatformSummary` and the
-        // published catalog states no language for a version (the languages a
-        // platform runs are read off its definition archive), so an `=` term on
-        // it selects nothing and a `!=` term selects everything.
+        // `ProgrammingLanguageName` is the one filter attribute `PlatformSummary`
+        // models no member for: the languages a published version runs are the
+        // catalogue's, and a term on them is answered from it — so an `=` term on
+        // a language the catalogue publishes selects exactly the versions running
+        // it, and one on a language it does not publish selects nothing.
         FilterCase {
             case: "ProgrammingLanguageName = Python",
             params: &[
@@ -638,18 +720,18 @@ async fn a_filter_term_selects_by_the_attribute_its_type_names() {
                 ("Filters.member.1.Operator", "="),
                 ("Filters.member.1.Values.member.1", "Python"),
             ],
-            holds: |_summary| false,
+            holds: |summary| summary.category == "Python",
             narrows: true,
         },
         FilterCase {
-            case: "ProgrammingLanguageName != Python",
+            case: "ProgrammingLanguageName = a language no platform runs",
             params: &[
                 ("Filters.member.1.Type", "ProgrammingLanguageName"),
-                ("Filters.member.1.Operator", "!="),
-                ("Filters.member.1.Values.member.1", "Python"),
+                ("Filters.member.1.Operator", "="),
+                ("Filters.member.1.Values.member.1", "COBOL"),
             ],
-            holds: |_summary| true,
-            narrows: false,
+            holds: |_summary| false,
+            narrows: true,
         },
     ];
 
