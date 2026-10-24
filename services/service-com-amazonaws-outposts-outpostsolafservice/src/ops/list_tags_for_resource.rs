@@ -161,27 +161,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let store = state.lock();
         // Tags live on the resource they were applied to, so this reads them off
-        // that stored record — one arm per resource kind this service persists.
-        // Any other kind is a resource this store cannot hold, which is the
-        // not-found error this operation models; its body echoes the identifier
-        // member and the value as supplied, as this API's not-found bodies do.
-        let tags = match resource_type.as_str() {
-            "site" => store
-                .sites
-                .get(&resource_id)
-                .map(|record| record.site.tags.clone()),
-            "outpost" => store
-                .outposts
-                .get(&resource_id)
-                .map(|record| record.outpost.tags.clone()),
-            _ => None,
-        }
-        .ok_or_else(|| {
-            ListTagsForResourceErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!("resourceArn={}", input.resource_arn)),
-            })
-        })?;
+        // that stored record, through the one place that knows which resource kinds
+        // this store holds tags for. Any other kind is a resource this store cannot
+        // hold, which is the not-found error this operation models; its body echoes
+        // the identifier member and the value as supplied, as this API's not-found
+        // bodies do.
+        let tags = store
+            .tags(&resource_type, &resource_id)
+            .ok_or_else(|| {
+                ListTagsForResourceErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::identifier_not_found(
+                        crate::state::RESOURCE_ARN_MEMBER,
+                        &input.resource_arn,
+                    )),
+                })
+            })?;
 
-        Ok(ListTagsForResourceOutput { tags })
+        Ok(ListTagsForResourceOutput {
+            tags: crate::state::tags_member(&tags),
+        })
     }
 }

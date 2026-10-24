@@ -29,6 +29,18 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// it (`arnNamespace: outposts`) — the third segment of every ARN it mints.
 pub const ARN_NAMESPACE: &str = "outposts";
 
+/// The ARN resource TYPE a site's ARN carries (`…:site/os-…`), as the modelled
+/// `SiteArn` pattern spells it.
+///
+/// Minting an ARN ([`site_arn`]) and reading one back ([`resource_arn_parts`])
+/// name the kind through this one constant, so the two can never disagree about
+/// what a site's ARN looks like.
+pub const SITE_RESOURCE_TYPE: &str = "site";
+
+/// The ARN resource TYPE an Outpost's ARN carries (`…:outpost/op-…`), from the
+/// modelled `OutpostArn` pattern. See [`SITE_RESOURCE_TYPE`].
+pub const OUTPOST_RESOURCE_TYPE: &str = "outpost";
+
 /// The `LifeCycleStatus` a freshly created Outpost carries.
 ///
 /// AWS answers `CreateOutpost` with an Outpost that is still being provisioned, so
@@ -428,6 +440,47 @@ impl ComAmazonawsOutpostsOutpostsolafserviceState {
             .find(|task| task.order_id.as_deref() == Some(order_id) && task.is_active())
     }
 
+    /// The tag map of the resource an Outposts resource ARN names, or `None` when
+    /// this store holds no such resource.
+    ///
+    /// A resource's tags live ON that resource, so every tagging operation reads
+    /// and writes them through the stored record the ARN names — and it does so
+    /// through this one place, so which resource kinds are taggable cannot differ
+    /// between the operations that report tags and the ones that change them. A
+    /// kind this store does not hold is `None`, which each of them answers as the
+    /// not-found error it models.
+    pub fn tags(&self, resource_type: &str, resource_id: &str) -> Option<HashMap<String, String>> {
+        let tags = match resource_type {
+            SITE_RESOURCE_TYPE => &self.sites.get(resource_id)?.site.tags,
+            OUTPOST_RESOURCE_TYPE => &self.outposts.get(resource_id)?.outpost.tags,
+            _ => return None,
+        };
+        // `None` from this function means NO SUCH RESOURCE. A resource whose
+        // record carries no map carries no tags, which is an EMPTY map (see
+        // [`tags_member`]), so the two cannot be confused.
+        Some(tags.clone().unwrap_or_default())
+    }
+
+    /// The same tag map, to CHANGE: what `TagResource` writes into. See
+    /// [`Self::tags`].
+    ///
+    /// The map is materialised when the stored record carries none, so a tag can
+    /// be added to a resource created without any. That is not a change anybody
+    /// can observe: [`tags_member`] already reports a resource with no tags as an
+    /// empty map either way.
+    pub fn tags_mut(
+        &mut self,
+        resource_type: &str,
+        resource_id: &str,
+    ) -> Option<&mut HashMap<String, String>> {
+        let tags = match resource_type {
+            SITE_RESOURCE_TYPE => &mut self.sites.get_mut(resource_id)?.site.tags,
+            OUTPOST_RESOURCE_TYPE => &mut self.outposts.get_mut(resource_id)?.outpost.tags,
+            _ => return None,
+        };
+        Some(tags.get_or_insert_with(HashMap::new))
+    }
+
     /// Mint a fresh resource id of the form `<prefix>-<17 lowercase hex chars>`,
     /// and return it with the creation sequence to record on the new resource.
     ///
@@ -483,12 +536,20 @@ pub fn request_region(parts: &http::request::Parts) -> String {
 
 /// A `SiteArn`: `arn:aws:outposts:<region>:<account>:site/os-…`.
 pub fn site_arn(region: &str, site_id: &str) -> String {
-    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("site/{site_id}"))
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("{SITE_RESOURCE_TYPE}/{site_id}"),
+    )
 }
 
 /// An `OutpostArn`: `arn:aws:outposts:<region>:<account>:outpost/op-…`.
 pub fn outpost_arn(region: &str, outpost_id: &str) -> String {
-    ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("outpost/{outpost_id}"))
+    ::engine::emulator_arn(
+        ARN_NAMESPACE,
+        region,
+        &format!("{OUTPOST_RESOURCE_TYPE}/{outpost_id}"),
+    )
 }
 
 /// The bare resource id an Outposts identifier names, whether it arrived as the id
@@ -894,6 +955,28 @@ pub const QUOTE_IDENTIFIER_MEMBER: &str = "quoteIdentifier";
 /// it. See [`SITE_ID_MEMBER`].
 pub const OUTPOST_IDENTIFIER_MEMBER: &str = "outpostIdentifier";
 
+/// The validation-path name of the `ResourceArn` input member every tagging
+/// operation names a resource by. See [`SITE_ID_MEMBER`].
+pub const RESOURCE_ARN_MEMBER: &str = "resourceArn";
+
+/// The validation-path name of the `Tags` input member `TagResource` carries.
+/// See [`SITE_ID_MEMBER`].
+pub const TAGS_MEMBER: &str = "tags";
+
+/// How many entries the modelled `TagMap` holds (`@length(min: 1, max: 50)`).
+///
+/// It is the bound on a RESOURCE's tag map and not only on one request's: the
+/// tags a resource carries are reported as that same `TagMap`
+/// (`ListTagsForResource$Tags`, `Site$Tags`, `Outpost$Tags`), so a resource
+/// holding more than this could not be reported within the model at all. A tag
+/// change that would take a resource past it is therefore refused.
+pub const TAG_MAP_MAX: i64 = 50;
+
+/// The `@pattern` the model declares on `Arn`, the shape every tagging
+/// operation's `ResourceArn` targets, verbatim. See [`SITE_ID_PATTERN`].
+pub const RESOURCE_ARN_PATTERN: &str =
+    r"^(arn:aws([a-z-]+)?:outposts:[a-z\d-]+:\d{12}:([a-z\d-]+)/)[a-z]{2,8}-[a-f0-9]{17}$";
+
 /// The `@pattern` the model declares on `SiteId`, verbatim: a report names a
 /// pattern exactly as the model spells it, anchors included.
 pub const SITE_ID_PATTERN: &str =
@@ -1042,6 +1125,28 @@ pub fn outpost_identifier_pattern_report() -> String {
         OUTPOST_IDENTIFIER_MEMBER,
         ViolationKind::Pattern(OUTPOST_IDENTIFIER_PATTERN.to_string()),
     )
+}
+
+/// The report a `ResourceArn` that is not an Outposts resource ARN states for a
+/// handler that reads that ARN itself.
+///
+/// The boundary refuses such a value first, with the ARN-syntax code this service
+/// names for it (`EmulatedService::override_refusal`), so this is the modelled
+/// fallback a tagging handler states through the errors ITS model carries. See
+/// [`site_id_pattern_report`].
+pub fn resource_arn_pattern_report() -> String {
+    constraint_report(
+        RESOURCE_ARN_MEMBER,
+        ViolationKind::Pattern(RESOURCE_ARN_PATTERN.to_string()),
+    )
+}
+
+/// The report a tag change that would take a resource past [`TAG_MAP_MAX`]
+/// states: the modelled `TagMap` maximum, named on the member the tags arrived
+/// in, worded by the same rule as every other constraint this service reports and
+/// rendering none of the tags themselves.
+pub fn tag_map_limit_report() -> String {
+    constraint_report(TAGS_MEMBER, ViolationKind::MaxLength(TAG_MAP_MAX))
 }
 
 /// The report an unusable pagination token states.

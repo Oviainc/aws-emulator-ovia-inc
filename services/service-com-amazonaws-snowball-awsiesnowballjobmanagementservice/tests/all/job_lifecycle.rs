@@ -20,6 +20,9 @@ use serde_json::{json, Value};
 // the ceiling case cannot drift from the bound it exercises. Nothing in this API deletes
 // an address or a job, so each create is refused once its store is full.
 use service_com_amazonaws_snowball_awsiesnowballjobmanagementservice::ops::create_address::DEFAULT_ADDRESS_TYPE;
+use service_com_amazonaws_snowball_awsiesnowballjobmanagementservice::ops::create_job::{
+    EXPORT_JOB_TYPE, JOB_PARTS_PER_EXPORT_JOB,
+};
 use service_com_amazonaws_snowball_awsiesnowballjobmanagementservice::ops::types::JOB_STATE_VALUES;
 use service_com_amazonaws_snowball_awsiesnowballjobmanagementservice::state::{
     JobState, MAX_STORED_ADDRESSES, MAX_STORED_JOBS,
@@ -657,7 +660,11 @@ async fn describe_job_reports_the_job_create_job_stored() {
 
         let created = ok(&router, "CreateJob", submitted.clone(), case).await;
         let job_id = string(&created, "JobId", case);
-        assert_prefixed_uuid(&job_id, "JID", case);
+        // An EXPORT create mints the MAIN job of an export order, whose id carries the
+        // `MID` form of the modelled `JobId` pattern; every other create mints one plain
+        // job, in the `JID` form. The whole structure is `export_job_parts`' subject.
+        let is_export = submitted.get("JobType").and_then(Value::as_str) == Some(EXPORT_JOB_TYPE);
+        assert_prefixed_uuid(&job_id, if is_export { "MID" } else { "JID" }, case);
         assert!(
             minted.insert(job_id.clone()),
             "case {case:?}: CreateJob minted {job_id}, which it had minted before"
@@ -681,12 +688,24 @@ async fn describe_job_reports_the_job_create_job_stored() {
             "case {case:?}: expected a CreationDate after 2020, got {creation_date}"
         );
 
-        // A job with no sub-jobs reports no `SubJobMetadata` member at all.
+        // An export order's main job reports its job parts; a job with no parts reports
+        // no `SubJobMetadata` member at all.
         let sub_jobs = described.get("SubJobMetadata").unwrap_or(&Value::Null);
-        assert!(
-            sub_jobs.is_null(),
-            "case {case:?}: expected no SubJobMetadata, got {sub_jobs}"
-        );
+        if is_export {
+            let parts = sub_jobs.as_array().unwrap_or_else(|| {
+                panic!("case {case:?}: expected SubJobMetadata on an export job, got {described}")
+            });
+            assert_eq!(
+                parts.len(),
+                JOB_PARTS_PER_EXPORT_JOB,
+                "case {case:?}: expected {JOB_PARTS_PER_EXPORT_JOB} job part(s), got {described}"
+            );
+        } else {
+            assert!(
+                sub_jobs.is_null(),
+                "case {case:?}: expected no SubJobMetadata, got {sub_jobs}"
+            );
+        }
 
         // Reading does not change what the next caller sees.
         let described_again = ok(&router, "DescribeJob", json!({ "JobId": job_id }), case).await;
@@ -806,6 +825,30 @@ async fn router_with_jobs(count: usize) -> (MultiServiceRouter, Vec<String>) {
     (router, job_ids)
 }
 
+/// The jobs `ListJobs` must report for the orders `created`, in order: each order's own
+/// job — paired with whether it is a main job — followed by that order's job parts, which
+/// `DescribeJob` on the order reports.
+async fn expected_listing(
+    router: &MultiServiceRouter,
+    created: &[String],
+) -> Vec<(String, bool)> {
+    let mut expected: Vec<(String, bool)> = Vec::new();
+    for job_id in created {
+        let case = format!("the order {job_id}");
+        let described = ok(router, "DescribeJob", json!({ "JobId": job_id }), &case).await;
+        let parts = described
+            .get("SubJobMetadata")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        expected.push((job_id.clone(), !parts.is_empty()));
+        for part in &parts {
+            expected.push((string(part, "JobId", &case), false));
+        }
+    }
+    expected
+}
+
 /// Walk `ListJobs` with `max_results` as the page size, returning the ids in the order
 /// the pages reported them.
 async fn page_through(
@@ -867,6 +910,18 @@ async fn page_through(
 async fn list_jobs_pages_over_every_stored_job_in_creation_order() {
     let total = 5usize;
     let (router, created) = router_with_jobs(total).await;
+    // The stored jobs are the orders plus the job parts of the export orders among them,
+    // each of which `ListJobs` pages over in its own right.
+    let expected: Vec<String> = expected_listing(&router, &created)
+        .await
+        .into_iter()
+        .map(|(job_id, _)| job_id)
+        .collect();
+    assert!(
+        expected.len() > created.len(),
+        "expected the export orders among {total} jobs to add job parts to the listing, \
+         got {expected:?}"
+    );
 
     // Each row is a page size: the published bounds, sizes that divide the list and
     // sizes that do not, and a request that declares none.
@@ -880,9 +935,9 @@ async fn list_jobs_pages_over_every_stored_job_in_creation_order() {
         ("MaxResults at the published maximum", Some(MAX_RESULTS_MAX)),
     ];
     for (case, max_results) in rows {
-        let seen = page_through(&router, max_results, total, case).await;
+        let seen = page_through(&router, max_results, expected.len(), case).await;
         assert_eq!(
-            seen, created,
+            seen, expected,
             "case {case:?}: expected the pages to report every job once, in creation order"
         );
     }
@@ -905,6 +960,7 @@ async fn list_jobs_pages_over_every_stored_job_in_creation_order() {
 #[tokio::test]
 async fn list_jobs_entries_report_the_persisted_job() {
     let (router, created) = router_with_jobs(3).await;
+    let expected = expected_listing(&router, &created).await;
     let listed = ok(&router, "ListJobs", json!({}), "every job").await;
     let entries = listed["JobListEntries"]
         .as_array()
@@ -912,17 +968,17 @@ async fn list_jobs_entries_report_the_persisted_job() {
         .clone();
     assert_eq!(
         entries.len(),
-        created.len(),
-        "expected one entry per stored job, got {listed}"
+        expected.len(),
+        "expected one entry per stored job — every order and every job part — got {listed}"
     );
 
     for (index, entry) in entries.iter().enumerate() {
         let case = format!("entry {index}");
         let job_id = string(entry, "JobId", &case);
         assert_eq!(
-            job_id, created[index],
+            job_id, expected[index].0,
             "case {case:?}: expected the entry for {}, got {job_id}",
-            created[index]
+            expected[index].0
         );
         let described = ok(&router, "DescribeJob", json!({ "JobId": job_id }), &case).await;
         let metadata = &described["JobMetadata"];
@@ -942,9 +998,13 @@ async fn list_jobs_entries_report_the_persisted_job() {
                  {entry} vs {metadata}"
             );
         }
-        assert!(
-            !boolean(entry, "IsMaster"),
-            "case {case:?}: a job this service minted is not a main job, got {entry}"
+        // `IsMaster` is true for exactly the main job of an export order — the job whose
+        // parts `DescribeJob` reports — and false for a job part and for a plain job.
+        assert_eq!(
+            boolean(entry, "IsMaster"),
+            expected[index].1,
+            "case {case:?}: expected IsMaster {}, got {entry}",
+            expected[index].1
         );
     }
 }
@@ -1011,26 +1071,49 @@ async fn list_jobs_refuses_a_token_it_did_not_mint() {
 async fn cancel_job_moves_the_job_to_cancelled_once() {
     let total = 3usize;
     let (router, created) = router_with_jobs(total).await;
+    // One group per create: the job it answered with, followed by that order's job parts.
+    // Cancelling an order cancels the whole group.
+    let mut orders: Vec<Vec<String>> = Vec::new();
+    for job_id in &created {
+        let group: Vec<String> = expected_listing(&router, std::slice::from_ref(job_id))
+            .await
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        orders.push(group);
+    }
 
-    for (index, job_id) in created.iter().enumerate() {
+    for (index, order) in orders.iter().enumerate() {
         let case = format!("cancelling job {index} of {total}");
+        let job_id = &order[0];
         ok(&router, "CancelJob", json!({ "JobId": job_id }), &case).await;
 
-        // The new state is what a later reader observes, through both readers.
+        // The new state is what a later reader observes, through both readers, for every
+        // job the cancelled order covers.
         let described = ok(&router, "DescribeJob", json!({ "JobId": job_id }), &case).await;
-        assert_eq!(
-            described["JobMetadata"].get("JobState").and_then(Value::as_str),
-            Some("Cancelled"),
-            "case {case:?}: expected DescribeJob to report Cancelled, got {described}"
-        );
+        for member_id in order {
+            let reported = ok(&router, "DescribeJob", json!({ "JobId": member_id }), &case).await;
+            assert_eq!(
+                reported["JobMetadata"].get("JobState").and_then(Value::as_str),
+                Some("Cancelled"),
+                "case {case:?}: expected DescribeJob to report {member_id} Cancelled, \
+                 got {reported}"
+            );
+        }
+        let cancelled: BTreeSet<String> = orders[..=index].iter().flatten().cloned().collect();
         let listed = ok(&router, "ListJobs", json!({}), &case).await;
         let entries = listed["JobListEntries"].as_array().expect("JobListEntries");
-        for (position, entry) in entries.iter().enumerate() {
-            let expected_state = if position <= index { "Cancelled" } else { "New" };
+        for entry in entries.iter() {
+            let entry_id = string(entry, "JobId", &case);
+            let expected_state = if cancelled.contains(&entry_id) {
+                "Cancelled"
+            } else {
+                "New"
+            };
             assert_eq!(
                 entry.get("JobState").and_then(Value::as_str),
                 Some(expected_state),
-                "case {case:?}: expected job {position} to be {expected_state}, got {entry}"
+                "case {case:?}: expected {entry_id} to be {expected_state}, got {entry}"
             );
         }
 
