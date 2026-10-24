@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/change_progress.rs"]
 mod change_progress;
+#[path = "all/cross_cluster_connections.rs"]
+mod cross_cluster_connections;
 #[path = "all/data_source_registry.rs"]
 mod data_source_registry;
 #[path = "all/default_application_setting.rs"]

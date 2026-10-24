@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeOutboundConnections
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeOutboundConnections`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeOutboundConnections::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored [`crate::state::Connection`] records as their OUTBOUND view —
+//! the same records `CreateOutboundConnection` minted — narrowed by the request's
+//! filters and answered one page at a time.
 //!
 //! ## Shape of an operation
 //!
@@ -81,6 +76,34 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{invalid_pagination_token, Connection};
+
+/// The largest page this operation answers with, and the page size a request that
+/// names none gets: `MaxResults` is `@range(max: 100)`, so 100 results is the most
+/// any request can ask for.
+const MAX_PAGE: usize = 100;
+
+/// `Filter$Name` for the connection's own id.
+///
+/// This and the four below are the filter names AWS documents as available for this
+/// operation (`Filters` in the API reference for `DescribeOutboundConnections`); the
+/// model's own documentation for the member says only "List of filter names and
+/// values that you can use for requests". A connection has no value for any OTHER
+/// name, so a filter naming one selects nothing.
+const FILTER_CONNECTION_ID: &str = "connection-id";
+
+/// `Filter$Name` for the source (local) domain's name.
+const FILTER_LOCAL_DOMAIN_NAME: &str = "local-domain-info.domain-name";
+
+/// `Filter$Name` for the destination (remote) domain's name.
+const FILTER_REMOTE_DOMAIN_NAME: &str = "remote-domain-info.domain-name";
+
+/// `Filter$Name` for the account that owns the destination (remote) domain.
+const FILTER_REMOTE_OWNER_ID: &str = "remote-domain-info.owner-id";
+
+/// `Filter$Name` for the Region the destination (remote) domain is in.
+const FILTER_REMOTE_REGION: &str = "remote-domain-info.region";
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -150,18 +173,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeOutboundConnections` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeOutboundConnectionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeOutboundConnections"))
+        let _ = ctx;
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        let now = ::std::time::SystemTime::now();
+        let filters = input.filters.unwrap_or_default();
+
+        let mut store = state.lock();
+        // The ONLY write this report makes, and it writes only what the clock already
+        // owed every connection at this instant had nobody called: a request whose
+        // validation has fallen due is reported in the status it is then in.
+        store.settle_connections(now);
+
+        // Order-stable, because the store is keyed by connection id: the same request
+        // reports the same order twice, which is what lets a token name a place in the
+        // set. Bounded by the store itself — [`crate::state::CONNECTION_QUOTA`] per
+        // source domain — rather than unbounded.
+        let matching: Vec<&Connection> = store
+            .connections
+            .values()
+            .filter(|connection| matches_every_filter(connection, &filters))
+            .collect();
+
+        // A token names the connection the next page starts at, so paging is resumed
+        // from a place in the set rather than from an offset a create or a delete
+        // would have shifted. A token that names no connection of THIS filtered set —
+        // one this service never minted, one whose connection has since been released,
+        // or one carried over to a request with different filters — names no such
+        // place, which is the modelled refusal.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => matching
+                .iter()
+                .position(|connection| connection.connection_id == token)
+                .ok_or_else(|| {
+                    DescribeOutboundConnectionsErrorModeled::InvalidPaginationTokenException(
+                        invalid_pagination_token(token),
+                    )
+                })?,
+        };
+
+        // `MaxResults` is "an optional parameter": the model defaults it to 0, so a
+        // request that asks for no particular page size gets the largest page the
+        // model allows rather than an empty one.
+        let page_size = match usize::try_from(input.max_results) {
+            Ok(0) | Err(_) => MAX_PAGE,
+            Ok(size) => size.min(MAX_PAGE),
+        };
+        let end = start.saturating_add(page_size).min(matching.len());
+
+        Ok(DescribeOutboundConnectionsOutput {
+            connections: Some(
+                matching[start..end]
+                    .iter()
+                    .map(|connection| connection.to_outbound())
+                    .collect(),
+            ),
+            // "When nextToken is returned, there are more results available": the
+            // token is the next connection in the set, and there is none once this
+            // page ended the set.
+            next_token: matching
+                .get(end)
+                .map(|connection| connection.connection_id.clone()),
+        })
+    }
+}
+
+/// Whether `connection` is reported under `filters`.
+///
+/// A connection must match EVERY filter given, and "must match at least one of the
+/// specified values" of each (`Filter`'s own documentation), so the values within one
+/// filter are alternatives and the filters themselves are cumulative. A filter naming
+/// a property a connection has no value for — including a name this operation does
+/// not filter on — matches nothing.
+fn matches_every_filter(connection: &Connection, filters: &[Filter]) -> bool {
+    filters.iter().all(|filter| {
+        let values = filter.values.as_deref().unwrap_or_default();
+        filtered_property(connection, filter.name.as_deref().unwrap_or_default())
+            .is_some_and(|actual| values.contains(&actual))
+    })
+}
+
+/// The value of the connection property `name` filters on, or `None` when this
+/// operation filters on no such property.
+fn filtered_property(connection: &Connection, name: &str) -> Option<String> {
+    match name {
+        FILTER_CONNECTION_ID => Some(connection.connection_id.clone()),
+        FILTER_LOCAL_DOMAIN_NAME => Some(connection.local_domain.domain_name.clone()),
+        FILTER_REMOTE_DOMAIN_NAME => Some(connection.remote_domain.domain_name.clone()),
+        FILTER_REMOTE_OWNER_ID => connection.remote_domain.owner_id.clone(),
+        FILTER_REMOTE_REGION => connection.remote_domain.region.clone(),
+        _ => None,
     }
 }
