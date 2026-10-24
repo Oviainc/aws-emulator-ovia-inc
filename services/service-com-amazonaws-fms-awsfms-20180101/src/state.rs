@@ -1812,6 +1812,134 @@ pub fn resource_set_arn(region: &str, id: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, &format!("resource-set/{id}"))
 }
 
+/// The number of items ONE call may carry when it changes a resource set's
+/// membership.
+///
+/// An EMULATOR-CHOSEN bound, not an AWS-documented one: the model's
+/// `IdentifierList` declares no length, so the request boundary admits any
+/// number of items and the service is what bounds them. It bounds the work ONE
+/// call does — the classification loop runs under this service's state lock — so
+/// a caller cannot make one request hold the store for an unbounded time. A
+/// caller with more resources to associate or disassociate sends more calls.
+///
+/// Shared by both batch operations, so neither of them can admit a batch the
+/// other refuses.
+pub const MAX_RESOURCE_SET_ITEMS_PER_CALL: usize = 100;
+
+/// Resolve a `ResourceSetIdentifier` to the key a resource set is stored under
+/// in [`ComAmazonawsFmsAwsfms20180101State::resource_sets`].
+///
+/// The modelled `Identifier` is up to 2048 characters where the resource set's
+/// own `Id` is 22, so a caller may name the set by either its `Id` or its ARN;
+/// both are identifiers it holds. `None` when it names neither.
+///
+/// Lives here rather than in one operation so every operation that takes a
+/// `ResourceSetIdentifier` resolves it identically.
+pub fn resolve_resource_set_id(
+    store: &ComAmazonawsFmsAwsfms20180101State,
+    identifier: &str,
+) -> Option<String> {
+    if store.resource_sets.contains_key(identifier) {
+        return Some(identifier.to_string());
+    }
+    store
+        .resource_sets
+        .values()
+        .find(|record| record.arn == identifier)
+        .map(|record| record.id.clone())
+}
+
+/// Compare two names that spell the same thing differently on the wire: the
+/// `AWS::NetworkFirewall::Firewall` resource type's `Firewall` and the
+/// `firewall/<name>` of a Network Firewall ARN, or `ResolverQueryLogConfig` and
+/// `resolver-query-log-config`. Keeps only the alphanumerics, lowercased.
+fn normalized_type_name(value: &str) -> String {
+    value
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// The type segment of an ARN's resource field: `firewall` of
+/// `firewall/<name>`, `instance` of `instance/i-0123`. The whole field when it
+/// carries no separator, which is a resource whose ARN names only an id.
+fn arn_resource_type(resource: &str) -> &str {
+    resource
+        .split_once(['/', ':'])
+        .map_or(resource, |(resource_type, _)| resource_type)
+}
+
+/// Why `uri` cannot be a member of a resource set that holds `resource_types`
+/// in `region`, or `None` when it can.
+///
+/// Every reason is a value of the model's `FailedItemReason`
+/// (`crate::ops::types::FAILED_ITEM_REASON_VALUES`), and the checks run in the
+/// order the ARN is built, so an item is reported against the FIRST field that
+/// disagrees:
+///
+/// * not an ARN at all -> `NOT_VALID_ARN`;
+/// * another partition than the one this emulator's resources live in
+///   (`partition`) -> `NOT_VALID_PARTITION`;
+/// * another Region than the one the request addresses -> `NOT_VALID_REGION`,
+///   because a resource set holds the resources of the administrator's Region;
+/// * an account that is not in this organization (`accounts`) ->
+///   `NOT_VALID_ACCOUNT_ID`;
+/// * a resource whose type no entry of the set's `ResourceTypeList` names ->
+///   `NOT_VALID_RESOURCE_TYPE`, because the set's `ResourceTypeList`
+///   "determines the resources that can be associated to the resource set"
+///   (`ResourceSet$ResourceTypeList`).
+///
+/// `partition` and `accounts` are derived ONCE by the caller, so classifying a
+/// batch does not rebuild them per item. It is one shared classifier so the
+/// operations that associate and disassociate a resource's membership cannot
+/// disagree about which items a set can hold.
+pub fn resource_set_item_failure_reason(
+    uri: &str,
+    region: &str,
+    partition: &str,
+    accounts: &BTreeSet<String>,
+    resource_types: &[String],
+) -> Option<&'static str> {
+    let Some(arn) = parse_arn(uri) else {
+        return Some("NOT_VALID_ARN");
+    };
+    if arn.partition != partition {
+        return Some("NOT_VALID_PARTITION");
+    }
+    if arn.region != region {
+        return Some("NOT_VALID_REGION");
+    }
+    if !accounts.contains(arn.account) {
+        return Some("NOT_VALID_ACCOUNT_ID");
+    }
+    let resource_type = normalized_type_name(arn_resource_type(arn.resource));
+    let in_scope = resource_types.iter().any(|declared| {
+        declared
+            .rsplit("::")
+            .next()
+            .is_some_and(|last| normalized_type_name(last) == resource_type)
+    });
+    (!in_scope).then_some("NOT_VALID_RESOURCE_TYPE")
+}
+
+/// The accounts of this organization a resource may belong to: the ones
+/// [`ComAmazonawsFmsAwsfms20180101State::member_accounts`] reports — the SAME
+/// definition `ListMemberAccounts` answers with, so two operations cannot
+/// disagree about who is in the organization — together with the accounts the
+/// discovered-resource inventory carries, which are by construction accounts
+/// Firewall Manager discovered resources in.
+pub fn organization_accounts(store: &ComAmazonawsFmsAwsfms20180101State) -> BTreeSet<String> {
+    let mut accounts = store.member_accounts();
+    accounts.extend(
+        store
+            .discovered_resources
+            .values()
+            .filter_map(|resource| resource.account_id.clone()),
+    );
+    accounts
+}
+
 /// The ARN of a Firewall Manager applications list:
 /// `arn:aws:fms:<region>:<account>:applications-list/<ListId>`.
 pub fn apps_list_arn(region: &str, list_id: &str) -> String {

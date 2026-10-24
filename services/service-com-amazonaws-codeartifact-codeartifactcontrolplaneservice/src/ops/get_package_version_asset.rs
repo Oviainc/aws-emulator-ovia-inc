@@ -254,7 +254,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &input.repository,
                 ),
                 &input.package,
-                PACKAGE_RESOURCE_TYPE,
+                crate::state::PACKAGE_RESOURCE_TYPE,
             ));
         };
         // The package exists; the version it was asked for may not. Reported as the
@@ -272,7 +272,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &input.package,
                     &input.package_version,
                 ),
-                PACKAGE_VERSION_RESOURCE_TYPE,
+                crate::state::PACKAGE_VERSION_RESOURCE_TYPE,
             ));
         };
 
@@ -292,7 +292,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             &input.package,
                             &input.package_version,
                         )),
-                        resource_type: Some(PACKAGE_VERSION_RESOURCE_TYPE.to_string()),
+                        resource_type: Some(
+                            crate::state::PACKAGE_VERSION_RESOURCE_TYPE.to_string(),
+                        ),
                     },
                 )
                 .into());
@@ -306,7 +308,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     input.asset, input.package, input.package_version, input.repository
                 ),
                 &input.asset,
-                ASSET_RESOURCE_TYPE,
+                crate::state::ASSET_RESOURCE_TYPE,
             ));
         };
 
@@ -322,17 +324,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
-
-/// `ResourceType$package` — the type a refusal reports for a package coordinate.
-/// (`ResourceType` models exactly `asset`, `domain`, `package`, `package-version` and
-/// `repository`; see `RESOURCE_TYPE_VALUES` in [`super::types`].)
-const PACKAGE_RESOURCE_TYPE: &str = "package";
-
-/// `ResourceType$package-version`.
-const PACKAGE_VERSION_RESOURCE_TYPE: &str = "package-version";
-
-/// `ResourceType$asset`.
-const ASSET_RESOURCE_TYPE: &str = "asset";
 
 /// A `ResourceNotFoundException` (404) naming the resource that was addressed, so a
 /// caller can tell an unknown domain or repository from an unknown package, version or
