@@ -211,7 +211,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 state: Some(environment.state),
                 status: Some(environment.status),
                 capacity_limits: environment.capacity_limits,
-                tags: environment.tags,
+                // Always materialised: an environment created with no tags is described
+                // with an EMPTY map, never with the member missing.
+                tags: batch::materialized_tags(&environment.tags),
             })
             .collect();
 

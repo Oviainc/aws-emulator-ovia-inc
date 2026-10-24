@@ -166,7 +166,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         Ok(ListTagsForResourceOutput {
-            tags: Some(tags.clone().unwrap_or_default()),
+            // The one place the tag-materialisation rule lives: a resource with no tags
+            // answers an EMPTY map, as every `Describe*` reader of this service does.
+            tags: batch::materialized_tags(tags),
         })
     }
 }

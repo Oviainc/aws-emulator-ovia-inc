@@ -215,7 +215,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     node_properties: job.node_properties.clone(),
                     array_properties: None,
                     timeout: job.timeout.clone(),
-                    tags: job.tags.clone(),
+                    tags: batch::materialized_tags(&job.tags),
                     propagate_tags: job.propagate_tags,
                     platform_capabilities: job.platform_capabilities.clone(),
                     eks_properties: None,

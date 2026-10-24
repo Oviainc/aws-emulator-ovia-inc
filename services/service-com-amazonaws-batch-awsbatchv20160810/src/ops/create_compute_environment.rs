@@ -227,11 +227,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .contains_key(&input.compute_environment_name)
         {
             // The bare detail AWS is recorded to state for a duplicate name: it names the
-            // collision, not the object (`state::OBJECT_ALREADY_EXISTS`).
-            return Err(CreateComputeEnvironmentErrorModeled::ClientException(
-                batch::client_exception(batch::OBJECT_ALREADY_EXISTS),
-            )
-            .into());
+            // collision, not the object (`state::OBJECT_ALREADY_EXISTS`). A collision is a
+            // CONFLICT, so it is answered with the status AWS answers
+            // (`state::CONFLICT_STATUS`) rather than the model's `httpError`.
+            return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                CreateComputeEnvironmentErrorModeled::ClientException(batch::client_exception(
+                    batch::OBJECT_ALREADY_EXISTS,
+                )),
+                batch::CONFLICT_STATUS,
+            ));
         }
         if state.compute_environments.len() >= batch::limits::MAX_COMPUTE_ENVIRONMENTS {
             return Err(CreateComputeEnvironmentErrorModeled::ClientException(

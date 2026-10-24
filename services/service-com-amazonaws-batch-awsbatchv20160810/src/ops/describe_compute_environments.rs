@@ -212,7 +212,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // No Amazon ECS cluster is created for an emulated environment, so
                 // there is no cluster ARN to report.
                 ecs_cluster_arn: None,
-                tags: environment.tags,
+                // Always materialised: an environment created with no tags is described
+                // with an EMPTY map, never with the member missing.
+                tags: batch::materialized_tags(&environment.tags),
                 r#type: Some(environment.ce_type),
                 state: Some(environment.state),
                 status: Some(environment.status),

@@ -241,10 +241,45 @@ fn validate_tag_key(key: &str) -> Result<(), String> {
 pub const QUOTA_SHARE_ARN_NOT_VALID: &str =
     "Quota Share arn should match a valid Quota Share arn pattern";
 
+/// What a scheduling-policy operation answers for an identifier that is not a
+/// scheduling-policy ARN at all ([`parse_scheduling_policy_arn`]).
+///
+/// Worded as the quota-share twin above is: the pattern requirement, without echoing the
+/// value the caller gave or spelling the pattern out.
+pub const SCHEDULING_POLICY_ARN_NOT_VALID: &str =
+    "Scheduling policy arn should match a valid Scheduling policy arn pattern";
+
+/// What `DescribeSchedulingPolicies` answers for a request whose `arns` names nothing.
+///
+/// The member is `@required` (`smithy_query(query="operation",
+/// operation="DescribeSchedulingPolicies")`) because it carries the identity of what to
+/// describe — unlike the optional filter list of `DescribeComputeEnvironments`,
+/// `DescribeJobQueues` and `DescribeServiceEnvironments`, where naming nothing means
+/// "every one of them". A list with no entries therefore identifies nothing, and is
+/// refused instead of answered with an empty result.
+pub const SCHEDULING_POLICY_ARNS_REQUIRED: &str =
+    "arns must name at least one scheduling policy";
+
+/// What `DeleteSchedulingPolicy` answers for a policy a job queue still names:
+/// `DeleteSchedulingPolicy`'s own doc — "You can't delete a scheduling policy that's used
+/// in any job queues."
+pub const SCHEDULING_POLICY_IN_USE: &str =
+    "Cannot delete a scheduling policy that's used in any job queues.";
+
 /// What AWS Batch answers when a `Create*` names an object it already holds: the bare
 /// detail `CreateComputeEnvironment` is recorded to state for a duplicate name, with no
 /// resource name interpolated into it.
 pub const OBJECT_ALREADY_EXISTS: &str = "Object already exists";
+
+/// The HTTP status AWS Batch answers a NAME COLLISION with.
+///
+/// The model gives `ClientException` `httpError` 400, which is the status a validation
+/// refusal carries; a `Create*` that names an object the service already holds is a
+/// CONFLICT, and the frontend answers the same error shape with HTTP 409 — recorded for a
+/// duplicate `CreateSchedulingPolicy`. The status is the only thing that differs, so each
+/// collision refusal is built from [`OBJECT_ALREADY_EXISTS`] exactly as before and carried
+/// on `crate::scaffolded::Scaffolded::modeled_with_status`.
+pub const CONFLICT_STATUS: u16 = 409;
 
 /// What `CreateComputeEnvironment` answers when an `UNMANAGED` environment is created
 /// with Fargate compute resources — the recorded detail, stated as the rule rather than
@@ -425,6 +460,10 @@ pub const MAX_COMPUTE_RESERVATION: i32 = 99;
 pub const MIN_WEIGHT_FACTOR: f32 = 0.0001;
 /// See [`MIN_WEIGHT_FACTOR`].
 pub const MAX_WEIGHT_FACTOR: f32 = 999.9999;
+
+/// The `ShareAttributes$weightFactor` of an entry that carries none, from the member's own
+/// doc: "The weight factor for the share identifier. The default value is 1.0."
+pub const DEFAULT_WEIGHT_FACTOR: f32 = 1.0;
 
 /// The longest `ShareAttributes$shareIdentifier` the service accepts, from the member's
 /// own doc: "The string is limited to 255 alphanumeric characters, and can be followed by
@@ -875,6 +914,20 @@ pub fn scheduling_policy_arn(region: &str, name: &str) -> String {
     ::engine::emulator_arn(ARN_SERVICE, region, &format!("scheduling-policy/{name}"))
 }
 
+/// The policy NAME a well-formed scheduling-policy ARN names, or `None` when `value` is
+/// not a scheduling-policy ARN at all — which is a DIFFERENT refusal from an ARN of the
+/// right shape naming nothing stored (that one is reported as absent, not refused).
+///
+/// Every scheduling-policy member is documented as an ARN and only as an ARN
+/// (`DescribeSchedulingPolicies$arns` is "a list of up to 100 scheduling policy Amazon
+/// Resource Name (ARN) entries"; `DeleteSchedulingPolicy$arn` and
+/// `UpdateSchedulingPolicy$arn` are "the Amazon Resource Name (ARN) of the scheduling
+/// policy"), unlike the "name or ARN" members every other resource kind takes.
+pub fn parse_scheduling_policy_arn(value: &str) -> Option<&str> {
+    let name = arn_resource_id(value, "scheduling-policy")?;
+    (!name.is_empty() && !name.contains('/')).then_some(name)
+}
+
 /// `arn:aws:batch:<region>:<account>:service-job/<job id>` — the ARN a service job
 /// carries, the resource kind AWS Batch names a service job with.
 pub fn service_job_arn(region: &str, job_id: &str) -> String {
@@ -1042,9 +1095,12 @@ pub struct ComputeEnvironment {
 /// A service environment, exactly as `CreateServiceEnvironment` stored it.
 ///
 /// The name is the environment's identity and the ARN is minted once beside it, so every
-/// later operation reports the same one. AWS Batch returns a fresh service environment in
-/// the non-terminal `CREATING` status, so the move to `VALID` is owed by the clock
-/// ([`ServiceEnvironment::status_due_at`]).
+/// later operation reports the same one. AWS Batch returns a service environment READY:
+/// the `DescribeServiceEnvironments` that follows the create reports it `VALID`, so there
+/// is no transient status here and nothing about a fresh environment is owed by the clock.
+/// [`ServiceEnvironment::status_due_at`] carries the one move a LATER call owes: the
+/// `DELETING` span `DeleteServiceEnvironment` writes, at the end of which the record stops
+/// existing.
 #[derive(Debug, Clone)]
 pub struct ServiceEnvironment {
     pub name: String,
@@ -1055,7 +1111,8 @@ pub struct ServiceEnvironment {
     pub state: String,
     /// `ServiceEnvironmentStatus`.
     pub status: String,
-    /// Set while the `CREATING` -> `VALID` move is still owed by the clock.
+    /// Set while a status move is still owed by the clock: the `DELETING` span a delete
+    /// wrote. `None` for a fresh environment, which is already `VALID`.
     pub status_due_at: Option<i64>,
     pub capacity_limits: Vec<CapacityLimit>,
     pub tags: Option<HashMap<String, String>>,
@@ -1598,6 +1655,31 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
         names
     }
 
+    /// The names of the job queues whose `serviceEnvironmentOrder` still names the service
+    /// environment `arn`.
+    ///
+    /// `DeleteServiceEnvironment`'s own doc requires the environment to be disassociated
+    /// "from any job queues with the UpdateJobQueue API operation" before it can be
+    /// deleted, so the delete answers the modelled refusal while this is non-empty — the
+    /// compute-environment rule above, on the other order a queue carries.
+    pub fn queues_using_service_environment(&self, arn: &str) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .job_queues
+            .values()
+            .filter(|queue| {
+                queue
+                    .service_environment_order
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|entry| entry.service_environment == arn)
+            })
+            .map(|queue| queue.name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
     /// The consumable resource `name_or_arn` names, resolved by name or by ARN — the two
     /// forms every `consumableResource` member documents ("The name or ARN of the
     /// consumable resource").
@@ -1881,10 +1963,30 @@ impl ComAmazonawsBatchAwsbatchv20160810State {
                     .retain(|_, share| share.job_queue_arn != removed.arn);
             }
         }
+        // A service environment is stored already `VALID` (AWS returns it ready), so the
+        // only move the clock owes one is the removal a delete accepted: the record stops
+        // existing when the `DELETING` span it wrote falls due. The status is checked, not
+        // assumed, so a transition added here later cannot be mistaken for a removal.
+        let mut deleted_service_environments: Vec<String> = Vec::new();
         for environment in self.service_environments.values_mut() {
-            if environment.status_due_at.is_some_and(|due| due <= now) {
-                environment.status = STATUS_VALID.to_string();
+            if environment.status_due_at.is_some_and(|due| due <= now)
+                && environment.status == STATUS_DELETING
+            {
                 environment.status_due_at = None;
+                deleted_service_environments.push(environment.name.clone());
+            }
+        }
+        for name in deleted_service_environments {
+            if let Some(removed) = self.service_environments.remove(&name) {
+                self.service_environments_by_arn.remove(&removed.arn);
+                // A queue's `serviceEnvironmentOrder` must not keep an entry naming a
+                // record nothing resolves any more, the way a deleted queue's quota shares
+                // go with it above.
+                for queue in self.job_queues.values_mut() {
+                    if let Some(order) = queue.service_environment_order.as_mut() {
+                        order.retain(|entry| entry.service_environment != removed.arn);
+                    }
+                }
             }
         }
         for share in self.quota_shares.values_mut() {
@@ -2509,11 +2611,54 @@ pub fn is_valid_scheduling_policy_name(value: &str) -> bool {
     is_valid_resource_name(value, MAX_SCHEDULING_POLICY_NAME_LEN)
 }
 
+/// Whether `value` is the ARN of a scheduling policy this endpoint serves.
+///
+/// The ARN is `arn:<partition>:batch:<region>:<account>:scheduling-policy/<name>`, the
+/// form `SchedulingPolicyDetail$arn` documents, and it is served only when it is the one
+/// this service mints for that name in `region` ([`scheduling_policy_arn`]): a policy in
+/// another region, account or partition is not this endpoint's to describe. An ARN of
+/// another resource kind, or of no kind, names no policy at all.
+pub fn is_scheduling_policy_arn(region: &str, value: &str) -> bool {
+    parse_scheduling_policy_arn(value).is_some_and(|name| {
+        is_valid_scheduling_policy_name(name) && value == scheduling_policy_arn(region, name)
+    })
+}
+
+/// Whether `value` can name a scheduling policy this endpoint serves.
+///
+/// Either shape a scheduling-policy identifier has: the ARN
+/// ([`is_scheduling_policy_arn`]) or the `<name>` inside it. Anything else — an ARN of
+/// another resource kind or of no kind, an empty identifier, a value outside the charset
+/// the `name` member documents — names no policy at all, which is a DIFFERENT answer from
+/// an identifier of the right shape naming nothing stored (that one is reported as absent,
+/// or is already deleted); the refusal is [`SCHEDULING_POLICY_ARN_NOT_VALID`].
+///
+/// The WRITERS (`DeleteSchedulingPolicy`, `UpdateSchedulingPolicy`) resolve both shapes,
+/// the way every other identifier in this service resolves: their `arn` member is
+/// documented as an ARN, but no recorded response refuses a bare name there, and this
+/// service resolves "name or ARN" everywhere a refusal is not recorded.
+/// `DescribeSchedulingPolicies` is the exception: its `arns` is "a list of up to 100
+/// scheduling policy Amazon Resource Name (ARN) entries" AND a describe naming a policy by
+/// name is recorded as refused, so that reader checks [`is_scheduling_policy_arn`] instead
+/// of this.
+pub fn is_scheduling_policy_reference(region: &str, value: &str) -> bool {
+    is_scheduling_policy_arn(region, value) || is_valid_scheduling_policy_name(value)
+}
+
 /// Every `QuotaShareIdleResourceAssignmentStrategy` the model declares
 /// (`smithy_query(query="shape", shape="QuotaShareIdleResourceAssignmentStrategy")`).
 /// The generated input types carry the member as a plain `String`, so the value is
 /// checked here by every operation that accepts a quota-share policy.
 pub const QUOTA_SHARE_IDLE_RESOURCE_ASSIGNMENT_STRATEGIES: [&str; 1] = ["FIFO"];
+
+/// What an update that would change a scheduling policy's KIND is refused with.
+///
+/// "Once set during creation, a fairsharePolicy cannot be removed or changed to a
+/// quotaSharePolicy" (`UpdateSchedulingPolicy$fairsharePolicy`), and the mirror sentence on
+/// `$quotaSharePolicy`: the kind a policy was created with is the kind it keeps.
+pub const POLICY_KIND_IS_FIXED: &str =
+    "A scheduling policy's fairsharePolicy or quotaSharePolicy cannot be changed to the other \
+     once it is set";
 
 /// The refusal detail when a request carries a policy of neither kind or of both.
 ///
@@ -2681,6 +2826,67 @@ fn parse_job_definition_reference(reference: &str) -> Option<(&str, Option<i32>)
         Some((name, revision)) => Some((name, Some(revision.parse().ok()?))),
         None => Some((short, None)),
     }
+}
+
+/// The tag map a `Describe*` reader reports for a record whose `tags` are `tags`.
+///
+/// AWS Batch's tag plane MATERIALISES the map: a resource created with no tags is
+/// described with `tags` present and EMPTY, never with the member missing (the same map
+/// `ListTagsForResource` answers for it). A typed client therefore reads
+/// `detail.tags()` without a null guard, so every reader in this service reports the map
+/// through here rather than passing the stored `Option` straight out.
+pub fn materialized_tags(tags: &Option<HashMap<String, String>>) -> Option<HashMap<String, String>> {
+    Some(tags.clone().unwrap_or_default())
+}
+
+/// The `fairsharePolicy` `DescribeSchedulingPolicies` reports for a policy whose stored
+/// policies are `fairshare` and `quota_share`.
+///
+/// AWS Batch materialises a scheduling policy's fair-share policy the way it materialises
+/// a tag map: a FAIR-SHARE policy is described with all three of its members present,
+/// zero-valued where the create left them out and with each distribution entry carrying
+/// its `weightFactor`, and a policy created with NEITHER kind is described carrying the
+/// zero-valued fair-share policy. Nothing is invented by it: each value is the member's own
+/// documented default (zero for the decay, "A value of zero (0) indicates the default
+/// minimum time window"; zero for the reservation, "The minimum value is 0"; `1.0` for a
+/// weight factor, "The default value is 1.0"), and a policy that shares nothing
+/// distributes nothing.
+///
+/// A QUOTA-SHARE policy carries no fair-share policy at all: "Only one of fairsharePolicy
+/// or quotaSharePolicy can be set" (`CreateSchedulingPolicy$fairsharePolicy`), so adding a
+/// zero-valued one would describe a policy of both kinds — one this service's own
+/// [`validate_policy_kinds`] refuses, and one no caller could round-trip back into a
+/// create or an update.
+pub fn materialized_fairshare_policy(
+    fairshare: Option<&FairsharePolicy>,
+    quota_share: Option<&QuotaSharePolicy>,
+) -> Option<FairsharePolicy> {
+    if fairshare.is_none() && quota_share.is_some() {
+        return None;
+    }
+    Some(FairsharePolicy {
+        share_decay_seconds: Some(
+            fairshare
+                .and_then(|policy| policy.share_decay_seconds)
+                .unwrap_or(0),
+        ),
+        compute_reservation: Some(
+            fairshare
+                .and_then(|policy| policy.compute_reservation)
+                .unwrap_or(0),
+        ),
+        share_distribution: Some(
+            fairshare
+                .and_then(|policy| policy.share_distribution.clone())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|entry| ShareAttributes {
+                    share_identifier: entry.share_identifier,
+                    weight_factor: Some(entry.weight_factor.unwrap_or(DEFAULT_WEIGHT_FACTOR)),
+                })
+                .collect(),
+        ),
+    })
 }
 
 /// A `ClientException` whose message is `detail` exactly as the code raising it states

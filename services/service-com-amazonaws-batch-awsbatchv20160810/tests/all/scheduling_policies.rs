@@ -7,10 +7,17 @@
 //! * a create persists every member the request carried and `DescribeSchedulingPolicies`
 //!   reads it back unchanged — the name, the policy (fair-share or quota-share) and the
 //!   tags;
+//! * the detail carries the members AWS always materialises: the tag map of a policy
+//!   created without tags is EMPTY rather than missing, and the `fairsharePolicy` is
+//!   always present with all three of its members, zero-valued where the create left them
+//!   out;
 //! * the name is the policy's identity: the ARN is
 //!   `arn:aws:batch:<region>:<account>:scheduling-policy/<name>`, minted once and reported
-//!   identically by every later read, and re-creating a name is refused with the modelled
-//!   `ClientException` (HTTP 400) instead of overwriting;
+//!   identically by every later read, and re-creating a name is refused as a CONFLICT
+//!   (`ClientException` with Batch's conflict status) instead of overwriting;
+//! * a policy is identified to the READER by its ARN alone — an `arns` entry of any other
+//!   shape is refused, as is an `arns` list that names nothing — while an ARN of the right
+//!   shape naming no stored policy is reported as absent;
 //! * `name` is accepted only in the charset and length the member documents, and refused
 //!   with a `ClientException` outside it;
 //! * a request carries a `fairsharePolicy` OR a `quotaSharePolicy`, never both;
@@ -173,6 +180,48 @@ fn share_distribution(count: usize) -> Value {
     )
 }
 
+/// The `fairsharePolicy` a describe must report for a create that carried `submitted`
+/// beside `quota_share`.
+///
+/// AWS materialises the whole fair-share policy, as it does the tag map: all three members
+/// are present, zero-valued where the request left them out, each distribution entry
+/// carries its `weightFactor` (whose documented default is 1.0), and a create carrying
+/// NEITHER policy kind reads back the zero-valued one. A quota-share policy carries no
+/// fair-share policy at all, since only one of the two can be set.
+pub(crate) fn materialized_fairshare(submitted: Option<&Value>, quota_share: Option<&Value>) -> Value {
+    if submitted.is_none() && quota_share.is_some() {
+        return Value::Null;
+    }
+    let submitted = submitted.cloned().unwrap_or_else(|| json!({}));
+    let distribution: Vec<Value> = submitted
+        .get("shareDistribution")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|entry| {
+            json!({
+                "shareIdentifier": entry["shareIdentifier"],
+                "weightFactor": entry
+                    .get("weightFactor")
+                    .cloned()
+                    .unwrap_or_else(|| json!(state::DEFAULT_WEIGHT_FACTOR)),
+            })
+        })
+        .collect();
+    json!({
+        "shareDecaySeconds": submitted
+            .get("shareDecaySeconds")
+            .cloned()
+            .unwrap_or_else(|| json!(0)),
+        "computeReservation": submitted
+            .get("computeReservation")
+            .cloned()
+            .unwrap_or_else(|| json!(0)),
+        "shareDistribution": distribution,
+    })
+}
+
 #[tokio::test]
 async fn create_persists_every_member_and_describe_reads_it_back() {
     let batch = Batch::new();
@@ -209,19 +258,15 @@ async fn create_persists_every_member_and_describe_reads_it_back() {
             "case {:?}: the read-back ARN must be the minted one, got {detail}",
             case.label
         );
-        match case.fairshare_policy.as_ref() {
-            Some(policy) => assert_eq!(
-                &detail["fairsharePolicy"],
-                policy,
-                "case {:?}: expected the submitted fairsharePolicy back, got {detail}",
-                case.label
+        assert_eq!(
+            &detail["fairsharePolicy"],
+            &materialized_fairshare(
+                case.fairshare_policy.as_ref(),
+                case.quota_share_policy.as_ref()
             ),
-            None => assert!(
-                detail["fairsharePolicy"].is_null(),
-                "case {:?}: a create with no fairsharePolicy must report none, got {detail}",
-                case.label
-            ),
-        }
+            "case {:?}: expected the materialized fairsharePolicy, got {detail}",
+            case.label
+        );
         match case.quota_share_policy.as_ref() {
             Some(policy) => assert_eq!(
                 &detail["quotaSharePolicy"],
@@ -242,9 +287,10 @@ async fn create_persists_every_member_and_describe_reads_it_back() {
                 "case {:?}: expected the submitted tags back, got {detail}",
                 case.label
             ),
-            None => assert!(
-                detail["tags"].is_null(),
-                "case {:?}: a create with no tags must report none, got {detail}",
+            None => assert_eq!(
+                detail["tags"],
+                json!({}),
+                "case {:?}: a create with no tags must report an empty map, got {detail}",
                 case.label
             ),
         }
@@ -282,8 +328,23 @@ async fn recreating_a_name_is_refused_and_does_not_overwrite() {
             .call("/v1/createschedulingpolicy", create_body(&clashing))
             .await;
         assert_eq!(
-            status, 400,
-            "case {:?}: re-creating a name must answer 400, got {status} {body}",
+            status,
+            state::CONFLICT_STATUS,
+            "case {:?}: re-creating a name must answer the conflict status {}, got {status} \
+             {body}",
+            case.label,
+            state::CONFLICT_STATUS
+        );
+        // The recorded conflict status, pinned as the literal the wire carries.
+        assert_eq!(
+            status, 409,
+            "case {:?}: the conflict status on the wire is 409, got {status} {body}",
+            case.label
+        );
+        assert_eq!(
+            crate::job_lifecycle::error_message(&body),
+            state::OBJECT_ALREADY_EXISTS,
+            "case {:?}: the conflict carries the bare detail, got {body}",
             case.label
         );
 
@@ -346,18 +407,34 @@ async fn a_name_outside_the_documented_charset_is_refused() {
             status, 400,
             "case {label:?}: a name outside the documented charset must answer 400, got {status} {body}"
         );
-        // Nothing was stored for it.
-        let found = batch
-            .ok(
+        // Nothing was stored for it. A name outside the documented charset is no policy
+        // identifier either — neither the name nor the ARN form of one — so for those the
+        // describe is REFUSED, which is itself proof that nothing is reachable under that
+        // name.
+        let reference = arn(&format!("scheduling-policy/{name}"));
+        let (status, found) = batch
+            .call(
                 "/v1/describeschedulingpolicies",
-                json!({"arns": [arn(&format!("scheduling-policy/{name}"))]}),
+                json!({"arns": [&reference]}),
             )
             .await;
-        assert_eq!(
-            found["schedulingPolicies"],
-            json!([]),
-            "case {label:?}: a refused create must persist nothing, got {found}"
-        );
+        if state::is_scheduling_policy_arn(crate::job_lifecycle::REGION, &reference) {
+            assert_eq!(
+                status, 200,
+                "case {label:?}: a well-formed ARN must be described, got {status} {found}"
+            );
+            assert_eq!(
+                found["schedulingPolicies"],
+                json!([]),
+                "case {label:?}: a refused create must persist nothing, got {found}"
+            );
+        } else {
+            assert_eq!(
+                status, 400,
+                "case {label:?}: an entry that cannot name a policy must be refused, got \
+                 {status} {found}"
+            );
+        }
     }
 }
 
@@ -583,15 +660,9 @@ async fn describe_collapses_duplicates_skips_unknown_and_bounds_its_input() {
 
     let rows: &[(&str, Vec<String>, usize)] = &[
         ("one ARN", vec![arn_of(&names[0])], 1),
-        ("by name", vec![names[0].clone()], 1),
         (
             "the same policy named twice collapses",
             vec![arn_of(&names[1]), arn_of(&names[1])],
-            1,
-        ),
-        (
-            "name and ARN of the SAME policy collapse",
-            vec![names[1].clone(), arn_of(&names[1])],
             1,
         ),
         (
@@ -605,7 +676,6 @@ async fn describe_collapses_duplicates_skips_unknown_and_bounds_its_input() {
             vec![arn_of("sp-absent"), arn_of(&names[0])],
             1,
         ),
-        ("no entries at all", Vec::new(), 0),
         (
             "every entry, at the documented maximum",
             {
@@ -644,6 +714,16 @@ async fn describe_collapses_duplicates_skips_unknown_and_bounds_its_input() {
     assert_eq!(
         status, 400,
         "case one past the documented arns maximum: expected 400, got {status} {body}"
+    );
+
+    // `arns` is the REQUIRED identity of what to describe, so a list that names nothing is
+    // refused rather than answered with an empty result.
+    let (status, body) = batch
+        .call("/v1/describeschedulingpolicies", json!({"arns": []}))
+        .await;
+    assert_eq!(
+        status, 400,
+        "case no entries at all: expected 400, got {status} {body}"
     );
 }
 

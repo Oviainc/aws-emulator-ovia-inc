@@ -342,7 +342,8 @@ async fn job_submission_lifecycle_round_trips_through_persisted_state() {
         "case create compute environment: expected the minted ARN, got {environment_arn:?}"
     );
 
-    // Re-creating the same name fails instead of overwriting.
+    // Re-creating the same name fails instead of overwriting: a name collision is a
+    // CONFLICT, not a validation failure.
     let (status, body) = batch
         .call(
             "/v1/createcomputeenvironment",
@@ -350,8 +351,10 @@ async fn job_submission_lifecycle_round_trips_through_persisted_state() {
         )
         .await;
     assert_eq!(
-        status, 400,
-        "case duplicate compute environment: expected 400, got {status} {body}"
+        status,
+        state::CONFLICT_STATUS,
+        "case duplicate compute environment: expected {}, got {status} {body}",
+        state::CONFLICT_STATUS
     );
 
     // A MANAGED environment without computeResources is refused.

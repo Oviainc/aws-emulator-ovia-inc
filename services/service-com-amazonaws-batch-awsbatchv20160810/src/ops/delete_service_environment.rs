@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteServiceEnvironment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteServiceEnvironment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Deletes the service environment `serviceEnvironment` names and returns the modelled
+//! empty 200. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteServiceEnvironment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The rules are the operation's own contract — "Before you can delete a service
+//! environment, you must first set its state to DISABLED with the UpdateServiceEnvironment
+//! API operation and disassociate it from any job queues with the UpdateJobQueue API
+//! operation":
+//!
+//! * an identifier ("the name or ARN of the service environment to delete") that resolves
+//!   to nothing asks for a removal that already happened, so it answers the same empty
+//!   success and writes nothing — the idempotent delete `DeleteComputeEnvironment` and
+//!   `DeleteConsumableResource` answer;
+//! * an environment whose `state` is not `DISABLED`, and one a job queue's
+//!   `serviceEnvironmentOrder` still names, are each refused with the modelled
+//!   `ClientException` and nothing is written;
+//! * the accepted delete puts the environment into the non-terminal `DELETING` status the
+//!   model declares, and the CLOCK removes it from the store when that move falls due
+//!   ([`crate::state::ComAmazonawsBatchAwsbatchv20160810State::materialize_due`]), so a
+//!   later `DescribeServiceEnvironments` stops reporting it; repeating the delete while it
+//!   is `DELETING` is the same empty success.
 //!
 //! ## Shape of an operation
 //!
@@ -138,18 +149,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteServiceEnvironment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteServiceEnvironmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteServiceEnvironment"))
+        use crate::state as batch;
+
+        // `ctx` carries request metadata only; this operation mints no ARN, so it reads
+        // nothing from it.
+        let _ = ctx;
+        let Some(state) = batch::service_state(&*self.engine) else {
+            return Err(DeleteServiceEnvironmentErrorModeled::ServerException(
+                batch::unreachable_state(),
+            )
+            .into());
+        };
+        let now = batch::now_millis();
+        let mut state = state.lock();
+        state.materialize_due(now);
+
+        let Some(name) = state.service_environment_name(&input.service_environment) else {
+            // A removal of something that is not there is ALREADY DONE: this operation's
+            // post-state ("the environment is gone") already holds, so it answers its
+            // empty success body and changes nothing.
+            return Ok(DeleteServiceEnvironmentOutput {});
+        };
+        let Some(environment) = state.service_environments.get(&name) else {
+            return Err(DeleteServiceEnvironmentErrorModeled::ServerException(
+                batch::unreachable_state(),
+            )
+            .into());
+        };
+        // A delete already accepted is in flight: repeating it asks for a removal the
+        // clock already owes, so it is the same success and changes nothing.
+        if environment.status == batch::STATUS_DELETING {
+            return Ok(DeleteServiceEnvironmentOutput {});
+        }
+        if environment.state != batch::STATE_DISABLED {
+            return Err(DeleteServiceEnvironmentErrorModeled::ClientException(
+                batch::client_exception(format!(
+                    "Cannot delete service environment {name} while its state is {}: set it \
+                     to {} with UpdateServiceEnvironment first",
+                    environment.state,
+                    batch::STATE_DISABLED
+                )),
+            )
+            .into());
+        }
+        let attached = state.queues_using_service_environment(&environment.arn);
+        if !attached.is_empty() {
+            return Err(DeleteServiceEnvironmentErrorModeled::ClientException(
+                batch::client_exception(format!(
+                    "Cannot delete, found existing JobQueue relationship: {}",
+                    attached.join(", ")
+                )),
+            )
+            .into());
+        }
+
+        // Accepted: the environment enters DELETING now and stops existing when that move
+        // falls due (`state::materialize_due`).
+        if let Some(environment) = state.service_environments.get_mut(&name) {
+            environment.status = batch::STATUS_DELETING.to_string();
+            environment.status_due_at = Some(now + batch::JOB_PHASE_MILLIS);
+        }
+
+        Ok(DeleteServiceEnvironmentOutput {})
     }
 }

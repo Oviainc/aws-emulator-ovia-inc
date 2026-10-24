@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateServiceEnvironment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateServiceEnvironment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Updates the service environment `serviceEnvironment` names, in place, and answers its
+//! name and ARN: the environment `DescribeServiceEnvironments` reads back afterwards is
+//! the one this call left behind. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateServiceEnvironment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The rules are the operation's own contract:
+//!
+//! * `serviceEnvironment` is "the name or ARN of the service environment to update", so it
+//!   resolves both ways; an identifier that resolves to nothing is refused with the ARN it
+//!   resolved to ([`crate::state::does_not_exist_message`]);
+//! * "You can update the state of a service environment from ENABLED to DISABLED to
+//!   prevent new service jobs from being placed in the service environment" — `state` and
+//!   `capacityLimits` are each written only when the request carries them, and a request
+//!   that carries neither changes nothing;
+//! * the capacity limits are stored exactly as the request carried them, the way
+//!   `CreateServiceEnvironment` stores them;
+//! * an environment whose deletion the clock already owes cannot be updated: the delete
+//!   was accepted, so there is nothing left to configure.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +157,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateServiceEnvironment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateServiceEnvironmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateServiceEnvironment"))
+        use crate::state as batch;
+
+        let Some(state) = batch::service_state(&*self.engine) else {
+            return Err(UpdateServiceEnvironmentErrorModeled::ServerException(
+                batch::unreachable_state(),
+            )
+            .into());
+        };
+        let region = batch::request_region(ctx);
+        let refuse = |detail: String| {
+            UpdateServiceEnvironmentError::from(
+                UpdateServiceEnvironmentErrorModeled::ClientException(batch::client_exception(
+                    detail,
+                )),
+            )
+        };
+        let now = batch::now_millis();
+        let mut state = state.lock();
+        state.materialize_due(now);
+
+        let Some(name) = state.service_environment_name(&input.service_environment) else {
+            // An identifier that resolves to nothing is refused with the ARN it resolved
+            // to and nothing else: the environment is not stored, so that ARN comes from
+            // the request.
+            return Err(refuse(batch::does_not_exist_message(&batch::resolved_arn(
+                &input.service_environment,
+                |name| batch::service_environment_arn(&region, name),
+            ))));
+        };
+        let Some(environment) = state.service_environments.get_mut(&name) else {
+            return Err(refuse(batch::does_not_exist_message(
+                &input.service_environment,
+            )));
+        };
+        if environment.status == batch::STATUS_DELETING {
+            return Err(refuse(format!(
+                "Service environment {name} is {} and can't be updated",
+                batch::STATUS_DELETING
+            )));
+        }
+        if let Some(requested_state) = input.state {
+            environment.state = requested_state;
+        }
+        if let Some(limits) = input.capacity_limits {
+            environment.capacity_limits = limits;
+        }
+        let arn = environment.arn.clone();
+
+        Ok(UpdateServiceEnvironmentOutput {
+            service_environment_name: name,
+            service_environment_arn: arn,
+        })
     }
 }

@@ -432,9 +432,11 @@ async fn submitting_a_service_job_persists_it_and_describe_reads_it_back() {
             row.preemption_retries,
             "case {case}: expected the submitted preemptionConfiguration, got {detail}"
         );
+        // Batch's tag plane materialises the map, so a submit that carried no tags reads
+        // back an EMPTY one rather than no member at all.
         assert_eq!(
             detail["tags"],
-            row.tags.clone().unwrap_or(Value::Null),
+            row.tags.clone().unwrap_or_else(|| json!({})),
             "case {case}: expected the submitted tags, got {detail}"
         );
     }

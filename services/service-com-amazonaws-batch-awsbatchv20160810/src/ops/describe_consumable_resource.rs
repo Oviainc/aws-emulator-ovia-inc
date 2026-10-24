@@ -183,7 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             available_quantity: Some(resource.available_quantity()),
             resource_type: Some(resource.resource_type.clone()),
             created_at: Some(resource.created_at),
-            tags: resource.tags.clone(),
+            tags: batch::materialized_tags(&resource.tags),
         })
     }
 }

@@ -9,12 +9,13 @@
 //!   tags;
 //! * the name is the environment's identity: the ARN is
 //!   `arn:aws:batch:<region>:<account>:service-environment/<name>`, minted once and
-//!   reported identically by every later read, and re-creating a name is refused with the
-//!   modelled `ClientException` (HTTP 400) instead of overwriting;
+//!   reported identically by every later read, and re-creating a name is refused as a
+//!   CONFLICT (`ClientException` with Batch's conflict status) instead of overwriting;
 //! * `state` defaults to `ENABLED` when the request names none, and is echoed when it
 //!   does;
-//! * the environment is returned in the non-terminal `CREATING` status and the CLOCK — not
-//!   a read — moves it to `VALID`; two reads at the same instant answer identically;
+//! * the environment is returned READY: the describe that follows the create reports
+//!   `VALID`, and a read never changes it — two reads at the same instant answer
+//!   identically;
 //! * `serviceEnvironmentName` is accepted only in the charset and length the member
 //!   documents, and refused with a `ClientException` outside it;
 //! * `DescribeServiceEnvironments` resolves each entry by name OR by ARN, collapses
@@ -139,8 +140,8 @@ async fn describe_one(batch: &Batch, reference: &str) -> Value {
     found[0].clone()
 }
 
-/// How long to wait for the `CREATING` -> `VALID` move to fall due: the span the clock
-/// owes it ([`state::JOB_PHASE_MILLIS`]), with margin for a slow machine.
+/// How long a clock-owed transition takes ([`state::JOB_PHASE_MILLIS`]), with margin for a
+/// slow machine: long enough that a status a read must NOT move has had the time to move.
 async fn wait_for_valid() {
     let span = u64::try_from(state::JOB_PHASE_MILLIS).unwrap_or(500);
     tokio::time::sleep(Duration::from_millis(span * 3)).await;
@@ -203,9 +204,12 @@ async fn create_persists_every_member_and_describe_reads_it_back() {
                 "case {:?}: expected the submitted tags back, got {detail}",
                 case.label
             ),
-            None => assert!(
-                detail["tags"].is_null(),
-                "case {:?}: a create with no tags must report none, got {detail}",
+            // Batch's tag plane materialises the map: no tags means an EMPTY map, never a
+            // missing member.
+            None => assert_eq!(
+                detail["tags"],
+                json!({}),
+                "case {:?}: a create with no tags must report an empty map, got {detail}",
                 case.label
             ),
         }
@@ -236,9 +240,12 @@ async fn recreating_a_name_is_refused_and_does_not_overwrite() {
             .call("/v1/createserviceenvironment", create_body(&clashing))
             .await;
         assert_eq!(
-            status, 400,
-            "case {:?}: re-creating a name must answer 400, got {status} {body}",
-            case.label
+            status,
+            state::CONFLICT_STATUS,
+            "case {:?}: re-creating a name must answer the conflict status {}, got {status} \
+             {body}",
+            case.label,
+            state::CONFLICT_STATUS
         );
 
         let detail = describe_one(&batch, &case.name).await;
@@ -258,11 +265,11 @@ async fn recreating_a_name_is_refused_and_does_not_overwrite() {
 }
 
 #[tokio::test]
-async fn status_starts_creating_and_only_the_clock_moves_it() {
+async fn a_created_environment_is_valid_and_a_read_does_not_change_it() {
     let batch = Batch::new();
 
-    // One row per state, so the clock-owed move is asserted for both — a DISABLED
-    // environment is created just as a non-terminal one.
+    // One row per state, so the status is asserted for both — a DISABLED environment is
+    // created just as an ENABLED one is.
     for state_value in STATES {
         let name = format!("se-status-{}", state_value.to_lowercase());
         batch
@@ -277,20 +284,21 @@ async fn status_starts_creating_and_only_the_clock_moves_it() {
             )
             .await;
 
-        // The span is never zero, so a caller reading straight after the create still
-        // observes the transient status.
+        // AWS Batch returns a service environment ready, so the describe that follows the
+        // create reports `VALID` — the status a client waits for before attaching the
+        // environment to a job queue.
         let first = describe_one(&batch, &name).await;
         assert_eq!(
             first["status"].as_str(),
-            Some("CREATING"),
-            "case {state_value:?}: a fresh environment must report CREATING, got {first}"
+            Some("VALID"),
+            "case {state_value:?}: a created environment must report VALID, got {first}"
         );
-        // A READ does not move it: the second read at the same instant answers the same.
+        // A READ does not move it: the second read answers the same, and so does one a
+        // clock-owed span later.
         let second = describe_one(&batch, &name).await;
         assert_eq!(
-            second["status"].as_str(),
-            first["status"].as_str(),
-            "case {state_value:?}: two reads at the same instant must agree, got {second}"
+            second, first,
+            "case {state_value:?}: two reads must agree, got {second}"
         );
 
         wait_for_valid().await;
@@ -299,7 +307,7 @@ async fn status_starts_creating_and_only_the_clock_moves_it() {
         assert_eq!(
             settled["status"].as_str(),
             Some("VALID"),
-            "case {state_value:?}: the clock must move CREATING -> VALID, got {settled}"
+            "case {state_value:?}: it must stay VALID, got {settled}"
         );
         assert_eq!(
             settled["state"].as_str(),

@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateSchedulingPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateSchedulingPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Updates the scheduling policy `arn` names, in place, and returns the modelled empty
+//! 200: the policy `DescribeSchedulingPolicies` reads back afterwards is the one this call
+//! left behind. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateSchedulingPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The rules are the operation's own contract:
+//!
+//! * the identifier is a scheduling-policy ARN, or the name that ARN carries; one of
+//!   neither shape is refused with the modelled `ClientException`
+//!   ([`crate::state::is_scheduling_policy_reference`]), and one of the right shape that
+//!   names no stored policy is refused with the ARN it resolved to
+//!   ([`crate::state::does_not_exist_message`]);
+//! * "Only one of fairsharePolicy or quotaSharePolicy can be set", and each is accepted
+//!   only inside the bounds its own members document
+//!   ([`crate::state::validate_policy_kinds`]);
+//! * "Once set during creation, a fairsharePolicy cannot be removed or changed to a
+//!   quotaSharePolicy" (and the mirror sentence on `quotaSharePolicy`), so an update that
+//!   carries the OTHER kind than the policy was created with is refused and the stored
+//!   policy is left exactly as it was;
+//! * a request that carries neither member changes nothing, and answers the same empty
+//!   200.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +152,66 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateSchedulingPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateSchedulingPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateSchedulingPolicy"))
+        use crate::state as batch;
+
+        let Some(state) = batch::service_state(&*self.engine) else {
+            return Err(UpdateSchedulingPolicyErrorModeled::ServerException(
+                batch::unreachable_state(),
+            )
+            .into());
+        };
+        let region = batch::request_region(ctx);
+        let refuse = |detail: String| {
+            UpdateSchedulingPolicyError::from(UpdateSchedulingPolicyErrorModeled::ClientException(
+                batch::client_exception(detail),
+            ))
+        };
+
+        if !batch::is_scheduling_policy_reference(&region, &input.arn) {
+            return Err(UpdateSchedulingPolicyErrorModeled::ClientException(
+                batch::client_exception_enveloped(batch::SCHEDULING_POLICY_ARN_NOT_VALID),
+            )
+            .into());
+        }
+        // One policy kind, each inside the bounds its own members document — the same
+        // validation `CreateSchedulingPolicy` applies to the pair.
+        batch::validate_policy_kinds(
+            input.fairshare_policy.as_ref(),
+            input.quota_share_policy.as_ref(),
+        )
+        .map_err(refuse)?;
+
+        let now = batch::now_millis();
+        let mut state = state.lock();
+        state.materialize_due(now);
+
+        let Some(name) = state.scheduling_policy_name(&input.arn) else {
+            // An identifier that resolves to nothing is refused with the ARN it resolved
+            // to and nothing else: the policy is not stored, so that ARN comes from the
+            // request.
+            return Err(refuse(batch::does_not_exist_message(&batch::resolved_arn(
+                &input.arn,
+                |name| batch::scheduling_policy_arn(&region, name),
+            ))));
+        };
+        let Some(policy) = state.scheduling_policies.get_mut(&name) else {
+            return Err(refuse(batch::does_not_exist_message(&input.arn)));
+        };
+        // "Once set during creation, a fairsharePolicy cannot be removed or changed to a
+        // quotaSharePolicy", and the mirror sentence on `quotaSharePolicy`: an update of
+        // the other kind than the policy carries is refused.
+        if input.fairshare_policy.is_some() && policy.quota_share_policy.is_some() {
+            return Err(refuse(batch::POLICY_KIND_IS_FIXED.to_string()));
+        }
+        if input.quota_share_policy.is_some() && policy.fairshare_policy.is_some() {
+            return Err(refuse(batch::POLICY_KIND_IS_FIXED.to_string()));
+        }
+        if let Some(fairshare) = input.fairshare_policy {
+            policy.fairshare_policy = Some(fairshare);
+        }
+        if let Some(quota_share) = input.quota_share_policy {
+            policy.quota_share_policy = Some(quota_share);
+        }
+        Ok(UpdateSchedulingPolicyOutput {})
     }
 }

@@ -2,11 +2,13 @@
 
 //! @op CreateServiceEnvironment
 //! Creates a service environment and persists it in [`crate::state`]. The name is the
-//! environment's identity: re-creating one that already exists is a `ClientException`,
-//! never an overwrite. The ARN is minted once, from the region the request was signed
-//! for, and stored with the record, so every later operation reports the same one. The
-//! environment is returned in the non-terminal `CREATING` status, which the clock moves
-//! to `VALID`, and `state` defaults to `ENABLED` (the member's own doc).
+//! environment's identity: re-creating one that already exists is refused as a CONFLICT
+//! (the modelled `ClientException` with [`crate::state::CONFLICT_STATUS`]), never an
+//! overwrite. The ARN is minted once, from the region the request was signed for, and
+//! stored with the record, so every later operation reports the same one. The environment
+//! is stored `VALID` — AWS Batch returns it READY, and the describe that follows the
+//! create reports `VALID`, so no transient status is invented for it — and `state`
+//! defaults to `ENABLED` (the member's own doc).
 //!
 //! This is the ONLY file to touch for this operation.
 //!
@@ -114,7 +116,7 @@ pub type CreateServiceEnvironmentError = crate::scaffolded::Scaffolded<CreateSer
 /// this operation is implemented.
 impl From<CreateServiceEnvironmentErrorModeled> for CreateServiceEnvironmentError {
     fn from(modeled: CreateServiceEnvironmentErrorModeled) -> Self {
-        crate::scaffolded::Scaffolded::Modeled(modeled)
+        Self::Modeled(modeled)
     }
 }
 
@@ -182,10 +184,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .service_environments
             .contains_key(&input.service_environment_name)
         {
-            return Err(CreateServiceEnvironmentErrorModeled::ClientException(
-                batch::client_exception(batch::OBJECT_ALREADY_EXISTS),
-            )
-            .into());
+            // A name collision is a CONFLICT: the bare detail, answered with the status
+            // AWS answers rather than the model's `httpError`.
+            return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                CreateServiceEnvironmentErrorModeled::ClientException(batch::client_exception(
+                    batch::OBJECT_ALREADY_EXISTS,
+                )),
+                batch::CONFLICT_STATUS,
+            ));
         }
         if state.service_environments.len() >= batch::limits::MAX_SERVICE_ENVIRONMENTS {
             return Err(CreateServiceEnvironmentErrorModeled::ClientException(
@@ -207,8 +213,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             state: input
                 .state
                 .unwrap_or_else(|| batch::STATE_ENABLED.to_string()),
-            status: batch::STATUS_CREATING.to_string(),
-            status_due_at: Some(now + batch::JOB_PHASE_MILLIS),
+            status: batch::STATUS_VALID.to_string(),
+            // AWS Batch returns a service environment READY: the describe that follows the
+            // create reports it `VALID`, so nothing about it is owed by the clock.
+            status_due_at: None,
             capacity_limits: input.capacity_limits,
             tags: input.tags,
         };

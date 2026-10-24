@@ -198,7 +198,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             preemption_configuration: Some(share.preemption_configuration.clone()),
             state: Some(share.state.clone()),
             status: Some(share.status.clone()),
-            tags: share.tags.clone(),
+            tags: batch::materialized_tags(&share.tags),
         })
     }
 }

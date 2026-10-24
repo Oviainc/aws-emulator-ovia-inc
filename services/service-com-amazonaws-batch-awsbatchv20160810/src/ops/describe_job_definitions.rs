@@ -247,7 +247,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 next_token = Some(crate::state::encode_page_token(&key.0, key.1));
                 break;
             }
-            page.push(definition.clone());
+            let mut detail = definition.clone();
+            // Always materialised: a revision registered with no tags is described with an
+            // EMPTY map, never with the member missing.
+            detail.tags = crate::state::materialized_tags(&detail.tags);
+            page.push(detail);
         }
 
         Ok(DescribeJobDefinitionsOutput {

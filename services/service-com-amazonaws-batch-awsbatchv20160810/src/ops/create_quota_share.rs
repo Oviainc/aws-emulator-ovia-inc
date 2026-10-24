@@ -127,7 +127,7 @@ pub type CreateQuotaShareError = crate::scaffolded::Scaffolded<CreateQuotaShareE
 /// this operation is implemented.
 impl From<CreateQuotaShareErrorModeled> for CreateQuotaShareError {
     fn from(modeled: CreateQuotaShareErrorModeled) -> Self {
-        crate::scaffolded::Scaffolded::Modeled(modeled)
+        Self::Modeled(modeled)
     }
 }
 
@@ -222,10 +222,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let queue_name = queue.name.clone();
         let arn = batch::quota_share_arn(&region, &queue_name, &input.quota_share_name);
         if state.quota_shares.contains_key(&arn) {
-            return Err(CreateQuotaShareErrorModeled::ClientException(
-                batch::client_exception_enveloped(batch::OBJECT_ALREADY_EXISTS),
-            )
-            .into());
+            // A name collision is a CONFLICT: the same detail as before, answered with the
+            // status AWS answers rather than the model's `httpError`.
+            return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                CreateQuotaShareErrorModeled::ClientException(batch::client_exception_enveloped(
+                    batch::OBJECT_ALREADY_EXISTS,
+                )),
+                batch::CONFLICT_STATUS,
+            ));
         }
         if state.quota_shares.len() >= batch::limits::MAX_QUOTA_SHARES {
             return Err(CreateQuotaShareErrorModeled::ClientException(

@@ -105,7 +105,7 @@ pub type CreateConsumableResourceError = crate::scaffolded::Scaffolded<CreateCon
 /// this operation is implemented.
 impl From<CreateConsumableResourceErrorModeled> for CreateConsumableResourceError {
     fn from(modeled: CreateConsumableResourceErrorModeled) -> Self {
-        crate::scaffolded::Scaffolded::Modeled(modeled)
+        Self::Modeled(modeled)
     }
 }
 
@@ -198,10 +198,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Then what the STORE says about the request: "The name of the consumable
         // resource. Must be unique."
         if state.consumable_resources.contains_key(&name) {
-            return Err(CreateConsumableResourceErrorModeled::ClientException(
-                batch::client_exception(batch::OBJECT_ALREADY_EXISTS),
-            )
-            .into());
+            // A name collision is a CONFLICT: the bare detail, answered with the status
+            // AWS answers rather than the model's `httpError`.
+            return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                CreateConsumableResourceErrorModeled::ClientException(batch::client_exception(
+                    batch::OBJECT_ALREADY_EXISTS,
+                )),
+                batch::CONFLICT_STATUS,
+            ));
         }
         if state.consumable_resources.len() >= batch::limits::MAX_CONSUMABLE_RESOURCES {
             return Err(CreateConsumableResourceErrorModeled::ClientException(

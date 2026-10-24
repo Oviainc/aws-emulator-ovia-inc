@@ -209,7 +209,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 compute_environment_order: queue.compute_environment_order,
                 service_environment_order: queue.service_environment_order,
                 job_queue_type: queue.job_queue_type,
-                tags: queue.tags,
+                // Always materialised: a queue created with no tags is described with an
+                // EMPTY map, never with the member missing.
+                tags: batch::materialized_tags(&queue.tags),
                 job_state_time_limit_actions: queue.job_state_time_limit_actions,
             })
             .collect();

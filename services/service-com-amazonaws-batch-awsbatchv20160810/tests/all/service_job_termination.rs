@@ -518,7 +518,6 @@ async fn describe_service_job_reports_the_stored_record_member_for_member() {
                     "retryStrategy",
                     "timeoutConfig",
                     "preemptionConfiguration",
-                    "tags",
                 ] {
                     assert_eq!(
                         detail[member],
@@ -527,6 +526,15 @@ async fn describe_service_job_reports_the_stored_record_member_for_member() {
                          not either, got {detail}"
                     );
                 }
+                // `tags` is the exception: Batch's tag plane MATERIALISES the map, so a
+                // record carrying none is reported with an empty one rather than with the
+                // member missing.
+                assert_eq!(
+                    detail["tags"],
+                    json!({}),
+                    "case {case}: a record with no tags must report an empty map, got \
+                     {detail}"
+                );
             }
         }
     }

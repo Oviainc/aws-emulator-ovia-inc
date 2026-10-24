@@ -4,7 +4,9 @@
 //! Creates a scheduling policy and persists it in [`crate::state`]. The `name` is the
 //! policy's identity: the ARN is minted once from it
 //! ([`crate::state::scheduling_policy_arn`]) and re-creating a name that already exists is
-//! refused with the modelled `ClientException` instead of overwriting the stored policy. A
+//! refused as a CONFLICT — the modelled `ClientException` with Batch's conflict status
+//! ([`crate::state::CONFLICT_STATUS`]) and the bare detail
+//! ([`crate::state::OBJECT_ALREADY_EXISTS`]) — instead of overwriting the stored policy. A
 //! request may carry a `fairsharePolicy` OR a `quotaSharePolicy`, never both, and each is
 //! accepted only inside the bounds its own members document
 //! ([`crate::state::validate_policy_kinds`]). Nothing about a scheduling policy is owed by
@@ -117,7 +119,7 @@ pub type CreateSchedulingPolicyError = crate::scaffolded::Scaffolded<CreateSched
 /// this operation is implemented.
 impl From<CreateSchedulingPolicyErrorModeled> for CreateSchedulingPolicyError {
     fn from(modeled: CreateSchedulingPolicyErrorModeled) -> Self {
-        crate::scaffolded::Scaffolded::Modeled(modeled)
+        Self::Modeled(modeled)
     }
 }
 
@@ -194,13 +196,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.materialize_due(now);
 
         if state.scheduling_policies.contains_key(&input.name) {
-            return Err(CreateSchedulingPolicyErrorModeled::ClientException(
-                batch::client_exception(format!(
-                    "Object already exists: scheduling policy {}",
-                    input.name
+            // A name collision is a CONFLICT: the bare detail every other `Create*` of
+            // this service answers it with, answered with the status AWS answers
+            // (`state::CONFLICT_STATUS`) rather than the model's `httpError`.
+            return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                CreateSchedulingPolicyErrorModeled::ClientException(batch::client_exception(
+                    batch::OBJECT_ALREADY_EXISTS,
                 )),
-            )
-            .into());
+                batch::CONFLICT_STATUS,
+            ));
         }
         if state.scheduling_policies.len() >= batch::limits::MAX_SCHEDULING_POLICIES {
             return Err(CreateSchedulingPolicyErrorModeled::ClientException(

@@ -730,8 +730,11 @@ async fn the_quota_share_refusals_are_distinct_client_exceptions() {
         )
         .await;
     assert_eq!(
-        status, 400,
-        "case create a quota share twice: expected 400, got {status} {refused}"
+        status,
+        state::CONFLICT_STATUS,
+        "case create a quota share twice: expected the conflict status {}, got {status} \
+         {refused}",
+        state::CONFLICT_STATUS
     );
     assert!(
         error_message(&refused).contains(state::OBJECT_ALREADY_EXISTS),
@@ -1135,8 +1138,10 @@ async fn a_refusal_carries_the_message_the_refusing_code_states() {
 
     compute_environment(&batch, "ce-messages").await;
 
-    // Recorded BARE refusals: the detail alone, with no envelope around it.
-    let bare: Vec<(&str, &str, Value, &str)> = vec![
+    // Recorded BARE refusals: the detail alone, with no envelope around it. The status is
+    // the row's too: a name collision is a CONFLICT (`state::CONFLICT_STATUS`), every
+    // other refusal here is the model's 400.
+    let bare: Vec<(&str, &str, Value, &str, u16)> = vec![
         (
             "a job queue over a compute environment nothing holds",
             "/v1/createjobqueue",
@@ -1148,6 +1153,7 @@ async fn a_refusal_carries_the_message_the_refusing_code_states() {
                 ],
             }),
             state::COMPUTE_ENVIRONMENTS_NOT_ATTACHABLE,
+            400,
         ),
         (
             "a job queue over a compute environment ARN nothing holds",
@@ -1160,31 +1166,35 @@ async fn a_refusal_carries_the_message_the_refusing_code_states() {
                 ],
             }),
             state::COMPUTE_ENVIRONMENTS_NOT_ATTACHABLE,
+            400,
         ),
         (
             "a compute environment name already stored",
             "/v1/createcomputeenvironment",
             json!({"computeEnvironmentName": "ce-messages", "type": "UNMANAGED"}),
             state::OBJECT_ALREADY_EXISTS,
+            state::CONFLICT_STATUS,
         ),
         (
             "a nextToken this service did not issue",
             "/v1/describejobdefinitions",
             json!({"nextToken": "not-a-token-we-minted"}),
             state::NEXT_TOKEN_NOT_PROCESSABLE,
+            400,
         ),
         (
             "a nextToken that is empty",
             "/v1/describejobdefinitions",
             json!({"nextToken": ""}),
             state::NEXT_TOKEN_NOT_PROCESSABLE,
+            400,
         ),
     ];
-    for (case, uri, request, expected) in bare {
+    for (case, uri, request, expected, expected_status) in bare {
         let (status, refused) = batch.call(uri, request).await;
         assert_eq!(
-            status, 400,
-            "case {case}: expected 400, got {status} {refused}"
+            status, expected_status,
+            "case {case}: expected {expected_status}, got {status} {refused}"
         );
         assert_eq!(
             error_code(&refused),

@@ -29,7 +29,9 @@
 
 use serde_json::{json, Value};
 
-use service_com_amazonaws_batch_awsbatchv20160810::state::{limits, CONSUMABLE_RESOURCE_TYPES};
+use service_com_amazonaws_batch_awsbatchv20160810::state::{
+    limits, CONFLICT_STATUS, CONSUMABLE_RESOURCE_TYPES,
+};
 
 use crate::job_lifecycle::{arn, error_code, error_message, Batch};
 
@@ -65,6 +67,8 @@ struct Case {
     extra: Value,
     expected_total: i64,
     expected_type: &'static str,
+    /// The tag map the reader must report. A create that carried none reports an EMPTY
+    /// map, not a missing member: Batch's tag plane materialises it.
     expected_tags: Value,
 }
 
@@ -79,7 +83,7 @@ fn cases() -> Vec<Case> {
             extra: json!({}),
             expected_total: 0,
             expected_type: DEFAULT_RESOURCE_TYPE,
-            expected_tags: Value::Null,
+            expected_tags: json!({}),
         },
         Case {
             label: "totalQuantity at its lower bound, resourceType defaulted",
@@ -87,7 +91,7 @@ fn cases() -> Vec<Case> {
             extra: json!({"totalQuantity": 0}),
             expected_total: 0,
             expected_type: DEFAULT_RESOURCE_TYPE,
-            expected_tags: Value::Null,
+            expected_tags: json!({}),
         },
         Case {
             label: "totalQuantity 1, resourceType named explicitly",
@@ -95,7 +99,7 @@ fn cases() -> Vec<Case> {
             extra: json!({"totalQuantity": 1, "resourceType": "REPLENISHABLE"}),
             expected_total: 1,
             expected_type: "REPLENISHABLE",
-            expected_tags: Value::Null,
+            expected_tags: json!({}),
         },
         Case {
             label: "NON_REPLENISHABLE, the resourceType the issue did not cite",
@@ -103,7 +107,7 @@ fn cases() -> Vec<Case> {
             extra: json!({"totalQuantity": 42, "resourceType": "NON_REPLENISHABLE"}),
             expected_total: 42,
             expected_type: "NON_REPLENISHABLE",
-            expected_tags: Value::Null,
+            expected_tags: json!({}),
         },
         Case {
             label: "totalQuantity at the largest Long the model admits",
@@ -111,7 +115,7 @@ fn cases() -> Vec<Case> {
             extra: json!({"totalQuantity": i64::MAX}),
             expected_total: i64::MAX,
             expected_type: DEFAULT_RESOURCE_TYPE,
-            expected_tags: Value::Null,
+            expected_tags: json!({}),
         },
         Case {
             label: "one tag",
@@ -382,61 +386,70 @@ async fn a_create_the_service_cannot_accept_is_refused_and_stores_nothing() {
     .await;
     assert_eq!(status, 200, "the resource the duplicate rows collide with is created");
 
-    // (case, request body, the member the refusal must name)
-    let refusals: Vec<(&str, Value, &str)> = vec![
+    // (case, request body, the member the refusal must name, the status it answers)
+    let refusals: Vec<(&str, Value, &str, u16)> = vec![
         (
             "a name already stored",
             json!({"consumableResourceName": "taken", "totalQuantity": 99}),
             // A duplicate name is the one refusal that names no member: AWS answers the
-            // bare `Object already exists` (`state::OBJECT_ALREADY_EXISTS`).
+            // bare `Object already exists` (`state::OBJECT_ALREADY_EXISTS`), and it is a
+            // CONFLICT rather than a validation failure (`state::CONFLICT_STATUS`).
             "Object already exists",
+            CONFLICT_STATUS,
         ),
         (
             "a name already stored, with no other member",
             json!({"consumableResourceName": "taken"}),
             "Object already exists",
+            CONFLICT_STATUS,
         ),
         (
             "an empty name",
             json!({"consumableResourceName": ""}),
             "consumableResourceName",
+            400,
         ),
         (
             "totalQuantity one past its lower bound",
             json!({"consumableResourceName": "negative-1", "totalQuantity": -1}),
             "totalQuantity",
+            400,
         ),
         (
             "totalQuantity at the smallest Long",
             json!({"consumableResourceName": "negative-min", "totalQuantity": i64::MIN}),
             "totalQuantity",
+            400,
         ),
         (
             "a resourceType outside the documented pair",
             json!({"consumableResourceName": "bad-type", "resourceType": "RECYCLABLE"}),
             "resourceType",
+            400,
         ),
         (
             "a documented resourceType in the wrong case",
             json!({"consumableResourceName": "lower-type", "resourceType": "replenishable"}),
             "resourceType",
+            400,
         ),
         (
             "an empty resourceType",
             json!({"consumableResourceName": "empty-type", "resourceType": ""}),
             "resourceType",
+            400,
         ),
     ];
 
-    for (case, body, named) in refusals {
+    for (case, body, named, expected_status) in refusals {
         let requested = body["consumableResourceName"]
             .as_str()
             .unwrap_or_default()
             .to_string();
         let (status, refused) = create(&batch, body).await;
         assert_eq!(
-            status, 400,
-            "case {case:?}: expected HTTP 400, got {status} {refused}"
+            status, expected_status,
+            "case {case:?}: expected HTTP {expected_status}, got {status} {refused}"
         );
         assert_eq!(
             error_code(&refused),

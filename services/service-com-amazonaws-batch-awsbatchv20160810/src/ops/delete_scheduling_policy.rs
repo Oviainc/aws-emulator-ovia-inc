@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteSchedulingPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteSchedulingPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Deletes the scheduling policy `arn` names and returns the modelled empty 200. The
+//! deletion reaches the SAME store every reader reads, so a policy this call removed is
+//! gone from `DescribeSchedulingPolicies` (and its name is free for a later create)
+//! rather than lingering behind a successful teardown.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteSchedulingPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Three rules, each from the operation's own contract:
+//!
+//! * `arn` is "the Amazon Resource Name (ARN) of the scheduling policy to delete", so an
+//!   identifier that cannot name a policy — neither that ARN nor the name it carries — is
+//!   refused with the modelled `ClientException`
+//!   ([`crate::state::is_scheduling_policy_reference`]);
+//! * "You can't delete a scheduling policy that's used in any job queues" — an ARN a job
+//!   queue still names is refused with the same modelled error
+//!   ([`crate::state::SCHEDULING_POLICY_IN_USE`]);
+//! * an identifier that resolves to no stored policy is ALREADY in the state this call
+//!   asks for, so it answers the empty success and changes nothing — the same idempotent
+//!   delete `DeleteConsumableResource` answers.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -137,18 +147,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteSchedulingPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteSchedulingPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteSchedulingPolicy"))
+        use crate::state as batch;
+
+        // `ctx` carries the region every ARN of this service is minted in, which is the
+        // region an ARN identifier must name.
+        let Some(state) = batch::service_state(&*self.engine) else {
+            return Err(DeleteSchedulingPolicyErrorModeled::ServerException(
+                batch::unreachable_state(),
+            )
+            .into());
+        };
+        let region = batch::request_region(ctx);
+        // An identifier that cannot name a scheduling policy this endpoint serves is
+        // refused; one of the right shape that names nothing stored has already been
+        // deleted.
+        if !batch::is_scheduling_policy_reference(&region, &input.arn) {
+            return Err(DeleteSchedulingPolicyErrorModeled::ClientException(
+                batch::client_exception_enveloped(batch::SCHEDULING_POLICY_ARN_NOT_VALID),
+            )
+            .into());
+        }
+        let now = batch::now_millis();
+        let mut state = state.lock();
+        state.materialize_due(now);
+
+        // An identifier that resolves to nothing names a policy that has already been
+        // deleted, so this answers the same empty success and writes nothing.
+        let Some(name) = state.scheduling_policy_name(&input.arn) else {
+            return Ok(DeleteSchedulingPolicyOutput {});
+        };
+        let Some(stored_arn) = state
+            .scheduling_policies
+            .get(&name)
+            .map(|policy| policy.arn.clone())
+        else {
+            return Ok(DeleteSchedulingPolicyOutput {});
+        };
+        // "You can't delete a scheduling policy that's used in any job queues."
+        if state
+            .job_queues
+            .values()
+            .any(|queue| queue.scheduling_policy_arn.as_deref() == Some(stored_arn.as_str()))
+        {
+            return Err(DeleteSchedulingPolicyErrorModeled::ClientException(
+                batch::client_exception(batch::SCHEDULING_POLICY_IN_USE),
+            )
+            .into());
+        }
+        state.scheduling_policies.remove(&name);
+        state.scheduling_policies_by_arn.remove(&stored_arn);
+        Ok(DeleteSchedulingPolicyOutput {})
     }
 }

@@ -8,6 +8,19 @@
 //! is reported once. This is a REPORTING operation: it writes nothing, so two reads at the
 //! same instant answer identically.
 //!
+//! A policy is identified HERE by its ARN alone — `arns` is "a list of up to 100 scheduling
+//! policy Amazon Resource Name (ARN) entries" — so an entry of any other shape (a bare
+//! name, an ARN of another region, account, partition or resource kind) is refused with the
+//! modelled `ClientException` ([`crate::state::is_scheduling_policy_arn`]), and so is an
+//! `arns` list that names nothing at all
+//! ([`crate::state::SCHEDULING_POLICY_ARNS_REQUIRED`]), which is REQUIRED. An ARN of the
+//! right shape that names no stored policy is reported as absent instead.
+//!
+//! The detail carries the members AWS always materialises: the tag map of a policy created
+//! without tags is present and empty, and a fair-share policy is present with all three of
+//! its members, zero-valued where the create left them out — including for a policy created
+//! with neither policy kind ([`crate::state::materialized_fairshare_policy`]).
+//!
 //! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
@@ -141,13 +154,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as batch;
 
-        let _ = ctx;
         let Some(state) = batch::service_state(&*self.engine) else {
             return Err(DescribeSchedulingPoliciesErrorModeled::ServerException(
                 batch::unreachable_state(),
             )
             .into());
         };
+        // `ctx` carries the region every ARN of this service is minted in, which is the
+        // region an entry of `arns` must name.
+        let region = batch::request_region(ctx);
 
         // "A list of up to 100 scheduling policy Amazon Resource Name (ARN) entries"
         // (`arns`). The model types the list without a length constraint, so the bound is
@@ -162,6 +177,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // `arns` is REQUIRED: it carries the identity of what to describe, so a request
+        // that names nothing identifies nothing and is refused — unlike the readers whose
+        // filter list is optional (`DescribeComputeEnvironments`, `DescribeJobQueues`,
+        // `DescribeServiceEnvironments`), where an absent or empty list means "all".
+        if input.arns.is_empty() {
+            return Err(DescribeSchedulingPoliciesErrorModeled::ClientException(
+                batch::client_exception_enveloped(batch::SCHEDULING_POLICY_ARNS_REQUIRED),
+            )
+            .into());
+        }
+        // Every entry is an ARN of this endpoint's own: a bare name, or an ARN of another
+        // region, account, partition or resource kind, names no scheduling policy here, so
+        // it is refused rather than reported as absent.
+        if !input
+            .arns
+            .iter()
+            .all(|reference| batch::is_scheduling_policy_arn(&region, reference))
+        {
+            return Err(DescribeSchedulingPoliciesErrorModeled::ClientException(
+                batch::client_exception_enveloped(batch::SCHEDULING_POLICY_ARN_NOT_VALID),
+            )
+            .into());
+        }
 
         let state = state.lock();
         let mut seen = ::std::collections::HashSet::new();
@@ -173,9 +211,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|policy| SchedulingPolicyDetail {
                 name: policy.name.clone(),
                 arn: policy.arn.clone(),
-                fairshare_policy: policy.fairshare_policy.clone(),
+                // Always materialised on a fair-share policy, zero-valued where the create
+                // left a member out; a quota-share policy carries none.
+                fairshare_policy: batch::materialized_fairshare_policy(
+                    policy.fairshare_policy.as_ref(),
+                    policy.quota_share_policy.as_ref(),
+                ),
                 quota_share_policy: policy.quota_share_policy.clone(),
-                tags: policy.tags.clone(),
+                tags: batch::materialized_tags(&policy.tags),
             })
             .collect();
 

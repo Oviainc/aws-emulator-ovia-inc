@@ -228,7 +228,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             retry_strategy: job.retry_strategy.clone(),
             timeout_config: job.timeout_config.clone(),
             preemption_configuration: job.preemption_configuration.clone(),
-            tags: job.tags.clone(),
+            tags: batch::materialized_tags(&job.tags),
             // A service job's work is dispatched to another service, which nothing here
             // runs, so no attempt, capacity usage or preemption is invented for it.
             attempts: None,

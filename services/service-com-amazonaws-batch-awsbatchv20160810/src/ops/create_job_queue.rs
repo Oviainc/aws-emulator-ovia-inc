@@ -155,7 +155,7 @@ pub type CreateJobQueueError = crate::scaffolded::Scaffolded<CreateJobQueueError
 /// this operation is implemented.
 impl From<CreateJobQueueErrorModeled> for CreateJobQueueError {
     fn from(modeled: CreateJobQueueErrorModeled) -> Self {
-        crate::scaffolded::Scaffolded::Modeled(modeled)
+        Self::Modeled(modeled)
     }
 }
 
@@ -208,10 +208,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.materialize_due(now);
 
         if state.job_queues.contains_key(&input.job_queue_name) {
-            return Err(CreateJobQueueErrorModeled::ClientException(batch::client_exception(
-                batch::OBJECT_ALREADY_EXISTS,
-            ))
-            .into());
+            // A name collision is a CONFLICT: the bare detail, answered with the status
+            // AWS answers rather than the model's `httpError`.
+            return Err(crate::scaffolded::Scaffolded::modeled_with_status(
+                CreateJobQueueErrorModeled::ClientException(batch::client_exception(
+                    batch::OBJECT_ALREADY_EXISTS,
+                )),
+                batch::CONFLICT_STATUS,
+            ));
         }
 
         if state.job_queues.len() >= batch::limits::MAX_JOB_QUEUES {
