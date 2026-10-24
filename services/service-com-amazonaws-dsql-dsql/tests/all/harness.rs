@@ -289,6 +289,16 @@ pub fn expected_arn(region: &str, identifier: &str) -> String {
     )
 }
 
+/// The ARN `StreamArn`'s pattern requires for a stream of a cluster: the stream is
+/// nested UNDER its cluster's resource path
+/// (`cluster/{cluster}/stream/{stream}`, `state::stream_arn`).
+pub fn expected_stream_arn(region: &str, cluster: &str, stream: &str) -> String {
+    format!(
+        "arn:aws:dsql:{region}:{}:cluster/{cluster}/stream/{stream}",
+        engine::EMULATOR_ACCOUNT_ID
+    )
+}
+
 /// A syntactically valid cluster id for a cluster that was never created.
 pub fn absent_identifier() -> String {
     "zzzzzzzzzzzzzzzzzzzzzzzzzz".to_string()

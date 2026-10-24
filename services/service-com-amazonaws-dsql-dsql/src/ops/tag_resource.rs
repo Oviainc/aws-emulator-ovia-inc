@@ -8,14 +8,18 @@
 //! here, is how a tag is removed.
 //!
 //! The resource an ARN names is resolved the way this service's other ARN-addressed
-//! operations resolve it, through [`crate::state::parse_resource_arn`]: an ARN that
-//! names no Aurora DSQL resource at all is a bad request (400 `ValidationException`),
-//! and a well-formed one naming nothing this store holds answers the modelled 404.
-//! Only the cluster is resolved, exactly as in `ListTagsForResource`; a stream's
-//! nested ARN answers that 404 (see the lookup below). A tag is resource metadata
-//! rather than cluster configuration, so tagging drives no status change and is
-//! accepted for any cluster that exists, including one the clock still owes its
-//! `ACTIVE` status.
+//! operations resolve it, through [`crate::state::parse_resource_arn`] and then the
+//! one shared resolver [`crate::state::ComAmazonawsDsqlDsqlState::resource_tags_mut`]:
+//! an ARN that names no Aurora DSQL resource at all is a bad request (400
+//! `ValidationException`), and a well-formed one naming nothing this store holds
+//! answers the modelled 404. EVERY tagged resource of this service resolves —  a
+//! cluster (`cluster/{cluster}`) and a stream of it
+//! (`cluster/{cluster}/stream/{stream}`) — each to its OWN tag map, exactly as in
+//! `ListTagsForResource` and `UntagResource`, so a tag write and a tag read never
+//! disagree about which ARNs name something here. A tag is resource metadata rather
+//! than resource configuration, so tagging drives no status change and is accepted
+//! for any resource that exists, including one the clock still owes its terminal
+//! status.
 //!
 //! ## Shape of an operation
 //!
@@ -198,22 +202,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // whose deletion came due is not found here either.
         state.settle(std::time::SystemTime::now());
 
-        let held = match resource.resource_type.as_str() {
-            crate::state::RESOURCE_TYPE_CLUSTER => state
-                .clusters
-                .get_mut(&resource.resource_id)
-                .map(|cluster| &mut cluster.tags),
-            // Any OTHER type segment names no resource this operation resolves, so
-            // the answer is the modelled 404. A stream is addressed by the nested
-            // ARN `cluster/{cluster}/stream/{stream}` (`crate::state::stream_arn`),
-            // which the parser splits at the first `/` and so arrives above as the
-            // `cluster` type with a compound id that matches no stored cluster: tags
-            // on a stream are reachable through neither this operation nor the
-            // `ListTagsForResource` beside it yet, and belong to that gap's own
-            // issue rather than to this one.
-            _ => None,
-        };
-        let Some(held) = held else {
+        // The one resolution of a tagging ARN, shared with `ListTagsForResource` and
+        // `UntagResource`: it walks every tagged resource of this service — a cluster,
+        // and a stream of a cluster addressed by its nested ARN
+        // `cluster/{cluster}/stream/{stream}` (`crate::state::stream_arn`) — to that
+        // resource's own tag map. A well-formed ARN naming nothing this store holds
+        // answers the modelled 404, whichever of the two it names.
+        let Some(held) = state.resource_tags_mut(&resource) else {
             return Err(TagResourceErrorModeled::ResourceNotFoundException(
                 crate::state::resource_not_found(
                     &input.resource_arn,

@@ -9,11 +9,13 @@
 //! `TagMap`'s published maximum, and an ARN that resolves to no stored resource is
 //! refused (404) rather than tagged.
 //!
-//! The tables span the class the rule generalises over: the shape of the prior tag set
-//! (none, disjoint, colliding, both), the size and characters of the keys and values
-//! (`TagKey` / `TagValue` at their published bounds, every character class the pattern
-//! allows), the count (one, several, forty, and the map at its ceiling) and the region.
-//! The recorded case — a cluster created, then tagged — is one row.
+//! The tables span the class the rule generalises over: the KIND of tagged resource the
+//! ARN names (a cluster, and a stream of a cluster — the two resources of this service
+//! that carry tags), the shape of the prior tag set (none, disjoint, colliding, both),
+//! the size and characters of the keys and values (`TagKey` / `TagValue` at their
+//! published bounds, every character class the pattern allows), the count (one, several,
+//! forty, and the map at its ceiling) and the region. The recorded case — a cluster
+//! created, then tagged — is one row.
 //!
 //! The client is the shared `Dsql` harness in `harness.rs`, which spells the
 //! `/tags/{resourceArn}` routes, the `@httpLabel` encoding and the modelled tag bounds
@@ -25,8 +27,8 @@ use std::collections::BTreeMap;
 use serde_json::{json, Map, Value};
 
 use crate::harness::{
-    absent_identifier, expected_arn, wait_for_the_clock, Answer, Dsql, TAG_KEY_MAX, TAG_MAP_MAX,
-    TAG_VALUE_MAX,
+    absent_identifier, expected_arn, expected_stream_arn, wait_for_the_clock, Answer, Dsql,
+    TAG_KEY_MAX, TAG_MAP_MAX, TAG_VALUE_MAX,
 };
 
 /// `POST /tags/{resourceArn}` with `tags`.
@@ -344,21 +346,22 @@ async fn tagging_an_arn_that_names_no_stored_resource_is_not_found() {
         ),
         (
             // The nested form `cluster/{cluster}/stream/{stream}` a stream ARN
-            // really takes (`state::stream_arn`): the parser splits it at the first
-            // `/`, so it addresses the `cluster` type with a compound id that names
-            // no stored cluster. A stream that exists answers the same 404 today —
-            // neither this operation nor the `ListTagsForResource` beside it
-            // resolves a stream ARN yet, which is that gap's own issue — so this row
-            // pins the ARN FORM, with a stream id that was never created.
-            "a stream's real nested ARN form, never created",
-            format!(
-                "arn:aws:dsql:us-east-1:{}:cluster/{}/stream/{}",
-                engine::EMULATOR_ACCOUNT_ID,
-                live,
-                absent_identifier()
-            ),
+            // really takes (`state::stream_arn`) does resolve — see
+            // `tagging_resolves_every_tagged_resource_by_its_own_arn` — so this row
+            // is about a stream of a LIVE cluster that was never created: the
+            // cluster resolves, the stream under it does not, and the answer is the
+            // modelled 404. The parser splits the resource field at its first `/`,
+            // so the error names the `cluster` type with the compound id.
+            "a stream of a live cluster, never created",
+            expected_stream_arn("us-east-1", &live, &absent_identifier()),
             "cluster",
             format!("{live}/stream/{}", absent_identifier()),
+        ),
+        (
+            "a stream of a cluster that was never created either",
+            expected_stream_arn("us-east-1", &absent_identifier(), &absent_identifier()),
+            "cluster",
+            format!("{}/stream/{}", absent_identifier(), absent_identifier()),
         ),
         (
             "a cluster ARN written with a colon before the id",
@@ -556,4 +559,242 @@ async fn tagging_past_the_per_resource_ceiling_is_refused_in_full() {
         "overwrite at the ceiling",
         after_overwrite.len()
     );
+}
+
+/// A `targetDefinition` naming a Kinesis destination, as `CreateStream` requires.
+/// Source: `smithy_query(query="shape", shape="KinesisTargetDefinition")` — a
+/// `streamArn` and a `roleArn`.
+fn kinesis_target(region: &str) -> Value {
+    let account = engine::EMULATOR_ACCOUNT_ID;
+    json!({"kinesis": {
+        "streamArn": format!("arn:aws:kinesis:{region}:{account}:stream/changes"),
+        "roleArn": format!("arn:aws:iam::{account}:role/dsql-cdc"),
+    }})
+}
+
+/// Which tagged resource of this service a case addresses. Source: the model's two
+/// resources that carry a `TagMap` — a cluster (`CreateCluster.tags` /
+/// `GetCluster.tags`) and a stream of one (`CreateStream.tags` / `GetStream.tags`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    Cluster,
+    Stream,
+}
+
+/// One `TagResource` call against ONE kind of tagged resource, with a resource of the
+/// OTHER kind standing beside it so a case also pins that only the addressed one moves.
+struct ResourceCase {
+    name: String,
+    region: &'static str,
+    kind: Kind,
+    /// The tags the ADDRESSED resource is created with.
+    initial: BTreeMap<String, String>,
+    request: BTreeMap<String, String>,
+    expected: BTreeMap<String, String>,
+}
+
+/// The tags the resource a case does NOT address is created with, so an assertion can
+/// tell one resource's map from the other's.
+fn sibling_tags() -> BTreeMap<String, String> {
+    tags(&[("env", "prod"), ("owner", "team-a")])
+}
+
+fn resource_cases() -> Vec<ResourceCase> {
+    let long_key = "k".repeat(TAG_KEY_MAX);
+    let long_value = "v".repeat(TAG_VALUE_MAX);
+    // Every character class `TagKey`'s pattern allows, in one key.
+    let every_class_key = "aZ9_.:/=+-@ x";
+
+    let mut cases = Vec::new();
+    for kind in [Kind::Cluster, Kind::Stream] {
+        cases.extend([
+            ResourceCase {
+                name: format!("{kind:?}: an untagged resource takes the one tag the call carries"),
+                region: "us-east-1",
+                kind,
+                initial: BTreeMap::new(),
+                request: tags(&[("env", "test")]),
+                expected: tags(&[("env", "test")]),
+            },
+            ResourceCase {
+                name: format!("{kind:?}: a key the resource does not hold is added, the rest kept"),
+                region: "eu-west-1",
+                kind,
+                initial: tags(&[("env", "test"), ("scope", "cdc")]),
+                request: tags(&[("owner", "team-b")]),
+                expected: tags(&[("env", "test"), ("owner", "team-b"), ("scope", "cdc")]),
+            },
+            ResourceCase {
+                name: format!("{kind:?}: a key the resource already holds takes the new value"),
+                region: "ap-southeast-2",
+                kind,
+                initial: tags(&[("env", "test"), ("scope", "cdc")]),
+                request: tags(&[("env", "staging"), ("tier", "1")]),
+                expected: tags(&[("env", "staging"), ("scope", "cdc"), ("tier", "1")]),
+            },
+            ResourceCase {
+                name: format!("{kind:?}: an empty tag map leaves the resource as it was"),
+                region: "us-east-2",
+                kind,
+                initial: tags(&[("env", "test")]),
+                request: BTreeMap::new(),
+                expected: tags(&[("env", "test")]),
+            },
+            ResourceCase {
+                name: format!(
+                    "{kind:?}: a key at TagKey's {TAG_KEY_MAX}-character maximum and a value at TagValue's {TAG_VALUE_MAX}"
+                ),
+                region: "us-west-1",
+                kind,
+                initial: tags(&[(every_class_key, every_class_key)]),
+                request: BTreeMap::from([(long_key.clone(), long_value.clone())]),
+                expected: BTreeMap::from([
+                    (every_class_key.to_string(), every_class_key.to_string()),
+                    (long_key.clone(), long_value.clone()),
+                ]),
+            },
+        ]);
+
+        // Count: forty tags at once, over a prior set of a different size.
+        let initial = numbered_tags("kept", 10);
+        let request = numbered_tags("added", 40);
+        let mut expected = initial.clone();
+        expected.extend(request.clone());
+        cases.push(ResourceCase {
+            name: format!("{kind:?}: forty tags added to the ten the resource already held"),
+            region: "us-west-2",
+            kind,
+            initial,
+            request,
+            expected,
+        });
+    }
+    cases
+}
+
+/// RULE: `TagResource` resolves `resourceArn` through the one resolution every tagging
+/// operation of this service uses, so EVERY resource of it that carries tags — a
+/// cluster, and a stream nested under a cluster's ARN — is tagged by its own ARN, the
+/// merge landing in that resource's OWN tag map and nowhere else; an ARN whose nested
+/// resource does not exist stays the modelled 404.
+#[tokio::test]
+async fn tagging_resolves_every_tagged_resource_by_its_own_arn() {
+    // The clock check below is one wall-clock wait, so it runs once per resource kind
+    // rather than once per row.
+    let mut settle_checked: Vec<Kind> = Vec::new();
+    for case in resource_cases() {
+        let dsql = Dsql::in_region(case.region);
+        let (cluster_initial, stream_initial) = match case.kind {
+            Kind::Cluster => (case.initial.clone(), sibling_tags()),
+            Kind::Stream => (sibling_tags(), case.initial.clone()),
+        };
+
+        let (cluster, cluster_arn) = cluster_with_tags(&dsql, &cluster_initial).await;
+        // `CreateStream` refuses a cluster the clock still owes its `ACTIVE` status,
+        // so the cluster is settled before the stream beside it is created.
+        wait_for_the_clock().await;
+        let created = dsql
+            .create_stream(
+                &cluster,
+                json!({
+                    "format": "JSON",
+                    "ordering": "UNORDERED",
+                    "targetDefinition": kinesis_target(case.region),
+                    "tags": tag_object(&stream_initial),
+                }),
+            )
+            .await;
+        assert_eq!(
+            created.status, 200,
+            "case {:?}: CreateStream must answer 200, got {} {:?}",
+            case.name, created.status, created.body
+        );
+        let stream = created.str("streamIdentifier");
+        let stream_arn = created.str("arn");
+        assert_eq!(
+            stream_arn,
+            expected_stream_arn(case.region, &cluster, &stream),
+            "case {:?}: CreateStream must answer the stream's nested ARN, got {stream_arn:?}",
+            case.name
+        );
+
+        let (target_arn, sibling_arn) = match case.kind {
+            Kind::Cluster => (cluster_arn.clone(), stream_arn.clone()),
+            Kind::Stream => (stream_arn.clone(), cluster_arn.clone()),
+        };
+
+        let tagged = tag_resource(&dsql, &target_arn, &case.request).await;
+        assert_eq!(
+            tagged.status, 200,
+            "case {:?}: TagResource on {target_arn:?} must answer 200, got {} {:?}",
+            case.name, tagged.status, tagged.body
+        );
+
+        // The resource's OWN reader, and the shared tag reader, must both report the
+        // merge — a hardcoded answer in one of them cannot satisfy both.
+        let own = match case.kind {
+            Kind::Cluster => dsql.get(&cluster).await,
+            Kind::Stream => dsql.get_stream(&cluster, &stream).await,
+        };
+        assert_eq!(
+            reported_tags(&own),
+            case.expected,
+            "case {:?}: expected the resource's own reader to report {:?}, got {:?}",
+            case.name,
+            case.expected,
+            reported_tags(&own)
+        );
+        let listed = list_tags(&dsql, &target_arn).await;
+        assert_eq!(
+            reported_tags(&listed),
+            case.expected,
+            "case {:?}: expected ListTagsForResource to report {:?}, got {:?}",
+            case.name,
+            case.expected,
+            reported_tags(&listed)
+        );
+
+        // The other resource's map is a DIFFERENT map: tagging one never writes it.
+        let sibling = list_tags(&dsql, &sibling_arn).await;
+        assert_eq!(
+            reported_tags(&sibling),
+            sibling_tags(),
+            "case {:?}: the resource beside it must keep {:?}, got {:?}",
+            case.name,
+            sibling_tags(),
+            reported_tags(&sibling)
+        );
+
+        // `@idempotent`: the same call again leaves the same tag set.
+        let again = tag_resource(&dsql, &target_arn, &case.request).await;
+        assert_eq!(
+            again.status, 200,
+            "case {:?}: a repeated TagResource must answer 200, got {} {:?}",
+            case.name, again.status, again.body
+        );
+        let after_repeat = list_tags(&dsql, &target_arn).await;
+        assert_eq!(
+            reported_tags(&after_repeat),
+            case.expected,
+            "case {:?}: a repeated call must leave {:?}, got {:?}",
+            case.name,
+            case.expected,
+            reported_tags(&after_repeat)
+        );
+
+        // And the tag survives the clock settling the resource's status, so the write
+        // landed in the stored resource rather than in anything per-request.
+        if !settle_checked.contains(&case.kind) {
+            settle_checked.push(case.kind);
+            wait_for_the_clock().await;
+            let settled = list_tags(&dsql, &target_arn).await;
+            assert_eq!(
+                reported_tags(&settled),
+                case.expected,
+                "case {:?}: the merge must survive the settle, got {:?}",
+                case.name,
+                reported_tags(&settled)
+            );
+        }
+    }
 }
