@@ -20,9 +20,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::SystemTime;
 
 use crate::ops::types::{
-    Campaign, CampaignSummary, ChannelSubtypeConfig, CommunicationLimitsConfig,
-    CommunicationTimeConfig, EncryptionConfig, EntryLimitsConfig, InstanceConfig,
-    InstanceOnboardingJobStatus, Schedule, Source,
+    Campaign, CampaignSummary, ChannelSubtypeConfig, CommunicationLimits,
+    CommunicationLimitsConfig, CommunicationTimeConfig, EncryptionConfig, EntryLimitsConfig,
+    InstanceConfig, InstanceOnboardingJobStatus, Schedule, Source,
 };
 
 /// The ARN namespace (and SigV4 signing name) this service's ARNs carry, as the
@@ -102,6 +102,35 @@ pub fn campaign_id_from_arn(arn: &str) -> Option<&str> {
     }
     let (resource_type, id) = resource.split_once('/')?;
     (resource_type == CAMPAIGN_RESOURCE_TYPE && !id.is_empty()).then_some(id)
+}
+
+/// The most entries a `communicationLimitsList` carries.
+///
+/// Source: the `@length` of `CommunicationLimits$communicationLimitsList`, whose
+/// maximum is 2.
+pub const MAX_COMMUNICATION_LIMITS: usize = 2;
+
+/// Why a communication-limits config is a bad request, or `None` when it is within
+/// the model's bounds.
+///
+/// The one place this service checks a `CommunicationLimits` union against the
+/// `@length` its list member carries, so every operation that accepts one
+/// (`CreateCampaign`, `UpdateCampaignCommunicationLimits`) refuses an over-long list
+/// the same way. `member` is the request path the refusal names, so the message is
+/// built from the request rather than fixed text.
+pub fn communication_limits_violation(
+    member: &str,
+    limits: Option<&CommunicationLimits>,
+) -> Option<String> {
+    let count = match limits? {
+        CommunicationLimits::communicationLimitsList(list) => list.len(),
+    };
+    (count > MAX_COMMUNICATION_LIMITS).then(|| {
+        format!(
+            "Value at '{member}' failed to satisfy constraint: \
+             Member must have length less than or equal to {MAX_COMMUNICATION_LIMITS}"
+        )
+    })
 }
 
 /// Encode a `ListCampaigns` cursor: the creation sequence number of the last
