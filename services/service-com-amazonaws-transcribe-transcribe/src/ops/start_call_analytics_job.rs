@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartCallAnalyticsJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartCallAnalyticsJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Records one Call Analytics job and answers the record it just stored, which
+//! `GetCallAnalyticsJob` reads back and `ListCallAnalyticsJobs` pages over. A job is
+//! `IN_PROGRESS` from the moment it is started — the queue this operation documents
+//! is entered only when an account exceeds its Concurrent Job Limit, a concurrency
+//! ceiling this emulator does not model — and the clock owes it `COMPLETED` a
+//! [`crate::state::JOB_TRANSITION_DELAY`] later.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartCallAnalyticsJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! NOTHING IS ANALYSED: no call is transcribed, no call characteristic, sentiment or
+//! summary is derived and no category is matched, so the `Transcript` URI a completed
+//! job reports names a location nothing writes to (see
+//! [`crate::state::call_analytics_output_uri`]), and the `MediaFormat` /
+//! `MediaSampleRateHertz` the real service DETECTS from the media file stay absent.
+//! The job RECORD is what this emulates.
+//!
+//! The member combinations the request documents but the model cannot express — a
+//! `Media` naming neither `MediaFileUri` nor `RedactedMediaFileUri`,
+//! `Settings.VocabularyFilterMethod` with a `VocabularyFilterName`, and two
+//! `ChannelDefinitions` naming one channel or one participant role — are refused with
+//! the modelled `BadRequestException`.
 //!
 //! ## Shape of an operation
 //!
@@ -216,18 +226,170 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartCallAnalyticsJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartCallAnalyticsJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartCallAnalyticsJob"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StartCallAnalyticsJobErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some(
+                        "this service is mounted on an engine that holds no Transcribe state"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+
+        // `Media` is required but every member of it is optional, so the boundary
+        // validator cannot refuse a `Media` that names no media. This operation
+        // documents `Media (MediaFileUri or RedactedMediaFileUri)` as a required
+        // request parameter: "With Call Analytics, you can redact the audio contained
+        // in your media file by including RedactedMediaFileUri, instead of
+        // MediaFileUri, to specify the location of your input audio."
+        let names_media = [
+            input.media.media_file_uri.as_deref(),
+            input.media.redacted_media_file_uri.as_deref(),
+        ]
+        .iter()
+        .flatten()
+        .any(|uri| !uri.trim().is_empty());
+        if !names_media {
+            return Err(bad_request(
+                "Your request must include one of Media.MediaFileUri or \
+                 Media.RedactedMediaFileUri. Specify the Amazon S3 location of your \
+                 input audio and try your request again.",
+            ));
+        }
+
+        // "Note that if you include VocabularyFilterName in your request, you must
+        // also include VocabularyFilterMethod" (model doc for
+        // `CallAnalyticsJobSettings$VocabularyFilterName`).
+        if let Some(settings) = input.settings.as_ref() {
+            if settings.vocabulary_filter_name.is_some()
+                && settings.vocabulary_filter_method.is_none()
+            {
+                return Err(bad_request(
+                    "Settings.VocabularyFilterMethod is required when \
+                     Settings.VocabularyFilterName is set. Correct your request and try \
+                     again.",
+                ));
+            }
+        }
+
+        // One definition per channel, each naming a different participant: "if your
+        // agent is the first participant to speak, you would set ChannelId to 0 (to
+        // indicate the first channel) and ParticipantRole to AGENT" (model doc for
+        // `ChannelDefinition`). The boundary validator has already refused a list that
+        // is not exactly two long and a `ChannelId` outside `@range(min: 0, max: 1)`,
+        // so what is left to refuse is two definitions that name the same channel or
+        // the same role — the rule `StartMedicalScribeJob` applies to its own channel
+        // definitions. `ParticipantRole` is OPTIONAL here ("Omitting this parameter is
+        // equivalent to specifying both participants"), so only roles the request
+        // actually named are compared: a definition that omits the role names no role
+        // to clash with.
+        if let Some(definitions) = input.channel_definitions.as_deref() {
+            let distinct_channels = definitions
+                .iter()
+                .map(|definition| definition.channel_id)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len();
+            let named_roles: Vec<&str> = definitions
+                .iter()
+                .filter_map(|definition| definition.participant_role.as_deref())
+                .collect();
+            let distinct_roles = named_roles
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len();
+            if distinct_channels != definitions.len() || distinct_roles != named_roles.len() {
+                return Err(bad_request(
+                    "Each ChannelDefinition must name a different ChannelId and a different \
+                     ParticipantRole. Correct your request and try again.",
+                ));
+            }
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+
+        // "This name is case sensitive, cannot contain spaces, and must be unique
+        // within an Amazon Web Services account. If you try to create a new job with
+        // the same name as an existing job, you get a ConflictException error."
+        if store
+            .call_analytics_jobs
+            .contains_key(&input.call_analytics_job_name)
+        {
+            return Err(StartCallAnalyticsJobErrorModeled::ConflictException(
+                ConflictException {
+                    // The kind, not the caller's name — see
+                    // [`crate::state::name_already_exists_message`].
+                    message: Some(crate::state::name_already_exists_message(
+                        crate::state::KIND_JOB,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The account's job quota: the store holds at most
+        // `MAX_CALL_ANALYTICS_JOBS` jobs of this family, and a start beyond that is
+        // refused with the error this operation models for an exceeded quota rather
+        // than growing the store without bound.
+        if store.call_analytics_jobs.len() >= crate::state::MAX_CALL_ANALYTICS_JOBS {
+            return Err(StartCallAnalyticsJobErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "You have reached the limit of {} Call Analytics jobs for this \
+                         account. Delete a job you no longer need and try your request again.",
+                        crate::state::MAX_CALL_ANALYTICS_JOBS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let sequence = store.next_sequence();
+        let record = crate::state::CallAnalyticsJobRecord {
+            name: input.call_analytics_job_name.clone(),
+            sequence,
+            status: crate::state::STATUS_IN_PROGRESS.to_string(),
+            media: input.media,
+            output_location: input.output_location,
+            output_encryption_kms_key_id: input.output_encryption_kms_key_id,
+            data_access_role_arn: input.data_access_role_arn,
+            region,
+            settings: input.settings,
+            channel_definitions: input.channel_definitions,
+            transcript: None,
+            failure_reason: None,
+            creation_time: now,
+            start_time: Some(now),
+            completion_time: None,
+            completion_due: now + crate::state::JOB_TRANSITION_DELAY,
+            tags: input.tags.unwrap_or_default(),
+        };
+
+        // The response is the record just stored, never the request echoed back.
+        let job = record.to_job();
+        ::tracing::info!(
+            operation = "StartCallAnalyticsJob",
+            job = %record.name,
+            status = %record.status,
+            region = %record.region,
+            "Call Analytics job started"
+        );
+        store.call_analytics_jobs.insert(record.name.clone(), record);
+
+        Ok(StartCallAnalyticsJobOutput {
+            call_analytics_job: Some(job),
+        })
     }
+}
+
+/// A `BadRequestException` (HTTP 400) refusing a request the model's own constraint
+/// traits cannot express.
+fn bad_request(message: &str) -> StartCallAnalyticsJobError {
+    StartCallAnalyticsJobErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message.to_string()),
+    })
+    .into()
 }
