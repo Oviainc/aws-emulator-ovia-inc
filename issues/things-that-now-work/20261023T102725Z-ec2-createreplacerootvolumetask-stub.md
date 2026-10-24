@@ -34,3 +34,30 @@ $headers.content-type: value_mismatch (expected 'text/xml;charset=UTF-8', got 't
 Boot the ec2 emulator
 Call CreateReplaceRootVolumeTask and observe HTTP 501 with no state persisted
 Replay any of the blocked units above and observe it fail on that refusal
+
+## Resolution
+
+Implemented: `CreateReplaceRootVolumeTask` starts one root volume replacement task for the
+instance the request names, stores it as `state::ReplaceRootVolumeTaskRecord` and answers
+it read back out of the store, so a later `DescribeReplaceRootVolumeTasks` reports the same
+task. The scaffold header line is gone. The four restore forms are mutually exclusive, each
+resource the request names is resolved before anything is stored, the task is handed back
+`pending` with the clock owing it `in-progress` and then `succeeded`, one `ClientToken`
+names one task, and `DryRun` reports whether the call would have succeeded without writing.
+Covered end to end by `tests/all/replace_root_volume_tasks.rs`.
+
+The recorded refusal of this operation (`ec2-instance-dependent-ops-error-paths#task#4`)
+also wanted the `<RequestID>` an EC2 error envelope closes with and the `charset` parameter
+on the media type. Both are answered by this service's `override_protocol` seam
+(`src/service.rs`: `RESPONSE_CONTENT_TYPE` and `with_error_request_id`), the second of which
+landed on mainline while this fix was being made; with them, that step no longer diverges.
+
+DECLINED — the `snapshotId` of the task (`ec2-replace-root-volume-task#task#6`, and the same
+member of the `DescribeReplaceRootVolumeTasks` report of it): a snapshot id is a value AWS
+mints per run. This emulator mints the AMI's root device snapshot id in the published
+`snap-` plus 17 lowercase hexadecimal digit form when the image is stored, reports that same
+id on every read of the image and of the task, and derives it from state rather than from
+the request — so the only difference from the recording is the value AWS itself generated
+when the recording was made. Answering with no snapshot at all was tried against the replay
+and diverges too (AWS reports one here), so the recorded value cannot be matched without
+fitting the recording, which is exactly what a per-run id may not be fitted to.

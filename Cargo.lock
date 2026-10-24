@@ -990,6 +990,57 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-sfn"
+version = "1.123.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c149c59d61748e843ef40e47db88a884148300dfa560c0d84b0fcf04f0c85c2f"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json 0.65.0",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema 1.1.0",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
+name = "aws-sdk-sns"
+version = "1.119.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0f4c47ebcc38f243e398cf0cc531c18a043944dc0f13d2bd0779e72a6043ec5c"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json 0.65.0",
+ "aws-smithy-observability",
+ "aws-smithy-query",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema 1.1.0",
+ "aws-smithy-types",
+ "aws-smithy-xml",
+ "aws-types",
+ "fastrand",
+ "http",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-sqs"
 version = "1.117.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8460,6 +8511,9 @@ dependencies = [
  "aws-emulator-smithy-macros",
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
+ "aws-sdk-lambda",
+ "aws-sdk-sfn",
+ "aws-sdk-sns",
  "aws-sdk-sqs",
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",
@@ -8468,6 +8522,10 @@ dependencies = [
  "hex",
  "http",
  "serde_json",
+ "service-com-amazonaws-cloudwatch-graniteserviceversion20100801",
+ "service-com-amazonaws-iam-awsidentitymanagementv20100508",
+ "service-com-amazonaws-sfn-awsstepfunctions",
+ "service-com-amazonaws-sns-amazonsimplenotificationservice",
  "service-com-amazonaws-sqs-amazonsqs",
  "service-common",
  "sha2 0.10.9",

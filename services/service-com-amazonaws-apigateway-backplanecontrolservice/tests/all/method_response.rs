@@ -260,13 +260,13 @@ async fn the_status_codes_a_method_response_takes_are_the_ones_the_pattern_admit
         assert_failure(
             &answer,
             400,
-            "ValidationException",
+            "BadRequestException",
             &format!("PutMethodResponse({status})"),
         );
         assert_failure(
             &get_method_response(&gateway, &api, &resource, "GET", status).await,
             400,
-            "ValidationException",
+            "BadRequestException",
             &format!("GetMethodResponse({status})"),
         );
     }

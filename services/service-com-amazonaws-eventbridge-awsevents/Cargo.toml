@@ -32,6 +32,21 @@ service-common = { path = "../common" }
 # client is needed — the emulator supplies the transport, so the SDK's own HTTPS
 # stack and runtime are left out.
 aws-sdk-sqs = { version = "1", default-features = false }
+# The clients for the other target kinds a rule's matched event is delivered to,
+# over the same in-process callback: a Lambda function (`Invoke`), an SNS topic
+# (`Publish`) and a Step Functions state machine (`StartExecution`).
+aws-sdk-lambda = { version = "1", default-features = false }
+aws-sdk-sns = { version = "1", default-features = false }
+aws-sdk-sfn = { version = "1", default-features = false }
+# `FailedInvocations`, the metric EventBridge counts an undeliverable event on,
+# is appended to the CloudWatch store in the SAME shared engine (the `AWS/Events`
+# namespace). CloudWatch refuses a `PutMetricData` into a reserved `AWS/`
+# namespace, so a service's own metrics never travel over that API; this writes
+# the very store `ListMetrics`/`GetMetricStatistics` read.
+service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
+# The IAM store a target's `RoleArn` is resolved against, to decide whether
+# EventBridge may assume that role and make the target's API call under it.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -39,10 +54,17 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
-# SQS is mounted beside EventBridge on one engine in the delivery tests, because a
-# rule's target is an SQS queue and a delivery is asserted where a client sees it:
-# on the queue.
+# `tokio::time` drives the tests' wait past a connection transition's due instant.
+tokio = { workspace = true, features = ["time"] }
+# The services a rule's targets live in are mounted beside EventBridge on one
+# engine in the delivery tests, because a delivery is asserted where a client sees
+# it: on the queue, on the topic, on the state machine's executions — and the role
+# a target names, plus the metric a failed delivery counts, live in IAM and
+# CloudWatch.
 service-com-amazonaws-sqs-amazonsqs = { workspace = true }
+service-com-amazonaws-sns-amazonsimplenotificationservice = { workspace = true }
+service-com-amazonaws-sfn-awsstepfunctions = { workspace = true }
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 
 [lints]
 workspace = true

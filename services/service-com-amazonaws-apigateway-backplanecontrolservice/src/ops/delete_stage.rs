@@ -176,6 +176,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some(crate::state::no_such_rest_api(&input.rest_api_id)),
             })
         })?;
+        // "Deletes a Stage resource": removing the record is what makes a later `GetStage`
+        // — and the API's `GetStages` listing — stop reporting it. A stage name that names
+        // no stage is nothing to delete, so the call is refused rather than answering a
+        // silent success. Nothing else about the stage conditions the removal: a stage
+        // serving a deployment, carrying a cache cluster or holding tags goes the same
+        // way, which is what makes two concurrent deletes of one stage resolve to one
+        // success and one `NotFoundException` rather than to a conflict.
+        //
         // A stage name names one stage of one API, so removing that key removes the
         // record — and only it. The deployment the stage pointed at is a record of the
         // API in its own right: a deployment outlives the stages that serve it, which is

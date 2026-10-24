@@ -290,6 +290,17 @@ fn validate_tag_key(member: &str, key: &str) -> Result<(), StateError> {
 /// and neither models a not-found for this surface.
 pub const IDENTITY_PROVIDER_NOT_VALID: &str = "Identity provider is not valid";
 
+/// What the USER-ASSOCIATION plane says about an identity provider that no LIVE
+/// registration of this account is for.
+///
+/// One sentence in one place, because it is one resolution: `AssociateUser` creates an
+/// association through the registration of the directory it names and
+/// `ListUserAssociations` reports the associations of that same directory, so both resolve
+/// it with [`ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsState::provider_key_is_registered`]
+/// and both answer their modelled `ResourceNotFoundException` carrying this.
+pub const IDENTITY_PROVIDER_NOT_REGISTERED: &str =
+    "the identity provider is not registered for user-based subscriptions";
+
 /// Why an operation could not be served from state.
 ///
 /// Each handler maps this onto its OWN modelled error enum (the generated enums are
@@ -319,10 +330,12 @@ pub enum StateError {
     ///   `UnauthorizedException` instead, disclosing nothing about whether the provider
     ///   exists.
     ///
-    /// `AssociateUser` is neither: it resolves its registration itself and answers its own
-    /// modelled `ResourceNotFoundException`, because the fact its authorization is about —
-    /// the caller's ownership of the EC2 instance — has already been established by the
-    /// time the directory is resolved, so there is nothing left to withhold.
+    /// The USER-ASSOCIATION plane (`AssociateUser`, `ListUserAssociations`) is neither: it
+    /// resolves the directory's registration itself and answers its own modelled
+    /// `ResourceNotFoundException` carrying [`IDENTITY_PROVIDER_NOT_REGISTERED`], because
+    /// the fact its authorization is about — the caller's ownership of the EC2 instance —
+    /// has already been established by the time the directory is resolved, so there is
+    /// nothing left to withhold.
     ProviderNotRegistered,
 }
 
@@ -905,11 +918,25 @@ impl ComAmazonawsLicensemanagerusersubscriptionsLicensemanagerusersubscriptionsS
             .filter(|record| !deregistration_started(&record.status))
     }
 
-    /// The user associations in association order.
-    pub fn instance_users_in_order(&self) -> Vec<InstanceUserRecord> {
+    /// The user associations of one identity provider on one EC2 instance, in association
+    /// order.
+    ///
+    /// An association is to a DIRECTORY (see [`InstanceUserRecord`]), so the provider is
+    /// named by its [`provider_key`] rather than by a registration ARN — the same key
+    /// `instance_user_index` is keyed on. Both halves of the scope are required because
+    /// every caller addresses one: `ListUserAssociations` models `IdentityProvider` and
+    /// `InstanceId` as required members, so there is no unscoped list to serve.
+    pub fn instance_users_in_order(
+        &self,
+        provider_key: &str,
+        instance_id: &str,
+    ) -> Vec<InstanceUserRecord> {
         self.instance_user_order
             .iter()
-            .filter_map(|arn| self.instance_users.get(arn).cloned())
+            .filter_map(|arn| self.instance_users.get(arn))
+            .filter(|record| record.provider_key == provider_key)
+            .filter(|record| record.instance_id == instance_id)
+            .cloned()
             .collect()
     }
 

@@ -389,7 +389,7 @@ async fn a_quota_period_outside_the_modelled_value_set_is_refused() {
     let gateway = Gateway::new();
     // `QuotaSettings$period` targets the modelled `QuotaPeriodType` enum, so a value
     // outside that set is refused by the boundary validator before the handler runs — the
-    // 400 `ValidationException` this service answers every modelled-constraint violation
+    // 400 `BadRequestException` this service answers every modelled-constraint violation
     // with (see the `validation_message_rules` suite). Rows: a value of another period
     // vocabulary, the right value in the wrong case, and the empty string.
     for period in ["YEAR", "day", ""] {
@@ -404,7 +404,7 @@ async fn a_quota_period_outside_the_modelled_value_set_is_refused() {
                 })),
             )
             .await;
-        assert_failure(&answer, 400, "ValidationException", &case);
+        assert_failure(&answer, 400, "BadRequestException", &case);
     }
 }
 

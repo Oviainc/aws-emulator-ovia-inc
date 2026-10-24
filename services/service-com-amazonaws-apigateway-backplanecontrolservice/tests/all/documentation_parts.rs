@@ -815,8 +815,8 @@ async fn a_body_that_is_not_a_documentation_set_is_refused_and_changes_nothing()
     }
 
     // A mode outside the documented value set is refused too — by the boundary
-    // validator, which enforces the modelled `PutMode` enum before the handler runs, so
-    // the code is `ValidationException` rather than the operation's own 400.
+    // validator, which enforces the modelled `PutMode` enum before the handler runs, and
+    // which names the same `BadRequestException` the operation's own refusals do.
     let answer = import_parts(
         &gateway,
         &api,
@@ -825,7 +825,7 @@ async fn a_body_that_is_not_a_documentation_set_is_refused_and_changes_nothing()
         &import_body(&[(json!({ "type": "API" }), json!({ "info": {} }))]),
     )
     .await;
-    assert_failure(&answer, 400, "ValidationException", "mode=replace");
+    assert_failure(&answer, 400, BAD_REQUEST, "mode=replace");
 
     // An unknown API is a not found, not a bad request.
     let answer = import_parts(

@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RejectDomainNameAccessAssociation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RejectDomainNameAccessAssociation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RejectDomainNameAccessAssociation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! PARTLY IMPLEMENTED — REFUSALS ONLY: both ARNs are read and resolved against stored
+//! state, so a malformed pair answers the modelled `BadRequestException` (400) and a
+//! well-formed pair naming records this emulator does not hold answers the modelled
+//! `NotFoundException` (404). The SUCCESS path is still the scaffold's 501: nothing can
+//! store a domain-name access association while `CreateDomainNameAccessAssociation` is a
+//! stub, so what a rejection removes is written by the change that lands that create —
+//! which is also the change that removes the 501 below.
 //!
 //! ## Shape of an operation
 //!
@@ -76,6 +74,51 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::TaggedResource;
+
+/// The ARN resource kind `domainNameAccessAssociationArn` must name: the first path
+/// segment of the operation that reads a domain name access association
+/// (`smithy_query(query="operation", operation="DeleteDomainNameAccessAssociation")`:
+/// `/domainnameaccessassociations/{domainNameAccessAssociationArn}`).
+const ACCESS_ASSOCIATION_KIND: &str = "domainnameaccessassociations";
+
+/// The ARN resource kind `domainNameArn` must name: the first path segment of the
+/// operation that reads a domain name (`smithy_query(query="operation",
+/// operation="GetDomainName")`: `/domainnames/{domainName}`).
+const DOMAIN_NAME_KIND: &str = "domainnames";
+
+/// Read one of this operation's two ARNs as the resource of `kind` it must name.
+///
+/// Both members are ARNs of resources of THIS service, so they are read through
+/// [`crate::state::parse_tagged_resource`] — the one place this service reads a
+/// caller-supplied ARN — and then held to the kind the member names. A value that is not
+/// an ARN at all, an ARN of another vendor, or an ARN naming another kind of resource is
+/// a malformed request rather than a missing one.
+fn arn_of_kind(
+    value: &str,
+    kind: &str,
+) -> Result<TaggedResource, RejectDomainNameAccessAssociationError> {
+    crate::state::parse_tagged_resource(value)
+        .filter(|resource| resource.kind() == kind)
+        .ok_or_else(|| bad_request(crate::state::invalid_arn(value)))
+}
+
+/// A request this service cannot read: the bad request it is.
+fn bad_request(message: String) -> RejectDomainNameAccessAssociationError {
+    RejectDomainNameAccessAssociationErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// A well-formed ARN whose resource this emulator holds no record of.
+fn not_found(message: String) -> RejectDomainNameAccessAssociationError {
+    RejectDomainNameAccessAssociationErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -173,18 +216,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RejectDomainNameAccessAssociation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RejectDomainNameAccessAssociationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RejectDomainNameAccessAssociation"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // Both ARNs are read BEFORE the store is reached, so a request this service
+        // cannot read resolves nothing: a malformed pair is a client error (400), which
+        // is a different answer from a well-formed pair naming records that do not exist
+        // (404). Each member is held to the kind of resource it names, so the ARN of some
+        // other API Gateway resource is refused the way a non-ARN is.
+        let association = arn_of_kind(
+            &input.domain_name_access_association_arn,
+            ACCESS_ASSOCIATION_KIND,
+        )?;
+        let domain_name = arn_of_kind(&input.domain_name_arn, DOMAIN_NAME_KIND)?;
+
+        let store = state.lock();
+        // "Rejects a domain name access association with a private custom domain name":
+        // the call resolves the domain name the association was requested on and the
+        // association itself, and both must name records this emulator holds. A domain
+        // name can be one (`CreateDomainName` stores it); an access association cannot
+        // yet, because `CreateDomainNameAccessAssociation` is still a scaffold. The lookup
+        // is the SAME one the tag operations resolve an ARN with, so when that create
+        // lands this operation resolves its records with no change here.
+        store.holds(&domain_name).map_err(not_found)?;
+        store.holds(&association).map_err(not_found)?;
+        // Unreachable while nothing can store an access association, which is why it is
+        // the scaffold's 501 rather than a success: what a rejection REMOVES belongs with
+        // the record, so it is written by the change that stores one instead of guessed
+        // at here. Every request a caller can make today is answered above, by this
+        // operation's own modelled errors.
+        drop(store);
+        Err(crate::scaffolded::Scaffolded::not_implemented(
+            "RejectDomainNameAccessAssociation",
+        ))
     }
 }
