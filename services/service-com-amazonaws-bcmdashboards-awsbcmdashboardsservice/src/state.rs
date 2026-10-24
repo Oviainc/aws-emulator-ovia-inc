@@ -9,8 +9,8 @@
 //! tagging operations share, the pagination cursor codec) are shared by those handlers
 //! rather than duplicated per operation.
 
-use std::collections::BTreeMap;
-use std::time::SystemTime;
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     DashboardReference, DateTimeRange, HealthStatus, ResourceTag, ScheduleConfig, ScheduledReport,
@@ -32,6 +32,30 @@ pub const SCHEDULE_STATE_ENABLED: &str = "ENABLED";
 /// scheduled report is configured properly and has all required permissions to
 /// execute", which is what a report this service accepted at create time is.
 pub const HEALTH_STATUS_HEALTHY: &str = "HEALTHY";
+
+/// The other `HealthStatusCode` (`HEALTH_STATUS_CODE_VALUES`): the model documents
+/// `UNHEALTHY` as "the scheduled report is unable to deliver the notification … and
+/// your action is needed", with the reasons in `statusReasons`.
+pub const HEALTH_STATUS_UNHEALTHY: &str = "UNHEALTHY";
+
+/// The `StatusReason` (`STATUS_REASON_VALUES`) for a scheduled report whose
+/// `dashboardArn` names no dashboard this account stores any more — the dashboard the
+/// report renders was deleted after the report was created.
+pub const STATUS_REASON_DASHBOARD_NOT_FOUND: &str = "DASHBOARD_NOT_FOUND";
+
+/// The `StatusReason` (`STATUS_REASON_VALUES`) for a scheduled report whose
+/// `widgetIds` name a widget its dashboard does not hold — the widget was removed from
+/// the dashboard after the report was created.
+pub const STATUS_REASON_WIDGET_ID_NOT_FOUND: &str = "WIDGET_ID_NOT_FOUND";
+
+/// How long the `clientToken` of an `ExecuteScheduledReport` call keeps answering with
+/// that call's outcome instead of triggering a second execution.
+///
+/// CITED, not chosen: the model documents the window on the operation itself — "If a
+/// `clientToken` is provided, the service uses it for idempotency. Requests with the
+/// same client token will not trigger a new execution within the same minute."
+/// (`smithy_query(query="doc",shape="ExecuteScheduledReport")`). One minute.
+pub const EXECUTION_IDEMPOTENCY_WINDOW: Duration = Duration::from_secs(60);
 
 /// The prefix a pagination cursor carries, so a token this service did not mint is
 /// rejected instead of being read as a resume point.
@@ -161,6 +185,19 @@ pub struct ScheduledReportRecord {
 }
 
 impl ScheduledReportRecord {
+    /// The `ScheduleState` this report's schedule is in: the stored value, or
+    /// [`SCHEDULE_STATE_ENABLED`] for a record stored without one. `state` is resolved
+    /// at write time by [`resolve_schedule_config`], so the fallback only covers a
+    /// record written before that resolution existed; keeping it in ONE place is what
+    /// lets every reader and `ExecuteScheduledReport` agree on whether a report's
+    /// schedule is enabled.
+    pub fn schedule_state(&self) -> &str {
+        self.schedule_config
+            .state
+            .as_deref()
+            .unwrap_or(SCHEDULE_STATE_ENABLED)
+    }
+
     /// This record projected onto the modelled `ScheduledReport` shape that
     /// `GetScheduledReport` (and the other readers) return: the stored record's own
     /// fields, never request input.
@@ -206,11 +243,7 @@ impl ScheduledReportRecord {
                 .schedule_expression
                 .clone()
                 .unwrap_or_default(),
-            state: self
-                .schedule_config
-                .state
-                .clone()
-                .unwrap_or_else(|| SCHEDULE_STATE_ENABLED.to_string()),
+            state: self.schedule_state().to_string(),
             health_status: self.health_status.clone().unwrap_or_else(|| HealthStatus {
                 status_code: HEALTH_STATUS_HEALTHY.to_string(),
                 last_refreshed_at: None,
@@ -223,6 +256,22 @@ impl ScheduledReportRecord {
             widget_ids: self.widget_ids.clone(),
         }
     }
+}
+
+/// The outcome one `ExecuteScheduledReport` call recorded under the `clientToken` it
+/// presented, so a retry inside [`EXECUTION_IDEMPOTENCY_WINDOW`] answers that same
+/// outcome rather than triggering a second execution.
+///
+/// `arn` is the report the token executed: a token identifies ONE execution, so the
+/// same token presented for a different report inside the window is a conflicting
+/// reuse, not a retry, and is refused rather than answered with another report's
+/// outcome.
+#[derive(Debug, Clone)]
+pub struct ScheduledReportExecution {
+    pub arn: String,
+    pub executed_at: SystemTime,
+    pub execution_triggered: bool,
+    pub health_status: HealthStatus,
 }
 
 /// Per-service state for com-amazonaws-bcmdashboards-awsbcmdashboardsservice. A handler reaches it through [`service_state`].
@@ -248,6 +297,12 @@ pub struct ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState {
     /// caller presenting it wins and every later one is refused with the modelled
     /// `ConflictException`, so a retried token can never mint a second report.
     pub scheduled_report_client_tokens: BTreeMap<String, String>,
+    /// The `clientToken` of every `ExecuteScheduledReport` that has triggered (or
+    /// declined to trigger) an execution, mapped to that call's outcome. An entry lives
+    /// for [`EXECUTION_IDEMPOTENCY_WINDOW`] from the call that wrote it and is dropped
+    /// once the clock has closed its window ([`Self::expire_execution_tokens`]), so the
+    /// map a caller can grow stays bounded by the tokens of one minute's calls.
+    pub scheduled_report_executions: BTreeMap<String, ScheduledReportExecution>,
 }
 
 impl ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState {
@@ -362,6 +417,82 @@ impl ComAmazonawsBcmdashboardsAwsbcmdashboardsserviceState {
                 widget
             })
             .collect()
+    }
+
+    /// The health of `report` as this store can establish it at `now`.
+    ///
+    /// The model documents `HEALTHY` as "the scheduled report is configured properly and
+    /// has all required permissions to execute" and `UNHEALTHY` as the report being
+    /// unable to deliver, with the reasons in `statusReasons`
+    /// (`smithy_query(query="shape",shape="HealthStatus")`). So the status is DERIVED
+    /// from what this store holds, never from a request: a report is healthy exactly
+    /// while every resource its configuration points at still resolves —
+    ///
+    /// * the dashboard its `dashboardArn` names is still stored
+    ///   ([`STATUS_REASON_DASHBOARD_NOT_FOUND`] when it is not), and
+    /// * every id in its `widgetIds` is still a widget of that dashboard
+    ///   ([`STATUS_REASON_WIDGET_ID_NOT_FOUND`] when one is not).
+    ///
+    /// Reasons are reported in that order and at most once each. The other
+    /// `StatusReason` values name failures of resources outside this service (the
+    /// execution role, the cost data source), which this store holds nothing about and
+    /// therefore never claims.
+    ///
+    /// `lastRefreshedAt` is `now` because this call is the refresh.
+    pub fn scheduled_report_health(
+        &self,
+        report: &ScheduledReportRecord,
+        now: SystemTime,
+    ) -> HealthStatus {
+        let mut status_reasons: Vec<String> = Vec::new();
+        match self.dashboards.get(&report.dashboard_arn) {
+            None => status_reasons.push(STATUS_REASON_DASHBOARD_NOT_FOUND.to_string()),
+            Some(dashboard) => {
+                let present: BTreeSet<&str> = dashboard
+                    .widgets
+                    .iter()
+                    .filter_map(|widget| widget.id.as_deref())
+                    .collect();
+                let names_a_missing_widget = report
+                    .widget_ids
+                    .iter()
+                    .flatten()
+                    .any(|id| !present.contains(id.as_str()));
+                if names_a_missing_widget {
+                    status_reasons.push(STATUS_REASON_WIDGET_ID_NOT_FOUND.to_string());
+                }
+            }
+        }
+
+        let healthy = status_reasons.is_empty();
+        HealthStatus {
+            status_code: if healthy {
+                HEALTH_STATUS_HEALTHY.to_string()
+            } else {
+                HEALTH_STATUS_UNHEALTHY.to_string()
+            },
+            last_refreshed_at: Some(::aws_smithy_types::DateTime::from(now)),
+            // The model documents `statusReasons` as "only present when the status is
+            // UNHEALTHY", so a healthy report carries none rather than an empty list.
+            status_reasons: (!healthy).then_some(status_reasons),
+        }
+    }
+
+    /// Drop every execution idempotency record whose [`EXECUTION_IDEMPOTENCY_WINDOW`]
+    /// the clock has already closed at `now`.
+    ///
+    /// This is the one write an `ExecuteScheduledReport` call makes before it decides
+    /// anything: the expiry was owed at `now` whether or not anybody called, so
+    /// materialising it changes nothing a later caller could otherwise have seen — it
+    /// only stops an expired token from being read as a retry.
+    pub fn expire_execution_tokens(&mut self, now: SystemTime) {
+        self.scheduled_report_executions.retain(|_, execution| {
+            // A clock that went backwards yields `Err` here; treat that as "no time has
+            // passed" and keep the record rather than dropping it early.
+            now.duration_since(execution.executed_at)
+                .unwrap_or_default()
+                < EXECUTION_IDEMPOTENCY_WINDOW
+        });
     }
 }
 
