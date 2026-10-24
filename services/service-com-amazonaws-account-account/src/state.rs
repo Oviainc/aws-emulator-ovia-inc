@@ -22,6 +22,15 @@
 //! [`::emulator_server::emulator_account_id`]. So a standalone call and a
 //! management-account call that names that same id land on ONE record.
 //!
+//! The GovCloud slice hangs off that record too:
+//! [`Account::gov_cloud_account`] holds the GovCloud account linked to the
+//! standard account, which `GetGovCloudAccountInformation` reports. Creating a
+//! GovCloud account is an Organizations operation and not one this service
+//! binds, so the link is a fact the store HOLDS ([`GovCloudAccountLink`]),
+//! never one a read derives and never one this emulator invents: no account
+//! comes up linked, and a record carries a link only once something records
+//! one through [`Account::link_gov_cloud_account`].
+//!
 //! The Region opt-in slice hangs off that same record:
 //! [`Account::region_opt_status`] holds the opt status of every Region the
 //! account has been opted into or out of, which `EnableRegion` and
@@ -97,17 +106,31 @@ pub const OTP_LENGTH: usize = 6;
 /// AWS sends it to the phone number itself, and the only thing this service
 /// reports is the resulting status.
 pub fn new_otp() -> String {
-    let mut passcode = String::with_capacity(OTP_LENGTH);
-    while passcode.len() < OTP_LENGTH {
-        passcode.extend(
+    random_chars(OTP_LENGTH, char::is_ascii_alphanumeric)
+}
+
+/// `len` random characters, each one the uuid-backed randomness produced and
+/// `admitted` accepts.
+///
+/// The randomness is the `uuid` crate's, reached through `emulator_telemetry`'s
+/// uuid-backed id newtype (`BatchId::random()` is a v4 UUID rendered
+/// canonically), which this crate already depends on — the ONE generator behind
+/// every value this store mints, so nothing here is hand-rolled and two mints
+/// never agree by construction. A canonical UUID carries fewer than `len`
+/// admitted characters for a long enough `len`, so ids are drawn until the
+/// length is reached.
+fn random_chars(len: usize, admitted: fn(&char) -> bool) -> String {
+    let mut minted = String::with_capacity(len);
+    while minted.len() < len {
+        minted.extend(
             ::emulator_telemetry::BatchId::random()
                 .as_str()
                 .chars()
-                .filter(char::is_ascii_alphanumeric),
+                .filter(admitted),
         );
     }
-    passcode.truncate(OTP_LENGTH);
-    passcode
+    minted.truncate(len);
+    minted
 }
 
 /// What a handler reports when the engine it was built on carries no store for
@@ -689,6 +712,61 @@ impl PhoneNumberVerification {
     }
 }
 
+/// How many digits an account id has: `AccountId` is modelled `^\d{12}$`
+/// (`smithy_query(query="shape",shape="AccountId")`), so an id this emulator
+/// mints has to be twelve digits for a caller to be able to send it back.
+pub const ACCOUNT_ID_LENGTH: usize = 12;
+
+/// A fresh account id for a GovCloud account: [`ACCOUNT_ID_LENGTH`] digits,
+/// which satisfies `AccountId`'s modelled `^\d{12}$`.
+///
+/// Minted through [`random_chars`], the one generator this store draws from, so
+/// the id is never derived from the standard account's id and no two links name
+/// one GovCloud account. It is minted ONCE and stored, so every later read
+/// reports the same id.
+pub fn new_gov_cloud_account_id() -> String {
+    random_chars(ACCOUNT_ID_LENGTH, char::is_ascii_digit)
+}
+
+/// The GovCloud account linked to one standard account, as this emulator
+/// persists it.
+///
+/// A GovCloud account is brought into existence by an Organizations operation,
+/// never by anything Account Management binds, so this record is a fact the
+/// store HOLDS rather than one a read computes: an account record carrying one
+/// has a GovCloud account to report, and an account record without one has
+/// none. [`Account::link_gov_cloud_account`] is the seam whatever creates a
+/// GovCloud account records it through.
+#[derive(Debug, Clone)]
+pub struct GovCloudAccountLink {
+    /// The 12-digit account id of the linked GovCloud account (`^\d{12}$`).
+    pub gov_cloud_account_id: String,
+    /// The linked GovCloud account's OWN state: one of `AwsAccountState`'s
+    /// values (`AWS_ACCOUNT_STATE_VALUES` in `ops::types`), which is the
+    /// GovCloud account's state and not the standard account's.
+    pub state: String,
+}
+
+impl GovCloudAccountLink {
+    /// A link to a freshly minted, ACTIVE GovCloud account of the standard
+    /// account `standard_account_id`.
+    ///
+    /// A GovCloud account is a SEPARATE account from the standard one it is
+    /// linked to, so the id is minted until it differs from the standard
+    /// account's — the one thing a caller can check about a minted id without
+    /// having been told it.
+    pub fn active_for(standard_account_id: &str) -> Self {
+        let mut gov_cloud_account_id = new_gov_cloud_account_id();
+        while gov_cloud_account_id == standard_account_id {
+            gov_cloud_account_id = new_gov_cloud_account_id();
+        }
+        Self {
+            gov_cloud_account_id,
+            state: ACTIVE_ACCOUNT_STATE.to_string(),
+        }
+    }
+}
+
 /// One Amazon Web Services account, as this emulator persists it.
 #[derive(Debug, Clone)]
 pub struct Account {
@@ -741,6 +819,12 @@ pub struct Account {
     /// record names the number the passcode went to, so it stops applying when
     /// the primary contact's phone number changes.
     pub phone_verification: Option<PhoneNumberVerification>,
+    /// The GovCloud account linked to this standard account, and `None` while
+    /// this emulator holds no record of one: a GovCloud account is created by
+    /// an Organizations operation, so this emulator learns of a link only by
+    /// being told of it, and never invents one for an account whose id it was
+    /// merely handed.
+    pub gov_cloud_account: Option<GovCloudAccountLink>,
 }
 
 impl Account {
@@ -757,7 +841,17 @@ impl Account {
             region_opt_status: BTreeMap::new(),
             primary_email_update: None,
             phone_verification: None,
+            gov_cloud_account: None,
         }
+    }
+
+    /// Record the GovCloud account linked to this standard account.
+    ///
+    /// The write seam for whatever CREATES a GovCloud account; an account has
+    /// at most one, so this replaces any link the record already carried rather
+    /// than appending a second.
+    pub fn link_gov_cloud_account(&mut self, link: GovCloudAccountLink) {
+        self.gov_cloud_account = Some(link);
     }
 
     /// Materialise the primary email update completion the clock already owes:
@@ -913,6 +1007,13 @@ pub struct ComAmazonawsAccountAccountState {
 /// The store starts holding the caller's OWN account: that account exists
 /// before any call is made, so a reporting operation never has to create it.
 /// Its `created_date` is fixed here, at the one instant the store comes up.
+///
+/// No account comes up GovCloud-LINKED. Creating a GovCloud account is an
+/// Organizations operation and not one this service binds, so this emulator
+/// invents no such pair: a record gains a link only when something records one
+/// ([`Account::link_gov_cloud_account`]), and until then
+/// `GetGovCloudAccountInformation` reports that there is no GovCloud account to
+/// report.
 impl Default for ComAmazonawsAccountAccountState {
     fn default() -> Self {
         let own = default_account_id().to_string();
@@ -1144,6 +1245,18 @@ pub fn cannot_target_own_account() -> AccessDeniedException {
         message: "The operation failed because the management account can't specify its own \
                   AccountId; this operation acts on a member account of the organization"
             .to_string(),
+        error_type: None,
+    }
+}
+
+/// The `ResourceNotFoundException` payload for a standard account this emulator
+/// holds no GovCloud link for — "the operation failed because it specified a
+/// resource that can't be found". There is no GovCloud account to report, which
+/// is a different fact from the account itself being unreachable
+/// ([`account_not_accessible`]).
+pub fn gov_cloud_account_not_linked(standard_account_id: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: format!("No GovCloud account is linked to account {standard_account_id}"),
         error_type: None,
     }
 }
