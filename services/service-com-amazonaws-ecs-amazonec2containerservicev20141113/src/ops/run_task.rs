@@ -395,6 +395,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // Both rules below are cross-field: each is keyed on the REGISTERED task
+        // definition this call runs, which the model cannot express, so both are checked
+        // here — before any task is stored, since AWS runs nothing when it refuses.
+        //
+        // An `awsvpc` task gets its own elastic network interface, so the run has to say
+        // which subnets and security groups it takes.
+        if let Some(message) = crate::state::network_configuration_violation(
+            &definition.network_mode,
+            input.network_configuration.as_ref(),
+        ) {
+            return Err(RunTaskErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+        // ECS Exec signs its session with the TASK's role, so a run that enables it needs
+        // the revision to declare one.
+        if let Some(message) = crate::state::execute_command_violation(
+            input.enable_execute_command,
+            Some(&definition),
+            crate::state::EXECUTE_COMMAND_TASK_SUBJECT,
+        ) {
+            return Err(RunTaskErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         // A revision is placed with a launch type only where it was validated against
         // it (`TaskDefinition$compatibilities`), so a request that asks for one the
         // stored revision does not support is refused before any task is created.
@@ -449,6 +481,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
+        }
+
+        // The same rule through a CAPACITY PROVIDER: an Auto Scaling group provider's
+        // capacity is the container instances that group registers into the cluster, so a
+        // cluster with none has nowhere to place the task either — UNLESS the provider
+        // scales the group itself. `ManagedScaling`'s own doc: "When managed scaling is
+        // turned on, Amazon ECS manages the scale-in and scale-out actions of the Auto
+        // Scaling group", so the request is one Amazon ECS can satisfy by adding capacity
+        // and is accepted; with managed scaling off ("the user must manage the scaling of
+        // the Auto Scaling group") there is no capacity coming and the task is refused.
+        // A name no stored provider carries, and the predefined Fargate providers, name no
+        // Auto Scaling group of this account, so this decides nothing about them.
+        if guard.registered_container_instances(&cluster_name) == 0 {
+            if let Some(provider) = capacity_provider_name
+                .as_deref()
+                .and_then(|name| guard.capacity_providers.get(name))
+            {
+                if crate::state::needs_registered_capacity_now(provider) {
+                    return Err(RunTaskErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(
+                                crate::state::NO_CONTAINER_INSTANCES_MESSAGE.to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                }
+            }
         }
 
         // "The default value is the family name of the task definition (for example,

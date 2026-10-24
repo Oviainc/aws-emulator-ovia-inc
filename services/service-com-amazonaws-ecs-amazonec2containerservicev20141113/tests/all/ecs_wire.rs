@@ -192,6 +192,20 @@ pub(crate) async fn register_instance(
     string(&body["containerInstance"], "containerInstanceArn", case)
 }
 
+/// The `networkConfiguration` every launch of an `awsvpc` task definition has to carry:
+/// an `awsvpc` task gets its own elastic network interface, so `CreateService`,
+/// `UpdateService` and `RunTask` must say which subnets and security groups it takes
+/// (`AwsVpcConfiguration$subnets`/`$securityGroups`). The ids are EC2-shaped but never
+/// resolved: ECS stores the configuration it is given.
+pub(crate) fn awsvpc_network_configuration() -> Value {
+    json!({
+        "awsvpcConfiguration": {
+            "subnets": ["subnet-0123456789abcdef0"],
+            "securityGroups": ["sg-0123456789abcdef0"],
+        }
+    })
+}
+
 /// Create a cluster and return its ARN.
 pub(crate) async fn create_cluster(
     router: &MultiServiceRouter,

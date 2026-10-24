@@ -149,7 +149,8 @@ pub fn validate_stage_name(stage_name: &str) -> Result<(), String> {
 }
 
 /// The `Stage` body for a stored stage — the one place this crate renders that shape, so
-/// `CreateStage`, `CreateDeployment` and `GetStage` cannot report a record differently.
+/// `CreateStage`, `CreateDeployment`, `GetStage` and `UpdateStage` cannot report a record
+/// differently.
 ///
 /// `methodSettings` is reported even when empty: every stage has the map, and it is what
 /// `UpdateStage` fills. `cacheClusterStatus` is computed from the stored record (see

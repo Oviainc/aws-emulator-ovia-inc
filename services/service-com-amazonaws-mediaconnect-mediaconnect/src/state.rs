@@ -65,6 +65,18 @@ pub const GATEWAY_STATE_DELETING: &str = "DELETING";
 /// [`StoredGateway::deleted_at`]).
 pub const GATEWAY_STATE_DELETED: &str = "DELETED";
 
+/// The `RouterInputState` enum the model declares for a router input
+/// (`smithy_query(query="shape",shape="RouterInputState")`: CREATING | STANDBY | STARTING
+/// | ACTIVE | STOPPING | DELETING | UPDATING | ERROR | RECOVERING | MIGRATING). Only the
+/// one a DELETE reaches is named here; the states a router input is created, started,
+/// stopped or updated into belong to those operations, which are still scaffolded.
+///
+/// There is no terminal `DELETED` value beside it — unlike `GatewayState`, which carries
+/// one (see [`GATEWAY_STATE_DELETED`]) — so a deleted router input is a resource that
+/// stops existing rather than one that stays readable: it is reported `DELETING` while the
+/// deletion is in progress and is then gone (see [`StoredRouterInput::removal_due_at`]).
+pub const ROUTER_INPUT_STATE_DELETING: &str = "DELETING";
+
 /// The `BridgeState` enum the model declares for a bridge
 /// (`smithy_query(query="shape",shape="BridgeState")`: CREATING | STANDBY | STARTING |
 /// DEPLOYING | ACTIVE | STOPPING | DELETING | DELETED | START_FAILED | START_PENDING |
@@ -1504,6 +1516,56 @@ impl StoredGateway {
     }
 }
 
+/// A router input, as the service holds it between calls. Every router input operation's
+/// response is computed from this record.
+///
+/// Keyed in the store by its own ARN, which is what every router input operation addresses
+/// one by (`@httpLabel Arn`) and which carries the input's generated id, so two router
+/// inputs that share a name are still distinct resources.
+#[derive(Debug, Clone)]
+pub struct StoredRouterInput {
+    /// The `RouterInputArn` this service minted for the input — its identity, and the key
+    /// it is stored under.
+    pub arn: String,
+    /// `RouterInput$Name` / `DeleteRouterInputResponse$Name`, as the create request gave
+    /// it.
+    pub name: String,
+    /// `RouterInput$State` / `DeleteRouterInputResponse$State`: one value of the modelled
+    /// `RouterInputState` enum (see [`ROUTER_INPUT_STATE_DELETING`]).
+    pub state: String,
+    /// When the record stops existing, or `None` while the input is not being deleted.
+    ///
+    /// A router input delete is not instantaneous and it is not a soft delete: the input
+    /// reports `DELETING` for one [`TRANSITION_SPAN`], and then it is gone, because
+    /// `RouterInputState` declares no terminal state a deleted input could be reported in.
+    /// Holding the instant rather than sleeping for it is what lets the delete answer
+    /// `DELETING` while a later call sees the input removed; the removal itself is
+    /// materialised by [`ComAmazonawsMediaconnectMediaconnectState::settle_due_transitions`],
+    /// because it was owed at this instant whether or not anybody called.
+    pub removal_due_at: Option<SystemTime>,
+}
+
+impl StoredRouterInput {
+    /// Whether this input is already on its way out: DeleteRouterInput accepted a delete
+    /// for it, so a repeat of that `@idempotent` call answers the same response rather than
+    /// restarting the deletion.
+    pub fn is_deleting(&self) -> bool {
+        self.removal_due_at.is_some()
+    }
+
+    /// Whether the clock has made this input's removal due at `now`.
+    pub fn is_removal_due(&self, now: SystemTime) -> bool {
+        self.removal_due_at.is_some_and(|due_at| now >= due_at)
+    }
+
+    /// Enter `DELETING` now and owe the record's removal once [`TRANSITION_SPAN`] has
+    /// passed — the router input counterpart of [`StoredGateway::begin_transition`].
+    pub fn begin_deletion(&mut self, now: SystemTime) {
+        self.state = ROUTER_INPUT_STATE_DELETING.to_string();
+        self.removal_due_at = Some(now + TRANSITION_SPAN);
+    }
+}
+
 /// The modelled `BridgeSource` a request entry configures, or `None` when the entry
 /// names neither a flow source nor a network source.
 ///
@@ -2076,6 +2138,17 @@ pub struct ComAmazonawsMediaconnectMediaconnectState {
     /// the model puts no uniqueness rule on `Bridge$Name`, and the bridge id in the ARN
     /// is what keeps two same-named bridges apart.
     pub bridges: BTreeMap<String, StoredBridge>,
+    /// Every router input the store holds, keyed by its ARN. Ordered, so ListRouterInputs
+    /// pages stably once it is implemented.
+    ///
+    /// A deleted router input leaves this map one [`TRANSITION_SPAN`] after the delete
+    /// (see [`StoredRouterInput::removal_due_at`]): the model declares no terminal
+    /// `DELETED` state it could be reported in, so unlike a gateway it is not retained.
+    ///
+    /// There is no index by name beside it, for the same reason as [`Self::gateways`]: the
+    /// model puts no uniqueness rule on `RouterInput$Name`, and the input id in the ARN is
+    /// what keeps two same-named router inputs apart.
+    pub router_inputs: BTreeMap<String, StoredRouterInput>,
     /// Every router output, keyed by its ARN — the identity every router output
     /// operation addresses one by (`@httpLabel Arn`, and the `Arns` BatchGetRouterOutput
     /// reads them by). Ordered, so ListRouterOutputs can page stably.
@@ -2115,7 +2188,8 @@ impl ComAmazonawsMediaconnectMediaconnectState {
     }
 
     /// Settle every flow, gateway, bridge and router output whose status change the clock
-    /// already made due.
+    /// already made due, and materialise the removal of every router input whose deletion
+    /// has come due.
     pub fn settle_due_transitions(&mut self, now: SystemTime) {
         for flow in self.flows.values_mut() {
             flow.settle(now);
@@ -2129,6 +2203,12 @@ impl ComAmazonawsMediaconnectMediaconnectState {
         for router_output in self.router_outputs.values_mut() {
             router_output.settle(now);
         }
+        // A router input whose removal the clock has made due stops existing: the deletion
+        // was owed at that instant whether or not anybody called, and `RouterInputState`
+        // declares no terminal state the record could be reported in afterwards (see
+        // [`StoredRouterInput::removal_due_at`]).
+        self.router_inputs
+            .retain(|_, router_input| !router_input.is_removal_due(now));
     }
 
     /// How many LIVE gateways the store holds — the count [`MAX_GATEWAYS`] bounds.
@@ -2228,6 +2308,19 @@ pub fn gateway_resource_fragment(suffix: u64, name: &str) -> String {
 /// is this service's own, shaped like every other ARN it mints.
 pub fn bridge_resource_fragment(suffix: u64, name: &str) -> String {
     format!("bridge:1-{suffix:08x}:{name}")
+}
+
+/// The resource fragment of a router input ARN: `routerInput:<id>`, with the id
+/// [`router_resource_id`] mints for every router resource.
+///
+/// The modelled `RouterInputArn` pattern
+/// (`smithy_query(query="shape",shape="RouterInputArn")`:
+/// `^arn:(aws[a-zA-Z-]*):mediaconnect:[a-z0-9-]+:[0-9]{12}:routerInput:[a-z0-9]{12}$`)
+/// fixes the id at exactly twelve `[a-z0-9]` characters and carries NO name segment, so
+/// unlike [`flow_resource_fragment`] the fragment is the id alone — the same shape as
+/// [`router_output_resource_fragment`].
+pub fn router_input_resource_fragment(id: &str) -> String {
+    format!("routerInput:{id}")
 }
 
 /// The resource fragment of an output ARN: `output:<output id>:<name>`.
@@ -2553,6 +2646,29 @@ pub fn is_mintable_bridge_arn(arn: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-')
         && is_valid_bridge_name(bridge_name)
+}
+
+/// Whether `arn` is a router input ARN this service could have minted: the prefix
+/// [`has_mintable_arn_prefix`] describes for the `routerInput` resource type, then an id of
+/// the form [`router_resource_id`] mints — the router input counterpart of
+/// [`is_mintable_router_output_arn`].
+///
+/// This function is the crate's ONE encoding of the modelled `RouterInputArn` constraint
+/// (`smithy_query(query="shape",shape="RouterInputArn")`:
+/// `^arn:(aws[a-zA-Z-]*):mediaconnect:[a-z0-9-]+:[0-9]{12}:routerInput:[a-z0-9]{12}$`),
+/// checked segment by segment; the integration test asserts minted ARNs through it, so
+/// there is no second spelling that can drift from it.
+pub fn is_mintable_router_input_arn(arn: &str) -> bool {
+    let segments: Vec<&str> = arn.split(':').collect();
+    let [.., router_input_id] = segments.as_slice() else {
+        return false;
+    };
+    segments.len() == 7
+        && has_mintable_arn_prefix(&segments, "routerInput")
+        && router_input_id.len() == 12
+        && router_input_id
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
 }
 
 /// Whether `arn` is a flow ARN this service could have minted.

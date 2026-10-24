@@ -60,6 +60,11 @@ mod cloudtrail_channel_routing;
 mod connect_signing_name_routing;
 #[path = "all/dynamodb_streams_routing.rs"]
 mod dynamodb_streams_routing;
+// Declared HERE, in the sorted list, rather than appended at the end of this file: the
+// tail is where every landing in the same window appends, so it is the contended region,
+// while this span of the sorted list is untouched by those appends.
+#[path = "all/ecs_service_target_group_association.rs"]
+mod ecs_service_target_group_association;
 // Declared HERE, in the sorted list, rather than appended at the end of this file like
 // the most recent suites: the tail is where every landing in the same window appends, so
 // it is the contended region now, while this span of the sorted list is untouched by

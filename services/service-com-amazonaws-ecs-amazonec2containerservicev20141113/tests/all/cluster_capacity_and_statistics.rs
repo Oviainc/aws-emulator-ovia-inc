@@ -29,8 +29,8 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::ecs_wire::{
-    cluster_with_capacity, count, create_cluster, list, ok, refusal, refused, register_capacity,
-    service, string,
+    awsvpc_network_configuration, cluster_with_capacity, count, create_cluster, list, ok, refusal,
+    refused, register_capacity, service, string,
 };
 use crate::task_lifecycle::container;
 
@@ -175,18 +175,18 @@ async fn each_launch_types_statistics_count_only_the_tasks_placed_with_it() {
         } else {
             register_bridge(&router, &family, case).await;
         }
-        let run = ok(
-            &router,
-            "RunTask",
-            json!({
-                "cluster": cluster,
-                "taskDefinition": family,
-                "launchType": launch_type,
-                "count": placed,
-            }),
-            case,
-        )
-        .await;
+        let mut request = json!({
+            "cluster": cluster,
+            "taskDefinition": family,
+            "launchType": launch_type,
+            "count": placed,
+        });
+        if awsvpc {
+            // An `awsvpc` revision is launched with the network configuration its
+            // elastic network interface takes.
+            request["networkConfiguration"] = awsvpc_network_configuration();
+        }
+        let run = ok(&router, "RunTask", request, case).await;
         assert_eq!(
             list(&run, "tasks", case).len() as i64,
             placed,
@@ -251,11 +251,14 @@ async fn a_launch_type_the_revision_was_not_validated_against_is_refused() {
     ];
 
     for (case, family, launch_type, supported) in rows {
-        let request = json!({
+        let mut request = json!({
             "cluster": "compat",
             "taskDefinition": family,
             "launchType": launch_type,
         });
+        if family == "awsvpcfam" {
+            request["networkConfiguration"] = awsvpc_network_configuration();
+        }
         if supported {
             let run = ok(&router, "RunTask", request, case).await;
             assert_eq!(
@@ -323,6 +326,7 @@ async fn a_platform_version_outside_the_published_list_is_refused() {
                 "taskDefinition": "platformfam",
                 "launchType": "FARGATE",
                 "platformVersion": version,
+                "networkConfiguration": awsvpc_network_configuration(),
             }),
             &case,
         )
@@ -417,7 +421,11 @@ async fn a_cluster_with_no_registered_capacity_cannot_place_a_task_on_it() {
         ),
         (
             "FARGATE needs no registered capacity",
-            json!({ "taskDefinition": "awsvpcfam", "launchType": "FARGATE" }),
+            json!({
+                "taskDefinition": "awsvpcfam",
+                "launchType": "FARGATE",
+                "networkConfiguration": awsvpc_network_configuration(),
+            }),
             false,
         ),
     ];

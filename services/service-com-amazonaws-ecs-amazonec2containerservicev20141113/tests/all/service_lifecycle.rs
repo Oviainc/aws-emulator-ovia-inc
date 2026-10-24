@@ -18,7 +18,10 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::ecs_wire::{count, list, ok, refused, service, string, ACCOUNT, SIGNED_REGION};
+use crate::ecs_wire::{
+    awsvpc_network_configuration, count, list, ok, refused, service, string, ACCOUNT,
+    SIGNED_REGION,
+};
 use crate::task_lifecycle::container;
 
 /// Long enough for one clock-owed task transition (`state::TRANSITION_SPAN` is 500 ms)
@@ -242,6 +245,7 @@ async fn service_create_reads_back_with_the_task_set_its_scheduler_placed() {
             "serviceName": test.service_name,
             "taskDefinition": reference,
             "desiredCount": test.desired,
+            "networkConfiguration": awsvpc_network_configuration(),
             "tags": [{ "key": "env", "value": "test" }],
         });
         if let Some(launch_type) = test.launch_type {
@@ -481,6 +485,7 @@ async fn update_service_moves_the_task_count_in_both_directions() {
             "taskDefinition": "scalingfamily",
             "desiredCount": 2,
             "launchType": "EC2",
+            "networkConfiguration": awsvpc_network_configuration(),
         }),
         "setup",
     )
@@ -593,6 +598,7 @@ async fn a_new_deployment_replaces_the_task_set_it_inherited() {
             "taskDefinition": format!("deployingfamily:{}", second_revision - 1),
             "desiredCount": 2,
             "launchType": "EC2",
+            "networkConfiguration": awsvpc_network_configuration(),
         }),
         "setup",
     )
@@ -711,6 +717,7 @@ async fn the_cluster_counts_the_services_and_tasks_it_holds() {
                 "taskDefinition": "countedfamily",
                 "desiredCount": desired,
                 "launchType": launch_type,
+                "networkConfiguration": awsvpc_network_configuration(),
             }),
             case,
         )
@@ -817,6 +824,7 @@ async fn a_service_request_that_cannot_be_satisfied_is_refused() {
             "taskDefinition": "refusingfamily",
             "desiredCount": 1,
             "launchType": "EC2",
+            "networkConfiguration": awsvpc_network_configuration(),
         }),
         "setup",
     )
@@ -832,6 +840,7 @@ async fn a_service_request_that_cannot_be_satisfied_is_refused() {
                 "serviceName": "not a service name",
                 "taskDefinition": "refusingfamily",
                 "desiredCount": 1,
+                "networkConfiguration": awsvpc_network_configuration(),
             }),
             "InvalidParameterException",
         ),
@@ -843,6 +852,7 @@ async fn a_service_request_that_cannot_be_satisfied_is_refused() {
                 "serviceName": "s".repeat(256),
                 "taskDefinition": "refusingfamily",
                 "desiredCount": 1,
+                "networkConfiguration": awsvpc_network_configuration(),
             }),
             "InvalidParameterException",
         ),
@@ -854,6 +864,7 @@ async fn a_service_request_that_cannot_be_satisfied_is_refused() {
                 "serviceName": "web",
                 "taskDefinition": "refusingfamily",
                 "desiredCount": 1,
+                "networkConfiguration": awsvpc_network_configuration(),
             }),
             "ClusterNotFoundException",
         ),
@@ -865,6 +876,7 @@ async fn a_service_request_that_cannot_be_satisfied_is_refused() {
                 "serviceName": "other",
                 "taskDefinition": "nosuchfamily",
                 "desiredCount": 1,
+                "networkConfiguration": awsvpc_network_configuration(),
             }),
             "ClientException",
         ),
@@ -886,6 +898,7 @@ async fn a_service_request_that_cannot_be_satisfied_is_refused() {
                 "serviceName": "other",
                 "taskDefinition": "refusingfamily",
                 "desiredCount": -1,
+                "networkConfiguration": awsvpc_network_configuration(),
             }),
             "InvalidParameterException",
         ),
@@ -910,6 +923,7 @@ async fn a_service_request_that_cannot_be_satisfied_is_refused() {
                 "serviceName": "web",
                 "taskDefinition": "refusingfamily",
                 "desiredCount": 1,
+                "networkConfiguration": awsvpc_network_configuration(),
             }),
             "InvalidParameterException",
         ),
@@ -1000,6 +1014,7 @@ async fn repeating_a_create_with_the_same_client_token_is_the_same_service() {
         "taskDefinition": "idempotentfamily",
         "desiredCount": 2,
         "launchType": "EC2",
+        "networkConfiguration": awsvpc_network_configuration(),
         "clientToken": "token-0001",
     });
     let case = "the same clientToken twice";
@@ -1032,6 +1047,7 @@ async fn repeating_a_create_with_the_same_client_token_is_the_same_service() {
             "serviceName": "other",
             "taskDefinition": "idempotentfamily",
             "desiredCount": 1,
+            "networkConfiguration": awsvpc_network_configuration(),
             "clientToken": "t".repeat(37),
         }),
         "InvalidParameterException",
@@ -1046,6 +1062,7 @@ async fn repeating_a_create_with_the_same_client_token_is_the_same_service() {
             "serviceName": "web",
             "taskDefinition": "idempotentfamily",
             "desiredCount": 2,
+            "networkConfiguration": awsvpc_network_configuration(),
             "clientToken": "token-0002",
         }),
         "InvalidParameterException",

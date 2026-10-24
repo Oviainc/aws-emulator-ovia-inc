@@ -135,16 +135,16 @@ const CASES: &[Case] = &[
         },
     },
     Case {
-        // Still a scaffold in the signaling service: the 501 naming the OPERATION is
-        // what proves that service claimed the `/v1` path space (the control plane
-        // binds none of it, and would not name this operation).
+        // The signaling service serves this route from its own channel registry, which
+        // this router holds no channel in: the 404 wording naming the signaling channel
+        // is what only that crate produces (the control plane binds none of `/v1`).
         name: "Signaling Channels GetIceServerConfig reaches the signaling service",
         host: "kinesisvideo.us-east-1.amazonaws.com",
         path: "/v1/get-ice-server-config",
         body: r#"{"ChannelARN":"arn:aws:kinesisvideo:us-east-1:000000000000:channel/probe/1"}"#,
         expect: Expect::Answered {
-            status: 501,
-            contains: "GetIceServerConfig",
+            status: 404,
+            contains: "No signaling channel exists with ARN",
         },
     },
     Case {

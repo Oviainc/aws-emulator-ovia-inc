@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartImageScan
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartImageScan`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartImageScan::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts a basic vulnerability scan of one stored image: the image the call names is
+//! resolved in the named repository and a scan record is written onto it, which answers
+//! `IN_PROGRESS` until the clock makes its completion due
+//! ([`crate::state::IMAGE_SCAN_DELAY`]) and is then readable through
+//! `DescribeImageScanFindings`. One image carries one scan: a start inside
+//! [`crate::state::BASIC_SCAN_INTERVAL`] of that image's last scan is refused with
+//! `LimitExceededException`, as is a start past the registry's
+//! [`crate::state::MAX_BASIC_SCANS_PER_INTERVAL`] scans in that span, and an image whose
+//! manifest declares no filesystem layer — a manifest list, or anything that is not a
+//! container image — with `UnsupportedImageTypeException`.
+//!
+//! An image in Amazon ECR archive cannot be scanned: its content is not in standard
+//! storage to be examined, so the start is refused with `ImageArchivedException` until
+//! `UpdateImageStorageClass` has restored it.
 //!
 //! ## Shape of an operation
 //!
@@ -138,6 +144,34 @@ impl From<StartImageScanErrorModeled> for StartImageScanError {
     }
 }
 
+/// The shared state helpers report their failures as [`crate::state::Fault`]; this maps
+/// each onto the modelled error this operation declares for it.
+fn fault_error(fault: crate::state::Fault) -> StartImageScanErrorModeled {
+    let message = Some(fault.message().to_string());
+    match fault {
+        crate::state::Fault::RepositoryNotFound(_) => {
+            StartImageScanErrorModeled::RepositoryNotFoundException(RepositoryNotFoundException {
+                message,
+            })
+        }
+        crate::state::Fault::ImageNotFound(_) => {
+            StartImageScanErrorModeled::ImageNotFoundException(ImageNotFoundException { message })
+        }
+        // A registry that is not this one, and an identifier that names neither a digest
+        // nor a tag, are each a parameter this operation cannot honour. The remaining
+        // kinds are unreachable here — this operation names no policy and carries no tags
+        // — and an invalid parameter is what each of them is from here.
+        crate::state::Fault::InvalidParameter(_)
+        | crate::state::Fault::LifecyclePolicyNotFound(_)
+        | crate::state::Fault::InvalidTagParameter(_)
+        | crate::state::Fault::TooManyTags(_) => {
+            StartImageScanErrorModeled::InvalidParameterException(InvalidParameterException {
+                message,
+            })
+        }
+    }
+}
+
 /// The `StartImageScan` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -172,20 +206,136 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartImageScan` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartImageScanErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartImageScan"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StartImageScanErrorModeled::ServerException(ServerException {
+                message: Some("the ecr repository store is unavailable".to_string()),
+            })
+            .into());
+        };
+
+        crate::state::check_registry(input.registry_id.as_ref()).map_err(fault_error)?;
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // The registry's own scan budget, counted from the scans it holds. Read before
+        // the repository is borrowed, because it spans every repository.
+        let scans_started =
+            store.basic_scans_started_within(crate::state::BASIC_SCAN_INTERVAL, now);
+
+        let repo = store
+            .repository_mut(&input.repository_name)
+            .map_err(fault_error)?;
+        let registry_id = repo.registry_id.clone();
+        let repository_name = repo.name.clone();
+
+        // A restore the clock has already made due is written down before the image's
+        // storage class is judged, so a scan started straight after one falls due is
+        // started on the image as it already stands.
+        repo.settle_image_storage_classes(now);
+
+        // The identifier must name a stored image; the resolution lives on `Repo`, so
+        // this operation refuses an identifier exactly as every other one does, and the
+        // record it hands back is the one this call writes its scan onto.
+        let image = repo.resolve_image_mut(&input.image_id).map_err(fault_error)?;
+        // The digest reported is the stored image's own, and the tag only where it really
+        // points at that image.
+        let image_id = image.identifier(input.image_id.image_tag.as_deref());
+
+        // An image in Amazon ECR archive — including one whose restore has not completed
+        // — is not in standard storage, so there is no image content to scan.
+        if image.is_archived() {
+            return Err(StartImageScanErrorModeled::ImageArchivedException(
+                ImageArchivedException {
+                    message: Some(format!(
+                        "The image with '{}' in the repository with name \
+                         '{repository_name}' in the registry with id '{registry_id}' is \
+                         archived and cannot be scanned",
+                        crate::state::identifier_description(&input.image_id)
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // A basic scan reads the operating system packages in an image's filesystem, so
+        // a manifest that declares no layer is of a type that cannot be scanned.
+        if !crate::state::is_scannable_image_manifest(&image.manifest) {
+            return Err(StartImageScanErrorModeled::UnsupportedImageTypeException(
+                UnsupportedImageTypeException {
+                    message: Some(format!(
+                        "The image with '{}' in the repository with name \
+                         '{repository_name}' in the registry with id '{registry_id}' is \
+                         of a type that cannot be scanned: a basic scan examines the \
+                         operating system packages in an image's filesystem layers, and \
+                         its manifest declares none",
+                        crate::state::identifier_description(&input.image_id)
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "A basic image scan can only be started once per 24 hours on an individual
+        // image." The image carries its one scan, so the refusal is read off that record
+        // rather than off anything the request says.
+        if image
+            .scan
+            .as_ref()
+            .is_some_and(|scan| !scan.may_restart_at(now))
+        {
+            return Err(StartImageScanErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "The image with '{}' in the repository with name \
+                         '{repository_name}' in the registry with id '{registry_id}' has \
+                         already been scanned: a basic image scan can only be started \
+                         once per {} hours on an individual image",
+                        crate::state::identifier_description(&input.image_id),
+                        crate::state::BASIC_SCAN_INTERVAL.as_secs() / 3_600
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "You can start up to 100,000 basic scans per 24 hours." — the registry-wide
+        // limit, which counts every scan started in that span.
+        if scans_started >= crate::state::MAX_BASIC_SCANS_PER_INTERVAL {
+            return Err(StartImageScanErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "The registry with id '{registry_id}' has already started the \
+                         maximum of {} basic scans per {} hours",
+                        crate::state::MAX_BASIC_SCANS_PER_INTERVAL,
+                        crate::state::BASIC_SCAN_INTERVAL.as_secs() / 3_600
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The scan examines the image as it stands now, and what it found is stored:
+        // reading the findings back reports this run rather than computing a fresh one.
+        let findings = crate::state::basic_scan_findings(image);
+
+        let scan = crate::state::ImageScan {
+            started_at: now,
+            complete_due_at: now + crate::state::IMAGE_SCAN_DELAY,
+            findings,
+        };
+        // The status answered is the record's own projection, so the start and a read
+        // straight after it report the same scan.
+        let image_scan_status = scan.to_status(now);
+        image.scan = Some(scan);
+
+        Ok(StartImageScanOutput {
+            registry_id: Some(registry_id),
+            repository_name: Some(repository_name),
+            image_id: Some(image_id),
+            image_scan_status: Some(image_scan_status),
+        })
     }
 }

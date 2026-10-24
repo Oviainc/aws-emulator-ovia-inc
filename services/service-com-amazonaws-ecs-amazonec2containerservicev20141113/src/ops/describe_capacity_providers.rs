@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeCapacityProviders
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeCapacityProviders`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeCapacityProviders::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the capacity providers the account holds, out of the records
+//! `CreateCapacityProvider` wrote. A REPORTING operation: it filters, pages and projects
+//! what is stored and changes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +172,146 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeCapacityProviders` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeCapacityProvidersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeCapacityProviders"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeCapacityProvidersErrorModeled::ServerException(ServerException {
+                message: Some("the ECS store is unavailable".to_string()),
+            })
+        })?;
+
+        let requested = input.capacity_providers.clone().unwrap_or_default();
+        // "Up to 100 capacity providers can be described in an action."
+        if requested.len() > crate::state::MAX_DESCRIBE_BATCH {
+            return Err(
+                DescribeCapacityProvidersErrorModeled::InvalidParameterException(
+                    InvalidParameterException {
+                        message: Some(format!(
+                            "capacityProviders must name at most {} capacity providers; \
+                             got {}",
+                            crate::state::MAX_DESCRIBE_BATCH,
+                            requested.len()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // "This value can be between 1 and 10."
+        if let Some(max_results) = input.max_results {
+            let page_size = i32::try_from(crate::state::DESCRIBE_CAPACITY_PROVIDERS_PAGE_SIZE)
+                .unwrap_or(i32::MAX);
+            if !(1..=page_size).contains(&max_results) {
+                return Err(
+                    DescribeCapacityProvidersErrorModeled::InvalidParameterException(
+                        InvalidParameterException {
+                            message: Some(format!(
+                                "maxResults must be between 1 and {page_size}; got \
+                                 {max_results}"
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let include_tags = crate::state::include_requests_tags(input.include.as_ref());
+        let cluster_name = input
+            .cluster
+            .as_deref()
+            .map(|reference| crate::state::cluster_name_from_reference(Some(reference)));
+        let region = crate::state::request_region(ctx);
+
+        let mut guard = state.lock();
+        guard.advance_clock(::std::time::SystemTime::now());
+
+        // "The name of the cluster to describe capacity providers for": a cluster this
+        // account does not hold is refused rather than reported as holding none.
+        let associated = match cluster_name.as_deref() {
+            None => None,
+            Some(cluster_name) => {
+                let Some(cluster) = guard.active_cluster(cluster_name) else {
+                    return Err(
+                        DescribeCapacityProvidersErrorModeled::ClusterNotFoundException(
+                            ClusterNotFoundException {
+                                message: Some(
+                                    crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                };
+                Some(cluster.capacity_providers.clone())
+            }
+        };
+
+        // "When specified, only capacity providers associated with this cluster are
+        // returned, including Amazon ECS Managed Instances capacity providers" — the
+        // providers `PutClusterCapacityProviders` associated with it, plus the
+        // managed-instances providers scoped to it, which are its by construction.
+        let in_scope = |provider: &crate::state::CapacityProviderRecord| match associated.as_ref()
+        {
+            None => true,
+            Some(associated) => {
+                associated.contains(&provider.name)
+                    || (provider.cluster.is_some()
+                        && provider.cluster.as_deref() == cluster_name.as_deref())
+            }
+        };
+
+        let mut failures = Vec::new();
+        // "The short name or full ARN of one or more capacity providers" — a request that
+        // names none describes every one in scope.
+        let mut matching: Vec<String> = if requested.is_empty() {
+            guard
+                .capacity_providers
+                .values()
+                .filter(|provider| in_scope(provider))
+                .map(|provider| provider.name.clone())
+                .collect()
+        } else {
+            let mut named = Vec::with_capacity(requested.len());
+            for reference in &requested {
+                let name = crate::state::capacity_provider_name_from_reference(reference);
+                match guard.capacity_providers.get(&name) {
+                    Some(provider) if in_scope(provider) => named.push(name),
+                    // An id that names nothing in scope is a FAILURE beside the results,
+                    // not an error for the whole call: that is what `failures` is for.
+                    _ => failures.push(crate::state::missing_failure(
+                        &crate::state::capacity_provider_arn(&region, &name),
+                    )),
+                }
+            }
+            named
+        };
+        // Provider names are unique, so sorting them gives paging a stable sequence to
+        // walk whichever order the map happened to hold them in.
+        matching.sort();
+        matching.dedup();
+
+        let page_size = input
+            .max_results
+            .and_then(|max_results| usize::try_from(max_results).ok())
+            .unwrap_or(crate::state::DESCRIBE_CAPACITY_PROVIDERS_PAGE_SIZE);
+        // The token is the NAME the next page starts at, so a page is unaffected by
+        // providers created or deleted before it.
+        let start = match input.next_token.as_deref() {
+            Some(token) => matching.partition_point(|name| name.as_str() < token),
+            None => 0,
+        };
+        let end = start.saturating_add(page_size).min(matching.len());
+        let capacity_providers = matching[start..end]
+            .iter()
+            .filter_map(|name| guard.capacity_providers.get(name))
+            .map(|provider| provider.view(include_tags))
+            .collect();
+        // "This value is null when there are no more results to return."
+        let next_token = matching.get(end).cloned();
+
+        Ok(DescribeCapacityProvidersOutput {
+            capacity_providers: Some(capacity_providers),
+            failures: Some(failures),
+            next_token,
+        })
     }
 }
