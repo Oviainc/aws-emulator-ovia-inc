@@ -199,27 +199,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "not already associated with another billing group" — an account belongs to
-        // at most one billing group, so an account owned by a DIFFERENT group is a
-        // conflict. One already in THIS group is left as it is: the association the
-        // request asks for already holds, so the call adds nothing and changes no size.
+        // at most one billing group, so an account owned by a DIFFERENT group refuses
+        // the request: the input names an account this call may not take, which is
+        // the `ACCOUNTS_ALREADY_ASSOCIATED` reason the model enumerates for a
+        // `ValidationException`, built in one place with `CreateBillingGroup`'s. One
+        // already in THIS group is left as it is: the association the request asks
+        // for already holds, so the call adds nothing and changes no size.
         for account_id in &input.account_ids {
             if let Some(owner) = state.conflicting_association(account_id, &group_arn) {
                 let owner = owner.to_string();
-                return Err(AssociateAccountsErrorModeled::ConflictException(
-                    ConflictException {
-                        message: format!(
-                            "the account is already associated with billing group {owner}"
-                        ),
-                        resource_id: account_id.clone(),
-                        resource_type: "account".to_string(),
-                        // No `Reason`: none of the values `ConflictExceptionReason`
-                        // enumerates describes an account that belongs to another
-                        // billing group, and `WRITE_CONFLICT_RETRY` would promise a
-                        // retry that can never succeed — the other group's
-                        // membership has to change first. The member is optional in
-                        // the model, so the honest answer is to omit it.
-                        reason: None,
-                    },
+                return Err(AssociateAccountsErrorModeled::ValidationException(
+                    crate::state::accounts_already_associated("AccountIds", account_id, &owner),
                 )
                 .into());
             }
