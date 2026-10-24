@@ -29,7 +29,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    AWSLocation, AccountStatus, Attachment, Bandwidth, ConnectAttachment, ConnectAttachmentOptions,
+    AWSLocation, AccountStatus, Attachment, AttachmentRoutingPolicyAssociationSummary, Bandwidth,
+    ConnectAttachment, ConnectAttachmentOptions,
     Connection, ConnectionHealth, CoreNetwork, CoreNetworkEdge, CoreNetworkNetworkFunctionGroup,
     CoreNetworkPolicy, CoreNetworkPolicyError, CoreNetworkPolicyException, CoreNetworkSegment,
     Device, GlobalNetwork, Link, LinkAssociation, Location, NetworkResource, NetworkTelemetry,
@@ -1372,8 +1373,8 @@ pub struct AttachmentRecord {
     pub resource_arn: String,
     /// The `RoutingPolicyLabel` the create carried, stored because the request supplied
     /// it. The modelled `Attachment` has no member for it (`smithy_query shape=Attachment`)
-    /// — it is reported by `ListAttachmentRoutingPolicyAssociations`, still a scaffold stub
-    /// — so it is held here rather than dropped.
+    /// — it is reported by `ListAttachmentRoutingPolicyAssociations`
+    /// ([`Self::to_routing_policy_association`]) — so it is held here rather than dropped.
     pub routing_policy_label: Option<String>,
     pub created_at: SystemTime,
     /// The instant the `CREATING` -> `AVAILABLE` transition the clock owes becomes due, or
@@ -1576,6 +1577,26 @@ impl AttachmentRecord {
             }),
             AttachmentDetail::Vpc { .. } | AttachmentDetail::Connect { .. } => None,
         }
+    }
+
+    /// The modelled `AttachmentRoutingPolicyAssociationSummary` of this record, or `None`
+    /// when the attachment carries no routing policy label: the label is what ties an
+    /// attachment to the routing policies of its core network, so an attachment without one
+    /// has no routing policy association to report.
+    pub fn to_routing_policy_association(&self) -> Option<AttachmentRoutingPolicyAssociationSummary> {
+        let label = self.routing_policy_label.clone()?;
+        Some(AttachmentRoutingPolicyAssociationSummary {
+            attachment_id: Some(self.id.clone()),
+            routing_policy_label: Some(label),
+            // The routing policies an attachment's label matches are declared by the core
+            // network policy document, which this slice parses for its edges, segments,
+            // network function groups and attachment policies ([`policy_topology`]) and for
+            // nothing else: no operation of this service creates, names or changes a routing
+            // policy, so there is no stored policy for a label to match. Both members are
+            // therefore absent rather than carrying names nothing declared.
+            pending_routing_policies: None,
+            associated_routing_policies: None,
+        })
     }
 }
 

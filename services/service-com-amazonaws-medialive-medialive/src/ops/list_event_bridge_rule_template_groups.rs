@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListEventBridgeRuleTemplateGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListEventBridgeRuleTemplateGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListEventBridgeRuleTemplateGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +142,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListEventBridgeRuleTemplateGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListEventBridgeRuleTemplateGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListEventBridgeRuleTemplateGroups"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+        // A template group belongs to the region it was created in, so the
+        // listing reports the groups of the region the request was signed for.
+        let region = crate::state::request_region(ctx.parts());
+
+        // `MaxResults` is a page size, so a non-positive one asks for nothing and
+        // is a bad request. It is clamped to the service's finite ceiling, and an
+        // absent one uses that ceiling, so no single request can ask the service
+        // to project an unbounded number of groups in one response.
+        let page_size = match input.max_results {
+            Some(max_results) if max_results < 1 => {
+                return Err(
+                    ListEventBridgeRuleTemplateGroupsErrorModeled::BadRequestException(
+                        BadRequestException {
+                            message: Some(format!(
+                                "maxResults must be at least 1, got {max_results}"
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            Some(max_results) => (max_results as usize).min(crate::state::MAX_LIST_PAGE_SIZE),
+            None => crate::state::MAX_LIST_PAGE_SIZE,
+        };
+
+        // A pure read: a group has no status and no transient state, so the clock
+        // owes this listing nothing to materialise, and what a later caller sees
+        // is unchanged by this call.
+        let state = state.lock();
+
+        // A signal map identifier narrows the listing to the groups THAT map is
+        // associated with: a signal map records the eventbridge rule template
+        // group ids it monitors through, so a map associated with no group admits
+        // none. The identifier resolves by the map's id or its current name, the
+        // two forms a signal map `Identifier` documents; one naming no stored map
+        // names no set of groups at all, which is this operation's modelled
+        // `NotFoundException`.
+        let signal_map_group_ids = match input.signal_map_identifier.as_deref() {
+            Some(identifier) => Some(
+                state
+                    .signal_map_id_for_identifier(identifier)
+                    .and_then(|id| state.signal_maps.get(id))
+                    .ok_or_else(|| not_found("Signal map", identifier))?
+                    .event_bridge_rule_template_group_ids
+                    .clone(),
+            ),
+            None => None,
+        };
+
+        // `NextToken` is the id the next page starts at, and ids sort in mint
+        // order in the store, so resuming is a range scan from that id.
+        let mut remaining = state
+            .event_bridge_rule_template_groups_in(&region, input.next_token.as_deref())
+            .filter(|group| {
+                signal_map_group_ids
+                    .as_ref()
+                    .is_none_or(|ids| ids.contains(&group.id))
+            });
+
+        let groups: Vec<EventBridgeRuleTemplateGroupSummary> = remaining
+            .by_ref()
+            .take(page_size)
+            .map(|group| state.event_bridge_rule_template_group_summary(group))
+            .collect();
+        // Absent on the last page: a token is handed out only when a group the
+        // filter admits is left over after this one.
+        let next_token = remaining.next().map(|group| group.id.clone());
+
+        Ok(ListEventBridgeRuleTemplateGroupsOutput {
+            event_bridge_rule_template_groups: Some(groups),
+            next_token,
+        })
     }
+}
+
+/// The request filtered by a resource of ANOTHER family that does not exist
+/// where this request can see it — the signal map the `SignalMapIdentifier`
+/// filter names. That family's 404 states its message, built from the request:
+/// the resource type, the identifier, then `not found`.
+fn not_found(resource_type: &str, identifier: &str) -> ListEventBridgeRuleTemplateGroupsError {
+    ListEventBridgeRuleTemplateGroupsErrorModeled::NotFoundException(NotFoundException {
+        message: Some(crate::state::not_found_message(resource_type, identifier)),
+    })
+    .into()
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no store to list the groups from. A modelled server error, never
+/// a fresh engine (which would answer from an empty private store).
+fn unavailable() -> ListEventBridgeRuleTemplateGroupsError {
+    ListEventBridgeRuleTemplateGroupsErrorModeled::InternalServerErrorException(
+        InternalServerErrorException {
+            message: Some(crate::state::NO_STORE.to_string()),
+        },
+    )
+    .into()
 }
