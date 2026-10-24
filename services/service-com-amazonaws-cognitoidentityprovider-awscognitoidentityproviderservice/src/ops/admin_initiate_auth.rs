@@ -349,7 +349,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if hides_user_existence {
                     incorrect_credentials()
                 } else {
-                    user_not_found(&username)
+                    user_not_found()
                 }
             })?;
             if !user.enabled {
@@ -485,10 +485,12 @@ fn client_not_found(client_id: &str) -> AdminInitiateAuthError {
     .into()
 }
 
-/// This operation's `UserNotFoundException` for an absent user.
-fn user_not_found(username: &str) -> AdminInitiateAuthError {
+/// This operation's `UserNotFoundException` for an absent user. Carries the
+/// fixed message of [`crate::state::USER_NOT_FOUND_MESSAGE`], which names no
+/// username.
+fn user_not_found() -> AdminInitiateAuthError {
     AdminInitiateAuthErrorModeled::UserNotFoundException(UserNotFoundException {
-        message: Some(format!("User {username} does not exist.")),
+        message: Some(crate::state::USER_NOT_FOUND_MESSAGE.to_string()),
     })
     .into()
 }

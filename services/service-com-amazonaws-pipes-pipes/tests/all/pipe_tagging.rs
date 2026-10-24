@@ -15,6 +15,11 @@
 //! report exactly that map. Each test's rows span what the rule generalises over (the
 //! number of tags, the key and value charsets and lengths, which keys a call names,
 //! whether a key is present) rather than one recorded request.
+//!
+//! The rules a tag KEY's content must satisfy (the published `TagKey`/`TagValue` length
+//! bounds, and the prefix AWS reserves for its own tags) have their own suite in
+//! `tests/all/tag_key_rules.rs`; the helpers below are `pub(crate)` so that suite reaches
+//! this same one request path rather than copying it.
 
 use std::collections::BTreeMap;
 
@@ -37,7 +42,7 @@ const MAX_TAG_KEY_LEN: usize = 128;
 const MAX_TAG_VALUE_LEN: usize = 256;
 
 /// The ARN `CreatePipe` mints for `name` in the region every request here is signed for.
-fn pipe_arn(name: &str) -> String {
+pub(crate) fn pipe_arn(name: &str) -> String {
     format!(
         "arn:aws:pipes:{REGION}:{}:pipe/{name}",
         engine::EMULATOR_ACCOUNT_ID
@@ -48,7 +53,7 @@ fn pipe_arn(name: &str) -> String {
 /// value: every byte outside RFC 3986's unreserved set (`A-Za-z0-9` and `-._~`) becomes
 /// `%XX`, so the ARN's `:` and `/` arrive escaped and `/tags/{resourceArn}` stays one
 /// path segment.
-fn encode(value: &str) -> String {
+pub(crate) fn encode(value: &str) -> String {
     let mut encoded = String::with_capacity(value.len());
     for byte in value.as_bytes() {
         match byte {
@@ -76,7 +81,11 @@ async fn list_tags(router: &MultiServiceRouter, resource_arn: &str) -> Reply {
     .await
 }
 
-async fn tag(router: &MultiServiceRouter, resource_arn: &str, tags: &Value) -> Reply {
+pub(crate) async fn tag(
+    router: &MultiServiceRouter,
+    resource_arn: &str,
+    tags: &Value,
+) -> Reply {
     call(
         router,
         "POST",
@@ -108,7 +117,7 @@ async fn delete_pipe(router: &MultiServiceRouter, name: &str) -> Reply {
 }
 
 /// A `CreatePipe` body carrying the required members plus `Tags` when the case has any.
-fn create_body(tags: Option<&Value>) -> Value {
+pub(crate) fn create_body(tags: Option<&Value>) -> Value {
     let mut body = minimal_body(
         "arn:aws:sqs:us-west-2:000000000000:orders",
         "arn:aws:lambda:us-west-2:000000000000:function:handler",
@@ -123,7 +132,7 @@ fn create_body(tags: Option<&Value>) -> Value {
 
 /// A JSON tag object as an order-independent map (`Value::Null` — an absent member —
 /// reads as no tags at all).
-fn tag_map(tags: &Value) -> BTreeMap<String, String> {
+pub(crate) fn tag_map(tags: &Value) -> BTreeMap<String, String> {
     tags.as_object()
         .map(|map| {
             map.iter()
@@ -143,7 +152,7 @@ fn generated_tags(n: usize) -> Value {
 }
 
 /// Assert that both readers of the pipe's tags agree with `expected`.
-async fn assert_tags_agree(
+pub(crate) async fn assert_tags_agree(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,

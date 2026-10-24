@@ -317,7 +317,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         if resend {
             // There is no invitation to resend to a user that does not exist.
-            return Err(user_not_found(&input.username));
+            return Err(user_not_found());
         }
         // This emulator holds a pool's users in memory, so the store is bounded.
         if pool.users.len() >= crate::state::MAX_USERS_PER_POOL {
@@ -378,10 +378,12 @@ fn user_pool_not_found(user_pool_id: &str) -> AdminCreateUserError {
     .into()
 }
 
-/// This operation's `UserNotFoundException` for an absent user.
-fn user_not_found(username: &str) -> AdminCreateUserError {
+/// This operation's `UserNotFoundException` for an absent user. Carries the
+/// fixed message of [`crate::state::USER_NOT_FOUND_MESSAGE`], which names no
+/// username.
+fn user_not_found() -> AdminCreateUserError {
     AdminCreateUserErrorModeled::UserNotFoundException(UserNotFoundException {
-        message: Some(format!("User {username} does not exist.")),
+        message: Some(crate::state::USER_NOT_FOUND_MESSAGE.to_string()),
     })
     .into()
 }

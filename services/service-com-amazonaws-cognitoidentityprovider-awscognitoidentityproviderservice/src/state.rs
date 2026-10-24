@@ -111,6 +111,50 @@ const DEFAULT_DELETION_PROTECTION: &str = "INACTIVE";
 /// which is the mode that answers `UserNotFoundException` for an absent user.
 const DEFAULT_PREVENT_USER_EXISTENCE_ERRORS: &str = "LEGACY";
 
+/// The message every `UserNotFoundException` carries.
+///
+/// `UserNotFoundException` is "the message returned when a user isn't found"
+/// (this service's model) and the answer is the same sentence whatever was asked
+/// for: it names neither the username nor the pool, so the error reports that
+/// the lookup found nothing without telling the caller which identity it looked
+/// for. A message built from the requested username would answer a different
+/// sentence per username, which is what makes the refusal an existence oracle.
+pub const USER_NOT_FOUND_MESSAGE: &str = "User does not exist.";
+
+// ---------------------------------------------------------------------------
+// Password policy rejection wording
+//
+// A rejection says that the password missed the pool's policy and which
+// requirement it missed, in a fixed clause per requirement: the clause is the
+// same whatever the pool configured, so the refusal does not report the pool's
+// policy values to a caller that has not read them.
+// ---------------------------------------------------------------------------
+
+/// The prefix every password-policy rejection message carries, ahead of the
+/// clause for the requirement the password missed.
+const PASSWORD_POLICY_PREFIX: &str = "Password did not conform with password policy: ";
+
+/// The clause for a password shorter than `PasswordPolicyType.MinimumLength`.
+const PASSWORD_TOO_SHORT: &str = "Password not long enough";
+
+/// The clause for `PasswordPolicyType.RequireUppercase`.
+const PASSWORD_NEEDS_UPPERCASE: &str = "Password must have uppercase characters";
+
+/// The clause for `PasswordPolicyType.RequireLowercase`.
+const PASSWORD_NEEDS_LOWERCASE: &str = "Password must have lowercase characters";
+
+/// The clause for `PasswordPolicyType.RequireNumbers`.
+const PASSWORD_NEEDS_NUMBERS: &str = "Password must have numeric characters";
+
+/// The clause for `PasswordPolicyType.RequireSymbols`.
+const PASSWORD_NEEDS_SYMBOLS: &str = "Password must have symbol characters";
+
+/// The message a password-policy rejection carries for the requirement
+/// `requirement` names.
+fn password_policy_message(requirement: &str) -> String {
+    format!("{PASSWORD_POLICY_PREFIX}{requirement}")
+}
+
 // ---------------------------------------------------------------------------
 // User pool domains
 // ---------------------------------------------------------------------------
@@ -138,6 +182,25 @@ pub const DEFAULT_MANAGED_LOGIN_VERSION: i32 = HOSTED_UI_CLASSIC_BRANDING;
 /// (`CreateUserPoolDomain.ManagedLoginVersion`); one of the modelled
 /// `UserPoolTierType` values.
 pub const LITE_USER_POOL_TIER: &str = "LITE";
+
+/// The message a `FeatureUnavailableInTierException` carries: a tier refusal
+/// reports the pool's configured feature plan and the feature that plan does not
+/// include, in one template, so a caller can parse the feature out of it and
+/// tell its operator what to upgrade.
+///
+/// `tier` is the pool's stored `UserPoolTier` (a `UserPoolTierType` value) and
+/// `feature` names the feature the request asked for.
+pub fn feature_unavailable_in_tier_message(tier: &str, feature: &str) -> String {
+    format!("The following feature is not available for the {tier} pricing tier configured: {feature}")
+}
+
+/// The feature name a tier refusal gives for a `ManagedLoginVersion` of
+/// `version`: the branding version is part of the feature asked for, since only
+/// managed login (version 2) needs a feature plan other than
+/// [`LITE_USER_POOL_TIER`].
+pub fn managed_login_feature_name(version: i32) -> String {
+    format!("Managed Login Version {version}")
+}
 
 /// The `DomainStatusType` a freshly created domain is in, until the clock makes
 /// its activation due: one of the modelled
@@ -655,37 +718,27 @@ impl UserPool {
 
     /// `None` when `password` satisfies this pool's password policy, else the
     /// requirement it misses — the message a client has to fix the request from.
+    ///
+    /// The message is the fixed clause for the requirement missed, behind the
+    /// fixed policy-rejection prefix: it reports WHICH requirement the password
+    /// failed and never the value this pool configured for it.
     pub fn check_password(&self, password: &str) -> Option<String> {
         let policy = self.password_policy();
         let minimum = policy.minimum_length.unwrap_or(DEFAULT_PASSWORD_MIN_LENGTH);
         if i64::try_from(password.chars().count()).unwrap_or(i64::MAX) < i64::from(minimum) {
-            return Some(format!(
-                "Password did not conform with policy: Password must be at least {minimum} characters long"
-            ));
+            return Some(password_policy_message(PASSWORD_TOO_SHORT));
         }
         if policy.require_uppercase && !password.chars().any(char::is_uppercase) {
-            return Some(
-                "Password did not conform with policy: Password must have uppercase characters"
-                    .to_string(),
-            );
+            return Some(password_policy_message(PASSWORD_NEEDS_UPPERCASE));
         }
         if policy.require_lowercase && !password.chars().any(char::is_lowercase) {
-            return Some(
-                "Password did not conform with policy: Password must have lowercase characters"
-                    .to_string(),
-            );
+            return Some(password_policy_message(PASSWORD_NEEDS_LOWERCASE));
         }
         if policy.require_numbers && !password.chars().any(|c| c.is_ascii_digit()) {
-            return Some(
-                "Password did not conform with policy: Password must have numeric characters"
-                    .to_string(),
-            );
+            return Some(password_policy_message(PASSWORD_NEEDS_NUMBERS));
         }
         if policy.require_symbols && !password.chars().any(is_symbol) {
-            return Some(
-                "Password did not conform with policy: Password must have symbol characters"
-                    .to_string(),
-            );
+            return Some(password_policy_message(PASSWORD_NEEDS_SYMBOLS));
         }
         None
     }
