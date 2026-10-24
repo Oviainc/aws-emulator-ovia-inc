@@ -29,6 +29,8 @@ mod patient_insights_job_lifecycle;
 mod region_scoping;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
+#[path = "all/start_patient_insights_job_write_discipline.rs"]
+mod start_patient_insights_job_write_discipline;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tag_map_bounds.rs"]
