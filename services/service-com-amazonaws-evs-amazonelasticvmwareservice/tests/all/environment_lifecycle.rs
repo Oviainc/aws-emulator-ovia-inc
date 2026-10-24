@@ -33,6 +33,7 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_ec2_amazonec2 as ec2;
+use service_com_amazonaws_evs_amazonelasticvmwareservice as evs;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The Region the test client signs for, so the ARNs under test carry it.
@@ -43,7 +44,12 @@ pub(crate) const ACCOUNT: &str = "000000000000";
 
 /// Long enough for the lifecycle transition this service owes a new or deleted
 /// environment to come due (its span is under a second by construction).
-const PAST_THE_TRANSITION: Duration = Duration::from_millis(900);
+///
+/// A suite that builds its own router, and so holds no engine to [`settle`] through,
+/// sleeps for this before reading an environment's resources back: a list addressed to
+/// an environment that is still initializing is refused
+/// (`tests/all/list_while_initializing.rs`).
+pub(crate) const PAST_THE_TRANSITION: Duration = Duration::from_millis(900);
 
 /// The emulator a test drives: one shared engine, this service mounted on it.
 ///
@@ -314,6 +320,41 @@ pub(crate) async fn create(router: &Emulator, name: Option<&str>) -> String {
         .as_str()
         .unwrap_or_else(|| panic!("create {name:?}: no environmentId in {body}"))
         .to_string()
+}
+
+/// Settle every lifecycle transition this service owes, WITHOUT sleeping for it.
+///
+/// A new environment is `CREATING` — still initializing — until the transition the
+/// clock owes it comes due, and a LIST addressed to an environment resource in that
+/// state is refused with a `ValidationException` (`ValidationException` doc; see
+/// `tests/all/list_while_initializing.rs`, which owns that rule). So a test that lists
+/// an environment's resources has to get past the create transition first.
+///
+/// The stored due instants are compared against the instant handed in, so settling
+/// against an instant [`PAST_THE_TRANSITION`] from now applies exactly the transitions
+/// a call made after that span would — and costs no wall-clock time, which matters for
+/// a test that creates many environments. A test that asserts the TIMING itself sleeps
+/// instead.
+pub(crate) fn settle(router: &Emulator) {
+    let state = evs::state::service_state(&*router.engine)
+        .expect("the in-memory engine carries this service's store");
+    let past_the_transition = std::time::Instant::now() + PAST_THE_TRANSITION;
+    let mut store = state.lock();
+    for environment in store.environments.values_mut() {
+        environment.materialise_due_transition(past_the_transition);
+    }
+    // The health checks are derived from the states just settled, exactly as the
+    // handlers' own `materialise_due_transitions` recomputes them after a transition.
+    store.recompute_environment_checks();
+}
+
+/// Create an environment, settle the transition the clock owes it, and return its id —
+/// what a test that goes on to LIST that environment's VLANs, hosts, connectors or
+/// entitlements needs ([`settle`]).
+pub(crate) async fn create_settled(router: &Emulator, name: Option<&str>) -> String {
+    let id = create(router, name).await;
+    settle(router);
+    id
 }
 
 #[tokio::test]
@@ -1066,7 +1107,9 @@ async fn list_environments_pages_with_max_results_and_a_resumable_token() {
 #[tokio::test]
 async fn list_environment_vlans_pages_with_max_results_and_a_resumable_token() {
     let router = emulator();
-    let id = create(&router, Some("paged-vlans")).await;
+    // Settled, because a list against an environment that is still initializing is
+    // refused — what `tests/all/list_while_initializing.rs` asserts.
+    let id = create_settled(&router, Some("paged-vlans")).await;
 
     for page_size in [1, 3, 4, 10, 100] {
         let mut seen: Vec<i64> = Vec::new();
@@ -1249,7 +1292,9 @@ async fn every_create_mints_a_distinct_environment_id_and_subnet_ids() {
     let mut subnet_ids = BTreeSet::new();
 
     for index in 0..25 {
-        let id = create(&router, Some(&format!("unique-{index}"))).await;
+        // Settled, because the list below is refused against an environment that is
+        // still initializing (`tests/all/list_while_initializing.rs`).
+        let id = create_settled(&router, Some(&format!("unique-{index}"))).await;
         assert!(
             is_environment_id(&id),
             "create {index}: environmentId {id:?} must match ^(env-[a-zA-Z0-9]{{10}})$"

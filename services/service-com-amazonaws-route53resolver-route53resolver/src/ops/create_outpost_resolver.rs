@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateOutpostResolver
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateOutpostResolver`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateOutpostResolver::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! SCAFFOLD REPLACED: implemented. Creates a Resolver on an Outpost and persists it, so the Get, Update, Delete
+//! and List operations of this resource all read the same record.
 //!
 //! ## Shape of an operation
 //!
@@ -169,18 +162,112 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateOutpostResolver` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateOutpostResolverErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateOutpostResolver"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                CreateOutpostResolverErrorModeled::InternalServiceErrorException(
+                    InternalServiceErrorException {
+                        message: Some("the Route 53 Resolver store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // `InstanceCount`: "The default and minimal value is 4." The model puts
+        // no `range` on the member, so the minimum is enforced here — before
+        // the store is locked, so a refused create writes nothing.
+        let instance_count = input
+            .instance_count
+            .unwrap_or(crate::state::OUTPOST_RESOLVER_INSTANCE_COUNT_DEFAULT);
+        if instance_count < crate::state::OUTPOST_RESOLVER_INSTANCE_COUNT_DEFAULT {
+            return Err(CreateOutpostResolverErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "InstanceCount must be at least {}, got {instance_count}",
+                        crate::state::OUTPOST_RESOLVER_INSTANCE_COUNT_DEFAULT
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let mut store = state.lock();
+        // `CreatorRequestId` is "a unique string that identifies the request and
+        // that allows failed requests to be retried without the risk of running
+        // the operation twice": a repeat of a request id that already created a
+        // Resolver resolves to THAT Resolver and creates nothing.
+        if let Some(existing_id) = store
+            .outpost_resolver_creator_request_ids
+            .get(&input.creator_request_id)
+        {
+            if let Some(record) = store.outpost_resolvers.get(existing_id) {
+                return Ok(CreateOutpostResolverOutput {
+                    outpost_resolver: Some(
+                        record.to_outpost_resolver(::std::time::Instant::now()),
+                    ),
+                });
+            }
+        }
+
+        // The store is bounded: a new Resolver past the cap is refused with the
+        // quota error this operation models, BEFORE anything is written, rather
+        // than growing the process without limit. The retry path above is
+        // unaffected — it allocates no record — and a delete frees a slot.
+        if !store.can_store_another_outpost_resolver() {
+            return Err(
+                CreateOutpostResolverErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "This emulator stores at most {} Resolvers on Outposts; delete one before creating another",
+                            crate::state::MAX_STORED_OUTPOST_RESOLVERS
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let region = crate::state::request_region(&ctx.parts().headers);
+        let now = ::std::time::Instant::now();
+        // AWS answers with `Status: CREATING` and provisions the EC2 instances
+        // behind the Resolver afterwards, so the move to `OPERATIONAL` is owed
+        // at a stored instant rather than being reported immediately.
+        let ready_at = now + crate::state::PROVISIONING_DELAY;
+        let timestamp = crate::state::now_rfc3339();
+
+        let seq = store.next_seq();
+        let id = crate::state::mint_outpost_resolver_id(seq);
+        let arn = ::engine::emulator_arn(
+            crate::state::ARN_NAMESPACE,
+            &region,
+            &format!("outpost-resolver/{id}"),
+        );
+
+        let record = crate::state::OutpostResolverRecord {
+            seq,
+            id: id.clone(),
+            arn,
+            name: input.name.clone(),
+            creator_request_id: input.creator_request_id.clone(),
+            instance_count,
+            preferred_instance_type: input.preferred_instance_type.clone(),
+            outpost_arn: input.outpost_arn.clone(),
+            status: crate::state::OUTPOST_RESOLVER_STATUS_CREATING.to_string(),
+            status_message: None,
+            tags: input.tags.clone().unwrap_or_default(),
+            creation_time: timestamp.clone(),
+            modification_time: timestamp,
+            ready_at,
+        };
+
+        let outpost_resolver = record.to_outpost_resolver(now);
+        store
+            .outpost_resolver_creator_request_ids
+            .insert(input.creator_request_id.clone(), id.clone());
+        store.outpost_resolvers.insert(id, record);
+
+        Ok(CreateOutpostResolverOutput {
+            outpost_resolver: Some(outpost_resolver),
+        })
     }
 }

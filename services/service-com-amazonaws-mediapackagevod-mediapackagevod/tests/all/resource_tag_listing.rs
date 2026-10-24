@@ -29,17 +29,17 @@ use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_mediapackagevod_mediapackagevod::state as vod;
 
 /// The Region every case is signed for unless it is varying the Region.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// A second, distinct Region, for the rows about an ARN of another Region.
-const OTHER_REGION: &str = "eu-central-1";
+pub(crate) const OTHER_REGION: &str = "eu-central-1";
 
 /// The PackagingGroup a packaging configuration and an asset are created under: both
 /// need a parent group that exists.
-const PARENT_GROUP: &str = "vod-parent-group";
+pub(crate) const PARENT_GROUP: &str = "vod-parent-group";
 
 /// A well-formed S3 object ARN, for `CreateAsset$SourceArn`.
-const SOURCE_ARN: &str = "arn:aws:s3:::test-bucket/asset.smil";
+pub(crate) const SOURCE_ARN: &str = "arn:aws:s3:::test-bucket/asset.smil";
 
 /// The modelled refusal of a resource this service does not hold
 /// (`smithy_query(query="shape",shape="NotFoundException")` — `httpError 404`).
@@ -48,28 +48,28 @@ const NOT_FOUND: (u16, &str) = (404, "NotFoundException");
 /// What one request answered: the HTTP status, restJson1's `x-amzn-errortype`, and the
 /// parsed body.
 #[derive(Debug)]
-struct Answer {
-    status: u16,
-    errortype: String,
-    body: Value,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) errortype: String,
+    pub(crate) body: Value,
 }
 
 /// One resource type of this service, as the tag rows address it.
 #[derive(Debug, Clone, Copy)]
-struct Kind {
+pub(crate) struct Kind {
     /// What a failing case names this resource type by.
-    name: &'static str,
+    pub(crate) name: &'static str,
     /// The resource-type segment this resource's ARN carries.
-    arn_kind: &'static str,
+    pub(crate) arn_kind: &'static str,
     /// The collection route its create posts to.
-    create_route: &'static str,
+    pub(crate) create_route: &'static str,
     /// The status this service answers that create with.
-    created_status: u16,
+    pub(crate) created_status: u16,
 }
 
 /// The three resource types an ARN of this service names. `CreatePackagingConfiguration`
 /// is the one create this service answers 202 rather than 200 with.
-const KINDS: [Kind; 3] = [
+pub(crate) const KINDS: [Kind; 3] = [
     Kind {
         name: "PackagingGroup",
         arn_kind: vod::ARN_KIND_PACKAGING_GROUPS,
@@ -92,7 +92,7 @@ const KINDS: [Kind; 3] = [
 
 impl Kind {
     /// The route that describes the resource `id` of this type.
-    fn describe_route(self, id: &str) -> String {
+    pub(crate) fn describe_route(self, id: &str) -> String {
         match self.arn_kind {
             vod::ARN_KIND_PACKAGING_GROUPS => format!("/packaging_groups/{id}"),
             vod::ARN_KIND_PACKAGING_CONFIGURATIONS => format!("/packaging_configurations/{id}"),
@@ -102,7 +102,7 @@ impl Kind {
 
     /// A create body for `id` of this type, carrying `tags` when the row supplies a
     /// tag map (a row that supplies none omits the member entirely).
-    fn create_body(self, id: &str, tags: Option<&Value>) -> Value {
+    pub(crate) fn create_body(self, id: &str, tags: Option<&Value>) -> Value {
         let role_arn = format!(
             "arn:aws:iam::{}:role/MediaPackageVod",
             engine::emulator_account_id()
@@ -130,7 +130,7 @@ impl Kind {
 
 /// A router carrying exactly this service over one shared engine — the same assembly
 /// `core/router` performs, minus the other services.
-fn router() -> MultiServiceRouter {
+pub(crate) fn router() -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
     router.register_service(
@@ -144,7 +144,7 @@ fn router() -> MultiServiceRouter {
 /// Send one request signed for `region` and report what it answered. Signature
 /// verification is off for this router, so only the credential SCOPE matters — that is
 /// what the handlers read the Region from.
-async fn call(
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     region: &str,
     method: &str,
@@ -193,13 +193,13 @@ async fn call(
 ///
 /// `ResourceArn` is a non-greedy `@httpLabel`, so it occupies ONE path segment and the
 /// `/` inside an ARN is sent percent-encoded, exactly as an AWS SDK sends it.
-fn tags_route(arn: &str) -> String {
+pub(crate) fn tags_route(arn: &str) -> String {
     format!("/tags/{}", arn.replace('/', "%2F"))
 }
 
 /// The `tags` member of a response body, as a map. A body that carries none reads as
 /// no tags, so a missing member and an empty map compare equal here.
-fn tag_map(body: &Value) -> BTreeMap<String, String> {
+pub(crate) fn tag_map(body: &Value) -> BTreeMap<String, String> {
     body.get("tags")
         .and_then(Value::as_object)
         .map(|tags| {
@@ -211,7 +211,7 @@ fn tag_map(body: &Value) -> BTreeMap<String, String> {
 }
 
 /// A tag map as the request sent it, for comparing against what was reported.
-fn expected_map(tags: Option<&Value>) -> BTreeMap<String, String> {
+pub(crate) fn expected_map(tags: Option<&Value>) -> BTreeMap<String, String> {
     tags.and_then(Value::as_object)
         .map(|tags| {
             tags.iter()
@@ -247,7 +247,7 @@ fn tag_rows() -> Vec<(&'static str, Option<Value>)> {
 }
 
 /// Create the parent PackagingGroup every configuration and asset row needs.
-async fn create_parent_group(router: &MultiServiceRouter, region: &str) {
+pub(crate) async fn create_parent_group(router: &MultiServiceRouter, region: &str) {
     let answer = call(
         router,
         region,
@@ -265,7 +265,7 @@ async fn create_parent_group(router: &MultiServiceRouter, region: &str) {
 
 /// Create the resource `id` of `kind` carrying `tags` and report the ARN the create
 /// answered with.
-async fn create_with_tags(
+pub(crate) async fn create_with_tags(
     router: &MultiServiceRouter,
     region: &str,
     kind: Kind,

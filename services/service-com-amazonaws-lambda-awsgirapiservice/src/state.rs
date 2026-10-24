@@ -1672,6 +1672,16 @@ pub struct LayerVersionRecord {
     pub code_sha256: Option<String>,
     /// ISO-8601 instant the version was published.
     pub created: String,
+    /// The resource-based policy of this version, once a statement has been added to
+    /// it.
+    ///
+    /// `AddLayerVersionPermission` "Adds permissions to the resource-based policy of a
+    /// version of an Lambda layer", so the policy belongs to the single version the call
+    /// addressed rather than to the layer as a whole, and `GetLayerVersionPolicy`
+    /// reports exactly the statements that were added. A version nobody has granted
+    /// anything on holds NO policy — not an empty one — which is what the read's 404
+    /// reports.
+    pub policy: Option<PolicyRecord>,
 }
 
 impl LayerVersionRecord {
@@ -3199,6 +3209,96 @@ pub fn resolve_function<'a>(
         return Err(ResolveFailure::NotFound(format!("Function not found: {arn}")));
     }
     Ok((record, version))
+}
+
+/// One layer version a `LayerName`/`VersionNumber` pair resolved to: the ARN that pair
+/// names, and the stored version itself.
+///
+/// The ARN comes along because it is the `Resource` every policy statement on this
+/// version is granted on, and the resource a refusal names; it is built from the stored
+/// layer record rather than from the request.
+#[derive(Debug)]
+pub struct ResolvedLayerVersion<'a> {
+    /// The ARN of the resolved version, as `LayerVersionArn` spells it.
+    pub arn: String,
+    /// The resolved version.
+    pub version: &'a mut LayerVersionRecord,
+}
+
+/// What [`ResolvedLayerVersion`] is to a write: the same pair resolved for a REPORT, so
+/// a reporting operation cannot reach a mutable borrow of the store at all.
+#[derive(Debug)]
+pub struct ResolvedLayerVersionRef<'a> {
+    /// The ARN of the resolved version, as `LayerVersionArn` spells it.
+    pub arn: String,
+    /// The resolved version.
+    pub version: &'a LayerVersionRecord,
+}
+
+/// The bare name a `LayerName` names, or the refusal a malformed one gets.
+///
+/// "The name or Amazon Resource Name (ARN) of the layer": both forms name the same
+/// record, so both resolvers below start here.
+fn layer_name_of(layer_name: &str) -> Result<String, ResolveFailure> {
+    parse_layer_name(layer_name).ok_or_else(|| {
+        ResolveFailure::Malformed(format!(
+            "1 validation error detected: Value '{layer_name}' at 'layerName' failed to satisfy \
+             constraint: Member must satisfy one of the documented layer name formats (name or \
+             layer ARN)"
+        ))
+    })
+}
+
+/// The refusal a `LayerName`/`VersionNumber` pair naming no stored version gets.
+fn no_such_layer_version(name: &str, version_number: i64) -> ResolveFailure {
+    ResolveFailure::NotFound(format!(
+        "Layer version {name}:{version_number} does not exist"
+    ))
+}
+
+/// Resolve a `LayerName` (a bare name or a layer ARN) and a `VersionNumber` to the one
+/// stored layer version they name, for an operation that CHANGES it.
+///
+/// Shared by every operation on a layer version's resource-based policy, so all of them
+/// read the same record and refuse an unknown layer or version the same way.
+pub fn resolve_layer_version<'a>(
+    store: &'a mut ComAmazonawsLambdaAwsgirapiserviceState,
+    layer_name: &str,
+    version_number: i64,
+) -> Result<ResolvedLayerVersion<'a>, ResolveFailure> {
+    let name = layer_name_of(layer_name)?;
+
+    let record = store
+        .layers
+        .get_mut(&name)
+        .ok_or_else(|| no_such_layer_version(&name, version_number))?;
+    let arn = record.version_arn(version_number);
+    let version = record
+        .versions
+        .get_mut(&version_number)
+        .ok_or_else(|| no_such_layer_version(&name, version_number))?;
+    Ok(ResolvedLayerVersion { arn, version })
+}
+
+/// [`resolve_layer_version`] for an operation that only REPORTS on the version, which
+/// therefore takes the store by shared reference and can change nothing.
+pub fn resolve_layer_version_ref<'a>(
+    store: &'a ComAmazonawsLambdaAwsgirapiserviceState,
+    layer_name: &str,
+    version_number: i64,
+) -> Result<ResolvedLayerVersionRef<'a>, ResolveFailure> {
+    let name = layer_name_of(layer_name)?;
+
+    let record = store
+        .layers
+        .get(&name)
+        .ok_or_else(|| no_such_layer_version(&name, version_number))?;
+    let arn = record.version_arn(version_number);
+    let version = record
+        .versions
+        .get(&version_number)
+        .ok_or_else(|| no_such_layer_version(&name, version_number))?;
+    Ok(ResolvedLayerVersionRef { arn, version })
 }
 
 #[cfg(test)]

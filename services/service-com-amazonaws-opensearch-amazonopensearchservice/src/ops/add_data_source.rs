@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddDataSource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddDataSource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddDataSource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates one direct-query data source on a domain and persists it as a
+//! `crate::state::DataSource` on that domain's record — the same record
+//! `GetDataSource` and `ListDataSources` report.
 //!
 //! ## Shape of an operation
 //!
@@ -85,6 +80,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use crate::state::{DataSource, DATA_SOURCE_QUOTA, DATA_SOURCE_STATUS_ACTIVE};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -159,18 +156,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddDataSource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddDataSourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddDataSource"))
+        let _ = ctx;
+        let state =
+            crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
+
+        let mut store = state.lock();
+        let domain = store.domains.get_mut(&input.domain_name).ok_or_else(|| {
+            AddDataSourceErrorModeled::ResourceNotFoundException(crate::state::domain_not_found(
+                &input.domain_name,
+            ))
+        })?;
+
+        // A data source's name identifies it within its domain, so a create cannot
+        // land on a name the domain already holds: the existing record stays exactly
+        // as it is and the call is refused. The model declares no "already exists"
+        // error for this operation, so the refusal is its `ValidationException`.
+        if domain.data_sources.contains_key(&input.name) {
+            return Err(AddDataSourceErrorModeled::ValidationException(
+                crate::state::data_source_exists(&input.name),
+            )
+            .into());
+        }
+
+        // The per-domain store is BOUNDED: past its quota a create is refused rather
+        // than adding another record, so a caller looping with fresh names cannot grow
+        // the state (or the listing's answer) without end.
+        // `LimitExceededException` is the modelled refusal for "trying to create more
+        // than the allowed number of resources or sub-resources".
+        if domain.data_sources.len() >= DATA_SOURCE_QUOTA {
+            return Err(AddDataSourceErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "Domain {} already holds the maximum of {DATA_SOURCE_QUOTA} data sources",
+                        input.domain_name
+                    )),
+                },
+            )
+            .into());
+        }
+
+        domain.data_sources.insert(
+            input.name.clone(),
+            DataSource {
+                name: input.name.clone(),
+                data_source_type: input.data_source_type,
+                description: input.description,
+                // A newly created data source is queryable: `DataSourceStatus`'s only
+                // other value, `DISABLED`, is reached by an `UpdateDataSource` that
+                // asks for it.
+                status: DATA_SOURCE_STATUS_ACTIVE.to_string(),
+            },
+        );
+
+        Ok(AddDataSourceOutput {
+            message: Some(format!(
+                "Successfully created a data source named {} for domain {}",
+                input.name, input.domain_name
+            )),
+        })
     }
 }

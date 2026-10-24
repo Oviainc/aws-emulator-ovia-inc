@@ -30,6 +30,10 @@
 //!   not issue refused rather than resumed;
 //! * the refusals of a create that names no one source of ephemeris data, or a satellite
 //!   this account is not on-boarded to — each of which stores nothing.
+//!
+//! The data builders, the onboarding helper and the create-and-assert helper below are
+//! `pub(crate)`, so the sibling `ephemeris_description.rs` suite stores the same
+//! ephemerides through the same front door rather than standing up a second copy of them.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -52,24 +56,24 @@ const WHOLE_WINDOW: (i64, i64) = (1, 4_102_444_800);
 
 /// An expiration far enough ahead that nothing this suite stores expires while it runs
 /// (2096-10-02).
-const FUTURE: i64 = 4_000_000_000;
+pub(crate) const FUTURE: i64 = 4_000_000_000;
 
 /// An expiration already in the past (2001-09-09), so the ephemeris carrying it is owed
 /// `EXPIRED`.
-const PAST: i64 = 1_000_000_000;
+pub(crate) const PAST: i64 = 1_000_000_000;
 
 /// Line 1 of a two-line element set, spelled as the modelled `TleLineOne` requires: 69
 /// characters over the pattern `smithy_query(query="shape", shape="TLEData")` carries. A
 /// value outside it never reaches the handler — this service's validator answers it.
-const TLE_LINE_1: &str = "1 27424U 02022A   24001.50000000  .00001234  00000+0  12345-4 0  9991";
+pub(crate) const TLE_LINE_1: &str = "1 27424U 02022A   24001.50000000  .00001234  00000+0  12345-4 0  9991";
 
 /// Line 2 of the same two-line element set (`TleLineTwo`: 69 characters).
-const TLE_LINE_2: &str = "2 27424  98.2000 100.0000 0001234 100.0000 260.0000 14.57100000123454";
+pub(crate) const TLE_LINE_2: &str = "2 27424  98.2000 100.0000 0001234 100.0000 260.0000 14.57100000123454";
 
 /// An OEM body, as the model takes it: "OEM data that you provide directly instead of
 /// using an Amazon S3 object" (`smithy_query(query="shape", shape="OEMEphemeris")`), which
 /// this emulator stores verbatim rather than parsing.
-const OEM_BODY: &str = "CCSDS_OEM_VERS = 2.0\nCREATION_DATE = 2024-01-01T00:00:00\nORIGINATOR = \
+pub(crate) const OEM_BODY: &str = "CCSDS_OEM_VERS = 2.0\nCREATION_DATE = 2024-01-01T00:00:00\nORIGINATOR = \
                         TEST\n";
 
 /// Longer than the span this service gives an ephemeris in `VALIDATING`, so a read taken
@@ -78,7 +82,7 @@ const OEM_BODY: &str = "CCSDS_OEM_VERS = 2.0\nCREATION_DATE = 2024-01-01T00:00:0
 /// Waited out with `std::thread::sleep` rather than `tokio::time::sleep`: the emulator
 /// stores a due instant and never arms a timer, so there is no task to drive while
 /// waiting, and this workspace's `tokio` carries no `time` feature.
-fn wait_out_validation() {
+pub(crate) fn wait_out_validation() {
     std::thread::sleep(EPHEMERIS_VALIDATION_SETTLES_AFTER + Duration::from_millis(300));
 }
 
@@ -87,7 +91,7 @@ fn wait_out_validation() {
 ///
 /// Satellites are not created through this API (the model declares no operation that
 /// onboards one), so an ephemeris that references one needs the onboarding seeded.
-fn onboard(engine: &engine::InMemoryEngine, setting: &str) -> Vec<String> {
+pub(crate) fn onboard(engine: &engine::InMemoryEngine, setting: &str) -> Vec<String> {
     let catalog = parse_satellites(setting);
     let state = service_state(engine).expect("this service's state store");
     state.lock().satellites = catalog.clone();
@@ -106,7 +110,7 @@ async fn create(router: &MultiServiceRouter, body: Value) -> Reply {
 
 /// `CreateEphemeris` with `body`, asserting it was accepted, and the `ephemerisId` it
 /// minted.
-async fn create_ok(router: &MultiServiceRouter, case: &str, body: Value) -> String {
+pub(crate) async fn create_ok(router: &MultiServiceRouter, case: &str, body: Value) -> String {
     let reply = create(router, body).await;
     assert_eq!(
         reply.status, 200,
@@ -234,7 +238,7 @@ pub(crate) fn tle_inline(ranges: &[(i64, i64)]) -> Value {
 ///
 /// The times are epoch seconds, which is how this emulator's schema layer reads a
 /// `Timestamp` member of a request body.
-fn az_el_inline(ranges: &[(i64, i64)]) -> Value {
+pub(crate) fn az_el_inline(ranges: &[(i64, i64)]) -> Value {
     let segments: Vec<Value> = ranges
         .iter()
         .map(|(start, end)| {
@@ -256,7 +260,7 @@ fn az_el_inline(ranges: &[(i64, i64)]) -> Value {
 }
 
 /// The Amazon S3 object a suite row supplies its data from.
-fn s3_object(key: &str) -> Value {
+pub(crate) fn s3_object(key: &str) -> Value {
     json!({"bucket": "ground-station-ephemerides", "key": key, "version": "3HL4kqtJlcpXroDTDmj"})
 }
 

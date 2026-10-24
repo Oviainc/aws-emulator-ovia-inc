@@ -29,7 +29,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_ec2_amazonec2 as ec2;
 use service_com_amazonaws_evs_amazonelasticvmwareservice::state::MAX_EIP_ASSOCIATIONS_PER_VLAN;
 
-use crate::environment_lifecycle::{call, emulator, error_type, vlans_with_prefix, Emulator};
+use crate::environment_lifecycle::{call, emulator, error_type, settle, vlans_with_prefix, Emulator};
 
 /// An environment id that is well formed (`^(env-[a-zA-Z0-9]{10})$`) and names no
 /// environment.
@@ -51,6 +51,10 @@ fn register_elastic_ip(engine: &engine::InMemoryEngine, allocation_id: &str, pub
 }
 
 /// Create an environment whose HCX VLAN is public, and return its id.
+///
+/// The environment is SETTLED before it is returned, because every test here reads its
+/// HCX VLAN back through `ListEnvironmentVlans` and a list addressed to an environment
+/// that is still initializing is refused (`tests/all/list_while_initializing.rs`).
 async fn create_public_hcx(router: &Emulator, name: &str) -> String {
     let mut request = router.create_request(Some(name));
     let mut vlans = vlans_with_prefix(28);
@@ -63,10 +67,12 @@ async fn create_public_hcx(router: &Emulator, name: &str) -> String {
         status, 200,
         "create {name:?}: expected 200, got {status} {body}"
     );
-    body["environment"]["environmentId"]
+    let id = body["environment"]["environmentId"]
         .as_str()
         .unwrap_or_else(|| panic!("create {name:?}: no environmentId in {body}"))
-        .to_string()
+        .to_string();
+    settle(router);
+    id
 }
 
 /// The HCX VLAN of `environment_id`, read back through `ListEnvironmentVlans`.
@@ -319,7 +325,8 @@ async fn only_the_public_hcx_vlan_of_a_stored_environment_takes_an_eip() {
     let router = emulator();
     let public_hcx = create_public_hcx(&router, "public-hcx").await;
     // An environment whose HCX VLAN is private, which is the default a create makes.
-    let private_hcx = crate::environment_lifecycle::create(&router, Some("private-hcx")).await;
+    let private_hcx =
+        crate::environment_lifecycle::create_settled(&router, Some("private-hcx")).await;
 
     // Each row: the case, the environment the request names, the `vlanName` it gives,
     // and the error code the rule answers with — `""` for a row that is accepted.
