@@ -169,15 +169,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // operation cannot read, which is what `InvalidArn` reports, before any
         // resource resolution.
         let endpoint_region = crate::state::request_region(ctx.parts());
-        let target = match crate::state::read_taggable_arn(&input.resource_arn, &endpoint_region) {
-            Ok(target) => target,
-            Err(message) => {
-                return Err(TagResourceErrorModeled::InvalidArn(InvalidArn {
-                    message: Some(message),
-                })
-                .into())
-            }
-        };
+        if let Err(message) = crate::state::read_taggable_arn(&input.resource_arn, &endpoint_region)
+        {
+            return Err(TagResourceErrorModeled::InvalidArn(InvalidArn {
+                message: Some(message),
+            })
+            .into());
+        }
 
         // `tags` carries no modelled length bound, so the REQUEST chooses how many
         // pairs arrive. A request carrying more than one resource may hold can only
@@ -210,27 +208,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // from being tagged back into existence.
         store.settle(crate::state::now());
 
-        // Only a state machine can be in the store: `CreateActivity` is still
-        // scaffolded, so no activity exists for an activity ARN to name, and the
-        // honest answer for one is that the resource could not be found.
-        match target {
-            crate::state::TaggableResource::Activity(_) => Err(not_found(&input.resource_arn)),
-            crate::state::TaggableResource::StateMachine(_) => {
-                match store.merge_state_machine_tags(&input.resource_arn, &input.tags) {
-                    Ok(()) => Ok(TagResourceOutput {}),
-                    Err(crate::state::TagWriteRejection::NotFound) => {
-                        Err(not_found(&input.resource_arn))
-                    }
-                    // Both remaining rejections are the one modelled limit error,
-                    // and it carries the service's fixed text: a merge that would
-                    // leave the resource past `MAX_TAGS`, and one that would take
-                    // this emulator's store past `MAX_STORE_BYTES`.
-                    Err(
-                        crate::state::TagWriteRejection::TooManyTags(_)
-                        | crate::state::TagWriteRejection::NoRoom,
-                    ) => Err(too_many_tags(&input.resource_arn)),
-                }
-            }
+        // Either taggable resource type answers from the store — the ARN's own
+        // resource-type field is what decides which record is looked up — so an ARN
+        // the store holds no resource under is what the modelled `ResourceNotFound`
+        // reports.
+        match store.merge_tags(&input.resource_arn, &input.tags) {
+            Ok(()) => Ok(TagResourceOutput {}),
+            Err(crate::state::TagWriteRejection::NotFound) => Err(not_found(&input.resource_arn)),
+            // Both remaining rejections are the one modelled limit error, and it
+            // carries the service's fixed text: a merge that would leave the
+            // resource past `MAX_TAGS`, and one that would take this emulator's
+            // store past `MAX_STORE_BYTES`.
+            Err(
+                crate::state::TagWriteRejection::TooManyTags(_)
+                | crate::state::TagWriteRejection::NoRoom,
+            ) => Err(too_many_tags(&input.resource_arn)),
         }
     }
 }
