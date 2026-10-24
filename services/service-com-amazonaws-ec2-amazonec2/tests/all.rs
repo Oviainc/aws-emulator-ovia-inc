@@ -110,6 +110,9 @@ mod ec2_query_envelope;
 mod elastic_ip_addresses;
 #[path = "all/fast_launch_images.rs"]
 mod fast_launch_images;
+// What `DisableFastSnapshotRestores` answers per (snapshot, Availability Zone) pair.
+#[path = "all/fast_snapshot_restores.rs"]
+mod fast_snapshot_restores;
 #[path = "all/fpga_image_tasks_and_volume_io.rs"]
 mod fpga_image_tasks_and_volume_io;
 #[path = "all/get_password_data.rs"]

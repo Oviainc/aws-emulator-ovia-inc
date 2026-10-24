@@ -726,6 +726,75 @@ async fn memory_and_vcpus_follow_the_size_ladder() {
     }
 }
 
+/// RULE: the size component of an instance type name is read into sixteenths of a `large`
+/// only where it names a size AWS could offer — the ladder words, and a multiple of
+/// `xlarge` up to the ceiling the module publishes. Anything else, including a multiple
+/// above that ceiling, is answered `None`, so no caller-supplied multiple is multiplied out
+/// (an unbounded one would overflow the conversion rather than report a size).
+///
+/// The rows are the ladder's own words, the largest size AWS publishes (`112xlarge`, in
+/// `u7i-12tb.112xlarge`), the module's ceiling and the step past it, and the multiples no
+/// arithmetic may be done on: `u32::MAX`, a value above it, and the bare metal form of each.
+#[test]
+fn a_size_component_is_read_into_sixteenths_only_within_the_published_ladder() {
+    let ceiling = ec2::state::MAX_SIZE_MULTIPLE;
+    let past = ceiling + 1;
+    // (case, the size component, the sixteenths it reads as)
+    let cases: Vec<(String, String, Option<u32>)> = vec![
+        ("a nano".to_string(), "nano".to_string(), Some(1)),
+        ("a medium".to_string(), "medium".to_string(), Some(8)),
+        ("a large".to_string(), "large".to_string(), Some(16)),
+        ("an xlarge".to_string(), "xlarge".to_string(), Some(32)),
+        ("a 2xlarge".to_string(), "2xlarge".to_string(), Some(64)),
+        (
+            "a 112xlarge".to_string(),
+            "112xlarge".to_string(),
+            Some(112 * 32),
+        ),
+        (
+            "the ceiling".to_string(),
+            format!("{ceiling}xlarge"),
+            Some(ceiling * 32),
+        ),
+        (
+            "the ceiling, bare metal".to_string(),
+            format!("metal-{ceiling}xl"),
+            Some(ceiling * 32),
+        ),
+        (
+            "one past the ceiling".to_string(),
+            format!("{past}xlarge"),
+            None,
+        ),
+        (
+            "one past the ceiling, bare metal".to_string(),
+            format!("metal-{past}xl"),
+            None,
+        ),
+        (
+            "every bit of a u32".to_string(),
+            format!("{}xlarge", u32::MAX),
+            None,
+        ),
+        (
+            "a multiple above a u32".to_string(),
+            format!("{}xlarge", u64::from(u32::MAX) + 1),
+            None,
+        ),
+        // A plain `metal` names the whole host, whose size the name does not give.
+        ("a plain metal".to_string(), "metal".to_string(), None),
+        ("not a size at all".to_string(), "enormous".to_string(), None),
+    ];
+
+    for (case, size, expected) in cases {
+        let read = ec2::state::instance_size_sixteenths(&size);
+        assert_eq!(
+            read, expected,
+            "case {case:?}: expected {size:?} to read as {expected:?} sixteenths, got {read:?}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Rule 2: the vCPU options are consistent with the default
 // ---------------------------------------------------------------------------

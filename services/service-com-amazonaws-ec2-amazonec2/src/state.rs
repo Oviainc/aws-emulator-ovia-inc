@@ -5683,6 +5683,17 @@ const MAC_HOSTS: [(&str, i32, i64); 9] = [
     ("mac-m4max", 16, 128),
 ];
 
+/// The largest multiple of `xlarge` this module will read out of a size component.
+///
+/// AWS's published ladder tops out at `112xlarge` (`u7i-12tb.112xlarge`), so a multiple
+/// above this ceiling names no size AWS offers. The ceiling is what BOUNDS the arithmetic
+/// below: the size component is TEXT, so a multiple near `u32::MAX` would otherwise
+/// overflow the conversion into sixteenths — a panic where overflow checks are on, a
+/// wrapped count where they are off — and then the vCPU ([`default_vcpus`]) and memory
+/// ([`memory_mib_of`]) derivations built on it. It sits well above the published ladder so
+/// a new AWS size does not need it changed.
+pub const MAX_SIZE_MULTIPLE: u32 = 512;
+
 /// The size component of an instance type name, in SIXTEENTHS of the family's `large`
 /// size.
 ///
@@ -5693,7 +5704,8 @@ const MAC_HOSTS: [(&str, i32, i64); 9] = [
 ///
 /// `metal-48xl` is the 48xlarge-sized bare metal size, so it is on the ladder. A plain
 /// `metal` names the whole host, whose size the name itself does not give, so it is
-/// answered `None` here and resolved by [`instance_size_sixteenths_of`].
+/// answered `None` here and resolved by [`instance_size_sixteenths_of`]. A multiple above
+/// [`MAX_SIZE_MULTIPLE`] is answered `None` too: it is not a size AWS offers.
 pub fn instance_size_sixteenths(size: &str) -> Option<u32> {
     match size {
         "nano" => Some(SIZE_UNIT / 16),
@@ -5708,10 +5720,14 @@ pub fn instance_size_sixteenths(size: &str) -> Option<u32> {
                 size.strip_prefix("metal-")
                     .and_then(|sized| sized.strip_suffix("xl"))
             })?;
+            // A multiple above the ladder's ceiling is not a size at all, so it is answered
+            // `None` the way any other unreadable size component is, rather than multiplied
+            // out; `checked_mul` is what makes the bound structural rather than a comment.
             multiple
                 .parse::<u32>()
                 .ok()
-                .map(|multiple| multiple * 2 * SIZE_UNIT)
+                .filter(|multiple| *multiple <= MAX_SIZE_MULTIPLE)
+                .and_then(|multiple| multiple.checked_mul(2 * SIZE_UNIT))
         }
     }
 }
@@ -5845,7 +5861,9 @@ fn default_vcpus(name: &InstanceTypeName<'_>, sixteenths: u32) -> i32 {
         let single = smallest && name.generation.is_some_and(|generation| generation < 3);
         return if single { 1 } else { 2 };
     }
-    let mut vcpus = (sixteenths * VCPUS_PER_SIZE_UNIT / SIZE_UNIT).max(1);
+    // `sixteenths` is bounded by `MAX_SIZE_MULTIPLE`, so this product cannot overflow; the
+    // saturating form is what keeps that true if the ceiling ever moves.
+    let mut vcpus = (sixteenths.saturating_mul(VCPUS_PER_SIZE_UNIT) / SIZE_UNIT).max(1);
     // An HPC family ships with simultaneous multithreading DISABLED, so where the
     // hardware has a second thread per core the ladder's threads arrive as half as many
     // vCPUs: `hpc6a.48xlarge` has 96 vCPUs, not 192. A Graviton HPC family has no second
@@ -5878,7 +5896,9 @@ fn memory_mib_of(name: &InstanceTypeName<'_>, sixteenths: u32) -> i64 {
     if let Some(gib) = stated_memory_gib(name.family) {
         return gib * 1024;
     }
-    memory_mib_per_size_unit(name) * i64::from(sixteenths) / i64::from(SIZE_UNIT)
+    // Bounded by `MAX_SIZE_MULTIPLE` like the vCPU count above, and saturating for the same
+    // reason.
+    memory_mib_per_size_unit(name).saturating_mul(i64::from(sixteenths)) / i64::from(SIZE_UNIT)
 }
 
 /// Does this instance type come with local instance storage?
@@ -9109,35 +9129,83 @@ impl ComAmazonawsEc2Amazonec2State {
     }
 }
 
+/// EC2's message for a snapshot id no snapshot of the account has, in ONE place: the
+/// request-level refusal ([`invalid_snapshot_id_not_found`]) and the per-pair item a fast
+/// snapshot restore call reports it in ([`unresolvable_snapshot_id_error`]) carry the same
+/// sentence, so a client reads one wording per cause whichever channel it arrives in.
+fn snapshot_id_not_found_message(snapshot_id: &str) -> String {
+    format!("The snapshot '{snapshot_id}' does not exist.")
+}
+
+/// EC2's message for a value that is not a snapshot id at all: "Value
+/// (snap-00000000000000000) for snapshot ID is invalid.", as AWS answered the recorded
+/// `DisableFastSnapshotRestores` call behind
+/// `issues/.../20261023T102725Z-ec2-disablefastsnapshotrestores-stub.md` — the message is
+/// built from the value the request gave, so the VALUE is the request's and the sentence
+/// around it is the service's.
+fn snapshot_id_malformed_message(snapshot_id: &str) -> String {
+    format!("Value ({snapshot_id}) for snapshot ID is invalid.")
+}
+
 /// Refuse a request that named a snapshot id no snapshot of the account has, the way
 /// EC2 does: HTTP 400 `InvalidSnapshot.NotFound`.
 pub fn invalid_snapshot_id_not_found<E>(snapshot_id: &str) -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::service_error(
         INVALID_SNAPSHOT_ID_NOT_FOUND,
         400,
-        format!("The snapshot '{snapshot_id}' does not exist."),
+        snapshot_id_not_found_message(snapshot_id),
     )
 }
 
-/// Whether `id` is a well-formed EBS snapshot id: `snap-` followed by 8 or 17 lowercase
-/// hexadecimal digits — the short and the long id form, as the model's own
-/// `^snap-([0-9a-f]{8}|[0-9a-f]{17})$` style id patterns read.
+/// Whether `id` is a well-formed EBS snapshot id — one EC2 could have ISSUED.
+///
+/// A snapshot id is `snap-` followed by 8 or 17 lowercase hexadecimal digits — the short
+/// and the long id form, as the model's own `^snap-([0-9a-f]{8}|[0-9a-f]{17})$` style id
+/// patterns read — of which not all are `0`.
+///
+/// That last clause is the ALL-ZERO id, the value every client reaches for as a
+/// placeholder: EC2 answers it `InvalidSnapshotID.Malformed` rather than
+/// `InvalidSnapshot.NotFound`, because the mint counts from one so no snapshot can ever
+/// hold the null id. The evidence is the recorded `DisableFastSnapshotRestores` call behind
+/// `issues/.../20261023T102725Z-ec2-disablefastsnapshotrestores-stub.md`, which named
+/// `snap-00000000000000000` — seventeen hexadecimal digits, so well formed under the
+/// structural rule alone — and was answered `InvalidSnapshotID.Malformed`. It is the same
+/// clause [`instance_id_is_well_formed`] carries on its own recorded evidence, and it is a
+/// fact about THESE id kinds rather than about every EC2 id: a network interface id answers
+/// `NotFound` for the same all-zero suffix, so the clause is not generalised to the readers
+/// built on [`prefixed_id_is_well_formed`].
 pub fn snapshot_id_is_well_formed(id: &str) -> bool {
-    prefixed_id_is_well_formed("snap", id)
+    prefixed_id_is_well_formed("snap", id) && id_is_not_the_null_id("snap", id)
 }
 
-/// Refuse a snapshot id the request named that this service cannot resolve: a malformed
-/// one is answered as malformed, and a well-formed one as not found — the way the
-/// service orders the two, and the same ordering [`require_known_volume`] keeps.
-pub fn unresolvable_snapshot_id<E>(snapshot_id: &str) -> crate::scaffolded::Scaffolded<E> {
+/// The error code and message EC2 answers a snapshot id this service cannot resolve with: a
+/// malformed one as malformed, and a well-formed one as not found — the way the service
+/// orders the two, and the same ordering [`require_known_volume`] keeps.
+///
+/// The classification is a PAIR rather than an error so that both channels EC2 carries it
+/// in read it: the request-level refusal ([`unresolvable_snapshot_id`], which `CreateVolume`
+/// and `ImportImage` answer a `SnapshotId` with) and the per-snapshot item a fast snapshot
+/// restore call reports, where one unresolvable snapshot must not refuse the snapshots
+/// beside it.
+pub fn unresolvable_snapshot_id_error(snapshot_id: &str) -> (&'static str, String) {
     if snapshot_id_is_well_formed(snapshot_id) {
-        return invalid_snapshot_id_not_found(snapshot_id);
+        return (
+            INVALID_SNAPSHOT_ID_NOT_FOUND,
+            snapshot_id_not_found_message(snapshot_id),
+        );
     }
-    crate::scaffolded::Scaffolded::service_error(
+    (
         INVALID_SNAPSHOT_ID_MALFORMED,
-        400,
-        format!("Invalid id: '{snapshot_id}'"),
+        snapshot_id_malformed_message(snapshot_id),
     )
+}
+
+/// Refuse a snapshot id the request named that this service cannot resolve, through the one
+/// classification [`unresolvable_snapshot_id_error`] holds: HTTP 400, with that cause's own
+/// code.
+pub fn unresolvable_snapshot_id<E>(snapshot_id: &str) -> crate::scaffolded::Scaffolded<E> {
+    let (code, message) = unresolvable_snapshot_id_error(snapshot_id);
+    crate::scaffolded::Scaffolded::service_error(code, 400, message)
 }
 
 /// Refuse a create that would take the store past [`MAX_STORED_VOLUMES`]: HTTP 400
@@ -16664,6 +16732,21 @@ pub fn prefixed_id_is_well_formed(prefix: &str, id: &str) -> bool {
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+/// Whether `id` is NOT the null id of the kind `prefix` names: `<prefix>-` followed by
+/// nothing but `0`.
+///
+/// The all-zero id is the value every client reaches for as a placeholder, and the mint
+/// counts from one ([`ComAmazonawsEc2Amazonec2State::next_id`]), so no resource can ever
+/// hold it. The ONE definition of that clause, for the id readers whose kind AWS answers
+/// `Invalid<Kind>.Malformed` for it ([`issued_long_id_is_well_formed`] and
+/// [`snapshot_id_is_well_formed`], each on the evidence recorded with it) — it is not a rule
+/// about every EC2 id, so [`prefixed_id_is_well_formed`] does not read it.
+fn id_is_not_the_null_id(prefix: &str, id: &str) -> bool {
+    id.strip_prefix(prefix)
+        .and_then(|rest| rest.strip_prefix('-'))
+        .is_some_and(|suffix| suffix.bytes().any(|digit| digit != b'0'))
+}
+
 /// Whether `id` is a well-formed LONG-form EC2 resource id of the kind `prefix` names that
 /// EC2 could have ISSUED.
 ///
@@ -16692,7 +16775,7 @@ pub fn issued_long_id_is_well_formed(prefix: &str, id: &str) -> bool {
             .bytes()
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
         && suffix.starts_with('0')
-        && suffix.bytes().any(|byte| byte != b'0')
+        && id_is_not_the_null_id(prefix, id)
 }
 
 /// Whether `id` is a well-formed VPC ENDPOINT id, as opposed to an id of one of the two
