@@ -24,8 +24,11 @@
 //! 6. a service-linked recorder is always recording and is not this account's
 //!    customer managed recorder.
 //!
-//! The connector the recorder links to is created over the wire with `PutConnector`,
-//! like every other step.
+//! The connector the recorder links to is SEEDED in the shared engine
+//! (`crate::config_connectors::seed_connector`), because `PutConnector` creates none:
+//! it verifies a provider credential with the provider before materializing anything,
+//! which is an outbound connection this emulator does not make (see
+//! `connector_credential_verification.rs`). Every other step goes over the wire.
 
 use std::time::Duration;
 
@@ -44,24 +47,15 @@ const UNRECOGNIZED_PRINCIPAL_MESSAGE: &str =
     "The service principal of the configuration recorder you entered cannot be found. \
      Verify the configuration recorder service principal, and try again.";
 
-/// Create the connector a third-party service-linked recorder links to, over the
-/// wire, and return the ARN `PutConnector` minted for it.
-async fn put_connector(emulator: &Emulator, tenant: &str) -> String {
-    let created = emulator
-        .ok(
-            "PutConnector",
-            &json!({
-                "ConnectorConfiguration": { "azure": {
-                    "tenantIdentifier": tenant,
-                    "clientIdentifier": format!("client-{tenant}"),
-                } },
-            }),
-        )
-        .await;
-    created["Arn"]
-        .as_str()
-        .unwrap_or_else(|| panic!("PutConnector must answer an Arn, got {created}"))
-        .to_string()
+/// The connector a third-party service-linked recorder links to, placed in the store
+/// and answered by its ARN.
+///
+/// `PutConnector` creates no connector in this emulator — it refuses a provider
+/// credential it cannot verify with the provider, which is every one — so the
+/// connector this suite needs is seeded the way the other suites of this crate seed
+/// state (`crate::config_connectors::seed_connector`).
+fn seed_connector(emulator: &Emulator, tenant: &str) -> String {
+    crate::config_connectors::seed_connector(emulator, tenant, &format!("client-{tenant}"))
 }
 
 /// The request body for the operation under test.
@@ -162,7 +156,7 @@ async fn a_service_principal_that_owns_no_third_party_recorder_is_refused() {
         );
 
         let emulator = Emulator::new();
-        let connector = put_connector(&emulator, "tenant-unrecognized").await;
+        let connector = seed_connector(&emulator, "tenant-unrecognized");
         let message = refused_with(
             &emulator,
             case,
@@ -249,7 +243,7 @@ async fn a_supported_service_principal_creates_the_recorder_the_linked_service_m
         // for, from `state::THIRD_PARTY_SERVICE_LINKED_PRINCIPALS`.
         for principal in state::THIRD_PARTY_SERVICE_LINKED_PRINCIPALS {
             let emulator = Emulator::in_region("us-west-2");
-            let connector = put_connector(&emulator, "tenant-create").await;
+            let connector = seed_connector(&emulator, "tenant-create");
 
             let created = emulator
                 .ok(PUT_THIRD_PARTY, &put_request(principal, &connector, &scope))
@@ -406,7 +400,7 @@ async fn a_supported_service_principal_creates_the_recorder_the_linked_service_m
 #[tokio::test]
 async fn the_first_recording_event_settles_the_way_the_clock_owes_it() {
     let emulator = Emulator::new();
-    let connector = put_connector(&emulator, "tenant-settle").await;
+    let connector = seed_connector(&emulator, "tenant-settle");
     let principal = state::THIRD_PARTY_SERVICE_LINKED_PRINCIPALS[0];
     emulator
         .ok(
@@ -465,7 +459,7 @@ async fn a_scope_configuration_outside_its_published_constraints_is_refused() {
 
     for (case, scope) in cases {
         let emulator = Emulator::new();
-        let connector = put_connector(&emulator, "tenant-scope").await;
+        let connector = seed_connector(&emulator, "tenant-scope");
         let principal = state::THIRD_PARTY_SERVICE_LINKED_PRINCIPALS[0];
         let message = refused_with(
             &emulator,
@@ -536,7 +530,7 @@ async fn the_connector_the_recorder_is_linked_to_must_exist() {
 
     // The same request succeeds once that connector exists, so the refusals above are
     // about existence and not about the shape of the request.
-    let connector = put_connector(&emulator, "tenant-now-created").await;
+    let connector = seed_connector(&emulator, "tenant-now-created");
     let created = emulator
         .ok(PUT_THIRD_PARTY, &put_request(principal, &connector, &scope))
         .await;
@@ -552,8 +546,8 @@ async fn the_connector_the_recorder_is_linked_to_must_exist() {
 async fn a_repeat_call_updates_the_scope_and_another_connector_conflicts() {
     let emulator = Emulator::new();
     let principal = state::THIRD_PARTY_SERVICE_LINKED_PRINCIPALS[0];
-    let first_connector = put_connector(&emulator, "tenant-first").await;
-    let second_connector = put_connector(&emulator, "tenant-second").await;
+    let first_connector = seed_connector(&emulator, "tenant-first");
+    let second_connector = seed_connector(&emulator, "tenant-second");
 
     let mut request = put_request(
         principal,
@@ -668,7 +662,7 @@ async fn a_repeat_call_updates_the_scope_and_another_connector_conflicts() {
 async fn a_service_linked_recorder_is_not_this_account_s_customer_managed_recorder() {
     let emulator = Emulator::new();
     let principal = state::THIRD_PARTY_SERVICE_LINKED_PRINCIPALS[0];
-    let connector = put_connector(&emulator, "tenant-separation").await;
+    let connector = seed_connector(&emulator, "tenant-separation");
     emulator
         .ok(
             PUT_THIRD_PARTY,
