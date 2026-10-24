@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Assigns tags to the resource its `resourceArn` names.
+//!
+//! The ARN is read with [`crate::state::parse_tagged_resource_arn`] — an `RsiArn` names a
+//! virtual cluster or a resource under one — and each pair of the request's `tags` is
+//! written into the ONE tag set that resource's own record holds: a key the resource does
+//! not carry is added, a key it already carries takes the new value, and every key the
+//! request does not name is left as it was, so the next read of the resource (through
+//! `DescribeVirtualCluster` or `DescribeJobRun`) reports the merged set. An ARN whose
+//! resource path is not one the model declares is refused with the modelled
+//! `ValidationException`; a well-formed one naming no stored resource with
+//! `ResourceNotFoundException`; and a merge that would leave the resource holding more
+//! than [`crate::state::MAX_RESOURCE_TAGS`] tags with `ValidationException`, writing
+//! nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -143,20 +148,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        // The request context carries no value this operation needs: the resource is
+        // named by the ARN in the request itself, not by the caller's credential scope.
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let store = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            TagResourceErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the virtual cluster store is unavailable".to_string()),
+            })
+        })?;
+
+        // `resourceArn`'s length and pattern, and every `tags` key's and value's own
+        // length and pattern, are refused at the boundary BEFORE this handler runs. What
+        // is left to judge about the ARN is whether its resource path names a resource
+        // this service models at all: `RsiArn`'s pattern ends in `/virtualclusters/.+`,
+        // which admits paths no resource of this service ever has.
+        let Some(resource) = crate::state::parse_tagged_resource_arn(&input.resource_arn) else {
+            return Err(TagResourceErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "{} is not the ARN of an EMR on EKS resource",
+                        input.resource_arn
+                    )),
+                },
+            )
+            .into());
+        };
+
+        let mut state = store.lock();
+        // Mutating, but it materialises what the clock already owed first, so the record
+        // this call edits is the settled one rather than a stale copy of it.
+        state.settle();
+
+        let Some(tags) = state.resource_tags_mut(&resource, &input.resource_arn) else {
+            return Err(TagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!("Resource {} was not found", input.resource_arn)),
+                },
+            )
+            .into());
+        };
+
+        // How big the merged set would be: the keys the resource already holds that this
+        // request does not name, plus every key it does. A request that only re-values
+        // keys the resource already carries never grows the set, so a resource sitting AT
+        // the cap can still have its tags rewritten.
+        let merged = tags
+            .keys()
+            .filter(|key| !input.tags.contains_key(key.as_str()))
+            .count()
+            + input.tags.len();
+        if merged > crate::state::MAX_RESOURCE_TAGS {
+            return Err(TagResourceErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "a resource holds at most {} tags; this request would leave {} holding {merged}",
+                        crate::state::MAX_RESOURCE_TAGS, input.resource_arn
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Write exactly the pairs the request names and leave every other tag in place.
+        // A key the resource already carries takes the new value, so the same call
+        // repeated answers the same way and leaves the same state.
+        for (key, value) in input.tags {
+            tags.insert(key, value);
+        }
+
+        Ok(TagResourceOutput {})
     }
 }
