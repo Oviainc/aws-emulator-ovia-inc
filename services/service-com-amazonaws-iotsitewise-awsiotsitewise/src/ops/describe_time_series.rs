@@ -250,15 +250,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // `workspaceName` scopes the lookup to one SiteWise workspace. Workspaces are
-        // created by `CreateWorkspace`, which is still a scaffold stub here, so no
-        // workspace exists for a request to name and the one it names is absent. A
-        // request that identifies no series is still invalid first: the scope only
-        // narrows where a well-formed lookup is answered from.
+        // `workspaceName` scopes the lookup to one SiteWise workspace. This store
+        // holds no time series inside a workspace — nothing that ingests one
+        // records a workspace for it — so a scoped lookup resolves to nothing: to
+        // the workspace itself when the store does not hold that either, and
+        // otherwise to the series the request identified inside it. A request that
+        // identifies no series is still invalid first: the scope only narrows where
+        // a well-formed lookup is answered from.
         if let Some(workspace) = input.workspace_name.as_deref() {
-            return Err(not_found(crate::state::not_found_message(
-                crate::state::RESOURCE_WORKSPACE,
-                workspace,
+            if !store.workspaces.contains_key(workspace) {
+                return Err(not_found(crate::state::not_found_message(
+                    crate::state::RESOURCE_WORKSPACE,
+                    workspace,
+                )));
+            }
+            return Err(not_found(format!(
+                "The time series the request identifies could not be found in the workspace \
+                 {workspace}."
             )));
         }
 

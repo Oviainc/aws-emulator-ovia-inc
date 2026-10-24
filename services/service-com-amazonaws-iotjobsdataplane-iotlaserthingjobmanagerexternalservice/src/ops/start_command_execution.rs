@@ -7,7 +7,12 @@
 //! `commandArn` must name a command that EXISTS in the shared command index the
 //! IoT control plane owns (`service_common::iot_commands`), or the call is refused
 //! 400 `ValidationException` naming the missing command rather than accepting an
-//! execution that could never run. Then it ADMITS the request only while the target
+//! execution that could never run. That same index says what the command ADMITS, and
+//! two requests it does not admit are refused 400 as well: an execution of a command
+//! the control plane has DEPRECATED (`iot:UpdateCommand$deprecated`), which is no
+//! longer a command new executions may be created from, and one carrying `parameters`
+//! for a command whose payload is STATIC, which has no placeholder any parameter could
+//! fill. Then it ADMITS the request only while the target
 //! device is under the published per-device command-execution concurrency limit
 //! (`service_common::iot_job_executions::MAX_CONCURRENT_COMMAND_EXECUTIONS_PER_THING`
 //! non-terminal command executions); a device already at that limit is refused 402
@@ -253,6 +258,22 @@ fn command_not_found_message(command_name: &str) -> String {
     format!("The command {command_name} was not found.")
 }
 
+/// The 400 message the service builds when `commandArn` names a command the control
+/// plane has DEPRECATED. Request-derived like the others: it names the command the
+/// ARN named, and says what about it refuses the start.
+fn command_deprecated_message(command_name: &str) -> String {
+    format!("The command {command_name} is deprecated and cannot be used to start new command executions.")
+}
+
+/// The 400 message the service builds for `parameters` supplied against a command
+/// whose payload is STATIC.
+///
+/// The refusal is about the referenced COMMAND's payload kind rather than about any
+/// value in the request, so, unlike the target and command-name refusals, there is
+/// nothing of the request to read back into it.
+const STATIC_PAYLOAD_PARAMETERS_MESSAGE: &str =
+    "The parameters option is unsupported for commands with static payloads.";
+
 /// One command parameter as JSON, keyed by the member the model names on the wire
 /// (`S`, `B`, `I`, `L`, `D`, `BIN`, `UL`). A blob is base64, the restJson1 form.
 fn parameter_value_json(value: &CommandParameterValue) -> serde_json::Value {
@@ -426,13 +447,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a specific device". Commands are owned by the IoT control plane, so the
         // store that answers it is the shared command index — never this
         // operation's own guess from the ARN's form, which says nothing about
-        // whether the command was ever created.
+        // whether the command was ever created, what it admits, or whether it is
+        // still one new executions may be created from.
         let Some(commands) = crate::state::command_registry(&*self.engine) else {
             return Err(unavailable("command registry"));
         };
-        let command_exists = commands.lock().contains(&input.command_arn);
-        if !command_exists {
+        let command = commands.lock().facts(&input.command_arn);
+        let Some(command) = command else {
             return Err(invalid_request(command_not_found_message(command_name)));
+        };
+        // A DEPRECATED command still exists and is still readable, but it is not one an
+        // execution may be started from any more: the request is refused with this
+        // operation's modelled client error, and nothing is stored.
+        if command.deprecated {
+            return Err(invalid_request(command_deprecated_message(command_name)));
+        }
+        // `parameters` is "a list of parameters that are required by the
+        // StartCommandExecution API when performing the command on a device": it is
+        // meaningful only where the command's payload has placeholders for it — a
+        // command created with a `payloadTemplate` (or with `mandatoryParameters` a
+        // start fills in). A command created with a literal, STATIC payload has none,
+        // so parameters supplied against one are not a request the service can honor
+        // and are refused rather than silently baked into a document the device's
+        // payload does not use. An EMPTY map asks for no substitution at all, so it is
+        // not what is refused.
+        let supplies_parameters = input
+            .parameters
+            .as_ref()
+            .is_some_and(|parameters| !parameters.is_empty());
+        if command.static_payload && supplies_parameters {
+            return Err(invalid_request(STATIC_PAYLOAD_PARAMETERS_MESSAGE.to_string()));
         }
 
         let parameters = parameters_json(input.parameters.as_ref());

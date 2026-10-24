@@ -24,9 +24,9 @@
 //! it, the same definition `ListMemberAccounts` reports.
 //!
 //! Both sizes a caller controls here are BOUNDED: how many items one call may
-//! carry ([`MAX_ITEMS_PER_CALL`]) and how many resources one resource set may
-//! hold ([`MAX_RESOURCES_PER_RESOURCE_SET`]), so neither the per-call work nor
-//! the stored membership can grow without limit.
+//! carry ([`crate::state::MAX_RESOURCE_SET_ITEMS_PER_CALL`]) and how many
+//! resources one resource set may hold ([`MAX_RESOURCES_PER_RESOURCE_SET`]), so
+//! neither the per-call work nor the stored membership can grow without limit.
 //!
 //! ## Shape of an operation
 //!
@@ -141,16 +141,6 @@ impl From<BatchAssociateResourceErrorModeled> for BatchAssociateResourceError {
     }
 }
 
-/// The number of items one `BatchAssociateResource` call may carry.
-///
-/// An EMULATOR-CHOSEN bound, not an AWS-documented one: the model's
-/// `IdentifierList` declares no length, so the request boundary admits any
-/// number of items and the service is what bounds them. It bounds the work ONE
-/// call does — the classification loop below runs under this service's state
-/// lock — so a caller cannot make one request hold the store for an unbounded
-/// time. A caller with more resources to associate sends more calls.
-const MAX_ITEMS_PER_CALL: usize = 100;
-
 /// The number of resources one resource set may hold.
 ///
 /// An EMULATOR-CHOSEN bound, not an AWS-documented quota number (Firewall
@@ -161,116 +151,6 @@ const MAX_ITEMS_PER_CALL: usize = 100;
 /// the condition that error's own documentation names — so repeated calls
 /// cannot grow one set's stored membership without limit.
 const MAX_RESOURCES_PER_RESOURCE_SET: usize = 500;
-
-/// Resolve a `ResourceSetIdentifier` to the key a resource set is stored under.
-///
-/// The modelled `Identifier` is up to 2048 characters where the resource set's
-/// own `Id` is 22, so a caller may name the set by either its `Id` or its ARN;
-/// both are identifiers it holds. `None` when it names neither.
-fn resolve_resource_set_id(
-    store: &crate::state::ComAmazonawsFmsAwsfms20180101State,
-    identifier: &str,
-) -> Option<String> {
-    if store.resource_sets.contains_key(identifier) {
-        return Some(identifier.to_string());
-    }
-    store
-        .resource_sets
-        .values()
-        .find(|record| record.arn == identifier)
-        .map(|record| record.id.clone())
-}
-
-/// Compare two names that spell the same thing differently on the wire: the
-/// `AWS::NetworkFirewall::Firewall` resource type's `Firewall` and the
-/// `firewall/<name>` of a Network Firewall ARN, or `ResolverQueryLogConfig` and
-/// `resolver-query-log-config`. Keeps only the alphanumerics, lowercased.
-fn normalized(value: &str) -> String {
-    value
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .map(|c| c.to_ascii_lowercase())
-        .collect()
-}
-
-/// The type segment of an ARN's resource field: `firewall` of
-/// `firewall/<name>`, `instance` of `instance/i-0123`. The whole field when it
-/// carries no separator, which is a resource whose ARN names only an id.
-fn arn_resource_type(resource: &str) -> &str {
-    resource
-        .split_once(['/', ':'])
-        .map_or(resource, |(resource_type, _)| resource_type)
-}
-
-/// Why `uri` cannot be associated with a resource set that holds
-/// `resource_types` in `region`, or `None` when it can.
-///
-/// Every reason is a value of the model's `FailedItemReason`
-/// (`crate::ops::types::FAILED_ITEM_REASON_VALUES`), and the checks run in the
-/// order the ARN is built, so an item is reported against the FIRST field that
-/// disagrees:
-///
-/// * not an ARN at all -> `NOT_VALID_ARN`;
-/// * another partition than the one this emulator's resources live in
-///   (`partition`) -> `NOT_VALID_PARTITION`;
-/// * another Region than the one the request addresses -> `NOT_VALID_REGION`,
-///   because a resource set holds the resources of the administrator's Region;
-/// * an account that is not in this organization (`accounts`) ->
-///   `NOT_VALID_ACCOUNT_ID`;
-/// * a resource whose type no entry of the set's `ResourceTypeList` names ->
-///   `NOT_VALID_RESOURCE_TYPE`, because the set's `ResourceTypeList` is what
-///   "determines the resources that can be associated to the resource set"
-///   (`ResourceSet$ResourceTypeList`).
-///
-/// `partition` and `accounts` are derived ONCE by the caller, so classifying a
-/// batch does not rebuild them per item.
-fn failure_reason(
-    uri: &str,
-    region: &str,
-    partition: &str,
-    accounts: &::std::collections::BTreeSet<String>,
-    resource_types: &[String],
-) -> Option<&'static str> {
-    let Some(arn) = crate::state::parse_arn(uri) else {
-        return Some("NOT_VALID_ARN");
-    };
-    if arn.partition != partition {
-        return Some("NOT_VALID_PARTITION");
-    }
-    if arn.region != region {
-        return Some("NOT_VALID_REGION");
-    }
-    if !accounts.contains(arn.account) {
-        return Some("NOT_VALID_ACCOUNT_ID");
-    }
-    let resource_type = normalized(arn_resource_type(arn.resource));
-    let in_scope = resource_types.iter().any(|declared| {
-        declared
-            .rsplit("::")
-            .next()
-            .is_some_and(|last| normalized(last) == resource_type)
-    });
-    (!in_scope).then_some("NOT_VALID_RESOURCE_TYPE")
-}
-
-/// The accounts of this organization a resource may belong to: the ones
-/// [`crate::state::ComAmazonawsFmsAwsfms20180101State::member_accounts`] reports
-/// — the SAME definition `ListMemberAccounts` answers with, so two operations
-/// cannot disagree about who is in the organization — together with the accounts
-/// the discovered-resource inventory carries, which are by construction accounts
-/// Firewall Manager discovered resources in.
-fn organization_accounts(
-    store: &crate::state::ComAmazonawsFmsAwsfms20180101State,
-) -> ::std::collections::BTreeSet<String> {
-    let mut accounts = store.member_accounts();
-    accounts.extend(
-        store
-            .discovered_resources
-            .values()
-            .filter_map(|resource| resource.account_id.clone()),
-    );
-    accounts
-}
 
 /// The `BatchAssociateResource` operation.
 ///
@@ -325,12 +205,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The batch is bounded before anything is classified: the model declares
         // no length for `Items`, so this is where the per-call work is capped.
-        if input.items.len() > MAX_ITEMS_PER_CALL {
+        if input.items.len() > crate::state::MAX_RESOURCE_SET_ITEMS_PER_CALL {
             return Err(BatchAssociateResourceErrorModeled::InvalidInputException(
                 InvalidInputException {
                     message: Some(format!(
-                        "Items must name at most {MAX_ITEMS_PER_CALL} resources in one call; {} \
-                         were sent",
+                        "Items must name at most {} resources in one call; {} were sent",
+                        crate::state::MAX_RESOURCE_SET_ITEMS_PER_CALL,
                         input.items.len()
                     )),
                 },
@@ -338,7 +218,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let Some(id) = resolve_resource_set_id(&store, &input.resource_set_identifier) else {
+        let Some(id) = crate::state::resolve_resource_set_id(&store, &input.resource_set_identifier)
+        else {
             return Err(
                 BatchAssociateResourceErrorModeled::ResourceNotFoundException(
                     crate::state::resource_not_found(),
@@ -355,11 +236,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|record| record.resource_set.resource_type_list.clone())
             .unwrap_or_default();
         let partition = crate::state::emulator_partition();
-        let accounts = organization_accounts(&store);
+        let accounts = crate::state::organization_accounts(&store);
         let mut failed_items = Vec::new();
         let mut associated = Vec::new();
         for uri in &input.items {
-            match failure_reason(uri, &region, &partition, &accounts, &resource_types) {
+            match crate::state::resource_set_item_failure_reason(
+                uri,
+                &region,
+                &partition,
+                &accounts,
+                &resource_types,
+            ) {
                 Some(reason) => failed_items.push(FailedItem {
                     uri: Some(uri.clone()),
                     reason: Some(reason.to_string()),

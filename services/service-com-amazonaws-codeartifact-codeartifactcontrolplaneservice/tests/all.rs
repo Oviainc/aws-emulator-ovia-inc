@@ -63,3 +63,5 @@ mod package_group_arn_encoding;
 mod package_version_asset_download;
 #[path = "all/package_group_allowed_repositories.rs"]
 mod package_group_allowed_repositories;
+#[path = "all/package_version_asset_listing.rs"]
+mod package_version_asset_listing;

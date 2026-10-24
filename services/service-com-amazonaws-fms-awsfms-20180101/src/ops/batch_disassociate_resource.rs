@@ -1,15 +1,35 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchDisassociateResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchDisassociateResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchDisassociateResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Disassociates resource URIs from a Firewall Manager resource set. A MUTATING
+//! operation, and the exact inverse of `BatchAssociateResource`: the set's
+//! membership is a SET of URIs, so disassociating a URI the set does not hold
+//! changes nothing and succeeds.
+//!
+//! Administrator-gated, like every organisation-scoped Firewall Manager
+//! operation: with no Firewall Manager default administrator association in this
+//! account/Region the call is refused by [`crate::state::require_administrator`]
+//! BEFORE the `ResourceSetIdentifier` is looked up and before any item is
+//! examined, so a nonexistent resource-set id AND a malformed item ARN both get
+//! the authorization refusal rather than `ResourceNotFoundException` or a
+//! per-item `FailedItems` result.
+//!
+//! With an administrator associated, an identifier that names no stored resource
+//! set is `ResourceNotFoundException`, and each item is classified
+//! INDEPENDENTLY: a URI the set HOLDS is removed, since nothing can make a
+//! resource that is already a member unremovable; a URI the set does not hold
+//! and that could not be a member of it at all is reported in `FailedItems` with
+//! the `FailedItemReason` of the first ARN field that disagrees
+//! ([`crate::state::resource_set_item_failure_reason`], the SAME classifier
+//! `BatchAssociateResource` admits items by); and a URI that could be a member
+//! but is not one leaves nothing to remove. The rest of the batch is
+//! disassociated either way: a batch is not all-or-nothing.
+//!
+//! How many items one call may carry is BOUNDED
+//! ([`crate::state::MAX_RESOURCE_SET_ITEMS_PER_CALL`]), so the per-call work
+//! cannot grow without limit; the stored membership needs no bound of its own
+//! here, because removing resources only shrinks it.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +175,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchDisassociateResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchDisassociateResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchDisassociateResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                BatchDisassociateResourceErrorModeled::InternalErrorException(
+                    InternalErrorException {
+                        message: Some("the Firewall Manager store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let mut store = state.lock();
+        // The authorization gate, BEFORE the resource set is looked up and before
+        // any item is examined.
+        crate::state::require_administrator(&store, &region)?;
+
+        // The batch is bounded before anything is classified: the model declares
+        // no length for `Items`, so this is where the per-call work is capped.
+        if input.items.len() > crate::state::MAX_RESOURCE_SET_ITEMS_PER_CALL {
+            return Err(
+                BatchDisassociateResourceErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(format!(
+                            "Items must name at most {} resources in one call; {} were sent",
+                            crate::state::MAX_RESOURCE_SET_ITEMS_PER_CALL,
+                            input.items.len()
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let Some(id) = crate::state::resolve_resource_set_id(&store, &input.resource_set_identifier)
+        else {
+            return Err(
+                BatchDisassociateResourceErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(),
+                )
+                .into(),
+            );
+        };
+
+        // The set's own `ResourceTypeList` and its current membership, both read
+        // ONCE before anything is written. The identifier resolved above, so this
+        // lookup finds the record under the same held lock; it is read through
+        // the same not-found channel rather than a default, so no future change
+        // can classify a batch against an empty `ResourceTypeList`.
+        let Some(record) = store.resource_sets.get(&id) else {
+            return Err(
+                BatchDisassociateResourceErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(),
+                )
+                .into(),
+            );
+        };
+        let resource_types = record.resource_set.resource_type_list.clone();
+        let held = record.resources.clone();
+        let partition = crate::state::emulator_partition();
+        let accounts = crate::state::organization_accounts(&store);
+        let mut failed_items = Vec::new();
+        let mut disassociated = Vec::new();
+        for uri in &input.items {
+            // A resource the set already holds is removable whatever it is: it
+            // became a member when it was associated, and the set's
+            // `ResourceTypeList` can be rewritten afterwards, so classifying a
+            // member again could otherwise leave it stuck in the set.
+            if held.contains(uri) {
+                disassociated.push(uri.clone());
+                continue;
+            }
+            // Not a member. Either it is something that could never be one — the
+            // per-item failure this operation's output models — or it is a
+            // resource this set simply does not hold, which leaves nothing to
+            // remove.
+            if let Some(reason) = crate::state::resource_set_item_failure_reason(
+                uri,
+                &region,
+                &partition,
+                &accounts,
+                &resource_types,
+            ) {
+                failed_items.push(FailedItem {
+                    uri: Some(uri.clone()),
+                    reason: Some(reason.to_string()),
+                });
+            }
+        }
+
+        if let Some(record) = store.resource_sets.get_mut(&id) {
+            for uri in &disassociated {
+                record.resources.remove(uri);
+            }
+        }
+        Ok(BatchDisassociateResourceOutput {
+            resource_set_identifier: id,
+            failed_items,
+        })
     }
 }
+

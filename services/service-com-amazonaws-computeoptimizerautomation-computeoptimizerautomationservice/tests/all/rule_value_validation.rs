@@ -17,9 +17,11 @@
 //! * `recommendedActionTypes` — the action types the rule executes, so an empty
 //!   list automates nothing;
 //! * `schedule` — "The expression that defines when the schedule runs", a cron
-//!   of six fields of which "Your cron expression must use specific values (not
+//!   expression of which "Your cron expression must use specific values (not
 //!   wildcards) for the minutes and hours fields"
 //!   (`smithy_query(query="doc",shape="Schedule",member="scheduleExpression")`).
+//!   The FORMS one and the same cron expression can be written in are
+//!   [`crate::schedule_expression_forms`]' own table.
 //!
 //! Each is asserted over a TABLE spanning the class rather than over the one
 //! request a report named: the operator cases are EXHAUSTIVE over every member
@@ -477,15 +479,16 @@ async fn criteria_hold_at_most_twenty_conditions_each_over_at_most_twenty_values
 // schedule
 // ---------------------------------------------------------------------------
 
-/// A schedule is accepted only when it carries a six-field cron expression whose
-/// minutes and hours fields each name ONE value in range.
+/// A schedule is accepted only when it carries a cron expression whose minutes
+/// and hours fields each name ONE value in range.
 ///
 /// The table walks every form a cron field can take — a specific value at each
 /// end of its range, both wildcards, a list, a range, a step, a value past the
-/// field's bound — and every field count around the documented six. The four
-/// fields the doc does not constrain (`day_of_month`, `month`, `day_of_week`,
-/// `year`) are left to the expression's own vocabulary, which the accepted rows
-/// below exercise.
+/// field's bound — and field counts around the documented ones (the trailing
+/// `year` field is optional, as the member's own example `(30 12 * * *)` shows).
+/// The fields the doc does not constrain (`day_of_month`, `month`,
+/// `day_of_week`, `year`) are left to the expression's own vocabulary, which the
+/// accepted rows below exercise.
 #[tokio::test]
 async fn a_schedule_is_accepted_only_with_specific_minutes_and_hours() {
     let router = emulator();
@@ -587,8 +590,18 @@ async fn a_schedule_is_accepted_only_with_specific_minutes_and_hours() {
             false,
         ),
         (
-            "five-fields",
+            "the-documented-five-field-example",
+            json!({"scheduleExpression": "30 12 * * *"}),
+            true,
+        ),
+        (
+            "five-fields-with-any-day-of-week",
             json!({"scheduleExpression": "30 12 * * ?"}),
+            true,
+        ),
+        (
+            "four-fields",
+            json!({"scheduleExpression": "30 12 * *"}),
             false,
         ),
         (
