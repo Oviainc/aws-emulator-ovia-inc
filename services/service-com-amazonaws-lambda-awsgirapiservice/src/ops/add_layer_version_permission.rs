@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op AddLayerVersionPermission
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `AddLayerVersionPermission`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Grants a principal permission to use one version of a layer, by appending one
+//! statement to that version's resource-based policy — the slice
+//! [`crate::state::LayerVersionRecord::policy`] holds and `GetLayerVersionPolicy`
+//! reports.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`AddLayerVersionPermission::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! What this handler writes is exactly what the request described: the statement's
+//! `Sid`, `Action` and `Principal` come from the request, its `Resource` is the ARN of
+//! the resolved version, and an `OrganizationId` becomes the condition key that
+//! expresses it (see [`crate::state::PolicyStatement`]). The policy is attached to the
+//! single version the request addressed, because this call "Adds permissions to the
+//! resource-based policy of a version of an Lambda layer".
+//!
+//! Refusals, each from the state the store holds rather than from the shape of the
+//! request: an unknown layer or version is a `ResourceNotFoundException`; a
+//! `StatementId` the policy already holds is a `ResourceConflictException`; a
+//! `RevisionId` that does not match the policy's current revision is a
+//! `PreconditionFailedException`; and a call that would push the document past the
+//! published 20 KB quota is a `PolicyLengthExceededException`.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +188,161 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `AddLayerVersionPermission` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(AddLayerVersionPermissionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("AddLayerVersionPermission"))
+        // The grant is attached to the stored layer version, whose ARN carries the
+        // region it was published in, so no request metadata takes part in the answer.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(AddLayerVersionPermissionErrorModeled::ServiceException(ServiceException {
+                r#type: None,
+                message: Some("Lambda state is not reachable on this engine".to_string()),
+            })
+            .into());
+        };
+
+        let mut store = state.lock();
+        let resolved = crate::state::resolve_layer_version(
+            &mut store,
+            &input.layer_name,
+            input.version_number,
+        )
+        .map_err(|failure| match failure {
+            crate::state::ResolveFailure::Malformed(message) => {
+                AddLayerVersionPermissionErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        r#type: None,
+                        message: Some(message),
+                    },
+                )
+            }
+            crate::state::ResolveFailure::NotFound(message) => {
+                AddLayerVersionPermissionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        r#type: None,
+                        message: Some(message),
+                    },
+                )
+            }
+        })?;
+        // The ARN of the version the statement is granted on, which is its `Resource`.
+        let resource = resolved.arn;
+
+        // "With the principal set to *, grant permission to all accounts in the
+        // specified organization": an organization narrows the wildcard principal, so
+        // naming one beside a single account grants two different things at once and is
+        // refused rather than silently dropped.
+        if input.organization_id.is_some() && input.principal != "*" {
+            return Err(
+                AddLayerVersionPermissionErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
+                        r#type: None,
+                        message: Some(format!(
+                            "The principal must be '*' when an organization id is specified, \
+                             not '{}'.",
+                            input.principal
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Worked on a copy of the stored policy, so a refused call leaves the policy
+        // exactly as it was — including the revision a later precondition is checked
+        // against.
+        let mut policy = resolved.version.policy.clone().unwrap_or_default();
+
+        // "An identifier that distinguishes the policy from others on the same layer
+        // version", so a statement id the version already carries names an existing
+        // grant rather than a new one. This check comes before the revision
+        // precondition below, exactly as the function-level `AddPermission` handler
+        // beside this one orders the same two.
+        if policy.holds(&input.statement_id) {
+            return Err(AddLayerVersionPermissionErrorModeled::ResourceConflictException(
+                ResourceConflictException {
+                    r#type: None,
+                    message: Some(format!(
+                        "The statement id ({}) provided already exists. Please provide a new \
+                         statement id, or remove the existing statement.",
+                        input.statement_id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "Only update the policy if the revision ID matches the ID specified." The id
+        // to match is the policy's own, which is the one `GetLayerVersionPolicy`
+        // reports; a version with no policy yet is at no revision, so any expectation
+        // fails against it.
+        if let Some(expected) = input.revision_id.as_deref() {
+            let current = resolved
+                .version
+                .policy
+                .as_ref()
+                .map(|stored| stored.revision_id.as_str());
+            if current != Some(expected) {
+                return Err(
+                    AddLayerVersionPermissionErrorModeled::PreconditionFailedException(
+                        PreconditionFailedException {
+                            r#type: None,
+                            message: Some(format!(
+                                "The RevisionId ({expected}) provided does not match the latest \
+                                 RevisionId for the resource {resource}. Call \
+                                 GetLayerVersionPolicy to retrieve the latest RevisionId for \
+                                 your resource."
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let statement = crate::state::PolicyStatement {
+            sid: input.statement_id.clone(),
+            action: input.action.clone(),
+            principal: input.principal.clone(),
+            resource: resource.clone(),
+            principal_org_id: input.organization_id.clone(),
+            // A layer-version grant carries none of the other restrictions a function's
+            // `AddPermission` can express: this operation models no member for them.
+            source_arn: None,
+            source_account: None,
+            event_source_token: None,
+            function_url_auth_type: None,
+            invoked_via_function_url: None,
+        };
+        // "The permission statement" is what this call answers with, so it is rendered
+        // once and both stored and reported.
+        let added = statement.to_json();
+        policy.statements.push(statement);
+
+        let size = policy.to_json().len();
+        if size > crate::state::MAX_POLICY_SIZE_BYTES {
+            return Err(
+                AddLayerVersionPermissionErrorModeled::PolicyLengthExceededException(
+                    PolicyLengthExceededException {
+                        r#type: None,
+                        message: Some(format!(
+                            "The resource policy of {resource} would be {size} bytes, past the \
+                             maximum of {} bytes.",
+                            crate::state::MAX_POLICY_SIZE_BYTES
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The policy changed, so it is at a new revision, and that revision is what
+        // this call reports back.
+        policy.revision_id = crate::state::mint_revision_id();
+        let revision_id = policy.revision_id.clone();
+        resolved.version.policy = Some(policy);
+
+        Ok(AddLayerVersionPermissionOutput {
+            statement: Some(added),
+            revision_id: Some(revision_id),
+        })
     }
 }
