@@ -8,6 +8,11 @@
 //! engage the contact through", and `SendActivationCode`/`ActivateContactChannel` are
 //! what move it — so the create never activates one.
 //!
+//! A channel's `Name` identifies it within its contact, so a create naming a name the
+//! contact's live channels already carry is refused with the modelled `ConflictException`
+//! (HTTP 409) naming the channel in use, rather than minting a second channel of that
+//! name.
+//!
 //! The ACCOUNT-level Incident Manager precondition
 //! ([`crate::state::ComAmazonawsSsmcontactsSsmcontactsState::require_active_replication_set`])
 //! is evaluated FIRST: the channel lives in the Regions of the account's replication set,
@@ -252,6 +257,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // A channel's `Name` is its identifier WITHIN its contact, so a second create under
+        // a name the contact's live channels already carry would leave the contact with two
+        // channels answering to one name — the inconsistent state this operation's
+        // `ConflictException` is modelled for, exactly as a repeated `Alias` is for
+        // `CreateContact`. The check follows the replay, so a retried create still answers
+        // with its first call's ARN instead of conflicting with itself.
+        if let Some(existing) = state.channel_of_contact_named(&contact_arn, &input.name) {
+            return Err(CreateContactChannelErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "The contact channel name '{}' is already in use by {} on contact {}",
+                        input.name, existing.arn, contact_arn
+                    ),
+                    resource_id: existing.arn.clone(),
+                    resource_type: CONTACT_CHANNEL_RESOURCE_TYPE.to_string(),
+                    dependent_entities: None,
+                },
+            )
+            .into());
+        }
+
         if state.contact_channels.len() >= crate::state::MAX_CONTACT_CHANNELS {
             return Err(validation(format!(
                 "This emulator holds at most {} contact channels; delete one before creating \
@@ -304,6 +330,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The `ActivationStatus` a newly created channel carries, from the model's own
 /// `ActivationStatus` value set.
 const NOT_ACTIVATED: &str = "NOT_ACTIVATED";
+
+/// The `resourceType` this operation's conflict error names.
+const CONTACT_CHANNEL_RESOURCE_TYPE: &str = "contact-channel";
 
 /// The account precondition's refusal: this operation's modelled `ValidationException`,
 /// which the model classifies `client` with `httpError` 400.
