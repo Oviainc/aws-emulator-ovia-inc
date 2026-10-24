@@ -346,20 +346,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        store.discovered_resources.insert(
-            key,
-            crate::state::DiscoveredResourceEntry {
-                resource_type: input.resource_type.clone(),
-                resource_id: input.resource_id.clone(),
-                resource_name: input.resource_name.clone(),
-                deleted_at: None,
-                schema_version_id: Some(input.schema_version_id.clone()),
-                configuration: Some(input.configuration.clone()),
-                tags: input.tags.clone().unwrap_or_default().into_iter().collect(),
-                first_recorded_at: Some(now),
-                last_recorded_at: Some(now),
-            },
-        );
+        // The inventory is written through the store's one accessor, which keeps it
+        // bounded (`DISCOVERED_RESOURCES_KEPT`) whatever a caller records.
+        store.record_discovered_resource(crate::state::DiscoveredResourceEntry {
+            resource_type: input.resource_type.clone(),
+            resource_id: input.resource_id.clone(),
+            resource_name: input.resource_name.clone(),
+            deleted_at: None,
+            schema_version_id: Some(input.schema_version_id.clone()),
+            configuration: Some(input.configuration.clone()),
+            tags: input.tags.clone().unwrap_or_default().into_iter().collect(),
+            first_recorded_at: Some(now),
+            last_recorded_at: Some(now),
+        });
 
         Ok(PutResourceConfigOutput)
     }

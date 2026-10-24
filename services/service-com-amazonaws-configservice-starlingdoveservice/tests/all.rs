@@ -81,6 +81,10 @@ mod delete_service_linked_recorder;
 mod config_rules_on_demand_evaluation;
 #[path = "all/config_delete_configuration_aggregator.rs"]
 mod config_delete_configuration_aggregator;
+#[path = "all/conformance_packs.rs"]
+mod conformance_packs;
+#[path = "all/select_resource_config.rs"]
+mod select_resource_config;
 #[path = "all/configuration_recorder_refusal_messages.rs"]
 mod configuration_recorder_refusal_messages;
 #[path = "all/list_stored_queries.rs"]

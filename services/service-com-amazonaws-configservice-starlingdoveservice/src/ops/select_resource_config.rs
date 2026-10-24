@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SelectResourceConfig
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SelectResourceConfig`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SelectResourceConfig::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Runs a Config query over the resources Config has recorded in this account and
+//! Region, and answers the properties that query selected.
+//!
+//! What this handler enforces, and where each rule comes from:
+//!
+//! * the `Expression` is READ as the SQL `SELECT` command the Config query language is
+//!   ([`crate::state::read_expression`], which parses it with `sqlparser`); an
+//!   expression that is not one — unparsable, more than one statement, or carrying what
+//!   the documented query form has no place for — is refused with the modelled
+//!   `InvalidExpressionException` ("The syntax of the query is incorrect"), never
+//!   answered with an empty result set;
+//! * the query runs over the CURRENT configuration item of each recorded resource
+//!   ([`crate::state::resource_configuration_item_documents`]), so the properties it
+//!   selects and filters on are the members of `ConfigurationItem`;
+//! * `Limit` is the page size, with the modelled default of 0 meaning the maximum
+//!   ([`crate::state::SELECT_RESULTS_PAGE_SIZE`]); a limit outside the modelled range
+//!   is `InvalidLimitException`;
+//! * `NextToken` resumes the page after the results already answered, and a token
+//!   outside the opaque form this operation issues is `InvalidNextTokenException`.
 //!
 //! ## Shape of an operation
 //!
@@ -86,6 +97,12 @@ use super::types::*;
 // `SelectResourceConfigError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-configservice-starlingdoveservice.json");
 
+/// The largest page of results a request may ask for (`Limit`, range 0..100: "The
+/// maximum number of query results returned on each page"), which is also the page a
+/// request that asks for none gets ([`crate::state::SELECT_RESULTS_PAGE_SIZE`]), so the
+/// modelled maximum is stated in one place.
+const MAX_LIMIT: usize = crate::state::SELECT_RESULTS_PAGE_SIZE;
+
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
 // here — hence the `SelectResourceConfigError` alias below. An operation that models no errors
@@ -150,18 +167,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SelectResourceConfig` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SelectResourceConfigErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SelectResourceConfig"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
+        })?;
+
+        // "The maximum number of query results returned on each page." The modelled
+        // range (0..100) is refused at the request boundary where the boundary enforces
+        // it; the check stands so a limit outside it answers this operation's own
+        // modelled `InvalidLimitException` either way, with a message BUILT FROM THE
+        // REQUEST. A limit of 0 is the modelled default — "unspecified" — which is the
+        // largest page the model lets one response carry.
+        let requested = input.limit;
+        if requested < 0 || usize::try_from(requested).unwrap_or(usize::MAX) > MAX_LIMIT {
+            return Err(SelectResourceConfigErrorModeled::InvalidLimitException(
+                InvalidLimitException {
+                    message: Some(format!(
+                        "Value '{requested}' at 'limit' failed to satisfy constraint: Member \
+                         must be between 0 and {MAX_LIMIT}"
+                    )),
+                },
+            )
+            .into());
+        }
+        let page_size = match usize::try_from(requested).unwrap_or_default() {
+            0 => crate::state::SELECT_RESULTS_PAGE_SIZE,
+            limit => limit,
+        };
+
+        // The token is opaque: anything this operation did not issue is malformed. It
+        // names how many results of this query were already answered, which is what
+        // makes the next page the rows after them.
+        let resume_at = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => match crate::state::decode_page_token(token)
+                .and_then(|resume_at| resume_at.parse::<usize>().ok())
+            {
+                Some(resume_at) => resume_at,
+                None => {
+                    return Err(SelectResourceConfigErrorModeled::InvalidNextTokenException(
+                        InvalidNextTokenException {
+                            message: Some(
+                                "the specified NextToken is not valid; use the NextToken a \
+                                 previous SelectResourceConfig response returned"
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into());
+                }
+            },
+        };
+
+        // An expression that is not a Config query is refused BEFORE anything is read
+        // out of the store: a malformed query is a different answer from a query that
+        // matched nothing, and a client has to be able to tell the two apart.
+        let query = crate::state::read_expression(&input.expression).map_err(|detail| {
+            SelectResourceConfigErrorModeled::InvalidExpressionException(
+                InvalidExpressionException {
+                    message: Some(format!(
+                        "The expression is not a valid Config query: {detail}."
+                    )),
+                },
+            )
+        })?;
+
+        let region = crate::state::request_region(ctx);
+        let store = state.lock();
+        let documents = crate::state::resource_configuration_item_documents(&store, &region);
+        let results = query.run(&documents);
+
+        // "Returns the results for the SQL query": each result is one JSON document of
+        // the properties the query selected.
+        let page: Vec<String> = results
+            .iter()
+            .skip(resume_at)
+            .take(page_size)
+            .map(::serde_json::Value::to_string)
+            .collect();
+        let answered = resume_at.saturating_add(page.len());
+        let next_token =
+            (answered < results.len()).then(|| crate::state::encode_page_token(&answered.to_string()));
+
+        Ok(SelectResourceConfigOutput {
+            results: Some(page),
+            // "Returns the QueryInfo object": the fields this query selected, in the
+            // order it selected them.
+            query_info: Some(QueryInfo {
+                select_fields: Some(
+                    query
+                        .field_names()
+                        .into_iter()
+                        .map(|name| FieldInfo { name: Some(name) })
+                        .collect(),
+                ),
+            }),
+            next_token,
+        })
     }
 }
