@@ -3,9 +3,11 @@
 //! @op GetScope
 //!
 //! Reports the scope this service's store ([`crate::state`]) holds under the
-//! requested `scopeId`, or the modelled `ResourceNotFoundException` when it holds
-//! none. `@readonly`: the only write it makes is materializing the status change
-//! the clock has already made due, which was owed whether or not anyone called.
+//! requested `scopeId`, the modelled `ValidationException` when the `scopeId` is not
+//! of the form this service generates, and the modelled `ResourceNotFoundException`
+//! when the store holds no scope under a well-formed one. `@readonly`: the only write
+//! it makes is materializing the status change the clock has already made due, which
+//! was owed whether or not anyone called.
 //!
 //! ## Shape of an operation
 //!
@@ -161,6 +163,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The FORM of the `scopeId` first, before the store is reached: a value that
+        // is not an identifier this service generates names no scope under any state
+        // of the store, so it is a fault in the request (the modelled 400) and never
+        // the absence of a resource (404).
+        if !crate::state::is_scope_id(&input.scope_id) {
+            return Err(
+                GetScopeErrorModeled::ValidationException(crate::state::invalid_scope_id()).into(),
+            );
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetScopeErrorModeled::InternalServerException(
                 crate::state::state_unavailable(),
@@ -173,7 +185,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A scope id the store holds nothing under is the modelled 404, worded the
         // way this service words a missing SCOPE: the scope ARN the request names,
-        // built from the request's own Region (`state::scope_not_found`).
+        // built from the request's own Region (`state::scope_not_found`). Only a
+        // WELL-FORMED id reaches here, so a 404 always means "no such scope" rather
+        // than "that cannot be a scope id".
         let Some(scope) = state.scopes.get(&input.scope_id) else {
             return Err(GetScopeErrorModeled::ResourceNotFoundException(
                 crate::state::scope_not_found(

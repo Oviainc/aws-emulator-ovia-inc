@@ -73,7 +73,11 @@ use super::types::*;
 /// `scrape_configs` entry is a Prometheus scrape job (`job_name` plus the Kubernetes
 /// service-discovery role it scrapes); `scrape_interval: 30s` and the comments are the
 /// published document's own, kept verbatim so a caller feeding the blob to Prometheus
-/// sees what AWS hands it.
+/// sees what AWS hands it — INCLUDING the commented-out `global.external_labels` block,
+/// which the document ships inert with a `<REPLACE_ME>` placeholder for the caller to
+/// fill in: an ACTIVE `clusterArn` would stamp a label of this emulator's choosing onto
+/// every series the caller scrapes. The `kubernetes-apiservers` job declares `scheme:
+/// https` and no `tls_config`, as the served document does.
 ///
 /// ONE deliberate omission: the published document points the cAdvisor and API-server
 /// jobs at the in-cluster service-account token and CA files under the kubelet's secret
@@ -87,8 +91,8 @@ use super::types::*;
 /// restJson1 serializer does that, so this handler must NOT encode it itself).
 pub(crate) const DEFAULT_SCRAPER_CONFIGURATION: &str = r#"global:
   scrape_interval: 30s
-  external_labels:
-    clusterArn: apiserver-url-here
+  # external_labels:
+    # clusterArn: <REPLACE_ME>
 scrape_configs:
   # pod metrics
   - job_name: pod_exporter
@@ -120,8 +124,6 @@ scrape_configs:
           - __meta_kubernetes_service_name
           - __meta_kubernetes_endpoint_port_name
     scheme: https
-    tls_config:
-      insecure_skip_verify: false
   # kube proxy metrics
   - job_name: kube-proxy
     honor_labels: true

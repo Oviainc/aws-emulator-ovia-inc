@@ -199,13 +199,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         state.settle(now);
 
+        // The monitor the query hangs off has to exist. This operation models no
+        // `ResourceNotFoundException`, so a reference the store cannot resolve — and
+        // therefore cannot authorize — is the modelled 403, not a 400.
         if !state.monitors.contains_key(&input.monitor_name) {
             return Err(
-                StartQueryMonitorTopContributorsErrorModeled::ValidationException(
-                    crate::state::field_validation(
-                        "monitorName",
-                        format!("monitor {} was not found", input.monitor_name),
-                    ),
+                StartQueryMonitorTopContributorsErrorModeled::AccessDeniedException(
+                    crate::state::reference_denied(crate::state::MONITOR_RESOURCE),
                 )
                 .into(),
             );

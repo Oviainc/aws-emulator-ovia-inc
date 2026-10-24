@@ -6,7 +6,9 @@
 //! store ([`crate::state`]): a key the resource does not carry is added and a key
 //! it does carry takes the request's value, while every other key it carries is
 //! left alone. `@idempotent` — the same request applied twice leaves the same tag
-//! set, which [`crate::ops::list_tags_for_resource`] reports.
+//! set, which [`crate::ops::list_tags_for_resource`] reports. A successful write
+//! reports no content, so it answers 204
+//! ([`crate::state::NO_CONTENT_SUCCESS_STATUS`]).
 //!
 //! ## Shape of an operation
 //!
@@ -134,7 +136,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "TagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    // A successful tag write reports NO content: its output shape declares no
+    // members, so the status is 204, not the model's defaulted 200. See
+    // `state::NO_CONTENT_SUCCESS_STATUS` for what states that.
+    const SUCCESS_STATUS: u16 = crate::state::NO_CONTENT_SUCCESS_STATUS;
 
     async fn handle(
         &self,

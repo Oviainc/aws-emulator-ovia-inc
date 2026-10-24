@@ -5,7 +5,8 @@
 //! Removes the tag keys the request names from the resource `resourceArn` names in
 //! this service's store ([`crate::state`]), leaving every other key it carries.
 //! `@idempotent` — a key the resource does not carry is nothing to remove, so the
-//! same request applied twice leaves the same tag set.
+//! same request applied twice leaves the same tag set. A successful removal reports
+//! no content, so it answers 204 ([`crate::state::NO_CONTENT_SUCCESS_STATUS`]).
 //!
 //! ## Shape of an operation
 //!
@@ -134,7 +135,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "UntagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    // A successful untag reports NO content either, under the same rule as
+    // `TagResource`: 204, not the model's defaulted 200. See
+    // `state::NO_CONTENT_SUCCESS_STATUS`.
+    const SUCCESS_STATUS: u16 = crate::state::NO_CONTENT_SUCCESS_STATUS;
 
     async fn handle(
         &self,

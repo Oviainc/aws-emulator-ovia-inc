@@ -578,7 +578,7 @@ async fn an_arn_that_names_no_taggable_resource_is_refused() {
             "ResourceNotFoundException",
         ),
         (
-            "a configuration template, which no implemented operation creates",
+            "a configuration template this application does not hold",
             format!("{eb}:configurationtemplate/exists/base-template"),
             "ResourceNotFoundException",
         ),
