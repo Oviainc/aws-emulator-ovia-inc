@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ImportRestApi
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ImportRestApi`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: creates a NEW `RestApi` from the OpenAPI/Swagger definition carried in
+//! the `body` payload — the API's name, description, version and binary media types come
+//! from the document, every path of the definition becomes a `Resource` (with the
+//! ancestors a nested path implies) and every operation on a path becomes a `Method` on
+//! that resource. The request's `parameters` choose the created API's endpoint type and
+//! how the document's own base path is applied to the paths it declares.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ImportRestApi::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The definition is read, bounded and planned BEFORE any record is written, so a
+//! refused import — a malformed document, a parameter value the operation does not
+//! support, or `failOnWarnings` with a warning to report — leaves no API behind.
+//!
+//! The definition reader itself lives in [`super::put_rest_api`], the other operation
+//! that imports one: both take the same `body` member, so the tree this operation builds
+//! for a document is the tree that one builds for it.
 //!
 //! ## Shape of an operation
 //!
@@ -131,6 +136,241 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::collections::{BTreeMap, BTreeSet};
+
+use crate::state::{ResourceEntry, RestApiEntry};
+
+use super::create_rest_api::{API_STATUS_AVAILABLE, ROOT_RESOURCE_PATH};
+use super::put_rest_api::{
+    bound_definition, materialise_definition, parse_definition, plan_resources, ImportScope,
+    ImportedDefinition,
+};
+
+/// The `parameters` key that chooses the created API's endpoint type, from the member's
+/// own documentation: "To configure the endpoint type, set `parameters` as
+/// `endpointConfigurationTypes=EDGE`, `endpointConfigurationTypes=REGIONAL`, or
+/// `endpointConfigurationTypes=PRIVATE`."
+const ENDPOINT_CONFIGURATION_TYPES_PARAMETER: &str = "endpointConfigurationTypes";
+
+/// The endpoint types [`ENDPOINT_CONFIGURATION_TYPES_PARAMETER`] accepts: the three the
+/// member documents, which are the values of the modelled `EndpointType` enum
+/// (`smithy_query(query="shape", shape="EndpointType")`). The documented default is the
+/// one `CreateRestApi` gives an API whose request sets none, so both paths to a created
+/// API start it on the same endpoint type.
+const ENDPOINT_TYPE_VALUES: &[&str] = &[
+    crate::state::DEFAULT_ENDPOINT_TYPE,
+    crate::state::REGIONAL_ENDPOINT_TYPE,
+    crate::state::PRIVATE_ENDPOINT_TYPE,
+];
+
+/// The `parameters` key that chooses how the definition's own base path is applied to the
+/// paths it declares: "To handle imported `basepath`, set `parameters` as
+/// `basepath=ignore`, `basepath=prepend` or `basepath=split`."
+const BASE_PATH_PARAMETER: &str = "basepath";
+
+/// `basepath=ignore`: the base path is not part of the imported paths. The documented
+/// default — the key is optional, and a definition's base path is where the API is
+/// DEPLOYED rather than a resource under it.
+const BASE_PATH_IGNORE: &str = "ignore";
+
+/// `basepath=prepend`: the base path prefixes every imported path, so the resource tree
+/// carries it.
+const BASE_PATH_PREPEND: &str = "prepend";
+
+/// `basepath=split`: the base path's leading segment names the stage the API is deployed
+/// to, so only what follows it prefixes the imported paths.
+const BASE_PATH_SPLIT: &str = "split";
+
+/// The values [`BASE_PATH_PARAMETER`] accepts, in the order the member documents them.
+const BASE_PATH_VALUES: &[&str] = &[BASE_PATH_IGNORE, BASE_PATH_PREPEND, BASE_PATH_SPLIT];
+
+/// The refusal for a definition that names no API.
+///
+/// An OpenAPI document's `info` object is where it names the API and `title` is a
+/// required field of that object, so a document carrying none describes no API this
+/// operation could create — `CreateRestApi` takes the same name as a required member.
+const NO_API_NAME: &str =
+    "Unable to create API: the API definition declares no 'info.title' to name it";
+
+/// The message for a `parameters` entry whose value is outside what the member documents
+/// for that key; the sentence names the key, the value and the values it accepts.
+fn unsupported_parameter(key: &str, value: &str, supported: &[&str]) -> String {
+    format!(
+        "parameters {key} must be one of {}, got {value}",
+        supported.join(", ")
+    )
+}
+
+/// How the definition's own base path is applied to the paths it declares.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BasePathMode {
+    /// [`BASE_PATH_IGNORE`].
+    Ignore,
+    /// [`BASE_PATH_PREPEND`].
+    Prepend,
+    /// [`BASE_PATH_SPLIT`].
+    Split,
+}
+
+/// What this import reads out of the request's `parameters` map.
+///
+/// `parameters` is `@httpQueryParams`, so it carries this request's WHOLE query string —
+/// the route's own `mode=import` and `failonwarnings` included. Only the keys the member
+/// documents are read; any other key specifies the behaviour of some other importing
+/// operation and is not this one's to refuse.
+#[derive(Debug, Clone)]
+struct ImportParameters {
+    /// The endpoint types the created API is given, or `None` when the request names
+    /// none, which is what leaves the documented default endpoint type in place.
+    endpoint_types: Option<Vec<String>>,
+    /// How the definition's base path is applied; [`BasePathMode::Ignore`] unless the
+    /// request asks for another.
+    base_path: BasePathMode,
+}
+
+impl ImportParameters {
+    /// Read the documented keys out of a request's `parameters`.
+    ///
+    /// `Err` carries the message for a value outside what the member documents for its
+    /// key: the caller has to fix the request from that text alone.
+    fn read(
+        parameters: Option<&std::collections::HashMap<String, String>>,
+    ) -> Result<Self, String> {
+        let mut read = Self {
+            endpoint_types: None,
+            base_path: BasePathMode::Ignore,
+        };
+        let Some(parameters) = parameters else {
+            return Ok(read);
+        };
+
+        if let Some(declared) = parameters.get(ENDPOINT_CONFIGURATION_TYPES_PARAMETER) {
+            // One key, one or several endpoint types: a query parameter repeated for
+            // each type reaches a `MapOfStringToString` member as one comma-separated
+            // value, so both spellings of "EDGE and REGIONAL" are read the same way.
+            let mut types: Vec<String> = Vec::new();
+            for value in declared
+                .split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                let supported = ENDPOINT_TYPE_VALUES
+                    .iter()
+                    .find(|candidate| **candidate == value)
+                    .ok_or_else(|| {
+                        unsupported_parameter(
+                            ENDPOINT_CONFIGURATION_TYPES_PARAMETER,
+                            value,
+                            ENDPOINT_TYPE_VALUES,
+                        )
+                    })?;
+                if !types.iter().any(|kept| kept == supported) {
+                    types.push((*supported).to_string());
+                }
+            }
+            if types.is_empty() {
+                return Err(unsupported_parameter(
+                    ENDPOINT_CONFIGURATION_TYPES_PARAMETER,
+                    declared,
+                    ENDPOINT_TYPE_VALUES,
+                ));
+            }
+            read.endpoint_types = Some(types);
+        }
+
+        if let Some(declared) = parameters.get(BASE_PATH_PARAMETER) {
+            read.base_path = match declared.as_str() {
+                BASE_PATH_IGNORE => BasePathMode::Ignore,
+                BASE_PATH_PREPEND => BasePathMode::Prepend,
+                BASE_PATH_SPLIT => BasePathMode::Split,
+                other => {
+                    return Err(unsupported_parameter(
+                        BASE_PATH_PARAMETER,
+                        other,
+                        BASE_PATH_VALUES,
+                    ))
+                }
+            };
+        }
+
+        Ok(read)
+    }
+
+    /// `definition` with its paths as the `basepath` parameter asks for them to be
+    /// imported: unchanged for a document that declares no base path, or for the key's
+    /// default, and otherwise prefixed by the base path (`prepend`) or by what follows
+    /// its leading segment (`split`).
+    fn rebased(&self, mut definition: ImportedDefinition) -> ImportedDefinition {
+        let Some(base_path) = definition.base_path.clone() else {
+            return definition;
+        };
+        let prefix = match self.base_path {
+            BasePathMode::Ignore => return definition,
+            BasePathMode::Prepend => base_path,
+            BasePathMode::Split => base_path
+                .split('/')
+                .filter(|segment| !segment.is_empty())
+                .skip(1)
+                .fold(String::new(), |mut prefix, segment| {
+                    prefix.push('/');
+                    prefix.push_str(segment);
+                    prefix
+                }),
+        };
+        if prefix.is_empty() {
+            return definition;
+        }
+        for imported in &mut definition.paths {
+            imported.path = format!("{prefix}{}", imported.path);
+        }
+        definition
+    }
+
+    /// The endpoint configuration the created API is given: the types this request named,
+    /// completed by the service's own defaults the way `CreateRestApi` completes the
+    /// member it takes.
+    fn endpoint_configuration(&self) -> EndpointConfiguration {
+        crate::state::defaulted_endpoint_configuration(self.endpoint_types.clone().map(|types| {
+            EndpointConfiguration {
+                types: Some(types),
+                ip_address_type: None,
+                vpc_endpoint_ids: None,
+            }
+        }))
+    }
+}
+
+impl From<&RestApiEntry> for ImportRestApiOutput {
+    /// The `RestApi` body for a stored API. `ImportRestApi` and `CreateRestApi` share the
+    /// `RestApi` shape but the scaffold renders it as two Rust types, so this mirrors the
+    /// `CreateRestApiOutput` conversion member for member. `warnings` is the one member
+    /// no stored record carries: it belongs to the import that just ran, and the handler
+    /// fills it in.
+    fn from(entry: &RestApiEntry) -> Self {
+        let body = CreateRestApiOutput::from(entry);
+        Self {
+            id: body.id,
+            name: body.name,
+            description: body.description,
+            created_date: body.created_date,
+            version: body.version,
+            warnings: body.warnings,
+            binary_media_types: body.binary_media_types,
+            minimum_compression_size: body.minimum_compression_size,
+            api_key_source: body.api_key_source,
+            endpoint_configuration: body.endpoint_configuration,
+            policy: body.policy,
+            tags: body.tags,
+            disable_execute_api_endpoint: body.disable_execute_api_endpoint,
+            root_resource_id: body.root_resource_id,
+            security_policy: body.security_policy,
+            endpoint_access_mode: body.endpoint_access_mode,
+            api_status: body.api_status,
+            api_status_message: body.api_status_message,
+        }
+    }
+}
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -204,18 +444,170 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ImportRestApi` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ImportRestApiErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ImportRestApi"))
+        let state = crate::state::service_state(&*self.engine)
+            .ok_or_else(crate::state::state_unavailable)?;
+
+        // The request's definition, its parameters or its size is wrong, and the message
+        // names what to fix.
+        fn bad_request(message: String) -> ImportRestApiError {
+            ImportRestApiErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+            .into()
+        }
+
+        // A record quota this import would grow the store past.
+        fn limit_exceeded(message: String) -> ImportRestApiError {
+            ImportRestApiErrorModeled::LimitExceededException(LimitExceededException {
+                retry_after_seconds: None,
+                message: Some(message),
+            })
+            .into()
+        }
+
+        // Everything the request asks for is read, bounded and planned BEFORE the store
+        // lock is taken, so a refused import creates nothing at all.
+        let parameters = ImportParameters::read(input.parameters.as_ref()).map_err(bad_request)?;
+        let definition = parameters.rebased(
+            parse_definition(&input.body, &ImportScope::of(ctx.parts())).map_err(bad_request)?,
+        );
+        bound_definition(&definition).map_err(bad_request)?;
+
+        let name = definition
+            .title
+            .clone()
+            .filter(|title| !title.is_empty())
+            .ok_or_else(|| bad_request(NO_API_NAME.to_string()))?;
+
+        // `failOnWarnings` is "a query parameter to indicate whether to rollback the API
+        // creation (true) or not (false) when a warning is encountered": the definition
+        // is read before anything is created, so the rollback is that no API exists.
+        if input.fail_on_warnings && !definition.warnings.is_empty() {
+            return Err(bad_request(format!(
+                "Errors found during import: {}",
+                definition.warnings.join("; ")
+            )));
+        }
+
+        // A created API holds its root resource and nothing else, so every path the
+        // definition declares — and every ancestor one implies — is planned.
+        let mut known = BTreeSet::from([ROOT_RESOURCE_PATH.to_string()]);
+        let planned = plan_resources(&mut known, &definition).map_err(limit_exceeded)?;
+
+        let mut store = state.lock();
+
+        if store.rest_apis.len() >= crate::state::MAX_REST_APIS {
+            return Err(limit_exceeded(format!(
+                "Maximum number of REST APIs exceeded: {}",
+                crate::state::MAX_REST_APIS
+            )));
+        }
+
+        // One id for the API, one for its root resource, and one per planned resource;
+        // one creation rank for the API, and one per planned resource so the imported
+        // resources are listed in the order the definition declares them.
+        let ids = store.reserve_ids(2 + planned.len());
+        let mut minted = ids.into_iter();
+        let id = minted.next().ok_or_else(crate::state::state_unavailable)?;
+        let root_resource_id = minted.next().ok_or_else(crate::state::state_unavailable)?;
+        let resource_ids: Vec<String> = minted.collect();
+        let sequence = store.next_sequence();
+        let sequences: Vec<u64> = (0..planned.len()).map(|_| store.next_sequence()).collect();
+
+        let mut resources = BTreeMap::new();
+        resources.insert(
+            root_resource_id.clone(),
+            ResourceEntry {
+                // The root resource has neither a parent nor a path part; its path is the
+                // API's root. Every API is created with one, however the create was
+                // addressed.
+                id: root_resource_id.clone(),
+                parent_id: None,
+                path_part: None,
+                path: ROOT_RESOURCE_PATH.to_string(),
+                methods: BTreeMap::new(),
+                sequence: 0,
+            },
+        );
+
+        let mut entry = RestApiEntry {
+            id: id.clone(),
+            // The API's own members come from the definition: `info` is where an OpenAPI
+            // document carries the API's name, description and version, and
+            // `binaryMediaTypes` comes from API Gateway's own document extension.
+            name,
+            description: definition.description.clone(),
+            version: definition.version.clone(),
+            created_date: Some(crate::state::now()),
+            binary_media_types: definition.binary_media_types.clone().unwrap_or_default(),
+            // The members an imported definition carries nothing for: this operation
+            // models no input member for them, and a document declares none, so the
+            // created API starts on the same values `CreateRestApi` gives an API whose
+            // request set none.
+            minimum_compression_size: None,
+            api_key_source: Some(crate::state::DEFAULT_API_KEY_SOURCE.to_string()),
+            endpoint_configuration: Some(parameters.endpoint_configuration()),
+            policy: None,
+            security_policy: Some(crate::state::DEFAULT_SECURITY_POLICY.to_string()),
+            endpoint_access_mode: None,
+            api_status: Some(API_STATUS_AVAILABLE.to_string()),
+            api_status_message: None,
+            tags: BTreeMap::new(),
+            disable_execute_api_endpoint: false,
+            root_resource_id: root_resource_id.clone(),
+            resources,
+            // An imported API is created with no deployment, so it has no stage either;
+            // `CreateDeployment` and `CreateStage` are what add them, exactly as for an
+            // API created from a request.
+            stages: BTreeMap::new(),
+            deployments: BTreeMap::new(),
+            // Nor with a customized gateway response, a documentation part, a
+            // documentation version, an authorizer or a request validator: each is
+            // written by the operation that owns it.
+            gateway_responses: BTreeMap::new(),
+            documentation_parts: BTreeMap::new(),
+            documentation_versions: BTreeMap::new(),
+            authorizers: BTreeMap::new(),
+            request_validators: BTreeMap::new(),
+            sequence,
+        };
+
+        // The definition's resource tree, under the ids and ranks reserved for it. One of
+        // each was reserved per planned resource, so the materialisation cannot be short
+        // of either.
+        materialise_definition(
+            &mut entry,
+            &definition,
+            &planned,
+            &resource_ids,
+            &sequences,
+        )
+        .map_err(|_| crate::state::state_unavailable())?;
+
+        store.rest_apis.insert(id.clone(), entry);
+        let stored = store
+            .rest_apis
+            .get(&id)
+            .ok_or_else(crate::state::state_unavailable)?;
+        let mut output = ImportRestApiOutput::from(stored);
+        // The only member of the body that is not a stored one: what THIS import could
+        // not carry over. Assigned unconditionally, because an import that warned about
+        // nothing reports no warnings.
+        output.warnings = (!definition.warnings.is_empty()).then(|| definition.warnings.clone());
+        // Everything below is owned, so the store lock is released before the record is
+        // formatted: the critical section covers the state change only.
+        drop(store);
+        // The access record for a state-changing operation: who, what, and the outcome.
+        // Metadata only — never the definition itself.
+        ::tracing::info!(
+            target: crate::state::AUDIT_TARGET,
+            operation = Self::NAME,
+            caller = ?crate::state::request_caller(ctx.parts()),
+            rest_api = ?id,
+            paths = definition.paths.len(),
+            outcome = "created",
+            "api created from an imported definition",
+        );
+        Ok(output)
     }
 }

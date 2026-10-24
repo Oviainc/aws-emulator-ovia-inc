@@ -531,6 +531,287 @@ async fn an_update_enforces_the_documented_cadence_against_the_stored_policy() {
     }
 }
 
+/// A default `VOLUME` policy already holding the cadence
+/// `(create_interval, retain_interval)`, as the subject of one patch row.
+///
+/// Each row gets its OWN subject, so a row can state the stored cadence it needs
+/// and no row depends on what the row before it left behind.
+async fn default_policy_holding(
+    router: &MultiServiceRouter,
+    case: &str,
+    create_interval: i64,
+    retain_interval: i64,
+) -> String {
+    let answer = create(
+        router,
+        json!({
+            "ExecutionRoleArn": role_arn(),
+            "Description": "the subject of a patch",
+            "State": "ENABLED",
+            "DefaultPolicy": "VOLUME",
+            "CreateInterval": create_interval,
+            "RetainInterval": retain_interval,
+        }),
+    )
+    .await;
+    assert_eq!(
+        answer.status, 200,
+        "case {case:?}: the subject policy ({create_interval}/{retain_interval}) must be \
+         created, got {} with {:?}",
+        answer.status, answer.body
+    );
+    answer.policy_id()
+}
+
+/// A patch stating its cadence inside `PolicyDetails`, which for a default policy
+/// also carries the two members that say WHICH kind of policy the configuration
+/// describes.
+fn details_patch(members: Value) -> Value {
+    let mut details = json!({"PolicyLanguage": DEFAULT_POLICY_LANGUAGE, "ResourceType": "VOLUME"});
+    for (member, value) in members.as_object().expect("the row states an object") {
+        details[member] = value.clone();
+    }
+    json!({"PolicyDetails": details})
+}
+
+/// One patch the service owes a refusal for, against a policy holding a known
+/// cadence.
+struct RefusedPatchCase {
+    case: &'static str,
+    /// The `(CreateInterval, RetainInterval)` the subject policy already holds.
+    stored: (i64, i64),
+    patch: Value,
+    /// The member the refusal must name.
+    named: &'static str,
+}
+
+/// A patch whose cadence falls outside the documented domain is refused, and the
+/// WHOLE stored policy — not just the two members — is left exactly as it was.
+///
+/// The rows span the class the issue's one recorded PATCH is an instance of:
+/// each member one past each of its published bounds and at the largest integer
+/// its target shape admits, the ordering rule at equality and below it judged
+/// against the value the policy ALREADY holds for the member the patch leaves
+/// out, and both places a patch can state the cadence (the request body and the
+/// `PolicyDetails` structure).
+#[tokio::test]
+async fn an_update_refused_for_its_cadence_leaves_the_whole_stored_policy_untouched() {
+    let router = emulator();
+    let rows = vec![
+        RefusedPatchCase {
+            // The PATCH the issue recorded.
+            case: "a creation frequency of 30 days beside a 1-day retention period",
+            stored: (3, RETAIN_INTERVAL_MAX),
+            patch: json!({"CreateInterval": 30, "RetainInterval": 1}),
+            named: "CreateInterval",
+        },
+        RefusedPatchCase {
+            case: "a creation frequency one day past its documented maximum",
+            stored: (3, RETAIN_INTERVAL_MAX),
+            patch: json!({"CreateInterval": CREATE_INTERVAL_MAX + 1}),
+            named: "CreateInterval",
+        },
+        RefusedPatchCase {
+            case: "a creation frequency at the largest integer the member admits",
+            stored: (3, RETAIN_INTERVAL_MAX),
+            patch: json!({"CreateInterval": 2_147_483_647i64}),
+            named: "CreateInterval",
+        },
+        RefusedPatchCase {
+            case: "a retention period one day below its documented minimum",
+            stored: (CREATE_INTERVAL_MIN, RETAIN_INTERVAL_MAX),
+            patch: json!({"RetainInterval": RETAIN_INTERVAL_MIN - 1}),
+            named: "RetainInterval",
+        },
+        RefusedPatchCase {
+            case: "a retention period one day past its documented maximum",
+            stored: (CREATE_INTERVAL_MIN, RETAIN_INTERVAL_MIN),
+            patch: json!({"RetainInterval": RETAIN_INTERVAL_MAX + 1}),
+            named: "RetainInterval",
+        },
+        RefusedPatchCase {
+            case: "a retention period equal to the stored creation frequency",
+            stored: (3, RETAIN_INTERVAL_MAX),
+            patch: json!({"RetainInterval": 3}),
+            named: "RetainInterval",
+        },
+        RefusedPatchCase {
+            case: "a retention period below the stored creation frequency",
+            stored: (3, RETAIN_INTERVAL_MAX),
+            patch: json!({"RetainInterval": RETAIN_INTERVAL_MIN}),
+            named: "RetainInterval",
+        },
+        RefusedPatchCase {
+            case: "a creation frequency equal to the stored retention period",
+            stored: (2, 5),
+            patch: json!({"CreateInterval": 5}),
+            named: "RetainInterval",
+        },
+        RefusedPatchCase {
+            case: "a creation frequency above the stored retention period",
+            stored: (2, 5),
+            patch: json!({"CreateInterval": 6}),
+            named: "RetainInterval",
+        },
+        RefusedPatchCase {
+            case: "a creation frequency past its maximum, stated inside PolicyDetails",
+            stored: (3, RETAIN_INTERVAL_MAX),
+            patch: details_patch(json!({
+                "CreateInterval": CREATE_INTERVAL_MAX + 1,
+                "RetainInterval": RETAIN_INTERVAL_MAX,
+            })),
+            named: "CreateInterval",
+        },
+        RefusedPatchCase {
+            case: "a retention period past its maximum, stated inside PolicyDetails",
+            stored: (3, RETAIN_INTERVAL_MAX),
+            patch: details_patch(json!({"RetainInterval": 20})),
+            named: "RetainInterval",
+        },
+        RefusedPatchCase {
+            case: "a PolicyDetails cadence whose retention period equals its creation frequency",
+            stored: (3, RETAIN_INTERVAL_MAX),
+            patch: details_patch(json!({"CreateInterval": 4, "RetainInterval": 4})),
+            named: "RetainInterval",
+        },
+    ];
+
+    for row in rows {
+        let case = row.case;
+        let (stored_create, stored_retain) = row.stored;
+        let id = default_policy_holding(&router, case, stored_create, stored_retain).await;
+        let before = get(&router, &id).await;
+        assert_eq!(
+            before.status, 200,
+            "case {case:?}: the subject policy must be readable, got {} with {:?}",
+            before.status, before.body
+        );
+        let snapshot = before.policy().clone();
+
+        let answer = update(&router, &id, row.patch).await;
+        assert_refused(case, row.named, &answer);
+
+        // The whole record, DateModified and all: a refused update writes
+        // NOTHING, so a later read reports exactly what the earlier one did.
+        let after = get(&router, &id).await;
+        assert_eq!(
+            after.policy(),
+            &snapshot,
+            "case {case:?}: a refused update must leave the stored policy untouched, got {:?}",
+            after.policy()
+        );
+        assert_eq!(
+            at(after.policy(), "/PolicyDetails/CreateInterval"),
+            json!(stored_create),
+            "case {case:?}: expected the policy to still hold CreateInterval {stored_create}, \
+             got {:?}",
+            at(after.policy(), "/PolicyDetails/CreateInterval")
+        );
+        assert_eq!(
+            at(after.policy(), "/PolicyDetails/RetainInterval"),
+            json!(stored_retain),
+            "case {case:?}: expected the policy to still hold RetainInterval {stored_retain}, \
+             got {:?}",
+            at(after.policy(), "/PolicyDetails/RetainInterval")
+        );
+    }
+}
+
+/// One patch inside the documented domain, and the cadence the policy holds once
+/// it has been applied.
+struct AcceptedPatchCase {
+    case: &'static str,
+    /// The `(CreateInterval, RetainInterval)` the subject policy already holds.
+    stored: (i64, i64),
+    patch: Value,
+    /// The cadence a read reports after the patch.
+    expected: (i64, i64),
+}
+
+/// A patch INSIDE the documented domain is applied and read back — including at
+/// each published bound, and for a `PolicyDetails` that replaces the
+/// configuration wholesale (every member it omits going back to its documented
+/// default).
+#[tokio::test]
+async fn an_update_inside_the_documented_cadence_is_applied_and_read_back() {
+    let router = emulator();
+    let rows = vec![
+        AcceptedPatchCase {
+            case: "the creation frequency lowered to its documented minimum",
+            stored: (3, RETAIN_INTERVAL_MAX),
+            patch: json!({"CreateInterval": CREATE_INTERVAL_MIN}),
+            expected: (CREATE_INTERVAL_MIN, RETAIN_INTERVAL_MAX),
+        },
+        AcceptedPatchCase {
+            case: "the creation frequency raised to its documented maximum",
+            stored: (3, RETAIN_INTERVAL_MAX),
+            patch: json!({"CreateInterval": CREATE_INTERVAL_MAX}),
+            expected: (CREATE_INTERVAL_MAX, RETAIN_INTERVAL_MAX),
+        },
+        AcceptedPatchCase {
+            case: "the retention period lowered to its documented minimum",
+            stored: (CREATE_INTERVAL_MIN, RETAIN_INTERVAL_MAX),
+            patch: json!({"RetainInterval": RETAIN_INTERVAL_MIN}),
+            expected: (CREATE_INTERVAL_MIN, RETAIN_INTERVAL_MIN),
+        },
+        AcceptedPatchCase {
+            case: "the retention period raised to its documented maximum",
+            stored: (CREATE_INTERVAL_MIN, RETAIN_INTERVAL_MIN),
+            patch: json!({"RetainInterval": RETAIN_INTERVAL_MAX}),
+            expected: (CREATE_INTERVAL_MIN, RETAIN_INTERVAL_MAX),
+        },
+        AcceptedPatchCase {
+            case: "both members at once, one day apart",
+            stored: (3, RETAIN_INTERVAL_MAX),
+            patch: json!({"CreateInterval": 6, "RetainInterval": 7}),
+            expected: (6, 7),
+        },
+        AcceptedPatchCase {
+            case: "both members stated inside PolicyDetails",
+            stored: (3, 10),
+            patch: details_patch(json!({
+                "CreateInterval": CREATE_INTERVAL_MAX,
+                "RetainInterval": RETAIN_INTERVAL_MAX,
+            })),
+            expected: (CREATE_INTERVAL_MAX, RETAIN_INTERVAL_MAX),
+        },
+        AcceptedPatchCase {
+            case: "a PolicyDetails stating neither member, so both go back to their default",
+            stored: (3, 10),
+            patch: details_patch(json!({})),
+            expected: (CREATE_INTERVAL_DEFAULT, RETAIN_INTERVAL_DEFAULT),
+        },
+    ];
+
+    for row in rows {
+        let case = row.case;
+        let (stored_create, stored_retain) = row.stored;
+        let id = default_policy_holding(&router, case, stored_create, stored_retain).await;
+
+        let answer = update(&router, &id, row.patch).await;
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: expected HTTP 200, got {} with {:?}",
+            answer.status, answer.body
+        );
+
+        let read = get(&router, &id).await;
+        let (expected_create, expected_retain) = row.expected;
+        assert_eq!(
+            at(read.policy(), "/PolicyDetails/CreateInterval"),
+            json!(expected_create),
+            "case {case:?}: expected CreateInterval {expected_create}, got {:?}",
+            at(read.policy(), "/PolicyDetails/CreateInterval")
+        );
+        assert_eq!(
+            at(read.policy(), "/PolicyDetails/RetainInterval"),
+            json!(expected_retain),
+            "case {case:?}: expected RetainInterval {expected_retain}, got {:?}",
+            at(read.policy(), "/PolicyDetails/RetainInterval")
+        );
+    }
+}
+
 /// A custom snapshot policy whose schedules are `schedules`.
 fn custom_details(schedules: Value) -> Value {
     json!({

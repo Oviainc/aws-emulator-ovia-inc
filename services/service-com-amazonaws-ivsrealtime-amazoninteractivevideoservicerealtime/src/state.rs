@@ -424,18 +424,27 @@ pub const MAX_PARTICIPANTS_PER_SESSION: usize = 1_000;
 // `CreateIngestConfiguration` takes the protocol, the stage and the publisher's
 // identity; the three members an `IngestConfiguration` reports that no request
 // supplies — its state, its stage when the request named none, and its redundant
-// credentials — are fixed here, each from the model's own doc for that member.
+// credentials — come from here, each from the model's own doc for that member. The
+// state is the one of them that is not fixed: it follows the publishers the
+// configuration's stage holds ([`ingest_configuration_publishers`]).
 // ---------------------------------------------------------------------------
 
 /// State of an ingest configuration nobody is publishing to.
 ///
-/// The model documents `IngestConfiguration$state`: "It is `ACTIVE` if a publisher
-/// currently is publishing to the stage associated with the ingest configuration."
-/// Nothing publishes to an emulated stage — no operation of this service starts a
-/// broadcast — so every configuration this service holds reports this value. It is not
-/// a transition the clock owes either: what makes a configuration `ACTIVE` is a
-/// publisher connecting, not time passing, so it does not become `ACTIVE` on its own.
+/// One of the two values the modelled `IngestConfigurationState` carries
+/// (`smithy_query(query="shape",shape="IngestConfigurationState")`), and the one a
+/// configuration reports while no publisher is broadcasting with it. It is not a
+/// transition the clock owes: what moves a configuration off it is a publisher
+/// connecting, not time passing, so it does not change on its own.
 pub const NO_PUBLISHER_INGEST_CONFIGURATION_STATE: &str = "INACTIVE";
+
+/// State of an ingest configuration a publisher is broadcasting with right now.
+///
+/// The other value of the modelled `IngestConfigurationState`, and the one its member
+/// doc names: `IngestConfiguration$state` "is `ACTIVE` if a publisher currently is
+/// publishing to the stage associated with the ingest configuration". Which publishers
+/// those are is [`ingest_configuration_publishers`].
+pub const PUBLISHING_INGEST_CONFIGURATION_STATE: &str = "ACTIVE";
 
 /// `stageArn` of an ingest configuration associated with no stage.
 ///
@@ -815,8 +824,6 @@ pub struct IngestConfigurationRecord {
     pub stage_arn: String,
     /// The participant this configuration's publisher appears as in the stage.
     pub participant_id: String,
-    /// [`NO_PUBLISHER_INGEST_CONFIGURATION_STATE`] while nobody is publishing to it.
-    pub state: String,
     pub user_id: Option<String>,
     pub redundant_ingest: bool,
     /// The backup credentials redundant ingest takes, minted at creation beside the
@@ -831,8 +838,14 @@ pub struct IngestConfigurationRecord {
 }
 
 impl IngestConfigurationRecord {
-    /// The modelled `IngestConfiguration` this record reports.
-    pub fn to_ingest_configuration(&self) -> IngestConfiguration {
+    /// The modelled `IngestConfiguration` this record reports, read against `store`:
+    /// the configuration's `state` is not a stored value but a fact about the stage it
+    /// is associated with right now, so it is computed from the records that hold that
+    /// fact ([`ingest_configuration_publishers`]) on every read.
+    pub fn to_ingest_configuration(
+        &self,
+        store: &ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
+    ) -> IngestConfiguration {
         IngestConfiguration {
             name: self.name.clone(),
             arn: self.arn.clone(),
@@ -840,7 +853,13 @@ impl IngestConfigurationRecord {
             stream_key: self.stream_key.clone(),
             stage_arn: self.stage_arn.clone(),
             participant_id: self.participant_id.clone(),
-            state: self.state.clone(),
+            // `ACTIVE` exactly while a publisher is broadcasting with this
+            // configuration, as the member's own doc states it.
+            state: if ingest_configuration_publishers(store, self).is_empty() {
+                NO_PUBLISHER_INGEST_CONFIGURATION_STATE.to_string()
+            } else {
+                PUBLISHING_INGEST_CONFIGURATION_STATE.to_string()
+            },
             user_id: self.user_id.clone(),
             redundant_ingest: self.redundant_ingest,
             // "present only when `redundantIngest` is set to `true`", as the member's
@@ -859,6 +878,21 @@ impl IngestConfigurationRecord {
             // back, exactly as on a stage.
             tags: Some(self.tags.clone()),
         }
+    }
+
+    /// Whether `participant_id` is one of the participants THIS configuration's ingest
+    /// credentials were minted for: its own, or one of its redundant ones.
+    ///
+    /// The ONE test for "is this participant an identity of this configuration", so the
+    /// lookup that resolves a participant of a stage ([`stage_participant`]) and the one
+    /// that finds a configuration's publishers ([`ingest_configuration_publishers`])
+    /// cannot drift apart.
+    pub fn mints_participant(&self, participant_id: &str) -> bool {
+        self.participant_id == participant_id
+            || self
+                .redundant_ingest_credentials
+                .iter()
+                .any(|credential| credential.participant_id == participant_id)
     }
 }
 
@@ -1858,11 +1892,7 @@ pub fn stage_participant(
         .values()
         .find(|configuration| {
             configuration.stage_arn == stage_arn
-                && (configuration.participant_id == participant_id
-                    || configuration
-                        .redundant_ingest_credentials
-                        .iter()
-                        .any(|credential| credential.participant_id == participant_id))
+                && configuration.mints_participant(participant_id)
         })
         .map(|configuration| StageParticipant {
             // An ingest configuration is a publisher's credential: it carries the ingest
@@ -1870,6 +1900,61 @@ pub fn stage_participant(
             publishes: true,
             attributes: configuration.attributes.clone(),
         })
+}
+
+/// One publisher broadcasting with an ingest configuration right now: the session of
+/// the configuration's stage it is in, and the participant it publishes as.
+#[derive(Debug, Clone)]
+pub struct IngestPublisher {
+    /// The session of the configuration's stage the publisher joined.
+    pub session_id: String,
+    /// The participant the publisher appears as in that session.
+    pub participant_id: String,
+}
+
+/// The publishers broadcasting with `configuration` right now, in the order the
+/// sessions of its stage hold them.
+///
+/// `IngestConfiguration$state` is `ACTIVE` "if a publisher currently is publishing to
+/// the stage associated with the ingest configuration", so a publisher of a
+/// configuration is a participant of a session of THAT stage which is still
+/// [`PARTICIPANT_STATE_CONNECTED`] and which reached the stage with this
+/// configuration's credentials — recorded with the configuration's ARN, or publishing
+/// as one of the participants its ingest credentials were minted for. Those are the
+/// records the stage's data plane writes ([`join_stage_session`]) and
+/// `ListParticipants` reports; a configuration associated with no stage
+/// ([`NO_ASSOCIATED_STAGE_ARN`]) has nothing to publish to, so it has no publisher.
+///
+/// The ONE lookup for "is a publisher broadcasting with this configuration", so what a
+/// read reports about a configuration and what a delete refuses over cannot disagree.
+pub fn ingest_configuration_publishers(
+    state: &ComAmazonawsIvsrealtimeAmazoninteractivevideoservicerealtimeState,
+    configuration: &IngestConfigurationRecord,
+) -> Vec<IngestPublisher> {
+    let mut publishers = Vec::new();
+    if configuration.stage_arn == NO_ASSOCIATED_STAGE_ARN {
+        return publishers;
+    }
+    let Some(sessions) = state.stage_sessions.get(&configuration.stage_arn) else {
+        return publishers;
+    };
+    for session in sessions {
+        for participant in &session.participants {
+            if participant.state != PARTICIPANT_STATE_CONNECTED {
+                continue;
+            }
+            let publishes_with_configuration = participant.ingest_configuration_arn.as_deref()
+                == Some(configuration.arn.as_str())
+                || configuration.mints_participant(&participant.participant_id);
+            if publishes_with_configuration {
+                publishers.push(IngestPublisher {
+                    session_id: session.session_id.clone(),
+                    participant_id: participant.participant_id.clone(),
+                });
+            }
+        }
+    }
+    publishers
 }
 
 /// The region a minted ARN names: the one the request was signed for, so a caller
@@ -2360,6 +2445,24 @@ pub fn replication_already_active_message(
     format!(
         "Resource: participant {participant_id} of {source_stage_arn} is already \
          replicated to {destination_stage_arn}"
+    )
+}
+
+/// How this service states a request to delete an ingest configuration a publisher is
+/// broadcasting with: it names the configuration, the participant publishing with it
+/// and the stage it publishes to, so the caller can see what is in use.
+///
+/// AWS documents no text for `ConflictException` beyond what it means ("Updating or
+/// deleting a resource can cause an inconsistent state"), so the sentence is built from
+/// the request and the store, the way every other refusal of this service is.
+pub fn ingest_configuration_publishing_message(
+    arn: &str,
+    participant_id: &str,
+    stage_arn: &str,
+) -> String {
+    format!(
+        "Resource: {arn} is in use: participant {participant_id} is publishing with it to \
+         {stage_arn}"
     )
 }
 

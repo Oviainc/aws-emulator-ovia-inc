@@ -34,7 +34,7 @@ use crate::harness::{call, emulator_with_analysed_services, error_code, opt_in};
 /// that carries what it reports, and whether the store this emulator starts with holds an
 /// analysis for that resource type (an Amazon ECS service recommendation is computed over
 /// the ECS services the ECS emulator holds, and this suite creates none).
-const READERS: [(&str, &str, bool); 7] = [
+const READERS: [(&str, &str, bool); 8] = [
     (
         "GetAutoScalingGroupRecommendations",
         "autoScalingGroupRecommendations",
@@ -58,6 +58,10 @@ const READERS: [(&str, &str, bool); 7] = [
         "ecsServiceRecommendations",
         false,
     ),
+    // An idle resource recommendation is produced by Compute Optimizer's own analysis of an
+    // observed workload and no operation of this API creates one, so the store this suite
+    // starts with holds none.
+    ("GetIdleRecommendations", "idleRecommendations", false),
 ];
 
 /// The refusal every reader answers a request about another account with: the constant this

@@ -33,6 +33,8 @@ mod lambda_function_recommendations;
 mod license_recommendations;
 #[path = "all/organization_enrollment_statuses.rs"]
 mod organization_enrollment_statuses;
+#[path = "all/rds_database_recommendation_projected_metrics.rs"]
+mod rds_database_recommendation_projected_metrics;
 #[path = "all/rds_database_recommendations.rs"]
 mod rds_database_recommendations;
 #[path = "all/rds_database_recommendations_export.rs"]

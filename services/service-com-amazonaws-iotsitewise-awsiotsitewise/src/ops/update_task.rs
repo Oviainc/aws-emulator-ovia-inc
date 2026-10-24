@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateTask
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateTask`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateTask::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -159,20 +150,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateTask` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateTaskErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateTask"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateTaskError::Modeled(UpdateTaskErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: "the IoT SiteWise store is unavailable".to_string(),
+                },
+            ))
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        let key = crate::state::task_key(&input.workspace_name, &input.task_name);
+        let mut store = state.lock();
+        let record = store
+            .tasks
+            .get_mut(&key)
+            .ok_or_else(|| not_found(&input.task_name))?;
+
+        // "Only the fields provided in the request are updated; fields not included in
+        // the request are preserved unchanged": an absent member keeps the value the
+        // version this update builds on carried, and a present one replaces it.
+        let description = input
+            .description
+            .clone()
+            .or_else(|| record.current.description.clone());
+        let configuration = input
+            .task_configuration
+            .clone()
+            .unwrap_or_else(|| record.current.configuration.clone());
+
+        // The accepted configuration becomes a NEW version — `version` is "The new
+        // version of the task created by this update" — and the one it replaces is
+        // kept, so a later read naming it still answers from it.
+        record.record_update(description, configuration, now);
+
+        Ok(UpdateTaskOutput {
+            version: record.version_label(),
+            status: record.status(now),
+        })
     }
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the task the request addressed.
+fn not_found(task_name: &str) -> UpdateTaskError {
+    UpdateTaskError::Modeled(UpdateTaskErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: crate::state::not_found_message(crate::state::RESOURCE_TASK, task_name),
+        },
+    ))
 }
