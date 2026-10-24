@@ -180,9 +180,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let pipe = state.pipe_by_arn_mut(&input.resource_arn).ok_or_else(|| {
-            TagResourceErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!("Pipe not found: {}", input.resource_arn)),
-            })
+            TagResourceErrorModeled::NotFoundException(crate::state::pipe_not_found(
+                crate::state::pipe_name_in_arn(&input.resource_arn),
+            ))
         })?;
 
         // The documented cap is on the tags a pipe CARRIES, so it is the merged set that
@@ -196,16 +196,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             + input.tags.len();
         if merged > crate::state::MAX_TAGS_PER_PIPE {
             let limit = crate::state::MAX_TAGS_PER_PIPE;
-            return Err(TagResourceErrorModeled::ValidationException(ValidationException {
-                message: Some(format!(
-                    "A pipe can be associated with at most {limit} tags; this request would \
-                     leave it with {merged}."
-                )),
-                field_list: Some(vec![ValidationExceptionField {
-                    name: "tags".to_string(),
-                    message: format!("must leave the pipe with at most {limit} tags"),
-                }]),
-            })
+            return Err(TagResourceErrorModeled::ValidationException(
+                crate::state::validation_error(vec![crate::state::validation_field(
+                    "tags",
+                    format!(
+                        "must leave the pipe with at most {limit} tags; this request would \
+                         leave it with {merged}"
+                    ),
+                )]),
+            )
             .into());
         }
 

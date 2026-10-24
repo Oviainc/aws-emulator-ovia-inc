@@ -208,20 +208,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let requested_state = match input.desired_state.as_deref() {
             None => None,
             Some(value) if REQUESTED_PIPE_STATE_VALUES.contains(&value) => Some(value.to_string()),
-            Some(value) => {
-                return Err(UpdatePipeErrorModeled::ValidationException(ValidationException {
-                    message: Some(format!(
-                        "DesiredState must be one of {}; got '{value}'",
-                        REQUESTED_PIPE_STATE_VALUES.join(", "),
-                    )),
-                    field_list: Some(vec![ValidationExceptionField {
-                        name: "DesiredState".to_string(),
-                        message: format!(
+            Some(_) => {
+                return Err(UpdatePipeErrorModeled::ValidationException(
+                    crate::state::validation_error(vec![crate::state::validation_field(
+                        "DesiredState",
+                        format!(
                             "must be one of {}",
                             REQUESTED_PIPE_STATE_VALUES.join(", ")
                         ),
-                    }]),
-                })
+                    )]),
+                )
                 .into());
             }
         };
@@ -230,20 +226,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.settle_due_transitions();
 
         let pipe = state.pipes.get_mut(&input.name).ok_or_else(|| {
-            UpdatePipeErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!("Pipe not found: {}", input.name)),
-            })
+            UpdatePipeErrorModeled::NotFoundException(crate::state::pipe_not_found(&input.name))
         })?;
 
         // A pipe whose last call left it mid-transition is not reconfigurable: the move
         // in flight has to land first. Reported with the conflict error the model
-        // declares, naming the state that blocks the update.
-        if let Some(transient) = pipe.transient_state() {
+        // declares, as ONE sentence naming the pipe whichever move is in flight — which
+        // of its own states the pipe is passing through is not the caller's business and
+        // does not change what the caller must do (wait for it to land and ask again).
+        if pipe.transient_state().is_some() {
             return Err(UpdatePipeErrorModeled::ConflictException(ConflictException {
-                message: format!(
-                    "Pipe {} is in state {transient} and cannot be updated.",
-                    pipe.name
-                ),
+                message: format!("Pipe {} is updating concurrently.", pipe.name),
                 resource_id: pipe.name.clone(),
                 resource_type: crate::state::PIPE_RESOURCE_TYPE.to_string(),
             })
@@ -254,9 +247,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // record exactly as it was.
         let source_parameters = match input.source_parameters.as_ref() {
             None => None,
-            Some(update) => {
-                Some(updated_source_parameters(update, pipe.source_parameters.as_ref())?)
-            }
+            Some(update) => Some(updated_source_parameters(
+                update,
+                pipe.source_parameters.as_ref(),
+                &pipe.source_type(),
+            )?),
         };
 
         // Only the members the request carries move; the rest stay as stored.
@@ -329,19 +324,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// The `PipeSourceParameters` to store for an `UpdatePipeSourceParameters` the caller
-/// sent, given what the pipe currently holds.
+/// sent, given what the pipe currently holds and the source type it reads from.
 ///
-/// Each service-specific object is overridden atomically as one (see the operation doc
-/// above), so the request's object REPLACES the stored one member for member. The
-/// members `UpdatePipeSourceParameters` cannot express are exactly those fixed when the
-/// pipe was created — a stream's starting position, a queue or topic name, a consumer
-/// group id — and they are carried over from the stored object of the same source type.
-/// An update naming a source type the pipe holds no parameters for has nowhere to carry
-/// those required members from, so it is refused rather than guessed at.
+/// A pipe's source type is fixed when it is created — `UpdatePipe` carries no `Source`
+/// member at all, and `UpdatePipeSourceParameters` has exactly one member per source type
+/// — so parameters belonging to any other type are REFUSED rather than applied.
+///
+/// For the pipe's own type, each service-specific object is overridden atomically as one
+/// (see the operation doc above), so the request's object REPLACES the stored one member
+/// for member. The members `UpdatePipeSourceParameters` cannot express are exactly those
+/// fixed when the pipe was created — a stream's starting position, a queue or topic name,
+/// a consumer group id — and they are carried over from the stored object of the same
+/// source type; an update that has no stored object to carry them from is refused the same
+/// way, because the source cannot hold the parameters as sent.
 fn updated_source_parameters(
     update: &UpdatePipeSourceParameters,
     stored: Option<&PipeSourceParameters>,
+    source_type: &str,
 ) -> Result<PipeSourceParameters, UpdatePipeError> {
+    for member in supplied_source_type_members(update) {
+        if member_source_type(member) != source_type {
+            return Err(invalid_source_parameter(member, source_type));
+        }
+    }
+
     let kinesis = match (&update.kinesis_stream_parameters, stored_kinesis(stored)) {
         (None, _) => None,
         (Some(new), Some(old)) => Some(PipeSourceKinesisStreamParameters {
@@ -355,7 +361,12 @@ fn updated_source_parameters(
             starting_position: old.starting_position.clone(),
             starting_position_timestamp: old.starting_position_timestamp,
         }),
-        (Some(_), None) => return Err(not_that_source_type("KinesisStreamParameters")),
+        (Some(_), None) => {
+            return Err(invalid_source_parameter(
+                "KinesisStreamParameters",
+                source_type,
+            ));
+        }
     };
     let dynamo_db = match (&update.dynamo_db_stream_parameters, stored_dynamo_db(stored)) {
         (None, _) => None,
@@ -369,10 +380,15 @@ fn updated_source_parameters(
             parallelization_factor: new.parallelization_factor,
             starting_position: old.starting_position.clone(),
         }),
-        (Some(_), None) => return Err(not_that_source_type("DynamoDBStreamParameters")),
+        (Some(_), None) => {
+            return Err(invalid_source_parameter(
+                "DynamoDBStreamParameters",
+                source_type,
+            ));
+        }
     };
     // `SqsQueueParameters` is the one branch whose read shape has no member the update
-    // shape lacks, so it needs nothing carried over and applies to any pipe.
+    // shape lacks, so it needs nothing carried over from a stored object.
     let sqs = update
         .sqs_queue_parameters
         .as_ref()
@@ -388,7 +404,12 @@ fn updated_source_parameters(
             batch_size: new.batch_size,
             maximum_batching_window_in_seconds: new.maximum_batching_window_in_seconds,
         }),
-        (Some(_), None) => return Err(not_that_source_type("ActiveMQBrokerParameters")),
+        (Some(_), None) => {
+            return Err(invalid_source_parameter(
+                "ActiveMQBrokerParameters",
+                source_type,
+            ));
+        }
     };
     let rabbit_mq = match (&update.rabbit_mq_broker_parameters, stored_rabbit_mq(stored)) {
         (None, _) => None,
@@ -399,7 +420,12 @@ fn updated_source_parameters(
             batch_size: new.batch_size,
             maximum_batching_window_in_seconds: new.maximum_batching_window_in_seconds,
         }),
-        (Some(_), None) => return Err(not_that_source_type("RabbitMQBrokerParameters")),
+        (Some(_), None) => {
+            return Err(invalid_source_parameter(
+                "RabbitMQBrokerParameters",
+                source_type,
+            ));
+        }
     };
     let msk = match (
         &update.managed_streaming_kafka_parameters,
@@ -415,7 +441,10 @@ fn updated_source_parameters(
             credentials: new.credentials.clone(),
         }),
         (Some(_), None) => {
-            return Err(not_that_source_type("ManagedStreamingKafkaParameters"));
+            return Err(invalid_source_parameter(
+                "ManagedStreamingKafkaParameters",
+                source_type,
+            ));
         }
     };
     let self_managed = match (
@@ -434,7 +463,12 @@ fn updated_source_parameters(
             server_root_ca_certificate: new.server_root_ca_certificate.clone(),
             vpc: new.vpc.clone(),
         }),
-        (Some(_), None) => return Err(not_that_source_type("SelfManagedKafkaParameters")),
+        (Some(_), None) => {
+            return Err(invalid_source_parameter(
+                "SelfManagedKafkaParameters",
+                source_type,
+            ));
+        }
     };
 
     // `SourceParameters` is itself one of the objects AWS overrides atomically, so a
@@ -451,19 +485,81 @@ fn updated_source_parameters(
     })
 }
 
-/// The refusal for a `SourceParameters` branch the stored pipe holds nothing for: its
-/// create-time members (a starting position, a queue or topic name) have no source.
-fn not_that_source_type(member: &str) -> UpdatePipeError {
-    UpdatePipeErrorModeled::ValidationException(ValidationException {
-        message: Some(format!(
-            "SourceParameters.{member} cannot be updated: this pipe has no \
-             {member} to update."
-        )),
-        field_list: Some(vec![ValidationExceptionField {
-            name: format!("SourceParameters.{member}"),
-            message: "must name the source type the pipe was created with".to_string(),
-        }]),
-    })
+/// Every `UpdatePipeSourceParameters` member that belongs to a source type, with the
+/// source type it belongs to as [`crate::state::PipeRecord::source_type`] reports one.
+///
+/// Source: the members of `UpdatePipeSourceParameters` in the model — each is the
+/// parameters of exactly ONE source type — paired with the service namespace of that
+/// type's resource ARN. `FilterCriteria`, the one member that belongs to no source type,
+/// is deliberately absent: it applies to a pipe whatever its source is.
+const SOURCE_TYPE_MEMBERS: &[(&str, &str)] = &[
+    ("KinesisStreamParameters", "kinesis"),
+    ("DynamoDBStreamParameters", "dynamodb"),
+    ("SqsQueueParameters", "sqs"),
+    // An Amazon MQ broker is `arn:…:mq:…` whichever engine it runs.
+    ("ActiveMQBrokerParameters", "mq"),
+    ("RabbitMQBrokerParameters", "mq"),
+    ("ManagedStreamingKafkaParameters", "kafka"),
+    (
+        "SelfManagedKafkaParameters",
+        crate::state::SELF_MANAGED_KAFKA,
+    ),
+];
+
+/// The source type `member` belongs to, per [`SOURCE_TYPE_MEMBERS`].
+fn member_source_type(member: &str) -> &str {
+    SOURCE_TYPE_MEMBERS
+        .iter()
+        .find(|(name, _)| *name == member)
+        .map_or("", |(_, source_type)| *source_type)
+}
+
+/// The source-type members this request carries, in the order the model declares them.
+fn supplied_source_type_members(update: &UpdatePipeSourceParameters) -> Vec<&'static str> {
+    [
+        (
+            "KinesisStreamParameters",
+            update.kinesis_stream_parameters.is_some(),
+        ),
+        (
+            "DynamoDBStreamParameters",
+            update.dynamo_db_stream_parameters.is_some(),
+        ),
+        ("SqsQueueParameters", update.sqs_queue_parameters.is_some()),
+        (
+            "ActiveMQBrokerParameters",
+            update.active_mq_broker_parameters.is_some(),
+        ),
+        (
+            "RabbitMQBrokerParameters",
+            update.rabbit_mq_broker_parameters.is_some(),
+        ),
+        (
+            "ManagedStreamingKafkaParameters",
+            update.managed_streaming_kafka_parameters.is_some(),
+        ),
+        (
+            "SelfManagedKafkaParameters",
+            update.self_managed_kafka_parameters.is_some(),
+        ),
+    ]
+    .into_iter()
+    .filter(|(_, supplied)| *supplied)
+    .map(|(member, _)| member)
+    .collect()
+}
+
+/// The refusal for a `SourceParameters` member the pipe's source cannot have: the member
+/// belongs to another source type, or to this one but names create-time parameters the
+/// pipe holds nothing to carry over. Either way the offending request field is reported
+/// by the member that carried it and the source type the pipe resolves to.
+fn invalid_source_parameter(member: &str, source_type: &str) -> UpdatePipeError {
+    UpdatePipeErrorModeled::ValidationException(crate::state::validation_error(vec![
+        crate::state::validation_field(
+            member,
+            format!("Invalid source parameter provided for source {source_type}."),
+        ),
+    ]))
     .into()
 }
 

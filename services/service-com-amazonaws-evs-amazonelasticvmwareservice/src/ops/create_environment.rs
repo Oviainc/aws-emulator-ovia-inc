@@ -63,6 +63,11 @@
 //!    `CreateEnvironmentHost` applies to its single `host`, at the scope the doc states
 //!    it, and judged only where the request's VCF version adds the hosts at all, because
 //!    a mode that adds none takes no name.
+//! 11. No `tags` key claims the reserved `aws:` namespace
+//!    ([`crate::state::RESERVED_TAG_KEY_PREFIX`]): that namespace is Amazon Web
+//!    Services' own, so a caller cannot create a tag in it — the same reservation
+//!    `TagResource` and `UntagResource` enforce, applied here because this operation
+//!    writes the request's tags onto the environment it mints.
 //!
 //! Supplying a parameter the chosen VCF mode does not support is NOT one of them.
 //! `SELF_DEPLOYED` "does not support" `licenseInfo`, `hosts`, `vcfHostnames`, `siteId`
@@ -354,6 +359,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut failures: Vec<ValidationExceptionField> = Vec::new();
         failures.extend(terms_accepted_failure(&input));
+        // A tag key in AWS's reserved `aws:` namespace is not the caller's to create,
+        // whichever member carries it: the create path writes the request's `tags`
+        // straight onto the environment, so it enforces the same reservation the
+        // tagging operations do — here as one more entry of this operation's
+        // aggregated `ValidationException`, the only client-input error it models.
+        failures.extend(crate::state::reserved_tag_key_failure(
+            "tags",
+            input
+                .tags
+                .iter()
+                .flat_map(|tags| tags.keys())
+                .map(String::as_str),
+        ));
         failures.extend(host_failures(input.hosts.as_deref().unwrap_or_default()));
         let vlan_plan = plan_vlans(&input.initial_vlans);
         failures.extend(vlan_failures(&input.initial_vlans, &vlan_plan));
@@ -495,9 +513,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let requested_hosts = input.hosts.unwrap_or_default();
 
         // The ten VLAN subnets have to fit in the account's EC2 store, and that is
-        // asked BEFORE this service reserves anything of its own: a request that cannot
-        // be served must not consume an environment slot (reserving one can purge the
-        // longest-deleted record) or an environment id.
+        // asked BEFORE anything of this service's own is minted: a request that cannot
+        // be served must not consume an environment id.
         if let Some((held, limit)) =
             crate::state::ec2_resources::subnet_room_shortfall(&*self.engine, vlan_plan.len())
         {
@@ -506,8 +523,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Bound the store before anything is minted: a generated emulator holds its
         // resources for the life of the process, so the create path is the one that
-        // must refuse rather than grow without limit.
-        if !state.reserve_environment_slot() {
+        // must refuse rather than grow without limit. This asks only whether there is
+        // room — a pure read, so a request refused further down leaves every stored
+        // record where it is; the purge that MAKES the room runs immediately before the
+        // insert below ([`crate::state::ComAmazonawsEvsAmazonelasticvmwareserviceState::reclaim_environment_slot`]).
+        if !state.has_room_for_environment() {
             return Err(CreateEnvironmentErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException {
                     message: format!(
@@ -588,7 +608,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
-            // Asked before the slot was reserved, so this is only reachable if another
+            // Asked before anything was minted, so this is only reachable if another
             // request filled the EC2 store in between; nothing was written either way.
             crate::state::ec2_resources::VlanSubnetProvisioning::SubnetLimitExceeded {
                 held,
@@ -674,23 +694,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let transition_due_at = environment.pending.as_ref().map(|pending| pending.due_at);
-        let stored = match state.environments.entry(environment_id) {
-            std::collections::btree_map::Entry::Vacant(slot) => slot.insert(environment),
-            // Unreachable: ids are minted from a strictly increasing seed. Answering
-            // honestly beats reporting some other environment as the created one.
-            std::collections::btree_map::Entry::Occupied(taken) => {
-                let message =
-                    format!("The environment id {} is already in use.", taken.key());
-                // Nothing of this environment is stored, so the subnets provisioned for
-                // it are released rather than left in the account's EC2 store with no
-                // environment to delete them.
-                release(&*self.engine, &provisioned);
-                return Err(CreateEnvironmentErrorModeled::InternalServerException(
-                    InternalServerException { message },
-                )
-                .into());
-            }
-        };
+        // Unreachable: ids are minted from a strictly increasing seed. Answering
+        // honestly beats overwriting another environment or reporting it as the created
+        // one — and it is asked BEFORE the slot is reclaimed, so a create that cannot be
+        // completed purges no finished record.
+        if state.environments.contains_key(&environment_id) {
+            // Nothing of this environment is stored, so the subnets provisioned for
+            // it are released rather than left in the account's EC2 store with no
+            // environment to delete them.
+            release(&*self.engine, &provisioned);
+            return Err(CreateEnvironmentErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: format!("The environment id {environment_id} is already in use."),
+                },
+            )
+            .into());
+        }
+        // Everything that can fail has run: make the room the check above found and
+        // store the environment, so the purge and the insert cannot come apart.
+        state.reclaim_environment_slot();
+        let stored = state
+            .environments
+            .entry(environment_id)
+            .or_insert(environment);
         // The ESX hosts the request asked Amazon EVS to ADD to the environment, added to
         // the record just stored: each one a host of this environment, which is what
         // `ListEnvironmentHosts` reports and what the next `CreateEnvironmentHost` finds

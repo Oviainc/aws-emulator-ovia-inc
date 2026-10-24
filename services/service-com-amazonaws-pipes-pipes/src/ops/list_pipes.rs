@@ -181,16 +181,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ] {
             if let Some(value) = value {
                 if !allowed.contains(&value) {
-                    return Err(ListPipesErrorModeled::ValidationException(ValidationException {
-                        message: Some(format!(
-                            "{member} must be one of {}; got '{value}'",
-                            allowed.join(", "),
-                        )),
-                        field_list: Some(vec![ValidationExceptionField {
-                            name: member.to_string(),
-                            message: format!("must be one of {}", allowed.join(", ")),
-                        }]),
-                    })
+                    return Err(ListPipesErrorModeled::ValidationException(
+                        crate::state::validation_error(vec![crate::state::validation_field(
+                            member,
+                            format!("must be one of {}", allowed.join(", ")),
+                        )]),
+                    )
                     .into());
                 }
             }
@@ -203,15 +199,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => MAX_LIMIT,
             Some(limit) if (1..=MAX_LIMIT).contains(&limit) => limit,
             Some(limit) => {
-                return Err(ListPipesErrorModeled::ValidationException(ValidationException {
-                    message: Some(format!(
-                        "Limit must be between 1 and {MAX_LIMIT}; got {limit}"
-                    )),
-                    field_list: Some(vec![ValidationExceptionField {
-                        name: "Limit".to_string(),
-                        message: format!("must be between 1 and {MAX_LIMIT}"),
-                    }]),
-                })
+                return Err(ListPipesErrorModeled::ValidationException(
+                    crate::state::validation_error(vec![crate::state::validation_field(
+                        "Limit",
+                        format!("must be between 1 and {MAX_LIMIT}; got {limit}"),
+                    )]),
+                )
                 .into());
             }
         };
@@ -225,18 +218,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(after) => Some(after),
                 None => {
                     return Err(ListPipesErrorModeled::ValidationException(
-                        ValidationException {
-                            message: Some(
-                                "NextToken is not a token issued by a previous ListPipes call"
-                                    .to_string(),
-                            ),
-                            field_list: Some(vec![ValidationExceptionField {
-                                name: "NextToken".to_string(),
-                                message: "must be a NextToken returned by a previous ListPipes \
-                                          call, passed back unchanged"
-                                    .to_string(),
-                            }]),
-                        },
+                        crate::state::validation_error(vec![crate::state::validation_field(
+                            "NextToken",
+                            "must be a NextToken returned by a previous ListPipes call, \
+                             passed back unchanged",
+                        )]),
                     )
                     .into());
                 }
