@@ -247,11 +247,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The token is a secret handed to the caller: it is minted by the emulator's
-        // credential store, never constructed here. Nothing persists it — no operation
-        // reports a key's token again.
+        // credential store, never constructed here. Only a one-way digest of it is
+        // persisted — enough for the workspace's own Grafana HTTP API to recognise the
+        // token a bearer presents, and not enough to report the token again.
         let Some(key) = crate::state::mint_grafana_bearer_token(ctx.credential_store()) else {
             return Err(server_unavailable());
         };
+        let token_digest = crate::state::bearer_token_digest(&key);
 
         // `secondsToLive` is "the time in seconds until the key expires"; the model
         // bounds it to `@range(min: 1, max: 2592000)` (30 days), so the boundary
@@ -265,6 +267,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 role: input.key_role,
                 created: now,
                 expires: now + seconds_to_live,
+                token_digest,
             },
         );
 

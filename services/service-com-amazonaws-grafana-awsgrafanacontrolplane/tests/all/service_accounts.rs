@@ -435,6 +435,10 @@ async fn a_create_against_no_workspace_is_refused() {
 
 /// The modelled constraints on the request: `name`'s length bounds and `grafanaRole`'s
 /// value set. Both bounds are checked, and one character past each.
+///
+/// Both members travel in the request BODY, so a value outside their modelled bounds is
+/// refused by the service's request validator as a bad request — not with the modelled
+/// `ValidationException`, which is what a refusal the HANDLER raises carries.
 #[tokio::test]
 async fn a_request_outside_the_modelled_constraints_is_refused() {
     let emulator = emulator();
@@ -461,8 +465,9 @@ async fn a_request_outside_the_modelled_constraints_is_refused() {
         if status == 400 {
             assert_eq!(
                 answer.error_code(),
-                "ValidationException",
-                "case {case:?}: expected ValidationException, got {:?}",
+                "BadRequestException",
+                "case {case:?}: expected BadRequestException from the body validator, got \
+                 {:?}",
                 answer.body
             );
             assert!(

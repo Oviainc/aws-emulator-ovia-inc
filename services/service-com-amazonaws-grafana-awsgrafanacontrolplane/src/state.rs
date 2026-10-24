@@ -49,9 +49,28 @@ pub const DEFAULT_GRAFANA_VERSION: &str =
 /// an empty object is the document that overrides nothing.
 pub const DEFAULT_WORKSPACE_CONFIGURATION: &str = "{}";
 
-/// The region a workspace endpoint is built for when the request carries no
-/// SigV4 credential scope to read one from.
-pub const DEFAULT_REGION: &str = "us-east-1";
+/// The host a URL this emulator announces names when the asking request carries
+/// no address at all — only an in-process caller that builds a path-only URI with
+/// no `Host` does.
+///
+/// Loopback is where the emulator binds by default (`EMULATOR_BIND_ADDRESS`), so
+/// an announced URL still names this emulator rather than a host it does not
+/// serve; it is the fallback
+/// `service-com-amazonaws-codecommit-codecommit-20150413` uses for the same
+/// question about its own clone URL.
+pub const LOOPBACK_HOST: &str = "127.0.0.1";
+
+/// The path prefix a workspace's own (native) Grafana HTTP API answers on, under
+/// the endpoint this emulator is reached at: `<prefix><workspaceId>` is the base
+/// `WorkspaceDescription$endpoint` reports, and the Grafana API's own routes hang
+/// off it (`<endpoint>/api/org`).
+///
+/// On AWS the endpoint is a per-workspace HOST; this emulator serves every face of
+/// itself on the one address it is reached on, so the workspace is named by a path
+/// segment instead. The prefix is disjoint from the control plane's own URI space
+/// (`/workspaces`, `/tags`, `/versions`), so a data-plane request can never be
+/// mistaken for a modelled operation.
+pub const WORKSPACE_API_PATH_PREFIX: &str = "/grafana-workspaces/";
 
 /// The `AuthenticationProviderTypes` value naming SAML 2.0 authentication, one
 /// of the two that enum admits (`AWS_SSO`, `SAML`).
@@ -198,7 +217,9 @@ pub const LIFECYCLE_TRANSITION: Duration = Duration::from_millis(500);
 ///
 /// The key TOKEN is not here: it is a secret handed to the caller once, by
 /// `CreateWorkspaceApiKey`, and no operation reports it again — so nothing in the
-/// store needs to hold it.
+/// store holds it. What is held is its [`token_digest`](ApiKey::token_digest),
+/// which is what lets the workspace's own Grafana HTTP API recognise the token a
+/// client presents without the store ever holding the secret itself.
 #[derive(Debug, Clone)]
 pub struct ApiKey {
     /// `ApiKeyName`, unique within the workspace ("Keynames must be unique to
@@ -211,6 +232,10 @@ pub struct ApiKey {
     /// the key expires"). Past this instant the key is no longer a key of the
     /// workspace.
     pub expires: SystemTime,
+    /// [`bearer_token_digest`] of the token `CreateWorkspaceApiKey` handed the
+    /// caller: a one-way digest, so the record identifies the key a bearer
+    /// presents without being able to reproduce it.
+    pub token_digest: String,
 }
 
 /// A status change the clock owes a workspace: the instant it falls due, and the
@@ -580,6 +605,11 @@ pub struct ServiceAccountToken {
     /// unset until something authorizes with it, which only the workspace's own
     /// data plane can do.
     pub last_used: Option<SystemTime>,
+    /// [`bearer_token_digest`] of the key `CreateWorkspaceServiceAccountToken`
+    /// handed the caller, for the same reason as [`ApiKey::token_digest`]: the
+    /// workspace's Grafana HTTP API recognises the key a bearer presents, and the
+    /// store never holds the key itself.
+    pub token_digest: String,
 }
 
 impl ServiceAccountToken {
@@ -643,9 +673,64 @@ impl ComAmazonawsGrafanaAwsgrafanacontrolplaneState {
     }
 }
 
-/// The URL users access the Grafana console in a workspace through.
-pub fn workspace_endpoint(id: &str, region: &str) -> String {
-    format!("https://{id}.grafana-workspace.{region}.amazonaws.com")
+/// The endpoint a client reached this emulator at: the scheme and authority every
+/// URL this emulator announces for itself has to name.
+///
+/// `WorkspaceDescription$endpoint` is the address the workspace's own Grafana HTTP
+/// API answers on (`CreateWorkspaceApiKey` mints a key "used to authenticate
+/// requests sent to the workspace's HTTP API"), so in an emulator it is the
+/// address THIS emulator answers on — the endpoint the request arrived at — and
+/// not a `*.grafana-workspace.<region>.amazonaws.com` host, which is a different
+/// server entirely and would send a client that follows it off the emulator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServingEndpoint {
+    pub scheme: String,
+    pub authority: String,
+}
+
+impl ServingEndpoint {
+    /// The endpoint this request arrived at: the `Host` header (or, on HTTP/2, the
+    /// URI authority), under the scheme the request names.
+    ///
+    /// A request that carries neither — only an in-process caller that builds a
+    /// path-only URI with no `Host` — falls back to [`LOOPBACK_HOST`], so every
+    /// URL this service announces names an address this emulator serves.
+    pub fn from_request(parts: &::http::request::Parts) -> Self {
+        let authority = parts
+            .headers
+            .get(::http::header::HOST)
+            .and_then(|host| host.to_str().ok())
+            .map(str::to_string)
+            .or_else(|| parts.uri.authority().map(|a| a.as_str().to_string()))
+            .filter(|authority| !authority.is_empty())
+            .unwrap_or_else(|| LOOPBACK_HOST.to_string());
+        let scheme = parts
+            .uri
+            .scheme_str()
+            .or_else(|| {
+                parts
+                    .headers
+                    .get("x-forwarded-proto")
+                    .and_then(|proto| proto.to_str().ok())
+            })
+            // The emulator's own listener serves HTTPS, which is also the only
+            // scheme Amazon Managed Grafana publishes a workspace endpoint for.
+            .unwrap_or("https")
+            .to_string();
+        Self { scheme, authority }
+    }
+
+    /// The URL the workspace's own Grafana HTTP API answers on — the one
+    /// `WorkspaceDescription$endpoint` / `WorkspaceSummary$endpoint` report, and
+    /// the base the native routes hang off (`<endpoint>/api/org`). It is served by
+    /// [`crate::service::workspace_api`] at
+    /// [`WORKSPACE_API_PATH_PREFIX`]`<workspaceId>`.
+    pub fn workspace_endpoint(&self, id: &str) -> String {
+        format!(
+            "{}://{}{WORKSPACE_API_PATH_PREFIX}{id}",
+            self.scheme, self.authority
+        )
+    }
 }
 
 /// True when `value` satisfies `WorkspaceId`'s `^g-[0-9a-f]{10}$`.
@@ -721,11 +806,33 @@ pub fn upgrade_targets(current: &str) -> Vec<String> {
         .collect()
 }
 
-/// The region this request was signed for — what a workspace endpoint names.
-pub fn request_region(parts: &::http::request::Parts) -> String {
-    ::emulator_server::sigv4_credential_scope(&parts.headers)
-        .map(|scope| scope.region)
-        .unwrap_or_else(|| DEFAULT_REGION.to_string())
+/// The digest a bearer token is recognised by: the SHA-256 of the token, in
+/// lowercase hex.
+///
+/// A token is a secret handed to its caller once, so the store keeps only this
+/// one-way digest of it — enough for the workspace's Grafana HTTP API to tell
+/// whether the token a client presented is the one a live key was minted with, and
+/// not enough to reproduce the token from the record.
+pub fn bearer_token_digest(token: &str) -> String {
+    use ::sha2::Digest as _;
+    let mut hasher = ::sha2::Sha256::new();
+    hasher.update(token.as_bytes());
+    ::hex::encode(hasher.finalize())
+}
+
+/// Whether two [`bearer_token_digest`] values are the same, compared without an
+/// early exit so the time taken does not depend on how much of a presented token
+/// was right.
+pub fn same_token_digest(stored: &str, presented: &str) -> bool {
+    let (stored, presented) = (stored.as_bytes(), presented.as_bytes());
+    if stored.len() != presented.len() {
+        return false;
+    }
+    let mut difference = 0u8;
+    for (left, right) in stored.iter().zip(presented) {
+        difference |= left ^ right;
+    }
+    difference == 0
 }
 
 /// True when `value` parses as a JSON document.
@@ -851,6 +958,11 @@ pub fn api_key_name_taken(workspace_id: &str, key_name: &str) -> ConflictExcepti
 ///
 /// `None` when the store minted no session-token secret, which leaves the
 /// operation to refuse rather than report a token it made up.
+///
+/// The operation that hands the token out persists only its
+/// [`bearer_token_digest`], never the token: that is what lets the workspace's own
+/// Grafana HTTP API recognise the token a client presents without any record
+/// holding the secret.
 pub fn mint_grafana_bearer_token(store: &::emulator_server::CredentialStore) -> Option<String> {
     let minted = store.create(&::emulator_server::aws_credentials::AWS_SESSION);
     let token = minted

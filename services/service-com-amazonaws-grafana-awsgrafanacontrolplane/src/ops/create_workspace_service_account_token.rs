@@ -266,10 +266,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The key is a secret handed to the caller once ("Do not lose this key, as it
         // will not be retrievable again"): it is minted by the emulator's credential
-        // store, never constructed here, and nothing persists it.
+        // store, never constructed here, and only a one-way digest of it is persisted —
+        // enough for the workspace's own Grafana HTTP API to recognise the key a bearer
+        // presents, and not enough to report the key again.
         let Some(key) = crate::state::mint_grafana_bearer_token(ctx.credential_store()) else {
             return Err(server_unavailable());
         };
+        let token_digest = crate::state::bearer_token_digest(&key);
 
         // Re-reached mutably now that every refusal is behind us, so no refused request
         // has touched the store.
@@ -283,6 +286,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             expires: now + seconds_to_live,
             // Nothing has authorized with the key yet.
             last_used: None,
+            token_digest,
         };
 
         // The response reports the record that was stored, read off it; only the key is

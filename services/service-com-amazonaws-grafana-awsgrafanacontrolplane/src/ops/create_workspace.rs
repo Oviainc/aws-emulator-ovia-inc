@@ -261,7 +261,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = ::std::time::SystemTime::now();
-        let region = crate::state::request_region(ctx.parts());
+        // The endpoint a workspace announces is the address its own Grafana HTTP
+        // API answers on, which for an emulator is the address THIS emulator was
+        // reached at (see `crate::state::ServingEndpoint`).
+        let serving = crate::state::ServingEndpoint::from_request(ctx.parts());
         let mut store = state.lock();
 
         // `@idempotencyToken`: the same token names the same workspace, so a
@@ -304,7 +307,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let id = store.mint_workspace_id();
         let workspace = crate::state::Workspace {
-            endpoint: crate::state::workspace_endpoint(&id, &region),
+            endpoint: serving.workspace_endpoint(&id),
             id: id.clone(),
             name: input.workspace_name,
             description: input.workspace_description,
