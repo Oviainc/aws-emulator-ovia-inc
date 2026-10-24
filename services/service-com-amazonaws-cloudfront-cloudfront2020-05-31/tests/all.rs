@@ -17,6 +17,8 @@ mod cache_policy_lifecycle;
 mod continuous_deployment_policies;
 #[path = "all/distribution_config_defaults.rs"]
 mod distribution_config_defaults;
+#[path = "all/distribution_config_read.rs"]
+mod distribution_config_read;
 #[path = "all/distribution_copy.rs"]
 mod distribution_copy;
 #[path = "all/distribution_delete_gate.rs"]
