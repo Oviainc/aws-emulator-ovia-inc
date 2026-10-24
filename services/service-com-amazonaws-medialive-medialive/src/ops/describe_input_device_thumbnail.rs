@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeInputDeviceThumbnail
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeInputDeviceThumbnail`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeInputDeviceThumbnail::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Report the latest thumbnail the input device the request names has sent: the
+//! image data itself as the response payload, the media type it is in, the length
+//! and the entity tag derived from that data, and the instant the device last
+//! updated it.
+//!
+//! REPORTING ONLY: the one write it makes is the `settle` every operation runs
+//! first, which materialises the maintenance window the clock had already closed.
+//! The thumbnail comes from the device's own record in [`crate::state`] — nothing
+//! here invents one, and nothing in this emulator sends one, because the real
+//! service receives it from a connected Link unit and no unit is connected here.
+//! So a device that has sent none reports the empty payload its `Body` member
+//! defaults to, which is what it has, and none of the metadata that would
+//! describe an image that was never sent.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +164,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeInputDeviceThumbnail` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeInputDeviceThumbnailErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(unavailable)?;
+        let now = ::std::time::SystemTime::now();
+
+        // Reporting only. `settle` materialises what the clock had already made
+        // due at this instant, so a later caller sees exactly the same thing
+        // whether or not this read happened.
+        let mut state = state.lock();
+        state.settle(now);
+
+        // "The HTTP Accept header. Indicates the requested type for the
+        // thumbnail." The response can only carry a media type the model's own
+        // `ContentType` enum declares, so an `Accept` that allows none of them
+        // asks for a representation this operation cannot produce — the modelled
+        // `BadRequestException`, not a thumbnail in a type the caller refused. A
+        // request carrying no `Accept` asks for no particular type and is served.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeInputDeviceThumbnail"))
+        // Checked BEFORE the device is resolved, so a request this operation
+        // could not answer for ANY device is refused for what is wrong with the
+        // request rather than for which device it named: the caller has to fix the
+        // `Accept` either way, and the refusal then reveals nothing about which
+        // ids exist.
+        if !ACCEPT_HEADER_VALUES
+            .iter()
+            .any(|served| crate::state::accept_allows(&input.accept, served))
+        {
+            return Err(bad_request(crate::state::unacceptable_media_type_message(
+                &input.accept,
+                ACCEPT_HEADER_VALUES,
+            )));
+        }
+
+        let device = state.input_device(&input.input_device_id).ok_or_else(|| {
+            DescribeInputDeviceThumbnailErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::not_found_message(
+                    "InputDevice",
+                    &input.input_device_id,
+                )),
+            })
+        })?;
+
+        // A device that has sent no thumbnail has no image, no media type, no
+        // version and no instant one was updated at: the empty payload `Body`
+        // defaults to, whose length is nothing.
+        let Some(thumbnail) = device.thumbnail() else {
+            return Ok(DescribeInputDeviceThumbnailOutput {
+                body: Vec::new(),
+                content_length: Some(0),
+                content_type: None,
+                e_tag: None,
+                last_modified: None,
+            });
+        };
+
+        Ok(DescribeInputDeviceThumbnailOutput {
+            body: thumbnail.body.clone(),
+            content_length: Some(thumbnail.content_length()),
+            content_type: Some(thumbnail.content_type.clone()),
+            e_tag: Some(thumbnail.etag()),
+            last_modified: Some(::aws_smithy_types::DateTime::from(thumbnail.last_modified)),
+        })
     }
+}
+
+/// The request asked for something this operation cannot answer with, which is
+/// this operation's own modelled client error.
+fn bad_request(message: String) -> DescribeInputDeviceThumbnailError {
+    DescribeInputDeviceThumbnailErrorModeled::BadRequestException(BadRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The engine this operation was built from is not the shared in-memory engine,
+/// so there is no store to read the device's thumbnail from. A modelled server
+/// error, never a fresh engine (which would answer from an empty private store).
+fn unavailable() -> DescribeInputDeviceThumbnailError {
+    DescribeInputDeviceThumbnailErrorModeled::InternalServerErrorException(
+        InternalServerErrorException {
+            message: Some(crate::state::NO_STORE.to_string()),
+        },
+    )
+    .into()
 }
