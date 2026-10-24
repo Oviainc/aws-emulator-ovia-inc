@@ -14,6 +14,11 @@
 //! `CreateBenefitApplication` already fills from `CreateBenefitApplicationInput$Tags`),
 //! so there is no second copy of a resource's tags.
 //!
+//! A key in the AWS-reserved `aws:` namespace is not the caller's to write: a request
+//! carrying one is refused with the modelled `ValidationException` (HTTP 400) and nothing
+//! is stored — see [`crate::state::reserved_tag_key_refusal`], which `UntagResource` and
+//! `CreateBenefitApplication` apply to their own tag-key members too.
+//!
 //! A `resourceArn` that names no resource this service holds is refused with the modelled
 //! `ResourceNotFoundException` (HTTP 404). Its message is the service's catalog-lookup
 //! form ``Catalog `<name>` not found`` built from the `Catalog` the request named; the
@@ -188,6 +193,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // fixture's `TagResource` step is answered `ResourceNotFoundException` and its
         // `ListTagsForResource` step `AccessDeniedException`.
         let _ = ctx;
+
+        // The `aws:` tag-key namespace is AWS's own: a caller cannot create or overwrite a
+        // key in it, so a request carrying one is refused here — before any resource is
+        // looked up and before anything is persisted — rather than stored. The modelled
+        // `TagKey` pattern admits `:`, so this is not a constraint the centralized walk
+        // can enforce; see [`crate::state::reserved_tag_key_refusal`].
+        if let Some(refusal) = crate::state::reserved_tag_key_refusal(
+            "tags",
+            input.tags.iter().map(|tag| tag.key.as_str()),
+        ) {
+            return Err(TagResourceErrorModeled::ValidationException(refusal).into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(TagResourceErrorModeled::InternalServerException(
                 InternalServerException {
