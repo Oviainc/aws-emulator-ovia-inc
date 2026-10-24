@@ -486,6 +486,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ))
             })?,
         };
+        // "In some cases, you must explicitly acknowledge that your stack template contains
+        // certain capabilities ... If you don't specify either of these capabilities,
+        // CloudFormation returns an InsufficientCapabilities error": the template this
+        // change set would put on the stack is held to the acknowledgement THIS request
+        // carries, before the plan is written.
+        if let Some(message) = crate::state::insufficient_capabilities(
+            &template_body,
+            input.capabilities.as_deref().unwrap_or_default(),
+        ) {
+            return Err(
+                CreateChangeSetErrorModeled::InsufficientCapabilitiesException(
+                    InsufficientCapabilitiesException {
+                        message: Some(message),
+                    },
+                )
+                .into(),
+            );
+        }
         let mut parameters =
             crate::state::merged_parameters(&previous_parameters, input.parameters.as_deref())
                 .map_err(crate::scaffolded::Scaffolded::validation_error)?;

@@ -26,13 +26,16 @@
 //! does not perform either way. `StackPolicyURL` names a policy in Amazon S3 and is
 //! answered 501, like `TemplateURL`.
 //!
-//! Three gaps are deliberate and predate the output evaluation, so a test author can see
+//! `Capabilities` is WEIGHED against the template's own declarations: a template declaring
+//! an IAM resource the request did not acknowledge is refused with the modelled
+//! `InsufficientCapabilitiesException`, before the stack is created — see
+//! [`crate::state::insufficient_capabilities`].
+//!
+//! Two gaps are deliberate and predate the output evaluation, so a test author can see
 //! them: `ClientRequestToken` is stored as the operation's token but not checked for
-//! reuse, so the modelled `TokenAlreadyExistsException` is never answered; `Capabilities`
-//! is stored but not weighed against the template's resource types, so
-//! `InsufficientCapabilitiesException` is never answered; and a `TemplateBody` that is
-//! neither JSON nor YAML is stored (and declares no resources and no outputs) rather than
-//! refused with a template-format `ValidationError`.
+//! reuse, so the modelled `TokenAlreadyExistsException` is never answered; and a
+//! `TemplateBody` that is neither JSON nor YAML is stored (and declares no resources and
+//! no outputs) rather than refused with a template-format `ValidationError`.
 //!
 //! A template whose `Resources` section declares a resource type CloudFormation does not
 //! recognise IS refused, with HTTP 400 `ValidationError` naming those types, before the
@@ -333,6 +336,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `crate::state::resource_types` for the recognised set.
         crate::state::validate_resource_types(&template_body)
             .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        // "In some cases, you must explicitly acknowledge that your stack template contains
+        // certain capabilities in order for CloudFormation to create the stack": a template
+        // whose IAM resources this request did not acknowledge is refused HERE, before the
+        // stack is created, so nothing mints a privileged identity the caller never
+        // acknowledged.
+        if let Some(message) = crate::state::insufficient_capabilities(
+            &template_body,
+            input.capabilities.as_deref().unwrap_or_default(),
+        ) {
+            return Err(CreateStackErrorModeled::InsufficientCapabilitiesException(
+                InsufficientCapabilitiesException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         // `Parameter$UsePreviousValue` is a stack-UPDATE instruction ("During a stack
         // update, use the existing parameter value that the stack is using for a given
         // parameter key"), so a create — which has no previous values at all — is refused

@@ -301,6 +301,23 @@ pub fn validate_resource_types(template_body: &str) -> Result<(), String> {
     }
 }
 
+/// `None` when `capabilities` — the request's own `Capabilities` — acknowledges everything
+/// the submitted template requires; otherwise the `InsufficientCapabilitiesException`
+/// message that refuses the request.
+///
+/// The rule every operation that SUBMITS a template is held to, before anything is
+/// created: a template declaring an IAM resource requires that resource's capability to be
+/// acknowledged, and one giving such a resource a custom name requires the named form
+/// ([`template::required_capabilities`] is where the requirement is computed). A body this
+/// service's reader will not read at all declares no resource to require a capability, so
+/// it is answered by the template-format rules instead — the same shape as
+/// [`validate_resource_types`].
+pub fn insufficient_capabilities(template_body: &str, capabilities: &[String]) -> Option<String> {
+    let parsed = template::parse(template_body)?;
+    let missing = template::missing_capabilities(&parsed, capabilities);
+    (!missing.is_empty()).then(|| template::insufficient_capabilities_message(&missing))
+}
+
 /// `StackStatus` values this service puts a stack into (all from the model's
 /// `StackStatus` enum).
 pub mod status {

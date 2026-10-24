@@ -346,6 +346,19 @@ pub(crate) async fn create_stack(
     call(router, "CreateStack", &members).await
 }
 
+/// `extra` plus the `Capabilities` member that acknowledges the IAM resources a template
+/// declares.
+///
+/// `CAPABILITY_NAMED_IAM` acknowledges both forms the gate distinguishes — "If you have IAM
+/// resources, you can specify either capability. If you have IAM resources with custom
+/// names, you must specify CAPABILITY_NAMED_IAM" — so a row whose template declares an IAM
+/// resource is accepted whichever of the two it requires.
+pub(crate) fn acknowledging_iam(extra: &[(String, String)]) -> Vec<(String, String)> {
+    let mut members = extra.to_vec();
+    members.push(member("Capabilities.member.1", "CAPABILITY_NAMED_IAM"));
+    members
+}
+
 pub(crate) async fn describe_stack(router: &MultiServiceRouter, name_or_id: &str) -> (u16, String) {
     call(
         router,
