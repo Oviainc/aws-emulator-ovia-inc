@@ -137,12 +137,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             TagResourceErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the Outposts store is unavailable".to_string()),
             })
         })?;
+        // The region this request is addressed to: a resource is part of its own
+        // region's inventory and of no other's, so that is where the ARN is
+        // resolved — one region's endpoint cannot tag another region's resource.
+        let region = crate::state::request_region(ctx.parts());
         // The same reading of `ResourceArn` every tagging operation does. The
         // modelled `Arn` pattern pins it to `arn:…:outposts:…:<type>/<id>`, so the
         // boundary has already refused every value this cannot read — with the
@@ -163,14 +166,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // this store holds tags for. Any other kind is a resource this store cannot
         // hold, which is the not-found error this operation models; its body is the
         // identifier echo every not-found body of this service carries.
-        let tags = store.tags_mut(&resource_type, &resource_id).ok_or_else(|| {
-            TagResourceErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::identifier_not_found(
-                    crate::state::RESOURCE_ARN_MEMBER,
-                    &input.resource_arn,
-                )),
-            })
-        })?;
+        let tags = store
+            .tags_mut(&region, &resource_type, &resource_id)
+            .ok_or_else(|| {
+                TagResourceErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::identifier_not_found(
+                        crate::state::RESOURCE_ARN_MEMBER,
+                        &input.resource_arn,
+                    )),
+                })
+            })?;
 
         // A key the request names REPLACES the stored value rather than adding an
         // entry, so what the resource would end up holding is its own keys the

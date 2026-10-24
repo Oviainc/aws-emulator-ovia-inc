@@ -138,12 +138,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetQuoteErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the Outposts store is unavailable".to_string()),
             })
         })?;
+        // The region this request is addressed to: a quote is part of its own
+        // region's inventory and of no other's, so that is where the identifier is
+        // resolved.
+        let region = crate::state::request_region(ctx.parts());
         // `QuoteIdentifier` accepts the bare id or the full quote ARN; both name the
         // same stored record.
         let quote_id = crate::state::resolve_quote_id(&input.quote_identifier).ok_or_else(|| {
@@ -159,8 +162,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // its expiry is told so rather than being handed a stale `CREATED`.
         store.settle_quotes();
         let quote = store
-            .quotes
-            .get(&quote_id)
+            .quote(&region, &quote_id)
             .map(|record| record.quote.clone())
             .ok_or_else(|| {
                 GetQuoteErrorModeled::NotFoundException(NotFoundException {

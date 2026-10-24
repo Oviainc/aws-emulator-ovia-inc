@@ -91,7 +91,7 @@ async fn refused(outposts: &Outposts, case: &str, region: &str, request: &Value,
         );
     }
     let name = text(request, "Name");
-    let listed = listed_names(&outposts.list_outposts("").await);
+    let listed = listed_names(&outposts.list_outposts_in(region, "").await);
     assert!(
         !listed.contains(&name),
         "case {case:?} in {region}: a refused create must store nothing, yet \
@@ -100,20 +100,27 @@ async fn refused(outposts: &Outposts, case: &str, region: &str, request: &Value,
 }
 
 /// `CreateOutpost` in `region` carrying `member: value`, read back through
-/// `GetOutpost`, as the `(AvailabilityZone, AvailabilityZoneId)` the store holds.
+/// `GetOutpost` in that same region, as the `(AvailabilityZone, AvailabilityZoneId)`
+/// the store holds.
+///
+/// The site the Outpost is placed on is created in `region` too: a site belongs to
+/// the region it was created in, and an Outpost can only be placed on a site of its
+/// own region.
 async fn accepted_pair(
     outposts: &Outposts,
     region: &str,
-    site_id: &str,
     name: &str,
     identity: &[(&str, &str)],
 ) -> (String, String) {
+    let site_id = outposts.site_id_in(region, &format!("{name} site")).await;
     let mut request = json!({ "Name": name, "SiteId": site_id });
     for (member, value) in identity {
         request[*member] = json!(value);
     }
     let outpost = outposts.create_outpost_in(region, &request).await;
-    let read = outposts.get_outpost(&text(&outpost, "OutpostId")).await;
+    let read = outposts
+        .get_outpost_in(region, &text(&outpost, "OutpostId"))
+        .await;
     (
         text(&read, "AvailabilityZone"),
         text(&read, "AvailabilityZoneId"),
@@ -130,10 +137,6 @@ async fn accepted_pair(
 #[tokio::test]
 async fn create_outpost_refuses_an_identifier_that_names_no_zone_of_the_region() {
     let outposts = Outposts::new();
-    let site = outposts
-        .create_site(&json!({ "Name": "zone identity site" }))
-        .await;
-    let site_id = text(&site, "SiteId");
 
     // (case, region, member, value)
     let mut refusals: Vec<(String, &str, &str, String)> = Vec::new();
@@ -170,6 +173,12 @@ async fn create_outpost_refuses_an_identifier_that_names_no_zone_of_the_region()
         ));
     }
     for (case, region, member, value) in &refusals {
+        // An Outpost is placed on a site of its OWN region, so the site each row
+        // names is created in the region that row is addressed to: what the row is
+        // refused for is the zone, not the site.
+        let site_id = outposts
+            .site_id_in(region, &format!("zone identity site {region}"))
+            .await;
         let mut request = json!({ "Name": format!("refused {case}"), "SiteId": site_id });
         request[*member] = json!(value);
         refused(&outposts, case, region, &request, &[value.as_str()]).await;
@@ -190,7 +199,6 @@ async fn create_outpost_refuses_an_identifier_that_names_no_zone_of_the_region()
                 let stored = accepted_pair(
                     &outposts,
                     region,
-                    &site_id,
                     &format!("accepted {case}"),
                     &[(member, value)],
                 )
@@ -216,10 +224,6 @@ async fn create_outpost_refuses_an_identifier_that_names_no_zone_of_the_region()
 #[tokio::test]
 async fn create_outpost_refuses_two_identities_that_name_different_zones() {
     let outposts = Outposts::new();
-    let site = outposts
-        .create_site(&json!({ "Name": "zone pair site" }))
-        .await;
-    let site_id = text(&site, "SiteId");
 
     // (name index, id index): two identities name two zones whenever the indices
     // differ, however far apart they are and whichever way round.
@@ -231,6 +235,11 @@ async fn create_outpost_refuses_two_identities_that_name_different_zones() {
         (3, 5),
     ];
     for &(region, abbreviation) in REGIONS {
+        // See `accepted_pair`: the site every row of this region names is created in
+        // that region.
+        let site_id = outposts
+            .site_id_in(region, &format!("zone pair site {region}"))
+            .await;
         for (named, identified) in mismatched {
             let zone = format!("{region}{}", zone_letter(named));
             let zone_id = format!("{abbreviation}-az{identified}");
@@ -266,7 +275,6 @@ async fn create_outpost_refuses_two_identities_that_name_different_zones() {
                 let stored = accepted_pair(
                     &outposts,
                     region,
-                    &site_id,
                     &format!("accepted {case}"),
                     &[
                         ("AvailabilityZone", named_zone.as_str()),
@@ -296,10 +304,6 @@ async fn create_outpost_refuses_two_identities_that_name_different_zones() {
 #[tokio::test]
 async fn a_pair_of_a_region_with_no_zone_id_abbreviation_is_judged_by_what_resolves() {
     let outposts = Outposts::new();
-    let site = outposts
-        .create_site(&json!({ "Name": "unabbreviable region site" }))
-        .await;
-    let site_id = text(&site, "SiteId");
     // A region code whose final segment is not the single digit a zone-ID
     // abbreviation ends in, so the mapping has nothing to map it through.
     let region = "zz-testing-12";
@@ -308,7 +312,6 @@ async fn a_pair_of_a_region_with_no_zone_id_abbreviation_is_judged_by_what_resol
     let stored = accepted_pair(
         &outposts,
         region,
-        &site_id,
         "accepted unmappable pair",
         &[
             ("AvailabilityZone", zone),
@@ -322,6 +325,11 @@ async fn a_pair_of_a_region_with_no_zone_id_abbreviation_is_judged_by_what_resol
         "a pair neither direction can map is stored as supplied, got {stored:?}"
     );
 
+    // See `accepted_pair`: the site this row names is created in the region the row
+    // is addressed to.
+    let site_id = outposts
+        .site_id_in(region, "unabbreviable region site")
+        .await;
     let resolving_id = "use1-az1";
     let request = json!({
         "Name": "refused unmappable name with a resolving id",

@@ -149,12 +149,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetRenewalPricingErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the Outposts store is unavailable".to_string()),
             })
         })?;
+        // The region this request is addressed to: an Outpost is part of its own
+        // region's inventory and of no other's, so that is where the identifier is
+        // resolved.
+        let region = crate::state::request_region(ctx.parts());
         // `OutpostIdentifier` accepts the bare id or the full Outpost ARN; both name
         // the same stored Outpost.
         let outpost_id =
@@ -170,8 +173,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // for it to materialise and nothing for it to write.
         let store = state.lock();
         let options = store
-            .outposts
-            .get(&outpost_id)
+            .outpost(&region, &outpost_id)
             .map(|record| record.renewal_pricing.clone())
             .ok_or_else(|| {
                 GetRenewalPricingErrorModeled::NotFoundException(NotFoundException {

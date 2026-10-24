@@ -157,12 +157,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UpdateSiteAddressErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the Outposts store is unavailable".to_string()),
             })
         })?;
+        // The region this request is addressed to: a site is part of its own
+        // region's inventory and of no other's, so that is where the identifier is
+        // resolved.
+        let region = crate::state::request_region(ctx.parts());
         // Which of the site's two addresses this call is about. The modelled
         // `AddressType` enum is validated at the boundary, so an unmodelled value
         // never reaches here; it is still refused as that modelled constraint rather
@@ -196,7 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         // An identifier that names no site is answered before anything about a
         // site's Outposts is read.
-        if !store.sites.contains_key(&site_id) {
+        if store.site(&region, &site_id).is_none() {
             return Err(not_found().into());
         }
         // The Outpost that holds the site's OPERATING address, read before the
@@ -204,7 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // limit is on the address the site itself is at.
         let blocking = match kind {
             crate::state::SiteAddressKind::Operating => store
-                .outpost_at_site(&site_id)
+                .outpost_at_site(&region, &site_id)
                 .and_then(|record| record.outpost.outpost_id.clone()),
             crate::state::SiteAddressKind::Shipping => None,
         };
@@ -221,7 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        let record = store.sites.get_mut(&site_id).ok_or_else(not_found)?;
+        let record = store.site_mut(&region, &site_id).ok_or_else(not_found)?;
         // The whole address replaces the stored one of that type: `Address` is one
         // `@required` structure, not a set of patchable members, so there is nothing
         // to merge.

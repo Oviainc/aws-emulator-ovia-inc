@@ -136,12 +136,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             ListTagsForResourceErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the Outposts store is unavailable".to_string()),
             })
         })?;
+        // The region this request is addressed to: a resource is part of its own
+        // region's inventory and of no other's, so that is where the ARN is
+        // resolved.
+        let region = crate::state::request_region(ctx.parts());
         // The modelled `Arn` pattern pins `ResourceArn` to
         // `arn:…:outposts:…:<type>/<id>`, so the boundary has already refused every
         // value this cannot read — with the ARN-syntax code this service names for
@@ -167,7 +170,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the identifier member and the value as supplied, as this API's not-found
         // bodies do.
         let tags = store
-            .tags(&resource_type, &resource_id)
+            .tags(&region, &resource_type, &resource_id)
             .ok_or_else(|| {
                 ListTagsForResourceErrorModeled::NotFoundException(NotFoundException {
                     message: Some(crate::state::identifier_not_found(

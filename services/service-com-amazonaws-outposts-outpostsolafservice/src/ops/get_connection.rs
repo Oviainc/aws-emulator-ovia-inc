@@ -145,27 +145,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetConnectionErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the Outposts store is unavailable".to_string()),
             })
         })?;
+        // The region this request is addressed to: a connection is part of its own
+        // region's inventory and of no other's, so that is where the id is resolved.
+        let region = crate::state::request_region(ctx.parts());
 
         // A pure report: the connection is answered from what `StartConnection`
         // persisted, and nothing here writes, so a later caller sees exactly what
         // this one did. `ConnectionId` has ONE form, the opaque id the start minted,
         // so there is nothing to resolve before the lookup.
         let store = state.lock();
-        let record = store.connections.get(&input.connection_id).ok_or_else(|| {
-            GetConnectionErrorModeled::NotFoundException(NotFoundException {
-                // The identifier echo, of the value as supplied.
-                message: Some(crate::state::identifier_not_found(
-                    crate::state::CONNECTION_ID_MEMBER,
-                    &input.connection_id,
-                )),
-            })
-        })?;
+        let record = store
+            .connection(&region, &input.connection_id)
+            .ok_or_else(|| {
+                GetConnectionErrorModeled::NotFoundException(NotFoundException {
+                    // The identifier echo, of the value as supplied.
+                    message: Some(crate::state::identifier_not_found(
+                        crate::state::CONNECTION_ID_MEMBER,
+                        &input.connection_id,
+                    )),
+                })
+            })?;
 
         Ok(GetConnectionOutput {
             // The STORED id: the record is the one thing that says what this

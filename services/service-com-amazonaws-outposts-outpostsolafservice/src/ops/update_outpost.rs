@@ -149,12 +149,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             UpdateOutpostErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the Outposts store is unavailable".to_string()),
             })
         })?;
+        // The region this request is addressed to: an Outpost is part of its own
+        // region's inventory and of no other's, so that is where the identifier is
+        // resolved — one region's endpoint cannot change another region's Outpost.
+        let region = crate::state::request_region(ctx.parts());
         // `OutpostId` accepts the bare id or the full Outpost ARN; both name the
         // same stored record.
         let outpost_id = crate::state::resolve_outpost_id(&input.outpost_id).ok_or_else(|| {
@@ -169,7 +172,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // materialised first, exactly as every other path that reports an Outpost
         // does, so an update never answers a stale lifecycle status.
         store.settle_outposts();
-        let record = store.outposts.get_mut(&outpost_id).ok_or_else(|| {
+        let record = store.outpost_mut(&region, &outpost_id).ok_or_else(|| {
             UpdateOutpostErrorModeled::NotFoundException(NotFoundException {
                 // The identifier echo, of the value AS SUPPLIED — not of
                 // `outpost_id`, which is the bare id an ARN resolved to.
