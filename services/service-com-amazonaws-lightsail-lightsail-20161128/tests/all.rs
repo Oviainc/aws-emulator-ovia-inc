@@ -63,6 +63,8 @@ mod export_snapshot_records;
 mod instance_delete_attachments;
 #[path = "all/instance_error_envelope.rs"]
 mod instance_error_envelope;
+#[path = "all/instance_https_setup.rs"]
+mod instance_https_setup;
 #[path = "all/instance_lifecycle.rs"]
 mod instance_lifecycle;
 #[path = "all/instance_metric_data.rs"]

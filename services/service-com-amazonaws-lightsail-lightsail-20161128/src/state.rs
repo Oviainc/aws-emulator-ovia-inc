@@ -70,7 +70,8 @@ use crate::ops::types::{
     LoadBalancerTlsCertificateSummary,
     MonitoredResourceInfo, MonthlyTransfer, Operation, Origin, PrivateRegistryAccess, Region,
     RelationalDatabaseBundle, RelationalDatabaseParameter,
-    ResourceLocation, ResourceReceivingAccess, StaticIp, Tag, REGION_NAME_VALUES,
+    ResourceLocation, ResourceReceivingAccess,
+    StaticIp, Tag, REGION_NAME_VALUES,
 };
 
 // ---------------------------------------------------------------------------
@@ -665,8 +666,12 @@ pub const EXPORT_SNAPSHOT_RECORD_PAGE_SIZE: usize = 10;
 /// entry of `reported`: there is no page to report, which the caller turns into a
 /// refusal. An absent token asks for the first page.
 ///
-/// Shared by every published catalog this service pages (blueprints, instance
-/// bundles), so each one walks its catalog exactly the same way.
+/// `id_of` answers a [`std::borrow::Cow`], so an entry whose token is a member it
+/// already holds lends it (`Cow::Borrowed`) while one whose token is DERIVED from a
+/// member can compute it (`Cow::Owned`) — one walk serves both.
+///
+/// Shared by every listing this service pages (blueprints, instance bundles, the
+/// HTTPS setup history), so each one walks its records exactly the same way.
 ///
 /// TOTAL on every input, including an arbitrary caller-supplied token: the token
 /// is only ever COMPARED against each entry's id, the start comes from
@@ -679,14 +684,16 @@ fn catalog_page<T: Clone>(
     reported: &[T],
     page_size: usize,
     page_token: Option<&str>,
-    id_of: impl Fn(&T) -> Option<&str>,
+    id_of: impl Fn(&T) -> Option<std::borrow::Cow<'_, str>>,
 ) -> Option<(Vec<T>, Option<String>)> {
     // A page carries at least one entry, so a walk over a non-empty catalog
     // always advances.
     let page_size = page_size.max(1);
     let start = match page_token {
         None => 0,
-        Some(token) => reported.iter().position(|entry| id_of(entry) == Some(token))?,
+        Some(token) => reported
+            .iter()
+            .position(|entry| id_of(entry).as_deref() == Some(token))?,
     };
     let page = reported
         .iter()
@@ -696,7 +703,7 @@ fn catalog_page<T: Clone>(
         .collect::<Vec<_>>();
     let next_page_token = reported
         .get(start.saturating_add(page_size))
-        .and_then(|entry| id_of(entry).map(str::to_string));
+        .and_then(|entry| id_of(entry).map(std::borrow::Cow::into_owned));
     Some((page, next_page_token))
 }
 
@@ -1060,7 +1067,7 @@ pub fn bundle_page(
     page_token: Option<&str>,
 ) -> Option<(Vec<Bundle>, Option<String>)> {
     catalog_page(reported, page_size, page_token, |bundle| {
-        bundle.bundle_id.as_deref()
+        bundle.bundle_id.as_deref().map(std::borrow::Cow::Borrowed)
     })
 }
 
@@ -2091,7 +2098,7 @@ pub fn blueprint_page(
     page_token: Option<&str>,
 ) -> Option<(Vec<Blueprint>, Option<String>)> {
     catalog_page(reported, page_size, page_token, |blueprint| {
-        blueprint.blueprint_id.as_deref()
+        blueprint.blueprint_id.as_deref().map(std::borrow::Cow::Borrowed)
     })
 }
 
@@ -5726,6 +5733,140 @@ impl StoredOperation {
 }
 
 // ---------------------------------------------------------------------------
+// Instance HTTPS setup
+//
+// The append-only history of the `SetupInstanceHttps` calls made against one
+// instance: what `GetSetupHistory` reports back. It sits beside the operation
+// log, which every one of those calls also writes an entry to.
+// ---------------------------------------------------------------------------
+
+/// The `Operation$operationType` a `SetupInstanceHttps` call logs, the modelled
+/// `OperationType` enum's own `SetupInstanceHttps` member.
+pub const OPERATION_TYPE_SETUP_INSTANCE_HTTPS: &str = "SetupInstanceHttps";
+
+/// `SetupStatus` values this slice uses, from the modelled enum: a setup is
+/// `inProgress` for as long as the certificate the request asked for is still
+/// being put in place, and `succeeded` once it is.
+pub const SETUP_STATUS_IN_PROGRESS: &str = "inProgress";
+/// See [`SETUP_STATUS_IN_PROGRESS`].
+pub const SETUP_STATUS_SUCCEEDED: &str = "succeeded";
+
+/// How many setup records one `GetSetupHistory` page carries, from that
+/// operation's own documentation: "Returns detailed information for five of the
+/// most recent `SetupInstanceHttps` requests that were ran on the target
+/// instance."
+pub const SETUP_HISTORY_PAGE_SIZE: usize = 5;
+
+/// The length at which a `SetupInstanceHttps` domain name counts as a short one,
+/// from that operation's documentation: "If you provide more than one domain name
+/// in the request, at least one name must be less than or equal to 63 characters
+/// in length."
+pub const SETUP_DOMAIN_NAME_SHORT_LENGTH: usize = 63;
+
+/// The most HTTPS setup records this emulator keeps, oldest dropped first.
+///
+/// Emulator resource guard: the history is append-only, exactly like the
+/// operation log, so without a cap a long-lived emulator would grow without
+/// bound.
+pub const MAX_INSTANCE_HTTPS_SETUPS: usize = 2_000;
+
+/// One `SetupInstanceHttps` request against one instance, and what became of it.
+///
+/// The record is what `GetSetupHistory` reports, so it holds the request as it
+/// was submitted together with the instance it ran against AS IT WAS THEN: this
+/// is a history, and the resource members of a history entry do not change when
+/// the instance later does.
+#[derive(Debug, Clone)]
+pub struct StoredInstanceHttpsSetup {
+    /// The operation-log entry this call wrote, which is also what identifies
+    /// the record: `SetupHistory$operationId` is "A GUID that's used to identify
+    /// the operation".
+    pub operation_id: String,
+    pub instance_name: String,
+    pub domain_names: Vec<String>,
+    pub certificate_provider: String,
+    /// The renewal contact the request carried. Kept, never reported: the
+    /// modelled `SetupRequest` has no member for it, because it "Returns
+    /// information that was submitted during the `SetupInstanceHttps` request.
+    /// Email information is redacted for privacy."
+    pub email_address: String,
+    /// The instance's ARN when the setup ran.
+    pub resource_arn: String,
+    /// The instance's creation time when the setup ran.
+    pub resource_created_at_ms: i64,
+    /// Where that instance was.
+    pub resource_location: StoredLocation,
+    /// A value of the modelled `SetupStatus` enum: [`SETUP_STATUS_IN_PROGRESS`]
+    /// until the clock settles it into [`SETUP_STATUS_SUCCEEDED`].
+    pub status: String,
+    /// When the clock owes this setup its terminal `succeeded` status, while one
+    /// is outstanding.
+    pub settles_at_ms: Option<i64>,
+}
+
+impl StoredInstanceHttpsSetup {
+    /// The `SetupHistoryPageToken` that names this record.
+    ///
+    /// The modelled token admits `^[A-Za-z0-9+/=]+$` at 24..40 characters, which
+    /// a GUID's own hyphens do not satisfy, so the token is that GUID's 32 hex
+    /// digits — still naming exactly one record, and within the modelled length.
+    pub fn page_token(&self) -> String {
+        self.operation_id.replace('-', "")
+    }
+
+    /// This record as the modelled `SetupHistory`.
+    pub fn view(&self) -> crate::ops::types::SetupHistory {
+        crate::ops::types::SetupHistory {
+            operation_id: Some(self.operation_id.clone()),
+            request: Some(crate::ops::types::SetupRequest {
+                instance_name: Some(self.instance_name.clone()),
+                domain_names: Some(self.domain_names.clone()),
+                certificate_provider: Some(self.certificate_provider.clone()),
+            }),
+            resource: Some(crate::ops::types::SetupHistoryResource {
+                name: Some(self.instance_name.clone()),
+                arn: Some(self.resource_arn.clone()),
+                created_at: Some(timestamp(self.resource_created_at_ms)),
+                location: Some(self.resource_location.view()),
+                resource_type: Some(RESOURCE_TYPE_INSTANCE.to_string()),
+            }),
+            // `SetupExecutionDetails` is one COMMAND run on the instance's
+            // operating system, with the stdout, the stderr and the script
+            // version it produced. This emulator runs no command on an instance,
+            // so there is no command output to report, and inventing some would
+            // claim output nothing produced. The list is reported EMPTY rather
+            // than left out, so a typed caller iterating it still gets a list.
+            execution_details: Some(Vec::new()),
+            status: Some(self.status.clone()),
+        }
+    }
+}
+
+/// Accept the domain names a `SetupInstanceHttps` request carries, or refuse with
+/// a message naming the member that is wrong and the constraint it broke.
+///
+/// Each name's own length and charset, and the list's own 1..10 length, are
+/// modelled constraints the centralized walk already refused outside. What is
+/// left is the rule the model cannot express, from the operation's own
+/// documentation: "If you provide more than one domain name in the request, at
+/// least one name must be less than or equal to 63 characters in length."
+pub fn validate_setup_domain_names(domain_names: &[String]) -> Result<(), String> {
+    let short = domain_names
+        .iter()
+        .any(|name| name.chars().count() <= SETUP_DOMAIN_NAME_SHORT_LENGTH);
+    if domain_names.len() > 1 && !short {
+        return Err(format!(
+            "domainNames carries {} names and every one of them is longer than \
+             {SETUP_DOMAIN_NAME_SHORT_LENGTH} characters: a request naming more than one \
+             domain must name at least one of at most {SETUP_DOMAIN_NAME_SHORT_LENGTH} \
+             characters",
+            domain_names.len()
+        ));
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Container services
 // ---------------------------------------------------------------------------
 
@@ -7541,6 +7682,12 @@ pub struct ComAmazonawsLightsailLightsail20161128State {
     /// The append-only operation log, newest last: the source of truth for the
     /// `operations` every mutating instance call answers with.
     pub operations: Vec<StoredOperation>,
+    /// The append-only `SetupInstanceHttps` history, newest last: the source of
+    /// truth for what `GetSetupHistory` reports for an instance. A `Vec` for the
+    /// same reason the operation log is one — it is a log, several entries of it
+    /// name the same instance, and `GetSetupHistory` reports the most recent
+    /// ones first.
+    pub instance_https_setups: Vec<StoredInstanceHttpsSetup>,
     /// Every container service, keyed by the region it was created in and its
     /// name — the pair that identifies it, because a container service name is
     /// unique within one region of the account and `GetContainerServices`
@@ -8258,6 +8405,64 @@ impl ComAmazonawsLightsailLightsail20161128State {
         self.record_operation(operation)
     }
 
+    /// Append `setup` to the `SetupInstanceHttps` history, dropping the oldest
+    /// records past [`MAX_INSTANCE_HTTPS_SETUPS`] so the history stays bounded
+    /// however many calls a caller makes.
+    ///
+    /// The bound is over the WHOLE history, as the operation log's own is: the
+    /// log is one append-only sequence, so a store driven past the bound drops
+    /// its oldest records whichever instance they name.
+    pub fn record_instance_https_setup(&mut self, setup: StoredInstanceHttpsSetup) {
+        self.instance_https_setups.push(setup);
+        if let Some(excess) = self
+            .instance_https_setups
+            .len()
+            .checked_sub(MAX_INSTANCE_HTTPS_SETUPS)
+        {
+            self.instance_https_setups.drain(..excess);
+        }
+    }
+
+    /// One page of the HTTPS setup history of the resource `resource_name`, and
+    /// the token naming the first record of the page after it — present only
+    /// while records remain.
+    ///
+    /// The most recent record comes first, and a page carries at most
+    /// [`SETUP_HISTORY_PAGE_SIZE`] of them. The walk itself is [`catalog_page`],
+    /// shared with this service's other paged listings; only the token a record
+    /// is named by is this history's own — it is DERIVED from the record's
+    /// operation id (see [`StoredInstanceHttpsSetup::page_token`]) rather than a
+    /// member it holds, which is what `catalog_page`'s `Cow` answer is for. So a
+    /// token naming no record of this resource's history answers `None`, which
+    /// the caller turns into a refusal, and an absent token asks for the first
+    /// page.
+    pub fn setup_history_page(
+        &self,
+        resource_name: &str,
+        page_token: Option<&str>,
+    ) -> Option<(Vec<crate::ops::types::SetupHistory>, Option<String>)> {
+        let reported = self
+            .instance_https_setups
+            .iter()
+            .rev()
+            .filter(|setup| setup.instance_name == resource_name)
+            .collect::<Vec<_>>();
+        let (page, next_page_token) = catalog_page(
+            &reported,
+            SETUP_HISTORY_PAGE_SIZE,
+            page_token,
+            // Owned, because the token is the operation id's hex digits rather
+            // than a member the record holds. The walk is over at most
+            // [`MAX_INSTANCE_HTTPS_SETUPS`] records, so the comparison is
+            // bounded.
+            |setup| Some(std::borrow::Cow::Owned(setup.page_token())),
+        )?;
+        Some((
+            page.iter().map(|setup| setup.view()).collect::<Vec<_>>(),
+            next_page_token,
+        ))
+    }
+
     /// Materialise every transition the clock had already made due at `now_ms`:
     /// an instance, a disk, a disk snapshot, an instance snapshot, an export
     /// snapshot record, a managed
@@ -8378,6 +8583,15 @@ impl ComAmazonawsLightsailLightsail20161128State {
                 operation.is_terminal = true;
                 operation.status_changed_at_ms = settles_at_ms;
                 operation.settles_at_ms = None;
+            }
+        }
+        for setup in &mut self.instance_https_setups {
+            let Some(settles_at_ms) = setup.settles_at_ms else {
+                continue;
+            };
+            if settles_at_ms <= now_ms {
+                setup.status = SETUP_STATUS_SUCCEEDED.to_string();
+                setup.settles_at_ms = None;
             }
         }
     }
