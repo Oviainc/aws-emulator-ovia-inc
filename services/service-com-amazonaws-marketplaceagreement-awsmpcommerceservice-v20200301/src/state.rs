@@ -71,8 +71,9 @@ use crate::ops::types::{
     FixedUpfrontPricingTerm, FreeTrialPricingTerm, GetAgreementPaymentRequestOutput,
     GetBillingAdjustmentRequestOutput, InternalServerException, ItemizedCharge, LegalTerm,
     NetPaymentTerm, PaymentRequestSummary, PaymentScheduleTerm, ProposalSummary, Proposer,
-    PurchaseOrder, RecurringPaymentTerm, RenewalTerm, RequestedTerm, RequestedTermConfiguration,
-    Resource, ResourceNotFoundException, SendAgreementPaymentRequestInput, SupportTerm,
+    CreateAgreementRequestInput, PurchaseOrder, RecurringPaymentTerm, RenewalTerm, RequestedTerm,
+    RequestedTermConfiguration, Resource, ResourceNotFoundException,
+    SendAgreementCancellationRequestInput, SendAgreementPaymentRequestInput, SupportTerm,
     TaxConfiguration, ThrottlingException, UsageBasedPricingTerm, ValidationException,
     ValidationExceptionField, ValidityTerm, VariablePaymentTerm, AGREEMENT_STATUS_VALUES,
     END_TIME_BEHAVIOR_REASON_CODE_VALUES, END_TIME_BEHAVIOR_TYPE_VALUES,
@@ -1079,6 +1080,42 @@ pub struct AgreementRequest {
     pub created_at: SystemTime,
 }
 
+impl AgreementRequest {
+    /// Whether this request is the one `input` asks to create — every member the
+    /// create carries beside its `clientToken` is the same.
+    ///
+    /// A create replaying the same token with the same content reports this
+    /// request; one reusing it for different content is a conflict, as the
+    /// siblings [`PaymentRequest::matches_send`] and
+    /// [`BillingAdjustmentRequest::matches_entry`] treat the same case.
+    pub fn matches_create(&self, input: &CreateAgreementRequestInput) -> bool {
+        self.intent == input.intent
+            && self.requested_terms == input.requested_terms
+            && self.source_agreement_identifier == input.source_agreement_identifier
+            && self.agreement_proposal_identifier == input.agreement_proposal_identifier
+            && tax_estimation(self.tax_configuration.as_ref())
+                == tax_estimation(input.tax_configuration.as_ref())
+    }
+}
+
+/// What tax estimation `configuration` asks for, as the request effectively
+/// carries it.
+///
+/// `TaxConfiguration$taxEstimation` is modelled with the default
+/// [`TAX_ESTIMATION_DEFAULT`], so a request that names no configuration at all
+/// asks for exactly what one naming that default asks for: the two are the same
+/// content, which is what makes a replay of one under the other's `clientToken`
+/// a replay rather than a conflict.
+fn tax_estimation(configuration: Option<&TaxConfiguration>) -> &str {
+    configuration.map_or(TAX_ESTIMATION_DEFAULT, |configuration| {
+        configuration.tax_estimation.as_str()
+    })
+}
+
+/// `TaxConfiguration$taxEstimation`'s modelled default, which is also what a
+/// request naming no `taxConfiguration` asks for.
+pub const TAX_ESTIMATION_DEFAULT: &str = "DISABLED";
+
 /// One entitlement an acceptance provisioned, as this emulator persists it.
 ///
 /// What is STORED is the entitlement's IDENTITY — the resource it was
@@ -1627,6 +1664,19 @@ pub struct AgreementCancellationRequest {
 }
 
 impl AgreementCancellationRequest {
+    /// Whether this request is the one `input` asks to send — every member the
+    /// send carries beside its `clientToken` is the same.
+    ///
+    /// A send replaying the same token with the same content reports this
+    /// request; one reusing it for different content is a conflict, as the
+    /// siblings [`PaymentRequest::matches_send`] and
+    /// [`BillingAdjustmentRequest::matches_entry`] treat the same case.
+    pub fn matches_send(&self, input: &SendAgreementCancellationRequestInput) -> bool {
+        self.agreement_id == input.agreement_id
+            && self.reason_code == input.reason_code
+            && self.description == input.description
+    }
+
     /// The `ListAgreementCancellationRequests` projection of this request.
     pub fn to_summary(&self) -> AgreementCancellationRequestSummary {
         AgreementCancellationRequestSummary {

@@ -22,8 +22,14 @@ pub struct CreateAgreementRequestInput {
     pub tax_configuration: Option<TaxConfiguration>,
 }
 
+// `PartialEq` on the requested-terms tree (this structure, the configuration union
+// and everything reachable from them): `clientToken` is modelled
+// `@idempotencyToken`, so a create carrying a token that already named a quote has
+// to tell a REPLAY of the same request from a REUSE of the token for different
+// content, and that comparison is value equality of the terms the stored request
+// asked for against the submitted ones. Nothing else about these shapes changes.
 #[smithy_macros::smithy(shape = "com.amazonaws.marketplaceagreement#RequestedTerm")]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct RequestedTerm {
     pub id: String,
     pub configuration: Option<RequestedTermConfiguration>,
@@ -31,7 +37,7 @@ pub struct RequestedTerm {
 
 #[smithy_macros::smithy(union_for = "com.amazonaws.marketplaceagreement#RequestedTermConfiguration")]
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum RequestedTermConfiguration {
     configurableUpfrontPricingTermConfiguration(ConfigurableUpfrontPricingTermConfiguration),
     renewalTermConfiguration(RenewalTermConfiguration),
