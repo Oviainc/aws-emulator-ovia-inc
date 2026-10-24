@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RetireGrant
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RetireGrant`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: deletes the grant the request identifies — by grant token, or by key
+//! identifier and grant id — so the permissions it carried are gone from the next
+//! request on. This is the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RetireGrant::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A mutating operation — except under `DryRun`, which validates the request exactly as
+//! a real one and then refuses it with `DryRunOperationException`, deleting nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -204,18 +201,147 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RetireGrant` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RetireGrantErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RetireGrant"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(RetireGrantErrorModeled::KMSInternalException(KMSInternalException {
+                message: Some("the KMS state store is unavailable".to_string()),
+            })
+            .into());
+        };
+
+        // "To identify the grant to retire, use a grant token, or both the grant ID and
+        // a key identifier (key ID or key ARN) of the KMS key"
+        // (`smithy_query(query="doc",shape="RetireGrant")`). The model marks none of the
+        // three members required, so a request that identifies no grant at all is
+        // refused with the synthetic 400 `ValidationException`.
+        let by_grant_id = input.key_id.is_some() && input.grant_id.is_some();
+        if input.grant_token.is_none() && !by_grant_id {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                "You must specify either GrantToken, or both GrantId and KeyId, to identify \
+                 the grant to retire.",
+            ));
+        }
+
+        let region = crate::state::request_region(ctx);
+        let mut state = state.lock();
+
+        // The grant to retire. A grant token names it on its own; otherwise the key
+        // identifier and the grant id do, and each of them is judged the way every
+        // other operation judges it.
+        let grant_id = match input.grant_token.as_deref() {
+            Some(token) => match state.grant_for_token(&region, token) {
+                Some(grant) => grant.grant_id.clone(),
+                // A token that is not one this service minted names no grant at all,
+                // so the TOKEN "is not valid". One whose grant is gone carries no
+                // permission to retire anything, which — since "permission to retire a
+                // grant is determined primarily by the grant"
+                // (`smithy_query(query="doc",shape="RetireGrant")`) — is an
+                // authorization failure rather than an absent resource.
+                None => {
+                    return Err(match crate::state::decode_grant_token(token) {
+                        // The token is well formed and names a grant, but the store
+                        // holds no such grant, so it carries no permission to retire
+                        // one: an authorization failure rather than a bad token.
+                        Some(grant_id) => crate::scaffolded::Scaffolded::access_denied(
+                            crate::state::retire_grant_access_denied_message(&grant_id),
+                        ),
+                        // Not a token this service minted, so it names no grant at
+                        // all: the TOKEN is what "is not valid".
+                        None => RetireGrantErrorModeled::InvalidGrantTokenException(
+                            InvalidGrantTokenException {
+                                message: Some(
+                                    "The specified grant token is not valid.".to_string(),
+                                ),
+                            },
+                        )
+                        .into(),
+                    });
+                }
+            },
+            None => {
+                let requested_key = input.key_id.as_deref().unwrap_or_default();
+                let requested_grant = input.grant_id.as_deref().unwrap_or_default();
+
+                if !crate::state::names_a_grant_id(requested_grant) {
+                    return Err(RetireGrantErrorModeled::InvalidGrantIdException(
+                        InvalidGrantIdException {
+                            message: Some(crate::state::invalid_grant_id_message(requested_grant)),
+                        },
+                    )
+                    .into());
+                }
+
+                let key_id = match state.resolve(&region, requested_key) {
+                    crate::state::KeyRef::Found(key) => key.key_id.clone(),
+                    crate::state::KeyRef::MalformedArn => {
+                        return Err(RetireGrantErrorModeled::InvalidArnException(
+                            InvalidArnException {
+                                message: Some(crate::state::invalid_arn_message(requested_key)),
+                            },
+                        )
+                        .into());
+                    }
+                    crate::state::KeyRef::NotFound => {
+                        return Err(RetireGrantErrorModeled::NotFoundException(NotFoundException {
+                            message: Some(crate::state::key_not_found_message(
+                                &region,
+                                requested_key,
+                            )),
+                        })
+                        .into());
+                    }
+                };
+
+                // A grant id that names no grant OF THIS KEY carries no permission to
+                // retire anything: "permission to retire a grant is determined
+                // primarily by the grant"
+                // (`smithy_query(query="doc",shape="RetireGrant")`), so with no grant
+                // there is no permission — an authorization failure rather than an
+                // absent resource. A second retire of the same grant meets the same
+                // answer, since the first one removed it.
+                let held = state
+                    .grant(&region, requested_grant)
+                    .is_some_and(|grant| grant.key_id == key_id);
+                if !held {
+                    return Err(crate::scaffolded::Scaffolded::access_denied(
+                        crate::state::retire_grant_access_denied_message(requested_grant),
+                    ));
+                }
+                requested_grant.to_string()
+            }
+        };
+
+        // "The KMS key that you use for this operation must be in a compatible key
+        // state": a key whose deletion is scheduled is not. A disabled key still has
+        // grants to retire, and this operation models no `DisabledException`.
+        let key_pending_deletion = state
+            .grant(&region, &grant_id)
+            .and_then(|grant| state.key_in(&region, &grant.key_id))
+            .filter(|key| key.key_state == crate::state::KEY_STATE_PENDING_DELETION)
+            .map(crate::state::invalid_state_message);
+        if let Some(message) = key_pending_deletion {
+            return Err(RetireGrantErrorModeled::KMSInvalidStateException(
+                KMSInvalidStateException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // `DryRun` is answered only once everything that would reject the request for
+        // its own reason has been judged, so a dry run reports the SAME refusal a real
+        // call would — and it reaches no write, so the grant stays as it is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(RetireGrantErrorModeled::DryRunOperationException(
+                DryRunOperationException {
+                    message: Some(crate::state::DRY_RUN_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        state.remove_grant(&region, &grant_id);
+
+        // "This operation does not return a response."
+        Ok(RetireGrantOutput)
     }
 }
