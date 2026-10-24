@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteNotification
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteNotification`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteNotification::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes one notification from the budget that owns it, together with the
+//! subscribers held with it — "Deleting a notification also deletes the subscribers
+//! that are associated with the notification." The caller names the notification by
+//! value (it has no id of its own); which members make up that identity lives in
+//! [`crate::state::same_notification`].
 //!
 //! ## Shape of an operation
 //!
@@ -150,16 +147,61 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
         // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteNotification` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteNotificationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteNotification"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteNotificationErrorModeled::InternalErrorException(InternalErrorException {
+                message: Some(
+                    "budgets is mounted on an engine that holds no state for it".to_string(),
+                ),
+            })
+        })?;
+
+        // The modelled `BudgetName` `@pattern` the boundary validator cannot compile —
+        // refused as the request-validation failure it is (HTTP 400
+        // `ValidationException`), naming the member path and the constraint.
+        if let Some(message) =
+            crate::state::budget_name_violation(&["BudgetName"], &input.budget_name)
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
+        let mut store = state.lock();
+        // A notification lives inside the budget that owns it, so the budget is resolved
+        // by the same `(AccountId, BudgetName)` identity every other operation uses.
+        let stored = store
+            .budgets
+            .get_mut(&(input.account_id.clone(), input.budget_name.clone()))
+            .ok_or_else(|| {
+                DeleteNotificationErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(format!(
+                        "Unable to delete notification: {} - the budget doesn't exist.",
+                        input.budget_name
+                    )),
+                })
+            })?;
+
+        // A notification carries no id: the caller names it by value, and
+        // `crate::state::same_notification` holds which members that identity is made of
+        // (the service-owned alarm state is not one of them).
+        let found = stored.notifications.iter().position(|held| {
+            crate::state::same_notification(&held.notification, &input.notification)
+        });
+        let Some(index) = found else {
+            return Err(DeleteNotificationErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(format!(
+                        "Unable to delete notification: {} - the notification doesn't exist.",
+                        input.budget_name
+                    )),
+                },
+            )
+            .into());
+        };
+        // The subscribers are stored inside the notification, so removing it removes them
+        // with it. The budget's other notifications keep their relative order, which is
+        // the order a paginated read indexes into.
+        stored.notifications.remove(index);
+
+        Ok(DeleteNotificationOutput {})
     }
 }

@@ -17,5 +17,7 @@ mod budget_lifecycle;
 mod budget_read_projection;
 #[path = "all/client_error_envelopes.rs"]
 mod client_error_envelopes;
+#[path = "all/notification_deletion.rs"]
+mod notification_deletion;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

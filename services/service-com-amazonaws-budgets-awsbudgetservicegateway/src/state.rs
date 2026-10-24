@@ -233,6 +233,37 @@ pub fn stamp_notification(notification: &mut Notification) {
     }
 }
 
+/// `ThresholdType$PERCENTAGE` — the threshold type a notification that names none
+/// carries: "Thresholds are always a percentage" (`Notification$Threshold`), so an
+/// absent `ThresholdType` and an explicit `PERCENTAGE` describe the same threshold.
+pub const THRESHOLD_TYPE_PERCENTAGE: &str = "PERCENTAGE";
+
+/// Whether `left` and `right` name the SAME notification of a budget.
+///
+/// A notification carries no id of its own, so every operation that acts on one
+/// (`DeleteNotification`, `UpdateNotification`, `DeleteSubscriber`, …) names it by
+/// passing the whole `Notification` shape back. Its identity is therefore the members
+/// that describe WHICH notification it is — the notification type, the comparison
+/// operator, the threshold and the threshold type (absent meaning
+/// [`THRESHOLD_TYPE_PERCENTAGE`], since "Thresholds are always a percentage").
+///
+/// `NotificationState` is deliberately NOT part of it: it "specifies whether this
+/// notification is in alarm" (`Notification$NotificationState`), a state the service
+/// moves on its own as spend crosses the threshold, so a caller naming a notification
+/// cannot be required to guess the alarm state it is in at that instant.
+pub fn same_notification(left: &Notification, right: &Notification) -> bool {
+    fn threshold_type(notification: &Notification) -> &str {
+        notification
+            .threshold_type
+            .as_deref()
+            .unwrap_or(THRESHOLD_TYPE_PERCENTAGE)
+    }
+    left.notification_type == right.notification_type
+        && left.comparison_operator == right.comparison_operator
+        && left.threshold == right.threshold
+        && threshold_type(left) == threshold_type(right)
+}
+
 /// The `PlannedBudgetLimits` entry in force at `at`.
 ///
 /// The map's key is the start of the planned month or quarter, "`UTC` in epoch seconds"
