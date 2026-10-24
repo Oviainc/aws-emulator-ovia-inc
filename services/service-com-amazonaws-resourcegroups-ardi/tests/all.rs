@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/group_owner_configuration_and_update.rs"]
 mod group_owner_configuration_and_update;
+#[path = "all/group_query.rs"]
+mod group_query;
 #[path = "all/grouping_statuses.rs"]
 mod grouping_statuses;
 #[path = "all/resource_group_lifecycle.rs"]

@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetGroupQuery
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetGroupQuery`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetGroupQuery::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the resource query of the stored group that `Group` (a name or a group ARN)
+//! or the deprecated `GroupName` names, exactly as [`crate::state`] holds it: the query
+//! `CreateGroup` persisted. Reporting only, so it never writes.
+//!
+//! A group contains either a resource query or a service configuration, never both, so
+//! a group that holds no query has no query to report. The group itself exists, so that
+//! is the modelled `BadRequestException` rather than `NotFoundException` or a 200 whose
+//! empty body would report the group as queried by nothing — the same split
+//! `GetGroupConfiguration` makes for a group that holds no configuration.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +160,63 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetGroupQuery` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetGroupQueryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetGroupQuery"))
+        // Authorization is not emulated: the emulator verifies request signatures
+        // centrally but holds no principals or policies, so the modelled
+        // `ForbiddenException` is deliberately unreachable here and a success says
+        // nothing about the caller's permissions. A read emits no audit record, so
+        // `ctx` carries nothing this handler needs.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetGroupQueryErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the resource-groups store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        // Neither member is `@required`, but the operation addresses exactly one
+        // group, so a request naming none cannot be served. `Group` wins over the
+        // deprecated `GroupName`, so the group a request addresses never depends on
+        // which of the two is read.
+        let Some(identifier) = input.group.as_deref().or(input.group_name.as_deref()) else {
+            return Err(GetGroupQueryErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(
+                        "the request must name the group whose query to get, in Group or \
+                         GroupName"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        let not_found = || {
+            GetGroupQueryError::from(GetGroupQueryErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::GROUP_NOT_FOUND_MESSAGE.to_string()),
+                },
+            ))
+        };
+        let store = state.lock();
+        let name = store.lookup(identifier).ok_or_else(not_found)?;
+        let record = store.groups.get(&name).ok_or_else(not_found)?;
+        // A resource query is an attribute only a query-based group has: a group
+        // created with a `Configuration`, or with neither, holds none.
+        let Some(resource_query) = record.to_resource_query() else {
+            return Err(GetGroupQueryErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(format!("the group {name} has no resource query")),
+                },
+            )
+            .into());
+        };
+        Ok(GetGroupQueryOutput {
+            group_query: Some(GroupQuery {
+                // The group's STORED name, never the identifier the request used, so
+                // addressing one group by name and by ARN reports the same query.
+                group_name: record.name.clone(),
+                resource_query,
+            }),
+        })
     }
 }
