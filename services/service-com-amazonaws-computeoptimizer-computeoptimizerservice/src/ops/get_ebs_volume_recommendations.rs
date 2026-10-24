@@ -331,11 +331,10 @@ fn invalid_parameter(message: String) -> GetEBSVolumeRecommendationsError {
 }
 
 /// What this operation answers when a request asks about an account other than the one
-/// this service answers for: the real service's constant refusal, which names neither the
-/// member nor the account — it states the permission that is missing and how an
-/// organization account gets it.
-const CROSS_ACCOUNT_MESSAGE: &str = "Invalid permission to access another account. If this \
-     is an organization account, request the management account to enable service access.";
+/// this service answers for: the real service's constant refusal, stated once for the
+/// whole crate ([`crate::state::CROSS_ACCOUNT_MESSAGE`]) so no two readers word it
+/// differently.
+const CROSS_ACCOUNT_MESSAGE: &str = crate::state::CROSS_ACCOUNT_MESSAGE;
 
 /// A 400 `InvalidParameterValueException` for a request that asks about an account other
 /// than the one this service answers for.
@@ -353,37 +352,15 @@ fn foreign_account() -> GetEBSVolumeRecommendationsError {
 /// The account whose recommendations this request asks for: the one id `accountIds`
 /// carries, or the caller's own account when it carries none.
 ///
-/// "Only one account ID can be specified per request"
-/// (`GetEBSVolumeRecommendations$accountIds`), and an `AccountId` is a 12-digit Amazon
-/// Web Services account id (`Scope$value`), so anything else is refused rather than
-/// silently answered for the caller. An id that is well-formed but names another account
-/// is refused by [`foreign_account`].
+/// The rule is the crate's ([`crate::state::requested_account_id`]): "Only one account ID
+/// can be specified per request" (`GetEBSVolumeRecommendations$accountIds`), an
+/// `AccountId` is a 12-digit Amazon Web Services account id (`Scope$value`), and an id
+/// that is well-formed but names another account is refused by [`foreign_account`]. This
+/// wrapper only lifts the reason into this operation's error channel.
 fn requested_account_id(
     account_ids: Option<&[String]>,
 ) -> Result<String, GetEBSVolumeRecommendationsError> {
-    let account_ids = account_ids.unwrap_or_default();
-    if account_ids.len() > 1 {
-        return Err(invalid_parameter(format!(
-            "The value supplied for parameter accountIds is not valid: only one account ID can \
-             be specified per request, not {}.",
-            account_ids.len(),
-        )));
-    }
-    match account_ids.first() {
-        None => Ok(::engine::emulator_account_id().to_string()),
-        Some(account_id) => {
-            if !crate::state::is_account_id(account_id) {
-                return Err(invalid_parameter(format!(
-                    "The value supplied for parameter accountIds is not valid: {account_id} is \
-                     not a 12-digit Amazon Web Services account ID."
-                )));
-            }
-            if account_id != ::engine::emulator_account_id() {
-                return Err(foreign_account());
-            }
-            Ok(account_id.clone())
-        }
-    }
+    crate::state::requested_account_id(account_ids).map_err(invalid_parameter)
 }
 
 /// The volumes this request asks about, by volume id, or `None` when it names none and so

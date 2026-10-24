@@ -759,13 +759,16 @@ async fn requested_identifiers_are_selected_reported_as_errors_or_refused() {
         "the error code must say the recommendation does not exist, got {body}"
     );
 
-    // `accountIds`: the emulator's own account holds the analysis; any other account
-    // holds none, and more than one account id — or a malformed one — is refused.
+    // `accountIds`: the emulator's own account holds the analysis; any OTHER account is a
+    // member account of an organization this service records none of, so naming it is
+    // refused rather than answered with an empty list — and more than one account id, or a
+    // malformed one, is refused too. The whole class is covered in
+    // `tests/all/cross_account_requests.rs`; these rows pin it for THIS reader.
     let own = ::engine::emulator_account_id().to_string();
     let every_name: Vec<String> = groups.iter().map(|group| group.name.clone()).collect();
     let cases: Vec<(Vec<&str>, Option<Vec<String>>)> = vec![
         (vec![own.as_str()], Some(every_name)),
-        (vec!["111122223333"], Some(Vec::new())),
+        (vec!["111122223333"], None),
         (vec![own.as_str(), "111122223333"], None),
         (vec!["1234"], None),
         (vec!["00000000000a"], None),
