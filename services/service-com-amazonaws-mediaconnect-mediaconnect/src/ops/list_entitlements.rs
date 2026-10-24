@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListEntitlements
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListEntitlements`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListEntitlements::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the entitlements this account HOLDS — the ones granted TO it — a page at a
+//! time, read out of [`crate::state`]: a grant that names this account among an
+//! entitlement's subscribers is listed, and a revoke takes it off the listing.
 //!
 //! ## Shape of an operation
 //!
@@ -91,6 +86,18 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The largest page ListEntitlements returns: the maximum of the modelled `MaxResults`
+/// range (1..1000).
+const MAX_PAGE_SIZE: i32 = 1000;
+
+/// The page size ListEntitlements uses when the request names none: "If MaxResults is not
+/// included in the request, the service defaults to pagination with a maximum of 20
+/// results per page"
+/// (`smithy_query(query="doc",shape="ListEntitlementsRequest",member="MaxResults")`) —
+/// the same 20 the operation's own doc states ("this request returns 20 results per
+/// page").
+const DEFAULT_PAGE_SIZE: i32 = 20;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -162,18 +169,75 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListEntitlements` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListEntitlementsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListEntitlements"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListEntitlementsErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: "the mediaconnect flow store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+
+        // `NextToken` is the entitlement ARN this listing resumes at, so a token the
+        // service never minted is a semantic error, not a key to page from. The
+        // entitlement it names may have been revoked in between — paging survives that,
+        // which is why the check is on the token's FORM and not on the store.
+        if let Some(token) = input.next_token.as_deref() {
+            if !crate::state::is_mintable_entitlement_arn(token) {
+                return Err(ListEntitlementsErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: crate::state::validation_failed_message(&format!(
+                            "Invalid NextToken {token:?}. A pagination token must be one this \
+                             service issued."
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Defence in depth: the modelled `MaxResults` range (1..1000) is already enforced
+        // at the boundary, so an out-of-range value is refused with a 400 before this
+        // handler runs and the clamp below never fires on a real request.
+        let page_size = usize::try_from(
+            input
+                .max_results
+                .unwrap_or(DEFAULT_PAGE_SIZE)
+                .clamp(1, MAX_PAGE_SIZE),
+        )
+        .unwrap_or(1);
+
+        // A pure read: nothing this operation reports moves with the clock (an
+        // entitlement carries no status the service settles and no expiry), so unlike
+        // DescribeFlow and ListFlows this handler materialises nothing and writes nothing.
+        let store = state.lock();
+        // "Displays a list of all entitlements that have been granted to this account",
+        // each a "ListedEntitlement ... that has been granted to you from other Amazon Web
+        // Services accounts" — so the subject is the SUBSCRIBER side of a grant: an
+        // entitlement is reported to each account its `Subscribers` name. This emulator
+        // serves the one account every ARN it mints carries, so that account is the caller
+        // here.
+        let held = store.entitlements_granted_to(::engine::emulator_account_id());
+
+        // The token is the ARN of the first entitlement of the NEXT page, so paging
+        // resumes at that key even if entitlements were granted or revoked in between.
+        // With no token the walk starts before every minted ARN, which is what the empty
+        // key is.
+        let resume_at = input.next_token.clone().unwrap_or_default();
+        let mut entitlements: Vec<ListedEntitlement> = Vec::new();
+        let mut next_token: Option<String> = None;
+        for (entitlement_arn, entitlement) in held.range(resume_at..) {
+            if entitlements.len() == page_size {
+                next_token = Some(entitlement_arn.clone());
+                break;
+            }
+            entitlements.push(entitlement.clone());
+        }
+
+        Ok(ListEntitlementsOutput {
+            entitlements: Some(entitlements),
+            next_token,
+        })
     }
 }
