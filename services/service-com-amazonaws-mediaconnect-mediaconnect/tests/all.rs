@@ -35,6 +35,8 @@ mod flow_projection;
 mod flow_source_failover_bound;
 #[path = "all/flow_source_metadata.rs"]
 mod flow_source_metadata;
+#[path = "all/flow_source_thumbnail.rs"]
+mod flow_source_thumbnail;
 #[path = "all/flow_sources.rs"]
 mod flow_sources;
 #[path = "all/gateway_instances.rs"]

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDataset
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDataset`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDataset::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: the handler below reports the stored dataset the request names,
+//! exactly as the create and the updates before it left it. A READ: it answers
+//! from the store and writes nothing, so what the next caller sees is unchanged.
 //!
 //! ## Shape of an operation
 //!
@@ -179,18 +174,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDataset` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDatasetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDataset"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeDatasetError::Modeled(DescribeDatasetErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: "the IoT SiteWise store is unavailable".to_string(),
+                },
+            ))
+        })?;
+        let _ = ctx;
+        let now = ::std::time::SystemTime::now();
+
+        let store = state.lock();
+        let dataset = store
+            .datasets
+            .get(&input.dataset_id)
+            .filter(|dataset| {
+                // `workspaceName` names the workspace that contains the dataset, so a
+                // request that names one scopes the lookup: a dataset held by another
+                // workspace, or by none, is not the dataset this request addresses.
+                input.workspace_name.is_none() || input.workspace_name == dataset.workspace_name
+            })
+            // `datasetVersion` asks for ONE version of the dataset. This store keeps
+            // only the version its last accepted write produced, so a request for any
+            // other version names something it does not hold.
+            .filter(|dataset| {
+                input
+                    .dataset_version
+                    .as_ref()
+                    .is_none_or(|version| *version == dataset.version_label())
+            })
+            .ok_or_else(|| not_found(&input.dataset_id))?;
+
+        Ok(DescribeDatasetOutput {
+            dataset_id: dataset.id.clone(),
+            dataset_arn: dataset.arn.clone(),
+            dataset_name: dataset.name.clone(),
+            // The model makes this member required while every member that writes it
+            // is optional, so a dataset nobody described reports the empty string
+            // rather than a description it was never given.
+            dataset_description: dataset.description.clone().unwrap_or_default(),
+            dataset_type: dataset.dataset_type.clone(),
+            dataset_config: dataset.config.clone(),
+            workspace_name: dataset.workspace_name.clone(),
+            // A dataset carrying no metadata reports none, rather than an empty map it
+            // was not given.
+            metadata: (!dataset.metadata.is_empty()).then(|| dataset.metadata.clone()),
+            dataset_source: dataset.source.clone(),
+            dataset_status: dataset.status(now),
+            dataset_creation_date: crate::state::to_date_time(dataset.creation_date),
+            dataset_last_update_date: crate::state::to_date_time(dataset.last_update_date),
+            dataset_version: Some(dataset.version_label()),
+            // Nothing in this emulator enriches a dataset yet — `CreateEnrichmentJob`
+            // is still a scaffold — so no enrichment status is reported.
+            enrichment_status: None,
+        })
     }
+}
+
+/// HTTP 404 `ResourceNotFoundException` naming the id that resolved to nothing.
+fn not_found(dataset_id: &str) -> DescribeDatasetError {
+    DescribeDatasetError::Modeled(DescribeDatasetErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: crate::state::not_found_message(crate::state::RESOURCE_DATASET, dataset_id),
+        },
+    ))
 }
