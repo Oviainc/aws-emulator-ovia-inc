@@ -66,9 +66,9 @@ const DATASTORE_NOT_FOUND: &str = "Datastore resource is not found.";
 /// One frame to seed: the transfer syntax its pixel data is stored in (`None` for an
 /// instance that declared none) and the bytes themselves.
 #[derive(Debug, Clone)]
-struct SeedFrame {
-    transfer_syntax_uid: Option<&'static str>,
-    pixel_data: Vec<u8>,
+pub(crate) struct SeedFrame {
+    pub(crate) transfer_syntax_uid: Option<&'static str>,
+    pub(crate) pixel_data: Vec<u8>,
 }
 
 /// Seed one image set in `state`, holding one frame per entry of `frames`, and answer
@@ -77,7 +77,7 @@ struct SeedFrame {
 /// The record is built with the crate's own `ImageSet::new`, and each frame id is minted
 /// by the same `mint_id` every handler mints identifiers with, so a seeded image set is
 /// shaped exactly like one a handler would hold.
-fn seed_image_set_with_frames(
+pub(crate) fn seed_image_set_with_frames(
     emulator: &Emulator,
     datastore_id: &str,
     image_set_state: ImageSetState,
@@ -160,7 +160,7 @@ async fn copy_image_set(
 
 /// Pixel data of `len` bytes that no two frames share: a frame's blob must come back
 /// byte for byte, so each case's payload has to be distinguishable from every other's.
-fn pixel_data(seed: u8, len: usize) -> Vec<u8> {
+pub(crate) fn pixel_data(seed: u8, len: usize) -> Vec<u8> {
     (0..len)
         .map(|index| seed.wrapping_add((index % 251) as u8))
         .collect()

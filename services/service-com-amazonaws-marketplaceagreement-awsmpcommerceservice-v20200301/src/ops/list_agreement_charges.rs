@@ -166,6 +166,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
+        // Every selector whose value set this service fixes is RESOLVED before
+        // anything is selected: a `catalog` that is not the one AWS Marketplace
+        // exposes and an `agreementType` outside the documented pair name
+        // nothing this service holds
+        // (`crate::state::selector_value_refusal`).
+        if let Some(refusal) = crate::state::selector_value_refusal(
+            input.agreement_type.as_deref(),
+            input.catalog.as_deref(),
+        ) {
+            return Err(ListAgreementChargesErrorModeled::ValidationException(refusal).into());
+        }
+
         // A pure report: it reads the stored agreements and their quotes and
         // writes nothing.
         let store = state.lock();
@@ -177,13 +189,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refusal is its modelled `ValidationException` carrying the
         // `INVALID_AGREEMENT_ID` reason a client branches on — the same refusal
         // the sibling listings of this service answer the same member with.
-        if let Some(agreement_id) = input.agreement_id.as_deref() {
-            if !store.agreements.contains_key(agreement_id) {
-                return Err(ListAgreementChargesErrorModeled::ValidationException(
-                    crate::state::validation_exception("INVALID_AGREEMENT_ID", "agreementId"),
-                )
-                .into());
-            }
+        if let Some(refusal) = store.unknown_agreement_refusal(input.agreement_id.as_deref()) {
+            return Err(ListAgreementChargesErrorModeled::ValidationException(refusal).into());
         }
 
         // "details about all charges regardless of whether a purchase order is

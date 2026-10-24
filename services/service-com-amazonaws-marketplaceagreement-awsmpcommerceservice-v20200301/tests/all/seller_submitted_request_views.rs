@@ -179,6 +179,10 @@ async fn the_proposer_listing_filters_the_requests_it_owns() {
     let router = emulator();
     let first_agreement = agreement(&router, "ap-sel1").await;
     let second_agreement = agreement(&router, "ap-sel2").await;
+    // A third agreement nothing was submitted under, so an `agreementId` naming
+    // it selects nothing — as opposed to one naming no agreement at all, which
+    // is refused (`selector_resolution.rs`).
+    let empty_agreement = agreement(&router, "ap-sel3").await;
     // Index 0 and 2 belong to the first agreement, index 1 to the second.
     let stored = [
         cancellation_over(&router, &first_agreement, "OTHER").await,
@@ -199,7 +203,7 @@ async fn the_proposer_listing_filters_the_requests_it_owns() {
         },
         Selector {
             case: "an agreement no stored request was sent under",
-            filters: json!({"agreementId": "no-such-agreement"}),
+            filters: json!({"agreementId": empty_agreement}),
             selects: vec![],
         },
         Selector {
@@ -226,11 +230,6 @@ async fn the_proposer_listing_filters_the_requests_it_owns() {
             case: "the catalog they were created in",
             filters: json!({"catalog": CATALOG}),
             selects: vec![0, 1, 2],
-        },
-        Selector {
-            case: "another catalog",
-            filters: json!({"catalog": "AWSMarketplace.Other"}),
-            selects: vec![],
         },
         Selector {
             case: "every selector at once",

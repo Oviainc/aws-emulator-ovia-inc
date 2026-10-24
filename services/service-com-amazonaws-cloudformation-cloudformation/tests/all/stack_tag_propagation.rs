@@ -39,8 +39,8 @@ use std::collections::BTreeMap;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::stack_lifecycle::{
-    create_stack, describe_stack, iam, member, router, sns, wait_for_the_transition, xml_blocks,
-    xml_text,
+    acknowledging_iam, create_stack, describe_stack, iam, member, router, sns,
+    wait_for_the_transition, xml_blocks, xml_text,
 };
 use crate::stack_resource_provisioning::{output_value, s3};
 use service_com_amazonaws_cloudformation_cloudformation::state::status;
@@ -618,11 +618,13 @@ async fn a_role_a_stack_creates_carries_the_stack_tags_iam_will_take() {
         })
         .to_string();
 
+        // The row's template declares the IAM role whose tags are under test, so the
+        // request acknowledges the template's IAM resources.
         let (status, created) = create_stack(
             &router,
             case.stack_name,
             &template,
-            &tag_members(case.stack_tags),
+            &acknowledging_iam(&tag_members(case.stack_tags)),
         )
         .await;
         assert_eq!(

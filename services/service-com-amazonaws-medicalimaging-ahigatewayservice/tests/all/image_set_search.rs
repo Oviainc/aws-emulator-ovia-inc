@@ -10,8 +10,9 @@
 //! when it asks for none, which the response echoes), served one `maxResults`-sized page
 //! at a time with an opaque token that resumes where the previous page stopped. Every
 //! member of each summary comes from the record, and because the operation REPORTS,
-//! nothing it reads changes: `lastAccessedAt` stays absent and two searches answer
-//! identically. A criteria this service cannot evaluate is 400 `ValidationException`, and
+//! nothing it reads changes: the `lastAccessedAt` it reports is the stored one — a search
+//! is not an access of the content it describes — and two searches answer identically. A
+//! criteria this service cannot evaluate is 400 `ValidationException`, and
 //! a data store it does not hold is 404 `ResourceNotFoundException`.
 //!
 //! Every case drives real HTTP through the production front door, so what is asserted is
@@ -203,6 +204,9 @@ fn seed_one(emulator: &Emulator, datastore_id: &str, seed: &ImageSetSeed) -> Str
         at(seed.updated_offset_secs),
     );
     image_set.created_at = at(seed.created_offset_secs);
+    // Nothing has accessed the content of a seeded image set, so its last access is the
+    // instant it came into existence.
+    image_set.last_accessed_at = at(seed.created_offset_secs);
     if seed.deleted {
         image_set.deleted_at = Some(at(seed.updated_offset_secs));
     }
@@ -258,7 +262,7 @@ impl Seeded {
 /// what an SDK puts on the wire when the caller names no criteria. The payload itself is
 /// never omitted: a `POST` with no body at all is not a JSON document, which the protocol
 /// refuses before any handler runs.
-async fn search(
+pub(crate) async fn search(
     emulator: &Emulator,
     datastore_id: &str,
     criteria: Option<Value>,
@@ -597,9 +601,11 @@ async fn every_reported_member_comes_from_the_persisted_image_set() {
             "case {:?}: expected the stored storage tier, got {summary:?}",
             seed.label
         );
-        assert!(
-            summary["lastAccessedAt"].is_null(),
-            "case {:?}: a search must not record an access, got {summary:?}",
+        assert_eq!(
+            summary["lastAccessedAt"].as_f64(),
+            Some(wire_instant(seed.created_offset_secs)),
+            "case {:?}: expected the stored last-access instant, which a search does not \
+             move, got {summary:?}",
             seed.label
         );
         for (member, stored) in [

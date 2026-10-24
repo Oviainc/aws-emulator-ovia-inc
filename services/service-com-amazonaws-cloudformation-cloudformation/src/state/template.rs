@@ -598,6 +598,43 @@ pub fn required_capabilities(template: &Template) -> RequiredCapabilities {
     }
 }
 
+/// Whether `provided` — a request's own `Capabilities` — acknowledges the single
+/// capability `required`.
+///
+/// [`CAPABILITY_NAMED_IAM`] is the stronger acknowledgement: "If you have IAM resources,
+/// you can specify either capability", so it also acknowledges a template whose IAM
+/// resources all take generated names. [`CAPABILITY_IAM`] alone does NOT acknowledge a
+/// custom-named one — "if your stack template contains IAM resources with custom names,
+/// you must specify CAPABILITY_NAMED_IAM".
+fn acknowledges(provided: &[String], required: &str) -> bool {
+    provided
+        .iter()
+        .any(|value| value == required || (required == CAPABILITY_IAM && value == CAPABILITY_NAMED_IAM))
+}
+
+/// The capabilities `template` requires that `provided` leaves unacknowledged, in the order
+/// [`required_capabilities`] reports them.
+///
+/// Empty — the only case a request may go ahead on — when the request acknowledged
+/// everything the template's own declarations require.
+pub fn missing_capabilities(template: &Template, provided: &[String]) -> Vec<String> {
+    required_capabilities(template)
+        .capabilities
+        .into_iter()
+        .filter(|required| !acknowledges(provided, required))
+        .collect()
+}
+
+/// The `InsufficientCapabilitiesException` message naming the capabilities a request did
+/// not acknowledge, as the service words it: `Requires capabilities :
+/// [CAPABILITY_NAMED_IAM]`.
+///
+/// Built from the request itself — the capabilities the submitted template requires and
+/// this request withheld — rather than from any fixed text.
+pub fn insufficient_capabilities_message(missing: &[String]) -> String {
+    format!("Requires capabilities : [{}]", missing.join(", "))
+}
+
 /// Read a template body, whether it is spelled as JSON or as YAML.
 ///
 /// A body whose `Transform` section names a macro this emulator PROCESSES is processed

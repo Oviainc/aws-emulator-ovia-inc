@@ -365,9 +365,11 @@ pub struct ComAmazonawsCodegurusecurityAwscodegurusecurityState {
     pub upload_bytes_held: usize,
     /// The account's configuration record, absent until the account is onboarded to
     /// CodeGuru Security ([`Self::onboard_account`]). The SINGLE copy of the
-    /// configuration: `GetAccountConfiguration` reports it, `UpdateAccountConfiguration`
-    /// updates it (and refuses while it is absent) and `CreateUploadUrl` derives an
-    /// upload's server-side-encryption headers from it, so there is no second copy to
+    /// configuration: `GetAccountConfiguration` reports it (reporting the documented
+    /// AWS-managed default while it is absent), `UpdateAccountConfiguration` writes it
+    /// ([`Self::set_encryption_kms_key_arn`], which brings the record into existence when
+    /// the account has none) and `CreateUploadUrl` derives an upload's
+    /// server-side-encryption headers from it, so there is no second copy to
     /// drift. One record, not a map: every request this emulator serves is for the one
     /// emulator account (`engine::emulator_account_id`).
     pub account_configuration: Option<AccountConfiguration>,
@@ -505,9 +507,9 @@ impl ComAmazonawsCodegurusecurityAwscodegurusecurityState {
     /// CodeGuru Security holds an account configuration for an account that is ONBOARDED
     /// to the service, and its API has no onboarding operation: the record appears when
     /// the account starts using the service. This emulator therefore creates it on the
-    /// first call that registers a resource for the account (`CreateUploadUrl`,
-    /// `CreateScan`), and a newly created record names no customer-managed key, so the
-    /// account keeps using the AWS-managed key until an update names one.
+    /// first call that writes state for the account (`CreateUploadUrl`, `CreateScan`,
+    /// `UpdateAccountConfiguration`), and a newly created record names no customer-managed
+    /// key, so the account keeps using the AWS-managed key until an update names one.
     ///
     /// IDEMPOTENT: an account that already has a record keeps it, with the key it
     /// configured and the instant it was created.
@@ -518,6 +520,30 @@ impl ComAmazonawsCodegurusecurityAwscodegurusecurityState {
                 created_at_millis: now_millis,
             });
         }
+    }
+
+    /// Write the account's `encryptionConfig.kmsKeyArn` — `None` asks for the AWS-managed
+    /// key — and report the value now configured.
+    ///
+    /// The account's encryption configuration is a per-account SETTING with a documented
+    /// default, not a named resource a caller creates: writing it therefore brings the
+    /// record into existence for an account that has none — the same record
+    /// [`Self::onboard_account`] creates — rather than failing, so the setting can be
+    /// configured as the account's first call. The write itself cannot be skipped: the
+    /// record is obtained, created if need be, and then written through.
+    pub fn set_encryption_kms_key_arn(
+        &mut self,
+        kms_key_arn: Option<String>,
+        now_millis: i64,
+    ) -> Option<String> {
+        let config = self
+            .account_configuration
+            .get_or_insert(AccountConfiguration {
+                encryption_kms_key_arn: None,
+                created_at_millis: now_millis,
+            });
+        config.encryption_kms_key_arn = kms_key_arn;
+        config.encryption_kms_key_arn.clone()
     }
 
     /// Record a minted upload target, registering its expiry.

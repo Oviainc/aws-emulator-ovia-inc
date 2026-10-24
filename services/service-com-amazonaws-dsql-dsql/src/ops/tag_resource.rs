@@ -21,6 +21,11 @@
 //! for any resource that exists, including one the clock still owes its terminal
 //! status.
 //!
+//! The one tag key a caller may not write is one under the prefix AWS reserves for
+//! its own tags ([`crate::state::validate_tag_keys`]): such a request is refused in
+//! full with the modelled 400 `ValidationException` and leaves the resource's tags
+//! unchanged.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -198,6 +203,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // A tag key under the AWS-reserved prefix is not the caller's to write: the
+        // whole request is refused, before any resource is resolved or any pair
+        // applied, so the addressed resource's tags are left exactly as they were.
+        // `TagKey`'s pattern admits the `:` such a key needs, so the boundary
+        // validator passes it through and the check belongs here.
+        if let Err(invalid) = crate::state::validate_tag_keys(
+            crate::state::TAGS_MEMBER,
+            input.tags.keys().map(String::as_str),
+        ) {
+            return Err(TagResourceErrorModeled::ValidationException(invalid).into());
+        }
 
         let mut state = state.lock();
         // Materialise what the clock already owes before the lookup, so a cluster

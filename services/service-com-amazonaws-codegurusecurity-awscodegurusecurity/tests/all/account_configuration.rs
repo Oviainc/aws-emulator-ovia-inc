@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! End-to-end HTTP tests for the CodeGuru Security account encryption configuration:
-//! `UpdateAccountConfiguration` -> `GetAccountConfiguration`, the not-found refusal an
-//! account with no configuration record answers an update with, and the effect the
-//! stored configuration has on `CreateUploadUrl`'s required upload headers.
+//! `UpdateAccountConfiguration` -> `GetAccountConfiguration`, the configuration record a
+//! first update brings into existence on an account that holds nothing yet, and the
+//! effect the stored configuration has on `CreateUploadUrl`'s required upload headers.
 //!
 //! Every request goes through the real router (`MultiServiceRouter::dispatch`), reusing
 //! the harness of `crate::scan_lifecycle`, so the restJson1 wire shape, the HTTP status
@@ -85,56 +85,50 @@ async fn onboard_with_artifact(router: &MultiServiceRouter, scan_name: &str) -> 
 }
 
 #[tokio::test]
-async fn updating_the_configuration_of_an_account_that_has_none_is_not_found() {
-    // The rule: UpdateAccountConfiguration updates the account's EXISTING configuration
-    // record and never brings one into existence, so an account CodeGuru Security holds
-    // no configuration for is refused with the modelled ResourceNotFoundException (HTTP
-    // 404, `errorKind` client, from
-    // `smithy_query(query="operation",operation="UpdateAccountConfiguration")`).
+async fn the_first_update_configures_an_account_that_holds_nothing_yet() {
+    // The rule: the account's encryption configuration is a per-account setting with a
+    // documented default, and UpdateAccountConfiguration names no resource
+    // (`smithy_query(query="operation",operation="UpdateAccountConfiguration")`: the
+    // input is the required `encryptionConfig` alone), so the write always applies and
+    // answers 200 with the value it committed — an account that holds no configuration
+    // record yet gets one rather than a not-found refusal.
     //
     // The rows differ along the request's own `encryptionConfig`: every key form the
     // modelled pattern admits, and the empty configuration that asks for the AWS-managed
-    // key. The refusal is a property of the account's state, not of the payload, so all
-    // of them are refused the same way.
+    // key. Each row runs on a FRESH emulator, so nothing but this update has ever touched
+    // the account.
     for (case, key) in WELL_FORMED_CONFIGS {
         let (engine, router) = harness();
 
         let answer = update_account_configuration(&router, encryption_config_body(*key)).await;
         assert_eq!(
-            answer.status, 404,
-            "case {case:?}: expected 404, got {} {}",
+            answer.status, 200,
+            "case {case:?}: expected 200, got {} {}",
             answer.status, answer.json
         );
+        let echoed = reported_key(case, &answer);
         assert_eq!(
-            answer.error_type, "ResourceNotFoundException",
-            "case {case:?}: expected ResourceNotFoundException, got {:?} {}",
-            answer.error_type, answer.json
-        );
-        let message = answer.json["message"].as_str().unwrap_or_default();
-        assert!(
-            !message.is_empty(),
-            "case {case:?}: the refusal must carry a populated message, got {}",
-            answer.json
-        );
-        assert_eq!(
-            answer.json["resourceType"].as_str(),
-            Some("accountConfiguration"),
-            "case {case:?}: the refusal must name the resource type, got {}",
-            answer.json
-        );
-        assert_eq!(
-            answer.json["resourceId"].as_str(),
-            Some(engine::emulator_account_id()),
-            "case {case:?}: the refusal must name the account, got {}",
-            answer.json
+            echoed.as_deref(),
+            *key,
+            "case {case:?}: expected the committed configuration {key:?} back, got {echoed:?}"
         );
 
-        // A refused update configures nothing: no record appears, and the reader still
-        // answers the documented default.
+        // The write created the account's single configuration record, stamped with the
+        // instant it came into existence, and the reader answers from that same record.
         let stored = store_of(&engine).lock().account_configuration.clone();
+        let stored = stored.unwrap_or_else(|| {
+            panic!("case {case:?}: the first update must create the configuration record")
+        });
+        assert_eq!(
+            stored.encryption_kms_key_arn.as_deref(),
+            *key,
+            "case {case:?}: the store must hold {key:?}, got {:?}",
+            stored.encryption_kms_key_arn
+        );
         assert!(
-            stored.is_none(),
-            "case {case:?}: a refused update must create no configuration, got {stored:?}"
+            stored.created_at_millis > 0,
+            "case {case:?}: the record must be stamped with the instant it was created, got {}",
+            stored.created_at_millis
         );
         let read = get_account_configuration(&router).await;
         assert_eq!(
@@ -144,8 +138,9 @@ async fn updating_the_configuration_of_an_account_that_has_none_is_not_found() {
         );
         let reported = reported_key(case, &read);
         assert_eq!(
-            reported, None,
-            "case {case:?}: expected an empty encryptionConfig, got {reported:?}"
+            reported.as_deref(),
+            *key,
+            "case {case:?}: GetAccountConfiguration expected {key:?}, got {reported:?}"
         );
     }
 }
@@ -203,38 +198,78 @@ async fn account_configuration_defaults_to_the_aws_managed_key() {
     );
 }
 
+/// Which calls precede the update under test, as a row of
+/// `the_update_is_accepted_whatever_the_account_has_done_before`.
+#[derive(Debug, Clone, Copy)]
+enum Preceding {
+    /// Nothing at all: the update is the account's very first call.
+    Nothing,
+    /// A read of the configuration, which changes nothing.
+    AReadOnly,
+    /// An earlier update, which already created the record.
+    AnEarlierUpdate,
+    /// A minted code artifact.
+    ACodeArtifact,
+    /// A minted code artifact and a scan recorded on it.
+    ACodeArtifactAndAScan,
+}
+
 #[tokio::test]
-async fn each_resource_creating_call_onboards_the_account_for_updates() {
-    // The configuration record appears when the account starts using CodeGuru Security.
-    // The rows differ along WHICH resource-creating call the account makes first — a code
-    // artifact alone, and a code artifact followed by a scan recorded on it — and in both
-    // cases the update that was refused before is accepted afterwards.
-    let cases: &[(&str, bool)] = &[
-        ("a code artifact alone", false),
-        ("a code artifact and a scan", true),
+async fn the_update_is_accepted_whatever_the_account_has_done_before() {
+    // The same rule, from the other side: because the configuration is a per-account
+    // setting the service always holds a value for, the update's acceptance does not
+    // depend on what else the account has done. The rows differ along WHICH calls precede
+    // it — none at all, a read, an earlier update, a minted code artifact, and an
+    // artifact plus a scan recorded on it — and every row must answer 200 with the key it
+    // committed, held in the account's ONE configuration record.
+    let cases: &[Preceding] = &[
+        Preceding::Nothing,
+        Preceding::AReadOnly,
+        Preceding::AnEarlierUpdate,
+        Preceding::ACodeArtifact,
+        Preceding::ACodeArtifactAndAScan,
     ];
 
-    for (case, also_scan) in cases {
+    for preceding in cases {
+        let case = format!("{preceding:?}");
         let (engine, router) = harness();
         let scan_name = "onboarding-scan";
 
-        let refused =
-            update_account_configuration(&router, encryption_config_body(Some(SINGLE_REGION_KEY)))
+        match preceding {
+            Preceding::Nothing => {}
+            Preceding::AReadOnly => {
+                let read = get_account_configuration(&router).await;
+                assert_eq!(
+                    read.status, 200,
+                    "case {case:?}: GetAccountConfiguration expected 200, got {} {}",
+                    read.status, read.json
+                );
+            }
+            Preceding::AnEarlierUpdate => {
+                let earlier = update_account_configuration(
+                    &router,
+                    encryption_config_body(Some(OTHER_REGION_KEY)),
+                )
                 .await;
-        assert_eq!(
-            refused.status, 404,
-            "case {case:?}: before any resource exists the update must be refused, got {} {}",
-            refused.status, refused.json
-        );
-
-        let artifact = onboard_with_artifact(&router, scan_name).await;
-        if *also_scan {
-            let created = create_scan(&router, json!({ "scanName": scan_name }), &artifact).await;
-            assert_eq!(
-                created.status, 200,
-                "case {case:?}: CreateScan expected 200, got {} {}",
-                created.status, created.json
-            );
+                assert_eq!(
+                    earlier.status, 200,
+                    "case {case:?}: the earlier update expected 200, got {} {}",
+                    earlier.status, earlier.json
+                );
+            }
+            Preceding::ACodeArtifact => {
+                onboard_with_artifact(&router, scan_name).await;
+            }
+            Preceding::ACodeArtifactAndAScan => {
+                let artifact = onboard_with_artifact(&router, scan_name).await;
+                let created =
+                    create_scan(&router, json!({ "scanName": scan_name }), &artifact).await;
+                assert_eq!(
+                    created.status, 200,
+                    "case {case:?}: CreateScan expected 200, got {} {}",
+                    created.status, created.json
+                );
+            }
         }
 
         let accepted =
@@ -242,10 +277,10 @@ async fn each_resource_creating_call_onboards_the_account_for_updates() {
                 .await;
         assert_eq!(
             accepted.status, 200,
-            "case {case:?}: after {case} the update must be accepted, got {} {}",
+            "case {case:?}: the update must be accepted, got {} {}",
             accepted.status, accepted.json
         );
-        let echoed = reported_key(case, &accepted);
+        let echoed = reported_key(&case, &accepted);
         assert_eq!(
             echoed.as_deref(),
             Some(MULTI_REGION_KEY),
@@ -256,6 +291,12 @@ async fn each_resource_creating_call_onboards_the_account_for_updates() {
             stored.as_deref(),
             Some(MULTI_REGION_KEY),
             "case {case:?}: the store must hold the configured key, got {stored:?}"
+        );
+        let reported = reported_key(&case, &get_account_configuration(&router).await);
+        assert_eq!(
+            reported.as_deref(),
+            Some(MULTI_REGION_KEY),
+            "case {case:?}: GetAccountConfiguration must report the configured key, got {reported:?}"
         );
     }
 }
@@ -330,9 +371,7 @@ async fn the_configured_key_drives_the_required_upload_headers() {
 
     // The configuration is ONE value: CreateUploadUrl derives the server-side-encryption
     // headers of a minted upload target from the same store GetAccountConfiguration
-    // reports, so configuring a key adds them and clearing it removes them again. The
-    // first minted artifact is also what onboards the account, so the first row needs no
-    // update at all.
+    // reports, so configuring a key adds them and clearing it removes them again.
     let cases: &[(&str, Option<&str>)] = &[
         ("no key configured", None),
         ("single-region key", Some(SINGLE_REGION_KEY)),
@@ -340,16 +379,13 @@ async fn the_configured_key_drives_the_required_upload_headers() {
         ("cleared again", None),
     ];
 
-    let mut onboarded = false;
     for (case, key) in cases {
-        if onboarded {
-            let updated = update_account_configuration(&router, encryption_config_body(*key)).await;
-            assert_eq!(
-                updated.status, 200,
-                "case {case:?}: UpdateAccountConfiguration expected 200, got {} {}",
-                updated.status, updated.json
-            );
-        }
+        let updated = update_account_configuration(&router, encryption_config_body(*key)).await;
+        assert_eq!(
+            updated.status, 200,
+            "case {case:?}: UpdateAccountConfiguration expected 200, got {} {}",
+            updated.status, updated.json
+        );
 
         let minted = create_upload_url(&router, "encryption-config-scan").await;
         assert_eq!(
@@ -357,7 +393,6 @@ async fn the_configured_key_drives_the_required_upload_headers() {
             "case {case:?}: CreateUploadUrl expected 200, got {} {}",
             minted.status, minted.json
         );
-        onboarded = true;
         let headers = minted.get("requestHeaders").clone();
         assert_eq!(
             headers["Content-Type"].as_str(),
