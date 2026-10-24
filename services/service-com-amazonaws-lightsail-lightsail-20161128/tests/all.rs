@@ -49,6 +49,8 @@ mod domain_entry_delete;
 mod domain_entry_recordset;
 #[path = "all/domain_entry_update.rs"]
 mod domain_entry_update;
+#[path = "all/domain_region_restriction.rs"]
+mod domain_region_restriction;
 #[path = "all/domain_zone.rs"]
 mod domain_zone;
 #[path = "all/export_snapshot_records.rs"]
