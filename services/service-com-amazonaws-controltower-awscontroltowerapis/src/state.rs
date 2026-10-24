@@ -38,8 +38,12 @@
 //! * `enabled_controls` holds at most [`MAX_ENABLED_CONTROLS`] control enablements — one
 //!   per control/target pair `EnableControl` is called for — and `EnableControl` is
 //!   REFUSED past that cap for the same reason as `EnableBaseline`;
-//! * `tags` is keyed by the ARNs of the two stores above, and an entry is dropped with
-//!   the resource it tags, so it is bounded by them.
+//! * `tags` is keyed by the ARNs of the stores above, and an entry is dropped with the
+//!   resource it tags, so it is bounded by them; one resource's tag map holds at most
+//!   [`MAX_TAGS_PER_RESOURCE`] entries and `TagResource` is REFUSED past that count (see
+//!   [`merge_tags`]), so repeating it with fresh keys cannot grow the store either.
+//!
+//! [`merge_tags`]: ComAmazonawsControltowerAwscontroltowerapisState::merge_tags
 //!
 //! [`settle`]: ComAmazonawsControltowerAwscontroltowerapisState::settle
 //! [`record_enablement`]: ComAmazonawsControltowerAwscontroltowerapisState::record_enablement
@@ -134,6 +138,17 @@ pub const MAX_BASELINE_OPERATIONS: usize = 1024;
 ///
 /// [`settle`]: ComAmazonawsControltowerAwscontroltowerapisState::settle
 pub const MAX_ENABLED_BASELINES: usize = 512;
+
+/// The most tags one resource may carry.
+///
+/// This is the model's OWN ceiling rather than a chosen one: `TagMap` carries
+/// `@length(min: 0, max: 200)`, and `ListTagsForResource` reports a resource's tags as a
+/// `TagMap`, so a resource holding more than 200 tags could not be reported inside the
+/// modelled constraint. `TagResource` is therefore refused with the `ValidationException`
+/// the model declares for it once the merged set would pass this count, which also bounds
+/// the tag store: a caller cannot grow one resource's tag map by repeating calls with
+/// fresh keys.
+pub const MAX_TAGS_PER_RESOURCE: usize = 200;
 
 /// The newest landing zone version this emulator's catalog offers.
 ///
@@ -515,7 +530,8 @@ pub struct ComAmazonawsControltowerAwscontroltowerapisState {
     /// [`MAX_BASELINE_OPERATIONS`] records; see the module header on retention.
     pub baseline_operations: HashMap<String, BaselineOperationRecord>,
     /// Tags keyed by the tagged resource's ARN — the single home for this service's
-    /// tags, written by `CreateLandingZone`'s and `EnableBaseline`'s `tags` members.
+    /// tags, written by `CreateLandingZone`'s, `EnableControl`'s and `EnableBaseline`'s
+    /// `tags` members and by `TagResource`, and read by `ListTagsForResource`.
     pub tags: HashMap<String, BTreeMap<String, String>>,
 }
 
@@ -906,6 +922,55 @@ impl ComAmazonawsControltowerAwscontroltowerapisState {
             },
         );
         Some(operation_identifier)
+    }
+
+    /// Whether `arn` names a resource of this service that tags attach to.
+    ///
+    /// The three resource stores are the whole set: a landing zone, an enabled control
+    /// and an enabled baseline are the resources this service mints ARNs for, and every
+    /// one of those ARNs is its store's key. An ARN outside them names no resource here,
+    /// which is what the tagging operations refuse with `ResourceNotFoundException`.
+    /// Call [`settle`] first, so a resource the clock has already torn down is gone.
+    ///
+    /// [`settle`]: Self::settle
+    pub fn taggable_resource_exists(&self, arn: &str) -> bool {
+        self.landing_zones.contains_key(arn)
+            || self.enabled_controls.contains_key(arn)
+            || self.enabled_baselines.contains_key(arn)
+    }
+
+    /// The tags attached to `arn`, in key order; empty when the resource carries none.
+    ///
+    /// A resource with no entry in the tag map is untagged, not missing: existence is
+    /// [`taggable_resource_exists`]'s question, and a caller must be able to tell an
+    /// untagged resource (an empty map) from an absent one (a 404).
+    ///
+    /// [`taggable_resource_exists`]: Self::taggable_resource_exists
+    pub fn tags_of(&self, arn: &str) -> BTreeMap<String, String> {
+        self.tags.get(arn).cloned().unwrap_or_default()
+    }
+
+    /// Merge `tags` into the tags attached to `arn`, returning the resulting tag count.
+    ///
+    /// A key already attached takes the new value and every other key is left alone, so
+    /// applying tags adds to a resource's tag set rather than replacing it. `None` when
+    /// the merged set would exceed [`MAX_TAGS_PER_RESOURCE`]: NOTHING is then written and
+    /// the caller refuses the request. The single site that GROWS a resource's tag set,
+    /// so that cap cannot be bypassed by repeated tagging; the create/enable operations
+    /// write their own `tags` member straight into the store at a freshly minted ARN,
+    /// where the front door's `TagMap` `@length` max already holds the same count.
+    pub fn merge_tags<I>(&mut self, arn: &str, tags: I) -> Option<usize>
+    where
+        I: IntoIterator<Item = (String, String)>,
+    {
+        let mut merged = self.tags_of(arn);
+        merged.extend(tags);
+        if merged.len() > MAX_TAGS_PER_RESOURCE {
+            return None;
+        }
+        let count = merged.len();
+        self.tags.insert(arn.to_string(), merged);
+        Some(count)
     }
 
     /// Start an `UPDATE_ENABLED_BASELINE` against the enablement `arn` names, parking the

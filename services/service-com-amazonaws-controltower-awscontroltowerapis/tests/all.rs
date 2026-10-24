@@ -25,5 +25,7 @@ mod front_door_validation;
 mod landing_zone_lifecycle;
 #[path = "all/landing_zone_update.rs"]
 mod landing_zone_update;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

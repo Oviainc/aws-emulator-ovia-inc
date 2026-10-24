@@ -7,7 +7,8 @@
 //! its threshold. `Action$ActionType` determines which member of `Definition` describes
 //! the work, so a mismatch is an `InvalidParameterException`
 //! ([`crate::state::validate_action_definition`]); a budget this account does not hold
-//! is a `NotFoundException`.
+//! is a `NotFoundException`. The call is recorded as the action's `CREATE_ACTION` event,
+//! which `DescribeBudgetActionHistories` reports.
 //!
 //! Nothing here applies the action's `Definition` to IAM, Organizations or Systems
 //! Manager: that work belongs to other services and no request in this emulator runs
@@ -210,7 +211,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "This field also determines the format for definition" — the one rule tying
-        // `ActionType` to `Definition`, which no constraint trait can express.
+        // `ActionType` to `Definition`, which no constraint trait can express. Checked
+        // before the budget is looked up, so a request that is malformed in itself is
+        // refused the same way whichever budget it names.
         crate::state::validate_action_definition(&input.action_type, &input.definition).map_err(
             |message| {
                 CreateBudgetActionErrorModeled::InvalidParameterException(
@@ -270,10 +273,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             status: crate::state::ACTION_STATUS_STANDBY.to_string(),
             subscribers: input.subscribers,
         };
-        stored.actions.push(crate::state::StoredAction::new(
+        let mut held = crate::state::StoredAction::new(
             action,
             input.resource_tags.unwrap_or_default(),
-        ));
+        );
+        // Every write against an action is recorded in its history, oldest first, and
+        // this call is that action's `CREATE_ACTION` event. `ActionHistory$Status` is
+        // "the status of action at the time of the event", so the record is written
+        // after the action is built.
+        crate::state::record_action_event(
+            &mut held,
+            crate::state::EVENT_TYPE_CREATE_ACTION,
+            "The budget action was created.",
+            ::std::time::SystemTime::now(),
+        );
+        stored.actions.push(held);
 
         Ok(CreateBudgetActionOutput {
             account_id: input.account_id,

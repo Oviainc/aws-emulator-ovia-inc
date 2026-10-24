@@ -8,7 +8,9 @@
 //! ([`crate::state::action_execution`]). An execution type the action's current status
 //! leaves nothing to do is an `InvalidParameterException`; one aimed at an action whose
 //! work is still running is the locked resource `ResourceLockedException` names; a
-//! budget or action this account does not hold is a `NotFoundException`.
+//! budget or action this account does not hold is a `NotFoundException`. The call is
+//! recorded as the action's `EXECUTE_ACTION` event, which
+//! `DescribeBudgetActionHistories` reports.
 //!
 //! Nothing here applies the action's `Definition` to IAM, Organizations or Systems
 //! Manager: that work belongs to other services and no request in this emulator runs
@@ -253,6 +255,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // straight after this call still sees the in-progress status and the refusals
         // that status carries.
         action.start(execution, now);
+        // Every write against an action is recorded in its history, which
+        // `DescribeBudgetActionHistories` reports. `ActionHistory$Status` is "the status
+        // of action at the time of the event", so the record carries the `*_IN_PROGRESS`
+        // status this call moved the action to, not the status the clock owes it next.
+        crate::state::record_action_event(
+            action,
+            crate::state::EVENT_TYPE_EXECUTE_ACTION,
+            &format!(
+                "A {} execution of the budget action was started.",
+                input.execution_type
+            ),
+            now,
+        );
 
         Ok(ExecuteBudgetActionOutput {
             account_id: input.account_id,
