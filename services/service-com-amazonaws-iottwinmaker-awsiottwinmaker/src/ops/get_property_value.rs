@@ -1,15 +1,34 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPropertyValue
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetPropertyValue`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reads the CURRENT value of the selected properties out of stored state. A
+//! property reads as the value written to it, else as the default its
+//! definition declares — the component's own definition, else the one it
+//! inherits from the component type it instantiates
+//! ([`crate::state::latest_property_value`] over
+//! [`crate::state::Workspace::effective_property_definition`]) — and the
+//! `propertyValue` member is omitted when neither exists. Nothing here writes:
+//! a read of a property leaves every later caller the same answer.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetPropertyValue::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A request addresses either ONE component — `entityId` with `componentName`,
+//! or `componentPath` for a composite component — whose selected properties come
+//! back as the `propertyValues` map keyed by property name, or a component TYPE,
+//! whose instances across the workspace's entities come back as a TABLE, a row
+//! per instance. `tabularConditions` is what asks for that table: its
+//! `propertyFilters` select its rows and its `orderBy` orders them. An unknown
+//! workspace, entity, component, component type or property group is a
+//! `ResourceNotFoundException`; a selected property that is none of the
+//! addressed component's, a selection outside a named `propertyGroupName`, a
+//! request that addresses nothing and a filter this service does not recognise
+//! are `ValidationException`s. Either answer is PAGED: `maxResults` caps it and
+//! `nextToken` resumes it.
+//!
+//! The tabular path is BOUNDED and interruptible: the scope is capped at
+//! [`MAX_TABLE_ROWS`] rows and the conditions at [`MAX_FILTERS`] filters and
+//! [`MAX_ORDER_KEYS`] ordering keys, each row's values are resolved once while
+//! the state lock is held, and the filtering and the ordering then run on the
+//! blocking pool with the lock RELEASED — so one request's table cannot
+//! serialise this service behind it or starve the async worker.
 //!
 //! ## Shape of an operation
 //!
@@ -171,18 +190,1115 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetPropertyValue` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetPropertyValueErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetPropertyValue"))
+        // Every call is recorded, successful or refused: the real service logs
+        // control-plane access, and this one reads tenant state.
+        ::tracing::info!(
+            operation = "GetPropertyValue",
+            workspace_id = %input.workspace_id,
+            entity_id = input.entity_id.as_deref().unwrap_or(""),
+            component_type_id = input.component_type_id.as_deref().unwrap_or(""),
+            "serving a request"
+        );
+        let _ = ctx;
+        let page_size = page_size(input.max_results)?;
+
+        // Everything either answer is computed from is read under the store's
+        // lock, and the lock is RELEASED before a table is filtered and
+        // ordered: that work is request-chosen (its size is the scope's, its
+        // repetitions are the conditions') and holding the lock across it would
+        // serialise every other operation of this service behind one request.
+        // The latest-value answer is built here instead: it is at most
+        // `SelectedPropertyList`'s modelled ten properties of one component.
+        let table = {
+            let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+                GetPropertyValueErrorModeled::InternalServerException(InternalServerException {
+                    message: Some("the iottwinmaker store is unavailable".to_string()),
+                })
+            })?;
+            let state = state.lock();
+
+            let Some(workspace) = state.workspaces.get(&input.workspace_id) else {
+                return Err(not_found(crate::state::workspace_not_found_message(
+                    &input.workspace_id,
+                )));
+            };
+
+            let query = resolve_query(workspace, &input)?;
+            let selected = selected_properties(workspace, &query, &input)?;
+
+            match &query {
+                Query::LatestValues(component) => {
+                    return latest_values_response(
+                        workspace, component, &selected, page_size, &input,
+                    )
+                }
+                Query::Table { conditions, .. } => {
+                    Table::read(workspace, &query, conditions, selected)?
+                }
+            }
+        };
+
+        // Bounded by construction — at most `MAX_TABLE_ROWS` rows, `MAX_FILTERS`
+        // filter passes and `MAX_ORDER_KEYS` sorts, each row's values resolved
+        // once before the lock was released — but still CPU work a request
+        // chose the size of, so it runs on the blocking pool: `spawn_blocking`
+        // is a real await point, so one table cannot starve the worker that
+        // serves health checks and every other request, and a cancellation or a
+        // timeout has somewhere to land.
+        let selected = table.selected.clone();
+        let sifted = ::tokio::task::spawn_blocking(move || table.sift()).await;
+        let rows = match sifted {
+            Ok(rows) => rows,
+            // A panic or a cancellation on the pool says nothing about the
+            // request, so it is reported as the server fault it is rather than
+            // as an empty table.
+            Err(error) => {
+                ::tracing::error!(
+                    operation = "GetPropertyValue",
+                    error = %error,
+                    "the tabular answer did not complete"
+                );
+                return Err(GetPropertyValueErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("the tabular answer did not complete".to_string()),
+                    },
+                )
+                .into());
+            }
+        };
+
+        table_response(rows, &selected, page_size, &input)
     }
+}
+
+/// Refuse the request, naming what about it cannot be served. The operation
+/// models `ValidationException` itself, so the refusal is the modelled shape
+/// rather than the scaffold wrapper's.
+fn invalid(message: String) -> GetPropertyValueError {
+    GetPropertyValueErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// Answer that something the request named does not exist.
+fn not_found(message: String) -> GetPropertyValueError {
+    GetPropertyValueErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// The page size this call serves.
+///
+/// `maxResults` documents a minimum of 1 and a default of 25, so an explicit
+/// zero is refused and a request that names none is served the documented
+/// default; whatever is asked for, at most [`crate::state::MAX_PAGE_SIZE`] rows
+/// are built under the state lock. The same rule every paged operation of this
+/// service applies.
+fn page_size(max_results: Option<i32>) -> Result<usize, GetPropertyValueError> {
+    match max_results {
+        None => Ok(crate::state::DEFAULT_PAGE_SIZE),
+        Some(requested) if requested < 1 => Err(invalid(
+            "maxResults must be at least 1; omit it for the default of 25".to_string(),
+        )),
+        Some(requested) => Ok(usize::try_from(requested)
+            .unwrap_or(crate::state::MAX_PAGE_SIZE)
+            .min(crate::state::MAX_PAGE_SIZE)),
+    }
+}
+
+/// One component a query reads properties out of: where its stored properties
+/// and property groups live, and how a reported `EntityPropertyReference` names
+/// it.
+///
+/// A top-level component and a composite one are read the same way — the
+/// difference is only that a composite one is addressed by a `componentPath`,
+/// which the reference carries back.
+struct ScopedComponent<'a> {
+    entity_id: &'a str,
+    component_name: &'a str,
+    /// The `componentPath` this component is addressed by, for a COMPOSITE
+    /// component; absent for a top-level one, which is addressed by name.
+    component_path: Option<&'a str>,
+    component_type_id: Option<&'a str>,
+    properties: &'a ::std::collections::BTreeMap<String, crate::state::PropertyRecord>,
+    property_groups: &'a ::std::collections::BTreeMap<String, crate::state::PropertyGroupRecord>,
+}
+
+/// What the request's addressing members ask for.
+enum Query<'a> {
+    /// The latest value of each selected property of ONE component, addressed
+    /// by `entityId` with `componentName` or `componentPath`.
+    LatestValues(ScopedComponent<'a>),
+    /// A TABLE: a row per component in scope, which is the one addressed
+    /// component for an entity-addressed query and every instance of the named
+    /// component type for a cross-entity one.
+    Table {
+        /// The component type a cross-entity query named, absent when the
+        /// query addressed one entity's component.
+        component_type_id: Option<&'a str>,
+        components: Vec<ScopedComponent<'a>>,
+        conditions: &'a TabularConditions,
+    },
+}
+
+impl<'a> Query<'a> {
+    /// The components this query reads properties out of.
+    fn components(&self) -> &[ScopedComponent<'a>] {
+        match self {
+            Self::LatestValues(component) => ::std::slice::from_ref(component),
+            Self::Table { components, .. } => components,
+        }
+    }
+
+    /// The component type a cross-entity query named, if any.
+    fn component_type_id(&self) -> Option<&'a str> {
+        match self {
+            Self::Table {
+                component_type_id, ..
+            } => *component_type_id,
+            Self::LatestValues(_) => None,
+        }
+    }
+}
+
+/// One stored top-level component as a component the query reads.
+fn scoped_component<'a>(
+    entity_id: &'a str,
+    component: &'a crate::state::ComponentRecord,
+) -> ScopedComponent<'a> {
+    ScopedComponent {
+        entity_id,
+        component_name: &component.component_name,
+        component_path: None,
+        component_type_id: component.component_type_id.as_deref(),
+        properties: &component.properties,
+        property_groups: &component.property_groups,
+    }
+}
+
+/// One stored composite component as a component the query reads. It carries
+/// the whole `ComponentPath` it was created under, which is what a reported
+/// reference to one of its properties names it by.
+fn scoped_composite_component<'a>(
+    entity_id: &'a str,
+    composite: &'a crate::state::CompositeComponentRecord,
+) -> ScopedComponent<'a> {
+    ScopedComponent {
+        entity_id,
+        component_name: &composite.component_name,
+        component_path: Some(&composite.component_path),
+        component_type_id: Some(&composite.component_type_id),
+        properties: &composite.properties,
+        property_groups: &composite.property_groups,
+    }
+}
+
+/// The component of `entity` a `componentPath` addresses.
+///
+/// A path of one segment names a top-level component ("the path to the
+/// composite component, STARTING FROM the top-level component", so the
+/// top-level component is the path's first segment); a longer one names the
+/// composite component stored under the rest of the path inside that component,
+/// which is the key [`crate::state::ComponentRecord::composite_components`]
+/// holds it under.
+fn component_at_path<'a>(
+    entity: &'a crate::state::Entity,
+    component_path: &str,
+) -> Option<ScopedComponent<'a>> {
+    match component_path.split_once(crate::state::COMPONENT_PATH_SEPARATOR) {
+        None => Some(scoped_component(
+            &entity.entity_id,
+            entity.components.get(component_path)?,
+        )),
+        Some((component_name, composite_path)) => {
+            let component = entity.components.get(component_name)?;
+            Some(scoped_composite_component(
+                &entity.entity_id,
+                component.composite_components.get(composite_path)?,
+            ))
+        }
+    }
+}
+
+/// What the request addresses, resolved against stored state.
+///
+/// `entityId` addresses one component of one entity, which is read as the
+/// latest value of each selected property — or as a one-row table when the
+/// request carries `tabularConditions`. `componentTypeId` without an entity
+/// addresses every INSTANCE of that component type in the workspace (a
+/// component whose type is it, or extends it, at any depth), which is why such
+/// a query is answered with a table and not with the `propertyValues` map: the
+/// map is keyed by property name, so it holds one value per property, while a
+/// component type has an instance per entity.
+fn resolve_query<'a>(
+    workspace: &'a crate::state::Workspace,
+    input: &'a GetPropertyValueInput,
+) -> Result<Query<'a>, GetPropertyValueError> {
+    if let Some(entity_id) = input.entity_id.as_deref() {
+        let Some(entity) = workspace.entities.get(entity_id) else {
+            return Err(not_found(crate::state::entity_not_found_message(
+                &input.workspace_id,
+                entity_id,
+            )));
+        };
+        let component = match (
+            input.component_path.as_deref(),
+            input.component_name.as_deref(),
+        ) {
+            (Some(component_path), _) => {
+                component_at_path(entity, component_path).ok_or_else(|| {
+                    not_found(format!(
+                        "entity {entity_id} of workspace {} has no component at componentPath \
+                         {component_path}",
+                        input.workspace_id
+                    ))
+                })?
+            }
+            (None, Some(component_name)) => {
+                let Some(component) = entity.components.get(component_name) else {
+                    return Err(not_found(format!(
+                        "entity {entity_id} of workspace {} has no component {component_name}",
+                        input.workspace_id
+                    )));
+                };
+                scoped_component(&entity.entity_id, component)
+            }
+            // A property belongs to a component, so an entity alone does not
+            // address one: an entity-scoped query names the component the
+            // properties are read out of.
+            (None, None) => {
+                return Err(invalid(format!(
+                    "componentName or componentPath is required to read properties of entity \
+                     {entity_id}"
+                )))
+            }
+        };
+        return Ok(match input.tabular_conditions.as_ref() {
+            Some(conditions) => Query::Table {
+                component_type_id: None,
+                components: vec![component],
+                conditions,
+            },
+            None => Query::LatestValues(component),
+        });
+    }
+
+    let Some(component_type_id) = input.component_type_id.as_deref() else {
+        return Err(invalid(
+            "entityId or componentTypeId is required: one of them is what addresses the \
+             properties to read"
+                .to_string(),
+        ));
+    };
+    if !workspace.component_types.contains_key(component_type_id) {
+        return Err(not_found(crate::state::component_type_not_found_message(
+            &input.workspace_id,
+            component_type_id,
+        )));
+    }
+    let Some(conditions) = input.tabular_conditions.as_ref() else {
+        return Err(invalid(format!(
+            "tabularConditions is required for a componentTypeId query: componentType \
+             {component_type_id} has an instance per entity, so its values are a table; name an \
+             entityId and a componentName to read one component's latest values"
+        )));
+    };
+
+    // The component types an instance of the named one may name, resolved ONCE
+    // per request rather than per component tested against it.
+    let instance_type_ids = workspace.component_type_instance_ids(component_type_id);
+    // In (entityId, componentName) order, the order the store is keyed in, so
+    // two reads of unchanged state build the same table and a page boundary
+    // does not depend on map iteration order. The scope is request-chosen and
+    // the workspace is caller-grown, so it is CAPPED: past the ceiling the
+    // request is refused rather than answered out of an unbounded scan.
+    let mut components = Vec::new();
+    for entity in workspace.entities.values() {
+        for component in entity.components.values() {
+            if component
+                .component_type_id
+                .as_deref()
+                .is_some_and(|instantiated| instance_type_ids.contains(instantiated))
+            {
+                components.push(scoped_component(&entity.entity_id, component));
+            }
+            for composite in component.composite_components.values() {
+                if instance_type_ids.contains(composite.component_type_id.as_str()) {
+                    components.push(scoped_composite_component(&entity.entity_id, composite));
+                }
+            }
+            if components.len() > MAX_TABLE_ROWS {
+                return Err(invalid(format!(
+                    "componentType {component_type_id} has more instances in workspace {} than \
+                     the {MAX_TABLE_ROWS} rows one table is built from; name an entityId, a \
+                     narrower componentTypeId or a propertyFilter",
+                    input.workspace_id
+                )));
+            }
+        }
+    }
+    Ok(Query::Table {
+        component_type_id: Some(component_type_id),
+        components,
+        conditions,
+    })
+}
+
+/// The properties the request selected, de-duplicated and in name order, each
+/// one checked to BE a property of what the request addressed.
+///
+/// A selected property is one of the addressed component's when the component
+/// itself carries it or when the component type it instantiates (or a type that
+/// type extends) defines it; a name that is none of them addresses no property
+/// at all, and is refused rather than reported with an empty value. Where the
+/// request also names a `propertyGroupName`, the selection has to lie inside
+/// that group, which is what naming a group asks for.
+///
+/// Sorted and de-duplicated because the selection is what the answer is keyed
+/// and paged by: one entry per property, in a stable order, so a `nextToken`
+/// resumes at the same place whatever order the properties were asked in.
+fn selected_properties(
+    workspace: &crate::state::Workspace,
+    query: &Query<'_>,
+    input: &GetPropertyValueInput,
+) -> Result<Vec<String>, GetPropertyValueError> {
+    let group = match input.property_group_name.as_deref() {
+        None => None,
+        Some(group_name) => Some(property_group_names(workspace, query, group_name)?),
+    };
+    let mut selected = input.selected_properties.clone();
+    selected.sort();
+    selected.dedup();
+    for property_name in &selected {
+        if !addresses_property(workspace, query, property_name) {
+            return Err(invalid(match query.component_type_id() {
+                Some(component_type_id) => format!(
+                    "selectedProperties {property_name} is not a property of componentType \
+                     {component_type_id}"
+                ),
+                None => format!(
+                    "selectedProperties {property_name} is not a property of the component this \
+                     request addresses"
+                ),
+            }));
+        }
+        if let Some(group_name) = input.property_group_name.as_deref() {
+            if !group
+                .as_ref()
+                .is_some_and(|names| names.iter().any(|name| name == property_name))
+            {
+                return Err(invalid(format!(
+                    "selectedProperties {property_name} is not in propertyGroup {group_name}"
+                )));
+            }
+        }
+    }
+    Ok(selected)
+}
+
+/// Whether `property_name` is a property of what the request addressed: a
+/// definition for it is reachable (the component's own, or one it inherits), or
+/// a value has been written to it, which a property with no definition of its
+/// own can still carry.
+fn addresses_property(
+    workspace: &crate::state::Workspace,
+    query: &Query<'_>,
+    property_name: &str,
+) -> bool {
+    if let Some(component_type_id) = query.component_type_id() {
+        return workspace
+            .component_type_chain(component_type_id)
+            .into_iter()
+            .any(|component_type| {
+                component_type
+                    .property_definitions
+                    .contains_key(property_name)
+            });
+    }
+    query.components().iter().any(|component| {
+        component.properties.contains_key(property_name)
+            || workspace
+                .effective_property_definition(
+                    component.component_type_id,
+                    component.properties,
+                    property_name,
+                )
+                .is_some()
+    })
+}
+
+/// The property names in the group `group_name` of what the request addressed.
+fn property_group_names(
+    workspace: &crate::state::Workspace,
+    query: &Query<'_>,
+    group_name: &str,
+) -> Result<Vec<String>, GetPropertyValueError> {
+    if let Some(component_type_id) = query.component_type_id() {
+        return workspace
+            .component_type_chain(component_type_id)
+            .into_iter()
+            .find_map(|component_type| component_type.property_groups.get(group_name))
+            .map(|group| group.property_names.clone())
+            .ok_or_else(|| {
+                not_found(format!(
+                    "componentType {component_type_id} has no propertyGroup {group_name}"
+                ))
+            });
+    }
+    let Some(component) = query.components().first() else {
+        return Err(invalid(format!(
+            "propertyGroup {group_name} cannot be resolved: the request addresses no component"
+        )));
+    };
+    workspace
+        .effective_property_group(
+            component.component_type_id,
+            component.property_groups,
+            group_name,
+        )
+        .map(|group| group.property_names.clone())
+        .ok_or_else(|| {
+            not_found(format!(
+                "component {} of entity {} has no propertyGroup {group_name}",
+                component.component_name, component.entity_id
+            ))
+        })
+}
+
+/// The value one property of one component reads as: the value written to it,
+/// else the default declared by the definition that gives it its meaning — the
+/// component's own, else the one it inherits from the component type it
+/// instantiates. The one rule every answer here is built from.
+fn property_value(
+    workspace: &crate::state::Workspace,
+    component: &ScopedComponent<'_>,
+    property_name: &str,
+) -> Option<DataValue> {
+    let definition = workspace.effective_property_definition(
+        component.component_type_id,
+        component.properties,
+        property_name,
+    );
+    crate::state::latest_property_value(component.properties.get(property_name), definition)
+}
+
+/// The `propertyValues` answer: the latest value of each selected property of
+/// the addressed component, keyed by property name, a page at a time.
+///
+/// The page walks the selection in name order and the `nextToken` resumes at
+/// the next property NAME — a key, not an offset, the way every paged listing of
+/// this service resumes, so the boundary means the same thing on the next call.
+/// A property that reads as nothing (no value written and no default declared)
+/// is still reported, with its reference and no `propertyValue`: it was selected
+/// and it exists, it just has no value yet.
+fn latest_values_response(
+    workspace: &crate::state::Workspace,
+    component: &ScopedComponent<'_>,
+    selected: &[String],
+    page_size: usize,
+    input: &GetPropertyValueInput,
+) -> Result<GetPropertyValueOutput, GetPropertyValueError> {
+    let resume_at = match input.next_token.as_deref() {
+        None | Some("") => None,
+        Some(token) => Some(
+            decode_value_token(input, token)
+                .ok_or_else(|| invalid(format!("nextToken {token} is not a valid token")))?,
+        ),
+    };
+    let mut remaining = selected.iter().skip_while(|property_name| {
+        resume_at
+            .as_deref()
+            .is_some_and(|from| property_name.as_str() < from)
+    });
+
+    let mut property_values = ::std::collections::HashMap::new();
+    for property_name in remaining.by_ref().take(page_size) {
+        property_values.insert(
+            property_name.clone(),
+            PropertyLatestValue {
+                property_reference: EntityPropertyReference {
+                    component_name: Some(component.component_name.to_string()),
+                    component_path: component.component_path.map(str::to_string),
+                    // No external id: the reference names the entity and
+                    // component this service stores the property in, not a
+                    // primary key of some external system.
+                    external_id_property: None,
+                    entity_id: Some(component.entity_id.to_string()),
+                    property_name: property_name.clone(),
+                },
+                property_value: property_value(workspace, component, property_name),
+            },
+        );
+    }
+    let next_token = remaining
+        .next()
+        .map(|property_name| encode_value_token(input, property_name));
+
+    Ok(GetPropertyValueOutput {
+        property_values: Some(property_values),
+        next_token,
+        // No table: this request asked for latest values, not for a tabular
+        // query.
+        tabular_property_values: None,
+    })
+}
+
+/// One row of a tabular answer, read out of the store and OWNED, so the state
+/// lock is released before the rows are filtered and ordered.
+///
+/// `values` carries every property the request mentions — the selected ones, the
+/// filtered ones and the ordered-by ones — resolved ONCE per row while the lock
+/// was held, so neither a filter pass nor a sort has to reach back into the
+/// store or walk an inheritance chain again.
+struct TableRow {
+    values: ::std::collections::BTreeMap<String, DataValue>,
+}
+
+/// One `propertyFilters` entry, validated and owned.
+struct RowFilter {
+    property_name: String,
+    operator: String,
+    value: DataValue,
+}
+
+/// One `orderBy` entry, validated and owned.
+struct RowOrder {
+    property_name: String,
+    descending: bool,
+}
+
+/// A tabular answer before its rows are filtered, ordered and paged: everything
+/// that work needs, owned, so it can run with the state lock released and off
+/// the async worker.
+struct Table {
+    rows: Vec<TableRow>,
+    filters: Vec<RowFilter>,
+    orders: Vec<RowOrder>,
+    /// The selected properties, which are the columns a reported row carries.
+    selected: Vec<String>,
+}
+
+impl Table {
+    /// Read the table a tabular request asks for out of the store, and validate
+    /// the conditions it is to be sifted with.
+    ///
+    /// One row per component in scope — a component none of the SELECTED
+    /// properties reads a value for contributes no row, since the row would
+    /// carry no cell at all. The number of conditions is bounded here
+    /// ([`MAX_FILTERS`], [`MAX_ORDER_KEYS`]) as the number of rows is bounded
+    /// where the scope is resolved ([`MAX_TABLE_ROWS`]), so the sifting below
+    /// is bounded by the product of two declared ceilings rather than by what a
+    /// request asks for.
+    fn read(
+        workspace: &crate::state::Workspace,
+        query: &Query<'_>,
+        conditions: &TabularConditions,
+        selected: Vec<String>,
+    ) -> Result<Self, GetPropertyValueError> {
+        let filters = row_filters(workspace, query, conditions)?;
+        let orders = row_orders(workspace, query, conditions)?;
+
+        // Every property the answer mentions, in one de-duplicated list, so a
+        // row's values are resolved once rather than once per pass over it.
+        let mut mentioned: Vec<String> = selected.clone();
+        mentioned.extend(filters.iter().map(|filter| filter.property_name.clone()));
+        mentioned.extend(orders.iter().map(|order| order.property_name.clone()));
+        mentioned.sort();
+        mentioned.dedup();
+
+        let mut rows = Vec::new();
+        for component in query.components() {
+            let values: ::std::collections::BTreeMap<String, DataValue> = mentioned
+                .iter()
+                .filter_map(|property_name| {
+                    property_value(workspace, component, property_name)
+                        .map(|value| (property_name.clone(), value))
+                })
+                .collect();
+            if selected
+                .iter()
+                .any(|property_name| values.contains_key(property_name))
+            {
+                rows.push(TableRow { values });
+            }
+        }
+        Ok(Self {
+            rows,
+            filters,
+            orders,
+            selected,
+        })
+    }
+
+    /// The rows this table reports: the ones every filter selects, in the order
+    /// the ordering keys put them in.
+    ///
+    /// Runs on the blocking pool with no access to the store — every value it
+    /// compares was resolved by [`read`](Self::read) — so it is bounded by
+    /// [`MAX_TABLE_ROWS`] × ([`MAX_FILTERS`] + [`MAX_ORDER_KEYS`]) and reaches
+    /// nothing a concurrent request is writing.
+    fn sift(self) -> Vec<TableRow> {
+        let Self {
+            mut rows, filters, orders, ..
+        } = self;
+        for filter in &filters {
+            // A row whose property reads as nothing, or as a value of another
+            // kind than the one compared against, satisfies no filter: the
+            // filter asks for rows whose value compares, and that one does not
+            // compare.
+            rows.retain(|row| {
+                row.values
+                    .get(&filter.property_name)
+                    .and_then(|value| compare_values(value, &filter.value))
+                    .is_some_and(|ordering| satisfies(&filter.operator, ordering))
+            });
+        }
+        // Applied from the LAST ordering key to the first with a STABLE sort,
+        // so the first key is the primary one and rows equal under every key
+        // keep the (entityId, componentName) order they were read in. The key
+        // is taken once per row rather than per comparison, and it is a TOTAL
+        // order (see [`OrderKey`]), which is what a sort may be handed.
+        for order in orders.iter().rev() {
+            let mut keyed: Vec<(OrderKey, TableRow)> = rows
+                .into_iter()
+                .map(|row| {
+                    let key = OrderKey::of(row.values.get(&order.property_name));
+                    (key, row)
+                })
+                .collect();
+            keyed.sort_by(|(left, _), (right, _)| {
+                let ordering = left.cmp(right);
+                if order.descending {
+                    ordering.reverse()
+                } else {
+                    ordering
+                }
+            });
+            rows = keyed.into_iter().map(|(_, row)| row).collect();
+        }
+        rows
+    }
+}
+
+/// The `propertyFilters` of a tabular request, validated and owned.
+///
+/// A filter carries the property it selects on, a value to compare against and
+/// an operator this service recognises, and names a property of the addressed
+/// scope — the same rule the selection is held to, so a mistyped filter is
+/// refused rather than answered with an empty table.
+fn row_filters(
+    workspace: &crate::state::Workspace,
+    query: &Query<'_>,
+    conditions: &TabularConditions,
+) -> Result<Vec<RowFilter>, GetPropertyValueError> {
+    let requested = conditions.property_filters.as_deref().unwrap_or_default();
+    if requested.len() > MAX_FILTERS {
+        return Err(invalid(format!(
+            "tabularConditions.propertyFilters carries {} filters, more than the {MAX_FILTERS} one \
+             request may apply",
+            requested.len()
+        )));
+    }
+    let mut filters = Vec::with_capacity(requested.len());
+    for filter in requested {
+        let Some(property_name) = filter.property_name.as_deref() else {
+            return Err(invalid(
+                "tabularConditions.propertyFilters propertyName is required: a filter selects \
+                 rows by one property's value"
+                    .to_string(),
+            ));
+        };
+        let Some(value) = filter.value.as_ref() else {
+            return Err(invalid(format!(
+                "tabularConditions.propertyFilters filter on {property_name} carries no value to \
+                 compare against"
+            )));
+        };
+        let operator = filter.operator.as_deref().unwrap_or(OPERATOR_EQUALS);
+        if !OPERATORS.contains(&operator) {
+            return Err(invalid(format!(
+                "tabularConditions.propertyFilters operator {operator} is not one of {}",
+                OPERATORS.join(" ")
+            )));
+        }
+        if !addresses_property(workspace, query, property_name) {
+            return Err(invalid(format!(
+                "tabularConditions.propertyFilters {property_name} is not a property of what this \
+                 request addresses"
+            )));
+        }
+        filters.push(RowFilter {
+            property_name: property_name.to_string(),
+            operator: operator.to_string(),
+            value: value.clone(),
+        });
+    }
+    Ok(filters)
+}
+
+/// The `orderBy` keys of a tabular request, validated and owned. Each one names
+/// a property of the addressed scope and an order the model's `Order` enum
+/// defines.
+fn row_orders(
+    workspace: &crate::state::Workspace,
+    query: &Query<'_>,
+    conditions: &TabularConditions,
+) -> Result<Vec<RowOrder>, GetPropertyValueError> {
+    let requested = conditions.order_by.as_deref().unwrap_or_default();
+    if requested.len() > MAX_ORDER_KEYS {
+        return Err(invalid(format!(
+            "tabularConditions.orderBy carries {} keys, more than the {MAX_ORDER_KEYS} one \
+             request may order by",
+            requested.len()
+        )));
+    }
+    let mut orders = Vec::with_capacity(requested.len());
+    for order_by in requested {
+        let order = order_by.order.as_deref().unwrap_or(ORDER_ASCENDING);
+        if !ORDER_VALUES.contains(&order) {
+            return Err(invalid(format!(
+                "tabularConditions.orderBy order {order} is not one of {}",
+                ORDER_VALUES.join(" ")
+            )));
+        }
+        if !addresses_property(workspace, query, &order_by.property_name) {
+            return Err(invalid(format!(
+                "tabularConditions.orderBy {} is not a property of what this request addresses",
+                order_by.property_name
+            )));
+        }
+        orders.push(RowOrder {
+            property_name: order_by.property_name.clone(),
+            descending: order == ORDER_DESCENDING,
+        });
+    }
+    Ok(orders)
+}
+
+/// The `tabularPropertyValues` answer: a page of the sifted rows, each carrying
+/// the selected properties that read a value.
+///
+/// The rows are wrapped in ONE table — `tabularPropertyValues` is a list of
+/// tables, and a request names one scope, so it is answered with one — and a
+/// page that carries no row carries no table rather than an empty one.
+fn table_response(
+    rows: Vec<TableRow>,
+    selected: &[String],
+    page_size: usize,
+    input: &GetPropertyValueInput,
+) -> Result<GetPropertyValueOutput, GetPropertyValueError> {
+    // A row has no key of its own — which rows there are and in what order is
+    // what this request's own filters and ordering say — so the token resumes
+    // at the row's ORDINAL in that sequence, and is bound to the query that
+    // produced it so a token from another one is refused rather than resumed.
+    let resume_at = match input.next_token.as_deref() {
+        None | Some("") => 0,
+        Some(token) => decode_row_token(input, token)
+            .ok_or_else(|| invalid(format!("nextToken {token} is not a valid token")))?,
+    };
+    let total = rows.len();
+    let page: Vec<::std::collections::HashMap<String, DataValue>> = rows
+        .into_iter()
+        .skip(resume_at)
+        .take(page_size)
+        .map(|row| {
+            row.values
+                .into_iter()
+                .filter(|(property_name, _)| selected.contains(property_name))
+                .collect()
+        })
+        .collect();
+    let served = resume_at.saturating_add(page.len());
+    let next_token = (served < total).then(|| encode_row_token(input, served));
+
+    Ok(GetPropertyValueOutput {
+        // No latest-value map: this request asked for a table.
+        property_values: None,
+        next_token,
+        tabular_property_values: Some(if page.is_empty() {
+            Vec::new()
+        } else {
+            vec![page]
+        }),
+    })
+}
+
+/// The most rows one tabular answer is built from before the request is refused.
+///
+/// A `componentTypeId` query's scope is every instance of that component type
+/// across the workspace's entities — request-chosen, over caller-grown state —
+/// so the rows it would materialise are capped the way this service's other
+/// caller-driven query path caps its own result rows, and a request past the
+/// ceiling is refused rather than answered out of an unbounded scan.
+const MAX_TABLE_ROWS: usize = 10_000;
+
+/// The most `propertyFilters` and `orderBy` keys one tabular request may carry.
+///
+/// Each one is a pass over every row, so they multiply the work the ceiling
+/// above bounds. Both lists are modelled `@length 1..10`, so the boundary
+/// validator has already refused anything longer; stating the ceilings here
+/// keeps this handler's own bound local rather than depending on that.
+const MAX_FILTERS: usize = 10;
+/// See [`MAX_FILTERS`].
+const MAX_ORDER_KEYS: usize = 10;
+
+/// The comparison operators a `propertyFilters` entry may carry.
+///
+/// `operator` is modelled as a plain string with no value list, so this set is
+/// not read off the model: these are the comparisons this service's own query
+/// language spells in a `WHERE` clause (`crate::ops::execute_query`), asked of
+/// the same stored property values. An operator outside the set is refused by
+/// name rather than ignored, which would answer a filtered question with
+/// unfiltered rows.
+const OPERATORS: &[&str] = &["=", "!=", "<", "<=", ">", ">="];
+
+/// The operator a filter that names none compares with: a filter carries a
+/// value to compare against, and equality is the comparison that value alone
+/// describes.
+const OPERATOR_EQUALS: &str = "=";
+
+/// The two values of the model's `Order` enum (`super::types::ORDER_VALUES`),
+/// named so the sort reads as what it does. `ASCENDING` is the order a key that
+/// names none is taken in.
+const ORDER_ASCENDING: &str = "ASCENDING";
+/// See [`ORDER_ASCENDING`].
+const ORDER_DESCENDING: &str = "DESCENDING";
+
+/// Whether a comparison that came out `ordering` satisfies `operator`.
+fn satisfies(operator: &str, ordering: ::std::cmp::Ordering) -> bool {
+    use ::std::cmp::Ordering;
+    match operator {
+        "=" => ordering == Ordering::Equal,
+        "!=" => ordering != Ordering::Equal,
+        "<" => ordering == Ordering::Less,
+        "<=" => ordering != Ordering::Greater,
+        ">" => ordering == Ordering::Greater,
+        ">=" => ordering != Ordering::Less,
+        // Unreachable: a filter's operator is checked against `OPERATORS`
+        // before it is applied, and every one of them is matched above.
+        _ => false,
+    }
+}
+
+/// The key a row is ORDERED by: a property's value reduced to something with a
+/// TOTAL order, which is what a sort has to be handed — a relation that calls
+/// two values equal to a third but not to each other may make `sort_by` panic.
+///
+/// The variants rank in declaration order — a number, then text, then a flag,
+/// then a value of a kind with no order of its own (a list, a map, a
+/// relationship, an expression), then no value at all — so values of different
+/// kinds order deterministically instead of comparing equal. Within the numbers
+/// every width is placed on the double and compared with `f64::total_cmp`,
+/// which orders `NaN` too.
+enum OrderKey {
+    Number(f64),
+    Text(String),
+    Flag(bool),
+    Unordered,
+    Absent,
+}
+
+impl OrderKey {
+    /// The key for the value a row's ordering property read as.
+    fn of(value: Option<&DataValue>) -> Self {
+        let Some(value) = value else {
+            return Self::Absent;
+        };
+        if let Some(number) = Number::of(value) {
+            return Self::Number(number.as_double());
+        }
+        if let Some(text) = value.string_value.as_deref() {
+            return Self::Text(text.to_string());
+        }
+        match value.boolean_value {
+            Some(flag) => Self::Flag(flag),
+            None => Self::Unordered,
+        }
+    }
+
+    /// Where this kind of value sorts relative to another kind.
+    fn rank(&self) -> u8 {
+        match self {
+            Self::Number(_) => 0,
+            Self::Text(_) => 1,
+            Self::Flag(_) => 2,
+            Self::Unordered => 3,
+            Self::Absent => 4,
+        }
+    }
+}
+
+impl Ord for OrderKey {
+    fn cmp(&self, other: &Self) -> ::std::cmp::Ordering {
+        match (self, other) {
+            (Self::Number(left), Self::Number(right)) => left.total_cmp(right),
+            (Self::Text(left), Self::Text(right)) => left.cmp(right),
+            (Self::Flag(left), Self::Flag(right)) => left.cmp(right),
+            // Different kinds, or two values of a kind with no order of its
+            // own: the rank decides, and two values of one unordered kind are
+            // equal — which is what keeps the relation total.
+            _ => self.rank().cmp(&other.rank()),
+        }
+    }
+}
+
+impl PartialOrd for OrderKey {
+    fn partial_cmp(&self, other: &Self) -> Option<::std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for OrderKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == ::std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for OrderKey {}
+
+/// A number a `DataValue` carries, at the width it travels in.
+///
+/// `INTEGER`, `LONG` and `DOUBLE` are widths of ONE domain, so a filter
+/// comparing a property against a threshold compares numbers whichever member
+/// each of them travels in. The integral widths are kept as an integer rather
+/// than folded into a double, so two `LONG`s too far apart for a double to tell
+/// apart still compare as the distinct values they are.
+enum Number {
+    Integer(i128),
+    Double(f64),
+}
+
+impl Number {
+    /// The number this value carries, or `None` when it carries none.
+    fn of(value: &DataValue) -> Option<Self> {
+        if let Some(double) = value.double_value {
+            return Some(Self::Double(double));
+        }
+        if let Some(integer) = value.integer_value {
+            return Some(Self::Integer(i128::from(integer)));
+        }
+        value.long_value.map(|long| Self::Integer(i128::from(long)))
+    }
+
+    /// This number on the double, the one width every number can be placed on:
+    /// what an ORDERING compares, where a total relation matters more than the
+    /// last bits of a very large integer.
+    fn as_double(&self) -> f64 {
+        match self {
+            Self::Integer(integer) => *integer as f64,
+            Self::Double(double) => *double,
+        }
+    }
+
+    /// Compare two numbers for a FILTER, which judges one pair at a time: two
+    /// integral values compare exactly, and a comparison that involves a double
+    /// compares on the double — `None` when a `NaN` makes the pair
+    /// incomparable.
+    fn compare(&self, other: &Self) -> Option<::std::cmp::Ordering> {
+        match (self, other) {
+            (Self::Integer(left), Self::Integer(right)) => Some(left.cmp(right)),
+            _ => self.as_double().partial_cmp(&other.as_double()),
+        }
+    }
+}
+
+/// Compare two modelled `DataValue`s for a FILTER, or `None` when they carry
+/// nothing comparable: two values of different kinds, or a kind with no order
+/// (a list, a map, a relationship, an expression).
+fn compare_values(left: &DataValue, right: &DataValue) -> Option<::std::cmp::Ordering> {
+    if let (Some(left), Some(right)) = (Number::of(left), Number::of(right)) {
+        return left.compare(&right);
+    }
+    if let (Some(left), Some(right)) = (
+        left.string_value.as_deref(),
+        right.string_value.as_deref(),
+    ) {
+        return Some(left.cmp(right));
+    }
+    if let (Some(left), Some(right)) = (left.boolean_value, right.boolean_value) {
+        return Some(left.cmp(&right));
+    }
+    None
+}
+
+/// The envelope the `nextToken` of a latest-value page carries, so a token
+/// minted elsewhere — for another query, or by hand — is recognisably not one of
+/// ours.
+const VALUE_TOKEN_PREFIX: &str = "iottwinmaker:property-values:1:";
+
+/// The envelope the `nextToken` of a tabular page carries. Distinct from
+/// [`VALUE_TOKEN_PREFIX`] because the two resume at different things: a
+/// property name, and a row ordinal.
+const ROW_TOKEN_PREFIX: &str = "iottwinmaker:property-table:1:";
+
+/// What a `nextToken` is bound to besides its workspace: the members that
+/// decide WHICH properties of which components the page is of, so a token is
+/// only resumed by the query that minted it.
+///
+/// Last of the token's scope parts, which is the one that may itself contain the
+/// separator ([`crate::state::encode_page_token`]), because the selected
+/// property names are free text. The selection is taken sorted and
+/// de-duplicated, the way the answer is keyed, so re-asking for the same
+/// properties in another order still resumes.
+///
+/// The filters and the ordering of a TABULAR query are NOT part of this: a
+/// tabular token resumes at a row's ordinal in the sequence the request's own
+/// `tabularConditions` produce, so a caller resumes by repeating the whole
+/// request with the token, which is what an SDK paginator does.
+fn token_scope(input: &GetPropertyValueInput) -> String {
+    let mut selected = input.selected_properties.clone();
+    selected.sort();
+    selected.dedup();
+    format!(
+        "{}|{}|{}|{}|{}|{}",
+        input.entity_id.as_deref().unwrap_or(""),
+        input.component_name.as_deref().unwrap_or(""),
+        input.component_path.as_deref().unwrap_or(""),
+        input.component_type_id.as_deref().unwrap_or(""),
+        input.property_group_name.as_deref().unwrap_or(""),
+        selected.join(","),
+    )
+}
+
+/// The opaque `nextToken` for a latest-value page that resumes at
+/// `property_name`.
+fn encode_value_token(input: &GetPropertyValueInput, property_name: &str) -> String {
+    crate::state::encode_page_token(
+        VALUE_TOKEN_PREFIX,
+        &[&input.workspace_id, &token_scope(input)],
+        property_name,
+    )
+}
+
+/// The property name inside a latest-value `nextToken`, or `None` when the
+/// token is not one this query minted.
+fn decode_value_token(input: &GetPropertyValueInput, token: &str) -> Option<String> {
+    crate::state::decode_page_token(
+        VALUE_TOKEN_PREFIX,
+        &[&input.workspace_id, &token_scope(input)],
+        token,
+    )
+}
+
+/// The opaque `nextToken` for a tabular page that resumes at the row `ordinal`.
+fn encode_row_token(input: &GetPropertyValueInput, ordinal: usize) -> String {
+    crate::state::encode_page_token(
+        ROW_TOKEN_PREFIX,
+        &[&input.workspace_id, &token_scope(input)],
+        &ordinal.to_string(),
+    )
+}
+
+/// The row ordinal inside a tabular `nextToken`, or `None` when the token is not
+/// one this query minted.
+fn decode_row_token(input: &GetPropertyValueInput, token: &str) -> Option<usize> {
+    crate::state::decode_page_token(
+        ROW_TOKEN_PREFIX,
+        &[&input.workspace_id, &token_scope(input)],
+        token,
+    )?
+    .parse()
+    .ok()
 }
