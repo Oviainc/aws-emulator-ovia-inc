@@ -174,11 +174,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         store.settle_due_transitions(now);
 
         // "Before you can delete a gateway, you must deregister its instances and delete
-        // its bridges": a gateway in this store holds no instances (the instance
-        // operations are still scaffolded), so its BRIDGES are the whole precondition
-        // here. A bridge names the gateway it is placed on by its placement ARN
-        // (`ListedBridge$PlacementArn`: "the ARN of the gateway associated with the
-        // bridge"), which is how a bridge still placed on this gateway is found.
+        // its bridges." Both halves are read off this store: an instance names the gateway
+        // it is registered with on its own record
+        // (`crate::state::StoredGatewayInstance::gateway_arn`), and a bridge names the
+        // gateway it is placed on by its placement ARN (`ListedBridge$PlacementArn`: "the
+        // ARN of the gateway associated with the bridge").
         let Some(gateway) = store.gateways.get(&input.gateway_arn) else {
             return Err(DeleteGatewayErrorModeled::NotFoundException(
                 NotFoundException {
@@ -193,6 +193,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A gateway already on its way out is past this precondition: the repeat of an
         // `@idempotent` delete answers the same ARN rather than refusing (see below).
         if !retired {
+            let registered = store.registered_gateway_instance_count(&gateway_arn);
+            if registered > 0 {
+                return Err(DeleteGatewayErrorModeled::BadRequestException(
+                    BadRequestException {
+                        message: crate::state::bad_request_message(&format!(
+                            "Gateway {gateway_arn} still has {registered} registered \
+                             instance(s). Deregister the instances of a gateway before \
+                             deleting the gateway."
+                        )),
+                    },
+                )
+                .into());
+            }
             let placed = store
                 .bridges
                 .values()

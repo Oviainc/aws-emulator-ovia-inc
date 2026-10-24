@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeGatewayInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeGatewayInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeGatewayInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the stored gateway instance the request names, or `NotFoundException` when no
+//! instance has that ARN: the record comes from [`crate::state`], projected through the one
+//! projection every gateway-instance operation answers from
+//! (`crate::state::ComAmazonawsMediaconnectMediaconnectState::gateway_instance_projection`).
+//!
+//! An instance the store holds is reported whatever state it is in, including the terminal
+//! `DEREGISTERED` one a deregistration leaves behind (see
+//! `crate::ops::deregister_gateway_instance`): a client polls this operation to watch a
+//! deregistration finish, so a deregistered instance answers 200 with its state rather
+//! than a not-found.
+//!
+//! An instance is never created by a client: see `crate::state::StoredGatewayInstance` for
+//! the out-of-band channel an instance registration reaches this service through.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +161,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeGatewayInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeGatewayInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeGatewayInstance"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DescribeGatewayInstanceErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        message: "the mediaconnect gateway store is unavailable".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+        // The ONLY write this reporting operation makes: an instance state change the clock
+        // already made due (see `crate::state::TRANSITION_SPAN`) was owed at that instant
+        // whether or not anybody called, so it is materialised before reporting.
+        store.settle_due_transitions(::std::time::SystemTime::now());
+
+        let Some(gateway_instance) = store.gateway_instance_projection(&input.gateway_instance_arn)
+        else {
+            return Err(DescribeGatewayInstanceErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: crate::state::not_found_message(&input.gateway_instance_arn),
+                },
+            )
+            .into());
+        };
+
+        Ok(DescribeGatewayInstanceOutput {
+            gateway_instance: Some(gateway_instance),
+        })
     }
 }

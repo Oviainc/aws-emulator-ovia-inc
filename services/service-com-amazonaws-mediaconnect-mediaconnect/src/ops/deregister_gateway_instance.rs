@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeregisterGatewayInstance
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeregisterGatewayInstance`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeregisterGatewayInstance::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Deregisters the stored instance the request names: the instance enters the non-terminal
+//! `DEREGISTERING` state and the clock owes it the terminal `DEREGISTERED` one
+//! `crate::state::TRANSITION_SPAN` later, so a caller that reads it straight afterwards
+//! still sees the deregistration in flight.
+//!
+//! The documented precondition is the bridges: "before you deregister an instance, all
+//! bridges running on the instance must be stopped. If you want to deregister an instance
+//! without stopping the bridges, you must use the --force option." The bridges running on
+//! an instance are counted off the bridge store
+//! (`crate::state::ComAmazonawsMediaconnectMediaconnectState::running_bridge_count`), and
+//! a request that names none of them stopped and does not set `Force` is the conflict
+//! `ConflictException` describes.
+//!
+//! An instance is never created by a client: see `crate::state::StoredGatewayInstance` for
+//! the out-of-band channel an instance registration reaches this service through.
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +168,114 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeregisterGatewayInstance` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeregisterGatewayInstanceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeregisterGatewayInstance"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DeregisterGatewayInstanceErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        message: "the mediaconnect gateway store is unavailable".to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The state change the clock already owes an instance is materialised before the
+        // deregistration is judged, so an instance whose registration has settled is
+        // deregistered rather than refused for a transition that is no longer in flight.
+        store.settle_due_transitions(now);
+
+        let Some(instance) = store.gateway_instances.get(&input.gateway_instance_arn) else {
+            return Err(DeregisterGatewayInstanceErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: crate::state::not_found_message(&input.gateway_instance_arn),
+                },
+            )
+            .into());
+        };
+
+        // A deregistration already under way or finished is what this `@idempotent` call
+        // asked for: it answers the instance's current state rather than restarting the
+        // transition or refusing, exactly as a repeated DeleteGateway does.
+        if instance.is_deregistering_or_deregistered() {
+            return Ok(DeregisterGatewayInstanceOutput {
+                gateway_instance_arn: Some(instance.gateway_instance_arn.clone()),
+                instance_state: Some(instance.instance_state.clone()),
+            });
+        }
+
+        // An instance whose registration is still in flight is between two states, which is
+        // the conflict `ConflictException` describes ("would cause a conflict with the
+        // current state of a service resource associated with the request", 409 and
+        // retryable — the caller retries once the registration it is waiting on has
+        // settled). The status and the error code are the contract; the sentence states the
+        // precondition, and carries neither of this service's refusal envelopes, which word
+        // a `BadRequestException` (`crate::state::bad_request_message`) and a
+        // `NotFoundException` (`crate::state::not_found_message`).
+        if instance.instance_state == crate::state::INSTANCE_STATE_REGISTERING {
+            return Err(DeregisterGatewayInstanceErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "Gateway instance {} is in state {}, so its registration must \
+                         finish before it can be deregistered.",
+                        instance.gateway_instance_arn, instance.instance_state
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // "Before you deregister an instance, all bridges running on the instance must be
+        // stopped. If you want to deregister an instance without stopping the bridges, you
+        // must use the --force option." A `Force` the request omits is not forcing: the
+        // member is optional and its absence leaves the precondition in place.
+        let running = store.running_bridge_count(instance);
+        let forced = input.force.unwrap_or(false);
+        if running > 0 && !forced {
+            return Err(DeregisterGatewayInstanceErrorModeled::ConflictException(
+                ConflictException {
+                    message: format!(
+                        "Gateway instance {} still has {running} bridge(s) running on it. \
+                         Stop the bridges before deregistering the instance, or set Force \
+                         to deregister it anyway.",
+                        instance.gateway_instance_arn
+                    ),
+                },
+            )
+            .into());
+        }
+
+        let Some(instance) = store
+            .gateway_instances
+            .get_mut(&input.gateway_instance_arn)
+        else {
+            return Err(
+                DeregisterGatewayInstanceErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        message: "the gateway instance could not be read back after it was read"
+                            .to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Deregistering is not instantaneous: the instance reports `DEREGISTERING` and the
+        // clock owes the terminal `DEREGISTERED` one transition span later, which is why
+        // this operation answers 202 rather than 200.
+        instance.begin_transition(
+            crate::state::INSTANCE_STATE_DEREGISTERING,
+            crate::state::INSTANCE_STATE_DEREGISTERED,
+            now,
+        );
+
+        // The response is the STORED record, read back off the instance this call wrote,
+        // not anything derived from the request.
+        Ok(DeregisterGatewayInstanceOutput {
+            gateway_instance_arn: Some(instance.gateway_instance_arn.clone()),
+            instance_state: Some(instance.instance_state.clone()),
+        })
     }
 }
