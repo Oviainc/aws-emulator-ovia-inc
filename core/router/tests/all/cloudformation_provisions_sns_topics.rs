@@ -466,18 +466,34 @@ async fn a_completed_stack_has_created_every_topic_it_declares_in_sns() {
             )
             .await;
             let tags = tags_of(&listed);
-            assert_eq!(
-                tags.len(),
-                topic.expected_tags.len(),
-                "case {case:?}: expected the declared tags and no others, got {tags:?}"
+            // The tags the template declared, PLUS the three CloudFormation records on
+            // every resource it provisions: `aws:cloudformation:stack-name`,
+            // `aws:cloudformation:stack-id` and `aws:cloudformation:logical-id` (these rows
+            // supply no stack-level `Tags`, which would be here too). The whole set is held
+            // to by
+            // `services/service-com-amazonaws-cloudformation-cloudformation/tests/all/stack_tag_propagation.rs`.
+            let mut expected_tags: BTreeMap<String, String> = topic
+                .expected_tags
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                .collect();
+            expected_tags.insert(
+                "aws:cloudformation:stack-name".to_string(),
+                row.stack_name.to_string(),
             );
-            for (key, value) in topic.expected_tags {
-                assert_eq!(
-                    tags.get(*key).map(String::as_str),
-                    Some(*value),
-                    "case {case:?}: expected the tag {key}={value}, got {tags:?}"
-                );
-            }
+            expected_tags.insert(
+                "aws:cloudformation:stack-id".to_string(),
+                xml_text(&body, "StackId").unwrap_or_default(),
+            );
+            expected_tags.insert(
+                "aws:cloudformation:logical-id".to_string(),
+                topic.logical_id.to_string(),
+            );
+            assert_eq!(
+                tags, expected_tags,
+                "case {case:?}: expected the declared tags beside the aws:cloudformation \
+                 ones, got {tags:?}"
+            );
 
             let listed = sns_ok(
                 &router,

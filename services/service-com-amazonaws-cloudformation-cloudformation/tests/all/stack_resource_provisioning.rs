@@ -31,14 +31,16 @@ use service_com_amazonaws_cloudformation_cloudformation::state::status;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// What an S3 request answered: the status, and the body for the cases that read one.
-struct S3Answer {
-    status: u16,
-    body: String,
+pub(crate) struct S3Answer {
+    pub(crate) status: u16,
+    pub(crate) body: String,
 }
 
 /// Drive one S3 request through the same router, signed for `s3` the way a client's SDK
 /// signs it (the harness verifies no signature, exactly as the emulator runs by default).
-async fn s3(
+///
+/// This crate's ONE S3 caller: a stack's buckets are read back as a client reads them.
+pub(crate) async fn s3(
     router: &MultiServiceRouter,
     method: &str,
     path: &str,
@@ -73,7 +75,7 @@ async fn head_bucket(router: &MultiServiceRouter, bucket: &str) -> u16 {
 /// Read as the pair of lists the response carries, which is sound here because every
 /// output of every template below resolves: an output with no value would shift the
 /// pairing, and the assertions on the value would fail loudly rather than silently pass.
-fn output_value(xml: &str, key: &str) -> String {
+pub(crate) fn output_value(xml: &str, key: &str) -> String {
     let keys = xml_texts(xml, "OutputKey");
     let values = xml_texts(xml, "OutputValue");
     keys.iter()

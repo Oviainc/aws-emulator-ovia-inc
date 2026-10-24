@@ -10,7 +10,8 @@
 //! section declares, and it deletes those same resources when the stack is deleted. What
 //! each resource IS — the physical id a `Ref` resolves to and the attributes an
 //! `Fn::GetAtt` resolves to — is computed by [`super::template`]; what this module adds is
-//! the call that makes the resource exist.
+//! the call that makes the resource exist, carrying the tags CloudFormation tags it with
+//! ([`StackProvenance`]).
 //!
 //! The call is made in-process through the handler's own callback into this emulator
 //! ([`smithy_server_runtime::OperationContext::callback`]), signed with the emulator's
@@ -205,8 +206,74 @@ impl Created {
     }
 }
 
-// The stack whose resources are being created or deleted is identified by its Region
-// alone — what the credential scope of every call this module makes names.
+/// The tag key CloudFormation records the NAME of the stack a resource belongs to under,
+/// on the resource itself.
+pub const STACK_NAME_TAG: &str = "aws:cloudformation:stack-name";
+/// The tag key it records that stack's ID under.
+pub const STACK_ID_TAG: &str = "aws:cloudformation:stack-id";
+/// The tag key it records the resource's LOGICAL id in that stack under.
+pub const LOGICAL_ID_TAG: &str = "aws:cloudformation:logical-id";
+
+/// The stack a deployment is provisioning for, as far as the resources it creates are
+/// concerned: the identity CloudFormation records ON each of them, and the stack-level tags
+/// it propagates TO each of them. The Region those resources live in travels beside this as
+/// [`reconcile`]'s own argument, because it is also what the credential scope of every call
+/// this module makes names.
+///
+/// ## The rule this carries
+///
+/// CloudFormation does not only create a stack's resources — it TAGS them. The stack-level
+/// `Tags` a stack operation supplies are "propagated to the resources that CloudFormation
+/// creates in the stack", and CloudFormation adds three tags of its own naming the stack
+/// and the resource's place in it ([`STACK_NAME_TAG`], [`STACK_ID_TAG`],
+/// [`LOGICAL_ID_TAG`]). So the owning service's own tag read on the handle a stack
+/// publishes for a resource answers with those tags — which is what tag-based cost
+/// allocation, tag-based access control and anything keying off `aws:cloudformation:*` see.
+///
+/// Applying them is PER TYPE, in [`super::provisioner`], because the tag set reaches each
+/// owning API its own way (a `Tags` member of the create, a map, a tagging call of its own);
+/// what is the same for every type is the set itself, which is [`Self::tags_for`].
+#[derive(Debug, Clone, Default)]
+pub struct StackProvenance {
+    /// `Stack$StackName`.
+    pub stack_name: String,
+    /// `Stack$StackId`.
+    pub stack_id: String,
+    /// The stack-level `Tags` in force, in the order the stack records them.
+    pub tags: Vec<(String, String)>,
+}
+
+impl StackProvenance {
+    /// The tags CloudFormation applies to the resource `logical_id` names: the stack's own,
+    /// then the three CloudFormation records itself — which are CloudFormation's to set, so
+    /// a stack tag spelled with one of those reserved keys does not displace them.
+    ///
+    /// A tag with an empty key is not a tag and is left out, and a key stated twice keeps
+    /// its first position with the later value, so what reaches an owning service is a
+    /// well-formed tag set however the stack itself was tagged.
+    pub fn tags_for(&self, logical_id: &str) -> Vec<(String, String)> {
+        let mut tags: Vec<(String, String)> = Vec::new();
+        let mut put = |key: &str, value: &str| {
+            if key.is_empty() {
+                return;
+            }
+            match tags
+                .iter_mut()
+                .find(|(existing, _)| existing.as_str() == key)
+            {
+                Some((_, held)) => *held = value.to_string(),
+                None => tags.push((key.to_string(), value.to_string())),
+            }
+        };
+        for (key, value) in &self.tags {
+            put(key, value);
+        }
+        put(STACK_NAME_TAG, &self.stack_name);
+        put(STACK_ID_TAG, &self.stack_id);
+        put(LOGICAL_ID_TAG, logical_id);
+        tags
+    }
+}
 
 /// What deploying a stack's template left its resources as.
 #[derive(Debug, Clone, Default)]
@@ -245,9 +312,16 @@ pub struct Materialised {
 /// configuration because that is the one now in force. Only a type with no update path
 /// there, and a change the owning service refuses, leave the deployment with a failure —
 /// never a success that dropped the caller's change.
+///
+/// `stack` is the stack the resources belong to: every resource this CREATES is created
+/// carrying the tags CloudFormation gives it ([`StackProvenance::tags_for`]), so the
+/// owning service's own tag read on the handle the stack publishes answers with the stack's
+/// tags and the `aws:cloudformation:*` ones. A resource the deployment carries forward keeps
+/// the tags it was created with: nothing is re-tagged for a resource nothing changed about.
 pub async fn reconcile(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
+    stack: &StackProvenance,
     declared: Vec<StoredResource>,
     previous: &[StoredResource],
 ) -> Materialised {
@@ -317,7 +391,12 @@ pub async fn reconcile(
             continue;
         }
         let created = match provisioner_for(&resource.resource_type) {
-            Some(provisioner) => provisioner.create(ctx, region, &resource).await,
+            // The resource is created WITH the tags CloudFormation gives it: the stack's
+            // own, plus the three that name the stack and this resource's place in it.
+            Some(provisioner) => {
+                let tags = stack.tags_for(&resource.logical_id);
+                provisioner.create(ctx, region, &resource, &tags).await
+            }
             // No provisioner for this type: nothing is asked of any service, and the
             // resource stays DECLARED-ONLY.
             None => {
