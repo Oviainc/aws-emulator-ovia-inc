@@ -206,6 +206,18 @@
 //! Keyed by `VolumeId` in a [`BTreeMap`], the same stable order the VPC and subnet stores
 //! are kept in, so a pagination token can name the id the next page starts at.
 //!
+//! ## VM Import/Export snapshot import tasks
+//!
+//! [`ComAmazonawsEc2Amazonec2State::import_snapshot_tasks`] holds the account's snapshot
+//! import tasks as the modelled [`ImportSnapshotTask`] shape itself, keyed by
+//! `ImportTaskId` in a [`BTreeMap`] — the same arrangement as the VPC and volume stores,
+//! and for the same two reasons: a member a writer sets round-trips through
+//! `DescribeImportSnapshotTasks` without a field-by-field copy, and the store's own order
+//! is the order that describe reports and a page token names a position in. The store is
+//! EMPTY for a fresh account, unlike the image store: nothing creates an import task until
+//! a caller asks for one ([`ComAmazonawsEc2Amazonec2State::insert_import_snapshot_task`]),
+//! and the describe answers "a list of zero or more import snapshot tasks".
+//!
 //! ## EBS volume modifications
 //!
 //! [`ComAmazonawsEc2Amazonec2State::volume_modifications`] holds, per `VolumeId`, the most
@@ -936,7 +948,8 @@ use crate::ops::types::{
     VolumeModification,
     EbsBlockDevice,
     EbsInfo, EfaInfo, EnableFastLaunchOutput, GroupIdentifier, Host, INSTANCE_TYPE_VALUES, Image,
-    ImageCriterion, Instance, InstanceApplicationStatus, InstanceStorageInfo, InstanceTypeInfo,
+    ImageCriterion, ImportSnapshotTask, Instance, InstanceApplicationStatus, InstanceStorageInfo,
+    InstanceTypeInfo,
     IpamInternetRegistryAssociation, IpamPolicy, IpamPool, IpamRoutingPolicyRegistration,
     IpamResourceTag, IpamRoutingPolicyRegistrationDelta, IpamScope,
     MemoryInfo, NetworkInfo, NitroTpmInfo, PlacementGroupInfo, ProcessorInfo, VCpuInfo,
@@ -953,7 +966,7 @@ use crate::ops::types::{
     RunInstancesOutput, SecondaryNetwork,
     SecondaryNetworkIpv4CidrBlockAssociation, SecondarySubnet,
     SecondarySubnetIpv4CidrBlockAssociation, SecurityGroup, ServiceConfiguration,
-    SpotPlacementScore, StateReason,
+    SnapshotTaskDetail, SpotPlacementScore, StateReason,
     Subnet, SubnetAssociation, Subscription, Tag,
     TagSpecification,
     TransitGateway, TransitGatewayClientVpnAttachment,
@@ -2078,6 +2091,18 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// A `CreateVolume` `ClientToken` and the volume id it minted, so a repeat of the
     /// same request answers with that volume instead of creating a second one.
     pub volume_client_tokens: HashMap<String, String>,
+    /// Every VM Import/Export snapshot import task the account holds, by `ImportTaskId`,
+    /// as the modelled [`ImportSnapshotTask`] shape itself — so a member a writer sets
+    /// round-trips through `DescribeImportSnapshotTasks` without a field-by-field copy
+    /// that can silently drop one. Ordered by id, which is the order that describe
+    /// reports and pages over, and the position a page token names.
+    ///
+    /// Empty for a fresh account, unlike [`Self::images`]: nothing in AWS creates an
+    /// import task until a caller asks for one, and the describe answers "a list of zero
+    /// or more import snapshot tasks"
+    /// (`DescribeImportSnapshotTasksResult$ImportSnapshotTasks`). `ImportSnapshot` is the
+    /// writer, through [`Self::insert_import_snapshot_task`].
+    pub import_snapshot_tasks: BTreeMap<String, ImportSnapshotTask>,
     /// Every instance event window the account holds, by `InstanceEventWindowId` — see the
     /// module docs. Ordered by id, which is the order `DescribeInstanceEventWindows`
     /// reports and pages over.
@@ -2556,6 +2581,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             id_counter: 0,
             volumes: BTreeMap::new(),
             volume_client_tokens: HashMap::new(),
+            import_snapshot_tasks: BTreeMap::new(),
             instance_event_windows: BTreeMap::new(),
             volume_modifications: BTreeMap::new(),
             secondary_networks: BTreeMap::new(),
@@ -9659,12 +9685,14 @@ pub fn import_image_task_payload_bytes(view: &ImportImageTask, client_token: Opt
         .saturating_add(client_token.map_or(0, str::len))
 }
 
-/// Whether `id` is a well-formed import image task id.
+/// Whether `id` is a well-formed import task id of the family `prefix` (carrying its
+/// hyphen) names: that prefix followed by 8 or 17 lowercase hexadecimal digits — the short
+/// and the long id form every EC2 resource id takes.
 ///
-/// An import image task id is `import-ami-` followed by 8 or 17 lowercase hexadecimal
-/// digits — the short and the long id form every EC2 resource id takes.
-pub fn import_image_task_id_is_well_formed(id: &str) -> bool {
-    let Some(suffix) = id.strip_prefix(IMPORT_IMAGE_TASK_ID_PREFIX_WITH_HYPHEN) else {
+/// The ONE reader of that form for every kind of import task, so the ids of an import image
+/// task and of an import snapshot task can differ only in their prefix.
+pub fn import_task_id_is_well_formed(prefix: &str, id: &str) -> bool {
+    let Some(suffix) = id.strip_prefix(prefix) else {
         return false;
     };
     matches!(suffix.len(), 8 | 17)
@@ -9673,17 +9701,19 @@ pub fn import_image_task_id_is_well_formed(id: &str) -> bool {
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// Refuse an `ImportTaskIds` entry that is not an import image task id at all: HTTP 400
-/// [`INVALID_CONVERSION_TASK_ID`], EC2's code for a conversion task id it cannot resolve.
+/// Refuse an `ImportTaskIds` entry that is not an import task id of the family `prefix`
+/// names: HTTP 400 [`INVALID_CONVERSION_TASK_ID`], EC2's code for a conversion task id it
+/// cannot resolve.
 ///
 /// Only a MALFORMED id is refused. A well-formed id no task of the account has is not an
-/// error: `DescribeImportImageTasks` answers "a list of zero or more import image tasks"
-/// (`DescribeImportImageTasksResult$ImportImageTasks`), so such an id simply selects no
-/// row — which is what the real service does with one.
-pub fn require_well_formed_import_image_task_id<E>(
+/// error: an import-task describe answers "a list of zero or more" tasks, so such an id
+/// simply selects no row — which is what the real service does with one. The ONE definition
+/// of that refusal for every import-task describe.
+pub fn require_well_formed_import_task_id<E>(
+    prefix: &str,
     task_id: &str,
 ) -> Result<(), crate::scaffolded::Scaffolded<E>> {
-    if import_image_task_id_is_well_formed(task_id) {
+    if import_task_id_is_well_formed(prefix, task_id) {
         return Ok(());
     }
     Err(crate::scaffolded::Scaffolded::service_error(
@@ -9691,6 +9721,23 @@ pub fn require_well_formed_import_image_task_id<E>(
         400,
         format!("Invalid id: '{task_id}'"),
     ))
+}
+
+/// Whether `id` is a well-formed import IMAGE task id: [`import_task_id_is_well_formed`] on
+/// the `import-ami-` family.
+pub fn import_image_task_id_is_well_formed(id: &str) -> bool {
+    import_task_id_is_well_formed(IMPORT_IMAGE_TASK_ID_PREFIX_WITH_HYPHEN, id)
+}
+
+/// Refuse a `DescribeImportImageTasks` `ImportTaskIds` entry that is not an import image
+/// task id at all: [`require_well_formed_import_task_id`] on the `import-ami-` family, so
+/// "a list of zero or more import image tasks"
+/// (`DescribeImportImageTasksResult$ImportImageTasks`) still covers a well-formed id the
+/// account holds no task for.
+pub fn require_well_formed_import_image_task_id<E>(
+    task_id: &str,
+) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+    require_well_formed_import_task_id(IMPORT_IMAGE_TASK_ID_PREFIX_WITH_HYPHEN, task_id)
 }
 
 /// Refuse a create that would take the store past a ceiling of its own:
@@ -13746,6 +13793,150 @@ impl ComAmazonawsEc2Amazonec2State {
             self.remove_security_group(&group_id);
         }
         Some(vpc)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VM Import/Export snapshot import tasks
+// ---------------------------------------------------------------------------
+//
+// An import snapshot task is the record of ONE `ImportSnapshot` request: the disk image
+// it names, the snapshot being made from it, and how far that has got. It is stored as
+// the modelled `ImportSnapshotTask` shape
+// ([`ComAmazonawsEc2Amazonec2State::import_snapshot_tasks`]) for the same reason a VPC
+// is stored as a `Vpc`: `DescribeImportSnapshotTasks` reports exactly what a writer
+// stored, so the two cannot disagree about one task.
+//
+// The task's state lives on its `SnapshotTaskDetail$Status`, which is the only place
+// either operation reads it from, and the `task-state` filter selects on. Those state
+// values, and `INVALID_CONVERSION_TASK_ID`, are the ones the import IMAGE task store above
+// already declares — an import task is an import task, whichever resource it produces — so
+// nothing here redeclares them.
+
+/// The most import snapshot tasks this in-memory store holds at once.
+///
+/// A capacity bound in the same style as [`MAX_STORED_IMPORT_IMAGE_TASKS`], not an AWS
+/// quota: each task is a record in this process's memory, so the number a caller can create
+/// has to be finite.
+/// [`ComAmazonawsEc2Amazonec2State::has_import_snapshot_task_capacity`] is the predicate a
+/// writer asks first, and
+/// [`ComAmazonawsEc2Amazonec2State::insert_import_snapshot_task`] refuses past it so no
+/// path can grow the store without bound even if a writer forgets to ask.
+pub const MAX_STORED_IMPORT_SNAPSHOT_TASKS: usize = 1_000;
+
+/// What a writer of an import snapshot task supplies: everything the task carries that
+/// comes from the REQUEST, with the task's own id left to
+/// [`ComAmazonawsEc2Amazonec2State::insert_import_snapshot_task`] to mint.
+#[derive(Debug, Clone, Default)]
+pub struct ImportSnapshotTaskSpec {
+    /// "The description string for the import snapshot task"
+    /// (`ImportSnapshotRequest$Description`), which the task reports on both its own
+    /// `Description` and its detail's.
+    pub description: Option<String>,
+    /// The progress of the import itself: the disk image it reads, the snapshot it makes,
+    /// the status it is in and how far it has got.
+    pub detail: SnapshotTaskDetail,
+    /// "The tags to apply to the import snapshot task during creation"
+    /// (`ImportSnapshotRequest$TagSpecifications`).
+    pub tags: Vec<Tag>,
+}
+
+/// The bytes a stored import snapshot task holds: [`IMPORT_TASK_ELEMENT_OVERHEAD_BYTES`] of
+/// per-record overhead — the same floor the import image task store charges, so a task
+/// carrying no text at all is not free against [`MAX_STORED_BYTES`] — plus its tags and the
+/// text of the request it was created from. The members the SERVICE owns (the task id, the
+/// snapshot id, the status, the progress) are fixed-size and stand for by the overhead.
+pub fn import_snapshot_task_payload_bytes(task: &ImportSnapshotTask) -> usize {
+    let detail = task.snapshot_task_detail.as_ref();
+    let text = |value: Option<&String>| value.map_or(0, String::len);
+    let bucket = detail.and_then(|detail| detail.user_bucket.as_ref());
+    tag_list_bytes(task.tags.as_deref().unwrap_or_default())
+        .saturating_add(IMPORT_TASK_ELEMENT_OVERHEAD_BYTES)
+        .saturating_add(text(task.description.as_ref()))
+        .saturating_add(text(detail.and_then(|detail| detail.description.as_ref())))
+        .saturating_add(text(detail.and_then(|detail| detail.format.as_ref())))
+        .saturating_add(text(detail.and_then(|detail| detail.kms_key_id.as_ref())))
+        .saturating_add(text(detail.and_then(|detail| detail.url.as_ref())))
+        .saturating_add(text(bucket.and_then(|bucket| bucket.s3_bucket.as_ref())))
+        .saturating_add(text(bucket.and_then(|bucket| bucket.s3_key.as_ref())))
+}
+
+/// The prefix, with its hyphen, of an import SNAPSHOT task id.
+pub const IMPORT_SNAPSHOT_TASK_ID_PREFIX_WITH_HYPHEN: &str = "import-snap-";
+
+/// Whether `id` is a well-formed import SNAPSHOT task id:
+/// [`import_task_id_is_well_formed`] — the one reader of an import task id's form — on the
+/// `import-snap-` family.
+pub fn import_snapshot_task_id_is_well_formed(id: &str) -> bool {
+    import_task_id_is_well_formed(IMPORT_SNAPSHOT_TASK_ID_PREFIX_WITH_HYPHEN, id)
+}
+
+/// Refuse an `ImportTaskIds` entry that is not an import snapshot task id at all: HTTP 400
+/// [`INVALID_CONVERSION_TASK_ID`], EC2's code for a conversion task id it cannot resolve.
+///
+/// Only a MALFORMED id is refused, the same rule
+/// [`require_well_formed_import_image_task_id`] holds for the sibling describe: a
+/// well-formed id no task of the account has is not an error, because
+/// `DescribeImportSnapshotTasks` answers "a list of zero or more import snapshot tasks"
+/// (`DescribeImportSnapshotTasksResult$ImportSnapshotTasks`), so such an id simply selects
+/// no row.
+pub fn require_well_formed_import_snapshot_task_id<E>(
+    task_id: &str,
+) -> Result<(), crate::scaffolded::Scaffolded<E>> {
+    require_well_formed_import_task_id(IMPORT_SNAPSHOT_TASK_ID_PREFIX_WITH_HYPHEN, task_id)
+}
+
+impl ComAmazonawsEc2Amazonec2State {
+    /// Whether another import snapshot task fits inside the store's ceiling
+    /// ([`MAX_STORED_IMPORT_SNAPSHOT_TASKS`]).
+    ///
+    /// The same contract as [`Self::has_vpc_capacity`]: a writer asks first and refuses
+    /// rather than growing the store past its ceiling.
+    pub fn has_import_snapshot_task_capacity(&self) -> bool {
+        self.import_snapshot_tasks.len() < MAX_STORED_IMPORT_SNAPSHOT_TASKS
+    }
+
+    /// Store an import snapshot task, and answer the `ImportTaskId` it was given — or
+    /// `None` when the store already holds [`MAX_STORED_IMPORT_SNAPSHOT_TASKS`] of them, in
+    /// which case NOTHING is stored and no bytes are charged.
+    ///
+    /// The ceiling is enforced here as well as asked about through
+    /// [`Self::has_import_snapshot_task_capacity`], because the count is the only thing
+    /// bounding this store's growth: a task's byte charge is dominated by caller-chosen
+    /// text it need not carry at all, so the byte budget alone cannot stop a sequence of
+    /// bare records from growing the store without bound.
+    ///
+    /// The id is minted here rather than taken from the caller, so a task never shares an
+    /// id with another resource of this store, and the description the request carried is
+    /// written onto BOTH the task (`ImportSnapshotTask$Description`, "A description of the
+    /// import snapshot task") and its detail (`SnapshotTaskDetail$Description`, "The
+    /// description of the disk image being imported") — one request field, so two readers
+    /// cannot see two descriptions. The caller-chosen bytes are charged against the
+    /// store's byte budget HERE rather than by each writer, the way [`Self::insert_vpc`]
+    /// charges a VPC's tags.
+    pub fn insert_import_snapshot_task(
+        &mut self,
+        spec: ImportSnapshotTaskSpec,
+    ) -> Option<String> {
+        if !self.has_import_snapshot_task_capacity() {
+            return None;
+        }
+        let import_task_id = self.next_id(
+            IMPORT_SNAPSHOT_TASK_ID_PREFIX_WITH_HYPHEN.trim_end_matches('-'),
+        );
+        let task = ImportSnapshotTask {
+            description: spec.description.clone(),
+            import_task_id: Some(import_task_id.clone()),
+            snapshot_task_detail: Some(SnapshotTaskDetail {
+                description: spec.description,
+                ..spec.detail
+            }),
+            tags: Some(spec.tags),
+        };
+        self.add_stored_bytes(import_snapshot_task_payload_bytes(&task));
+        self.import_snapshot_tasks
+            .insert(import_task_id.clone(), task);
+        Some(import_task_id)
     }
 }
 
