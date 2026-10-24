@@ -24,7 +24,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ops::types::{
-    ApiStage, CanarySettings, DocumentationPartLocation, EndpointConfiguration,
+    AccessLogSettings, ApiStage, CanarySettings, DocumentationPartLocation, EndpointConfiguration,
     GetGatewayResponseOutput, GetIntegrationOutput, GetMethodResponseOutput, GetSdkTypeOutput,
     MethodSetting, MethodSnapshot, MutualTlsAuthentication, QuotaSettings,
     SdkConfigurationProperty, ThrottleSettings,
@@ -270,6 +270,11 @@ pub struct StageEntry {
     /// it on, so an instant already in the past means no flush is outstanding; absent
     /// until the stage is flushed at all. See [`CACHE_CLUSTER_FLUSH_SPAN`].
     pub cache_flush_done_at: Option<::std::time::Instant>,
+    /// When the cache cluster an `UpdateStage` DISABLED finishes being torn down. A
+    /// cluster is reported `DELETE_IN_PROGRESS` until this instant and `NOT_AVAILABLE`
+    /// from it on; absent while the stage has a cluster and on one that never had one.
+    /// See [`CACHE_CLUSTER_DELETE_SPAN`].
+    pub cache_cluster_removed_at: Option<::std::time::Instant>,
     /// When `FlushStageAuthorizersCache` LAST dropped this stage's authorizer cache
     /// entries; absent until the stage's authorizer cache is flushed at all.
     ///
@@ -288,9 +293,18 @@ pub struct StageEntry {
     pub variables: BTreeMap<String, String>,
     pub documentation_version: Option<String>,
     pub canary_settings: Option<CanarySettings>,
+    /// The access logging an `UpdateStage` patch of `/accessLogSettings` configured on
+    /// this stage, kept as the modelled shape for the reason the module docs give;
+    /// absent until a patch sets it.
+    pub access_log_settings: Option<AccessLogSettings>,
+    /// The client certificate an `UpdateStage` patch of `/clientCertificateId`
+    /// associated with this stage.
+    pub client_certificate_id: Option<String>,
     pub tracing_enabled: bool,
-    /// Written by `UpdateStage`, which is still a stub, so this stays empty for now and
-    /// a `Stage` body reports an empty `methodSettings` map.
+    /// The per-method settings `UpdateStage` writes, keyed by the method path the patch
+    /// addressed — `{resource_path}/{http_method}`, or `*/*` for every method of the
+    /// stage; empty until a patch sets one, which is the empty `methodSettings` map a
+    /// freshly created stage reports.
     pub method_settings: BTreeMap<String, MethodSetting>,
     pub tags: BTreeMap<String, String>,
     pub created_date: Option<::aws_smithy_types::DateTime>,
@@ -306,9 +320,20 @@ impl StageEntry {
     /// transition is one the CLOCK owes, materialised from the stored due instant rather
     /// than by sleeping or by being read. A cluster a `FlushStageCache` call emptied
     /// reports `FLUSH_IN_PROGRESS` over [`CACHE_CLUSTER_FLUSH_SPAN`] the same way, and is
-    /// `AVAILABLE` again once that instant has passed.
+    /// `AVAILABLE` again once that instant has passed. A cluster an `UpdateStage`
+    /// disabled is torn down over [`CACHE_CLUSTER_DELETE_SPAN`], reporting
+    /// `DELETE_IN_PROGRESS` until then and `NOT_AVAILABLE` after it.
     pub fn cache_cluster_status(&self) -> &'static str {
         let now = ::std::time::Instant::now();
+        // A teardown the clock owes outranks the cluster that is going away: the stage
+        // reports the removal until it is due, and `NOT_AVAILABLE` from then on.
+        if let Some(removed_at) = self.cache_cluster_removed_at {
+            return if now < removed_at {
+                CACHE_CLUSTER_DELETE_IN_PROGRESS
+            } else {
+                CACHE_CLUSTER_NOT_AVAILABLE
+            };
+        }
         match self.cache_cluster_ready_at {
             None => CACHE_CLUSTER_NOT_AVAILABLE,
             Some(ready_at) if now < ready_at => CACHE_CLUSTER_CREATE_IN_PROGRESS,
@@ -1123,6 +1148,17 @@ pub const CACHE_CLUSTER_FLUSH_IN_PROGRESS: &str = "FLUSH_IN_PROGRESS";
 pub const CACHE_CLUSTER_FLUSH_SPAN: ::std::time::Duration =
     ::std::time::Duration::from_millis(500);
 
+/// The `cacheClusterStatus` of a cache cluster that is being torn down, after an
+/// `UpdateStage` disabled it.
+pub const CACHE_CLUSTER_DELETE_IN_PROGRESS: &str = "DELETE_IN_PROGRESS";
+
+/// How long a stage's cache cluster stays `DELETE_IN_PROGRESS` after an `UpdateStage`
+/// disabled it, after which the stage reports `NOT_AVAILABLE`. API Gateway documents no
+/// duration for the teardown, so this span is the emulator's own, chosen so a caller
+/// reading straight after the update still observes `DELETE_IN_PROGRESS`.
+pub const CACHE_CLUSTER_DELETE_SPAN: ::std::time::Duration =
+    ::std::time::Duration::from_millis(500);
+
 /// How long an edge-optimized custom domain name takes to become
 /// [`DOMAIN_NAME_AVAILABLE`]: the CloudFront distribution API Gateway creates for it is
 /// not in place when the create call answers. API Gateway documents no duration for it
@@ -1611,6 +1647,39 @@ impl Patch {
         Ok(parsed)
     }
 
+    /// The op's `value` read as a double inside `range`, for a member documented with
+    /// bounds. A `range` ending at [`f64::MAX`] is a member bounded only from BELOW —
+    /// the service publishes no maximum for it — and the refusal says so rather than
+    /// quoting that number back at the caller.
+    pub fn require_f64_in(
+        &self,
+        range: ::std::ops::RangeInclusive<f64>,
+    ) -> Result<f64, PatchFailure> {
+        let value = self.require_value()?;
+        let parsed: f64 = value.trim().parse().map_err(|_| {
+            PatchFailure::BadRequest(format!(
+                "{} takes a number value, got {value:?}",
+                self.path
+            ))
+        })?;
+        if !parsed.is_finite() || !range.contains(&parsed) {
+            let bound = if *range.end() == f64::MAX {
+                format!("must be a number of at least {}", range.start())
+            } else {
+                format!(
+                    "must be between {} and {}, inclusive",
+                    range.start(),
+                    range.end()
+                )
+            };
+            return Err(PatchFailure::BadRequest(format!(
+                "{} {bound}: {value}",
+                self.path
+            )));
+        }
+        Ok(parsed)
+    }
+
     /// This patch as it addresses a member of a NESTED structure: the first `depth`
     /// reference tokens — the ones naming the structure itself — are dropped, so the
     /// structure's own members are addressed exactly the way a top-level member is.
@@ -1830,6 +1899,37 @@ pub fn patch_optional_i32(
     match patch.op {
         PatchOpKind::Add | PatchOpKind::Replace => *current = Some(patch.require_i32_in(range)?),
         PatchOpKind::Remove => *current = None,
+        _ => return Err(patch.unsupported_op()),
+    }
+    Ok(())
+}
+
+/// Apply `patch` to an integer member declared with a default, bounded by `range`.
+/// `remove` is refused for the reason [`patch_bool`] gives: a member the model declares
+/// with a default always has a value.
+pub fn patch_i32_in(
+    current: &mut i32,
+    patch: &Patch,
+    range: ::std::ops::RangeInclusive<i32>,
+) -> Result<(), PatchFailure> {
+    patch.require_single_valued()?;
+    match patch.op {
+        PatchOpKind::Add | PatchOpKind::Replace => *current = patch.require_i32_in(range)?,
+        _ => return Err(patch.unsupported_op()),
+    }
+    Ok(())
+}
+
+/// Apply `patch` to a double member declared with a default, bounded by `range`; see
+/// [`patch_i32_in`] for why `remove` is refused.
+pub fn patch_f64_in(
+    current: &mut f64,
+    patch: &Patch,
+    range: ::std::ops::RangeInclusive<f64>,
+) -> Result<(), PatchFailure> {
+    patch.require_single_valued()?;
+    match patch.op {
+        PatchOpKind::Add | PatchOpKind::Replace => *current = patch.require_f64_in(range)?,
         _ => return Err(patch.unsupported_op()),
     }
     Ok(())

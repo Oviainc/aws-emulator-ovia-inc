@@ -85,6 +85,8 @@ mod tag_reads_by_arn;
 mod update_integration;
 #[path = "all/update_method_response.rs"]
 mod update_method_response;
+#[path = "all/update_stage.rs"]
+mod update_stage;
 #[path = "all/usage_plan_lifecycle.rs"]
 mod usage_plan_lifecycle;
 #[path = "all/validation_message_rules.rs"]

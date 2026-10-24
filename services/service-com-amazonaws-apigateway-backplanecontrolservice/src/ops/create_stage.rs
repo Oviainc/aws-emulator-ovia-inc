@@ -157,8 +157,7 @@ pub fn validate_stage_name(stage_name: &str) -> Result<(), String> {
 pub fn stage_body(entry: &StageEntry) -> CreateStageOutput {
     CreateStageOutput {
         deployment_id: Some(entry.deployment_id.clone()),
-        // Set by `UpdateStage`, which is still a stub.
-        client_certificate_id: None,
+        client_certificate_id: entry.client_certificate_id.clone(),
         stage_name: Some(entry.stage_name.clone()),
         description: entry.description.clone(),
         cache_cluster_enabled: entry.cache_cluster_enabled,
@@ -179,8 +178,7 @@ pub fn stage_body(entry: &StageEntry) -> CreateStageOutput {
                 .collect()
         }),
         documentation_version: entry.documentation_version.clone(),
-        // Set by `UpdateStage`, which is still a stub.
-        access_log_settings: None,
+        access_log_settings: entry.access_log_settings.clone(),
         canary_settings: entry.canary_settings.clone(),
         tracing_enabled: entry.tracing_enabled,
         // Set by associating a WebACL through AWS WAF, which this service does not model.
@@ -401,6 +399,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }),
             // No flush has run on a stage this call creates.
             cache_flush_done_at: None,
+            // Nor has a cluster been torn down on it.
+            cache_cluster_removed_at: None,
             authorizers_cache_flushed_at: None,
             variables: input
                 .variables
@@ -409,9 +409,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .collect::<BTreeMap<String, String>>(),
             documentation_version: input.documentation_version,
             canary_settings: input.canary_settings,
+            // Access logging and a client certificate are configured by `UpdateStage`,
+            // which is the only call that can set either on a stage.
+            access_log_settings: None,
+            client_certificate_id: None,
             tracing_enabled: input.tracing_enabled,
-            // `UpdateStage` writes the method settings; it is still a stub, so a new
-            // stage carries none.
+            // `UpdateStage` writes the method settings, so a new stage carries none.
             method_settings: BTreeMap::new(),
             tags: input
                 .tags

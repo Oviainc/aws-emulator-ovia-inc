@@ -395,6 +395,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             }),
                             // No flush has run on a stage this call creates.
                             cache_flush_done_at: None,
+                            // Nor has a cluster been torn down on it.
+                            cache_cluster_removed_at: None,
                             authorizers_cache_flushed_at: None,
                             variables,
                             documentation_version: None,
@@ -406,6 +408,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                 use_stage_cache: canary.use_stage_cache,
                             }),
                             tracing_enabled: input.tracing_enabled.unwrap_or(false),
+                            // Access logging and a client certificate are configured by
+                            // `UpdateStage`, the only call that sets either on a stage.
+                            access_log_settings: None,
+                            client_certificate_id: None,
                             method_settings: BTreeMap::new(),
                             tags: BTreeMap::new(),
                             created_date: Some(now),
