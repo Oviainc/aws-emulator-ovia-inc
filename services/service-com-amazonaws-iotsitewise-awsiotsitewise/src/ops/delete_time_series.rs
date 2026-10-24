@@ -198,13 +198,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut store = state.lock();
 
-        // `workspaceName` scopes the delete to one SiteWise workspace. Workspaces are
-        // created by `CreateWorkspace`, which is still a scaffold stub here, so no
-        // workspace exists for a request to name.
+        // `workspaceName` scopes the delete to one SiteWise workspace. This store
+        // holds no time series inside a workspace — nothing that ingests one
+        // records a workspace for it — so a scoped delete resolves to nothing: to
+        // the workspace itself when the store does not hold that either, and
+        // otherwise to the series the request identified inside it.
         if let Some(workspace) = input.workspace_name.as_deref() {
-            return Err(not_found(crate::state::not_found_message(
-                crate::state::RESOURCE_WORKSPACE,
-                workspace,
+            if !store.workspaces.contains_key(workspace) {
+                return Err(not_found(crate::state::not_found_message(
+                    crate::state::RESOURCE_WORKSPACE,
+                    workspace,
+                )));
+            }
+            return Err(not_found(format!(
+                "The time series the request identifies could not be found in the workspace \
+                 {workspace}."
             )));
         }
 

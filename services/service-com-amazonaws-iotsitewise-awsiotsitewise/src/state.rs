@@ -24,17 +24,19 @@
 //! handler reads and writes THIS struct through [`service_state`]; nothing in
 //! `src/ops/` keeps state of its own.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
     AggregatedValue, Aggregates, Alarms, AssetHierarchy, AssetModelCompositeModel,
     AssetModelCompositeModelPathSegment, AssetModelCompositeModelSummary, AssetModelHierarchy,
     AssetModelProperty, AssetModelPropertyDefinition, AssetModelStatus, AssetProperty,
-    AssetPropertyValue, AssetStatus, AssetSummary, ComputeNode, DatasetConfig, DatasetSource,
-    DatasetStatus, ExpressionVariable, GatewayCapabilitySummary, GatewayPlatform, ImageLocation,
-    LoggingOptions, PortalStatus, PortalTypeEntry, PropertyType, ResourceStatus, TaskConfiguration,
-    TimeInNanos, Variant,
+    AssetPropertyValue, AssetStatus, AssetSummary, ComputeNode, ComputeNodeExecutionDetails,
+    ComputeNodeExecutionStatus, DatasetConfig, DatasetSource, DatasetStatus,
+    ExecutionEnvironmentVariables, ExpressionVariable, GatewayCapabilitySummary, GatewayPlatform,
+    ImageLocation, LoggingOptions, Mount, MountOverrides, PipelineExecutionStatus, PortalStatus,
+    PortalTypeEntry, PropertyType, ResourceStatus, TaskConfiguration, TimeInNanos, Variant,
+    WorkspaceEncryptionConfiguration, WorkspaceStatus,
 };
 
 /// The `iotsitewise` ARN service namespace, as `OPERATIONS.md` reports it.
@@ -276,6 +278,9 @@ pub const FIRST_TASK_VERSION: u64 = 1;
 
 /// The ARN resource-type segment of a dataset ARN, as [`dataset_arn`] builds it.
 pub const DATASET_RESOURCE_TYPE: &str = "dataset";
+/// The ARN resource-type segment of a workspace ARN, as [`workspace_arn`] builds
+/// it.
+pub const WORKSPACE_RESOURCE_TYPE: &str = "workspace";
 
 /// See [`MAX_ASSET_MODELS`]: the same bound, for the portal map. `CreatePortal`
 /// is the only thing that adds a portal and it declares the modelled
@@ -328,6 +333,37 @@ pub const DEFAULT_GATEWAY_VERSION: &str = "2";
 /// creating a V3 gateway (gatewayVersion=3), you must also specify the
 /// coreDeviceOperatingSystem".
 pub const GATEWAY_VERSION_V3: &str = "3";
+
+/// See [`MAX_ASSET_MODELS`]: the same bound, for the workspace map.
+/// `CreateWorkspace` is the only thing that adds a workspace and it declares the
+/// modelled `LimitExceededException` (HTTP 410), so that is how this store
+/// refuses past the cap. The emulator's own bound, not a published AWS default.
+pub const MAX_WORKSPACES: usize = 1_000;
+
+/// See [`MAX_WORKSPACES`]: the same bound, for the pipeline-execution map.
+/// `StartPipelineExecution` is the only thing that adds an execution and it
+/// declares the modelled `LimitExceededException` (HTTP 410).
+pub const MAX_PIPELINE_EXECUTIONS: usize = 1_000;
+
+/// The `EncryptionType` that encrypts a workspace with the service's own key.
+///
+/// Source: `smithy_query(query="shape", shape="EncryptionType")` — the enum holds
+/// exactly this value and [`ENCRYPTION_TYPE_KMS_BASED`].
+pub const ENCRYPTION_TYPE_SITEWISE_DEFAULT: &str = "SITEWISE_DEFAULT_ENCRYPTION";
+
+/// The `EncryptionType` that encrypts a workspace with a customer managed KMS
+/// key; see [`ENCRYPTION_TYPE_SITEWISE_DEFAULT`].
+pub const ENCRYPTION_TYPE_KMS_BASED: &str = "KMS_BASED_ENCRYPTION";
+
+/// The `PipelineExecutionState` / `ComputeNodeExecutionState` value an execution
+/// that has not begun reports. Both enums declare it
+/// (`smithy_query(query="shape", shape="PipelineExecutionState,ComputeNodeExecutionState")`).
+pub const EXECUTION_STATE_NOT_STARTED: &str = "NOT_STARTED";
+
+/// The `executionPriority` an execution that named none runs at, as
+/// `StartPipelineExecution`'s own member documents it: "Lower values indicate
+/// higher priority. Defaults to 2 when not specified."
+pub const DEFAULT_EXECUTION_PRIORITY: i32 = 2;
 
 /// How many samples one `(assetId, propertyId)` series keeps.
 ///
@@ -907,6 +943,291 @@ impl DatasetRecord {
     }
 }
 
+/// A workspace, by the name that identifies it in this account and region.
+#[derive(Debug, Clone)]
+pub struct WorkspaceRecord {
+    pub name: String,
+    pub arn: String,
+    pub description: Option<String>,
+    /// The encryption scheme the create stated, kept verbatim so a read reports
+    /// what was accepted rather than a default.
+    pub encryption: WorkspaceEncryptionConfiguration,
+    pub creation_date: SystemTime,
+    pub last_update_date: SystemTime,
+    /// The instant the transition the clock owes — from [`Self::settling_state`]
+    /// to `ACTIVE` — falls due.
+    pub active_at: SystemTime,
+    /// The `WorkspaceState` this workspace reports until [`Self::active_at`]
+    /// falls due.
+    pub settling_state: String,
+    /// The `clientToken` of the create that made this workspace, if it carried
+    /// one, so a retry of that same create replays its answer rather than
+    /// colliding with the workspace it already made.
+    pub client_token: Option<String>,
+    pub tags: HashMap<String, String>,
+}
+
+impl WorkspaceRecord {
+    /// The workspace's `WorkspaceState` as of `now`: its [`Self::settling_state`]
+    /// until the owed transition falls due, `ACTIVE` from then on. Derived, so a
+    /// read never has to write.
+    pub fn state(&self, now: SystemTime) -> &str {
+        state_at(&self.settling_state, self.active_at, now)
+    }
+
+    /// The workspace's status as of `now`.
+    pub fn status(&self, now: SystemTime) -> WorkspaceStatus {
+        WorkspaceStatus {
+            state: self.state(now).to_string(),
+            error: None,
+        }
+    }
+}
+
+/// One compute node of a recorded pipeline execution: which task it runs, the
+/// nodes it waits for, and the environment and mounts resolved for it when the
+/// execution was accepted.
+///
+/// Resolved ONCE, at the call that starts the execution, so a later write to the
+/// pipeline or to a task cannot change what a past execution reports.
+#[derive(Debug, Clone)]
+pub struct ComputeNodeExecutionRecord {
+    pub compute_node_name: String,
+    pub task_name: String,
+    /// The ARN the task was minted with, copied rather than rebuilt, so the
+    /// execution keeps naming the task it actually resolved.
+    pub task_arn: String,
+    /// The task version the execution resolved.
+    pub task_version: String,
+    pub depends_on: Vec<String>,
+    /// A `ComputeNodeExecutionState` value.
+    pub state: String,
+    /// The fully resolved environment variables for this node.
+    pub environment_variables: HashMap<String, String>,
+    /// The fully resolved mounts for this node.
+    pub mounts: Vec<Mount>,
+    pub start_time: Option<SystemTime>,
+    pub end_time: Option<SystemTime>,
+}
+
+impl ComputeNodeExecutionRecord {
+    /// This node's execution detail, as `DescribePipelineExecution` reports it.
+    pub fn details(&self) -> ComputeNodeExecutionDetails {
+        ComputeNodeExecutionDetails {
+            compute_node_name: self.compute_node_name.clone(),
+            task_name: self.task_name.clone(),
+            task_arn: self.task_arn.clone(),
+            task_version: self.task_version.clone(),
+            depends_on: self.depends_on.clone(),
+            status: ComputeNodeExecutionStatus {
+                state: self.state.clone(),
+                state_details: None,
+            },
+            start_time: self.start_time.map(to_date_time),
+            end_time: self.end_time.map(to_date_time),
+            execution_environment_variables: Some(self.environment_variables.clone()),
+            execution_mounts: Some(self.mounts.clone()),
+        }
+    }
+}
+
+/// One pipeline execution, by the `pipelineExecutionId` that identifies it.
+///
+/// A compute node of an execution runs its task's container image, which this
+/// emulator has no runtime for, so an accepted execution is RECORDED and no node
+/// is reported started, succeeded or failed: a state, a duration or an error for
+/// work that nothing ran would be invented rather than observed. What the record
+/// does hold is everything the request and the stored pipeline determine — the
+/// pipeline version it ran against, the DAG order, and the environment and mounts
+/// resolved per node.
+#[derive(Debug, Clone)]
+pub struct PipelineExecutionRecord {
+    pub id: String,
+    pub workspace_name: String,
+    pub pipeline_name: String,
+    /// The `version` the pipeline carried when the execution was accepted.
+    pub pipeline_version: String,
+    /// A `PipelineExecutionState` value.
+    pub state: String,
+    /// The priority the execution runs at: the one the request named, or
+    /// [`DEFAULT_EXECUTION_PRIORITY`].
+    pub execution_priority: i32,
+    /// The environment variable overrides the request carried, verbatim.
+    pub request_environment_variables: ExecutionEnvironmentVariables,
+    /// The mount overrides the request carried, when it carried any.
+    pub request_mount_overrides: Option<MountOverrides>,
+    /// When the execution was accepted. Distinct from [`Self::start_time`], which
+    /// is when the execution itself began.
+    pub accepted_at: SystemTime,
+    pub start_time: Option<SystemTime>,
+    pub end_time: Option<SystemTime>,
+    /// The compute nodes, in the DAG order
+    /// [`compute_node_execution_order`] put them in.
+    pub compute_nodes: Vec<ComputeNodeExecutionRecord>,
+    /// The `clientToken` of the start that made this execution, if it carried
+    /// one, so a retry of that same start replays its answer rather than
+    /// starting a second execution; see
+    /// [`ComAmazonawsIotsitewiseAwsiotsitewiseState::pipeline_execution_tokens`].
+    pub client_token: Option<String>,
+}
+
+impl PipelineExecutionRecord {
+    /// The execution's status.
+    pub fn status(&self) -> PipelineExecutionStatus {
+        PipelineExecutionStatus {
+            state: self.state.clone(),
+            state_details: None,
+        }
+    }
+}
+
+/// The key a started execution's `clientToken` is indexed under: the pipeline it
+/// started and the token itself.
+///
+/// Scoped to the pipeline because a token makes ONE call idempotent, and the
+/// token is last so the two names cannot be confused with it (both are modelled
+/// `^[a-zA-Z0-9_-]+$`, which admits no `/`).
+pub fn execution_token_key(workspace_name: &str, pipeline_name: &str, client_token: &str) -> String {
+    format!("{workspace_name}/{pipeline_name}/{client_token}")
+}
+
+/// The canonical ARN of a workspace in `region`.
+pub fn workspace_arn(region: &str, workspace_name: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{WORKSPACE_RESOURCE_TYPE}/{workspace_name}"),
+    )
+}
+
+/// The order a pipeline's compute nodes run in: the DAG order their `dependsOn`
+/// edges define, as the positions of [`PipelineVersion::computations`].
+///
+/// "Nodes without dependencies start immediately, while dependent nodes wait for
+/// all upstream nodes to complete successfully" — so a node is ordered after
+/// every node it depends on. Ties keep declaration order, which makes the order
+/// one request produces stable across reads and resumable by a page token.
+///
+/// `Err` carries the refusal message for a `computations` list that is not a DAG
+/// at all, from [`check_compute_nodes`] — the one validator every write to a
+/// pipeline's compute nodes already uses, so one list is judged by one rule. The
+/// caller lifts it into its own modelled refusal.
+///
+/// Linear in the nodes and their dependencies, like that validator: the lookups
+/// are hashed and each edge is walked once (Kahn's algorithm over a ready set
+/// ordered by declaration position), so no shape of list — a chain declared
+/// backwards included — makes the walk cost more than the list itself. How long
+/// the list itself can be is bounded by the model: `ComputeNodeList` is
+/// `@length(min: 0, max: 50)` and `ComputeNodeNameList` `@length(min: 0, max:
+/// 10)`, both refused at the boundary before a handler sees the request, so no
+/// request can grow this walk.
+pub fn compute_node_execution_order(computations: &[ComputeNode]) -> Result<Vec<usize>, String> {
+    check_compute_nodes(computations)?;
+
+    // How many dependencies each node is still waiting on, by position, and
+    // which positions wait on each node.
+    let mut waiting: Vec<usize> = Vec::with_capacity(computations.len());
+    let mut dependents: HashMap<&str, Vec<usize>> = HashMap::with_capacity(computations.len());
+    for (at, node) in computations.iter().enumerate() {
+        let mut outstanding = 0usize;
+        for dependency in node.depends_on.iter().flatten() {
+            outstanding += 1;
+            dependents.entry(dependency.as_str()).or_default().push(at);
+        }
+        waiting.push(outstanding);
+    }
+
+    // The ready set is ordered BY POSITION, so of the nodes that could run next
+    // the one the write declared first is ordered first.
+    let mut ready: BTreeSet<usize> = waiting
+        .iter()
+        .enumerate()
+        .filter(|(_, outstanding)| **outstanding == 0)
+        .map(|(at, _)| at)
+        .collect();
+    let mut order = Vec::with_capacity(computations.len());
+    while let Some(at) = ready.pop_first() {
+        order.push(at);
+        let released = computations[at].compute_node_name.as_str();
+        for dependent in dependents.get(released).into_iter().flatten().copied() {
+            waiting[dependent] -= 1;
+            if waiting[dependent] == 0 {
+                ready.insert(dependent);
+            }
+        }
+    }
+    // Every node is placed: a list that would leave one waiting holds a cycle,
+    // which `check_compute_nodes` above already refused. Asserted rather than
+    // assumed, so a regression in that validator shows up as a failing test
+    // instead of an execution quietly missing compute nodes.
+    debug_assert_eq!(
+        order.len(),
+        computations.len(),
+        "the DAG walk placed {} of {} compute nodes",
+        order.len(),
+        computations.len()
+    );
+    Ok(order)
+}
+
+/// The environment variables one compute node of one execution runs with: every
+/// layer that can define them, folded lowest priority first.
+///
+/// The hierarchy is the one the members themselves document: a task defines
+/// "environment variables passed to the container at runtime"; a pipeline's are
+/// "shared across all compute nodes in the pipeline. Individual compute nodes can
+/// override these values with their own environment variables"; and an
+/// execution's overrides "take the highest priority in the environment variable
+/// hierarchy", with `global` applying "to all compute nodes in the pipeline
+/// execution" and `computeNodes` carrying "per-compute-node environment variable
+/// overrides". A later layer replaces an earlier layer's value for the same key
+/// and keeps every key it does not name, so the caller passes the layers it has
+/// in that order, lowest first.
+pub fn resolved_environment_variables(
+    layers: &[Option<&HashMap<String, String>>],
+) -> HashMap<String, String> {
+    let mut resolved = HashMap::new();
+    for layer in layers.iter().flatten() {
+        for (key, value) in *layer {
+            resolved.insert(key.clone(), value.clone());
+        }
+    }
+    resolved
+}
+
+/// The mounts one compute node of one execution runs with: its task-defined
+/// mounts with the execution's overrides for that node merged in.
+///
+/// The rule is the one `executionMountOverrides` documents: "Overrides are merged
+/// by mount name into each listed compute node's task-defined mounts: a matching
+/// name replaces the task-defined mount, a new name adds a mount, and
+/// task-defined mounts not referenced remain unchanged. Compute nodes not listed
+/// use their task-defined mounts as-is."
+pub fn resolved_mounts(task_mounts: &[Mount], overrides: Option<&[Mount]>) -> Vec<Mount> {
+    let overrides = overrides.unwrap_or(&[]);
+    let mut resolved: Vec<Mount> = task_mounts
+        .iter()
+        .map(|mount| {
+            overrides
+                .iter()
+                .rev()
+                .find(|replacement| replacement.name == mount.name)
+                .unwrap_or(mount)
+                .clone()
+        })
+        .collect();
+    for mount in overrides {
+        if !task_mounts
+            .iter()
+            .any(|defined| defined.name == mount.name)
+            && !resolved.iter().any(|added| added.name == mount.name)
+        {
+            resolved.push(mount.clone());
+        }
+    }
+    resolved
+}
+
 /// The platform device a gateway runs on, as a single comparable key: the
 /// Greengrass V1 group ARN, the Greengrass V2 core device thing name or the Siemens
 /// Industrial Edge IoT Core thing name, whichever the platform names.
@@ -1283,6 +1604,27 @@ impl TaskRecord {
         }
     }
 
+    /// The environment variables the task's current configuration itself
+    /// defines — the lowest layer of the hierarchy
+    /// [`resolved_environment_variables`] folds.
+    pub fn environment_variables(&self) -> Option<&HashMap<String, String>> {
+        match &self.current.configuration {
+            TaskConfiguration::containerTaskConfiguration(container) => {
+                container.environment_variables.as_ref()
+            }
+        }
+    }
+
+    /// The mounts the task's current configuration itself defines — what an
+    /// execution's mount overrides are merged into; see [`resolved_mounts`].
+    pub fn mounts(&self) -> &[Mount] {
+        match &self.current.configuration {
+            TaskConfiguration::containerTaskConfiguration(container) => {
+                container.mounts.as_deref().unwrap_or(&[])
+            }
+        }
+    }
+
     /// Record that an accepted update landed at `now`: the configuration it
     /// carries becomes a NEW version, the version it replaces is kept for a read
     /// that names it, and the task reports `UPDATING` until the transition this
@@ -1476,6 +1818,7 @@ tagged_record!(PortalRecord);
 tagged_record!(PipelineRecord);
 tagged_record!(TaskRecord);
 tagged_record!(DatasetRecord);
+tagged_record!(WorkspaceRecord);
 
 /// `record`'s tag set, but only when `record` is the one `arn` names exactly —
 /// same partition, account and region, not merely the same id.
@@ -1561,6 +1904,19 @@ pub struct ComAmazonawsIotsitewiseAwsiotsitewiseState {
     pub logging_options: HashMap<String, LoggingOptionsRecord>,
     /// Datasets by `datasetId`.
     pub datasets: HashMap<String, DatasetRecord>,
+    /// Workspaces by `workspaceName`, which is what identifies one in an
+    /// account and region.
+    pub workspaces: HashMap<String, WorkspaceRecord>,
+    /// Pipeline executions by `pipelineExecutionId`. The id alone identifies one,
+    /// and the record names the workspace and pipeline it belongs to, so a read
+    /// scoped to another pipeline resolves to nothing.
+    pub pipeline_executions: HashMap<String, PipelineExecutionRecord>,
+    /// `clientToken` -> `pipelineExecutionId`, keyed by
+    /// [`execution_token_key`], so a retried `StartPipelineExecution` carrying
+    /// the token of an execution it already started replays that answer instead
+    /// of starting a second one. Written beside the execution itself, and
+    /// bounded by it: at most one entry per execution that carried a token.
+    pub pipeline_execution_tokens: HashMap<String, String>,
 }
 
 impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
@@ -2033,6 +2389,7 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
                 tags_of(self.tasks.get(&task_key(workspace, name)), arn)
             }
             DATASET_RESOURCE_TYPE => tags_of(self.datasets.get(id), arn),
+            WORKSPACE_RESOURCE_TYPE => tags_of(self.workspaces.get(id), arn),
             _ => None,
         }
     }
@@ -2054,6 +2411,7 @@ impl ComAmazonawsIotsitewiseAwsiotsitewiseState {
                 tags_of_mut(self.tasks.get_mut(&task_key(workspace, name)), arn)
             }
             DATASET_RESOURCE_TYPE => tags_of_mut(self.datasets.get_mut(id), arn),
+            WORKSPACE_RESOURCE_TYPE => tags_of_mut(self.workspaces.get_mut(id), arn),
             _ => None,
         }
     }
@@ -2415,6 +2773,12 @@ pub const RESOURCE_TASK: &str = "Task";
 /// The resource kind those errors name for a dataset.
 pub const RESOURCE_DATASET: &str = "Dataset";
 
+/// The resource kind those errors name for a workspace.
+pub const RESOURCE_WORKSPACE: &str = "Workspace";
+
+/// The resource kind those errors name for a pipeline execution.
+pub const RESOURCE_PIPELINE_EXECUTION: &str = "Pipeline Execution";
+
 /// The resource kind those errors name for a composite model of an asset model.
 ///
 /// A composite model is not a top-level resource, so it is named as what it is
@@ -2432,9 +2796,6 @@ pub const RESOURCE_GATEWAY: &str = "Gateway";
 /// The resource kind those errors name for a data stream, which every operation
 /// that addresses one addresses by its `alias`.
 pub const RESOURCE_TIME_SERIES: &str = "Time Series";
-
-/// The resource kind those errors name for a workspace.
-pub const RESOURCE_WORKSPACE: &str = "Workspace";
 
 /// The resource kind those errors name for an IoT SiteWise Monitor portal.
 pub const RESOURCE_PORTAL: &str = "Portal";

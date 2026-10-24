@@ -220,12 +220,17 @@ pub const MAX_CONDITIONS_PER_CRITERION: usize = 20;
 /// per condition", the same `Criteria` doc sentence).
 pub const MAX_VALUES_PER_CONDITION: usize = 20;
 
-/// How many whitespace-separated fields a schedule expression has.
+/// How many whitespace-separated fields the cron expression of a schedule may
+/// have.
 ///
 /// DOCUMENTED: "A `cron` expression consists of six fields separated by white
-/// spaces: (`minutes` `hours` `day_of_month` `month` `day_of_week` `year`)"
-/// (`smithy_query(query="doc",shape="Schedule",member="scheduleExpression")`).
-pub const CRON_FIELD_COUNT: usize = 6;
+/// spaces: (`minutes` `hours` `day_of_month` `month` `day_of_week` `year`)",
+/// and the same doc's own example — "For example: (`30 12 * * *`) runs daily at
+/// 12:30 PM UTC" — writes the expression with the trailing `year` field left
+/// out (`smithy_query(query="doc",shape="Schedule",member="scheduleExpression")`),
+/// so a five-field expression says when the schedule runs just as well and is
+/// accepted too.
+pub const CRON_FIELD_COUNTS: &[usize] = &[5, 6];
 
 /// How many client tokens the idempotency ledger remembers. Reached only by
 /// distinct caller-supplied tokens; the oldest entry is evicted to make room, so
@@ -1802,28 +1807,54 @@ pub fn recommended_action_types_violation(action_types: &[String]) -> Option<Str
     None
 }
 
+/// The cron expression a schedule expression carries: its text with the
+/// optional `cron(...)` function wrapper removed and trimmed.
+///
+/// A schedule expression is written either bare (`30 12 * * ? *`) or wrapped in
+/// the `cron(...)` form a schedule expression names its kind with
+/// (`cron(30 12 * * ? *)`). The wrapper says which kind of expression follows
+/// and is not one of the expression's whitespace-separated fields, so it is
+/// stripped before the fields are read; the keyword is matched without regard
+/// to case, and the parenthesis follows it directly, as in every expression the
+/// form is written in. Text that is not so wrapped is its own cron expression.
+pub fn cron_expression(expression: &str) -> &str {
+    let trimmed = expression.trim();
+    trimmed
+        .strip_suffix(')')
+        .and_then(|body| {
+            let open = body.find('(')?;
+            let (keyword, rest) = body.split_at(open);
+            keyword
+                .eq_ignore_ascii_case("cron")
+                // `rest` starts at the `(` the keyword introduced, which is one
+                // byte wide, so the remainder is the wrapped expression.
+                .then_some(&rest[1..])
+        })
+        .unwrap_or(trimmed)
+        .trim()
+}
+
 /// Why this `schedule` cannot say when a rule runs, if it cannot.
 ///
 /// `scheduleExpression` is "The expression that defines when the schedule runs",
 /// so a schedule without one never runs and is refused rather than stored. The
-/// expression itself is documented as a cron of [`CRON_FIELD_COUNT`] fields
-/// (`minutes hours day_of_month month day_of_week year`) of which "You can
-/// schedule rules to run at most once per day. Your cron expression must use
-/// specific values (not wildcards) for the minutes and hours fields"
-/// (`smithy_query(query="doc",shape="Schedule",member="scheduleExpression")`), so
-/// those two fields must each name ONE value in range: a wildcard, a list, a
+/// expression itself is a cron of [`CRON_FIELD_COUNTS`] fields
+/// (`minutes hours day_of_month month day_of_week` and an optional `year`),
+/// optionally in the `cron(...)` wrapper ([`cron_expression`]), of which "You
+/// can schedule rules to run at most once per day. Your cron expression must
+/// use specific values (not wildcards) for the minutes and hours fields"
+/// (`smithy_query(query="doc",shape="Schedule",member="scheduleExpression")`),
+/// so those two fields must each name ONE value in range: a wildcard, a list, a
 /// range or a step in either would make the rule run more than once a day (or
-/// not at a fixed time at all). The remaining four fields are left to the
+/// not at a fixed time at all). The remaining fields are left to the
 /// expression's own vocabulary, which the doc does not constrain.
 ///
 /// `executionWindowInMinutes` carries `@range(60..1440)` in the model, so the
 /// protocol boundary has already refused a window outside it.
 pub fn schedule_violation(schedule: &Schedule) -> Option<String> {
-    let expression = schedule
-        .schedule_expression
-        .as_deref()
-        .unwrap_or_default()
-        .trim();
+    // The wrapper comes off FIRST, so an empty expression and an empty wrapper
+    // report the same thing: neither says when the schedule runs.
+    let expression = cron_expression(schedule.schedule_expression.as_deref().unwrap_or_default());
     if expression.is_empty() {
         return Some(constraint_report(
             "schedule.scheduleExpression",
@@ -1831,13 +1862,11 @@ pub fn schedule_violation(schedule: &Schedule) -> Option<String> {
         ));
     }
     let fields: Vec<&str> = expression.split_whitespace().collect();
-    if fields.len() != CRON_FIELD_COUNT {
+    if !CRON_FIELD_COUNTS.contains(&fields.len()) {
         return Some(constraint_report(
             "schedule.scheduleExpression",
-            &format!(
-                "Member must be a cron expression of {CRON_FIELD_COUNT} fields: minutes hours \
-                 day_of_month month day_of_week year"
-            ),
+            "Member must be a cron expression of the fields: minutes hours day_of_month month \
+             day_of_week [year]",
         ));
     }
     // (field index, field name, the largest value that field admits)

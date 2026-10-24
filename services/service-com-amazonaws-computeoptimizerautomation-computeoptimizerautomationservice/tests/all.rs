@@ -47,5 +47,7 @@ mod resource_tags;
 mod rule_projection;
 #[path = "all/rule_value_validation.rs"]
 mod rule_value_validation;
+#[path = "all/schedule_expression_forms.rs"]
+mod schedule_expression_forms;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
