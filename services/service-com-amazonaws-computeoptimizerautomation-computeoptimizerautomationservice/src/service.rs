@@ -222,8 +222,11 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // this service's validation report (see
         // `crate::state::validation_report`) — how many members failed, then
         // one clause per member naming the member and the requirement it
-        // failed, with no rejected value echoed back. Authentication refusals
-        // keep the framework's wording (`None`).
+        // failed, with no rejected value echoed back; except for a value
+        // outside one of the service's enum PARAMETER TYPES, which that
+        // reporter words as the type's own rejection (the type, the value as
+        // sent, and the type's modelled values). Authentication refusals keep
+        // the framework's wording (`None`).
         match refusal {
             Refusal::Invalid(violations) => Some(Refused {
                 code: "InvalidParameterValueException".to_string(),
