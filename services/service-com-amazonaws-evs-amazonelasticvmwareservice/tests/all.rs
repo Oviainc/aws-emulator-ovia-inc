@@ -46,6 +46,8 @@ mod hcx_eip_associations;
 mod host_ec2_instances;
 #[path = "all/hosts.rs"]
 mod hosts;
+#[path = "all/list_vm_entitlements_connector.rs"]
+mod list_vm_entitlements_connector;
 #[path = "all/list_while_initializing.rs"]
 mod list_while_initializing;
 #[path = "all/state_roundtrip.rs"]

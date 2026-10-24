@@ -31,12 +31,20 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_evs_amazonelasticvmwareservice as evs;
 
+use crate::entitlement_connector::connector_in;
 use crate::environment_lifecycle::{call, create, emulator, error_type, settle, Emulator};
 
-/// A well-formed `connectorId` for the `ListVmEntitlements` rows: it satisfies the
-/// modelled `^(cnctr-[a-zA-Z0-9]{10})$`, which is all that is needed here, because the
-/// state of the environment is decided before any connector filter is applied.
-const CONNECTOR_ID: &str = "cnctr-0123456789";
+/// A well-formed `connectorId` no connector was ever minted at: it satisfies the
+/// modelled `^(cnctr-[a-zA-Z0-9]{10})$`, which is all a row needs where the environment
+/// is decided before the connector handle is resolved — the environment's state and its
+/// absence are both answered first. A row that expects the list to be ANSWERED carries
+/// a connector the environment really holds instead
+/// (`tests/all/list_vm_entitlements_connector.rs` owns the connector-handle rule).
+const UNKNOWN_CONNECTOR_ID: &str = "cnctr-0123456789";
+
+/// The type of connector the `ListVmEntitlements` rows are listed through — any
+/// modelled type resolves, so this picks the one an entitlement is created through.
+const VCENTER: &str = "VCENTER";
 
 /// The only `EntitlementType` the model declares
 /// (`smithy_query(query="shape", shape="EntitlementType")`).
@@ -72,7 +80,7 @@ const VLAN_COUNT: usize = 10;
 /// among them — it addresses the account and Region, not one environment resource — and
 /// neither is `ListTagsForResource`, which addresses a resource by ARN and declares no
 /// `ValidationException` at all.
-fn list_requests(environment: &str) -> Vec<(&'static str, Value, &'static str)> {
+fn list_requests(environment: &str, connector_id: &str) -> Vec<(&'static str, Value, &'static str)> {
     vec![
         (
             "ListEnvironmentVlans",
@@ -93,7 +101,7 @@ fn list_requests(environment: &str) -> Vec<(&'static str, Value, &'static str)> 
             "ListVmEntitlements",
             json!({
                 "environmentId": environment,
-                "connectorId": CONNECTOR_ID,
+                "connectorId": connector_id,
                 "entitlementType": WINDOWS_SERVER,
             }),
             "entitlements",
@@ -158,8 +166,12 @@ async fn every_list_of_an_environment_is_refused_while_it_is_initializing() {
     // NOT settled: a freshly created environment is CREATING, which is the initializing
     // state.
     let id = create(&router, Some("initializing-env")).await;
+    // A connector of that environment, so the `ListVmEntitlements` rows carry a handle
+    // that resolves: the refusal under test must be the environment's state and not the
+    // connector lookup. A connector can be created while the environment initializes.
+    let connector = connector_in(&router, "initializing-env", &id, VCENTER).await;
 
-    for (operation, request, _) in list_requests(&id) {
+    for (operation, request, _) in list_requests(&id, &connector) {
         let case = format!("{operation} while CREATING");
         let (status, body) = call(&router, operation, &request).await;
         assert_initializing_refusal(&case, status, &body);
@@ -169,7 +181,7 @@ async fn every_list_of_an_environment_is_refused_while_it_is_initializing() {
     // come due: the refusal is the initializing state's and not the operation's answer
     // to everything.
     settle(&router);
-    for (operation, request, member) in list_requests(&id) {
+    for (operation, request, member) in list_requests(&id, &connector) {
         let case = format!("{operation} once CREATED");
         let (status, body) = call(&router, operation, &request).await;
         assert_eq!(
@@ -187,6 +199,7 @@ async fn every_list_of_an_environment_is_refused_while_it_is_initializing() {
 async fn a_list_is_refused_in_the_initializing_state_and_answered_in_every_other_one() {
     let router = emulator();
     let id = create(&router, Some("state-table-env")).await;
+    let connector = connector_in(&router, "state-table-env", &id, VCENTER).await;
     // Settled first, so the state each row forces is the state the list sees: an
     // environment that still owes a transition would leave the forced state behind as
     // soon as that transition came due.
@@ -194,7 +207,7 @@ async fn a_list_is_refused_in_the_initializing_state_and_answered_in_every_other
 
     for (state, initializing) in ENVIRONMENT_STATES {
         force_state(&router, &id, state);
-        for (operation, request, member) in list_requests(&id) {
+        for (operation, request, member) in list_requests(&id, &connector) {
             let case = format!("{operation} against an environment in {state}");
             let (status, body) = call(&router, operation, &request).await;
             if initializing {
@@ -266,7 +279,7 @@ async fn an_absent_environment_is_still_reported_absent_rather_than_initializing
     // One real, initializing environment, so the store is not empty.
     let _initializing = create(&router, Some("present-but-initializing")).await;
 
-    for (operation, request, _) in list_requests(absent) {
+    for (operation, request, _) in list_requests(absent, UNKNOWN_CONNECTOR_ID) {
         let case = format!("{operation} against an absent environment");
         let (status, body) = call(&router, operation, &request).await;
         assert_eq!(

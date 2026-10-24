@@ -18,7 +18,9 @@
 //!   entitled through the same connector reports the stored record and creates nothing.
 //! * An entitlement belongs to the connector it was created through: "Returns existing
 //!   entitlements for virtual machines associated with the specified environment and
-//!   connector" (`ListVmEntitlements` doc).
+//!   connector" (`ListVmEntitlements` doc). A `connectorId` the addressed environment
+//!   holds no live connector for is refused instead of reported as an empty page —
+//!   `tests/all/list_vm_entitlements_connector.rs` owns that rule.
 //! * Every entitlement here is created through a connector this environment really
 //!   holds, minted by `CreateEnvironmentConnector`: "using the provided vCenter Server
 //!   connector" (`CreateEntitlement` doc). The refusal of a `connectorId` the
@@ -428,21 +430,19 @@ async fn entitlements_belong_to_the_connector_they_were_created_through() {
         }
     }
 
-    // Each row: the case, the environment listed, and the connector id it is listed
-    // with — a connector that holds no entitlement IN that environment. Both are
-    // connectors this emulator really minted: a connector of another type in the first
-    // environment, and the other environment's vCenter connector. The list filters the
-    // environment's records by connector ("Returns existing entitlements for virtual
-    // machines associated with the specified environment and connector"), so each is an
-    // empty page and never somebody else's records.
+    // Each row: the case, and the connector id the first environment is listed with — a
+    // connector that environment really holds, of another type, which holds no
+    // entitlement. The pair selects which records are reported ("Returns existing
+    // entitlements for virtual machines associated with the specified environment and
+    // connector"), so this is an empty page and never somebody else's records. A
+    // connector id the environment holds NO connector for is a different answer —
+    // `ResourceNotFoundException`, owned by `tests/all/list_vm_entitlements_connector.rs`.
     let (_, first_environment, first_connector, _) = &rows[0];
     let (_, _, other_connector, _) = &rows[1];
     let unused_type_connector =
         connector_in(&router, "an unused type", first_environment, "SDDC_MANAGER").await;
-    let empty_cases: [(&str, &str); 2] = [
-        ("a connector of another type", unused_type_connector.as_str()),
-        ("another environment's connector", other_connector.as_str()),
-    ];
+    let empty_cases: [(&str, &str); 1] =
+        [("a connector of another type", unused_type_connector.as_str())];
     for (case, connector) in empty_cases {
         let (status, body) = call(
             &router,

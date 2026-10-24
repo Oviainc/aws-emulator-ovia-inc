@@ -124,12 +124,21 @@ fn entitlements(case: &str, body: &Value) -> Vec<Value> {
 
 /// Assert one refusal: HTTP 400, a `ResourceNotFoundException` naming the connector the
 /// REQUEST asked for, and no entitlement stored for it.
+///
+/// `connector_of_the_environment` says whether the id names a connector the addressed
+/// environment really holds (a live connector of a type an entitlement cannot be created
+/// through) or no connector of it at all. It decides how the read-back answers: a
+/// `ListVmEntitlements` for a handle that resolves reports an empty page, and one for a
+/// handle that resolves to nothing is itself refused
+/// (`tests/all/list_vm_entitlements_connector.rs` owns that rule). Either way it shows
+/// the refused create persisted nothing.
 async fn assert_refused(
     router: &Emulator,
     case: &str,
     environment_id: &str,
     connector_id: &str,
     vm_ids: &[&str],
+    connector_of_the_environment: bool,
 ) {
     let (status, body) = call(
         router,
@@ -164,14 +173,32 @@ async fn assert_refused(
         &list_request(environment_id, connector_id),
     )
     .await;
-    assert_eq!(
-        status, 200,
-        "case {case:?}: the read-back expected 200, got {status} {listed}"
-    );
-    assert!(
-        entitlements(case, &listed).is_empty(),
-        "case {case:?}: the refused create must persist nothing, got {listed}"
-    );
+    if connector_of_the_environment {
+        assert_eq!(
+            status, 200,
+            "case {case:?}: the read-back expected 200, got {status} {listed}"
+        );
+        assert!(
+            entitlements(case, &listed).is_empty(),
+            "case {case:?}: the refused create must persist nothing, got {listed}"
+        );
+    } else {
+        assert_eq!(
+            status, 400,
+            "case {case:?}: a list for a connector this environment does not hold is \
+             refused too, got {status} {listed}"
+        );
+        assert_eq!(
+            error_type(&listed).rsplit(['#', '/']).next().unwrap_or(""),
+            "ResourceNotFoundException",
+            "case {case:?}: the read-back expected a ResourceNotFoundException, got {}",
+            error_type(&listed)
+        );
+        assert!(
+            listed["entitlements"].is_null(),
+            "case {case:?}: a refusal reports no page, got {listed}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -191,21 +218,24 @@ async fn a_connector_id_the_environment_holds_no_vcenter_connector_for_is_refuse
     // of a different environment, and the number of VMs asked for.
     let hundred_vms: Vec<String> = (1..=100).map(|ordinal| format!("vm-{ordinal}")).collect();
     let at_the_vm_ids_bound: Vec<&str> = hundred_vms.iter().map(String::as_str).collect();
-    let mut rows: Vec<(String, String, Vec<&str>)> = vec![
+    let mut rows: Vec<(String, String, Vec<&str>, bool)> = vec![
         (
             "a never-minted id, all digits".to_string(),
             "cnctr-0123456789".to_string(),
             vec!["vm-1"],
+            false,
         ),
         (
             "a never-minted id, lower case".to_string(),
             "cnctr-abcdefghij".to_string(),
             vec!["vm-1", "vm-2", "vm-3"],
+            false,
         ),
         (
             "a never-minted id, upper case".to_string(),
             "cnctr-ZZZZZZZZZZ".to_string(),
             vec!["vm-9"],
+            false,
         ),
         (
             // The modelled maximum of `vmIds` is 100 entries: a request at that bound
@@ -213,11 +243,13 @@ async fn a_connector_id_the_environment_holds_no_vcenter_connector_for_is_refuse
             "a never-minted id, mixed, at the vmIds maximum".to_string(),
             "cnctr-0A1b2C3d4E".to_string(),
             at_the_vm_ids_bound,
+            false,
         ),
         (
             "another environment's vCenter connector".to_string(),
             other_vcenter.clone(),
             vec!["vm-1"],
+            false,
         ),
     ];
 
@@ -230,6 +262,7 @@ async fn a_connector_id_the_environment_holds_no_vcenter_connector_for_is_refuse
             format!("a live {connector_type} connector of this environment"),
             id,
             vec!["vm-1"],
+            true,
         ));
     }
     // The table covers every modelled type: each non-vCenter one as a refusal row, and
@@ -245,8 +278,16 @@ async fn a_connector_id_the_environment_holds_no_vcenter_connector_for_is_refuse
         "every non-vCenter modelled type must have a row, got {rows:?}"
     );
 
-    for (case, connector_id, vm_ids) in &rows {
-        assert_refused(&router, case, &environment, connector_id, vm_ids).await;
+    for (case, connector_id, vm_ids, connector_of_the_environment) in &rows {
+        assert_refused(
+            &router,
+            case,
+            &environment,
+            connector_id,
+            vm_ids,
+            *connector_of_the_environment,
+        )
+        .await;
     }
 
     // The connector that DOES exist in this environment is still served, so the

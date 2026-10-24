@@ -7,13 +7,15 @@
 //! has made due already applied. An `environmentId` this service holds no environment
 //! for in the request's Region is a `ResourceNotFoundException`.
 //!
-//! `connectorId` is a FILTER on that environment's records here, not a lookup of its
-//! own: "Returns existing entitlements for virtual machines associated with the
-//! specified environment and connector" (this operation's doc), so a connector that
-//! holds no entitlement in the environment is an empty page. It cannot report a
-//! phantom connector's entitlement either way, because
-//! [`crate::ops::create_entitlement`] refuses to create one through a `connectorId`
-//! the environment holds no live vCenter connector for.
+//! `connectorId` is a required resource handle, so it is RESOLVED against that
+//! environment's connectors before it is used to select records: an id the environment
+//! holds no live connector for names no resource of the request and is refused with
+//! `ResourceNotFoundException`, exactly as [`crate::ops::create_entitlement`] and
+//! [`crate::ops::update_environment_connector`] refuse one. A connector the environment
+//! DOES hold and that carries no entitlement of the requested type is an empty page:
+//! "Returns existing entitlements for virtual machines associated with the specified
+//! environment and connector" (this operation's doc) — the records are selected by the
+//! pair, once both resources resolve.
 //!
 //! ## Shape of an operation
 //!
@@ -227,10 +229,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(ListVmEntitlementsErrorModeled::ValidationException(refusal).into());
         }
 
+        // `connectorId` is a required handle on a resource of that environment, not a
+        // free-text label: an id the environment holds no live connector for resolves to
+        // nothing, so the request is refused with the operation's modelled
+        // `ResourceNotFoundException` naming the connector the REQUEST asked for, rather
+        // than answered with an empty page a caller cannot tell from a connector that
+        // has no entitlement yet. A connector that has reached DELETED resolves to
+        // nothing either ("it may have a `state` of `DELETED`",
+        // `ResourceNotFoundException` doc). The connector's TYPE is not a condition here:
+        // this reports the records of a connector the environment holds, whichever type
+        // it is, and only `CreateEntitlement` requires the vCenter appliance the
+        // entitlement is tracked through.
+        if crate::state::live_connector(environment, &input.connector_id).is_none() {
+            return Err(ListVmEntitlementsErrorModeled::ResourceNotFoundException(
+                crate::state::connector_not_found(&input.connector_id),
+            )
+            .into());
+        }
+
         // "Returns existing entitlements for virtual machines associated with the
-        // specified environment and connector": the connector and the entitlement type
-        // the request names are a filter on the environment's records, not a lookup key
-        // of their own.
+        // specified environment and connector": with both resources resolved, the
+        // connector and the entitlement type the request names select the environment's
+        // records to report.
         let mut matching = environment
             .entitlements
             .range::<str, _>((
