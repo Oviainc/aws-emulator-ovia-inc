@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeQev2IdcApplications
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeQev2IdcApplications`'s real behaviour. Implement it here — this is
+//! IMPLEMENTED: reports the registered Query Editor (QEV2) IAM Identity Center
+//! applications, one page at a time. This is
 //! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeQev2IdcApplications::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -161,20 +155,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeQev2IdcApplications` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeQev2IdcApplicationsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeQev2IdcApplications"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                DescribeQev2IdcApplicationsErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // A pure report: nothing here changes what a later caller sees, and a
+        // registered application carries no status the clock owes a transition on.
+        let store = state.lock();
+
+        // Select by REFERENCE, then clone only the page: the work done under the
+        // state lock is proportional to the page, not to the whole store. One
+        // walk serves both the selection and the existence check below.
+        let matched: Vec<&Qev2IdcApplication> = store
+            .qev2_idc_applications
+            .iter()
+            .filter(|application| {
+                input
+                    .qev2_idc_application_arn
+                    .as_deref()
+                    .is_none_or(|wanted| {
+                        application.qev2_idc_application_arn.as_deref() == Some(wanted)
+                    })
+            })
+            .collect();
+
+        // An ARN that names no application is refused rather than reported as an
+        // empty page; an UNFILTERED read of a store holding none is an empty
+        // page, which is what "no application exists" looks like.
+        if let Some(wanted) = input.qev2_idc_application_arn.as_deref() {
+            if matched.is_empty() {
+                return Err(
+                    DescribeQev2IdcApplicationsErrorModeled::Qev2IdcApplicationNotExistsFault(
+                        Qev2IdcApplicationNotExistsFault {
+                            message: Some(format!(
+                                "Amazon Redshift Query Editor (QEV2) IAM Identity Center application not found: {wanted}"
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let (start, end, next_marker) =
+            match st::page_bounds(input.marker.as_deref(), input.max_records, matched.len()) {
+                Ok(page) => page,
+                Err(message) => return Err(crate::scaffolded::Scaffolded::validation(message)),
+            };
+
+        Ok(DescribeQev2IdcApplicationsOutput {
+            qev2_idc_applications: Some(
+                matched[start..end]
+                    .iter()
+                    .map(|application| (*application).clone())
+                    .collect(),
+            ),
+            marker: next_marker,
+        })
     }
 }

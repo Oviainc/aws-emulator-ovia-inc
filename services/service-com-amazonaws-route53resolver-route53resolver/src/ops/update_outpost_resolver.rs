@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateOutpostResolver
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateOutpostResolver`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateOutpostResolver::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! SCAFFOLD REPLACED: implemented. Updates the instance count, instance type or name of a
+//! stored Resolver on an Outpost.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +157,87 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateOutpostResolver` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateOutpostResolverErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateOutpostResolver"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                UpdateOutpostResolverErrorModeled::InternalServiceErrorException(
+                    InternalServiceErrorException {
+                        message: Some("the Route 53 Resolver store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Same documented minimum as on the create path: `InstanceCount`'s
+        // "default and minimal value is 4". Refused before the store is locked,
+        // so a rejected update leaves the record exactly as it was.
+        if let Some(requested) = input.instance_count {
+            if requested < crate::state::OUTPOST_RESOLVER_INSTANCE_COUNT_DEFAULT {
+                return Err(UpdateOutpostResolverErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "InstanceCount must be at least {}, got {requested}",
+                            crate::state::OUTPOST_RESOLVER_INSTANCE_COUNT_DEFAULT
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let now = ::std::time::Instant::now();
+        let mut store = state.lock();
+        let Some(record) = store.outpost_resolvers.get_mut(&input.id) else {
+            return Err(UpdateOutpostResolverErrorModeled::ResourceNotFoundException(
+                crate::state::outpost_resolver_not_found(&input.id),
+            )
+            .into());
+        };
+
+        // `ConflictException`: "The requested state transition isn't valid." A
+        // Resolver whose provisioning (or a previous update) has not settled is
+        // not in a state another update can be applied from, so the call is
+        // refused and nothing is written.
+        let current_status = record.status_at(now);
+        if current_status != crate::state::OUTPOST_RESOLVER_STATUS_OPERATIONAL {
+            return Err(UpdateOutpostResolverErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(format!(
+                        "Resolver on Outpost with ID \"{}\" is {current_status} and cannot be updated.",
+                        input.id
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Only the members the request carries are written; an absent member
+        // leaves the stored value alone. A request that carries none of them
+        // writes nothing at all, so it does not drive a settled Resolver back
+        // out of `OPERATIONAL` or move its `ModificationTime`.
+        let mut written = false;
+        if let Some(name) = input.name.clone() {
+            record.name = name;
+            written = true;
+        }
+        if let Some(instance_count) = input.instance_count {
+            record.instance_count = instance_count;
+            written = true;
+        }
+        if let Some(instance_type) = input.preferred_instance_type.clone() {
+            record.preferred_instance_type = instance_type;
+            written = true;
+        }
+
+        if written {
+            record.status = crate::state::OUTPOST_RESOLVER_STATUS_UPDATING.to_string();
+            record.ready_at = now + crate::state::PROVISIONING_DELAY;
+            record.modification_time = crate::state::now_rfc3339();
+        }
+
+        Ok(UpdateOutpostResolverOutput {
+            outpost_resolver: Some(record.to_outpost_resolver(now)),
+        })
     }
 }

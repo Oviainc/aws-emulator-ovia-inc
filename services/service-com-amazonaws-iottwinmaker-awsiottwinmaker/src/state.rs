@@ -208,6 +208,43 @@ pub const METADATA_TRANSFER_JOB_ERROR_MESSAGE: &str =
 pub const METADATA_TRANSFER_JOB_ROLE_PATH: &str =
     "role/aws-service-role/iottwinmaker.amazonaws.com/AWSServiceRoleForIoTTwinMaker";
 
+/// The `MetadataTransferJobState` values `CancelMetadataTransferJob` owns, and
+/// the third TERMINAL value of the enum.
+///
+/// `CANCELLING` is the state a cancellation the service has accepted puts the
+/// job in: the transfer is being torn down, so it is non-terminal and the clock
+/// owes `CANCELLED` ([`METADATA_TRANSFER_JOB_CANCEL_SPAN`]). `CANCELLED` and
+/// `COMPLETED` are terminal, as [`METADATA_TRANSFER_JOB_STATE_ERROR`] is:
+/// nothing moves a job out of one, so there is nothing left to cancel
+/// ([`metadata_transfer_job_state_is_terminal`]). `COMPLETED` is a state no
+/// operation of this emulator writes — it is the outcome of a transfer that ran,
+/// and none does (see [`METADATA_TRANSFER_JOB_ERROR_CODE`]) — but it is named
+/// here because the terminal rule holds for it too. The full value list is
+/// `METADATA_TRANSFER_JOB_STATE_VALUES` in `ops::types`.
+pub const METADATA_TRANSFER_JOB_STATE_CANCELLING: &str = "CANCELLING";
+/// See [`METADATA_TRANSFER_JOB_STATE_CANCELLING`]. TERMINAL.
+pub const METADATA_TRANSFER_JOB_STATE_CANCELLED: &str = "CANCELLED";
+/// See [`METADATA_TRANSFER_JOB_STATE_CANCELLING`]. TERMINAL.
+pub const METADATA_TRANSFER_JOB_STATE_COMPLETED: &str = "COMPLETED";
+
+/// How long a metadata transfer job stays in
+/// [`METADATA_TRANSFER_JOB_STATE_CANCELLING`] before the clock makes its
+/// transition to [`METADATA_TRANSFER_JOB_STATE_CANCELLED`] due.
+///
+/// `CancelMetadataTransferJob` answers with the job's status, and the status of
+/// a job whose cancellation the service has just accepted is the non-terminal
+/// `CANCELLING` — the transfer is being torn down, and the job is `CANCELLED`
+/// once that teardown has landed. AWS documents no duration for that window, so
+/// this span is CHOSEN by this emulator, exactly as
+/// [`METADATA_TRANSFER_JOB_SETTLE_SPAN`] and [`COMPONENT_TYPE_SETTLE_SPAN`] are:
+/// deliberately non-zero, so a caller that reads the job back in the same breath
+/// as the cancel still observes `CANCELLING`, and deliberately short, so a client
+/// that polls reaches `CANCELLED` without a long wait. Nothing sleeps for it: the
+/// instant it is due is stored on the record
+/// ([`MetadataTransferJob::settles_at`]) and a reader materialises the
+/// transition the clock already owed.
+pub const METADATA_TRANSFER_JOB_CANCEL_SPAN: Duration = Duration::from_millis(500);
+
 /// The one `SyncSource` this service supports.
 ///
 /// Taken from the model, not chosen here: the `syncSource` member of every sync
@@ -898,12 +935,22 @@ pub struct MetadataTransferJob {
     pub state: String,
     /// Why the job is in a failed state, and `None` while nothing has failed.
     pub error: Option<crate::ops::types::ErrorDetails>,
-    /// The instant the transition out of
-    /// [`METADATA_TRANSFER_JOB_STATE_VALIDATING`] falls due — the instant of
-    /// the create plus [`METADATA_TRANSFER_JOB_SETTLE_SPAN`]. Stored, never
-    /// slept for, so a reader can materialise a transition the clock already
-    /// owed without any caller having had to poll.
+    /// The instant the transition out of the job's current NON-TERMINAL state
+    /// falls due — the instant of the create plus
+    /// [`METADATA_TRANSFER_JOB_SETTLE_SPAN`] for the outcome a created job is
+    /// owed, or the instant of the cancel plus
+    /// [`METADATA_TRANSFER_JOB_CANCEL_SPAN`] once a cancellation has been
+    /// accepted ([`begin_cancel`](Self::begin_cancel)). Stored, never slept
+    /// for, so a reader can materialise a transition the clock already owed
+    /// without any caller having had to poll.
     pub settles_at: SystemTime,
+    /// The `MetadataTransferJobState` the transition due at
+    /// [`settles_at`](Self::settles_at) puts the job in:
+    /// [`METADATA_TRANSFER_JOB_STATE_ERROR`] for the outcome of a job nothing
+    /// transferred, or [`METADATA_TRANSFER_JOB_STATE_CANCELLED`] once a
+    /// cancellation has been accepted. It is read only while the job is
+    /// non-terminal: a job that has settled owes nothing more.
+    pub settles_to: String,
 }
 
 impl MetadataTransferJob {
@@ -932,7 +979,17 @@ impl MetadataTransferJob {
             state: METADATA_TRANSFER_JOB_STATE_VALIDATING.to_string(),
             error: None,
             settles_at: now + METADATA_TRANSFER_JOB_SETTLE_SPAN,
+            // The outcome an accepted job is owed: the modelled failure state,
+            // because this emulator transfers no metadata.
+            settles_to: METADATA_TRANSFER_JOB_STATE_ERROR.to_string(),
         }
+    }
+
+    /// Whether this job has finished for good: see
+    /// [`metadata_transfer_job_state_is_terminal`]. A job that has not is one
+    /// the clock still owes the transition at [`settles_at`](Self::settles_at).
+    pub fn is_terminal(&self) -> bool {
+        metadata_transfer_job_state_is_terminal(&self.state)
     }
 
     /// Materialise the lifecycle transition the CLOCK has already made due.
@@ -943,25 +1000,58 @@ impl MetadataTransferJob {
     /// writing it here makes the record say what was already true rather than
     /// changing anything a read caused.
     ///
-    /// The outcome is the modelled failure state: no metadata was transferred,
-    /// because this emulator transfers none (see
+    /// The outcome of a CREATED job is the modelled failure state: no metadata
+    /// was transferred, because this emulator transfers none (see
     /// [`METADATA_TRANSFER_JOB_ERROR_CODE`]), so the job carries the error that
-    /// says so instead of a `COMPLETED` nothing earned. Idempotent, a no-op
-    /// before the instant falls due, and a no-op on a job some other operation
-    /// has already moved out of the non-terminal state.
+    /// says so instead of a `COMPLETED` nothing earned. The outcome of a job
+    /// whose CANCELLATION was accepted is
+    /// [`METADATA_TRANSFER_JOB_STATE_CANCELLED`], which carries no error:
+    /// nothing failed, a caller asked the transfer to stop. Which of the two is
+    /// due is [`settles_to`](Self::settles_to). Idempotent, a no-op before the
+    /// instant falls due, and a no-op on a job that has already settled.
     pub fn settle(&mut self, now: SystemTime) {
-        if self.state != METADATA_TRANSFER_JOB_STATE_VALIDATING || now < self.settles_at {
+        if self.is_terminal() || now < self.settles_at {
             return;
         }
-        self.state = METADATA_TRANSFER_JOB_STATE_ERROR.to_string();
-        self.error = Some(crate::ops::types::ErrorDetails {
-            code: Some(METADATA_TRANSFER_JOB_ERROR_CODE.to_string()),
-            message: Some(METADATA_TRANSFER_JOB_ERROR_MESSAGE.to_string()),
-        });
+        self.state = self.settles_to.clone();
+        if self.state == METADATA_TRANSFER_JOB_STATE_ERROR {
+            self.error = Some(crate::ops::types::ErrorDetails {
+                code: Some(METADATA_TRANSFER_JOB_ERROR_CODE.to_string()),
+                message: Some(METADATA_TRANSFER_JOB_ERROR_MESSAGE.to_string()),
+            });
+        }
         // The change fell due at `settles_at`, not at the instant a caller
         // happened to ask, so that is when the job was last updated: two reads
         // of a settled job report the same instant.
         self.update_date_time = self.settles_at;
+    }
+
+    /// Accept a cancellation at `now`: the job leaves whichever non-terminal
+    /// state it was in for the non-terminal
+    /// [`METADATA_TRANSFER_JOB_STATE_CANCELLING`] — the teardown is in flight —
+    /// and the instant the clock owes
+    /// [`METADATA_TRANSFER_JOB_STATE_CANCELLED`] is stored beside it, never
+    /// slept for. See [`settle`](Self::settle).
+    ///
+    /// A job that has FINISHED is left exactly as it is, and so is one whose
+    /// cancellation the service has ALREADY accepted: the transition the clock
+    /// already owed is materialised first, a job that is terminal once it has
+    /// has nothing left to cancel, and a job already in
+    /// [`METADATA_TRANSFER_JOB_STATE_CANCELLING`] is being torn down under the
+    /// instant the clock already owes it — so neither that instant nor
+    /// `updateDateTime` moves when the same cancellation arrives twice. Both
+    /// rules live here rather than in the caller;
+    /// `CancelMetadataTransferJob` tests terminality too, because that is what
+    /// it answers the caller's `ConflictException` for.
+    pub fn begin_cancel(&mut self, now: SystemTime) {
+        self.settle(now);
+        if self.is_terminal() || self.state == METADATA_TRANSFER_JOB_STATE_CANCELLING {
+            return;
+        }
+        self.state = METADATA_TRANSFER_JOB_STATE_CANCELLING.to_string();
+        self.update_date_time = now;
+        self.settles_at = now + METADATA_TRANSFER_JOB_CANCEL_SPAN;
+        self.settles_to = METADATA_TRANSFER_JOB_STATE_CANCELLED.to_string();
     }
 
     /// The job's modelled `MetadataTransferJobStatus`: its stored state and,
@@ -1128,6 +1218,24 @@ impl ComponentType {
     pub fn is_abstract(&self) -> bool {
         false
     }
+}
+
+/// Whether a `MetadataTransferJobState` is TERMINAL — a state the job has
+/// finished in and never leaves, so there is nothing left for a cancellation to
+/// stop.
+///
+/// The model's `MetadataTransferJobState` enum
+/// (`ops::types::METADATA_TRANSFER_JOB_STATE_VALUES`) holds three such values:
+/// the transfer ran to the end (`COMPLETED`), it was cancelled (`CANCELLED`),
+/// or it failed (`ERROR`). Every other value is a state the job is still
+/// moving through.
+pub fn metadata_transfer_job_state_is_terminal(state: &str) -> bool {
+    matches!(
+        state,
+        METADATA_TRANSFER_JOB_STATE_COMPLETED
+            | METADATA_TRANSFER_JOB_STATE_CANCELLED
+            | METADATA_TRANSFER_JOB_STATE_ERROR
+    )
 }
 
 /// The modelled `Status` of a resource in `state`.
@@ -1800,6 +1908,19 @@ pub fn component_type_not_found_message(workspace_id: &str, component_type_id: &
 /// construction as [`entity_not_found_message`] one resource across.
 pub fn scene_not_found_message(workspace_id: &str, scene_id: &str) -> String {
     format!("Scene {scene_id} in workspace {workspace_id} not found.")
+}
+
+/// The message for a cancellation of a job that has already finished. Built
+/// from the request and the store: it names the job and the terminal state it
+/// finished in, which is what makes the conflict actionable for a caller that
+/// polled a moment too late.
+pub fn metadata_transfer_job_terminal_message(
+    metadata_transfer_job_id: &str,
+    state: &str,
+) -> String {
+    format!(
+        "MetadataTransferJob {metadata_transfer_job_id} is {state} and can no longer be cancelled."
+    )
 }
 
 /// The message for a sync job the workspace the request named does not hold.

@@ -21,6 +21,13 @@
 //! ([`MaintenanceStartTime`], [`BandwidthRateLimitInterval`]) rather than mirroring
 //! them, so a member cannot drift between what is stored and what is serialised.
 //!
+//! The gateway's MAINTENANCE WINDOW ([`StoredGateway::maintenance_start_time`]) is written
+//! by `PutMaintenanceStartTime` and by nothing else
+//! ([`ComAmazonawsBackupgatewayBackuponpremisesV20210101State::set_maintenance_start_time`]),
+//! and `GetGateway` reports whatever that field holds: a window is one resource, so a put
+//! REPLACES it whole rather than merging into it, and every reader of the record agrees on
+//! the window the last put wrote.
+//!
 //! The second resource this store owns is the **hypervisor** ([`StoredHypervisor`]),
 //! keyed by its own ARN: `GetHypervisor` resolves it out of that map and reports the
 //! record, `ListHypervisors` pages over that map in ARN order, and the state either one
@@ -218,6 +225,30 @@ pub const GATEWAY_OUT_OF_DATE: &str = "GatewayOutOfDate";
 /// (`issues/.../backup-gateway-puthypervisorpropertymappings-stub.md`), kept in one place
 /// so every operation the gateway has to carry out refuses the same way.
 pub const GATEWAY_OUT_OF_DATE_MESSAGE: &str = "The specified gateway is out of date.";
+
+/// `ValidationException$ErrorCode` for a maintenance window that names a day of the week
+/// AND a day of the month, and the sentence that states it.
+///
+/// A maintenance start time is one window: "This is your gateway's weekly maintenance
+/// start time including the day and time of the week. … Can be weekly or monthly"
+/// (`smithy_query(query="shape",shape="MaintenanceStartTime")`) — weekly OR monthly, so
+/// the two day members cannot hold together and a request carrying both states no window
+/// the service can keep. The model declares each member on its own, so the boundary
+/// validator cannot express the exclusion and the handler enforces it.
+///
+/// `ValidationException$ErrorCode` is documented as "A description of what caused the
+/// validation error" (`smithy_query(query="shape",shape="ValidationException")`) and AWS
+/// publishes no vocabulary for that member, so this value names the condition the way
+/// [`GATEWAY_OUT_OF_DATE`] names its own.
+pub const MAINTENANCE_START_TIME_INVALID: &str = "InvalidMaintenanceStartTime";
+
+/// See [`MAINTENANCE_START_TIME_INVALID`]. AWS publishes no wording for this refusal, so
+/// the sentence is an example; the requirement is the error shape, the status and the
+/// `ErrorCode`, and the sentence names the two members that cannot hold together so the
+/// caller can fix the request from it alone.
+pub const MAINTENANCE_START_TIME_INVALID_MESSAGE: &str =
+    "A maintenance start time is weekly or monthly: DayOfWeek and DayOfMonth cannot both \
+     be specified.";
 
 /// The region a minted ARN falls back to when the request carries no SigV4 credential
 /// scope to read one from (an unsigned request on an emulator with authentication off).
@@ -873,6 +904,27 @@ impl ComAmazonawsBackupgatewayBackuponpremisesV20210101State {
     /// carry the whole store.
     pub fn page_of_gateways(&self, after: Option<&str>, limit: usize) -> Page<StoredGateway> {
         page_of(&self.gateways, after, limit)
+    }
+
+    /// Set the maintenance start time of the gateway stored under `arn`, and hand back the
+    /// record as it is now STORED — read out of the map after the write, so what a caller
+    /// gets is what the store holds.
+    ///
+    /// `None` — nothing written — when this store holds no gateway under `arn`.
+    ///
+    /// The window REPLACES whatever that gateway carried: the request states the window
+    /// the gateway is to have, so a day the request does not carry is not on the record
+    /// afterwards either (a monthly window does not keep the `DayOfWeek` a weekly one left
+    /// behind), and setting the same window again leaves the record exactly as one call
+    /// left it. Nothing else on the record is touched — setting the window neither moves
+    /// the gateway's association nor touches its schedule or tags.
+    pub fn set_maintenance_start_time(
+        &mut self,
+        arn: &str,
+        window: MaintenanceStartTime,
+    ) -> Option<StoredGateway> {
+        self.gateways.get_mut(arn)?.maintenance_start_time = Some(window);
+        self.gateways.get(arn).cloned()
     }
 
     /// Associate the gateway stored under `gateway_arn` with the hypervisor stored under

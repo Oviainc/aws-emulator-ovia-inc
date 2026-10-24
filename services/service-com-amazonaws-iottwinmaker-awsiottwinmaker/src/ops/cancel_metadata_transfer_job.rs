@@ -1,15 +1,19 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CancelMetadataTransferJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CancelMetadataTransferJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CancelMetadataTransferJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Cancels a metadata transfer job: the job leaves whichever non-terminal state
+//! it was in for the non-terminal `CANCELLING`, and the clock — not a caller —
+//! settles it in `CANCELLED` once
+//! [`crate::state::METADATA_TRANSFER_JOB_CANCEL_SPAN`] has elapsed, the same
+//! way the create's outcome falls due. A job that has already finished
+//! (`COMPLETED`, `CANCELLED`, or the `ERROR` an accepted job settles in because
+//! this emulator transfers no metadata) has nothing left to cancel, so the call
+//! is refused with the modelled `ConflictException` (HTTP 409); a job this
+//! account does not hold is the modelled `ResourceNotFoundException` (HTTP 404).
+//!
+//! Authorization is not emulated, so the modelled `AccessDeniedException` is
+//! never returned.
 //!
 //! ## Shape of an operation
 //!
@@ -152,18 +156,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CancelMetadataTransferJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CancelMetadataTransferJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CancelMetadataTransferJob"))
+        // Every call is recorded, successful or refused: the real service logs
+        // control-plane access, and this one mutates tenant state.
+        ::tracing::info!(
+            operation = "CancelMetadataTransferJob",
+            metadata_transfer_job_id = %input.metadata_transfer_job_id,
+            "serving a request"
+        );
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CancelMetadataTransferJobErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the iottwinmaker store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let mut state = state.lock();
+
+        let Some(job) = state
+            .metadata_transfer_jobs
+            .get_mut(&input.metadata_transfer_job_id)
+        else {
+            // The outcome is recorded too, so the record of this call says what
+            // the service answered and not only that it was asked.
+            ::tracing::info!(
+                operation = "CancelMetadataTransferJob",
+                metadata_transfer_job_id = %input.metadata_transfer_job_id,
+                outcome = "ResourceNotFoundException",
+                "refusing a request"
+            );
+            return Err(
+                CancelMetadataTransferJobErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::metadata_transfer_job_not_found_message(
+                            &input.metadata_transfer_job_id,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // The clock, not this call, is what moves the job on: its outcome was
+        // due at `settles_at`, so judging this request against the
+        // un-materialised state would cancel a job that had already finished.
+        let now = ::std::time::SystemTime::now();
+        job.settle(now);
+
+        // A job that has finished has nothing left to cancel. That is a
+        // conflict with the job's own state, which is what this operation's
+        // `ConflictException` (HTTP 409) reports.
+        if job.is_terminal() {
+            ::tracing::info!(
+                operation = "CancelMetadataTransferJob",
+                metadata_transfer_job_id = %input.metadata_transfer_job_id,
+                state = %job.state,
+                outcome = "ConflictException",
+                "refusing a request"
+            );
+            return Err(CancelMetadataTransferJobErrorModeled::ConflictException(
+                ConflictException {
+                    message: Some(crate::state::metadata_transfer_job_terminal_message(
+                        &input.metadata_transfer_job_id,
+                        &job.state,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // Accept the cancellation. Cancelling a job that is ALREADY cancelling
+        // is the same request arriving twice, and `begin_cancel` owns that
+        // rule: the service has accepted this cancellation, so the second call
+        // reports the same accepted status and changes nothing — neither the
+        // instant the job was last updated nor the instant the teardown it
+        // already started falls due.
+        job.begin_cancel(now);
+
+        ::tracing::info!(
+            operation = "CancelMetadataTransferJob",
+            metadata_transfer_job_id = %input.metadata_transfer_job_id,
+            state = %job.state,
+            outcome = "accepted",
+            "served a request"
+        );
+
+        Ok(CancelMetadataTransferJobOutput {
+            metadata_transfer_job_id: job.metadata_transfer_job_id.clone(),
+            arn: job.arn.clone(),
+            update_date_time: crate::state::timestamp(job.update_date_time),
+            status: job.status(),
+            // Absent, for the reason `GetMetadataTransferJob` leaves it absent:
+            // a progress count counts what a transfer moved, and this emulator
+            // transfers no metadata — least of all a cancellation, which moves
+            // nothing by definition.
+            progress: None,
+        })
     }
 }
