@@ -638,10 +638,12 @@ async fn a_filter_the_operation_does_not_accept_is_refused() {
     let (router, engine) = service();
     seed_mixed_inventory(&engine);
 
-    // Each row is one request shape and the modelled error code it must answer with:
-    //   * a key outside the documented catalog -> InvalidFilterKey
-    //   * a tag filter combined with any other filter type -> InvalidFilterKey
-    //     ("Tag filters can't be combined with other filter types")
+    // Each row is one request shape and the error code it must answer with:
+    //   * a key outside the documented catalog -> ValidationException naming the key:
+    //     whether a filter key is one the operation knows is a validation of the request
+    //   * a tag filter combined with any other filter type -> ValidationException too,
+    //     worded about the filter kinds ("Tag filters can't be combined with other filter
+    //     types"): both keys are recognised, so what is refused is their combination
     //   * a value that is not a value of the node attribute the key names ->
     //     InvalidInstanceInformationFilterValue, or InvalidInstanceId for a node id
     //   * both filter members at once -> ValidationException
@@ -650,27 +652,27 @@ async fn a_filter_the_operation_does_not_accept_is_refused() {
         (
             "key InstanceId (singular)",
             json!({ "Filters": [{ "Key": "InstanceId", "Values": [EC2_SHORT] }] }),
-            "InvalidFilterKey",
+            "ValidationException",
         ),
         (
             "key PingStatuses",
             json!({ "Filters": [{ "Key": "PingStatuses", "Values": ["Online"] }] }),
-            "InvalidFilterKey",
+            "ValidationException",
         ),
         (
             "key platformtypes (wrong case)",
             json!({ "Filters": [{ "Key": "platformtypes", "Values": ["Linux"] }] }),
-            "InvalidFilterKey",
+            "ValidationException",
         ),
         (
             "key Tag-Key (wrong case)",
             json!({ "Filters": [{ "Key": "Tag-Key", "Values": ["env"] }] }),
-            "InvalidFilterKey",
+            "ValidationException",
         ),
         (
             "key tag: naming no tag",
             json!({ "Filters": [{ "Key": "tag:", "Values": ["dev"] }] }),
-            "InvalidFilterKey",
+            "ValidationException",
         ),
         // The legacy list's `key` is the modelled `InstanceInformationFilterKey` enum,
         // so a key outside it — including either tag form, which that legacy method does
@@ -697,7 +699,7 @@ async fn a_filter_the_operation_does_not_accept_is_refused() {
                 { "Key": "tag:env", "Values": ["dev"] },
                 { "Key": "PingStatus", "Values": ["Online"] }
             ] }),
-            "InvalidFilterKey",
+            "ValidationException",
         ),
         (
             "PlatformTypes then tag-key",
@@ -705,7 +707,7 @@ async fn a_filter_the_operation_does_not_accept_is_refused() {
                 { "Key": "PlatformTypes", "Values": ["Linux"] },
                 { "Key": "tag-key", "Values": ["env"] }
             ] }),
-            "InvalidFilterKey",
+            "ValidationException",
         ),
         (
             "InstanceIds then tag:Name",
@@ -713,7 +715,7 @@ async fn a_filter_the_operation_does_not_accept_is_refused() {
                 { "Key": "InstanceIds", "Values": [EC2_SHORT] },
                 { "Key": "tag:Name", "Values": ["web"] }
             ] }),
-            "InvalidFilterKey",
+            "ValidationException",
         ),
         // Node ids that are not node ids.
         (

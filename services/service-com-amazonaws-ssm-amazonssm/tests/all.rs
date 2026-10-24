@@ -15,6 +15,8 @@
 mod documents;
 #[path = "all/instance_properties.rs"]
 mod instance_properties;
+#[path = "all/managed_node_filter_validation.rs"]
+mod managed_node_filter_validation;
 #[path = "all/managed_node_information.rs"]
 mod managed_node_information;
 #[path = "all/parameter_deletion.rs"]
