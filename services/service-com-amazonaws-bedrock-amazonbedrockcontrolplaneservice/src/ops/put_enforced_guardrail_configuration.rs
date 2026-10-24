@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op PutEnforcedGuardrailConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `PutEnforcedGuardrailConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`PutEnforcedGuardrailConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Installs the account's single enforced guardrail configuration.
+//!
+//! The configuration names a guardrail REVISION this account already holds: the
+//! `guardrailIdentifier` is resolved against the guardrail store (either spelling — the
+//! bare id or the full ARN) and the `guardrailVersion` against that guardrail's numbered
+//! versions, and a configuration naming a revision that is not there is refused 404
+//! `ResourceNotFoundException`, the error this operation models for a resource that was
+//! not found.
+//!
+//! An account holds at most ONE such configuration
+//! ([`crate::state::EnforcedGuardrailConfiguration`]), so this `@idempotent` put REPLACES
+//! the installed one rather than adding another, keeping its `configId` and the instant
+//! and principal that first installed it. A put that names a `configId` the account does
+//! not hold addresses a configuration that does not exist, and is refused the same 404.
 //!
 //! ## Shape of an operation
 //!
@@ -156,18 +162,107 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `PutEnforcedGuardrailConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(PutEnforcedGuardrailConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("PutEnforcedGuardrailConfiguration"))
+        let now = ::std::time::SystemTime::now();
+        let caller = crate::state::caller_principal(ctx.parts());
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                PutEnforcedGuardrailConfigurationErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "enforced guardrail configuration state is not available on this \
+                             engine"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+        let mut store = state.lock();
+
+        // The guardrail revision the configuration enforces, resolved out of this
+        // account's own guardrail store: a configuration can only enforce a guardrail
+        // that is there, and the listing reports that guardrail's id and ARN, so both are
+        // read off the stored guardrail rather than rebuilt from the request.
+        let config = &input.guardrail_inference_config;
+        let not_found = |message: String| {
+            PutEnforcedGuardrailConfigurationErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(message),
+                },
+            )
+        };
+        let missing_revision = || {
+            not_found(format!(
+                "no guardrail {} at version {} exists in this account",
+                config.guardrail_identifier, config.guardrail_version
+            ))
+        };
+        let Some(guardrail) = store.guardrail(&config.guardrail_identifier) else {
+            return Err(missing_revision().into());
+        };
+        if guardrail.revision(Some(&config.guardrail_version)).is_none() {
+            return Err(missing_revision().into());
+        }
+        let guardrail_id = guardrail.id.clone();
+        let guardrail_arn = guardrail.arn.clone();
+
+        // The configuration this put addresses: the installed one, whose `configId` and
+        // creation facts survive a replacement, or — with none installed and none named —
+        // a freshly minted id. A `configId` the account does not hold addresses no
+        // configuration at all.
+        let installed = store.enforced_guardrail_configuration.as_ref().map(|stored| {
+            (
+                stored.config_id.clone(),
+                stored.created_at,
+                stored.created_by.clone(),
+            )
+        });
+        let addresses_installed = match (input.config_id.as_deref(), installed.as_ref()) {
+            (Some(named), Some((config_id, _, _))) => named == config_id,
+            (Some(_), None) => false,
+            (None, _) => true,
+        };
+        if !addresses_installed {
+            let named = input.config_id.as_deref().unwrap_or_default();
+            return Err(not_found(format!(
+                "no enforced guardrail configuration {named} exists in this account"
+            ))
+            .into());
+        }
+        let (config_id, created_at, created_by) = match installed {
+            Some(facts) => facts,
+            None => (
+                store.mint_enforced_guardrail_config_id(now),
+                now,
+                caller.clone(),
+            ),
+        };
+
+        store.enforced_guardrail_configuration =
+            Some(crate::state::EnforcedGuardrailConfiguration {
+                config_id,
+                guardrail_id,
+                guardrail_arn,
+                guardrail_version: config.guardrail_version.clone(),
+                selective_content_guarding: config.selective_content_guarding.clone(),
+                model_enforcement: config.model_enforcement.clone(),
+                created_at,
+                created_by,
+                updated_at: now,
+                updated_by: caller,
+            });
+
+        // Read the response back out of the STORED record, so what the caller is told is
+        // exactly what the listing reports.
+        let stored = store
+            .enforced_guardrail_configuration
+            .as_ref()
+            .expect("the configuration stored just above is there");
+        Ok(PutEnforcedGuardrailConfigurationOutput {
+            config_id: Some(stored.config_id.clone()),
+            updated_at: Some(crate::state::date_time(stored.updated_at)),
+            updated_by: Some(stored.updated_by.clone()),
+        })
     }
 }

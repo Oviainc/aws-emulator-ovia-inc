@@ -24,7 +24,12 @@ pub struct ListEnforcedGuardrailsConfigurationOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrock#AccountEnforcedGuardrailOutputConfiguration")]
+/// `AccountEnforcedGuardrailOutputConfiguration`, the row this listing carries. Its
+/// schema and codec come from [`bedrock_schema_and_codec!`] rather than
+/// `#[smithy_macros::smithy(shape = ...)]` because `createdAt` and `updatedAt` carry
+/// `@timestampFormat("date-time")`
+/// (`smithy_query(query="shape", shape="AccountEnforcedGuardrailOutputConfiguration")`),
+/// which the derive does not put on a member schema — see `types/date_time_wire.rs`.
 #[derive(Debug, Clone, Default)]
 pub struct AccountEnforcedGuardrailOutputConfiguration {
     pub config_id: Option<String>,
@@ -40,4 +45,45 @@ pub struct AccountEnforcedGuardrailOutputConfiguration {
     pub owner: Option<String>,
     pub model_enforcement: Option<ModelEnforcement>,
 }
+
+bedrock_schema_and_codec!(
+    AccountEnforcedGuardrailOutputConfiguration,
+    ACCOUNT_ENFORCED_GUARDRAIL_OUTPUT_CONFIGURATION_SCHEMA,
+    "com.amazonaws.bedrock#AccountEnforcedGuardrailOutputConfiguration",
+    "com.amazonaws.bedrock",
+    "AccountEnforcedGuardrailOutputConfiguration",
+    (M_CONFIG_ID, config_id, "configId", 0, opt, string),
+    (M_GUARDRAIL_ARN, guardrail_arn, "guardrailArn", 1, opt, string),
+    (M_GUARDRAIL_ID, guardrail_id, "guardrailId", 2, opt, string),
+    (M_INPUT_TAGS, input_tags, "inputTags", 3, opt, string),
+    (
+        M_SELECTIVE_CONTENT_GUARDING,
+        selective_content_guarding,
+        "selectiveContentGuarding",
+        4,
+        opt,
+        struct_of(SelectiveContentGuarding)
+    ),
+    (
+        M_GUARDRAIL_VERSION,
+        guardrail_version,
+        "guardrailVersion",
+        5,
+        opt,
+        string
+    ),
+    (M_CREATED_AT, created_at, "createdAt", 6, opt, date_time),
+    (M_CREATED_BY, created_by, "createdBy", 7, opt, string),
+    (M_UPDATED_AT, updated_at, "updatedAt", 8, opt, date_time),
+    (M_UPDATED_BY, updated_by, "updatedBy", 9, opt, string),
+    (M_OWNER, owner, "owner", 10, opt, string),
+    (
+        M_MODEL_ENFORCEMENT,
+        model_enforcement,
+        "modelEnforcement",
+        11,
+        opt,
+        struct_of(ModelEnforcement)
+    ),
+);
 
