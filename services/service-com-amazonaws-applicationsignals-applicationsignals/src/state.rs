@@ -11,7 +11,7 @@
 //! the server-derived members of a stored record — two copies of that logic would let a
 //! Get disagree with the Create that wrote the record.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound;
 use std::time::Duration;
 
@@ -28,7 +28,8 @@ use crate::ops::types::{
 // The shapes the time-ranged topology reads project, on their own `use` so this set and the
 // SLO lifecycle's above are edited on separate lines.
 use crate::ops::types::{
-    MetricReference, Service, ServiceDependency, ServiceDependent, ServiceOperation, ServiceSummary,
+    Dimension, MetricReference, Service, ServiceDependency, ServiceDependent, ServiceOperation,
+    ServiceSummary,
 };
 // The dynamic instrumentation shapes, on their own `use` for the same reason.
 use crate::ops::types::{
@@ -1070,23 +1071,137 @@ fn attribute_key(attributes: &HashMap<String, String>) -> String {
         .join("\u{1e}")
 }
 
-/// The `MetricReference`s this emulator can report for a discovered entity: NONE.
+/// The CloudWatch namespace Application Signals publishes the metrics it collects for the
+/// entities it discovers in.
 ///
-/// A `MetricReference` identifies a CloudWatch metric by three `@required` members —
-/// `Namespace`, `MetricName` and `MetricType` — and Application Signals fills them from its
-/// own standard-metric catalogue: which metric of which namespace it collects for an
-/// entity, under which metric type and dimension set. This emulator cannot compute that
-/// catalogue, and no stored record states it either: an SLO's
-/// `ServiceLevelIndicatorMetric.MetricType` reports a standard metric only for an SLO that
-/// names NO metric of its own ([`reported_metric_type`]), which is precisely the SLO that
-/// names no namespace or metric name to report beside it. So the list stays EMPTY rather
-/// than reporting a metric nothing selected — the same choice [`sli_from_config`] makes for
-/// `SliMetric.MetricDataQueries`.
+/// Every topology projection reports those metrics in a `@required` `MetricReferences`
+/// member documented as "one metric associated with this \<entity\> that was discovered by
+/// Application Signals" (`smithy_query(shape="ServiceDependent")` /
+/// `smithy_query(shape="ServiceOperation")`, and the same sentence without the clause on
+/// `Service`/`ServiceSummary`/`ServiceDependency`), so an entity this emulator reports as
+/// discovered carries the metrics the service collects for it.
 ///
-/// Single-homed here so the four topology reads cannot differ on it, and so this reasoning
-/// is stated once.
-fn no_metric_references() -> Vec<MetricReference> {
-    Vec::new()
+/// The model states only the SHAPE of a reference (`smithy_query(shape="MetricReference")`:
+/// `Namespace`, `MetricName` and `MetricType` all `@required`, `Dimensions` optional), so
+/// the CATALOGUE — this namespace, the metric names in [`STANDARD_METRICS`] and the
+/// dimension names in [`metric_dimensions`] — is the one the Amazon CloudWatch User Guide's
+/// Application Signals chapter documents: Application Signals collects `Latency`, `Fault`
+/// and `Error` in the `ApplicationSignals` namespace, dimensioned by the entity that emits
+/// them (`Service`, `Environment`, `Operation`) and, for a call that entity makes, by the
+/// far end of that call (the `Remote*` dimensions).
+///
+/// Every dimension VALUE is read out of the stored record the reference describes, so the
+/// references of two entities differ exactly as their stored identities do.
+const APPLICATION_SIGNALS_NAMESPACE: &str = "ApplicationSignals";
+
+/// The metrics of that catalogue, as `(MetricName, MetricType)`, in the order they are
+/// reported.
+///
+/// `MetricType` is "used to display the appropriate statistics in the CloudWatch console"
+/// (`smithy_query(shape="MetricReference")`, member `MetricType`, `pattern
+/// ^[A-Za-z0-9 -]+$`) and names the standard metric in the upper-case form the model itself
+/// uses for the one of these names it spells
+/// (`smithy_query(shape="ServiceLevelIndicatorMetricType")` -> `["LATENCY",
+/// "AVAILABILITY"]`).
+const STANDARD_METRICS: [(&str, &str); 3] = [
+    ("Latency", "LATENCY"),
+    ("Fault", "FAULT"),
+    ("Error", "ERROR"),
+];
+
+/// The `Attributes` entries a dimension value is read from, and the dimension each becomes.
+///
+/// The attribute names are the member's own (`smithy_query(shape="ServiceDependent")`,
+/// member `DependentKeyAttributes`): `Name` "specifies the name of the object ... used only
+/// if the value of the Type field is Service, RemoteService, or AWS::Service",
+/// `Environment` "specifies the location where this object is hosted", and `ResourceType`
+/// and `Identifier` are used "only when the value of the Type field is Resource or
+/// AWS::Resource". So the near end of an edge contributes the service it is and the
+/// environment it runs in, and the far end contributes either the remote service it is or
+/// the remote resource it identifies — which is why the two sides map the same attributes
+/// to different dimensions.
+const NEAR_END_DIMENSIONS: [(&str, &str); 2] =
+    [("Environment", "Environment"), ("Name", "Service")];
+
+/// [`NEAR_END_DIMENSIONS`], for the far end of a call.
+const FAR_END_DIMENSIONS: [(&str, &str); 3] = [
+    ("Name", "RemoteService"),
+    ("ResourceType", "RemoteResourceType"),
+    ("Identifier", "RemoteResourceIdentifier"),
+];
+
+/// The dimension carrying the operation of the entity the metrics were collected for.
+const OPERATION_DIMENSION: &str = "Operation";
+
+/// The dimension carrying the operation the far end of a call serves.
+const REMOTE_OPERATION_DIMENSION: &str = "RemoteOperation";
+
+/// The dimensions that identify the standard metrics of ONE discovered entity, or of one
+/// edge out of it: the entity's own identity and operation, plus the far end's identity and
+/// operation when the reference describes a call.
+///
+/// A dimension whose attribute the stored identity does not carry is LEFT OUT rather than
+/// reported empty — `Dimension.Value` is `length 1..1024`
+/// (`smithy_query(shape="Dimension")`), so an absent fact is an absent dimension, and the
+/// dimension set states exactly what the record states.
+fn metric_dimensions(
+    key_attributes: &HashMap<String, String>,
+    operation_name: Option<&str>,
+    far_end: Option<(&HashMap<String, String>, &str)>,
+) -> Vec<Dimension> {
+    let mut dimensions = Vec::new();
+    for (attribute, dimension) in NEAR_END_DIMENSIONS {
+        if let Some(value) = key_attributes.get(attribute) {
+            dimensions.push(Dimension {
+                name: dimension.to_string(),
+                value: value.clone(),
+            });
+        }
+    }
+    if let Some(operation_name) = operation_name {
+        dimensions.push(Dimension {
+            name: OPERATION_DIMENSION.to_string(),
+            value: operation_name.to_string(),
+        });
+    }
+    if let Some((far_attributes, far_operation_name)) = far_end {
+        for (attribute, dimension) in FAR_END_DIMENSIONS {
+            if let Some(value) = far_attributes.get(attribute) {
+                dimensions.push(Dimension {
+                    name: dimension.to_string(),
+                    value: value.clone(),
+                });
+            }
+        }
+        dimensions.push(Dimension {
+            name: REMOTE_OPERATION_DIMENSION.to_string(),
+            value: far_operation_name.to_string(),
+        });
+    }
+    dimensions
+}
+
+/// The references to the standard metrics collected under `dimensions`: one per metric in
+/// [`STANDARD_METRICS`], each identified by the same dimension set, which is what says
+/// WHICH entity's or edge's metrics these are.
+///
+/// `AccountId` stays absent: the member is "Amazon Web Services account ID"
+/// (`smithy_query(shape="MetricReference")`) and this store is one account's, so the metric
+/// is in the caller's own account and there is no source account to name.
+///
+/// Single-homed here so the five topology projections cannot differ on the catalogue, and
+/// so this reasoning is stated once.
+fn standard_metric_references(dimensions: Vec<Dimension>) -> Vec<MetricReference> {
+    STANDARD_METRICS
+        .iter()
+        .map(|(metric_name, metric_type)| MetricReference {
+            namespace: APPLICATION_SIGNALS_NAMESPACE.to_string(),
+            metric_type: (*metric_type).to_string(),
+            dimensions: Some(dimensions.clone()),
+            metric_name: (*metric_name).to_string(),
+            account_id: None,
+        })
+        .collect()
 }
 
 impl ComAmazonawsApplicationsignalsApplicationsignalsState {
@@ -1118,7 +1233,13 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
     /// key attributes rather than by a stored resource id, and this read reports what it
     /// observed for that identity.
     ///
-    /// `MetricReferences` is empty for the reason stated on [`no_metric_references`].
+    /// `MetricReferences` reports the standard metrics Application Signals collects for the
+    /// entity ([`standard_metric_references`]), dimensioned by the identity this read
+    /// reports for it — but only for an entity the store is evidence of over the window: an
+    /// identity nothing monitored was not DISCOVERED, so there is nothing collecting metrics
+    /// for it and the list is empty, exactly as it is for a window in which nothing was
+    /// observed.
+    ///
     /// `AttributeMaps`, `ServiceGroups` and `LogGroupReferences` stay absent: they are
     /// platform, grouping and log-group facts the real service learns from the telemetry an
     /// instrumented application sends it, which this emulator never receives.
@@ -1129,18 +1250,25 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
         window_end: &DateTime,
     ) -> Service {
         let mut reported = key_attributes.clone();
+        let mut discovered = false;
         for slo in self.monitoring(key_attributes, window_start, window_end) {
+            discovered = true;
             if let Some(observed) = entity_of(slo).key_attributes {
                 if observed.len() > reported.len() {
                     reported = observed;
                 }
             }
         }
+        let metric_references = if discovered {
+            standard_metric_references(metric_dimensions(&reported, None, None))
+        } else {
+            Vec::new()
+        };
         Service {
             key_attributes: reported,
             attribute_maps: None,
             service_groups: None,
-            metric_references: no_metric_references(),
+            metric_references,
             log_group_references: None,
         }
     }
@@ -1163,10 +1291,12 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
     /// ([`Self::observed_service`]). Reporting both would list one service twice and hand
     /// the caller a summary whose `KeyAttributes` no `GetService` echoes back.
     ///
-    /// `MetricReferences` is empty for the reason stated on [`no_metric_references`], and
-    /// `AttributeMaps`/`ServiceGroups` stay absent, exactly as [`Self::observed_service`]
-    /// leaves them: they are platform, grouping and telemetry facts the real service learns
-    /// from an instrumented application, which this emulator never receives.
+    /// `MetricReferences` reports the standard metrics collected for each reported identity
+    /// ([`standard_metric_references`]) — every summary here IS a discovered service, so
+    /// each carries them — and `AttributeMaps`/`ServiceGroups` stay absent, exactly as
+    /// [`Self::observed_service`] leaves them: they are platform, grouping and telemetry
+    /// facts the real service learns from an instrumented application, which this emulator
+    /// never receives.
     pub fn observed_services(
         &self,
         window_start: &DateTime,
@@ -1201,30 +1331,53 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
                 key_attributes: key_attributes.clone(),
                 attribute_maps: None,
                 service_groups: None,
-                metric_references: no_metric_references(),
+                metric_references: standard_metric_references(metric_dimensions(
+                    key_attributes,
+                    None,
+                    None,
+                )),
             })
             .collect()
     }
 
     /// The operations of the entity `key_attributes` identifies, in name order: one entry
     /// per distinct operation the stored SLOs name on it.
+    ///
+    /// Each entry's `MetricReferences` reports the standard metrics collected for THAT
+    /// operation ([`standard_metric_references`]): the dimensions are the entity's identity
+    /// plus the operation, so two operations of one service carry different references. The
+    /// identity used is the fullest one the stored SLOs hold for the entity, as
+    /// [`Self::observed_service`] reports it, so the dimensions cannot disagree with the
+    /// `GetService` answer for the same entity.
     pub fn observed_operations(
         &self,
         key_attributes: &HashMap<String, String>,
         window_start: &DateTime,
         window_end: &DateTime,
     ) -> Vec<ServiceOperation> {
-        let mut names: BTreeSet<String> = BTreeSet::new();
+        let mut by_name: BTreeMap<String, HashMap<String, String>> = BTreeMap::new();
         for slo in self.monitoring(key_attributes, window_start, window_end) {
-            if let Some(name) = entity_of(slo).operation_name {
-                names.insert(name);
+            let entity = entity_of(slo);
+            let Some(name) = entity.operation_name else {
+                continue;
+            };
+            let observed = entity
+                .key_attributes
+                .unwrap_or_else(|| key_attributes.clone());
+            let identity = by_name.entry(name).or_default();
+            if observed.len() > identity.len() {
+                *identity = observed;
             }
         }
-        names
+        by_name
             .into_iter()
-            .map(|name| ServiceOperation {
+            .map(|(name, identity)| ServiceOperation {
+                metric_references: standard_metric_references(metric_dimensions(
+                    &identity,
+                    Some(&name),
+                    None,
+                )),
                 name,
-                metric_references: no_metric_references(),
             })
             .collect()
     }
@@ -1237,6 +1390,11 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
     /// modelled `ServiceDependency` states the edge as "the operation in this service that
     /// calls the dependency" (`OperationName`, `@required`), so without it there is no edge
     /// to report.
+    ///
+    /// Each edge's `MetricReferences` reports the standard metrics collected for THAT call
+    /// ([`standard_metric_references`]): the dimensions are the calling entity's identity
+    /// and operation plus the far end's identity and operation, so two edges out of one
+    /// service carry different references.
     pub fn observed_dependencies(
         &self,
         key_attributes: &HashMap<String, String>,
@@ -1251,18 +1409,28 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
             else {
                 continue;
             };
-            by_edge
-                .entry(format!(
-                    "{operation_name}\u{1d}{}\u{1d}{}",
-                    attribute_key(&dependency.dependency_key_attributes),
-                    dependency.dependency_operation_name,
-                ))
-                .or_insert_with(|| ServiceDependency {
-                    operation_name,
-                    dependency_key_attributes: dependency.dependency_key_attributes,
-                    dependency_operation_name: dependency.dependency_operation_name,
-                    metric_references: no_metric_references(),
-                });
+            let identity = entity
+                .key_attributes
+                .unwrap_or_else(|| key_attributes.clone());
+            let edge = format!(
+                "{operation_name}\u{1d}{}\u{1d}{}",
+                attribute_key(&dependency.dependency_key_attributes),
+                dependency.dependency_operation_name,
+            );
+            let metric_references = standard_metric_references(metric_dimensions(
+                &identity,
+                Some(&operation_name),
+                Some((
+                    &dependency.dependency_key_attributes,
+                    &dependency.dependency_operation_name,
+                )),
+            ));
+            by_edge.entry(edge).or_insert_with(|| ServiceDependency {
+                operation_name,
+                dependency_key_attributes: dependency.dependency_key_attributes,
+                dependency_operation_name: dependency.dependency_operation_name,
+                metric_references,
+            });
         }
         by_edge.into_values().collect()
     }
@@ -1275,6 +1443,13 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
     /// dependency operation the edge points at), and `DependentOperationName` the operation
     /// of the dependent that invoked it — which an SLO that names no operation of its own
     /// leaves absent, as the model allows.
+    ///
+    /// `MetricReferences` reports the standard metrics collected for THAT call
+    /// ([`standard_metric_references`]). The metrics of a call are the INVOKING entity's, so
+    /// the dimensions are the dependent's identity and operation on the near end and the
+    /// invoked entity and operation on the far end — the same dimension set
+    /// [`Self::observed_dependencies`] reports for the same edge seen from the caller, which
+    /// is what keeps the two directions from disagreeing about one edge.
     pub fn observed_dependents(
         &self,
         key_attributes: &HashMap<String, String>,
@@ -1297,19 +1472,26 @@ impl ComAmazonawsApplicationsignalsApplicationsignalsState {
             let Some(dependent_key_attributes) = entity.key_attributes else {
                 continue;
             };
-            by_edge
-                .entry(format!(
-                    "{}\u{1d}{}\u{1d}{}",
-                    attribute_key(&dependent_key_attributes),
-                    entity.operation_name.clone().unwrap_or_default(),
-                    dependency.dependency_operation_name,
-                ))
-                .or_insert_with(|| ServiceDependent {
-                    operation_name: Some(dependency.dependency_operation_name),
-                    dependent_key_attributes,
-                    dependent_operation_name: entity.operation_name,
-                    metric_references: no_metric_references(),
-                });
+            let edge = format!(
+                "{}\u{1d}{}\u{1d}{}",
+                attribute_key(&dependent_key_attributes),
+                entity.operation_name.clone().unwrap_or_default(),
+                dependency.dependency_operation_name,
+            );
+            let metric_references = standard_metric_references(metric_dimensions(
+                &dependent_key_attributes,
+                entity.operation_name.as_deref(),
+                Some((
+                    &dependency.dependency_key_attributes,
+                    &dependency.dependency_operation_name,
+                )),
+            ));
+            by_edge.entry(edge).or_insert_with(|| ServiceDependent {
+                operation_name: Some(dependency.dependency_operation_name),
+                dependent_key_attributes,
+                dependent_operation_name: entity.operation_name,
+                metric_references,
+            });
         }
         by_edge.into_values().collect()
     }
